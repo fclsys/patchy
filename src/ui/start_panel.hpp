@@ -1,0 +1,84 @@
+#pragma once
+
+#include <QStringList>
+#include <QWidget>
+
+#include <functional>
+#include <vector>
+
+class QLabel;
+class QLineEdit;
+class QListWidget;
+class QPushButton;
+
+namespace patchy::ui {
+
+// The empty-workspace start panel: shown (as an overlay filling the document tab
+// area) whenever no document sessions exist. Offers New, Clipboard and Open buttons
+// and a clickable recent-files list, and carries the app branding (artwork,
+// tagline, version, links) plus the startup update-check status; MainWindow owns
+// visibility and geometry.
+class StartPanel final : public QWidget {
+  Q_OBJECT
+
+ public:
+  explicit StartPanel(QWidget* parent = nullptr);
+
+  // Replaces the recent list with the first files from paths (capped; the caller
+  // has already dropped missing ones, and this never touches the disk). The
+  // whole Recent section hides when the list is empty. The typed name filter,
+  // if any, is reapplied to the new list. A list equal to the one shown changes
+  // nothing (rows, hover and scroll position stay), so MainWindow pushes freely,
+  // whether or not the panel is showing.
+  void set_recent_files(const QStringList& paths);
+
+  // The window just recorded an open or save: clears the filter and scrolls the
+  // list to its top, so that file is the first row in view.
+  void show_newest_recent_file();
+
+  // Footer update-check line; an empty text hides it. MainWindow pushes the
+  // startup check result here even while the panel is hidden, so the cached
+  // status shows if the panel reappears later.
+  void set_update_status(const QString& text);
+
+  // Enables the Clipboard button; MainWindow mirrors File > Open from Clipboard's
+  // enabled state here (an image on the clipboard). Always off in the browser build.
+  void set_clipboard_available(bool available);
+
+ signals:
+  void new_document_requested();
+  void open_clipboard_requested();
+  void open_requested();
+  void recent_file_requested(const QString& path);
+  // Right-click on a recent row; MainWindow builds the menu so it shares the
+  // Open Recent menu's actions, reveal helper, and status messages.
+  void recent_file_context_menu_requested(const QString& path, const QPoint& global_position);
+  // The remove (x) button on a hovered recent row (GitHub issue 157).
+  void recent_file_remove_requested(const QString& path);
+
+ protected:
+  void showEvent(QShowEvent* event) override;
+  void changeEvent(QEvent* event) override;
+  bool eventFilter(QObject* watched, QEvent* event) override;
+  // The stylesheet background, then a theme package's backdrop image when the
+  // active theme has one (the empty workspace is pasteboard, theme_backdrop.hpp).
+  void paintEvent(QPaintEvent* event) override;
+
+ private:
+  // Rebuilds the visible rows from recent_paths_ through the current filter text.
+  void rebuild_recent_rows();
+  // Opens the topmost row that is a real file; the no-match placeholder is skipped.
+  void open_first_recent_match();
+
+  // Every existing recent file, filter or no filter; the list widget holds only
+  // the rows the filter currently keeps.
+  std::vector<std::function<void()>> retranslation_callbacks_;
+  QStringList recent_paths_;
+  QLabel* recent_label_{nullptr};
+  QLineEdit* recent_filter_edit_{nullptr};
+  QListWidget* recent_list_{nullptr};
+  QLabel* update_status_label_{nullptr};
+  QPushButton* clipboard_button_{nullptr};
+};
+
+}  // namespace patchy::ui

@@ -1,0 +1,138 @@
+#pragma once
+
+#include <QColor>
+#include <QDialogButtonBox>
+#include <QString>
+#include <QWidget>
+
+#include <functional>
+#include <memory>
+#include <optional>
+#include <vector>
+#include <string>
+
+class QDialog;
+class QHideEvent;
+class QShowEvent;
+class QWidget;
+
+namespace patchy::ui {
+
+class PatchyColorPickerPrivate;
+
+class PatchyColorPicker final : public QWidget {
+  Q_OBJECT
+
+public:
+  explicit PatchyColorPicker(QColor initial, QWidget* parent = nullptr);
+  ~PatchyColorPicker() override;
+
+  [[nodiscard]] QColor currentColor() const;
+
+  // Edit > Cut/Copy/Paste route here from MainWindow while keyboard focus is
+  // inside this picker (a parallel QShortcut would be ambiguous with the
+  // application-context hotkeys — same pattern as the Palette panel routing).
+  // Copy puts the current color on the clipboard (color mime + "#RRGGBB" text)
+  // and returns it; Paste applies a clipboard color and returns it (nullopt =
+  // no color on the clipboard); Cut copies like Copy, except with a custom
+  // color slot selected it copies THAT slot and resets it to white
+  // (cleared_custom_slot reports which happened).
+  QColor copy_color_to_clipboard();
+  std::optional<QColor> paste_color_from_clipboard();
+  QColor cut_color_to_clipboard(bool& cleared_custom_slot);
+  // Puts keyboard focus in the HTML (hex) field with its value selected, so
+  // Ctrl+C copies the hex and Ctrl+V or typing replaces it. Every picker does
+  // this on show (GitHub issue 68); the field also selects all on any focus-in.
+  void focus_hex_field();
+  // The Foreground Color window's Alt pick (GitHub issue 365): with a handler set, a
+  // press with Alt (Option on macOS) on the palette swatches, the custom colors, the
+  // Square field and hue strip, the Wheel or a Pick Screen Color click hands the color
+  // under the pointer to `handler` (MainWindow sets the background) instead of editing
+  // this picker's color, and Alt held over those areas shows the background cursor.
+  // The Sliders tab has no Alt pick. Set once, right after construction; no handler
+  // (the default) means Alt clicks act like plain clicks.
+  void set_background_pick_handler(std::function<void(QColor)> handler);
+  // True from a press on the Square field, the hue strip or the Wheel to its release (or
+  // the picker hiding). The moves between report a color each; MainWindow holds the
+  // settings write and the gradient refresh for color_drag_finished (GitHub issue 609).
+  [[nodiscard]] bool color_drag_active() const noexcept;
+
+public slots:
+  void setCurrentColor(QColor color);
+
+signals:
+  void currentColorChanged(QColor color);
+  // A deliberate choice, including picking the already displayed color.
+  void colorSelected(QColor color);
+  void color_drag_started();
+  void color_drag_finished();
+
+protected:
+  void showEvent(QShowEvent* event) override;
+  void hideEvent(QHideEvent* event) override;
+
+private:
+  std::unique_ptr<PatchyColorPickerPrivate> impl_;
+};
+
+// QSettings key shared by the color picker's palette dropdown and the Palette
+// panel's preset menu: the last palette choice ("basic", "current", or a built-in
+// preset id). The picker re-opens on this choice while the document is not in
+// palette (indexed) mode; in palette mode it defaults to the current palette.
+inline constexpr const char* kColorPickerPaletteChoiceKey = "palettes/lastPaletteChoice";
+
+// Publishes the active document's palette to every open color picker (and any
+// opened later): the picker's palette dropdown shows it as "Current palette",
+// defaults to it while palette mode is on, and refreshes it live. MainWindow's
+// refresh_palette_panel pushes this on every palette change.
+void set_color_picker_document_palette(std::vector<QColor> colors, bool palette_mode_active,
+                                       std::vector<std::string> names = {});
+void set_color_picker_document_palette_name_editor(std::function<void(int, const QString&)> editor);
+
+// Installs the write path for editing the "Current palette" from a picker
+// (dropping or pasting a color onto a palette cell): MainWindow points this at
+// apply_palette_entry_color so the edit is undoable and every view refreshes.
+// Unset = the current palette is read-only in pickers.
+void set_color_picker_document_palette_editor(std::function<void(int index, QColor color)> editor);
+
+// Re-reads the working CMYK space (color/color_management.hpp) in every open picker.
+// Preferences calls this after the user changes the profile or intent.
+void refresh_color_picker_cmyk_fields();
+
+// Applies a color to the open transient color picker (request_patchy_color), if
+// any, firing its live color_changed callback — used by the Palette panel so a
+// swatch click lands in e.g. the layer-style "Choose color" picker. Returns false
+// when no request picker is open.
+bool apply_color_to_open_color_picker(QColor color);
+
+// The open transient color picker (request_patchy_color), or null. A requester
+// whose target can change while the picker is open (the gradient stop editor)
+// closes it with accept(), which keeps the color picked so far.
+[[nodiscard]] QDialog* open_color_picker_dialog();
+
+// The picker containing this widget (walking up the parent chain), or null —
+// MainWindow's Edit > Cut/Copy/Paste handlers use it for focus routing.
+[[nodiscard]] PatchyColorPicker* color_picker_ancestor_of(QWidget* widget);
+
+// The color a hex or color-name entry names: "#RRGGBB", "RRGGBB", "#RGB", "#RRGGBBAA"
+// (alpha last) or a CSS/SVG name; invalid when it names none. The color window's HTML
+// field and the Color panel's hex field both read typed and pasted text with it.
+[[nodiscard]] QColor parse_panel_color(QString text);
+
+[[nodiscard]] QString color_button_style(QColor color);
+[[nodiscard]] QString inline_text_editor_style(QColor color, int pixel_size);
+// The live color window (picks apply as they happen). `button` is its one button: Close for the
+// Foreground and Background Color windows, OK for the Text Color window (GitHub issue 371);
+// either just closes it.
+[[nodiscard]] QDialog* create_patchy_color_panel(QWidget* parent, QColor initial, const QString& title,
+                                                    std::function<void(QColor)> color_changed,
+                                                    QDialogButtonBox::StandardButton button = QDialogButtonBox::Close);
+// Runs the transient picker. Accepting the dialog that launched it while the
+// picker is still open keeps the picked color: its live preview showed it as
+// applied, so OK on the parent must not revert it. Closing the parent any other
+// way cancels the picker.
+[[nodiscard]] std::optional<QColor> request_patchy_color(QWidget* parent, QColor initial, const QString& title,
+                                                         std::function<void(QColor)> color_changed = {},
+                                                         bool* user_selected = nullptr);
+
+}  // namespace patchy::ui

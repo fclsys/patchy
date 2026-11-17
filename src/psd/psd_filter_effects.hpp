@@ -1,0 +1,76 @@
+#pragma once
+
+#include "core/smart_filter_effects.hpp"
+#include "core/smart_filter.hpp"
+
+#include <cstddef>
+#include <cstdint>
+#include <memory>
+#include <optional>
+#include <span>
+#include <string>
+#include <string_view>
+#include <vector>
+
+namespace patchy::psd {
+
+// Defensive decoded-mask ceiling for editable imported/authored Smart Filters.
+// Larger native records remain byte-preserved but preview-locked.
+inline constexpr std::uint64_t kMaximumEditableSmartFilterMaskPixels =
+    64ULL * 1024ULL * 1024ULL;
+
+// Parses a document-global FEid/FXid payload. Broken outer version/record
+// boundaries return an opaque block holding the exact shared payload. A record
+// whose own bounded contents are unrecognized remains raw/rekeyable but reports
+// data_supported=false.
+[[nodiscard]] SmartFilterEffectsBlock parse_filter_effects_block(
+    std::string key, std::shared_ptr<const std::vector<std::uint8_t>> payload,
+    bool long_length = false, std::size_t original_global_index = SIZE_MAX);
+
+// Convenience overload for tests/callers that do not already own shared bytes.
+[[nodiscard]] SmartFilterEffectsBlock parse_filter_effects_block(
+    std::string_view key, std::span<const std::uint8_t> payload,
+    bool long_length = false, std::size_t original_global_index = SIZE_MAX);
+
+// Exact original payload while untouched/opaque. A changed parsed block is
+// rebuilt as outer-version + u64-length records; every record body remains raw
+// except for a requested Pascal placed-id replacement.
+[[nodiscard]] std::vector<std::uint8_t>
+serialize_filter_effects_block(const SmartFilterEffectsBlock &block);
+
+// Returns the shared raw record-body span, or an empty span for an invalid
+// range.
+[[nodiscard]] std::span<const std::uint8_t>
+raw_filter_effects_record_body(const SmartFilterEffectsRecord &record) noexcept;
+
+// Convert an authored sRGB cache to the save document's ink space, preserving
+// every non-color slot and the exact mask tail. Matching imported caches stay
+// byte-identical. Unsupported layouts or a different native source fail closed.
+[[nodiscard]] std::optional<SmartFilterEffectsRecord>
+native_filter_effects_cache(const SmartFilterEffectsRecord& record,
+                            std::shared_ptr<const PsdNativeColorSpace> space);
+
+// Replaces only the optional native filter-mask tail of the one record
+// associated with placed_uuid. The record's cache prefix, its block's
+// FEid/FXid dialect/version/length form, and every other record remain raw.
+// Empty mask pixels remove the optional tail. Mask enabled/link/extension
+// flags belong to SoLd and are deliberately not encoded here. Opaque,
+// ambiguous, unsupported, or malformed native data fails closed.
+[[nodiscard]] bool replace_filter_effects_mask(
+    SmartFilterEffectsStore &store, std::string_view placed_uuid,
+    const SmartFilterMask &mask);
+
+// Builds the Photoshop version-1 FEid record used by a freshly rendered Smart
+// Filter instance. Cache planes contain the unfiltered placed/warped Smart
+// Object over `document_bounds`, which callers pass as the filter canvas (the
+// document united with the placed bounds, smart_filter_canvas_bounds). The
+// shared filter mask is always written as an explicit 8-bit PackBits plane over
+// its own rectangle, or over the canvas when it holds no pixels.
+[[nodiscard]] std::optional<SmartFilterEffectsRecord>
+author_filter_effects_record(std::string_view placed_uuid,
+                             Rect document_bounds,
+                             const PixelBuffer &unfiltered_pixels,
+                             Rect unfiltered_bounds,
+                             const SmartFilterMask &mask);
+
+} // namespace patchy::psd

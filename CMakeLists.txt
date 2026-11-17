@@ -1,0 +1,2942 @@
+cmake_minimum_required(VERSION 3.26)
+
+project(
+  Patchy
+  VERSION 1.37
+  DESCRIPTION "A native, PSD-oriented image editor foundation"
+  LANGUAGES CXX
+)
+
+if(APPLE)
+  # Modern Apple linkers rescan archives and do not need repeated transitive
+  # static libraries. Keep the first occurrence so direct dependency order is
+  # retained while avoiding duplicate-library linker diagnostics.
+  if(POLICY CMP0156)
+    cmake_policy(SET CMP0156 NEW)
+  endif()
+  if(POLICY CMP0179)
+    cmake_policy(SET CMP0179 NEW)
+  endif()
+
+  # Objective-C++ translation units (per-OS *_mac.mm files, e.g. dialog_utils_mac.mm).
+  enable_language(OBJCXX)
+  set(CMAKE_OBJCXX_STANDARD 20)
+  set(CMAKE_OBJCXX_STANDARD_REQUIRED ON)
+endif()
+
+# The vendored miniz (src/formats/miniz/miniz.c, zlib inflate/deflate for zip-compressed
+# PSD channels and the Aseprite format; compiled into patchy_psd), the zstd decoder
+# (src/formats/zstd/zstddeclib.c, Zstandard TIFF and Affinity data; patchy_psd) and Little CMS
+# (src/color/lcms2/, ICC color management for CMYK PSD import) are plain C.
+enable_language(C)
+
+include(CTest)
+include(GNUInstallDirs)
+
+option(PATCHY_BUILD_APP "Build the Qt desktop application when Qt 6 is available" ON)
+option(PATCHY_BUILD_TESTS "Build unit tests" ON)
+option(PATCHY_ENABLE_STRICT_WARNINGS "Enable strict compiler warnings" ON)
+option(PATCHY_STORE_BUILD "Build for a store that delivers updates itself: no in-app update check" OFF)
+option(PATCHY_USE_PCH "Precompile stable Qt and standard library headers for native UI targets" ON)
+set(PATCHY_BUILD_STAMP_REFRESH_TOKEN "" CACHE STRING "Packaging token forcing a fresh build timestamp")
+include(cmake/patchy_incremental.cmake)
+
+set(CMAKE_CXX_STANDARD 20)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_CXX_EXTENSIONS OFF)
+set(PATCHY_BUNDLED_FONTS_DIR "${PROJECT_SOURCE_DIR}/third_party/fonts")
+# Web-only font set: a browser exposes no system fonts, so the wasm app build
+# additionally stages third_party/fonts-web into the shared fonts tree (see the
+# patchy_bundled_fonts target). Desktop builds never stage it.
+set(PATCHY_BUNDLED_FONTS_WEB_DIR "${PROJECT_SOURCE_DIR}/third_party/fonts-web")
+
+function(patchy_configure_target target)
+  # PRIVATE on purpose: every Patchy target calls this function itself (and
+  # CMAKE_CXX_STANDARD is 20), while a vendored library that links a Patchy
+  # target for one shim (patchy_gmic_vendor and the zlib.h over miniz) keeps
+  # the standard its own sources are written for.
+  target_compile_features(${target} PRIVATE cxx_std_20)
+  target_include_directories(${target} PUBLIC ${PROJECT_SOURCE_DIR}/src)
+  # Sources are UTF-8. Qt adds -utf-8 only to targets that link it; without the flag
+  # MSVC reads a Qt-free target's sources in the system code page, which mangles
+  # non-ASCII literals and warns C4819 on a Japanese (932) Windows.
+  if(MSVC)
+    target_compile_options(${target} PRIVATE $<$<COMPILE_LANGUAGE:C,CXX>:/utf-8>)
+  endif()
+
+  if(PATCHY_ENABLE_STRICT_WARNINGS)
+    if(MSVC)
+      target_compile_options(${target} PRIVATE /W4 /permissive-)
+    else()
+      target_compile_options(${target} PRIVATE -Wall -Wextra -Wpedantic)
+      # GCC 12 (the AppImage compiler, docs/appimage.md) reports -Wrestrict inside
+      # libstdc++'s inlined std::string copies for ordinary concatenations and literal
+      # assignments (GCC PR 105329/105651, fixed in GCC 13): only there is it switched off.
+      if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU" AND CMAKE_CXX_COMPILER_VERSION VERSION_LESS 13)
+        target_compile_options(${target} PRIVATE -Wno-restrict)
+      endif()
+    endif()
+  endif()
+endfunction()
+
+# MSVC Release codegen: /Zi + /DEBUG:FULL emit patchy.pdb for symbolizing WER
+# dumps, /INCREMENTAL:NO keeps full links reproducible for dump-matching
+# rebuilds, and /GL + /LTCG enable link-time optimization so the per-pixel
+# compositor helpers (blend_math, layer mask sampling) inline across the
+# patchy_core / patchy_render / patchy_ui library boundaries. Set here instead
+# of hand-editing CMakeCache.txt so a from-scratch reconfigure produces the
+# same binaries. Duplicated flags from an older hand-edited cache are harmless.
+if(MSVC)
+  string(APPEND CMAKE_C_FLAGS_RELEASE " /Zi /GL")
+  string(APPEND CMAKE_CXX_FLAGS_RELEASE " /Zi /GL")
+  string(APPEND CMAKE_EXE_LINKER_FLAGS_RELEASE " /DEBUG:FULL /INCREMENTAL:NO /LTCG")
+  string(APPEND CMAKE_SHARED_LINKER_FLAGS_RELEASE " /DEBUG:FULL /INCREMENTAL:NO /LTCG")
+  string(APPEND CMAKE_STATIC_LINKER_FLAGS_RELEASE " /LTCG")
+endif()
+
+# Miniz declares an internal fixed table without const qualification. Keep strict
+# warnings on the owning target and isolate only that vendored diagnostic.
+if(MSVC)
+  set_source_files_properties(
+    src/formats/miniz/miniz.c
+    PROPERTIES COMPILE_OPTIONS /wd4132
+  )
+endif()
+# Emscripten's libc headers inject an informational #pragma message (large-file
+# fopen support note) at miniz's unused stdio helpers. Same one-file scoping.
+if(EMSCRIPTEN)
+  set_source_files_properties(
+    src/formats/miniz/miniz.c
+    PROPERTIES COMPILE_OPTIONS "-Wno-#pragma-messages"
+  )
+endif()
+# stb_dxt and bcdec store int arithmetic into byte fields on purpose (MSVC C4244). Same
+# one-file, one-diagnostic scoping as miniz above.
+if(MSVC)
+  set_source_files_properties(
+    src/formats/stb/stb_dxt_impl.c
+    src/formats/bcdec/bcdec_impl.c
+    src/formats/bc7enc/bc7enc.c
+    PROPERTIES COMPILE_OPTIONS /wd4244
+  )
+endif()
+# stb_dxt's endpoint search and bc7enc's least-squares fits run in float. Fused
+# multiply-add would round differently per toolchain and change the DDS writer's bytes
+# (pinned by dds_writer_bytes_are_stable), so contraction is off for those vendored TUs.
+# MSVC's default /fp:precise already forbids contraction.
+# bcdec writes its partition tables as binary literals, a C23 feature that clang and GCC
+# flag as an extension under the default C standard, so that one TU compiles as C23.
+if(NOT MSVC)
+  set_source_files_properties(
+    src/formats/stb/stb_dxt_impl.c
+    PROPERTIES COMPILE_OPTIONS "-ffp-contract=off"
+  )
+  # Perspective plane geometry and resampling run in double; their pixels must match
+  # MSVC's on every toolchain (docs/perspective-planes.md).
+  set_source_files_properties(
+    src/core/perspective_planes.cpp
+    PROPERTIES COMPILE_OPTIONS "-ffp-contract=off"
+  )
+  # The factory brush tips are float coverage math; their masks are pinned
+  # (ui_default_brush_tip_masks_digest_is_pinned) and must match MSVC's everywhere.
+  set_source_files_properties(
+    src/ui/default_brush_tips.cpp
+    PROPERTIES COMPILE_OPTIONS "-ffp-contract=off"
+  )
+  set_source_files_properties(
+    src/formats/bcdec/bcdec_impl.c
+    PROPERTIES COMPILE_OPTIONS "-std=gnu2x"
+  )
+  # bc7enc declares its init function without a prototype and keeps a few unused helpers.
+  # GCC cannot see that m_num_pixels is at most 16 and flags the selector copy loop.
+  set_source_files_properties(
+    src/formats/bc7enc/bc7enc.c
+    PROPERTIES COMPILE_OPTIONS "-ffp-contract=off;-Wno-strict-prototypes;-Wno-unused-function;$<$<C_COMPILER_ID:GNU>:-Wno-stringop-overflow>"
+  )
+endif()
+
+add_library(patchy_core
+  src/core/gradient_fill_drag.cpp
+  src/core/gradient_presets.cpp
+  src/core/adjustment_deep.cpp
+  src/core/adjustment_layer.cpp
+  src/core/ink_space.cpp
+  src/core/invisible_watermark.cpp
+  src/core/trustmark_payload.cpp
+  src/core/blend_math.cpp
+  src/core/splitmix64.hpp
+  src/core/blend_math_deep.cpp
+  src/core/gimp_blend_modes.cpp
+  src/core/krita_blend_modes.cpp
+  src/core/brush_dynamics.cpp
+  src/core/paint_mode.cpp
+  src/core/brush_tip.cpp
+  src/core/contour_editing.cpp
+  src/core/contour_presets.cpp
+  src/core/document.cpp
+  src/core/document_channel.cpp
+  src/core/document_depth.cpp
+  src/core/document_memory.cpp
+  src/core/stroke_patch.cpp
+  src/core/document_recovery_store.cpp
+  src/support/atomic_file_write.cpp
+  src/support/random_uuid.cpp
+  src/support/scan_frame.cpp
+  src/support/byte_order.hpp
+  src/support/decode_budget.hpp
+  src/support/network_path.hpp
+  src/support/startup_trace.cpp
+  src/core/environment.cpp
+  src/core/hdr_display.cpp
+  src/core/artboard.cpp
+  src/core/document_geometry.cpp
+  src/core/resample.cpp
+  src/core/document_path.cpp
+  src/core/heal_membrane.cpp
+  src/core/clone_source_transform.cpp
+  src/core/image_trace.cpp
+  src/core/layer.cpp
+  src/core/smart_filter_schema.cpp
+  src/core/guide_layout.cpp
+  src/core/layer_alignment.cpp
+  src/core/layer_metadata.cpp
+  src/core/layer_render_utils.cpp
+  src/core/layer_tree.cpp
+  src/core/liquify.cpp
+  src/core/magnetic_lasso.cpp
+  src/core/mask_outline.cpp
+  src/core/palette.cpp
+  src/core/palette_presets.cpp
+  src/core/font_substitutes.cpp
+  src/core/font_style_class.cpp
+  src/core/path_fit.cpp
+  src/core/path_point_edits.cpp
+  src/core/path_simplify.cpp
+  src/core/shape_combine.cpp
+  src/core/pattern_presets.cpp
+  src/core/pattern_resource.cpp
+  src/core/photo_develop.cpp
+  src/core/photo_divide.cpp
+  src/core/book_scan.cpp
+  src/core/book_imposition.cpp
+  src/core/page_view_layout.cpp
+  src/core/pixel_buffer.cpp
+  src/core/pixel_depth.cpp
+  src/core/hdr_color.cpp
+  src/core/pixel_tools.cpp
+  src/core/quick_select.cpp
+  src/core/selection_modify.cpp
+  src/core/color_range.cpp
+  src/core/color_replace.cpp
+  src/core/color_match_stroke.cpp
+  src/core/background_eraser.cpp
+  src/core/rect_utils.cpp
+  src/core/smart_filter_adjustment.cpp
+  src/core/smart_filter_effects.cpp
+  src/core/smart_filter_table.cpp
+  src/core/smart_filter_gallery.cpp
+  src/core/smart_object.cpp
+  src/core/spot_heal.cpp
+  src/core/red_eye.cpp
+  src/core/perspective_planes.cpp
+  src/core/exemplar_inpaint.cpp
+  src/core/floating_selection.cpp
+  src/core/stroke_stabilizer.cpp
+  src/core/style_contour.cpp
+  src/core/style_presets.cpp
+  src/core/text_path.hpp
+  src/core/text_path.cpp
+  src/core/text_warp.cpp
+  src/core/vector_live_shapes.cpp
+  src/core/worker_budget.cpp
+  src/core/vector_raster.cpp
+  src/core/vector_shape.cpp
+  src/core/vector_compound.cpp
+  src/core/warp_mesh.hpp
+  src/core/warp_mesh.cpp
+)
+patchy_configure_target(patchy_core)
+
+include(cmake/patchy_ai.cmake)
+include(cmake/patchy_gegl.cmake)
+
+add_library(patchy_render
+  src/render/compositor.cpp
+  src/render/composite_targets.hpp
+  src/render/layer_compositor.hpp
+  src/render/layer_compositor.cpp
+  src/render/layer_compositor_deep.cpp
+  src/render/layer_compositor_isolated.cpp
+  src/render/layer_compositor_rgb8.cpp
+  src/render/layer_compositor_rgb8_per_pixel.cpp
+  src/render/layer_compositor_rgba8.cpp
+  src/render/layer_knockout.hpp
+  src/render/layer_render_facade.cpp
+  src/render/layer_render_facade.hpp
+  src/render/layer_render_types.hpp
+  src/render/style_mask_cache.hpp
+  src/render/native_cmyk.cpp
+  src/render/native_duotone.cpp
+  src/render/layer_style_mask_ops.cpp
+  src/render/tile_cache.cpp
+)
+# flatten_rgb8 composites large documents in parallel strips (std::async).
+find_package(Threads REQUIRED)
+target_link_libraries(patchy_render PUBLIC patchy_core Threads::Threads PRIVATE patchy_color)
+patchy_configure_target(patchy_render)
+
+# Vendored Little CMS 2.17 core (MIT), used to convert CMYK PSDs through their embedded
+# ICC profile on import. Core library ONLY: the optional lcms2 speed plugins (fast_float,
+# threaded) are GPL3-or-commercial and must never be vendored. A separate target skipped
+# by patchy_configure_target keeps the strict-warning flags off the vendored C sources.
+add_library(patchy_lcms2 STATIC
+  src/color/lcms2/cmsalpha.c
+  src/color/lcms2/cmscam02.c
+  src/color/lcms2/cmscgats.c
+  src/color/lcms2/cmscnvrt.c
+  src/color/lcms2/cmserr.c
+  src/color/lcms2/cmsgamma.c
+  src/color/lcms2/cmsgmt.c
+  src/color/lcms2/cmshalf.c
+  src/color/lcms2/cmsintrp.c
+  src/color/lcms2/cmsio0.c
+  src/color/lcms2/cmsio1.c
+  src/color/lcms2/cmslut.c
+  src/color/lcms2/cmsmd5.c
+  src/color/lcms2/cmsmtrx.c
+  src/color/lcms2/cmsnamed.c
+  src/color/lcms2/cmsopt.c
+  src/color/lcms2/cmspack.c
+  src/color/lcms2/cmspcs.c
+  src/color/lcms2/cmsplugin.c
+  src/color/lcms2/cmsps2.c
+  src/color/lcms2/cmssamp.c
+  src/color/lcms2/cmssm.c
+  src/color/lcms2/cmstypes.c
+  src/color/lcms2/cmsvirt.c
+  src/color/lcms2/cmswtpnt.c
+  src/color/lcms2/cmsxform.c
+)
+target_include_directories(patchy_lcms2 PUBLIC ${PROJECT_SOURCE_DIR}/src/color/lcms2)
+if(MSVC)
+  target_compile_definitions(patchy_lcms2 PRIVATE _CRT_SECURE_NO_WARNINGS)
+endif()
+if(UNIX AND NOT APPLE)
+  target_link_libraries(patchy_lcms2 PUBLIC m)
+endif()
+
+# Vendored LibRaw 0.22.1 (dual LGPL-2.1/CDDL-1.0; Patchy elects CDDL-1.0 — see
+# NOTICE-THIRD-PARTY.md), the camera raw decoder + dcraw-style develop pipeline behind
+# formats/raw_document_io. Stock tarball contents only: the separate LibRaw "demosaic pack"
+# repositories are GPL and must never be vendored (DCB/DHT/AAHD here come from the stock
+# tarball and are BSD/LGPL/CDDL-clean). Built WITHOUT jpeg/zlib/lcms (USE_* undefined), so
+# lossy- and deflate-compressed DNGs report clear errors instead of adding dependencies, and
+# WITHOUT LIBRAW_NOTHREADS (per-instance decoder state; instances may be used on different
+# threads concurrently, which the raw develop preview relies on). A separate target skipped
+# by patchy_configure_target keeps the strict-warning flags off the vendored sources.
+add_library(patchy_libraw STATIC
+  src/formats/libraw/src/decoders/canon_600.cpp
+  src/formats/libraw/src/decoders/crx.cpp
+  src/formats/libraw/src/decoders/decoders_dcraw.cpp
+  src/formats/libraw/src/decoders/decoders_libraw.cpp
+  src/formats/libraw/src/decoders/decoders_libraw_dcrdefs.cpp
+  src/formats/libraw/src/decoders/dng.cpp
+  src/formats/libraw/src/decoders/fp_dng.cpp
+  src/formats/libraw/src/decoders/fuji_compressed.cpp
+  src/formats/libraw/src/decoders/generic.cpp
+  src/formats/libraw/src/decoders/kodak_decoders.cpp
+  src/formats/libraw/src/decoders/load_mfbacks.cpp
+  src/formats/libraw/src/decoders/olympus14.cpp
+  src/formats/libraw/src/decoders/pana8.cpp
+  src/formats/libraw/src/decoders/smal.cpp
+  src/formats/libraw/src/decoders/sonycc.cpp
+  src/formats/libraw/src/decoders/unpack.cpp
+  src/formats/libraw/src/decoders/unpack_thumb.cpp
+  src/formats/libraw/src/decompressors/losslessjpeg.cpp
+  src/formats/libraw/src/demosaic/aahd_demosaic.cpp
+  src/formats/libraw/src/demosaic/ahd_demosaic.cpp
+  src/formats/libraw/src/demosaic/dcb_demosaic.cpp
+  src/formats/libraw/src/demosaic/dht_demosaic.cpp
+  src/formats/libraw/src/demosaic/misc_demosaic.cpp
+  src/formats/libraw/src/demosaic/xtrans_demosaic.cpp
+  src/formats/libraw/src/integration/dngsdk_glue.cpp
+  src/formats/libraw/src/integration/rawspeed_glue.cpp
+  src/formats/libraw/src/libraw_c_api.cpp
+  src/formats/libraw/src/libraw_datastream.cpp
+  src/formats/libraw/src/metadata/adobepano.cpp
+  src/formats/libraw/src/metadata/canon.cpp
+  src/formats/libraw/src/metadata/ciff.cpp
+  src/formats/libraw/src/metadata/cr3_parser.cpp
+  src/formats/libraw/src/metadata/epson.cpp
+  src/formats/libraw/src/metadata/exif_gps.cpp
+  src/formats/libraw/src/metadata/fuji.cpp
+  src/formats/libraw/src/metadata/hasselblad_model.cpp
+  src/formats/libraw/src/metadata/identify.cpp
+  src/formats/libraw/src/metadata/identify_tools.cpp
+  src/formats/libraw/src/metadata/kodak.cpp
+  src/formats/libraw/src/metadata/leica.cpp
+  src/formats/libraw/src/metadata/makernotes.cpp
+  src/formats/libraw/src/metadata/mediumformat.cpp
+  src/formats/libraw/src/metadata/minolta.cpp
+  src/formats/libraw/src/metadata/misc_parsers.cpp
+  src/formats/libraw/src/metadata/nikon.cpp
+  src/formats/libraw/src/metadata/normalize_model.cpp
+  src/formats/libraw/src/metadata/olympus.cpp
+  src/formats/libraw/src/metadata/p1.cpp
+  src/formats/libraw/src/metadata/pentax.cpp
+  src/formats/libraw/src/metadata/samsung.cpp
+  src/formats/libraw/src/metadata/sony.cpp
+  src/formats/libraw/src/metadata/tiff.cpp
+  src/formats/libraw/src/postprocessing/aspect_ratio.cpp
+  src/formats/libraw/src/postprocessing/dcraw_process.cpp
+  src/formats/libraw/src/postprocessing/mem_image.cpp
+  src/formats/libraw/src/postprocessing/postprocessing_aux.cpp
+  src/formats/libraw/src/postprocessing/postprocessing_utils.cpp
+  src/formats/libraw/src/postprocessing/postprocessing_utils_dcrdefs.cpp
+  src/formats/libraw/src/preprocessing/ext_preprocess.cpp
+  src/formats/libraw/src/preprocessing/raw2image.cpp
+  src/formats/libraw/src/preprocessing/subtract_black.cpp
+  src/formats/libraw/src/tables/cameralist.cpp
+  src/formats/libraw/src/tables/colorconst.cpp
+  src/formats/libraw/src/tables/colordata.cpp
+  src/formats/libraw/src/tables/wblists.cpp
+  src/formats/libraw/src/utils/curves.cpp
+  src/formats/libraw/src/utils/decoder_info.cpp
+  src/formats/libraw/src/utils/init_close_utils.cpp
+  src/formats/libraw/src/utils/open.cpp
+  src/formats/libraw/src/utils/phaseone_processing.cpp
+  src/formats/libraw/src/utils/read_utils.cpp
+  src/formats/libraw/src/utils/thumb_utils.cpp
+  src/formats/libraw/src/utils/utils_dcraw.cpp
+  src/formats/libraw/src/utils/utils_libraw.cpp
+  src/formats/libraw/src/write/apply_profile.cpp
+  src/formats/libraw/src/write/file_write.cpp
+  src/formats/libraw/src/write/tiff_writer.cpp
+  src/formats/libraw/src/x3f/x3f_parse_process.cpp
+  src/formats/libraw/src/x3f/x3f_utils_patched.cpp
+)
+target_include_directories(patchy_libraw PUBLIC ${PROJECT_SOURCE_DIR}/src/formats/libraw)
+# LibRaw's own code predates C++20; pin the standard it is developed against.
+set_target_properties(patchy_libraw PROPERTIES CXX_STANDARD 17 CXX_STANDARD_REQUIRED ON)
+if(MSVC)
+  target_compile_definitions(patchy_libraw PRIVATE _CRT_SECURE_NO_WARNINGS WIN32)
+  target_compile_options(patchy_libraw PRIVATE /w)
+else()
+  target_compile_options(patchy_libraw PRIVATE -w)
+endif()
+if(WIN32)
+  # Static build: without LIBRAW_NODLL the headers declare every entry point dllimport.
+  # PUBLIC because consumers include libraw/libraw.h through this target too.
+  target_compile_definitions(patchy_libraw PUBLIC LIBRAW_NODLL)
+  # ntohs/htons in the datastream and metadata parsers.
+  target_link_libraries(patchy_libraw PUBLIC ws2_32)
+endif()
+
+add_library(patchy_psd
+  src/formats/acv_curves_io.cpp
+  src/formats/photoshop_adjustment_presets.cpp
+  src/formats/miniz/miniz.c
+  src/formats/zstd/zstddeclib.c
+  src/psd/abr_reader.cpp
+  src/psd/asl_io.cpp
+  src/psd/csh_io.cpp
+  src/psd/grd_io.cpp
+  src/psd/pat_reader.cpp
+  src/psd/shc_io.cpp
+  src/psd/psd_adjustments.cpp
+  src/psd/psd_artboard.cpp
+  src/psd/psd_binary.cpp
+  src/psd/engine_data.cpp
+  src/psd/engine_data.hpp
+  src/psd/psd_channel_data.cpp
+  src/psd/psd_descriptor.cpp
+  src/psd/psd_document_io.cpp
+  src/psd/psd_filter_effects.cpp
+  src/psd/psd_image_resources.cpp
+  src/psd/psd_io_common.cpp
+  src/psd/psd_io_internal.hpp
+  src/psd/psd_layer_records.cpp
+  src/psd/psd_layer_styles.cpp
+  src/psd/psd_little_endian.cpp
+  src/psd/psd_little_endian.hpp
+  src/psd/psd_patterns.cpp
+  src/psd/psd_smart_filter_adjustments.cpp
+  src/psd/psd_smart_filter_gallery.cpp
+  src/psd/psd_smart_objects.cpp
+  src/psd/psd_smart_filter_table.cpp
+  src/psd/psd_smart_filter_table.hpp
+  src/psd/psd_text_engine_block.cpp
+  src/psd/psd_text_engine_block.hpp
+  src/psd/psd_text_engine_template.cpp
+  src/psd/psd_text_legacy.cpp
+  src/psd/psd_text_read.cpp
+  src/psd/psd_text_write.cpp
+  src/psd/psd_tiff.cpp
+  src/psd/psd_tiff.hpp
+  src/psd/psd_tiff_flat.cpp
+  src/psd/psd_tiff_internal.hpp
+  src/psd/psd_tiff_pages.cpp
+  src/psd/psd_vector.cpp
+)
+target_link_libraries(patchy_psd PUBLIC patchy_core patchy_render patchy_color)
+if(WIN32)
+  target_link_libraries(patchy_psd PUBLIC dwrite gdi32)
+endif()
+patchy_configure_target(patchy_psd)
+
+add_library(patchy_plugins
+  src/plugins/legacy_photoshop_adapter.cpp
+  src/plugins/pipl.cpp
+  src/plugins/plugin_host.cpp
+)
+target_link_libraries(patchy_plugins PUBLIC patchy_core)
+patchy_configure_target(patchy_plugins)
+
+# GEGL filters (docs/gegl-filters.md): patchy-gegl-host, the one Patchy process that loads
+# GEGL, babl and GLib, Patchy's own build of them (cmake/patchy_gegl.cmake), at run time.
+# Nothing is linked (docs/legal-licensing.md, "GEGL operations through a helper").
+if(NOT EMSCRIPTEN)
+  add_executable(patchy-gegl-host src/plugins/gegl/host/main.cpp)
+  if(WIN32)
+    target_link_options(patchy-gegl-host PRIVATE $<$<CXX_COMPILER_ID:MSVC>:/SUBSYSTEM:CONSOLE>)
+  else()
+    target_link_libraries(patchy-gegl-host PRIVATE ${CMAKE_DL_LIBS})
+  endif()
+  patchy_configure_target(patchy-gegl-host)
+  set_target_properties(patchy-gegl-host PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}")
+endif()
+
+if(WIN32)
+  # The out-of-process host for classic Photoshop filter plug-ins
+  # (docs/plugins.md): one Qt-free Win32 program built twice. On x64 the 64-bit
+  # helper is an ordinary target of this build; the 32-bit helper is the same
+  # sources configured as their own Ninja project inside the x86 developer
+  # environment (scripts\build-8bf-host.bat), because a 64-bit process cannot
+  # load a 32-bit plug-in. A Windows ARM64 build makes the 64-bit helper the same
+  # way as x64 code, since plug-ins are x64 code an ARM64 process cannot load
+  # either; it runs under Windows' x64 emulation. Both land next to patchy.exe.
+  set(PATCHY_8BF_HOST_OUTPUT_DIR "${CMAKE_BINARY_DIR}")
+  file(GLOB PATCHY_8BF_HOST_SOURCES CONFIGURE_DEPENDS
+       "${PROJECT_SOURCE_DIR}/src/plugins/host/*.cpp"
+       "${PROJECT_SOURCE_DIR}/src/plugins/host/*.hpp"
+       "${PROJECT_SOURCE_DIR}/src/plugins/host/CMakeLists.txt")
+  function(patchy_add_external_8bf_host target arch bits)
+    set(exe "${CMAKE_BINARY_DIR}/patchy-8bf-host${bits}.exe")
+    add_custom_command(
+      OUTPUT "${exe}"
+      COMMAND "${PROJECT_SOURCE_DIR}/scripts/build-8bf-host.bat"
+              "${PROJECT_SOURCE_DIR}/src/plugins/host"
+              "${CMAKE_BINARY_DIR}/8bf-host${bits}"
+              "${CMAKE_BINARY_DIR}"
+              "${CMAKE_COMMAND}"
+              "$<IF:$<CONFIG:Debug>,Debug,Release>"
+              "${CMAKE_MAKE_PROGRAM}"
+              "${arch}"
+      DEPENDS ${PATCHY_8BF_HOST_SOURCES} "${PROJECT_SOURCE_DIR}/scripts/build-8bf-host.bat"
+      COMMENT "Building the ${bits}-bit legacy plug-in host (patchy-8bf-host${bits}.exe, ${arch})"
+      VERBATIM)
+    add_custom_target(${target} ALL DEPENDS "${exe}")
+  endfunction()
+  if(CMAKE_CXX_COMPILER_ARCHITECTURE_ID STREQUAL "ARM64")
+    patchy_add_external_8bf_host(patchy-8bf-host64 x64 64)
+  else()
+    set(PATCHY_8BF_HOST_NAME patchy-8bf-host64)
+    add_subdirectory(src/plugins/host)
+  endif()
+  patchy_add_external_8bf_host(patchy_8bf_host32 x86 32)
+endif()
+
+add_library(patchy_filters
+  src/filters/auto_levels_math.cpp
+  src/filters/auto_levels_math.hpp
+  src/filters/builtin_filter_looks.cpp
+  src/filters/builtin_filter_looks.hpp
+  src/filters/builtin_filters.cpp
+  src/filters/deep_filters.cpp
+  src/filters/deep_filters.hpp
+  src/filters/filter_engine.cpp
+  src/filters/filter_kernels.cpp
+  src/filters/filter_kernels.hpp
+  src/filters/filter_registry.cpp
+  src/filters/filter_support.hpp
+  src/filters/rgba_filter_staging.hpp
+  src/filters/smart_filter_recipe_mapping.cpp
+  src/filters/smart_filter_renderer.cpp
+  src/filters/smart_filter_distort_stylize.cpp
+  src/filters/smart_filter_table_render.cpp
+  src/filters/smart_filter_table_render.hpp
+  src/filters/stylize_render_filters.cpp
+  src/filters/stylize_render_filters.hpp
+)
+target_link_libraries(patchy_filters PUBLIC patchy_core)
+patchy_configure_target(patchy_filters)
+# The filter kernels run in float and double. arm64 has fused multiply-add and clang
+# contracts a*b+c into it by default, rounding once where MSVC and x86-64 GCC round
+# twice, so the same filter wrote different 8-bit pixels on macOS. Contraction is off so
+# every toolchain matches MSVC's /fp:precise (docs/platform.md).
+if(NOT MSVC)
+  target_compile_options(patchy_filters PRIVATE -ffp-contract=off)
+endif()
+
+include(cmake/patchy_gmic.cmake)
+
+# The browser build may parse HEIF containers with libheif, but the compressed HEVC
+# picture is decoded only by the browser's WebCodecs implementation. Keep this dependency
+# out of every native build and the node-only wasm-core build. The explicit option list is
+# a legal boundary: no software HEVC decoder or encoder may enter Patchy's wasm binary.
+if(EMSCRIPTEN AND PATCHY_BUILD_APP)
+  function(patchy_add_wasm_libheif)
+    set(BUILD_SHARED_LIBS OFF)
+    set(BUILD_TESTING OFF)
+    set(BUILD_DOCUMENTATION OFF)
+    set(BUILD_DEVELOPMENT_TOOLS OFF)
+    set(ENABLE_COVERAGE OFF)
+    set(ENABLE_EXPERIMENTAL_FEATURES OFF)
+    set(ENABLE_MULTITHREADING_SUPPORT OFF)
+    set(ENABLE_PARALLEL_TILE_DECODING OFF)
+    set(ENABLE_PLUGIN_LOADING OFF)
+    set(WITH_EXAMPLES OFF)
+    set(WITH_GDK_PIXBUF OFF)
+    set(WITH_FUZZERS OFF)
+    set(WITH_HEADER_COMPRESSION OFF)
+    set(WITH_LIBSHARPYUV OFF)
+    set(WITH_UNCOMPRESSED_CODEC OFF)
+
+    set(WITH_LIBDE265 OFF)
+    set(WITH_X265 OFF)
+    set(WITH_KVAZAAR OFF)
+    set(WITH_FFMPEG_DECODER OFF)
+    set(WITH_AOM_DECODER OFF)
+    set(WITH_AOM_ENCODER OFF)
+    set(WITH_DAV1D OFF)
+    set(WITH_SvtEnc OFF)
+    set(WITH_RAV1E OFF)
+    set(WITH_JPEG_DECODER OFF)
+    set(WITH_JPEG_ENCODER OFF)
+    set(WITH_OpenJPEG_DECODER OFF)
+    set(WITH_OpenJPEG_ENCODER OFF)
+    set(WITH_OPENJPH_ENCODER OFF)
+    set(WITH_UVG266 OFF)
+    set(WITH_VVDEC OFF)
+    set(WITH_VVENC OFF)
+    set(WITH_X264 OFF)
+    set(WITH_OpenH264_DECODER OFF)
+    set(WITH_WEBCODECS ON)
+
+    add_subdirectory(
+      src/formats/libheif
+      "${CMAKE_CURRENT_BINARY_DIR}/libheif"
+      EXCLUDE_FROM_ALL
+    )
+
+    # libheif enables -Wconversion on itself, and on wasm32 (32-bit size_t)
+    # its pervasive uint64_t-to-size_t narrowing trips -Wshorten-64-to-32 in a
+    # dozen upstream sources. One diagnostic, vendored target only; Patchy
+    # sources are unaffected.
+    target_compile_options(heif PRIVATE -Wno-shorten-64-to-32)
+
+    # Make the legal boundary fail closed if a future libheif update enables a
+    # compressed-codec backend that is not represented by today's option list.
+    # encoder_mask.cc stores a raw auxiliary mask; it is not an HEVC encoder.
+    get_target_property(patchy_libheif_sources heif SOURCES)
+    foreach(source IN LISTS patchy_libheif_sources)
+      get_filename_component(source_name "${source}" NAME)
+      if(source_name MATCHES "^(decoder|encoder)_.*\\.(c|cc|cpp|cxx)$" AND
+         NOT source_name STREQUAL "decoder_webcodecs.cc" AND
+         NOT source_name STREQUAL "encoder_mask.cc")
+        message(FATAL_ERROR
+          "Forbidden libheif codec backend entered the WASM build: ${source_name}")
+      endif()
+    endforeach()
+  endfunction()
+  patchy_add_wasm_libheif()
+endif()
+
+include(cmake/patchy_webp.cmake)
+include(cmake/patchy_jxl.cmake)
+include(cmake/patchy_openjpeg.cmake)
+include(cmake/patchy_libjpeg.cmake)
+if(NOT EMSCRIPTEN)
+  include(cmake/patchy_avif.cmake)
+endif()
+
+add_library(patchy_formats
+  src/formats/animation_frames.cpp
+  src/formats/animation_timing.cpp
+  src/formats/apng_writer.cpp
+  src/formats/webp_animation_io.cpp
+  src/formats/af_document_io.cpp
+  src/formats/af_container.cpp
+  src/formats/af_raster.cpp
+  src/formats/af_text.cpp
+  src/formats/af_vector.cpp
+  src/formats/af_container_internal.hpp
+  src/formats/af_raster_internal.hpp
+  src/formats/af_import_internal.hpp
+  src/formats/af_tree.cpp
+  src/formats/aseprite_document_io.cpp
+  src/formats/bmp_document_io.cpp
+  src/formats/document_flatten.cpp
+  src/formats/document_trim.cpp
+  src/formats/font_zip.cpp
+  src/formats/format_file_io.cpp
+  src/formats/format_registry.cpp
+  src/formats/nrbf_reader.cpp
+  src/formats/gif_document_io.cpp
+  src/formats/heif_document_io.cpp
+  src/formats/ico_document_io.cpp
+  src/formats/image_density_probe.cpp
+  src/formats/image_open_diagnosis.cpp
+  src/formats/ilbm_document_io.cpp
+  src/formats/jxl_document_io.cpp
+  src/formats/hdr_document_io.cpp
+  src/formats/exr_document_io.cpp
+  src/formats/jp2_document_io.cpp
+  src/formats/jpeg_deep_glue.c
+  src/formats/jpeg_deep_reader.cpp
+  src/formats/avif_document_io.cpp
+  src/formats/hdr_transfer.cpp
+  src/formats/jxr_document_io.cpp
+  src/formats/layered_blend_support.cpp
+  src/formats/metadata/exif_tags.cpp
+  src/formats/metadata/gimp_image_metadata.cpp
+  src/formats/metadata/iptc_iim.cpp
+  src/formats/metadata/jumbf.cpp
+  src/formats/metadata/metadata_containers.cpp
+  src/formats/metadata/metadata_edit.cpp
+  src/formats/metadata/metadata_inject.cpp
+  src/formats/metadata/metadata_view.cpp
+  src/formats/metadata/tiff_ifd.cpp
+  src/formats/metadata/xmp.cpp
+  src/formats/kra_document_io.cpp
+  src/formats/kra_layers.cpp
+  src/formats/kra_odg.cpp
+  src/formats/kra_tiles.cpp
+  src/formats/ora_document_io.cpp
+  src/formats/zip_entry_reader.cpp
+  src/formats/palette_io.cpp
+  src/formats/pcx_document_io.cpp
+  src/formats/pdn_document_io.cpp
+  src/formats/xcf_document_io.cpp
+  src/formats/xcf_text.cpp
+  src/formats/xcf_unwrap.cpp
+  src/formats/pdf_content.cpp
+  src/formats/pdf_crypt.cpp
+  src/formats/pdf_document_io.cpp
+  src/formats/pdf_file.cpp
+  src/formats/pdf_image_writer.cpp
+  src/formats/pdf_png_writer.cpp
+  src/formats/pdf_filters.cpp
+  src/formats/pdf_fonts.cpp
+  src/formats/pdf_function.cpp
+  src/formats/pdf_syntax.cpp
+  src/formats/pdf_text_merge.cpp
+  src/formats/raw_document_io.cpp
+  src/formats/raw_tone.cpp
+  src/formats/raw_white_balance.cpp
+  src/formats/rttex_document_io.cpp
+  src/formats/dds_document_io.cpp
+  src/formats/css_layer_export.cpp
+  src/formats/svg_document_read.cpp
+  src/formats/svg_document_write.cpp
+  src/formats/svg_xml.cpp
+  src/formats/tga_document_io.cpp
+  src/formats/vector_export_plan.cpp
+  src/formats/vector_fill_rule.cpp
+  src/formats/stb/stb_image_impl.c
+  src/formats/stb/stb_dxt_impl.c
+  src/formats/bcdec/bcdec_impl.c
+  src/formats/bc7enc/bc7enc.c
+)
+# patchy_libraw stays PRIVATE: only raw_document_io.cpp touches LibRaw types; the public
+# raw_document_io.hpp is LibRaw-free like the rest of the formats API. patchy_filters is
+# PRIVATE too: af_document_io.cpp bakes Gaussian-blur layer effects through the calibrated
+# smart-filter blur (filters depends only on core, so no cycle).
+target_link_libraries(patchy_formats PUBLIC patchy_core patchy_render patchy_psd PRIVATE patchy_filters patchy_libraw)
+target_link_libraries(patchy_formats PRIVATE webp webpdemux libwebpmux patchy_jxl patchy_openjpeg patchy_libjpeg)
+# AVIF decodes through the vendored libavif + dav1d on every native build; the browser build
+# compiles only the unavailable stub in avif_document_io.cpp (docs/avif.md).
+if(NOT EMSCRIPTEN)
+  target_link_libraries(patchy_formats PRIVATE patchy_avif)
+  target_compile_definitions(patchy_formats PRIVATE PATCHY_AVIF_DECODER=1)
+endif()
+# tinyexr includes "miniz.h" by that bare name (exr_document_io.cpp).
+target_include_directories(patchy_formats PRIVATE ${PROJECT_SOURCE_DIR}/src/formats/miniz)
+target_include_directories(patchy_formats PRIVATE src/formats/libwebp/src)
+if(EMSCRIPTEN AND PATCHY_BUILD_APP)
+  target_sources(patchy_formats PRIVATE src/formats/heif_document_io_wasm.cpp)
+  target_compile_definitions(patchy_formats PRIVATE PATCHY_HEIF_WEBCODECS=1)
+  target_include_directories(patchy_formats PRIVATE
+    "${PROJECT_SOURCE_DIR}/src/formats/libheif/libheif/api"
+    "${CMAKE_CURRENT_BINARY_DIR}/libheif"
+  )
+  target_link_libraries(patchy_formats PRIVATE heif patchy_lcms2)
+elseif(WIN32)
+  # HEIF/HEIC decodes through Windows Imaging Component (the Microsoft Store HEIF/HEVC
+  # codec packages provide the HEVC decoder). macOS decodes HEIC via Qt's image plugin
+  # instead, so it compiles only the stub in heif_document_io.cpp.
+  #
+  # JPEG XR uses the same WIC plumbing (shared in wic_com.hpp), but its codec is in-box on
+  # every supported Windows and covers encoding too. No other platform has a decoder and Qt
+  # ships no plugin, so they compile only the throwing stub in jxr_document_io.cpp and hide
+  # the format from the save filters via jxr::is_available().
+  target_sources(patchy_formats PRIVATE
+    src/formats/heif_document_io_win.cpp
+    src/formats/jxr_document_io_win.cpp
+  )
+  target_link_libraries(patchy_formats PRIVATE windowscodecs ole32)
+elseif(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+  # HEIF/HEIC decodes through the distribution's own libheif, loaded with dlopen at run
+  # time (heif_document_io_linux.cpp). Nothing is linked: the AppImage must not bundle
+  # libheif or any HEVC decoder (docs/legal-licensing.md), and linuxdeploy only copies
+  # what the binary links. Little CMS bakes the file's ICC profile to sRGB as on wasm.
+  target_sources(patchy_formats PRIVATE src/formats/heif_document_io_linux.cpp)
+  target_compile_definitions(patchy_formats PRIVATE PATCHY_HEIF_HOST_LIBHEIF=1)
+  target_link_libraries(patchy_formats PRIVATE patchy_lcms2 ${CMAKE_DL_LIBS})
+elseif(APPLE)
+  # HEIF/HEIC deeper than 8 bits (10-bit captures, PQ and HLG HDR) decodes through ImageIO,
+  # the system HEVC decoder (heif_document_io_mac.cpp, plain C APIs, no Objective-C). Every
+  # other HEIC throws there and opens through Qt's qmacheif plugin as before.
+  target_sources(patchy_formats PRIVATE src/formats/heif_document_io_mac.cpp)
+  target_compile_definitions(patchy_formats PRIVATE PATCHY_HEIF_IMAGEIO=1)
+  target_link_libraries(patchy_formats PRIVATE "-framework ImageIO" "-framework CoreGraphics" "-framework CoreFoundation")
+endif()
+patchy_configure_target(patchy_formats)
+
+add_library(patchy_color
+  src/color/color_management.cpp
+  src/color/lcms_intent.hpp
+  src/color/rgb_profiles.cpp
+)
+target_link_libraries(patchy_color PUBLIC patchy_core PRIVATE patchy_lcms2)
+patchy_configure_target(patchy_color)
+
+if(PATCHY_BUILD_APP)
+  # Qt ships no PrintSupport (or Test need) for WebAssembly; requesting it
+  # there would fail the whole find_package and silently skip the app target.
+  if(EMSCRIPTEN)
+    set(PATCHY_QT_COMPONENTS Widgets Svg Network Qml LinguistTools)
+  else()
+    set(PATCHY_QT_COMPONENTS Widgets Svg PrintSupport Network Qml LinguistTools Test)
+  endif()
+  find_package(Qt6 QUIET COMPONENTS ${PATCHY_QT_COMPONENTS})
+  # Qt PDF is optional: a stock Qt install does not carry it and Qt publishes no
+  # WebAssembly build of it at all. Absent, patchy_ui compiles src/ui/pdf_import_stub.cpp
+  # and Patchy still EXPORTS PDF (QPdfWriter is QtGui), it just cannot open one.
+  #
+  # This is find_package(Qt6Pdf), NOT find_package(Qt6 COMPONENTS Pdf), and it must never
+  # be folded into PATCHY_QT_COMPONENTS: either of those forms overwrites Qt6_FOUND with
+  # the result of the Pdf lookup, so a machine without the add-on would silently skip the
+  # whole app target ("Qt 6 Widgets was not found"). Verified by configuring with
+  # -DCMAKE_DISABLE_FIND_PACKAGE_Qt6Pdf=ON.
+  if(NOT EMSCRIPTEN)
+    find_package(Qt6Pdf QUIET)
+  endif()
+  if(Qt6_FOUND)
+    if(APPLE AND TARGET WrapOpenGL::WrapOpenGL)
+      # Qt 6.8's FindWrapOpenGL.cmake links the long-dead AGL framework: the OS still
+      # ships /System/Library/Frameworks/AGL.framework (so find_library finds it) but the
+      # Xcode 26 SDK removed it (so the linker cannot), failing every link. The entry can
+      # therefore be either an absolute framework path or a literal "-framework AGL"
+      # fallback; OpenGL.framework is all Qt actually needs, so drop both forms.
+      get_target_property(PATCHY_WRAP_OPENGL_LIBS WrapOpenGL::WrapOpenGL INTERFACE_LINK_LIBRARIES)
+      if(PATCHY_WRAP_OPENGL_LIBS)
+        list(FILTER PATCHY_WRAP_OPENGL_LIBS EXCLUDE REGEX "AGL")
+        set_target_properties(WrapOpenGL::WrapOpenGL PROPERTIES
+          INTERFACE_LINK_LIBRARIES "${PATCHY_WRAP_OPENGL_LIBS}")
+      endif()
+    endif()
+    qt_standard_project_setup()
+    set(CMAKE_AUTORCC ON)
+    # No .ui files anywhere: skip the per-target uic scan qt_standard_project_setup turns on.
+    set(CMAKE_AUTOUIC OFF)
+    set(PATCHY_TRANSLATION_OUTPUT_DIR "${CMAKE_CURRENT_BINARY_DIR}/translations")
+    # Interpreter-only lookup selects a host tool even when cross-compiling wasm.
+    find_package(Python3 3.8 REQUIRED COMPONENTS Interpreter)
+    # Every shipped UI language except the English source. Mirrors the table in
+    # src/ui/localization.cpp; docs/localization.md describes adding one.
+    set(PATCHY_TRANSLATED_LANGUAGES de es fr it ja ko pl pt_BR ru zh_CN zh_TW)
+    # The English template: every extractable string with empty translations. It is
+    # regenerated with the language files and is never compiled.
+    set(PATCHY_TRANSLATION_TEMPLATE "${PROJECT_SOURCE_DIR}/translations/patchy_en.ts")
+    set(PATCHY_TS_FILES)
+    foreach(language IN LISTS PATCHY_TRANSLATED_LANGUAGES)
+      list(APPEND PATCHY_TS_FILES "${PROJECT_SOURCE_DIR}/translations/patchy_${language}.ts")
+    endforeach()
+    set_source_files_properties(${PATCHY_TS_FILES}
+      PROPERTIES OUTPUT_LOCATION "${PATCHY_TRANSLATION_OUTPUT_DIR}"
+    )
+    qt_add_lrelease(
+      TS_FILES ${PATCHY_TS_FILES}
+      LRELEASE_TARGET patchy_lrelease
+      QM_FILES_OUTPUT_VARIABLE PATCHY_QM_FILES
+    )
+    add_custom_target(patchy_translations DEPENDS ${PATCHY_QM_FILES})
+    # lupdate scans every Patchy-owned source on every platform (the macOS .mm scanner
+    # included) so the template is identical whichever host regenerates it; vendored
+    # code only produces parser noise. PATCHY_TRANSLATE_NOOP is the Qt-free marker from
+    # src/support/translate_noop.hpp. `scripts\update-translations.ps1` drives the
+    # target; the UI test translation_template_is_current reruns lupdate with the same
+    # manifest to prove the committed template matches the code.
+    file(GLOB_RECURSE PATCHY_LUPDATE_SOURCES CONFIGURE_DEPENDS
+         "${PROJECT_SOURCE_DIR}/src/*.cpp"
+         "${PROJECT_SOURCE_DIR}/src/*.hpp"
+         "${PROJECT_SOURCE_DIR}/src/*.mm")
+    list(FILTER PATCHY_LUPDATE_SOURCES EXCLUDE REGEX
+         "/src/(formats/(zstd|miniz|libheif|libraw|libjxl|libjpeg-turbo|stb|bcdec|bc7enc|openjpeg|tinyexr|dav1d|libavif)|color/lcms2)/")
+    # The vendored G'MIC interpreter holds no Patchy text.
+    list(FILTER PATCHY_LUPDATE_SOURCES EXCLUDE REGEX "/src/filters/gmic/(gmic\\.cpp|patchy_stub/)")
+    list(SORT PATCHY_LUPDATE_SOURCES)
+    set(PATCHY_LUPDATE_OPTIONS
+      -locations none
+      -no-obsolete
+      -source-language en
+      -tr-function-alias QT_TRANSLATE_NOOP+=PATCHY_TRANSLATE_NOOP
+    )
+    qt_add_lupdate(
+      SOURCES ${PATCHY_LUPDATE_SOURCES}
+      INCLUDE_DIRECTORIES "${PROJECT_SOURCE_DIR}/src"
+      TS_FILES "${PATCHY_TRANSLATION_TEMPLATE}" ${PATCHY_TS_FILES}
+      LUPDATE_TARGET patchy_update_translations
+      NO_GLOBAL_TARGET
+      OPTIONS ${PATCHY_LUPDATE_OPTIONS}
+    )
+    set_target_properties(patchy_update_translations PROPERTIES EXCLUDE_FROM_ALL TRUE)
+    # Manifest for the catalog tests and the release packager: the lupdate binary, its
+    # options, the include root, the source list, and the shipped language codes.
+    set(PATCHY_LUPDATE_MANIFEST "${PATCHY_TRANSLATION_OUTPUT_DIR}/lupdate-manifest.txt")
+    string(JOIN "\n" PATCHY_LUPDATE_MANIFEST_SOURCES ${PATCHY_LUPDATE_SOURCES})
+    string(JOIN ";" PATCHY_LUPDATE_MANIFEST_OPTIONS ${PATCHY_LUPDATE_OPTIONS})
+    string(JOIN "\n" PATCHY_LANGUAGE_LINES ${PATCHY_TRANSLATED_LANGUAGES})
+    file(GENERATE OUTPUT "${PATCHY_LUPDATE_MANIFEST}" CONTENT
+"lupdate=$<TARGET_FILE:Qt6::lupdate>
+options=${PATCHY_LUPDATE_MANIFEST_OPTIONS}
+include=${PROJECT_SOURCE_DIR}/src
+template=${PATCHY_TRANSLATION_TEMPLATE}
+languages=${PATCHY_TRANSLATED_LANGUAGES}
+${PATCHY_LUPDATE_MANIFEST_SOURCES}
+")
+    file(GENERATE OUTPUT "${PATCHY_TRANSLATION_OUTPUT_DIR}/languages.txt" CONTENT "${PATCHY_LANGUAGE_LINES}\n")
+    set(PATCHY_TRANSLATION_CATALOG_STAMP "${PATCHY_TRANSLATION_OUTPUT_DIR}/catalog-check.stamp")
+    patchy_add_success_check(patchy_check_translation_catalogs
+      STAMP "${PATCHY_TRANSLATION_CATALOG_STAMP}"
+      COMMAND "${Python3_EXECUTABLE}" "${PROJECT_SOURCE_DIR}/scripts/check-translations.py"
+              --manifest "${PATCHY_LUPDATE_MANIFEST}"
+      DEPENDS ${PATCHY_LUPDATE_SOURCES} "${PATCHY_TRANSLATION_TEMPLATE}" ${PATCHY_TS_FILES}
+              "${PATCHY_LUPDATE_MANIFEST}" "${PROJECT_SOURCE_DIR}/scripts/check-translations.py"
+              $<TARGET_FILE:Qt6::lupdate> "${Python3_EXECUTABLE}"
+      COMMENT "Checking translation source freshness and every language catalog"
+    )
+    # Revalidate every changed input before lrelease publishes .qm files; only an
+    # identical successful input set can reuse the previous check.
+    add_dependencies(patchy_lrelease patchy_check_translation_catalogs)
+    add_dependencies(patchy_translations patchy_check_translation_catalogs)
+    # Qt's own install variables handle every layout (aqt/official: <prefix>/plugins;
+    # distro/Flatpak KDE runtime: multiarch subdirs). Fall back to walking up from
+    # Qt6_DIR (<prefix>/lib/cmake/Qt6) for older Qt packages that don't export them.
+    if(DEFINED QT6_INSTALL_PREFIX AND DEFINED QT6_INSTALL_PLUGINS)
+      set(PATCHY_QT_PLUGIN_DIR "${QT6_INSTALL_PREFIX}/${QT6_INSTALL_PLUGINS}")
+      set(PATCHY_QT_TRANSLATION_DIR "${QT6_INSTALL_PREFIX}/${QT6_INSTALL_TRANSLATIONS}")
+    else()
+      get_filename_component(PATCHY_QT_PREFIX "${Qt6_DIR}/../../.." ABSOLUTE)
+      set(PATCHY_QT_PLUGIN_DIR "${PATCHY_QT_PREFIX}/plugins")
+      set(PATCHY_QT_TRANSLATION_DIR "${PATCHY_QT_PREFIX}/translations")
+    endif()
+    if(EMSCRIPTEN)
+      # The wasm kit ships no .qm files; the qtbase catalogs come from the host kit.
+      set(PATCHY_QT_TRANSLATION_DIR "${QT_HOST_PATH}/translations")
+    endif()
+    # Runtime asset copies are shared copy-once custom targets rather than
+    # per-target POST_BUILD commands: all executables share one output
+    # directory, and concurrent copies of the same destination files race
+    # under parallel Ninja (intermittent sharing violations on Windows).
+    # Qt's own dialog strings (qtbase_<code>.qm) ship beside patchy_<code>.qm for
+    # every language whose catalog the kit provides; a missing one leaves Qt's
+    # dialogs in English for that language, matching the per-string fallback.
+    set(PATCHY_QT_BASE_QM_FILES)
+    set(PATCHY_QT_BASE_QM_SOURCES)
+    foreach(language IN LISTS PATCHY_TRANSLATED_LANGUAGES)
+      set(qt_base_source "${PATCHY_QT_TRANSLATION_DIR}/qtbase_${language}.qm")
+      if(PATCHY_QT_TRANSLATION_DIR AND EXISTS "${qt_base_source}")
+        set(qt_base_destination "${CMAKE_BINARY_DIR}/translations/qtbase_${language}.qm")
+        add_custom_command(
+          OUTPUT "${qt_base_destination}"
+          COMMAND ${CMAKE_COMMAND} -E make_directory
+                  "${CMAKE_BINARY_DIR}/translations"
+          COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                  "${qt_base_source}" "${qt_base_destination}"
+          DEPENDS "${qt_base_source}"
+          COMMENT "Copying Qt base translation (${language})"
+        )
+        list(APPEND PATCHY_QT_BASE_QM_FILES "${qt_base_destination}")
+        list(APPEND PATCHY_QT_BASE_QM_SOURCES "${qt_base_source}")
+      else()
+        message(STATUS "Qt base translation for ${language} not found in ${PATCHY_QT_TRANSLATION_DIR}; Qt dialogs stay English for it")
+      endif()
+    endforeach()
+    if(PATCHY_QT_BASE_QM_FILES)
+      add_custom_target(patchy_qt_base_translations DEPENDS ${PATCHY_QT_BASE_QM_FILES})
+    endif()
+    function(patchy_copy_translations target)
+      # lrelease already writes the app .qm files to
+      # ${CMAKE_BINARY_DIR}/translations (OUTPUT_LOCATION above), which is the
+      # runtime location next to the executables, so no copy step is needed.
+      add_dependencies(${target} patchy_translations)
+      if(TARGET patchy_qt_base_translations)
+        add_dependencies(${target} patchy_qt_base_translations)
+      endif()
+    endfunction()
+    set(PATCHY_REQUIRED_QT_IMAGE_FORMAT_PLUGINS
+      qgif
+      qico
+      qjpeg
+      qsvg
+      qtiff
+      qwebp
+    )
+    # Per-platform Qt plugin file naming and the platform's TLS backend. The existence
+    # checks fail at configure time (not first HTTPS use / first TIFF open at runtime)
+    # when the Qt install is missing qtimageformats or its TLS plugin. Not on wasm:
+    # that kit links plugins statically (no loadable files to probe) and has no TLS
+    # backend at all (QtNetwork rides the browser's fetch).
+    if(NOT EMSCRIPTEN)
+      if(WIN32)
+        set(PATCHY_REQUIRED_QT_TLS_PLUGINS qschannelbackend)
+        set(PATCHY_QT_PLUGIN_PREFIX "")
+        set(PATCHY_QT_PLUGIN_SUFFIX ".dll")
+      elseif(APPLE)
+        set(PATCHY_REQUIRED_QT_TLS_PLUGINS qsecuretransportbackend)
+        set(PATCHY_QT_PLUGIN_PREFIX "lib")
+        set(PATCHY_QT_PLUGIN_SUFFIX ".dylib")
+      else()
+        set(PATCHY_REQUIRED_QT_TLS_PLUGINS qopensslbackend)
+        set(PATCHY_QT_PLUGIN_PREFIX "lib")
+        set(PATCHY_QT_PLUGIN_SUFFIX ".so")
+      endif()
+      foreach(plugin IN LISTS PATCHY_REQUIRED_QT_IMAGE_FORMAT_PLUGINS)
+        if(NOT EXISTS "${PATCHY_QT_PLUGIN_DIR}/imageformats/${PATCHY_QT_PLUGIN_PREFIX}${plugin}${PATCHY_QT_PLUGIN_SUFFIX}")
+          message(FATAL_ERROR
+            "Required Qt image format plugin was not found: "
+            "${PATCHY_QT_PLUGIN_DIR}/imageformats/${PATCHY_QT_PLUGIN_PREFIX}${plugin}${PATCHY_QT_PLUGIN_SUFFIX}. "
+            "Install the Qt qtimageformats module for TIFF/WebP support.")
+        endif()
+      endforeach()
+      foreach(plugin IN LISTS PATCHY_REQUIRED_QT_TLS_PLUGINS)
+        if(NOT EXISTS "${PATCHY_QT_PLUGIN_DIR}/tls/${PATCHY_QT_PLUGIN_PREFIX}${plugin}${PATCHY_QT_PLUGIN_SUFFIX}")
+          message(FATAL_ERROR
+            "Required Qt TLS plugin was not found: "
+            "${PATCHY_QT_PLUGIN_DIR}/tls/${PATCHY_QT_PLUGIN_PREFIX}${plugin}${PATCHY_QT_PLUGIN_SUFFIX}.")
+        endif()
+      endforeach()
+    endif()
+    # Source-side Qt runtime inputs serve both the build identity and runtime
+    # validation. Never use our staged DLLs or generated .qm files as stamp inputs.
+    set(PATCHY_QT_SOURCE_RUNTIME_INPUTS ${PATCHY_QT_BASE_QM_SOURCES})
+    foreach(qt_module Core Gui Widgets Svg PrintSupport Network Qml Test Pdf)
+      if(TARGET Qt6::${qt_module})
+        list(APPEND PATCHY_QT_SOURCE_RUNTIME_INPUTS $<TARGET_FILE:Qt6::${qt_module}>)
+      endif()
+    endforeach()
+    if(NOT EMSCRIPTEN)
+      file(GLOB PATCHY_QT_PLUGIN_RUNTIME_INPUTS CONFIGURE_DEPENDS LIST_DIRECTORIES FALSE
+        "${PATCHY_QT_PLUGIN_DIR}/platforms/*${PATCHY_QT_PLUGIN_SUFFIX}"
+        "${PATCHY_QT_PLUGIN_DIR}/iconengines/*${PATCHY_QT_PLUGIN_SUFFIX}"
+        "${PATCHY_QT_PLUGIN_DIR}/imageformats/*${PATCHY_QT_PLUGIN_SUFFIX}"
+        "${PATCHY_QT_PLUGIN_DIR}/tls/*${PATCHY_QT_PLUGIN_SUFFIX}")
+      list(APPEND PATCHY_QT_SOURCE_RUNTIME_INPUTS ${PATCHY_QT_PLUGIN_RUNTIME_INPUTS})
+    endif()
+    if(WIN32)
+      set(PATCHY_QT_IMAGE_FORMAT_PLUGIN_FILES)
+      foreach(plugin IN LISTS PATCHY_REQUIRED_QT_IMAGE_FORMAT_PLUGINS)
+        list(APPEND PATCHY_QT_IMAGE_FORMAT_PLUGIN_FILES
+          "${PATCHY_QT_PLUGIN_DIR}/imageformats/${plugin}$<$<CONFIG:Debug>:d>.dll")
+      endforeach()
+      set(PATCHY_QT_TLS_PLUGIN_FILES)
+      foreach(plugin IN LISTS PATCHY_REQUIRED_QT_TLS_PLUGINS)
+        list(APPEND PATCHY_QT_TLS_PLUGIN_FILES
+          "${PATCHY_QT_PLUGIN_DIR}/tls/${plugin}$<$<CONFIG:Debug>:d>.dll")
+      endforeach()
+      # Qt PDF is optional (see the find_package above), so its DLL joins the copy list
+      # only when the module is actually present; the variable stays empty otherwise.
+      set(PATCHY_QT_PDF_RUNTIME_FILE)
+      if(TARGET Qt6::Pdf)
+        set(PATCHY_QT_PDF_RUNTIME_FILE "$<TARGET_FILE:Qt6::Pdf>")
+      endif()
+      set(PATCHY_QT_RUNTIME_STAMP "${CMAKE_BINARY_DIR}/CMakeFiles/patchy_qt_runtime.stamp")
+      add_custom_command(
+        OUTPUT "${PATCHY_QT_RUNTIME_STAMP}"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                $<TARGET_FILE:Qt6::Core>
+                $<TARGET_FILE:Qt6::Gui>
+                $<TARGET_FILE:Qt6::Widgets>
+                $<TARGET_FILE:Qt6::Svg>
+                $<TARGET_FILE:Qt6::PrintSupport>
+                $<TARGET_FILE:Qt6::Network>
+                $<TARGET_FILE:Qt6::Qml>
+                $<TARGET_FILE:Qt6::Test>
+                ${PATCHY_QT_PDF_RUNTIME_FILE}
+                "${CMAKE_BINARY_DIR}"
+        COMMAND ${CMAKE_COMMAND} -E make_directory
+                "${CMAKE_BINARY_DIR}/platforms"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                "${PATCHY_QT_PLUGIN_DIR}/platforms/qwindows$<$<CONFIG:Debug>:d>.dll"
+                "${PATCHY_QT_PLUGIN_DIR}/platforms/qoffscreen$<$<CONFIG:Debug>:d>.dll"
+                "${CMAKE_BINARY_DIR}/platforms"
+        COMMAND ${CMAKE_COMMAND} -E make_directory
+                "${CMAKE_BINARY_DIR}/iconengines"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                "${PATCHY_QT_PLUGIN_DIR}/iconengines/qsvgicon$<$<CONFIG:Debug>:d>.dll"
+                "${CMAKE_BINARY_DIR}/iconengines"
+        COMMAND ${CMAKE_COMMAND} -E make_directory
+                "${CMAKE_BINARY_DIR}/imageformats"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                ${PATCHY_QT_IMAGE_FORMAT_PLUGIN_FILES}
+                "${CMAKE_BINARY_DIR}/imageformats"
+        COMMAND ${CMAKE_COMMAND} -E make_directory
+                "${CMAKE_BINARY_DIR}/tls"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                ${PATCHY_QT_TLS_PLUGIN_FILES}
+                "${CMAKE_BINARY_DIR}/tls"
+        COMMAND ${CMAKE_COMMAND} -E touch "${PATCHY_QT_RUNTIME_STAMP}"
+        DEPENDS
+          $<TARGET_FILE:Qt6::Core>
+          $<TARGET_FILE:Qt6::Gui>
+          $<TARGET_FILE:Qt6::Widgets>
+          $<TARGET_FILE:Qt6::Svg>
+          $<TARGET_FILE:Qt6::PrintSupport>
+          $<TARGET_FILE:Qt6::Network>
+          $<TARGET_FILE:Qt6::Qml>
+          $<TARGET_FILE:Qt6::Test>
+          ${PATCHY_QT_PDF_RUNTIME_FILE}
+          "${PATCHY_QT_PLUGIN_DIR}/platforms/qwindows$<$<CONFIG:Debug>:d>.dll"
+          "${PATCHY_QT_PLUGIN_DIR}/platforms/qoffscreen$<$<CONFIG:Debug>:d>.dll"
+          "${PATCHY_QT_PLUGIN_DIR}/iconengines/qsvgicon$<$<CONFIG:Debug>:d>.dll"
+          ${PATCHY_QT_IMAGE_FORMAT_PLUGIN_FILES}
+          ${PATCHY_QT_TLS_PLUGIN_FILES}
+        COMMENT "Copying Qt runtime into the build directory"
+      )
+      add_custom_target(patchy_qt_runtime DEPENDS "${PATCHY_QT_RUNTIME_STAMP}")
+    endif()
+    function(patchy_copy_qt_runtime target)
+      if(TARGET patchy_qt_runtime)
+        add_dependencies(${target} patchy_qt_runtime)
+      endif()
+    endfunction()
+    if(EXISTS "${PATCHY_BUNDLED_FONTS_DIR}")
+      file(GLOB_RECURSE PATCHY_BUNDLED_FONT_FILES CONFIGURE_DEPENDS
+        "${PATCHY_BUNDLED_FONTS_DIR}/*")
+      # Clean first: copy_directory never deletes, so a renamed or removed font
+      # would otherwise linger in existing build trees (and on wasm inside the
+      # preloaded patchy.data) forever.
+      set(PATCHY_FONTS_COPY_COMMANDS
+        COMMAND ${CMAKE_COMMAND} -E rm -rf "${CMAKE_BINARY_DIR}/fonts"
+        COMMAND ${CMAKE_COMMAND} -E copy_directory
+                "${PATCHY_BUNDLED_FONTS_DIR}"
+                "${CMAKE_BINARY_DIR}/fonts")
+      if(EMSCRIPTEN AND EXISTS "${PATCHY_BUNDLED_FONTS_WEB_DIR}")
+        file(GLOB_RECURSE PATCHY_BUNDLED_FONT_WEB_FILES CONFIGURE_DEPENDS
+          "${PATCHY_BUNDLED_FONTS_WEB_DIR}/*")
+        list(APPEND PATCHY_BUNDLED_FONT_FILES ${PATCHY_BUNDLED_FONT_WEB_FILES})
+        list(APPEND PATCHY_FONTS_COPY_COMMANDS
+          COMMAND ${CMAKE_COMMAND} -E copy_directory
+                  "${PATCHY_BUNDLED_FONTS_WEB_DIR}"
+                  "${CMAKE_BINARY_DIR}/fonts")
+      endif()
+      set(PATCHY_FONTS_STAMP "${CMAKE_BINARY_DIR}/CMakeFiles/patchy_bundled_fonts.stamp")
+      set(PATCHY_FONTS_INPUT_MANIFEST "${CMAKE_BINARY_DIR}/CMakeFiles/patchy_fonts_inputs.txt")
+      patchy_write_input_manifest("${PATCHY_FONTS_INPUT_MANIFEST}" ${PATCHY_BUNDLED_FONT_FILES})
+      add_custom_command(
+        OUTPUT "${PATCHY_FONTS_STAMP}"
+        ${PATCHY_FONTS_COPY_COMMANDS}
+        COMMAND ${CMAKE_COMMAND} -E touch "${PATCHY_FONTS_STAMP}"
+        DEPENDS ${PATCHY_BUNDLED_FONT_FILES} "${PATCHY_FONTS_INPUT_MANIFEST}"
+        COMMENT "Copying bundled fonts into the build directory"
+      )
+      add_custom_target(patchy_bundled_fonts DEPENDS "${PATCHY_FONTS_STAMP}")
+    endif()
+    function(patchy_copy_bundled_fonts target)
+      if(TARGET patchy_bundled_fonts)
+        add_dependencies(${target} patchy_bundled_fonts)
+      endif()
+    endfunction()
+    # Bundled example/utility scripts for the JS scripting system (plus patchy.d.ts, the
+    # typed API reference). Same shared copy-once shape as the fonts: per-target POST_BUILD
+    # copies into the shared output directory race under parallel Ninja. Only scripts/bundled
+    # ships; the rest of scripts/ is dev tooling and must never be staged next to the binary.
+    set(PATCHY_BUNDLED_SCRIPTS_DIR "${PROJECT_SOURCE_DIR}/scripts/bundled")
+    # In-source builds (the Flatpak's cmake-ninja module configures in /run/build/patchy)
+    # must skip this target: there CMAKE_BINARY_DIR/scripts IS the source scripts/ tree,
+    # so the clean step would delete scripts/bundled out from under its own copy.
+    # Installed layouts get the scripts through install(DIRECTORY ...) below instead.
+    if(EXISTS "${PATCHY_BUNDLED_SCRIPTS_DIR}" AND NOT CMAKE_BINARY_DIR STREQUAL PROJECT_SOURCE_DIR)
+      file(GLOB_RECURSE PATCHY_BUNDLED_SCRIPT_FILES CONFIGURE_DEPENDS
+        "${PATCHY_BUNDLED_SCRIPTS_DIR}/*")
+      set(PATCHY_SCRIPTS_STAMP "${CMAKE_BINARY_DIR}/CMakeFiles/patchy_bundled_scripts.stamp")
+      set(PATCHY_SCRIPTS_INPUT_MANIFEST "${CMAKE_BINARY_DIR}/CMakeFiles/patchy_scripts_inputs.txt")
+      patchy_write_input_manifest("${PATCHY_SCRIPTS_INPUT_MANIFEST}" ${PATCHY_BUNDLED_SCRIPT_FILES})
+      add_custom_command(
+        OUTPUT "${PATCHY_SCRIPTS_STAMP}"
+        # Clean first: copy_directory never deletes, so renamed/removed bundled
+        # scripts would otherwise linger in existing build trees forever.
+        COMMAND ${CMAKE_COMMAND} -E rm -rf "${CMAKE_BINARY_DIR}/scripts"
+        COMMAND ${CMAKE_COMMAND} -E copy_directory
+                "${PATCHY_BUNDLED_SCRIPTS_DIR}"
+                "${CMAKE_BINARY_DIR}/scripts"
+        COMMAND ${CMAKE_COMMAND} -E touch "${PATCHY_SCRIPTS_STAMP}"
+        DEPENDS ${PATCHY_BUNDLED_SCRIPT_FILES} "${PATCHY_SCRIPTS_INPUT_MANIFEST}"
+        COMMENT "Copying bundled scripts into the build directory"
+      )
+      add_custom_target(patchy_bundled_scripts DEPENDS "${PATCHY_SCRIPTS_STAMP}")
+    endif()
+    function(patchy_copy_bundled_scripts target)
+      if(TARGET patchy_bundled_scripts)
+        add_dependencies(${target} patchy_bundled_scripts)
+      endif()
+    endfunction()
+    # One writer assembles the installable skill, including the authoritative API docs.
+    if(NOT EMSCRIPTEN)
+      set(PATCHY_AGENT_KIT_DIR "${PROJECT_SOURCE_DIR}/agent-kit")
+      file(GLOB_RECURSE PATCHY_AGENT_KIT_FILES CONFIGURE_DEPENDS "${PATCHY_AGENT_KIT_DIR}/*")
+      set(PATCHY_AGENT_KIT_STAMP "${CMAKE_BINARY_DIR}/CMakeFiles/patchy_agent_kit.stamp")
+      set(PATCHY_AGENT_KIT_INPUT_MANIFEST "${CMAKE_BINARY_DIR}/CMakeFiles/patchy_agent_kit_inputs.txt")
+      patchy_write_input_manifest("${PATCHY_AGENT_KIT_INPUT_MANIFEST}" ${PATCHY_AGENT_KIT_FILES})
+      add_custom_command(OUTPUT "${PATCHY_AGENT_KIT_STAMP}"
+        # The output is always the dedicated ai child of the build directory.
+        COMMAND ${CMAKE_COMMAND} -E rm -rf "${CMAKE_BINARY_DIR}/ai"
+        COMMAND ${CMAKE_COMMAND} -E copy_directory "${PATCHY_AGENT_KIT_DIR}" "${CMAKE_BINARY_DIR}/ai"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                "${PATCHY_BUNDLED_SCRIPTS_DIR}/patchy.d.ts"
+                "${PATCHY_BUNDLED_SCRIPTS_DIR}/scripting-guide.md"
+                "${CMAKE_BINARY_DIR}/ai/patchy-control/references/"
+        COMMAND ${CMAKE_COMMAND} -E touch "${PATCHY_AGENT_KIT_STAMP}"
+        DEPENDS ${PATCHY_AGENT_KIT_FILES} "${PATCHY_AGENT_KIT_INPUT_MANIFEST}" "${PATCHY_BUNDLED_SCRIPTS_DIR}/patchy.d.ts"
+                "${PATCHY_BUNDLED_SCRIPTS_DIR}/scripting-guide.md"
+        COMMENT "Assembling the Patchy control skill")
+      add_custom_target(patchy_agent_kit ALL DEPENDS "${PATCHY_AGENT_KIT_STAMP}")
+    endif()
+    # Bundled theme packages: every file in a themes/bundled/<name>/ folder but its
+    # README.txt, under /patchy/themes/<name>/ in a generated qrc (docs/bundled-themes.md).
+    # CONFIGURE_DEPENDS regenerates it when a file is added or removed;
+    # rcc tracks edits to the listed files itself. Written through configure_file so an
+    # unchanged list does not rerun rcc.
+    set(PATCHY_THEME_PACKAGES_DIR "${CMAKE_CURRENT_SOURCE_DIR}/themes/bundled")
+    file(GLOB_RECURSE PATCHY_THEME_PACKAGE_FILES CONFIGURE_DEPENDS LIST_DIRECTORIES false
+         RELATIVE "${PATCHY_THEME_PACKAGES_DIR}" "${PATCHY_THEME_PACKAGES_DIR}/*")
+    list(SORT PATCHY_THEME_PACKAGE_FILES)
+    set(PATCHY_THEME_PACKAGES_QRC_TEXT "<RCC>\n  <qresource prefix=\"/patchy/themes\">\n")
+    foreach(PATCHY_THEME_PACKAGE_FILE IN LISTS PATCHY_THEME_PACKAGE_FILES)
+      if(NOT PATCHY_THEME_PACKAGE_FILE MATCHES "/" OR PATCHY_THEME_PACKAGE_FILE MATCHES "^[^/]+/README\\.txt$")
+        continue()  # the single-file themes are in src/ui/themes.qrc
+      endif()
+      if(PATCHY_THEME_PACKAGE_FILE MATCHES "[&<>\"]")
+        message(FATAL_ERROR "Theme package file name needs XML escaping: ${PATCHY_THEME_PACKAGE_FILE}")
+      endif()
+      string(APPEND PATCHY_THEME_PACKAGES_QRC_TEXT
+             "    <file alias=\"${PATCHY_THEME_PACKAGE_FILE}\">${PATCHY_THEME_PACKAGES_DIR}/${PATCHY_THEME_PACKAGE_FILE}</file>\n")
+    endforeach()
+    string(APPEND PATCHY_THEME_PACKAGES_QRC_TEXT "  </qresource>\n</RCC>\n")
+    file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/theme_packages.qrc.new" "${PATCHY_THEME_PACKAGES_QRC_TEXT}")
+    configure_file("${CMAKE_CURRENT_BINARY_DIR}/theme_packages.qrc.new"
+                   "${CMAKE_CURRENT_BINARY_DIR}/theme_packages.qrc" COPYONLY)
+    add_library(patchy_ui
+      src/ui/action_icons.cpp
+      src/ui/icon_theme.hpp
+      src/ui/icon_theme.cpp
+      src/ui/app_data_migration.hpp
+      src/ui/app_data_migration.cpp
+      src/ui/app_settings.hpp
+      src/ui/app_settings.cpp
+      src/ui/background_workers.hpp
+      src/ui/background_workers.cpp
+      src/ui/cli_exit.hpp
+      src/ui/cli_exit.cpp
+      src/ui/desktop_only_feature.hpp
+      src/ui/desktop_only_feature.cpp
+      src/ui/gradient_library.cpp
+      src/ui/gradient_manager_dialog.cpp
+      src/ui/gradient_preset_popup.hpp
+      src/ui/gradient_preset_popup.cpp
+      src/ui/blend_mode_ui.cpp
+      src/ui/brush_dynamics_popup.hpp
+      src/ui/brush_dynamics_popup.cpp
+      src/ui/brush_stroke_preview.hpp
+      src/ui/brush_stroke_preview.cpp
+      src/ui/brush_presets.cpp
+      src/ui/brush_automation.cpp
+      src/ui/main_window_brush_automation.cpp
+      src/ui/script_brush.cpp
+      src/ui/brush_tip_library.hpp
+      src/ui/brush_tip_library.cpp
+      src/ui/brush_tip_manager_dialog.hpp
+      src/ui/brush_tip_manager_dialog.cpp
+      src/ui/brush_tip_picker.hpp
+      src/ui/brush_tip_picker.cpp
+      src/ui/brush_tool_window.hpp
+      src/ui/brush_tool_window.cpp
+      src/ui/canvas_widget.hpp
+      src/ui/canvas_types.hpp
+      src/ui/image_save_options.hpp
+      src/ui/canvas_widget.cpp
+      src/ui/canvas_widget_shared.hpp
+      src/ui/canvas_widget_shared.cpp
+      src/ui/canvas_view_transform.hpp
+      src/ui/canvas_view_transform.cpp
+      src/ui/canvas_widget_render_rotated.cpp
+      src/ui/canvas_widget_rotate_view.cpp
+      src/ui/clipboard_text_paths.hpp
+      src/ui/clipboard_text_paths.cpp
+      src/ui/clipboard_format_probe.hpp
+      src/ui/clipboard_format_probe.cpp
+      src/ui/canvas_alt_space_filter.hpp
+      src/ui/canvas_alt_space_filter.cpp
+      src/ui/coalesced_pointer_input.hpp
+      src/ui/coalesced_pointer_input.cpp
+      src/ui/canvas_widget_brush.cpp
+      src/ui/canvas_widget_artboard.cpp
+      src/ui/main_window_artboards.cpp
+      src/ui/artboard_preset_picker.hpp
+      src/ui/artboard_preset_picker.cpp
+  src/ui/canvas_widget_crop.cpp
+  src/ui/crop_presets.hpp
+  src/ui/crop_presets.cpp
+  src/ui/main_window_crop_bar.cpp
+  src/ui/canvas_widget_perspective_crop.cpp
+  src/ui/canvas_widget_ruler.cpp
+  src/ui/canvas_widget_gradient_handles.cpp
+  src/ui/canvas_widget_shape_points.cpp
+  src/ui/canvas_widget_shape_resize.cpp
+      src/ui/ruler_tool.hpp
+      src/ui/ruler_tool.cpp
+      src/ui/canvas_widget_cursors.cpp
+      src/ui/canvas_widget_draw_tools.cpp
+      src/ui/eyedropper_sample_overlay.hpp
+      src/ui/eyedropper_sample_overlay.cpp
+      src/ui/canvas_widget_events.cpp
+      src/ui/canvas_widget_guides.cpp
+      src/ui/canvas_widget_move.cpp
+      src/ui/canvas_widget_patch_tool.cpp
+      src/ui/canvas_widget_preview_points.cpp
+      src/ui/canvas_widget_pen.cpp
+      src/ui/canvas_widget_render.cpp
+      src/ui/canvas_widget_vector_preview.cpp
+      src/ui/vector_preview_renderer.cpp
+      src/ui/layer_merge.cpp
+      src/ui/canvas_widget_selection.cpp
+      src/ui/canvas_widget_selection_engines.cpp
+      src/ui/canvas_widget_object_select.cpp
+      src/ui/color_range_dialog.hpp
+      src/ui/color_range_dialog.cpp
+      src/ui/main_window_color_range.cpp
+      src/ui/canvas_widget_spot_healing.cpp
+      src/ui/canvas_widget_red_eye.cpp
+      src/ui/canvas_widget_color_replace.cpp
+      src/ui/canvas_widget_erasers.cpp
+      src/ui/canvas_widget_transform.cpp
+      src/ui/canvas_widget_path_edits.cpp
+      src/ui/canvas_widget_vector_tools.cpp
+      src/ui/canvas_widget_view.cpp
+      src/ui/channel_panel.hpp
+      src/ui/channel_panel.cpp
+      src/ui/color_panel.hpp
+      src/ui/default_brush_tips.hpp
+      src/ui/default_brush_tips.cpp
+      src/ui/color_panel.cpp
+      src/ui/background_pick_cursor.hpp
+      src/ui/background_pick_cursor.cpp
+      src/ui/color_dock_panel.hpp
+      src/ui/color_dock_panel.cpp
+      src/ui/hdr_color_controls.hpp
+      src/ui/hdr_color_controls.cpp
+      src/ui/clone_source_panel.hpp
+      src/ui/clone_source_panel.cpp
+      src/ui/color_field_widgets.hpp
+      src/ui/color_field_widgets.cpp
+      src/ui/compatibility_report.cpp
+      src/ui/coalesced_preview_emitter.hpp
+      src/ui/curved_slider.hpp
+      src/ui/curved_slider.cpp
+      src/ui/dialog_utils.cpp
+      src/ui/file_info_dialog.hpp
+      src/ui/file_info_dialog.cpp
+      src/ui/convert_profile_dialog.hpp
+      src/ui/convert_profile_dialog.cpp
+      src/ui/view_extras.hpp
+      src/ui/view_extras.cpp
+      src/ui/document_float_window.hpp
+      src/ui/document_float_window.cpp
+      src/ui/edit_conversions.cpp
+      src/ui/curves_clipping_preview.hpp
+      src/ui/curves_clipping_preview.cpp
+      src/ui/curves_editor.hpp
+      src/ui/curves_editor.cpp
+      src/ui/curves_presets.hpp
+      src/ui/curves_presets.cpp
+      src/ui/adjustment_presets.hpp
+      src/ui/adjustment_presets.cpp
+      src/ui/filter_workflows.cpp
+      src/ui/adjustment_dialogs.cpp
+      src/ui/filter_look_library.hpp
+      src/ui/filter_look_library.cpp
+      src/ui/visual_filter_gallery_dialog.hpp
+      src/ui/visual_filter_gallery_dialog.cpp
+      src/ui/filter_gallery_controls.hpp
+      src/ui/filter_gallery_controls.cpp
+      src/ui/angle_dial.hpp
+      src/ui/angle_dial.cpp
+      src/ui/filter_overlay_sync.hpp
+      src/ui/filter_overlay_sync.cpp
+      src/ui/filter_parameter_panel.hpp
+      src/ui/filter_parameter_panel.cpp
+      src/ui/filter_preview_proxy.hpp
+      src/ui/filter_selection.hpp
+      src/ui/filter_preview_proxy.cpp
+      src/ui/zoomable_image_preview.hpp
+      src/ui/zoomable_image_preview.cpp
+      src/ui/font_picker.hpp
+      src/ui/font_picker.cpp
+      src/ui/font_family_filters.hpp
+      src/ui/font_family_filters.cpp
+      src/ui/font_replacement_memory.hpp
+      src/ui/font_replacement_memory.cpp
+      src/ui/font_display_names.hpp
+      src/ui/font_display_names.cpp
+      src/ui/blend_if_range_editor.hpp
+      src/ui/blend_if_range_editor.cpp
+      src/ui/gradient_stops_editor.hpp
+      src/ui/gradient_stops_editor.cpp
+      src/ui/command_search.hpp
+      src/ui/command_search.cpp
+      src/ui/hotkey_editor.hpp
+      src/ui/hotkey_editor.cpp
+      src/ui/hotkey_files.hpp
+      src/ui/hotkey_files.cpp
+      src/ui/hotkey_registry.hpp
+      src/ui/hotkey_registry.cpp
+      src/ui/hotkey_sets.hpp
+      src/ui/hotkey_sets.cpp
+      src/ui/image_document_io.cpp
+      src/ui/layer_compositor_qimage.cpp
+      src/ui/qimage_composite_target.hpp
+      src/ui/alpha_row_bands.hpp
+      src/ui/alpha_row_bands.cpp
+      src/ui/image_trace_dialog.hpp
+      src/ui/activity_spinner.cpp
+      src/ui/image_trace_dialog.cpp
+      src/ui/image_save_option_keys.hpp
+      src/ui/image_save_option_keys.cpp
+      src/ui/image_save_options_dialog.cpp
+      src/ui/web_export.hpp
+      src/ui/web_export.cpp
+      src/ui/layer_style_dialog.cpp
+      src/ui/layer_style_dialog_controls.cpp
+      src/ui/layer_style_dialog_controls.hpp
+      src/ui/layer_style_gradient_controls.cpp
+      src/ui/layer_style_gradient_controls.hpp
+      src/ui/layer_style_effect_pages.cpp
+      src/ui/layer_style_effect_pages.hpp
+      src/ui/layer_list_widget.cpp
+      src/ui/liquify_dialog.hpp
+      src/ui/liquify_dialog.cpp
+      src/ui/perspective_planes_dialog.hpp
+      src/ui/perspective_planes_dialog.cpp
+      src/ui/main_window_perspective.cpp
+      src/ui/localization.cpp
+      src/ui/memory_info.hpp
+      src/ui/memory_info.cpp
+      src/ui/click_modifier_recorder.hpp
+      src/ui/modifier_names.hpp
+      src/ui/modifier_names.cpp
+      src/ui/tool_modifier_style.hpp
+      src/ui/tool_modifier_style.cpp
+      src/ui/markdown_viewer_dialog.hpp
+      src/ui/markdown_viewer_dialog.cpp
+      src/ui/ai_control_paths.hpp
+      src/ui/ai_control_paths.cpp
+      src/ui/appimage_environment.hpp
+      src/ui/appimage_environment.cpp
+      src/ui/appimage_menu_entry.hpp
+      src/ui/appimage_menu_entry.cpp
+      src/ui/ai_setup_dialog.hpp
+      src/ui/ai_setup_dialog.cpp
+      src/ui/main_window.hpp
+      src/ui/main_window.cpp
+      src/ui/main_window_actions.cpp
+      src/ui/main_window_actions_internal.hpp
+      src/ui/main_window_actions_menus.cpp
+      src/ui/main_window_actions_options_bar.cpp
+      src/ui/options_flow_layout.hpp
+      src/ui/options_flow_layout.cpp
+      src/ui/tool_palette_footer.hpp
+      src/ui/tool_palette_footer.cpp
+      src/ui/tool_palette_customization.hpp
+      src/ui/tool_palette_customization.cpp
+      src/ui/tool_palette_layout.hpp
+      src/ui/tool_palette_layout.cpp
+      src/ui/main_window_actions_tool_palette.cpp
+      src/ui/main_window_adjustments.cpp
+      src/ui/main_window_channels.cpp
+      src/ui/main_window_chrome.cpp
+      src/ui/main_window_destructive_adjustments.cpp
+      src/ui/main_window_docks.cpp
+      src/ui/main_window_filters.cpp
+      src/ui/smart_filter_editing.hpp
+      src/ui/smart_filter_table_ui.hpp
+      src/ui/smart_filter_table_ui.cpp
+      src/ui/main_window_smart_filter_adjustments.cpp
+      src/ui/main_window_document_dialogs.cpp
+      src/ui/main_window_files.cpp
+      src/ui/main_window_pdf_viewer.cpp
+      src/ui/tiff_jpeg_reader.cpp
+      src/ui/apng_reader.cpp
+      src/ui/network_mounts.cpp
+      src/ui/wayland_popup_anchor.hpp
+      src/ui/wayland_popup_anchor.cpp
+      src/ui/wayland_pointer_cursor.hpp
+      src/ui/wayland_pointer_cursor.cpp
+      src/ui/pointer_lock.hpp
+      src/ui/pointer_lock.cpp
+      src/ui/blocked_window_cursor.hpp
+      src/ui/blocked_window_cursor.cpp
+      src/ui/spin_box_edit_field_fix.hpp
+      src/ui/spin_box_edit_field_fix.cpp
+      src/ui/main_window_history.cpp
+      src/ui/main_window_layer_ops.cpp
+      src/ui/selection_modify_dialogs.hpp
+      src/ui/selection_modify_dialogs.cpp
+      src/ui/main_window_ai_selection.cpp
+      src/ui/main_window_watermarks.cpp
+      src/ui/main_window_save_metadata.cpp
+      src/ui/main_window_appimage_menu_entry.cpp
+      src/ui/main_window_layer_panel.cpp
+      src/ui/main_window_layer_thumbnails.cpp
+      src/ui/main_window_palette.cpp
+      src/ui/main_window_missing_fonts.cpp
+      src/ui/main_window_plugins.cpp
+      src/ui/legacy_plugin_run_dialog.hpp
+      src/ui/legacy_plugin_run_dialog.cpp
+      src/ui/main_window_preferences.cpp
+      src/ui/main_window_preferences_themes.cpp
+      src/ui/preferences_themes_page.hpp
+      src/ui/main_window_scripting.cpp
+      src/ui/main_window_sessions.cpp
+      src/ui/main_window_recovery.cpp
+      src/ui/document_recovery.hpp
+      src/ui/document_recovery.cpp
+      src/ui/document_recovery_coordinator.cpp
+      src/ui/document_session_store.cpp
+      src/ui/session_history.cpp
+      src/ui/document_save_coordinator.cpp
+      src/ui/document_save_coordinator.hpp
+      src/ui/document_file_rename.cpp
+      src/ui/document_file_rename.hpp
+      src/ui/document_path_label.cpp
+      src/ui/document_path_label.hpp
+      src/ui/save_progress.cpp
+      src/ui/save_progress.hpp
+      src/ui/session_history.hpp
+      src/ui/main_window_shared.hpp
+      src/ui/main_window_shared.cpp
+      src/ui/font_face_name_index.hpp
+      src/ui/font_face_name_index.cpp
+      src/ui/main_window_smart_objects.cpp
+      src/ui/main_window_smart_object_external_edit.cpp
+      src/ui/main_window_stress_test.cpp
+      src/ui/main_window_theme.cpp
+      src/ui/main_window_theme_extras.cpp
+      src/ui/main_window_path_components.cpp
+      src/ui/main_window_paths.cpp
+      src/ui/main_window_tool_options.cpp
+      src/ui/main_window_vector.cpp
+      src/ui/main_window_text_outlines.cpp
+      src/ui/paths_panel.hpp
+      src/ui/paths_panel.cpp
+      src/ui/custom_shape_library.hpp
+      src/ui/custom_shape_library.cpp
+      src/ui/custom_shape_manager_dialog.hpp
+      src/ui/custom_shape_manager_dialog.cpp
+      src/ui/custom_shape_picker.hpp
+      src/ui/custom_shape_picker.cpp
+      src/ui/default_custom_shapes.hpp
+      src/ui/default_custom_shapes.cpp
+      src/ui/shape_appearance_dialog.hpp
+      src/ui/shape_appearance_dialog.cpp
+      src/ui/shape_appearance_panel.hpp
+      src/ui/shape_appearance_panel.cpp
+      src/ui/shape_pixel_options.hpp
+      src/ui/shape_pixel_options.cpp
+      src/ui/appearance_edits.hpp
+      src/ui/appearance_edits.cpp
+      src/ui/appearance_properties.hpp
+      src/ui/appearance_properties.cpp
+      src/ui/shape_create_dialog.hpp
+      src/ui/shape_create_dialog.cpp
+      src/ui/mask_properties_dialog.hpp
+      src/ui/mask_properties_dialog.cpp
+      src/ui/fill_dialog.hpp
+      src/ui/fill_dialog.cpp
+      src/ui/layer_lock_dialog.hpp
+      src/ui/layer_lock_dialog.cpp
+      src/ui/measurement_units.hpp
+      src/ui/measurement_units.cpp
+      src/ui/unit_spin_box.hpp
+      src/ui/unit_spin_box.cpp
+      src/ui/new_document_dialog.hpp
+      src/ui/new_document_dialog.cpp
+      src/ui/new_layer_dialog.hpp
+      src/ui/new_layer_dialog.cpp
+      src/ui/invisible_watermark_dialog.cpp
+      src/ui/stress_test.hpp
+      src/ui/palette_convert_dialog.hpp
+      src/ui/palette_convert_dialog.cpp
+      src/ui/palette_panel.hpp
+      src/ui/palette_panel.cpp
+      src/ui/panel_column.hpp
+      src/ui/panel_column.cpp
+      src/ui/pattern_library.hpp
+      src/ui/pattern_library.cpp
+      src/ui/pattern_manager_dialog.hpp
+      src/ui/pattern_manager_dialog.cpp
+      src/ui/ui_font.hpp
+      src/ui/ui_font.cpp
+      src/ui/app_style.hpp
+      src/ui/app_style.cpp
+      src/ui/ui_profile.hpp
+      src/ui/pdf_export.hpp
+      src/ui/pdf_export.cpp
+      src/ui/pdf_export_editable.cpp
+      src/ui/document_order_list.hpp
+      src/ui/document_order_list.cpp
+      src/ui/export_documents_folder_dialog.hpp
+      src/ui/export_documents_folder_dialog.cpp
+      src/ui/multipage_pdf_export_dialog.hpp
+      src/ui/multipage_pdf_export_dialog.cpp
+      src/ui/missing_fonts_dialog.hpp
+      src/ui/missing_fonts_dialog.cpp
+      src/ui/missing_links_dialog.hpp
+      src/ui/missing_links_dialog.cpp
+      src/ui/network_link_trust.hpp
+      src/ui/network_link_trust.cpp
+      src/ui/text_layer_painter.hpp
+      src/ui/pdf_import.hpp
+      src/ui/photo_pattern_presets.hpp
+      src/ui/photo_pattern_presets.cpp
+      src/ui/preset_library.hpp
+      src/ui/preset_library.cpp
+      src/ui/preset_manager_scaffold.hpp
+      src/ui/preset_manager_scaffold.cpp
+      src/ui/preset_grid_widget.hpp
+      src/ui/preset_grid_widget.cpp
+      src/ui/preset_tree_widget.hpp
+      src/ui/preset_tree_widget.cpp
+      src/ui/psd_font_resolver.hpp
+      src/ui/print_layout.cpp
+      src/ui/qt_geometry.cpp
+      src/ui/camera_raw_filter_dialog.hpp
+      src/ui/camera_raw_filter_dialog.cpp
+      src/ui/raw_develop_dialog.hpp
+      src/ui/raw_develop_dialog.cpp
+      src/ui/raw_develop_histogram.hpp
+      src/ui/raw_develop_histogram.cpp
+      src/ui/raw_develop_settings.hpp
+      src/ui/raw_develop_settings.cpp
+      src/ui/scanner_import.hpp
+      src/ui/scanner_session.hpp
+      src/ui/scanner_session.cpp
+      src/ui/book_scan_project.hpp
+      src/ui/book_scan_project.cpp
+      src/ui/book_pdf_export.hpp
+      src/ui/book_pdf_export.cpp
+      src/ui/book_scan_dialog.hpp
+      src/ui/book_scan_dialog.cpp
+      src/ui/js_syntax_highlighter.hpp
+      src/ui/js_syntax_highlighter.cpp
+      src/ui/script_api.hpp
+      src/ui/script_api.cpp
+      src/ui/script_perspective.hpp
+      src/ui/script_perspective.cpp
+      src/ui/display_hdr_info.hpp
+      src/ui/display_hdr_info.cpp
+      src/ui/script_save_options.hpp
+      src/ui/script_save_options.cpp
+      src/ui/script_vector.hpp
+      src/ui/script_vector.cpp
+      src/ui/script_vector_paints.cpp
+      src/ui/script_vector_shapes.cpp
+      src/ui/script_artboards.cpp
+      src/ui/script_vector_paths.cpp
+      src/ui/script_vector_masks.cpp
+      src/ui/script_vector_host.cpp
+      src/ui/script_ai_selection.cpp
+      src/ui/script_color_range.cpp
+      src/ui/script_pixel_io.cpp
+      src/ui/vector_operations.hpp
+      src/ui/vector_operations.cpp
+      src/ui/script_canvas_window.hpp
+      src/ui/script_canvas_window.cpp
+      src/ui/sound_effects.hpp
+      src/ui/sound_effects.cpp
+      src/ui/script_editor_dialog.hpp
+      src/ui/script_editor_dialog.cpp
+      src/ui/script_engine.hpp
+      src/ui/script_engine.cpp
+      src/ui/script_gegl_filters.cpp
+      src/ui/script_smart_filters.cpp
+      src/ui/script_automation.cpp
+      src/ui/connector_freshness.hpp
+      src/ui/connector_freshness.cpp
+      src/ui/mcp_session.hpp
+      src/ui/mcp_session.cpp
+      src/ui/mcp_activity.hpp
+      src/ui/mcp_activity.cpp
+      src/ui/mcp_attachment.hpp
+      src/ui/mcp_attachment.cpp
+      src/ui/companion_apps.hpp
+      src/ui/companion_apps.cpp
+      src/ui/canvas_widget_script_stroke.cpp
+      src/ui/script_folders.hpp
+      src/ui/script_folders.cpp
+      src/ui/selection_outline.hpp
+      src/ui/selection_outline.cpp
+      src/ui/recent_file_list.hpp
+      src/ui/recent_file_list.cpp
+      src/ui/start_panel.hpp
+      src/ui/start_panel.cpp
+      src/ui/smart_object_render.hpp
+      src/ui/smart_object_render.cpp
+      src/ui/divide_photos_dialog.hpp
+      src/ui/divide_photos_dialog.cpp
+      src/ui/image_sequence_dialog.hpp
+      src/ui/image_sequence_dialog.cpp
+      src/ui/sprite_sheet_dialog.hpp
+      src/ui/sprite_sheet_dialog.cpp
+      src/ui/style_browser.hpp
+      src/ui/style_browser.cpp
+      src/ui/contour_editor_dialog.hpp
+      src/ui/contour_editor_dialog.cpp
+      src/ui/contour_library.hpp
+      src/ui/contour_library.cpp
+      src/ui/style_library.hpp
+      src/ui/style_library.cpp
+      src/ui/style_manager_dialog.hpp
+      src/ui/style_manager_dialog.cpp
+      src/ui/stroke_preset_manager_dialog.hpp
+      src/ui/stroke_preset_manager_dialog.cpp
+      src/ui/theme_file.hpp
+      src/ui/theme_file.cpp
+      src/ui/theme_backdrop.hpp
+      src/ui/theme_backdrop.cpp
+      src/ui/theme_package.hpp
+      src/ui/theme_package.cpp
+      src/ui/theme_sounds.hpp
+      src/ui/theme_sounds.cpp
+      src/ui/theme_effects.hpp
+      src/ui/theme_effects.cpp
+      src/ui/theme_script_host.hpp
+      src/ui/theme_script_host.cpp
+      src/ui/theme_manager.hpp
+      src/ui/theme_manager.cpp
+      src/ui/theme_apply_trace.hpp
+      src/ui/theme_apply_trace.cpp
+      src/ui/theme_palette.hpp
+      src/ui/theme_palette.cpp
+      src/ui/theme_qss.hpp
+      src/ui/theme_qss.cpp
+      src/ui/ui_text_size.cpp
+      src/ui/transparency_checkerboard.hpp
+      src/ui/text_layout.hpp
+      src/ui/text_layout.cpp
+      src/ui/text_font_service.cpp
+      src/ui/text_language_font.cpp
+      src/ui/text_language_font.hpp
+      src/ui/text_font_service.hpp
+      src/ui/text_document.cpp
+      src/ui/text_document.hpp
+      src/ui/text_render.cpp
+      src/ui/text_render.hpp
+      src/ui/text_outline.cpp
+      src/ui/text_outline.hpp
+      src/ui/text_area_layout.cpp
+      src/ui/text_area_layout.hpp
+      src/ui/text_path_layout.cpp
+      src/ui/text_path_layout.hpp
+      src/ui/tile_preview_window.hpp
+      src/ui/tile_preview_window.cpp
+      src/ui/animation_preview_window.hpp
+      src/ui/animation_preview_window.cpp
+      src/ui/app_credits.hpp
+      src/ui/app_credits.cpp
+      src/ui/build_info.hpp
+      src/ui/build_info.cpp
+      src/ui/splash_artwork.hpp
+      src/ui/splash_artwork.cpp
+      src/ui/splash_dialog.cpp
+      src/ui/legacy_plugin_folder.hpp
+      src/ui/legacy_plugin_folder.cpp
+      src/ui/tool_cursors.hpp
+      src/ui/tool_cursors.cpp
+      src/ui/selection_load_cursor.hpp
+      src/ui/selection_load_cursor.cpp
+      src/ui/single_instance.hpp
+      src/ui/single_instance.cpp
+      src/ui/update_checker.hpp
+      src/ui/update_checker.cpp
+      src/ui/update_installer.hpp
+      src/ui/update_installer.cpp
+      src/ui/host_resolve.hpp
+      src/ui/host_resolve.cpp
+      src/ui/object_selection_model_download.hpp
+      src/ui/object_selection_model_download.cpp
+      src/ui/model_download_dialog.cpp
+      src/ui/watermark_model_download.cpp
+      src/ui/watermark_settings.cpp
+      src/ui/watermark_scan_report.cpp
+      src/ui/save_metadata_settings.cpp
+      src/ui/user_fonts.hpp
+      src/ui/user_fonts.cpp
+      src/ui/warp_text_dialog.hpp
+      src/ui/warp_text_dialog.cpp
+      src/ui/window_effects.hpp
+      src/ui/window_effects.cpp
+      src/ui/first_window_gpu_warmup.hpp
+      src/ui/first_window_gpu_warmup.cpp
+      src/ui/status_document_info.hpp
+      src/ui/status_document_info.cpp
+      src/ui/zoom_status_bar.hpp
+      src/ui/zoom_status_bar.cpp
+      src/ui/icons.qrc
+      src/ui/textures.qrc
+      src/ui/themes.qrc
+      "${CMAKE_CURRENT_BINARY_DIR}/theme_packages.qrc"
+      src/ui/color_profiles.qrc
+      src/ui/shapes.qrc
+    )
+    # The G'MIC Filter Library (docs/gmic.md). Its interface compiles in every build;
+    # the filter library text is embedded only when the engine is built.
+    target_sources(patchy_ui PRIVATE
+      src/ui/gmic_filter_library_dialog.cpp
+      src/ui/gmic_library.cpp
+      src/ui/gmic_parameter_panel.cpp
+      src/ui/main_window_gmic.cpp
+    )
+    target_link_libraries(patchy_ui PUBLIC patchy_gmic)
+    if(PATCHY_ENABLE_GMIC)
+      target_sources(patchy_ui PRIVATE src/ui/gmic.qrc)
+    endif()
+    # The print dialog TU is the one QtPrintSupport user; Qt ships no
+    # PrintSupport for wasm, so that build compiles the stub TU instead
+    # (print_layout.cpp above keeps the portable placement/render half real
+    # everywhere). dialog_utils_wasm.cpp is additive, not a swap: it holds the
+    # browser file-access glue (emscripten::val) that dialog_utils.cpp
+    # delegates to under Q_OS_WASM.
+    if(EMSCRIPTEN)
+      target_sources(patchy_ui PRIVATE
+        src/ui/print_dialog_wasm.cpp
+        src/ui/clipboard_wasm.hpp
+        src/ui/clipboard_wasm.cpp
+        src/ui/dialog_utils_wasm.hpp
+        src/ui/dialog_utils_wasm.cpp
+        src/ui/user_fonts_wasm.hpp
+        src/ui/user_fonts_wasm.cpp
+        src/ui/wasm_event_guard.hpp
+        src/ui/wasm_event_guard.cpp
+        src/ui/wasm_memory_telemetry.hpp
+        src/ui/wasm_memory_telemetry.cpp
+      )
+      # wasm_event_guard.cpp pins QtCore's private qwasmsuspendresumecontrol
+      # header to defuse the sendPendingEvents re-entrancy crash (docs/wasm.md);
+      # drop this dependency when the upstream fix lands.
+      target_link_libraries(patchy_ui PRIVATE Qt6::CorePrivate)
+    else()
+      target_sources(patchy_ui PRIVATE src/ui/print_dialog.cpp)
+      target_link_libraries(patchy_ui PUBLIC Qt6::PrintSupport)
+    endif()
+    # Same swap for the optional Qt PDF add-on: the real importer where the module exists,
+    # the stub (which reports PDF opening as unavailable) everywhere else. PDF EXPORT is
+    # not gated at all; pdf_export.cpp sits in the unconditional source list above.
+    if(TARGET Qt6::Pdf)
+      # The PDF viewer and its Print as Book need Qt PDF (and Qt Print Support, which every
+      # Qt PDF kit has: neither exists on wasm). docs/pdf-viewer.md, docs/pdf-book-print.md.
+      target_sources(patchy_ui PRIVATE
+        src/ui/pdf_import.cpp
+        src/ui/pdf_page_view.hpp
+        src/ui/pdf_page_view.cpp
+        src/ui/pdf_viewer_window.hpp
+        src/ui/pdf_viewer_window.cpp
+        src/ui/pdf_book_print_dialog.hpp
+        src/ui/pdf_book_print_dialog.cpp)
+      target_link_libraries(patchy_ui PRIVATE Qt6::Pdf)
+      target_compile_definitions(patchy_ui PUBLIC PATCHY_HAVE_QT_PDF=1)
+    else()
+      target_sources(patchy_ui PRIVATE src/ui/pdf_import_stub.cpp)
+    endif()
+    target_link_libraries(patchy_ui PUBLIC
+      Qt6::Widgets
+      Qt6::Svg
+      Qt6::Network
+      Qt6::Qml
+      patchy_core
+      patchy_ai
+      patchy_render
+      patchy_psd
+      patchy_plugins
+      patchy_filters
+      patchy_formats
+      patchy_color
+      $<$<PLATFORM_ID:Windows>:dwmapi>
+    )
+    # PATCHY_VERSION lives in a configure-time generated header, not a
+    # target-wide compile definition: Ninja treats a changed command line as a
+    # changed input, so a define on patchy_ui made every version bump recompile
+    # the whole library. configure_file leaves the header untouched when its
+    # content is unchanged, so only the translation units that include it (the
+    # About/start-panel text, the update check, the stress report, main.cpp)
+    # rebuild after a bump. The directory is PUBLIC so patchy and patchy-mcp
+    # see the same header through their patchy_ui link.
+    set(PATCHY_VERSION_HEADER_DIR "${CMAKE_BINARY_DIR}/generated/version")
+    configure_file("${PROJECT_SOURCE_DIR}/cmake/patchy_version.hpp.in"
+                   "${PATCHY_VERSION_HEADER_DIR}/patchy_version.hpp" @ONLY)
+    target_include_directories(patchy_ui PUBLIC "${PATCHY_VERSION_HEADER_DIR}")
+    # Source/build input changes refresh the date; a no-op build keeps the binary.
+    # Packagers explicitly request a refresh before building their artifacts.
+    patchy_setup_build_stamp()
+    add_dependencies(patchy_ui patchy_build_stamp)
+    set_source_files_properties(src/ui/build_info.cpp PROPERTIES
+      INCLUDE_DIRECTORIES "${CMAKE_BINARY_DIR}/generated"
+    )
+    if(PATCHY_STORE_BUILD)
+      # One source, not the target: update_checks_available() is the only reader.
+      set_source_files_properties(src/ui/update_checker.cpp PROPERTIES
+        COMPILE_DEFINITIONS PATCHY_STORE_BUILD
+      )
+    endif()
+    # main_window.cpp exceeds the default COFF section limit under MSVC.
+    target_compile_options(patchy_ui PRIVATE $<$<CXX_COMPILER_ID:MSVC>:/bigobj>)
+    if(APPLE)
+      target_sources(patchy_ui PRIVATE
+        src/ui/coalesced_pointer_input_mac.mm
+        src/ui/dialog_utils_mac.mm
+        src/ui/display_hdr_info_mac.mm
+        src/ui/scanner_import_mac.mm
+        src/ui/sound_effects_mac.mm
+      )
+      # The scanner controller uses weak delegates and an asynchronous AppKit sheet;
+      # keep its Objective-C object lifetime explicit through ARC without changing the
+      # existing dialog utility translation unit. The sound backend retains live
+      # NSSounds the same ARC way.
+      set_source_files_properties(src/ui/scanner_import_mac.mm PROPERTIES COMPILE_OPTIONS "-fobjc-arc")
+      set_source_files_properties(src/ui/sound_effects_mac.mm PROPERTIES COMPILE_OPTIONS "-fobjc-arc")
+      set_source_files_properties(src/ui/display_hdr_info_mac.mm PROPERTIES COMPILE_OPTIONS "-fobjc-arc")
+      # AVFoundation: AVAudioEngine plays the gapless looping theme sounds.
+      target_link_libraries(patchy_ui PUBLIC
+        "-framework AppKit"
+        "-framework AVFoundation"
+        "-framework Quartz"
+        "-framework ImageCaptureCore"
+        # Security: the keychain item a remembered OpenAI API key lives in.
+        "-framework Security"
+      )
+    endif()
+    if(NOT EMSCRIPTEN)
+      # OpenAI Image Tools (docs/openai-images.md): desktop only, since the wasm Qt has no TLS backend.
+      target_sources(patchy_ui PRIVATE
+        src/ui/openai_images.hpp
+        src/ui/openai_images.cpp
+        src/ui/openai_images_dialog.hpp
+        src/ui/openai_images_dialog.cpp
+        src/ui/main_window_openai_images.cpp)
+    endif()
+    if(NOT EMSCRIPTEN)
+      # GEGL filters (docs/gegl-filters.md): the scan and runs through patchy-gegl-host.
+      target_sources(patchy_ui PRIVATE src/ui/gegl_filters.cpp src/ui/gegl_filters.hpp src/ui/main_window_gegl_filters.cpp)
+      add_dependencies(patchy_ui patchy-gegl-host)
+      if(TARGET patchy_gegl_bundle)
+        add_dependencies(patchy_ui patchy_gegl_bundle)
+      endif()
+    endif()
+    if(UNIX AND NOT APPLE AND NOT EMSCRIPTEN)
+      # Font types of missing fonts from the user's fontconfig (GitHub issue 463), loaded with
+      # dlopen at run time like libheif: nothing is linked, no fontconfig headers are needed.
+      target_sources(patchy_ui PRIVATE src/ui/fontconfig_font_class.cpp src/ui/fontconfig_font_class.hpp)
+      target_compile_definitions(patchy_ui PUBLIC PATCHY_HAVE_FONTCONFIG_QUERY=1)
+      target_link_libraries(patchy_ui PRIVATE ${CMAKE_DL_LIBS})
+      if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+        # SANE scanner and libgphoto2 camera acquisition (File > Import > From Scanner or
+        # Camera...), both dlopened at run time like fontconfig: no headers, nothing bundled.
+        target_sources(patchy_ui PRIVATE src/ui/scanner_import_linux.cpp)
+      endif()
+      # "Pick Screen Color" on Wayland goes through the XDG desktop portal
+      # (src/ui/portal_color_pick.cpp, GitHub issue 128). Looked up as a separate
+      # package for the same reason as Qt6Pdf above: a kit without QtDBus keeps
+      # the app target and falls back to the overlay picker.
+      find_package(Qt6DBus QUIET)
+      if(TARGET Qt6::DBus)
+        target_sources(patchy_ui PRIVATE src/ui/portal_color_pick.cpp src/ui/portal_color_pick.hpp)
+        target_link_libraries(patchy_ui PRIVATE Qt6::DBus)
+        target_compile_definitions(patchy_ui PUBLIC PATCHY_HAVE_QT_DBUS=1)
+      endif()
+      # The brush-resize drag locks the pointer on Wayland (GitHub issue 637,
+      # src/ui/wayland_pointer_lock.cpp). Qt's QPA native interface hands out the window's
+      # wl_surface (Qt 6.10 and later ship that as the separate Qt6GuiPrivate package; 6.8
+      # defines the target with Qt6Gui). libwayland-client is looked up at run time in the
+      # copy Qt's Wayland plug-in loaded, so nothing new is linked and X11 sessions load nothing.
+      # Only QPlatformNativeInterface's long-stable virtual nativeResourceForWindow and
+      # QPlatformWindow::devicePixelRatio are used (no private symbols are imported), so the
+      # private-module notice Qt 6.10 prints at configure time is switched off for this lookup.
+      if(NOT TARGET Qt6::GuiPrivate)
+        set(QT_NO_PRIVATE_MODULE_WARNING ON)
+        find_package(Qt6GuiPrivate QUIET)
+        unset(QT_NO_PRIVATE_MODULE_WARNING)
+      endif()
+      if(TARGET Qt6::GuiPrivate)
+        target_sources(patchy_ui PRIVATE src/ui/wayland_pointer_lock.cpp src/ui/wayland_pointer_lock.hpp)
+        target_link_libraries(patchy_ui PRIVATE Qt6::GuiPrivate)
+        target_compile_definitions(patchy_ui PRIVATE PATCHY_HAVE_WAYLAND_POINTER_LOCK=1)
+      endif()
+    endif()
+    if(WIN32)
+      # WIA scanner/camera acquisition (File > Import > From Scanner or Camera...).
+      # legacy_plugin_runner_win.cpp drives the out-of-process 8BF host.
+      # display_hdr_info_win.cpp reads DXGI outputs (dxgi; Qt6Gui already imports dxgi.dll,
+      # so linking it adds no startup load).
+      target_sources(patchy_ui PRIVATE src/ui/scanner_import_win.cpp src/ui/scanner_session_win.cpp
+                     src/ui/legacy_plugin_runner_win.cpp
+                     src/ui/display_hdr_info_win.cpp)
+      add_dependencies(patchy_ui patchy-8bf-host64 patchy_8bf_host32)
+      # winmm: PlaySound for the script sound effects (sound_effects.cpp).
+      # ws2_32: getaddrinfo for the network clients' own host resolve (host_resolve.cpp).
+      # wintrust, crypt32: the one-click update checks the installer's Authenticode signer
+    # (update_installer.cpp).
+    # shlwapi: SHCreateStreamOnFileEx for the WIA book-scan transfers (scanner_session_win.cpp).
+    target_link_libraries(patchy_ui PUBLIC wiaguid shlwapi winmm ws2_32 wintrust crypt32 dxgi)
+    endif()
+    patchy_configure_target(patchy_ui)
+
+    if(EMSCRIPTEN)
+      # The single-threaded app artifact (wasm-release-st preset): no
+      # -pthread, no pool, no shared memory. It remains a manually selected
+      # Safari/WebKit diagnostic artifact because current ST builds also die
+      # under workload; see docs/wasm-memory.md. The threading seams in src
+      # gate themselves on __EMSCRIPTEN_PTHREADS__, so no source changes ride
+      # on this option.
+      option(PATCHY_WASM_SINGLETHREAD
+             "Single-threaded wasm app build (the Safari diagnostic artifact)" OFF)
+      # qt_add_executable generates the wasm deployment sidecars (patchy.html,
+      # qtloader.js) that a plain add_executable does not.
+      qt_add_executable(patchy src/app/main.cpp)
+      # The pthread pool must cover the largest fan-out that can be spawned
+      # while the spawning thread immediately blocks on the results (Edit >
+      # Flatten runs the strip compositor on the main thread, up to 16 strips;
+      # a lazily spawned worker cannot finish instantiating while the main
+      # thread is blocked, which deadlocks). Sized to the visitor's machine:
+      # up to 16 join-fanout workers plus headroom for the preview/open/undo
+      # workers that may be live at the same time. Headroom alone is not the
+      # guard: on a 60 MB document enough previews stayed busy to exhaust the
+      # old +8 pool and wedge the tab (2026-08-01), so main-thread blocking
+      # fan-outs now also clamp themselves to the idle pool via
+      # core/worker_budget.hpp; the +16 keeps them parallel under load.
+      # Emscripten evaluates the expression at page load, on the main thread
+      # only, so the globalThis override lets the shell page (or its
+      # ?PATCHY_WASM_POOL= knob) tune the pool per device without a relink;
+      # unset, the stock formula applies. No PTHREAD_POOL_SIZE_STRICT:
+      # overflow lazily spawns (fine from worker threads, which do yield)
+      # instead of aborting.
+      # QT_QML_MODULE_NO_IMPORT_SCAN: Patchy ships no QML (Qt6::Qml is linked
+      # for QJSEngine scripting only, which needs no QML plugins). Without the
+      # opt-out, Qt's static-build finalizer runs qmlimportscanner with
+      # -rootPath at the repository root, walks into the vendored Qt kits under
+      # .deps, finds Qt's own internal QML files there, and statically links
+      # the whole QtQuick/Controls/Dialogs stack into patchy.wasm as dead code.
+      # QT_WASM_INITIAL_MEMORY is the FLOOR baked into the wasm memory import
+      # (min pages): a page-supplied WebAssembly.Memory with a smaller initial
+      # is a LinkError. The deployed shell page (packaging/web/patchy.html.in)
+      # owns the effective initial per device (512 MB desktop, 256 MB iOS) and
+      # must keep its BAKED_MIN_MB in sync with this value; Qt's dev-loop
+      # patchy.html falls back to this floor plus heap growth.
+      set_target_properties(patchy PROPERTIES
+        QT_WASM_INITIAL_MEMORY "256MB"
+        QT_QML_MODULE_NO_IMPORT_SCAN TRUE
+      )
+      if(NOT PATCHY_WASM_SINGLETHREAD)
+        set_target_properties(patchy PROPERTIES
+          QT_WASM_PTHREAD_POOL_SIZE "(globalThis.patchyPthreadPoolSize||(Math.min(navigator.hardwareConcurrency,16)+16))"
+        )
+      endif()
+      # The qmltooling debug-service plugins are default static plugins of
+      # Qt6::Qml, and qmldbg_quickprofiler links the whole QtQuick scene graph
+      # plus its shader resources into the binary. QML debug services are dead
+      # weight in a deployed web build, so the category is excluded.
+      qt_import_plugins(patchy EXCLUDE_BY_TYPE qmltooling)
+      # Asyncify keeps the nested-event-loop sites (QDialog::exec and friends)
+      # working on wasm. Exceptions stay JS-based (-fexceptions, matching the
+      # preset's compile flags) because Asyncify does not support wasm-native
+      # exception handling. The preload mounts land at /fonts, /translations,
+      # and /scripts, which is exactly where the existing
+      # applicationDirPath()-relative probes look (appdir is "/" on wasm).
+      # No -sSTACK_SIZE here: Qt's wasm target machinery sets its own, and a
+      # second value only earns a duplicate-flag link warning. The pre-js
+      # forwards PATCHY_* URL query parameters into the app environment so the
+      # environment escape hatches work in a browser (the node test runner has
+      # its own pre-js doing the same from process.env).
+      # Link opt is -O3 since the 2026-07-31 in-app stress A/B: -O3 ran the
+      # filter/compositing steps 3-9% faster than -Os for +0.9% size, and
+      # end-user speed outranks size for the web build. (The earlier July
+      # trial preferred -Os, but it measured size only; see docs/wasm.md.)
+      # Workers get 4MB stacks: LibRaw's dcraw-derived decoders carry large
+      # stack locals (the reason wasm-core gives the main thread 8MB) and the
+      # compositor/preview workers now run there.
+      # -Wno-pthreads-mem-growth: same one-diagnostic suppression as the
+      # wasm-core preset; pthreads plus a growable heap slows JS-side heap
+      # views, which Qt touches only for canvas presentation.
+      # ASYNCIFY_STACK_SIZE: Emscripten's default is 4 KB per suspend, which
+      # fits the main loop's shallow idle suspend but silently overflows when
+      # a dialog opened from another dialog's nested exec suspends the full
+      # UI call chain (Qt 6.10 suspends via EM_ASYNC_JS with no size check in
+      # non-assertion builds; the overflow presents as "RuntimeError:
+      # unreachable" in maybeStopUnwind/doRewind plus memory-access-out-of-
+      # bounds). 1 MiB is allocated per live suspend, a few MB worst case.
+      # Cache variable so the Safari-compiler A/B variant builds can override
+      # the link optimization level without editing this file (docs/wasm.md,
+      # Safari 26 known issue). The shipped wasm-release stays -O3.
+      set(PATCHY_WASM_LINK_OPT "-O3" CACHE STRING "Optimization flag for the wasm app link")
+      # dlmalloc is the shipped allocator. The 2026-07-31 stress A/B found
+      # mimalloc 5-8% faster, but the exact 350 MB C2Kyoto PSD drives mimalloc's
+      # retained segments to the wasm32 4 GB ceiling and throws bad_alloc;
+      # dlmalloc opens it successfully. Keep mimalloc available for explicit
+      # benchmarks without making it the visitor default.
+      set(PATCHY_WASM_ALLOCATOR "dlmalloc" CACHE STRING "Emscripten allocator for the wasm app")
+      set_property(CACHE PATCHY_WASM_ALLOCATOR PROPERTY STRINGS dlmalloc mimalloc)
+      if(NOT PATCHY_WASM_ALLOCATOR STREQUAL "dlmalloc" AND
+         NOT PATCHY_WASM_ALLOCATOR STREQUAL "mimalloc")
+        message(FATAL_ERROR "PATCHY_WASM_ALLOCATOR must be dlmalloc or mimalloc")
+      endif()
+      target_link_options(patchy PRIVATE
+        -sASYNCIFY
+        -sASYNCIFY_STACK_SIZE=1048576
+        ${PATCHY_WASM_LINK_OPT}
+        "-sMALLOC=${PATCHY_WASM_ALLOCATOR}"
+        -fexceptions
+        -sALLOW_MEMORY_GROWTH=1
+        -sMAXIMUM_MEMORY=4GB
+        "SHELL:--pre-js ${PROJECT_SOURCE_DIR}/scripts/wasm/app-env-pre.js"
+        "SHELL:--preload-file ${CMAKE_BINARY_DIR}/fonts@/fonts"
+        "SHELL:--preload-file ${CMAKE_BINARY_DIR}/translations@/translations"
+        "SHELL:--preload-file ${CMAKE_BINARY_DIR}/scripts@/scripts"
+      )
+      if(NOT PATCHY_WASM_SINGLETHREAD)
+        target_link_options(patchy PRIVATE
+          -pthread
+          -Wno-pthreads-mem-growth
+          -sDEFAULT_PTHREAD_STACK_SIZE=4MB
+        )
+      endif()
+      # A fonts-only change must repack patchy.data: patchy_copy_bundled_fonts
+      # orders the staging before the build but does not make the link step
+      # depend on it, so without this a changed font would not ship until the
+      # next unrelated relink.
+      if(DEFINED PATCHY_FONTS_STAMP)
+        set_property(TARGET patchy APPEND PROPERTY LINK_DEPENDS "${PATCHY_FONTS_STAMP}")
+      endif()
+    else()
+      add_executable(patchy WIN32 MACOSX_BUNDLE
+        src/app/main.cpp
+      )
+    endif()
+    target_link_libraries(patchy PRIVATE patchy_ui)
+    if(NOT EMSCRIPTEN)
+      # The MCP connector (docs/ai-control.md) is a mode of the app: `patchy --mcp-connector`.
+      target_sources(patchy PRIVATE src/app/mcp_server.cpp src/app/mcp_stdio.cpp)
+    endif()
+    if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+      # Linux ships one app binary (GitHub issue 336): patchy-mcp is a script beside
+      # patchy that starts it in connector mode, in the build tree and installed (the
+      # Flatpak's /app/bin/patchy-mcp). The AppImage's AppRun starts the mode itself.
+      file(GENERATE OUTPUT "$<TARGET_FILE_DIR:patchy>/patchy-mcp"
+        CONTENT "#!/bin/sh
+# Patchy's MCP connector: the patchy binary beside this script in connector mode.
+exec \"$(dirname \"$(readlink -f \"$0\")\")/patchy\" --mcp-connector \"$@\"
+"
+        FILE_PERMISSIONS OWNER_READ OWNER_WRITE OWNER_EXECUTE GROUP_READ GROUP_EXECUTE WORLD_READ WORLD_EXECUTE)
+      install(PROGRAMS "$<TARGET_FILE_DIR:patchy>/patchy-mcp" DESTINATION ${CMAKE_INSTALL_BINDIR})
+    elseif(NOT EMSCRIPTEN)
+      # Windows and macOS still ship a separate patchy-mcp executable: the same main.cpp
+      # with the connector mode forced.
+      add_executable(patchy-mcp src/app/main.cpp src/app/mcp_server.cpp src/app/mcp_stdio.cpp)
+      target_link_libraries(patchy-mcp PRIVATE patchy_ui)
+      target_compile_definitions(patchy-mcp PRIVATE PATCHY_MCP_EXECUTABLE=1)
+      patchy_configure_target(patchy-mcp)
+      patchy_copy_translations(patchy-mcp)
+      patchy_copy_qt_runtime(patchy-mcp)
+      patchy_copy_bundled_fonts(patchy-mcp)
+      patchy_copy_bundled_scripts(patchy-mcp)
+      patchy_copy_ai_runtime(patchy-mcp)
+      add_dependencies(patchy-mcp patchy_agent_kit)
+      if(WIN32)
+        # MCP clients (the Codex app) keep a connector alive per thread, which locks
+        # patchy-mcp.exe against relinking (LNK1104). Move a locked one aside right
+        # before the link and sweep stale copies once nothing runs them; never kill
+        # a client. See docs/release-process-scripts.md.
+        add_custom_command(TARGET patchy-mcp PRE_LINK
+          COMMAND ${CMAKE_COMMAND} -DPATCHY_LOCKED_EXECUTABLE=$<TARGET_FILE:patchy-mcp>
+                  -P ${CMAKE_SOURCE_DIR}/cmake/unlock_locked_executable.cmake
+          VERBATIM)
+      endif()
+      install(TARGETS patchy-mcp RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+    endif()
+    if(WIN32)
+      # A patchy.exe from this build folder is often open while a build runs. A running
+      # image cannot be overwritten (LNK1104) but can be renamed, so move it aside
+      # exactly like the connector above; that instance keeps running the renamed
+      # copy and the link produces a fresh patchy.exe. Never kill it: it may hold
+      # unsaved work. See docs/release-process-scripts.md.
+      add_custom_command(TARGET patchy PRE_LINK
+        COMMAND ${CMAKE_COMMAND} -DPATCHY_LOCKED_EXECUTABLE=$<TARGET_FILE:patchy>
+                -P ${CMAKE_SOURCE_DIR}/cmake/unlock_locked_executable.cmake
+        VERBATIM)
+    endif()
+    patchy_configure_target(patchy)
+    patchy_copy_translations(patchy)
+    patchy_copy_qt_runtime(patchy)
+    patchy_copy_bundled_fonts(patchy)
+    patchy_copy_bundled_scripts(patchy)
+    patchy_copy_ai_runtime(patchy)
+    # Test translation units the translation checker and the UI suite both need, compiled
+    # once (ui_test_support.cpp alone is about 50 s). The harness body with <windows.h> and the
+    # MainWindowTestAccess bodies live here too, so editing an accessor recompiles one object.
+    # Only the targets that link it build it: the wasm site (no checker, tests off) has no
+    # QProcess for localization_tests.cpp.
+    if(NOT EMSCRIPTEN OR PATCHY_BUILD_TESTS)
+      add_library(patchy_ui_test_shared OBJECT
+        tests/test_harness.cpp
+        tests/ui/ui_test_support.cpp
+        tests/ui/ui_test_access.cpp
+        tests/ui/localization_tests.cpp
+        tests/ui/translation_runtime_tests.cpp
+      )
+      target_include_directories(patchy_ui_test_shared PRIVATE tests)
+      target_link_libraries(patchy_ui_test_shared PRIVATE patchy_ui Qt6::Test)
+      target_compile_definitions(patchy_ui_test_shared PRIVATE
+        PATCHY_SOURCE_DIR="${PROJECT_SOURCE_DIR}"
+        PATCHY_LUPDATE_MANIFEST="${PATCHY_LUPDATE_MANIFEST}"
+        PATCHY_PYTHON_EXECUTABLE="${Python3_EXECUTABLE}")
+      patchy_configure_target(patchy_ui_test_shared)
+      target_compile_options(patchy_ui_test_shared PRIVATE $<$<CXX_COMPILER_ID:MSVC>:/bigobj>)
+    endif()
+    if(NOT EMSCRIPTEN)
+      # This small runner is a required build tool, independent of PATCHY_BUILD_TESTS.
+      # It shares the actual checks with the UI suite and has private temporary settings.
+      add_executable(patchy_translation_checks
+        tests/ui/translation_check_main.cpp
+      )
+      target_include_directories(patchy_translation_checks PRIVATE tests)
+      target_link_libraries(patchy_translation_checks PRIVATE patchy_ui Qt6::Test patchy_ui_test_shared)
+      target_compile_definitions(patchy_translation_checks PRIVATE
+        PATCHY_SOURCE_DIR="${PROJECT_SOURCE_DIR}"
+        PATCHY_LUPDATE_MANIFEST="${PATCHY_LUPDATE_MANIFEST}"
+        PATCHY_PYTHON_EXECUTABLE="${Python3_EXECUTABLE}")
+      patchy_configure_target(patchy_translation_checks)
+      target_compile_options(patchy_translation_checks PRIVATE $<$<CXX_COMPILER_ID:MSVC>:/bigobj>)
+      if(MSVC)
+        # The app and connector link after this check, so its whole-program LTCG link
+        # used to sit on their critical path. The checker never ships: incremental LTCG
+        # (state in patchy_translation_checks.iobj) regenerates code only for changed
+        # functions. The release binaries keep full /LTCG. See docs/building.md.
+        target_link_options(patchy_translation_checks PRIVATE $<$<CONFIG:Release>:/LTCG:INCREMENTAL>)
+      endif()
+      patchy_copy_translations(patchy_translation_checks)
+      patchy_copy_qt_runtime(patchy_translation_checks)
+      patchy_copy_bundled_fonts(patchy_translation_checks)
+      patchy_copy_bundled_scripts(patchy_translation_checks)
+      patchy_copy_ai_runtime(patchy_translation_checks)
+      add_dependencies(patchy_translation_checks patchy_agent_kit)
+      set(PATCHY_TRANSLATION_RUNTIME_INPUTS
+        patchy_translation_checks "${PATCHY_TRANSLATION_CATALOG_STAMP}"
+        ${PATCHY_QM_FILES} ${PATCHY_QT_BASE_QM_FILES}
+        "${PATCHY_TRANSLATION_TEMPLATE}" ${PATCHY_TS_FILES}
+        "${PATCHY_LUPDATE_MANIFEST}" "${PATCHY_TRANSLATION_OUTPUT_DIR}/languages.txt"
+        ${PATCHY_QT_SOURCE_RUNTIME_INPUTS}
+      )
+      foreach(runtime_stamp PATCHY_QT_RUNTIME_STAMP PATCHY_FONTS_STAMP PATCHY_SCRIPTS_STAMP
+                            PATCHY_AI_RUNTIME_STAMP PATCHY_AGENT_KIT_STAMP)
+        if(DEFINED ${runtime_stamp})
+          list(APPEND PATCHY_TRANSLATION_RUNTIME_INPUTS "${${runtime_stamp}}")
+        endif()
+      endforeach()
+      set(PATCHY_TRANSLATION_RUNTIME_MANIFEST "${PATCHY_TRANSLATION_OUTPUT_DIR}/runtime-inputs.txt")
+      patchy_write_input_manifest("${PATCHY_TRANSLATION_RUNTIME_MANIFEST}" ${PATCHY_TRANSLATION_RUNTIME_INPUTS})
+      list(APPEND PATCHY_TRANSLATION_RUNTIME_INPUTS "${PATCHY_TRANSLATION_RUNTIME_MANIFEST}")
+      # A cross build (windows-arm64-cross-*) cannot run what it builds. The catalogs are
+      # the same on every architecture, so the x64 build beside it gates them; the UI
+      # suite on the ARM64 host runs the same checks (docs/building.md).
+      if(NOT CMAKE_CROSSCOMPILING)
+        patchy_add_success_check(patchy_check_translation_runtime
+          STAMP "${PATCHY_TRANSLATION_OUTPUT_DIR}/runtime-check.stamp"
+          COMMAND $<TARGET_FILE:patchy_translation_checks>
+          DEPENDS ${PATCHY_TRANSLATION_RUNTIME_INPUTS}
+          WORKING_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}"
+          COMMENT "Checking UI translations at startup and after language switches"
+        )
+        add_dependencies(patchy patchy_check_translation_runtime)
+        if(TARGET patchy-mcp)
+          add_dependencies(patchy-mcp patchy_check_translation_runtime)
+        endif()
+      endif()
+    endif()
+    if(WIN32)
+      # VERSIONINFO requires four decimal components. Release names such as
+      # 1.08 keep their spelling in strings, but must not become octal RC literals.
+      set(PATCHY_WINDOWS_VERSION_PARTS)
+      foreach(component MAJOR MINOR PATCH TWEAK)
+        string(REGEX REPLACE "^0+" "" part "${PROJECT_VERSION_${component}}")
+        if(part STREQUAL "")
+          set(part 0)
+        endif()
+        list(APPEND PATCHY_WINDOWS_VERSION_PARTS "${part}")
+      endforeach()
+      list(JOIN PATCHY_WINDOWS_VERSION_PARTS "," PATCHY_WINDOWS_VERSION)
+      set(PATCHY_WINDOWS_RESOURCE "${CMAKE_CURRENT_BINARY_DIR}/generated/patchy.rc")
+      configure_file(src/app/patchy.rc.in "${PATCHY_WINDOWS_RESOURCE}" @ONLY)
+      target_sources(patchy PRIVATE "${PATCHY_WINDOWS_RESOURCE}")
+      # The resource compiler's dependency scan follows #include only, not the
+      # ICON statement, so a changed icon left a stale patchy.rc.res (and the
+      # old taskbar/Explorer icon) in every existing build tree.
+      set_source_files_properties("${PATCHY_WINDOWS_RESOURCE}" PROPERTIES
+        OBJECT_DEPENDS "${PROJECT_SOURCE_DIR}/src/app/patchy.ico")
+    endif()
+    if(APPLE)
+      set_target_properties(patchy PROPERTIES
+        OUTPUT_NAME "Patchy"
+        MACOSX_BUNDLE_INFO_PLIST "${PROJECT_SOURCE_DIR}/packaging/macos/Info.plist.in"
+        MACOSX_BUNDLE_BUNDLE_NAME "Patchy"
+        MACOSX_BUNDLE_GUI_IDENTIFIER "com.rtsoft.patchy"
+        MACOSX_BUNDLE_BUNDLE_VERSION "${PROJECT_VERSION}"
+        MACOSX_BUNDLE_SHORT_VERSION_STRING "${PROJECT_VERSION}"
+        MACOSX_BUNDLE_ICON_FILE "patchy.icns"
+      )
+      if(EXISTS "${PROJECT_SOURCE_DIR}/packaging/macos/patchy.icns")
+        target_sources(patchy PRIVATE "${PROJECT_SOURCE_DIR}/packaging/macos/patchy.icns")
+        set_source_files_properties("${PROJECT_SOURCE_DIR}/packaging/macos/patchy.icns"
+          PROPERTIES MACOSX_PACKAGE_LOCATION Resources)
+      endif()
+      # Stage runtime resources inside the bundle (the executable lives in
+      # Contents/MacOS; fonts/translations are loaded from Contents/Resources).
+      # Stamp-driven, NOT a POST_BUILD on the patchy target: POST_BUILD only
+      # fires when the executable relinks, so a scripts/fonts/translations-only
+      # change left the bundle stale on incremental builds (Breakout kept
+      # shipping without its sound/zoom update while the build dir was fresh).
+      # The bundle Resources still has exactly one writer (this command), so
+      # the no-shared-POST_BUILD race rule is preserved.
+      # Clean the destinations first: copy_directory never deletes, so renamed or
+      # removed files linger in the long-lived bundle forever and ship in the dmg
+      # (pre-reorg loose scripts and even scripts/remote dev tooling really
+      # accumulated in Resources/scripts this way).
+      set(PATCHY_BUNDLE_RESOURCES_STAMP
+          "${CMAKE_BINARY_DIR}/CMakeFiles/patchy_bundle_resources.stamp")
+      set(PATCHY_BUNDLE_RESOURCE_DEPS patchy patchy-mcp patchy-gegl-host "${PATCHY_AGENT_KIT_STAMP}" ${PATCHY_QM_FILES})
+      list(APPEND PATCHY_BUNDLE_RESOURCE_DEPS ${PATCHY_QT_BASE_QM_FILES})
+      if(DEFINED PATCHY_FONTS_STAMP)
+        list(APPEND PATCHY_BUNDLE_RESOURCE_DEPS "${PATCHY_FONTS_STAMP}")
+      endif()
+      if(DEFINED PATCHY_SCRIPTS_STAMP)
+        list(APPEND PATCHY_BUNDLE_RESOURCE_DEPS "${PATCHY_SCRIPTS_STAMP}")
+      endif()
+      # Automatic selection: the models in Resources/ai-models and the ONNX Runtime dylib
+      # in Frameworks, where the engine loads it at run time (make-dmg.sh signs it with the
+      # bundle).
+      set(PATCHY_BUNDLE_AI_COMMANDS "")
+      if(PATCHY_AI_SELECTION_BUILT)
+        list(APPEND PATCHY_BUNDLE_RESOURCE_DEPS "${PATCHY_AI_RUNTIME_STAMP}")
+        set(PATCHY_BUNDLE_AI_COMMANDS
+          COMMAND ${CMAKE_COMMAND} -E copy_directory "${CMAKE_BINARY_DIR}/ai-models"
+                  "$<TARGET_BUNDLE_CONTENT_DIR:patchy>/Resources/ai-models"
+          COMMAND ${CMAKE_COMMAND} -E make_directory "$<TARGET_BUNDLE_CONTENT_DIR:patchy>/Frameworks"
+          COMMAND ${CMAKE_COMMAND} -E copy_if_different ${PATCHY_ONNXRUNTIME_RUNTIME_FILES}
+                  "$<TARGET_BUNDLE_CONTENT_DIR:patchy>/Frameworks/")
+      endif()
+      # Patchy's own GEGL (cmake/patchy_gegl.cmake): its code in Frameworks/gegl/lib, where
+      # bundled_gegl_library finds it and make-dmg.sh signs each library, and its catalogs and
+      # licenses in Resources/gegl. codesign takes a folder with a dot in its name inside
+      # Frameworks for a bundle and refuses the app, so the module folders are renamed
+      # gegl-modules and babl-extensions (prepare_helper points GEGL_PATH and BABL_PATH there).
+      if(TARGET patchy_gegl_bundle)
+        list(APPEND PATCHY_BUNDLE_RESOURCE_DEPS "${PATCHY_GEGL_BUNDLE_STAMP}")
+        list(APPEND PATCHY_BUNDLE_AI_COMMANDS
+          COMMAND ${CMAKE_COMMAND} -E rm -rf "$<TARGET_BUNDLE_CONTENT_DIR:patchy>/Frameworks/gegl"
+          COMMAND ${CMAKE_COMMAND} -E rm -rf "$<TARGET_BUNDLE_CONTENT_DIR:patchy>/Resources/gegl"
+          COMMAND ${CMAKE_COMMAND} -E copy_directory "${CMAKE_BINARY_DIR}/gegl/lib"
+                  "$<TARGET_BUNDLE_CONTENT_DIR:patchy>/Frameworks/gegl/lib"
+          COMMAND ${CMAKE_COMMAND} -E rename "$<TARGET_BUNDLE_CONTENT_DIR:patchy>/Frameworks/gegl/lib/gegl-0.4"
+                  "$<TARGET_BUNDLE_CONTENT_DIR:patchy>/Frameworks/gegl/lib/gegl-modules"
+          COMMAND ${CMAKE_COMMAND} -E rename "$<TARGET_BUNDLE_CONTENT_DIR:patchy>/Frameworks/gegl/lib/babl-0.1"
+                  "$<TARGET_BUNDLE_CONTENT_DIR:patchy>/Frameworks/gegl/lib/babl-extensions"
+          COMMAND ${CMAKE_COMMAND} -E copy_directory "${CMAKE_BINARY_DIR}/gegl/share"
+                  "$<TARGET_BUNDLE_CONTENT_DIR:patchy>/Resources/gegl/share"
+          COMMAND ${CMAKE_COMMAND} -E copy_directory "${CMAKE_BINARY_DIR}/gegl/licenses"
+                  "$<TARGET_BUNDLE_CONTENT_DIR:patchy>/Resources/gegl/licenses")
+      endif()
+      # The G'MIC engine's OpenMP runtime (cmake/patchy_gmic.cmake), found through the
+      # executables' @executable_path/../Frameworks rpath.
+      if(APPLE AND PATCHY_LIBOMP_DYLIB)
+        list(APPEND PATCHY_BUNDLE_AI_COMMANDS
+          COMMAND ${CMAKE_COMMAND} -E make_directory "$<TARGET_BUNDLE_CONTENT_DIR:patchy>/Frameworks"
+          COMMAND ${CMAKE_COMMAND} -E copy_if_different "${PATCHY_LIBOMP_DYLIB}"
+                  "$<TARGET_BUNDLE_CONTENT_DIR:patchy>/Frameworks/")
+        list(APPEND PATCHY_BUNDLE_RESOURCE_DEPS "${PATCHY_LIBOMP_DYLIB}")
+      endif()
+      # License texts the bundle carries: Patchy's own, the third-party notice and,
+      # with the G'MIC engine, the CeCILL and pocketfft texts.
+      set(PATCHY_BUNDLE_LICENSE_COMMANDS
+        COMMAND ${CMAKE_COMMAND} -E make_directory "$<TARGET_BUNDLE_CONTENT_DIR:patchy>/Resources/licenses"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different "${PROJECT_SOURCE_DIR}/LICENSE"
+                "${PROJECT_SOURCE_DIR}/NOTICE-THIRD-PARTY.md"
+                "$<TARGET_BUNDLE_CONTENT_DIR:patchy>/Resources/licenses/")
+      list(APPEND PATCHY_BUNDLE_RESOURCE_DEPS
+           "${PROJECT_SOURCE_DIR}/LICENSE" "${PROJECT_SOURCE_DIR}/NOTICE-THIRD-PARTY.md")
+      if(PATCHY_ENABLE_GMIC)
+        list(APPEND PATCHY_BUNDLE_LICENSE_COMMANDS
+          COMMAND ${CMAKE_COMMAND} -E copy_if_different "${PROJECT_SOURCE_DIR}/src/filters/gmic/COPYING"
+                  "$<TARGET_BUNDLE_CONTENT_DIR:patchy>/Resources/licenses/gmic-COPYING.txt"
+          COMMAND ${CMAKE_COMMAND} -E copy_if_different "${PROJECT_SOURCE_DIR}/src/filters/gmic/pocketfft/LICENSE.md"
+                  "$<TARGET_BUNDLE_CONTENT_DIR:patchy>/Resources/licenses/pocketfft-LICENSE.md")
+      endif()
+      add_custom_command(
+        OUTPUT "${PATCHY_BUNDLE_RESOURCES_STAMP}"
+        COMMAND ${CMAKE_COMMAND} -E rm -rf
+                "$<TARGET_BUNDLE_CONTENT_DIR:patchy>/Resources/licenses"
+                "$<TARGET_BUNDLE_CONTENT_DIR:patchy>/Resources/fonts"
+                "$<TARGET_BUNDLE_CONTENT_DIR:patchy>/Resources/translations"
+                "$<TARGET_BUNDLE_CONTENT_DIR:patchy>/Resources/scripts"
+                "$<TARGET_BUNDLE_CONTENT_DIR:patchy>/Resources/ai"
+                "$<TARGET_BUNDLE_CONTENT_DIR:patchy>/Resources/ai-models"
+        COMMAND ${CMAKE_COMMAND} -E copy_directory
+                "${CMAKE_BINARY_DIR}/fonts"
+                "$<TARGET_BUNDLE_CONTENT_DIR:patchy>/Resources/fonts"
+        COMMAND ${CMAKE_COMMAND} -E copy_directory
+                "${CMAKE_BINARY_DIR}/translations"
+                "$<TARGET_BUNDLE_CONTENT_DIR:patchy>/Resources/translations"
+        COMMAND ${CMAKE_COMMAND} -E copy_directory
+                "${CMAKE_BINARY_DIR}/scripts"
+                "$<TARGET_BUNDLE_CONTENT_DIR:patchy>/Resources/scripts"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different "$<TARGET_FILE:patchy-mcp>"
+                "$<TARGET_BUNDLE_CONTENT_DIR:patchy>/MacOS/patchy-mcp"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different "$<TARGET_FILE:patchy-gegl-host>"
+                "$<TARGET_BUNDLE_CONTENT_DIR:patchy>/MacOS/patchy-gegl-host"
+        COMMAND ${CMAKE_COMMAND} -E copy_directory "${CMAKE_BINARY_DIR}/ai"
+                "$<TARGET_BUNDLE_CONTENT_DIR:patchy>/Resources/ai"
+        ${PATCHY_BUNDLE_AI_COMMANDS}
+        ${PATCHY_BUNDLE_LICENSE_COMMANDS}
+        COMMAND ${CMAKE_COMMAND} -E touch "${PATCHY_BUNDLE_RESOURCES_STAMP}"
+        DEPENDS ${PATCHY_BUNDLE_RESOURCE_DEPS}
+        COMMENT "Staging fonts, translations, and scripts into the Patchy app bundle"
+      )
+      add_custom_target(patchy_bundle_resources ALL
+                        DEPENDS "${PATCHY_BUNDLE_RESOURCES_STAMP}")
+    endif()
+    if(NOT EMSCRIPTEN)
+      install(TARGETS patchy
+        BUNDLE DESTINATION .
+        RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
+      )
+    endif()
+    if(UNIX AND NOT APPLE AND NOT EMSCRIPTEN)
+      # The GEGL helper and Patchy's own GEGL in lib/patchy/gegl, where bundled_gegl_library
+      # finds it from bin (docs/gegl-filters.md; lib, not a multiarch LIBDIR). The Flatpak builds
+      # GEGL as manifest modules instead.
+      install(TARGETS patchy-gegl-host RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+      if(TARGET patchy_gegl_bundle)
+        install(DIRECTORY "${PATCHY_GEGL_BUNDLE_DIR_FOUND}/" DESTINATION "lib/patchy/gegl"
+                USE_SOURCE_PERMISSIONS)
+      endif()
+      install(DIRECTORY "${PATCHY_AGENT_KIT_DIR}/"
+              DESTINATION "${CMAKE_INSTALL_DATADIR}/patchy/ai")
+      install(FILES "${PATCHY_BUNDLED_SCRIPTS_DIR}/patchy.d.ts"
+                    "${PATCHY_BUNDLED_SCRIPTS_DIR}/scripting-guide.md"
+              DESTINATION "${CMAKE_INSTALL_DATADIR}/patchy/ai/patchy-control/references")
+      # Linux install layout (what the Flatpak build uses): binary in bin/, resources
+      # under share/patchy/ (probed by load_bundled_fonts / translation_directories),
+      # and the freedesktop integration files under share/.
+      install(DIRECTORY "${PATCHY_BUNDLED_FONTS_DIR}/"
+              DESTINATION "${CMAKE_INSTALL_DATADIR}/patchy/fonts")
+      if(EXISTS "${PATCHY_BUNDLED_SCRIPTS_DIR}")
+        install(DIRECTORY "${PATCHY_BUNDLED_SCRIPTS_DIR}/"
+                DESTINATION "${CMAKE_INSTALL_DATADIR}/patchy/scripts")
+      endif()
+      install(FILES ${PATCHY_QM_FILES}
+              DESTINATION "${CMAKE_INSTALL_DATADIR}/patchy/translations")
+      if(PATCHY_AI_SELECTION_BUILT)
+        # The models and their license texts; the ONNX Runtime library itself comes from
+        # the packager (the Flatpak's onnxruntime module installs it into /app/lib).
+        install(FILES ${PATCHY_AI_MODEL_SOURCES} "${PATCHY_AI_LICENSE_FILE}"
+                DESTINATION "${CMAKE_INSTALL_DATADIR}/patchy/ai-models")
+        install(FILES "${PATCHY_ONNXRUNTIME_DIR}/LICENSE"
+                DESTINATION "${CMAKE_INSTALL_DATADIR}/patchy/ai-models" RENAME onnxruntime-LICENSE.txt)
+        install(FILES "${PATCHY_ONNXRUNTIME_DIR}/ThirdPartyNotices.txt"
+                DESTINATION "${CMAKE_INSTALL_DATADIR}/patchy/ai-models" RENAME onnxruntime-ThirdPartyNotices.txt)
+      endif()
+      if(PATCHY_QT_BASE_QM_FILES)
+        install(FILES ${PATCHY_QT_BASE_QM_FILES}
+                DESTINATION "${CMAKE_INSTALL_DATADIR}/patchy/translations")
+      endif()
+      install(FILES "${PROJECT_SOURCE_DIR}/packaging/linux/com.rtsoft.patchy.desktop"
+              DESTINATION "${CMAKE_INSTALL_DATADIR}/applications")
+      install(FILES "${PROJECT_SOURCE_DIR}/packaging/linux/com.rtsoft.patchy.metainfo.xml"
+              DESTINATION "${CMAKE_INSTALL_DATADIR}/metainfo")
+      # Flathub requires each module's license files here; the notice covers the
+      # vendored libraries and the bundled font.
+      install(FILES "${PROJECT_SOURCE_DIR}/LICENSE"
+                    "${PROJECT_SOURCE_DIR}/NOTICE-THIRD-PARTY.md"
+              DESTINATION "${CMAKE_INSTALL_DATADIR}/licenses/com.rtsoft.patchy")
+      if(PATCHY_ENABLE_GMIC)
+        install(FILES "${PROJECT_SOURCE_DIR}/src/filters/gmic/COPYING"
+                DESTINATION "${CMAKE_INSTALL_DATADIR}/licenses/com.rtsoft.patchy" RENAME gmic-COPYING.txt)
+        install(FILES "${PROJECT_SOURCE_DIR}/src/filters/gmic/pocketfft/LICENSE.md"
+                DESTINATION "${CMAKE_INSTALL_DATADIR}/licenses/com.rtsoft.patchy" RENAME pocketfft-LICENSE.md)
+      endif()
+      foreach(icon_size 16 32 48 64 128 256 512)
+        install(FILES "${PROJECT_SOURCE_DIR}/packaging/linux/icons/hicolor/${icon_size}x${icon_size}/apps/com.rtsoft.patchy.png"
+                DESTINATION "${CMAKE_INSTALL_DATADIR}/icons/hicolor/${icon_size}x${icon_size}/apps")
+      endforeach()
+      install(FILES "${PROJECT_SOURCE_DIR}/packaging/branding/patchy-logo-folded.svg"
+              DESTINATION "${CMAKE_INSTALL_DATADIR}/icons/hicolor/scalable/apps"
+              RENAME com.rtsoft.patchy.svg)
+    endif()
+  else()
+    message(STATUS "Qt 6 Widgets was not found; skipping the native Patchy app target.")
+  endif()
+endif()
+
+if(PATCHY_BUILD_TESTS)
+  # One binary, one TU per test group (tests/core/test_groups.hpp lists the groups;
+  # main() concatenates the group vectors in a fixed order — never static self-registration).
+  add_executable(patchy_core_tests
+    tests/core/main.cpp
+    tests/test_harness.cpp
+    tests/core/core_test_support.cpp
+    tests/core/psd_test_support.cpp
+    tests/core/smart_filter_descriptors_test_support.cpp
+    tests/core/adjustments_curves_tests.cpp
+    tests/core/adjustment_preset_files_tests.cpp
+    tests/core/af_tests.cpp
+    tests/core/pdn_tests.cpp
+    tests/core/xcf_tests.cpp
+    tests/core/kra_tests.cpp
+    tests/core/brush_engine_tests.cpp
+    tests/core/composite_corpus_tests.cpp
+    tests/core/compositor_blend_if_tests.cpp
+    tests/core/compositor_layer_styles_tests.cpp
+    tests/core/deep_compositor_tests.cpp
+    tests/core/deep_filter_tests.cpp
+    tests/core/document_model_tests.cpp
+    tests/core/document_ops_filters_tests.cpp
+    tests/core/builtin_filter_looks_tests.cpp
+    tests/core/flat_formats_bmp_tests.cpp
+    tests/core/flat_formats_misc_tests.cpp
+    tests/core/animation_frames_tests.cpp
+    tests/core/decode_budget_tests.cpp
+    tests/core/unicode_path_tests.cpp
+    tests/core/atomic_write_recovery_tests.cpp
+    tests/core/font_zip_tests.cpp
+    tests/core/font_substitutes_tests.cpp
+    tests/core/font_style_class_tests.cpp
+    tests/core/gradients_interior_effects_tests.cpp
+    tests/core/image_trace_tests.cpp
+    tests/core/infra_selection_tests.cpp
+    tests/core/color_range_tests.cpp
+    tests/core/color_replace_tests.cpp
+    tests/core/eraser_tools_tests.cpp
+    tests/core/pipl_tests.cpp
+    tests/core/guide_layout_tests.cpp
+    tests/core/layer_alignment_tests.cpp
+    tests/core/layer_metadata_tests.cpp
+    tests/core/file_info_metadata_tests.cpp
+    tests/core/invisible_watermark_tests.cpp
+    tests/core/trustmark_tests.cpp
+    tests/core/palette_tests.cpp
+    tests/core/pat_asl_abr_tests.cpp
+    tests/core/contour_tests.cpp
+    tests/core/pattern_styles_fixtures_tests.cpp
+    tests/core/photo_develop_tests.cpp
+    tests/core/photo_divide_tests.cpp
+    tests/core/book_scan_tests.cpp
+    tests/core/book_imposition_tests.cpp
+    tests/core/pixel_depth_tests.cpp
+    tests/core/hdr_color_tests.cpp
+    tests/core/pixel_tools_tests.cpp
+    tests/core/red_eye_tests.cpp
+    tests/core/perspective_planes_tests.cpp
+    tests/core/psd_core_io_tests.cpp
+    tests/core/psd_deep_io_tests.cpp
+    tests/core/psd_cmyk_proof_tests.cpp
+    tests/core/rgb_profile_tests.cpp
+    tests/core/psd_structure_tests.cpp
+    tests/core/psd_text_tests.cpp
+    tests/core/psd_legacy_text_tests.cpp
+    tests/core/text_engine_block_tests.cpp
+    tests/core/text_path_tests.cpp
+    tests/core/psd_vector_fixtures_tests.cpp
+    tests/core/psd_writer_stability_tests.cpp
+    tests/core/jxr_tests.cpp
+    tests/core/scan_frame_tests.cpp
+    tests/core/rttex_tests.cpp
+    tests/core/dds_tests.cpp
+    tests/core/ora_tests.cpp
+    tests/core/jxl_tests.cpp
+    tests/core/hdr_display_tests.cpp
+    tests/core/hdr_import_tests.cpp
+    tests/core/raw_heif_tests.cpp
+    tests/core/smart_filter_descriptors_tests.cpp
+    tests/core/smart_filter_distort_stylize_tests.cpp
+    tests/core/smart_filter_descriptors_tests_canonical.cpp
+    tests/core/smart_filter_descriptors_tests_fixtures.cpp
+    tests/core/smart_filter_pixels_tests.cpp
+    tests/core/smart_filter_table_tests.cpp
+    tests/core/smart_filter_adjustment_tests.cpp
+    tests/core/smart_filter_gallery_tests.cpp
+    tests/core/smart_filter_classic_tests.cpp
+    tests/core/stylize_render_filters_tests.cpp
+    tests/core/smart_objects_warp_tests.cpp
+    tests/core/stroke_mask_effects_tests.cpp
+    tests/core/pdf_tests.cpp
+    tests/core/artboard_tests.cpp
+    tests/core/svg_tests.cpp
+    tests/core/css_layer_export_tests.cpp
+    tests/core/vector_raster_tests.cpp
+    tests/core/vector_shape_tests.cpp
+    tests/core/path_edits_tests.cpp
+    tests/core/translation_marker_tests.cpp
+    tests/core/ui_color_literal_tests.cpp
+    tests/core/floating_selection_tests.cpp
+    tests/core/ai_selection_tests.cpp
+    tests/core/gmic_tests.cpp
+    tests/core/tiff_layers_tests.cpp
+    tests/core/tiff_flat_tests.cpp
+  )
+  target_link_libraries(patchy_core_tests PRIVATE patchy_gmic)
+  # jxl_tests.cpp builds unusual source files (PQ, gray, premultiplied) straight through libjxl.
+  target_link_libraries(patchy_core_tests PRIVATE patchy_jxl)
+  # hdr_import_tests.cpp encodes PQ and HLG AVIF sources straight through libavif.
+  if(NOT EMSCRIPTEN)
+    target_link_libraries(patchy_core_tests PRIVATE patchy_avif)
+    target_compile_definitions(patchy_core_tests PRIVATE PATCHY_TEST_LIBAVIF=1)
+  endif()
+  # The split TUs live in tests/core/ but repeat the historical test_main.cpp
+  # include block ("test_harness.hpp" etc.), so tests/ must be on the include path.
+  target_include_directories(patchy_core_tests PRIVATE tests)
+  target_link_libraries(patchy_core_tests PRIVATE
+    patchy_core
+    patchy_ai
+    patchy_render
+    patchy_psd
+    patchy_plugins
+    patchy_filters
+    patchy_formats
+    patchy_color
+  )
+  patchy_configure_target(patchy_core_tests)
+  # No Q_OBJECT in the core suite: skip its moc scan.
+  set_target_properties(patchy_core_tests PROPERTIES AUTOMOC OFF)
+  target_compile_definitions(patchy_core_tests PRIVATE PATCHY_SOURCE_DIR="${PROJECT_SOURCE_DIR}")
+  if(WIN32)
+    # The legacy host self-tests run the helper executables next to the binary.
+    add_dependencies(patchy_core_tests patchy-8bf-host64 patchy_8bf_host32)
+  endif()
+  patchy_copy_ai_runtime(patchy_core_tests)
+  add_test(NAME patchy_core_tests COMMAND patchy_core_tests)
+
+  if(PATCHY_BUILD_APP AND Qt6_FOUND)
+    add_test(NAME patchy_translation_validator_tests
+      COMMAND "${Python3_EXECUTABLE}" "${PROJECT_SOURCE_DIR}/tests/translation_validator_tests.py"
+              --lupdate $<TARGET_FILE:Qt6::lupdate> --cmake "${CMAKE_COMMAND}")
+    add_test(NAME patchy_build_graph_tests
+      COMMAND "${Python3_EXECUTABLE}" "${PROJECT_SOURCE_DIR}/tests/build_graph_tests.py"
+              --cmake "${CMAKE_COMMAND}" --ninja "${CMAKE_MAKE_PROGRAM}")
+    # Unguarded QTimer::singleShot CHECKs and sub-minute wall-clock CHECKs (docs/testing.md).
+    add_test(NAME patchy_test_source_lint
+      COMMAND "${Python3_EXECUTABLE}" "${PROJECT_SOURCE_DIR}/scripts/lint-test-sources.py")
+    # One binary; per-group TUs live in tests/ui/ (tests/ui/ui_test_groups.hpp lists
+    # the groups; main() concatenates the group vectors in a fixed order — never
+    # static self-registration).
+    add_executable(patchy_ui_visual_tests
+      tests/ui/main.cpp
+      tests/ui/brush_pattern_palette_test_support.cpp
+      tests/ui/destructive_filters_gallery_test_support.cpp
+      tests/ui/smart_filter_test_support.cpp
+      tests/ui/readme_screenshot_test_support.cpp
+      tests/ui/app_shell_tests.cpp
+      tests/ui/app_shell_tests_workspace.cpp
+      tests/ui/app_shell_tests_updates_preferences.cpp
+      tests/ui/app_shell_tests_language_chrome.cpp
+      tests/ui/app_shell_tests_theme_status.cpp
+      tests/ui/font_coverage_tests.cpp
+      tests/ui/missing_fonts_tests.cpp
+      tests/ui/filter_catalog_dialog_tests.cpp
+      tests/ui/stylize_render_filters_ui_tests.cpp
+      tests/ui/filter_dialog_selection_tests.cpp
+      tests/ui/color_range_tests.cpp
+      tests/ui/color_replace_tests.cpp
+      tests/ui/eraser_tools_tests.cpp
+      tests/ui/layer_style_gradient_tests.cpp
+      tests/ui/layer_style_gradient_tests_effects.cpp
+      tests/ui/layer_style_gradient_tests_presets.cpp
+      tests/ui/destructive_filters_gallery_tests.cpp
+      tests/ui/destructive_filters_gallery_tests_dialogs_recipes.cpp
+      tests/ui/destructive_filters_gallery_tests_browse_controls.cpp
+      tests/ui/pickers_notices_hotkeys_tests.cpp
+      tests/ui/hotkey_sets_tests.cpp
+      tests/ui/tool_modifier_style_tests.cpp
+      tests/ui/canvas_view_tools_tests.cpp
+      tests/ui/view_rotation_tests.cpp
+      tests/ui/layer_context_lifecycle_tests.cpp
+      tests/ui/layer_export_tests.cpp
+      tests/ui/layer_menu_commands_tests.cpp
+      tests/ui/brush_pattern_palette_tests.cpp
+      tests/ui/brush_pattern_palette_tests_patterns_palette.cpp
+      tests/ui/brush_pattern_palette_tests_brush_dynamics.cpp
+      tests/ui/layer_panel_organization_tests.cpp
+      tests/ui/layer_panel_organization_tests_animation.cpp
+      tests/ui/layer_panel_organization_tests_cross_document.cpp
+      tests/ui/layer_panel_organization_tests_files_as_layers.cpp
+      tests/ui/layer_effect_rows_tests.cpp
+      tests/ui/move_tool_processing_overlay_tests.cpp
+      tests/ui/move_transform_zones_tests.cpp
+      tests/ui/shape_resize_handles_tests.cpp
+      tests/ui/free_transform_distort_tests.cpp
+      tests/ui/free_transform_selection_tests.cpp
+      tests/ui/move_selected_pixels_tests.cpp
+      tests/ui/alignment_tests.cpp
+      tests/ui/selection_marquee_lasso_tests.cpp
+      tests/ui/selection_marquee_lasso_tests_marquee_geometry.cpp
+      tests/ui/selection_marquee_lasso_tests_regions_lasso.cpp
+      tests/ui/crop_tool_tests.cpp
+      tests/ui/ruler_tool_tests.cpp
+      tests/ui/gradient_fill_handles_tests.cpp
+      tests/ui/shape_appearance_panel_tests.cpp
+      tests/ui/drag_coalescing_tests.cpp
+      tests/ui/view_shortcut_keys_tests.cpp
+      tests/ui/tool_palette_customize_tests.cpp
+      tests/ui/layer_row_options_tests.cpp
+      tests/ui/layer_eye_icon_tests.cpp
+      tests/ui/unit_spin_box_tests.cpp
+      tests/ui/clipboard_free_transform_tests.cpp
+      tests/ui/deep_operation_audit_tests.cpp
+      tests/ui/group_transform_tests.cpp
+      tests/ui/channels_panel_tests.cpp
+      tests/ui/camera_raw_filter_tests.cpp
+      tests/ui/camera_raw_heif_tests.cpp
+      tests/ui/layer_mask_tests.cpp
+      tests/ui/pen_tablet_input_tests.cpp
+      tests/ui/brush_engine_stroke_tests.cpp
+      tests/ui/brush_engine_stroke_tests_healing_patch.cpp
+      tests/ui/brush_engine_stroke_tests_strokes.cpp
+      tests/ui/toning_brush_tests.cpp
+      tests/ui/text_editor_font_picker_tests.cpp
+      tests/ui/font_picker_filter_tests.cpp
+      tests/ui/psd_text_import_tests.cpp
+      tests/ui/text_transform_commit_tests.cpp
+      tests/ui/text_transform_commit_tests_transform.cpp
+      tests/ui/text_transform_commit_tests_psd_commit.cpp
+      tests/ui/text_transform_commit_tests_flip.cpp
+      tests/ui/text_vertical_rtl_tests.cpp
+      tests/ui/text_rtl_psd_tests.cpp
+      tests/ui/text_area_tests.cpp
+      tests/ui/text_path_tests.cpp
+      tests/ui/text_canvas_session_tests.cpp
+      tests/ui/text_color_targets_tests.cpp
+      tests/ui/text_character_styles_tests.cpp
+      tests/ui/text_run_language_tests.cpp
+      tests/ui/text_options_bar_toggles_tests.cpp
+      tests/ui/flat_image_format_tests.cpp
+      tests/ui/smart_filter_tests.cpp
+      tests/ui/smart_filter_tests_flows.cpp
+      tests/ui/smart_filter_tests_classic.cpp
+      tests/ui/smart_filter_tests_scripting.cpp
+      tests/ui/smart_filter_tests_guards.cpp
+      tests/ui/smart_filter_tests_kinds.cpp
+      tests/ui/smart_filter_tests_schema.cpp
+      tests/ui/smart_filter_tests_table.cpp
+      tests/ui/smart_filter_tests_adjustments.cpp
+      tests/ui/smart_filter_tests_gallery.cpp
+      tests/ui/smart_object_tests.cpp
+      tests/ui/warp_tests.cpp
+      tests/ui/import_print_resolution_tests.cpp
+      tests/ui/import_print_resolution_test_support.cpp
+      tests/ui/import_print_resolution_tests_import_export.cpp
+      tests/ui/import_print_resolution_tests_pdf.cpp
+      tests/ui/import_print_resolution_tests_pdf_upgrade.cpp
+      tests/ui/import_print_resolution_tests_geometry_rendering.cpp
+      tests/ui/divide_photos_tests.cpp
+      tests/ui/book_scan_tests.cpp
+      tests/ui/pdf_viewer_tests.cpp
+      tests/ui/folder_open_export_tests.cpp
+      tests/ui/artboard_tests.cpp
+      tests/ui/image_adjustments_curves_tests.cpp
+      tests/ui/adjustment_presets_tests.cpp
+      tests/ui/contour_editor_tests.cpp
+      tests/ui/selection_engines_tests.cpp
+      tests/ui/ai_selection_tests.cpp
+      tests/ui/misc_visuals_outline_stress_tests.cpp
+      tests/ui/float_window_tests.cpp
+      tests/ui/document_rename_tests.cpp
+      tests/ui/vector_shape_tool_tests.cpp
+      tests/ui/vector_mask_editing_tests.cpp
+      tests/ui/batch_appearance_tests.cpp
+      tests/ui/vector_preview_tests.cpp
+      tests/ui/vector_preview_parity_tests.cpp
+      tests/ui/vector_point_editing_tests.cpp
+      tests/ui/vector_commands_tests.cpp
+      tests/ui/vector_path_edits_tests.cpp
+      tests/ui/layer_merge_tests.cpp
+      tests/ui/layer_filter_menu_tests.cpp
+      tests/ui/vector_scripting_tests.cpp
+      tests/ui/svg_ui_tests.cpp
+      tests/ui/ora_ui_tests.cpp
+      tests/ui/xcf_ui_tests.cpp
+      tests/ui/kra_ui_tests.cpp
+      tests/ui/image_trace_ui_tests.cpp
+      tests/ui/text_outline_tests.cpp
+      tests/ui/type_mask_tests.cpp
+      tests/ui/no_layer_warning_tests.cpp
+      tests/ui/scripting_tests.cpp
+      tests/ui/scripting_test_support.cpp
+      tests/ui/scripting_tests_mutations_text.cpp
+      tests/ui/scripting_tests_color_formats.cpp
+      tests/ui/scripting_tests_manager_automation.cpp
+      tests/ui/script_pixel_io_tests.cpp
+      tests/ui/script_move_tests.cpp
+      tests/ui/document_recovery_tests.cpp
+      tests/ui/mcp_tests.cpp
+      tests/ui/companion_tests.cpp
+      tests/ui/single_instance_tests.cpp
+      tests/ui/openai_images_tests.cpp
+      tests/ui/unicode_path_tests.cpp
+      tests/ui/legacy_plugin_tests.cpp
+      tests/ui/gegl_filter_tests.cpp
+      tests/ui/gmic_tests.cpp
+      tests/ui/combo_fit_tests.cpp
+      tests/ui/history_panel_tests.cpp
+      tests/ui/color_dock_panel_tests.cpp
+      tests/ui/hdr_color_choice_tests.cpp
+      tests/ui/clone_source_tests.cpp
+      tests/ui/brush_adjust_pointer_lock_tests.cpp
+      tests/ui/history_stroke_patch_tests.cpp
+      tests/ui/file_info_tests.cpp
+      tests/ui/web_export_tests.cpp
+      tests/ui/rgb_profile_tests.cpp
+      tests/ui/new_document_options_tests.cpp
+      tests/ui/watermark_tests.cpp
+      tests/ui/watermark_preferences_tests.cpp
+      tests/ui/ui_text_size_tests.cpp
+      tests/ui/save_metadata_tests.cpp
+      tests/ui/layered_tiff_tests.cpp
+      tests/ui/perspective_planes_ui_tests.cpp
+      tests/ui/appimage_menu_entry_tests.cpp
+      tests/ui/open_with_registration_tests.cpp
+      tests/ui/composite_render_tests.cpp
+      tests/ui/theme_package_tests.cpp
+      tests/ui/theme_script_tests.cpp
+      tests/ui/theme_guide_screenshot_tests.cpp
+      tests/ui/painted_chrome_scheme_tests.cpp
+      tests/ui/readme_screenshot_tests.cpp
+      tests/ui/readme_screenshot_tests_classic.cpp
+      tests/ui/readme_screenshot_tests_scripting.cpp
+      tests/ui/readme_screenshot_tests_showcase.cpp
+      tests/ui/readme_screenshot_tests_features.cpp
+    )
+    # The split TUs live in tests/ui/ but repeat the historical monolith include
+    # block ("test_harness.hpp" etc.), so tests/ must be on the include path.
+    target_include_directories(patchy_ui_visual_tests PRIVATE tests)
+    # Qt6::Test provides QTest::keyClick for tests that must go through real event
+    # dispatch (QShortcutMap contention) instead of QApplication::sendEvent.
+    target_link_libraries(patchy_ui_visual_tests PRIVATE patchy_ui Qt6::Test patchy_ui_test_shared)
+    # QPdfDocument is the independent decoder the PDF export tests verify against, and
+    # patchy_ui links Qt PDF privately, so the tests ask for the headers themselves.
+    if(TARGET Qt6::Pdf)
+      target_link_libraries(patchy_ui_visual_tests PRIVATE Qt6::Pdf)
+    endif()
+    # The portal color pick test delivers a real D-Bus Response over a peer connection
+    # (QDBusServer); patchy_ui links Qt D-Bus privately.
+    if(UNIX AND NOT APPLE AND TARGET Qt6::DBus)
+      target_link_libraries(patchy_ui_visual_tests PRIVATE Qt6::DBus)
+    endif()
+    patchy_configure_target(patchy_ui_visual_tests)
+    target_compile_options(patchy_ui_visual_tests PRIVATE $<$<CXX_COMPILER_ID:MSVC>:/bigobj>)
+    target_compile_definitions(patchy_ui_visual_tests PRIVATE
+      PATCHY_SOURCE_DIR="${PROJECT_SOURCE_DIR}"
+      PATCHY_LUPDATE_MANIFEST="${PATCHY_LUPDATE_MANIFEST}"
+      PATCHY_PYTHON_EXECUTABLE="${Python3_EXECUTABLE}")
+    patchy_copy_translations(patchy_ui_visual_tests)
+    patchy_copy_qt_runtime(patchy_ui_visual_tests)
+    patchy_copy_bundled_fonts(patchy_ui_visual_tests)
+    patchy_copy_bundled_scripts(patchy_ui_visual_tests)
+    patchy_copy_ai_runtime(patchy_ui_visual_tests)
+    add_test(NAME patchy_ui_visual_tests COMMAND patchy_ui_visual_tests)
+    set_tests_properties(patchy_ui_visual_tests PROPERTIES ENVIRONMENT "QT_QPA_PLATFORM=offscreen")
+
+    add_executable(patchy_curves_clipping_preview_tests
+      tests/curves_clipping_preview_tests.cpp
+      tests/test_harness.cpp
+    )
+    target_link_libraries(patchy_curves_clipping_preview_tests PRIVATE patchy_ui)
+    patchy_configure_target(patchy_curves_clipping_preview_tests)
+    patchy_copy_translations(patchy_curves_clipping_preview_tests)
+    patchy_copy_qt_runtime(patchy_curves_clipping_preview_tests)
+    patchy_copy_bundled_fonts(patchy_curves_clipping_preview_tests)
+    add_test(NAME patchy_curves_clipping_preview_tests
+             COMMAND patchy_curves_clipping_preview_tests)
+
+    add_executable(patchy_perf_tests
+      tests/perf_tests.cpp
+      tests/perf_startup.cpp
+      tests/test_harness.cpp
+    )
+    target_link_libraries(patchy_perf_tests PRIVATE patchy_ui)
+    # The startup scenario launches the app beside it (docs/startup-performance.md).
+    if(TARGET patchy)
+      add_dependencies(patchy_perf_tests patchy)
+    endif()
+    # The pdfopen scenario times QPdfDocument directly (the cost of the import dialog
+    # thumbnails); patchy_ui links Qt PDF privately.
+    if(TARGET Qt6::Pdf)
+      target_link_libraries(patchy_perf_tests PRIVATE Qt6::Pdf)
+    endif()
+    patchy_configure_target(patchy_perf_tests)
+    target_compile_definitions(patchy_perf_tests PRIVATE PATCHY_SOURCE_DIR="${PROJECT_SOURCE_DIR}")
+    patchy_copy_translations(patchy_perf_tests)
+    patchy_copy_qt_runtime(patchy_perf_tests)
+    patchy_copy_bundled_fonts(patchy_perf_tests)
+    add_test(NAME patchy_perf_tests COMMAND patchy_perf_tests)
+
+    # GitHub issue 95: the patched cocoa plugin's table-cell lifetime. Needs the real
+    # cocoa platform, so it is not a ctest; scripts/remote/build-and-test.sh runs it with
+    # the plugin from scripts/setup-qt-cocoa-patch-mac.sh (docs/building-qt.md).
+    if(APPLE)
+      add_executable(patchy_mac_a11y_tests tests/macos/cocoa_a11y_cell_lifetime_test.mm)
+      target_link_libraries(patchy_mac_a11y_tests PRIVATE Qt6::Widgets "-framework AppKit")
+      patchy_configure_target(patchy_mac_a11y_tests)
+    endif()
+  endif()
+endif()
+
+# The test executables never ship, and their whole-program LTCG links dominated a
+# release rebuild. Like patchy_translation_checks they link with incremental LTCG
+# (state in <target>.iobj): objects stay /GL, so the tests still run link-time
+# optimized code. patchy, patchy-mcp and the plug-in hosts keep full /LTCG.
+# See docs/building.md.
+if(MSVC)
+  foreach(ltcg_test_target patchy_core_tests patchy_ui_visual_tests
+                           patchy_curves_clipping_preview_tests patchy_perf_tests)
+    if(TARGET ${ltcg_test_target})
+      target_link_options(${ltcg_test_target} PRIVATE $<$<CONFIG:Release>:/LTCG:INCREMENTAL>)
+    endif()
+  endforeach()
+endif()
+
+# Configure PCHs only after source-specific options have been attached. Keep the
+# no-PCH preset as an include-hygiene check and for comparative measurements.
+foreach(pch_target patchy_ui patchy_translation_checks patchy_ui_visual_tests patchy_ui_test_shared patchy_perf_tests)
+  if(TARGET ${pch_target})
+    patchy_enable_ui_pch(${pch_target})
+  endif()
+endforeach()
+if(TARGET patchy_core_tests)
+  patchy_enable_core_pch(patchy_core_tests)
+endif()

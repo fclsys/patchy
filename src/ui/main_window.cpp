@@ -1,0 +1,15419 @@
+#include <QSplitter>
+#include <QWindow>
+#include "ui/main_window.hpp"
+
+#include "ui/shape_pixel_options.hpp"
+#include "ui/quick_mask_trace.hpp"
+#include "ui/options_flow_layout.hpp"
+#include "support/startup_trace.hpp"
+#include "ui/panel_column.hpp"
+#include "ui/brush_tip_library.hpp"
+#include "ui/gradient_stops_editor.hpp"
+#include <QMenuBar>
+#include <QStatusBar>
+#include "core/vector_shape.hpp"
+#include "core/layer.hpp"
+#include "core/pixel_buffer.hpp"
+#include "core/rect_utils.hpp"
+#include "color/color_management.hpp"
+#include "core/palette.hpp"
+#include "core/font_substitutes.hpp"
+#include "ui/canvas_types.hpp"
+#include "ui/canvas_widget.hpp"
+#include "ui/alpha_row_bands.hpp"
+#include "ui/canvas_widget_shared.hpp"
+#include "ui/main_window_shared.hpp"
+#include "ui/background_workers.hpp"
+#include "ui/document_recovery_coordinator.hpp"
+#include "ui/text_font_service.hpp"
+#include "ui/text_document.hpp"
+#include "ui/text_paragraph_metrics.hpp"
+#include "ui/text_render.hpp"
+
+#include "core/layer_metadata.hpp"
+#include "core/pixel_grid.hpp"
+#include "core/smart_object.hpp"
+#include "core/text_warp.hpp"
+#include "core/warp_mesh.hpp"
+#include "core/layer_render_utils.hpp"
+#include "core/layer_tree.hpp"
+#include "filters/builtin_filters.hpp"
+#include "formats/xcf_document_io.hpp"
+#include "filters/filter_engine.hpp"
+#include "ui/action_icons.hpp"
+#include "ui/app_settings.hpp"
+#include "ui/brush_dynamics_popup.hpp"
+#include "ui/brush_tip_picker.hpp"
+#include "ui/brush_tip_manager_dialog.hpp"
+#include "ui/image_document_io.hpp"
+#include "ui/localization.hpp"
+#include "ui/filter_workflows.hpp"
+#include "ui/dialog_utils.hpp"
+#include "ui/theme_palette.hpp"
+#include "ui/tool_cursors.hpp"
+#include <qlatin1stringview.h>
+#include <QAbstractSpinBox>
+#include <QAction>
+#include <QApplication>
+#include <QBrush>
+#include <QButtonGroup>
+#include <QByteArray>
+#include <QChar>
+#include <QCheckBox>
+#include <QClipboard>
+#include <QCloseEvent>
+#include <QColor>
+#include <QComboBox>
+#include <QContextMenuEvent>
+#include <QCoreApplication>
+#include <QCursor>
+#include <QDateTime>
+#include <QDialog>
+#include <QDoubleSpinBox>
+#include <QDragEnterEvent>
+#include <QDragMoveEvent>
+#include <QDropEvent>
+#include <QElapsedTimer>
+#include <QProgressDialog>
+#include <QEvent>
+#include <QEventLoop>
+#include <QFileInfo>
+#include <QFocusEvent>
+#include <QFont>
+#include <QFontDatabase>
+#include <QFontMetricsF>
+#include <QFormLayout>
+#include <QFrame>
+#include <QGuiApplication>
+#include <QHash>
+#include <QImage>
+#include <QInputMethodEvent>
+#include <QKeyEvent>
+#include <QKeySequence>
+#include <QLabel>
+#include <QLatin1Char>
+#include <QLatin1String>
+#include <QLineEdit>
+#include <QList>
+#include <QMainWindow>
+#include <QMenu>
+#include <QMessageBox>
+#include <QMimeData>
+#include <QMouseEvent>
+#include <QObject>
+#include <QOverload>
+#include <QPaintEvent>
+#include <QPainter>
+#include <QPainterPath>
+#include <QPalette>
+#include <QPen>
+#include <QPlainTextEdit>
+#include <QPoint>
+#include <QPointF>
+#include <QPointer>
+#include <QPointingDevice>
+#include <QPolygon>
+#include <QPolygonF>
+#include <QPushButton>
+#include <QRawFont>
+#include <QRect>
+#include <QRectF>
+#include <QRegion>
+#include <QScopeGuard>
+#include <QScrollBar>
+#include <QShortcut>
+#include <QSignalBlocker>
+#include <QSize>
+#include <QSizeF>
+#include <QSpinBox>
+#include <QStandardItemModel>
+#include <QString>
+#include <QStringList>
+#include <QStringLiteral>
+#include <QStringView>
+#include <QStyle>
+#include <QTabBar>
+#include <QTabWidget>
+#include <QTextBlock>
+#include <QTextBlockFormat>
+#include <QTextCharFormat>
+#include <QTextCursor>
+#include <QTextDocument>
+#include <QTextEdit>
+#include <QTextFormat>
+#include <QTextOption>
+#include <QTimer>
+#include <QActionGroup>
+#include <QSet>
+#include <QHBoxLayout>
+#include <QToolButton>
+#include <QToolTip>
+#include <QTransform>
+#include <QVariant>
+#include <QVariantList>
+#include <QWheelEvent>
+#include <QWidget>
+#include <Qt>
+#include <QtGlobal>
+#include <vector>
+#include "ui/update_installer.hpp"
+#include "ui/unit_spin_box.hpp"
+#ifdef Q_OS_WASM
+#include "ui/dialog_utils_wasm.hpp"
+#include "ui/wasm_event_guard.hpp"
+#include "ui/wasm_memory_telemetry.hpp"
+#endif
+#ifndef Q_OS_WASM
+#include "ui/gegl_filters.hpp"
+#endif
+#include "ui/document_float_window.hpp"
+#include "ui/font_picker.hpp"
+#include "ui/hotkey_editor.hpp"
+#include "ui/tool_modifier_style.hpp"
+#include "ui/edit_conversions.hpp"
+#include "ui/color_dock_panel.hpp"
+#include "ui/color_panel.hpp"
+#include "ui/layer_style_dialog.hpp"
+#include "ui/layer_list_widget.hpp"
+#include "ui/layer_merge.hpp"
+#include "ui/measurement_units.hpp"
+#include "ui/palette_panel.hpp"
+#include "ui/paths_panel.hpp"
+#include "ui/memory_info.hpp"
+#include "ui/pdf_export.hpp"
+#include "ui/print_dialog.hpp"
+#include "ui/smart_object_render.hpp"
+#include "ui/scanner_import.hpp"
+#include "ui/script_folders.hpp"
+#include "ui/start_panel.hpp"
+#include "ui/text_layer_painter.hpp"
+#include "ui/text_layout.hpp"
+#include "ui/text_area_layout.hpp"
+#include "core/text_area.hpp"
+#include "core/text_path.hpp"
+#include "core/pixel_depth.hpp"
+#include "ui/animation_preview_window.hpp"
+#include "ui/tile_preview_window.hpp"
+#include "ui/warp_text_dialog.hpp"
+#include "ui/qt_geometry.hpp"
+#include "ui/splash_dialog.hpp"
+#include "ui/update_checker.hpp"
+#include "ui/status_document_info.hpp"
+#include "ui/zoom_status_bar.hpp"
+#include "ui/tool_palette_footer.hpp"
+#include "ui/theme_manager.hpp"
+#include "ui/theme_qss.hpp"
+
+
+#include <algorithm>
+#include <thread>
+#include <deque>
+#include <array>
+#include <chrono>
+#include <cstddef>
+#include <cstdint>
+#include <cmath>
+#include <cstdlib>
+#include <exception>
+#include <functional>
+#include <future>
+#include <iostream>
+#include <iterator>
+#include <limits>
+#include <memory>
+#include <optional>
+#include <set>
+#include <sstream>
+#include <string>
+#include <string_view>
+#include <utility>
+
+#ifdef Q_OS_WIN
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+
+#endif
+
+// Icon resources live in the static patchy_ui library; force registration before first use.
+int qInitResources_icons();
+
+namespace patchy::ui {
+
+namespace {
+
+constexpr int kLayerOpacityApplyDelayMs = 33;
+constexpr int kLayerOpacityIdleFinishDelayMs = 250;
+// Longer than the opacity pause: people read each mode name between arrow presses.
+constexpr int kLayerBlendIdleFinishDelayMs = 1000;
+// Tool-option sliders apply to the canvas live but persist to disk only this
+// long after the last change, so dragging a slider does not write the whole
+// settings file on every intermediate value.
+constexpr int kToolSettingsSaveDelayMs = 250;
+
+
+constexpr auto kTextEditorAreaProperty = "patchy.documentTextArea";
+
+std::optional<VectorPath> text_editor_area(const QTextEdit& editor) {
+  auto area = parse_vector_path(editor.property(kTextEditorAreaProperty).toString().toStdString());
+  return area && valid_text_area(*area) ? std::move(area) : std::nullopt;
+}
+
+// Text along a path (docs/path-text.md): the session's contour in text-local coordinates and
+// the range its line is set in. Excludes the area contour.
+constexpr auto kTextEditorPathProperty = "patchy.documentTextPath";
+constexpr auto kTextEditorPathRangeProperty = "patchy.documentTextPathRange";
+
+bool text_editor_is_vertical(const QTextEdit& editor);
+
+std::optional<TextPathFrame> text_editor_path(const QTextEdit& editor) {
+  const auto serialized = editor.property(kTextEditorPathProperty).toString();
+  // Vertical type is not set on paths: a session switched to vertical is plain vertical text in
+  // the contour's bounds, and its commit drops the path (store_patchy_text_metadata).
+  if (serialized.isEmpty() || text_editor_is_vertical(editor)) {
+    return std::nullopt;
+  }
+  auto path = parse_vector_path(serialized.toStdString());
+  if (!path || !valid_text_path(*path)) {
+    return std::nullopt;
+  }
+  const auto range = parse_text_path_range(editor.property(kTextEditorPathRangeProperty).toString().toStdString());
+  const auto normalized = normalized_text_path_range(*path, range.value_or(full_text_path_range(*path)));
+  return TextPathFrame{std::move(*path), normalized};
+}
+
+void set_text_editor_path_properties(QTextEdit& editor, const std::optional<TextPathFrame>& frame) {
+  if (frame.has_value()) {
+    editor.setProperty(kTextEditorPathProperty, QString::fromStdString(serialize_vector_path(frame->path)));
+    editor.setProperty(kTextEditorPathRangeProperty,
+                       QString::fromStdString(serialize_text_path_range(frame->range)));
+  } else {
+    editor.setProperty(kTextEditorPathProperty, QVariant());
+    editor.setProperty(kTextEditorPathRangeProperty, QVariant());
+  }
+}
+
+// True for a session whose lines an owned contour places (area text or path text): it edits
+// through the transformed overlay and has no rectangular frame to resize or turn.
+bool text_editor_has_contour(const QTextEdit& editor) {
+  return text_editor_area(editor).has_value() || text_editor_path(editor).has_value();
+}
+
+// The session's area contour or path, onto the settings a render or a layout is built from.
+void apply_text_editor_contour(TextToolSettings& settings, const QTextEdit& editor) {
+  settings.area = text_editor_area(editor);
+  if (auto frame = text_editor_path(editor)) {
+    settings.path = std::move(frame->path);
+    settings.path_range = frame->range;
+  }
+}
+
+// The session's path line plan over its cached 1:1 layout; nothing for other sessions.
+std::optional<TextPathLinePlan> text_editor_path_line_plan(const QTextEdit& editor,
+                                                           const QTextDocument& layout_document) {
+  const auto frame = text_editor_path(editor);
+  if (!frame.has_value()) {
+    return std::nullopt;
+  }
+  auto plan = text_path_line_plan(layout_document, frame->path, frame->range);
+  return plan.valid ? std::optional<TextPathLinePlan>(std::move(plan)) : std::nullopt;
+}
+
+constexpr auto kTextEditorOrientationProperty = "patchy.documentTextOrientation";
+// Document-space point the vertical layout's Photoshop anchor stays pinned to for the session
+// (the click for a new layer, the layer's own anchor for a re-edit): vertical text grows LEFT
+// and, for centred/bottom text, UP, so the widget origin has to move as the layout grows.
+constexpr auto kTextEditorVerticalAnchorProperty = "patchy.verticalAnchor";
+
+bool text_editor_is_vertical(const QTextEdit& editor) {
+  return editor.property(kTextEditorOrientationProperty).toString() == QLatin1String(kTextOrientationVertical);
+}
+
+// Caret bars are thin ACROSS the reading direction: a horizontal caret gets its width, a
+// vertical one (em wide, one pixel tall from the layout) its height.
+void apply_text_caret_thickness(QRect& caret, int thickness, bool vertical) {
+  if (vertical) {
+    caret.setHeight(thickness);
+  } else {
+    caret.setWidth(thickness);
+  }
+}
+
+constexpr auto kTextEditorPreviewEnabledProperty = "patchy.textPreviewEnabled";
+constexpr auto kTextEditorPreviewExpensiveProperty = "patchy.expensiveTextStylePreview";
+constexpr auto kTextEditorPreviewGenerationProperty = "patchy.textPreviewGeneration";
+constexpr auto kTextEditorPreviewPaintProperty = "patchy.previewPaintsText";
+constexpr auto kTextEditorPreviewCaretProperty = "patchy.previewCaretRect";
+constexpr auto kTextEditorPreviewSelectionProperty = "patchy.previewSelectionRects";
+constexpr auto kTextEditorTransformedOverlayProperty = "patchy.transformedPreviewOverlayActive";
+// The input method's uncommitted composition (the kana being typed before the IME commits it).
+// Qt keeps it in the widget's preedit layer, outside the document, so every render document
+// built from the editor has to add it back or the user types blind until the IME commits.
+constexpr auto kTextEditorPreeditTextProperty = "patchy.preeditText";
+constexpr auto kTextEditorPreeditCursorProperty = "patchy.preeditCursor";
+constexpr auto kTextEditorChangedProperty = "patchy.textEditorChanged";
+constexpr auto kTextEditorSourceRasterPreviewProperty = "patchy.sourceRasterPreview";
+constexpr auto kTextEditorForceBakedPreviewProperty = "patchy.forceBakedPreview";
+constexpr auto kTextEditorTransformOverrideProperty = "patchy.textTransformOverride";
+constexpr auto kTextEditorSourceVisibleAnchorProperty = "patchy.sourceVisibleAnchor";
+constexpr auto kTextEditorSourceVisibleSizeProperty = "patchy.sourceVisibleSize";
+// Fraction (line start minus its whole-pixel rounding, in [-0.5, 0.5)) of the imported layer's
+// Photoshop line start, from the TySh anchor and advance box. The source raster's ink column
+// is already whole, so the anchor pin would otherwise lose it; the re-render needs it because
+// Photoshop rounds every glyph from the UNROUNDED start (docs/text-render-calibration-pixel-grid.md).
+constexpr auto kTextEditorSourceLineStartFractionProperty = "patchy.sourceLineStartFraction";
+// The session-start render's ink offset from its text-local origin (visible top-left plus
+// local_rect.topLeft()) and its first baseline in local units. The anchor pin places the
+// origin (the pen) from these, not from each new render's ink, so a style that grows the ink
+// elsewhere (a superscript, faux bold's stroke) leaves the rest of the line where it was.
+constexpr auto kTextEditorSourceInkOffsetProperty = "patchy.sourceInkOffset";
+constexpr auto kTextEditorSourceFirstBaselineProperty = "patchy.sourceFirstBaseline";
+// Photoshop's first baseline in document pixels (the TySh anchor's y, when it is a whole pixel)
+// for a horizontal point-text layer that still shows Photoshop's raster. The session-start pin
+// puts this baseline there instead of matching ink tops: a faint antialiased row above Patchy's
+// glyphs counted as ink and dropped most re-rendered words a pixel (GitHub issue 686).
+constexpr auto kTextEditorSourceDocumentBaselineProperty = "patchy.sourceDocumentBaseline";
+constexpr auto kTextEditorVisibleLocalRectProperty = "patchy.textVisibleLocalRect";
+constexpr auto kTextEditorRenderLocalRectProperty = "patchy.textRenderLocalRect";
+constexpr auto kTextEditorExtendedBoxPreviewProperty = "patchy.extendedBoxPreview";
+constexpr auto kTextEditorLineAwareBoxPreviewProperty = "patchy.lineAwareBoxPreview";
+constexpr auto kTextEditorMetricScaleProperty = "patchy.textMetricScale";
+constexpr auto kTextEditorProvisionalLayerProperty = "patchy.provisionalTextLayerId";
+// A Type Mask session (GitHub issue 670; docs/type-mask.md): its commit makes a selection and
+// no layer, Esc always cancels. The int property holds the selection combine (0 replace,
+// 1 add, 2 subtract, 3 intersect) the opening press's modifiers chose.
+constexpr auto kTextEditorTypeMaskProperty = "patchy.typeMask";
+constexpr auto kTextEditorTypeMaskOperationProperty = "patchy.typeMaskOperation";
+// Whether a box session offers the corner rotate zones (the #684 follow-up; set by
+// MainWindow::text_editor_box_rotatable, read by the flat zones and the overlay).
+constexpr auto kTextEditorRotateZonesProperty = "patchy.textBoxRotateZones";
+// The Move tool's reach beside a transform box corner (canvas_widget_transform.cpp,
+// kCornerRotateReach): a press within it, outside the box and its resize zones, rotates.
+constexpr double kTextBoxCornerRotateReach = 28.8;
+// Marks the empty text layer inserted the moment the Type tool starts a NEW edit (Photoshop
+// shows the layer immediately); commit/cancel remove it again, and the marker is the identity
+// check so a stale id can never delete an unrelated layer (layer ids restart per document).
+constexpr auto kLayerMetadataProvisionalTextMarker = "patchy.internal.provisional_text";
+constexpr auto kTransformedTextEditOverlayObjectName = "transformedTextEditOverlay";
+constexpr auto kTextFlowPoint = "point";
+constexpr auto kTextFlowBox = "box";
+constexpr int kTextEditorCaretWidth = 3;
+constexpr int kTextEditorPreviewDelayMs = 33;
+constexpr int kExpensiveTextEditorPreviewDelayMs = 200;
+// Set by the event filter for an auto-repeated key: the edit it makes previews at once.
+constexpr auto kTextEditorPreviewNowProperty = "patchy.textPreviewNow";
+// When the oldest edit the preview has not drawn yet happened (text_editor_preview_clock_ms).
+constexpr auto kTextEditorPreviewPendingSinceProperty = "patchy.textPreviewPendingSinceMs";
+constexpr int kTextEditorCaretBlinkSpeedMultiplier = 3;
+constexpr int kMinimumTextEditorCaretBlinkPhaseMs = 80;
+
+QString text_flow_metadata_value(bool boxed) {
+  return boxed ? QString::fromLatin1(kTextFlowBox) : QString::fromLatin1(kTextFlowPoint);
+}
+
+bool text_flow_is_box(const QString& value) {
+  return value.compare(QString::fromLatin1(kTextFlowBox), Qt::CaseInsensitive) == 0;
+}
+
+void update_text_editor_preview_caret(QTextEdit& editor, double zoom);
+int text_editor_caret_width(const QTextEdit& editor) noexcept;
+int text_editor_caret_blink_phase_ms();
+QRect text_editor_viewport_caret_rect(const QTextEdit& editor);
+std::optional<QRect> text_editor_input_method_rect(const QTextEdit& editor);
+QString text_editor_preedit_text(const QTextEdit& editor);
+int text_editor_caret_position(const QTextEdit& editor);
+std::vector<QRect> text_editor_viewport_selection_rects(const QTextEdit& editor, int start, int end);
+double text_editor_metric_scale(const QTextEdit& editor);
+bool text_editor_uses_photoshop_layout(const QTextEdit& editor);
+double text_editor_size_display_scale(const QTextEdit& editor);
+int text_editor_document_size_for_points(const QTextEdit& editor, double points, const Document& document);
+
+bool layer_text_is_vertical(const Layer& layer);
+std::optional<QPointF> vertical_text_layer_anchor(const Layer& layer);
+VerticalRenderPlan vertical_render_plan_for_editor(const QTextEdit& editor, const QTextDocument& layout_document);
+
+QTextDocument* text_editor_document_space_layout(const QTextEdit& editor, double& zoom_out);
+std::optional<QRectF> valid_text_local_rect(QRectF rect);
+
+// Faux bold rides column 11 of the v4+ patchy.text.runs blob (earlier versions have no faux
+// column and cannot carry the flag). Photoshop refuses to warp type that uses Faux Bold
+// anywhere in the layer, and Patchy mirrors that as an authoring rule, so this asks the
+// committed metadata, covering imported layers that never opened an editor.
+bool text_layer_uses_faux_bold(const Layer& layer) {
+  const auto found = layer.metadata().find(kLayerMetadataTextRuns);
+  if (found == layer.metadata().end()) {
+    return false;
+  }
+  const auto lines = QString::fromStdString(found->second).split(QLatin1Char('\n'));
+  for (const auto& raw_line : lines) {
+    const auto line = raw_line.trimmed();
+    if (line.isEmpty() || line.startsWith(QLatin1Char('v'))) {
+      continue;
+    }
+    const auto fields = line.split(QLatin1Char('\t'));
+    if (fields.size() >= 12 && fields[11].toInt() != 0) {
+      return true;
+    }
+  }
+  return false;
+}
+
+// `glyphless_fonts` are installed but hold no glyph for the text they are asked for; the dialog
+// says so instead of claiming it cannot locate a font that is sitting in the font list.
+// `substitutions` name the face each one will be drawn in (issue 463), one line each.
+bool confirm_psd_raster_preview_font_substitution(QWidget* parent, const QStringList& missing_fonts,
+                                                  const QStringList& glyphless_fonts,
+                                                  const QStringList& substitutions) {
+  if (missing_fonts.isEmpty() && glyphless_fonts.isEmpty()) {
+    return true;
+  }
+
+  QMessageBox dialog(QMessageBox::Warning, QObject::tr("Missing Font"), QString(), QMessageBox::NoButton, parent);
+  dialog.setObjectName(QStringLiteral("missingPsdTextFontMessageBox"));
+  if (!missing_fonts.isEmpty() && !glyphless_fonts.isEmpty()) {
+    dialog.setText(QObject::tr("Patchy can't locate these fonts: %1. These fonts have no glyphs for their text: %2. "
+                               "Editing this PSD raster preview will substitute other fonts. Continue?")
+                       .arg(missing_fonts.join(QStringLiteral(", ")), glyphless_fonts.join(QStringLiteral(", "))));
+  } else if (glyphless_fonts.size() == 1) {
+    dialog.setText(QObject::tr("The font \"%1\" has no glyphs for this text. Editing this PSD raster preview will "
+                               "substitute another font. Continue?")
+                       .arg(glyphless_fonts.front()));
+  } else if (!glyphless_fonts.isEmpty()) {
+    dialog.setText(QObject::tr("These fonts have no glyphs for their text: %1. Editing this PSD raster preview will "
+                               "substitute other fonts. Continue?")
+                       .arg(glyphless_fonts.join(QStringLiteral(", "))));
+  } else if (missing_fonts.size() == 1) {
+    dialog.setText(QObject::tr("Patchy can't locate the font \"%1\". Editing this PSD raster preview will substitute "
+                               "another font. Continue?")
+                       .arg(missing_fonts.front()));
+  } else {
+    dialog.setText(QObject::tr("Patchy can't locate these fonts: %1. Editing this PSD raster preview will substitute "
+                               "other fonts. Continue?")
+                       .arg(missing_fonts.join(QStringLiteral(", "))));
+  }
+  if (!substitutions.isEmpty()) {
+    dialog.setInformativeText(substitutions.join(QLatin1Char('\n')));
+  }
+  auto* continue_button = dialog.addButton(QObject::tr("Continue"), QMessageBox::AcceptRole);
+  dialog.addButton(QMessageBox::Cancel);
+  dialog.setDefaultButton(continue_button);
+  exec_dialog(dialog);
+  return dialog.clickedButton() == continue_button;
+}
+
+
+// Photoshop switches the FACE of characters the current font cannot draw (kana typed into
+// Arial lands in Kozuka Gothic, as its own style run). Qt only draws them through a silent
+// per-glyph fallback that the stored runs never named, so a Photoshop re-layout of the PSD
+// showed empty boxes for the kana. Runs the same substitution on every edit: characters the
+// run's PRIMARY face lacks move to the family Qt resolves for their writing system, so the
+// runs, the options bar and the exported font list all name the face that really draws them.
+void substitute_uncovered_characters_in_editor(QTextEdit& editor) {
+  auto* document = editor.document();
+  if (document == nullptr || editor.property("patchy.substitutingUncoveredCharacters").toBool()) {
+    return;
+  }
+  struct Range {
+    int start{0};
+    int length{0};
+    QString family;
+  };
+  std::vector<Range> ranges;
+  QHash<QString, QRawFont> primary_faces;
+  for (auto block = document->begin(); block.isValid(); block = block.next()) {
+    for (auto fragment_it = block.begin(); !fragment_it.atEnd(); ++fragment_it) {
+      const auto fragment = fragment_it.fragment();
+      if (!fragment.isValid() || fragment.length() <= 0) {
+        continue;
+      }
+      const auto format = fragment.charFormat();
+      const auto font = format.font();
+      const auto key = font.families().join(QLatin1Char('|')) + QLatin1Char('#') + font.styleName() +
+                       QString::number(font.weight()) + (font.italic() ? QLatin1String("i") : QLatin1String("r"));
+      auto primary = primary_faces.value(key);
+      if (!primary.isValid()) {
+        primary = QRawFont::fromFont(font);
+        primary_faces.insert(key, primary);
+      }
+      if (!primary.isValid()) {
+        continue;
+      }
+      const auto text = fragment.text();
+      int index = 0;
+      while (index < text.size()) {
+        uint code = text.at(index).unicode();
+        int length = 1;
+        if (text.at(index).isHighSurrogate() && index + 1 < text.size() && text.at(index + 1).isLowSurrogate()) {
+          code = QChar::surrogateToUcs4(text.at(index), text.at(index + 1));
+          length = 2;
+        }
+        const QChar probe(code < 0x10000 ? static_cast<char16_t>(code) : u' ');
+        const bool ignorable = code < 0x20 || QChar::isSpace(code) || QChar::isMark(code) ||
+                               probe.category() == QChar::Other_Format;
+        if (!ignorable && !primary.supportsCharacter(code)) {
+          const auto system = fallback_writing_system_for_character(probe);
+          // A writing system no registered face covers crashes QRawFont::familyName (docs/testing.md).
+          if (system != QFontDatabase::Any && !QFontDatabase::families(system).isEmpty()) {
+            const auto fallback = QRawFont::fromFont(font, system);
+            if (fallback.isValid() && !fallback.familyName().isEmpty() &&
+                fallback.familyName() != primary.familyName() && fallback.supportsCharacter(code)) {
+              const auto position = fragment.position() + index;
+              if (!ranges.empty() && ranges.back().family == fallback.familyName() &&
+                  ranges.back().start + ranges.back().length == position) {
+                ranges.back().length += length;
+              } else {
+                ranges.push_back(Range{position, length, fallback.familyName()});
+              }
+            }
+          }
+        }
+        index += length;
+      }
+    }
+  }
+  if (ranges.empty()) {
+    return;
+  }
+  editor.setProperty("patchy.substitutingUncoveredCharacters", true);
+  for (const auto& range : ranges) {
+    QTextCursor cursor(document);
+    cursor.setPosition(range.start);
+    cursor.setPosition(range.start + range.length, QTextCursor::KeepAnchor);
+    QTextCharFormat format;
+    format.setFontFamilies(QStringList{range.family});
+    set_text_display_family(format, range.family);
+    cursor.mergeCharFormat(format);
+  }
+  editor.setProperty("patchy.substitutingUncoveredCharacters", false);
+}
+
+
+
+
+
+bool affine_transform_has_non_translation_linear_part(const LayerAffineTransform& transform) {
+  constexpr double kEpsilon = 0.000001;
+  return std::abs(transform[0] - 1.0) > kEpsilon || std::abs(transform[1]) > kEpsilon ||
+         std::abs(transform[2]) > kEpsilon || std::abs(transform[3] - 1.0) > kEpsilon;
+}
+
+bool qtransform_has_non_translation_linear_part(const QTransform& transform) {
+  constexpr double kEpsilon = 0.000001;
+  return std::abs(transform.m11() - 1.0) > kEpsilon || std::abs(transform.m12()) > kEpsilon ||
+         std::abs(transform.m21()) > kEpsilon || std::abs(transform.m22() - 1.0) > kEpsilon ||
+         std::abs(transform.m13()) > kEpsilon || std::abs(transform.m23()) > kEpsilon;
+}
+
+bool layer_has_non_translation_text_transform(const Layer& layer) {
+  if (const auto found = layer.metadata().find(kLayerMetadataTextTransform); found != layer.metadata().end()) {
+    if (const auto transform = parse_layer_affine_transform(found->second); transform.has_value()) {
+      return affine_transform_has_non_translation_linear_part(*transform);
+    }
+  }
+  if (const auto found = layer.metadata().find(kLayerMetadataPsdTextTransform); found != layer.metadata().end()) {
+    if (const auto transform = parse_layer_affine_transform(found->second); transform.has_value()) {
+      return affine_transform_has_non_translation_linear_part(*transform);
+    }
+  }
+  return false;
+}
+
+bool layer_patchy_text_transform_overrides_psd_source(const Layer& layer) {
+  const auto patchy_transform = layer.metadata().find(kLayerMetadataTextTransform);
+  if (patchy_transform == layer.metadata().end()) {
+    return false;
+  }
+  const auto parsed_patchy = parse_layer_affine_transform(patchy_transform->second);
+  if (!parsed_patchy.has_value()) {
+    return false;
+  }
+  const auto psd_transform = layer.metadata().find(kLayerMetadataPsdTextTransform);
+  if (psd_transform == layer.metadata().end()) {
+    return true;
+  }
+  const auto parsed_psd = parse_layer_affine_transform(psd_transform->second);
+  if (!parsed_psd.has_value()) {
+    return true;
+  }
+  constexpr double kEpsilon = 0.000001;
+  for (std::size_t index = 0; index < parsed_patchy->size(); ++index) {
+    if (std::abs((*parsed_patchy)[index] - (*parsed_psd)[index]) > kEpsilon) {
+      return true;
+    }
+  }
+  return false;
+}
+
+// The PSD-frame session edits the frame as an axis-aligned document rect (psd_text_frame_rect is
+// the transformed frame's bounding box), so it only holds a scale. A rotated or sheared frame
+// edits through its transform like any other transformed text: on the frame path the session
+// showed it unrotated and the commit stored the bounding box corner as the rotated origin
+// (GitHub issue 373).
+bool layer_should_edit_with_psd_text_frame(const Layer& layer, bool boxed_text) {
+  if (!boxed_text || layer_patchy_text_transform_overrides_psd_source(layer) ||
+      !layer.metadata().contains(kLayerMetadataPsdTextBoxBounds)) {
+    return false;
+  }
+  const auto found = layer.metadata().find(kLayerMetadataPsdTextTransform);
+  if (found == layer.metadata().end()) {
+    return false;
+  }
+  const auto transform = parse_layer_affine_transform(found->second);
+  constexpr double kEpsilon = 0.000001;
+  return !transform.has_value() || (std::abs((*transform)[1]) <= kEpsilon && std::abs((*transform)[2]) <= kEpsilon);
+}
+
+bool layer_requires_text_editor_preview(const Layer& layer) {
+  return std::abs(layer.opacity() - 1.0F) > 0.001F || std::abs(layer.fill_opacity() - 1.0F) > 0.001F ||
+         layer.blend_mode() != BlendMode::Normal ||
+         (layer.layer_style().effects_visible && !layer.layer_style().empty()) ||
+         layer_has_non_translation_text_transform(layer);
+}
+
+void reset_text_editor_scroll(QTextEdit* editor) {
+  if (editor == nullptr) {
+    return;
+  }
+  for (auto* bar : {editor->horizontalScrollBar(), editor->verticalScrollBar()}) {
+    if (bar != nullptr && bar->value() != 0) {
+      QSignalBlocker blocker(bar);
+      bar->setValue(0);
+    }
+  }
+}
+
+qint64 text_editor_preview_clock_ms() {
+  static const QElapsedTimer clock = [] {
+    QElapsedTimer started;
+    started.start();
+    return started;
+  }();
+  return clock.elapsed();
+}
+
+// A NEW session still showing the "Type" placeholder nobody has typed over or restyled. Esc
+// drops such a session even when Esc commits text: there is nothing of the user's to keep
+// (GitHub issue 415).
+bool text_editor_shows_untouched_placeholder(const QTextEdit& editor, const QString& placeholder) {
+  return editor.property(kTextEditorProvisionalLayerProperty).isValid() &&
+         !editor.property(kTextEditorChangedProperty).toBool() && editor.toPlainText() == placeholder;
+}
+
+
+
+
+
+bool mark_text_editor_finished(QTextEdit* editor) {
+  if (editor == nullptr || editor->property(kTextEditorFinishedProperty).toBool()) {
+    return false;
+  }
+  editor->setProperty(kTextEditorFinishedProperty, true);
+  return true;
+}
+
+
+
+
+
+// The text box outline of an edit session, flat or transformed (GitHub issues 385 and 371): a
+// light line under accent dashes, a dark-plus-light pair like the marching ants, so one of
+// the two shows over any text or image under the box (a single blue line vanished over
+// matching ink). Canvas overlay colors, outside the theme palette (docs/ui-conventions.md).
+void draw_text_box_outline(QPainter& painter, const QPainterPath& outline) {
+  painter.save();
+  painter.setBrush(Qt::NoBrush);
+  painter.setPen(QPen(QColor(245, 248, 252, 235), 1.0));
+  painter.drawPath(outline);
+  QPen dashes(QColor(20, 92, 200), 1.0, Qt::CustomDashLine, Qt::FlatCap);
+  dashes.setDashPattern({4.0, 3.0});
+  painter.setPen(dashes);
+  painter.drawPath(outline);
+  painter.restore();
+}
+
+// GitHub issue 631: a box or area frame that hides lines of its story shows a plus inside its
+// bottom right resize handle while the Type tool edits it. Canvas overlay only: the layer's
+// pixels and the file never carry it. The editor holds the fact (from the render plan's
+// hidden_lines) and the cache key it was computed for (refresh_text_editor_hidden_lines).
+constexpr auto kTextEditorHiddenLinesProperty = "patchy.textHiddenLines";
+constexpr auto kTextEditorHiddenLinesKeyProperty = "patchy.textHiddenLinesKey";
+constexpr auto kTextResizeHandleOverflowProperty = "patchy.textOverflowMarker";
+
+// The tooltip the marked handle shows on hover (flat handle widget and transformed overlay alike).
+QString text_overflow_marker_tooltip() {
+  return MainWindow::tr("Some text does not fit. Drag to enlarge the box.");
+}
+
+// The plus, in the handle border's theme role, its arms on the handle's centre lines and a
+// pixel clear of the border on each side.
+void draw_text_overflow_marker(QPainter& painter, QRectF handle_rect) {
+  const auto center = handle_rect.center();
+  const auto arm = std::max(1.5, (std::min(handle_rect.width(), handle_rect.height()) - 4.0) / 2.0);
+  painter.save();
+  painter.setPen(Qt::NoPen);
+  painter.setBrush(theme().resize_handle_border);
+  painter.drawRect(QRectF(center.x() - arm, center.y() - 0.5, arm * 2.0, 1.0));
+  painter.drawRect(QRectF(center.x() - 0.5, center.y() - arm, 1.0, arm * 2.0));
+  painter.restore();
+}
+
+// The size cursor nearest a resize handle's outward direction on screen (y down): horizontal,
+// vertical, or one of the two diagonals (issue 684).
+Qt::CursorShape text_box_resize_cursor_for_direction(QPointF direction) {
+  if (std::abs(direction.x()) < 1e-9 && std::abs(direction.y()) < 1e-9) {
+    return Qt::SizeAllCursor;
+  }
+  auto degrees = std::atan2(direction.y(), direction.x()) * 180.0 / kPi;
+  degrees = std::fmod(degrees + 360.0, 180.0);
+  // 0 horizontal, 45 top left to bottom right, 90 vertical, 135 bottom left to top right.
+  switch (static_cast<int>(std::floor((degrees + 22.5) / 45.0)) % 4) {
+    case 0:
+      return Qt::SizeHorCursor;
+    case 1:
+      return Qt::SizeFDiagCursor;
+    case 2:
+      return Qt::SizeVerCursor;
+    default:
+      return Qt::SizeBDiagCursor;
+  }
+}
+
+// A flat session's resize handle: the style sheet draws the square (WA_StyledBackground), this
+// adds the overflow plus when kTextResizeHandleOverflowProperty is set.
+class TextBoxResizeHandle final : public QWidget {
+public:
+  using QWidget::QWidget;
+
+protected:
+  void paintEvent(QPaintEvent* event) override {
+    QWidget::paintEvent(event);
+    if (property(kTextResizeHandleOverflowProperty).toBool()) {
+      QPainter painter(this);
+      draw_text_overflow_marker(painter, QRectF(rect()));
+    }
+  }
+};
+
+class InlineTextEdit final : public QTextEdit {
+public:
+  explicit InlineTextEdit(QWidget* parent = nullptr) : QTextEdit(parent), caret_blink_timer_(this) {
+    setCursorWidth(kTextEditorCaretWidth);
+    caret_blink_clock_.start();
+    const auto flash_time = text_editor_caret_blink_phase_ms();
+    caret_blink_timer_.setInterval(std::max(40, flash_time > 0 ? flash_time / 2 : 80));
+    connect(&caret_blink_timer_, &QTimer::timeout, this, [this] {
+      if (hasFocus() && property(kTextEditorPreviewPaintProperty).toBool()) {
+        viewport()->update();
+      }
+    });
+    caret_blink_timer_.start();
+  }
+
+protected:
+  void focusInEvent(QFocusEvent* event) override {
+    caret_blink_clock_.restart();
+    QTextEdit::focusInEvent(event);
+  }
+
+  // Mirror the composition into properties the render documents read
+  // (document_from_editor_in_document_units) and re-preview, exactly like a keystroke: the
+  // preedit is not document text, so textChanged never fires for it.
+  void inputMethodEvent(QInputMethodEvent* event) override {
+    QTextEdit::inputMethodEvent(event);
+    const auto preedit = event->preeditString();
+    int cursor = static_cast<int>(preedit.size());
+    for (const auto& attribute : event->attributes()) {
+      if (attribute.type == QInputMethodEvent::Cursor) {
+        cursor = std::clamp(attribute.start, 0, static_cast<int>(preedit.size()));
+      }
+    }
+    const bool changed = property(kTextEditorPreeditTextProperty).toString() != preedit ||
+                         property(kTextEditorPreeditCursorProperty).toInt() != cursor;
+    setProperty(kTextEditorPreeditTextProperty, preedit.isEmpty() ? QVariant() : QVariant(preedit));
+    setProperty(kTextEditorPreeditCursorProperty, preedit.isEmpty() ? QVariant() : QVariant(cursor));
+    if (changed && composition_changed_ && !property(kTextEditorFinishedProperty).toBool()) {
+      composition_changed_();
+    }
+  }
+
+public:
+  void set_composition_changed_callback(std::function<void()> callback) {
+    composition_changed_ = std::move(callback);
+  }
+  // Host commands appended to the editor's right-click menu (GitHub issue 323).
+  void set_context_actions_callback(std::function<QList<QAction*>()> callback) {
+    context_actions_ = std::move(callback);
+  }
+
+protected:
+  // Qt's own text menu (Undo, Redo, Cut, Copy, Paste, Delete, Select All; translated by the
+  // qtbase catalogs) plus the host's commands after a separator. Convert to Shape and Create
+  // Work Path finish the edit, which deletes this editor, so the menu is reparented to the
+  // window first: a child menu would die under its own click.
+  void contextMenuEvent(QContextMenuEvent* event) override {
+    auto* menu = createStandardContextMenu(event->pos());
+    if (menu == nullptr) {
+      return;
+    }
+    menu->setObjectName(QStringLiteral("inlineTextEditorContextMenu"));
+    menu->setParent(window(), menu->windowFlags());
+    menu->setAttribute(Qt::WA_DeleteOnClose);
+    if (context_actions_) {
+      const auto actions = context_actions_();
+      if (std::any_of(actions.begin(), actions.end(), [](QAction* action) { return action != nullptr; })) {
+        menu->addSeparator();
+        for (auto* action : actions) {
+          if (action == nullptr) {
+            menu->addSeparator();
+          } else {
+            menu->addAction(action);
+          }
+        }
+      }
+    }
+    menu->popup(event->globalPos());
+    event->accept();
+  }
+
+protected:
+
+  // Vertical text: the arrow keys follow the columns. Up/Down step along the column (previous
+  // and next character), Left/Right jump to the next and previous column (columns advance
+  // leftward, and with NoWrap every paragraph is one QTextLine, so Qt's own Down/Up land
+  // there). Home/End keep their line meaning (column start/end).
+  void keyPressEvent(QKeyEvent* event) override {
+    if (text_editor_is_vertical(*this)) {
+      int remapped = 0;
+      switch (event->key()) {
+        case Qt::Key_Up:
+          remapped = Qt::Key_Left;
+          break;
+        case Qt::Key_Down:
+          remapped = Qt::Key_Right;
+          break;
+        case Qt::Key_Left:
+          remapped = Qt::Key_Down;
+          break;
+        case Qt::Key_Right:
+          remapped = Qt::Key_Up;
+          break;
+        default:
+          break;
+      }
+      if (remapped != 0) {
+        QKeyEvent replacement(event->type(), remapped, event->modifiers(), event->text(), event->isAutoRepeat(),
+                              static_cast<ushort>(event->count()));
+        QTextEdit::keyPressEvent(&replacement);
+        event->setAccepted(replacement.isAccepted());
+        return;
+      }
+    }
+    QTextEdit::keyPressEvent(event);
+  }
+
+  bool canInsertFromMimeData(const QMimeData* source) const override {
+    return source != nullptr && (source->hasText() || QTextEdit::canInsertFromMimeData(source));
+  }
+
+  // The input method (the Windows Japanese IME's candidate list, macOS marked text) is placed
+  // from this query. QTextEdit answers with its own internal layout's cursor, which is nowhere
+  // near the glyphs a previewed session draws (Photoshop leading, canvas zoom, a transform,
+  // and for vertical text a horizontal NoWrap line at the widget's top), so the candidate
+  // window landed on top of the text being typed. Answer with the drawn caret instead.
+  QVariant inputMethodQuery(Qt::InputMethodQuery query) const override {
+    if (query == Qt::ImCursorRectangle) {
+      if (const auto rect = text_editor_input_method_rect(*this); rect.has_value()) {
+        return *rect;
+      }
+    }
+    return QTextEdit::inputMethodQuery(query);
+  }
+
+  void insertFromMimeData(const QMimeData* source) override {
+    if (source == nullptr) {
+      return;
+    }
+    if (!source->hasText()) {
+      QTextEdit::insertFromMimeData(source);
+      return;
+    }
+    auto cursor = textCursor();
+    cursor.insertText(source->text(), currentCharFormat());
+    setTextCursor(cursor);
+    ensureCursorVisible();
+  }
+
+  // The frame paint (QAbstractScrollArea routes it to QFrame::paintEvent, not to the viewport
+  // paintEvent below) draws the box outline in the editor's transparent 1 px border, where the
+  // style sheet's dashed border never showed (GitHub issue 385). A transformed session draws
+  // the same outline through the transform on its overlay instead.
+  bool event(QEvent* event) override {
+    const bool handled = QTextEdit::event(event);
+    if (event->type() == QEvent::Paint && !property(kTextEditorTransformedOverlayProperty).toBool()) {
+      QPainter painter(this);
+      QPainterPath outline;
+      outline.addRect(QRectF(rect()).adjusted(0.5, 0.5, -0.5, -0.5));
+      draw_text_box_outline(painter, outline);
+    }
+    return handled;
+  }
+
+  void paintEvent(QPaintEvent* event) override {
+    if (!property(kTextEditorPreviewPaintProperty).toBool()) {
+      QTextEdit::paintEvent(event);
+      return;
+    }
+
+    bool zoom_ok = false;
+    const auto zoom = property("patchy.editorZoom").toDouble(&zoom_ok);
+    update_text_editor_preview_caret(*this, zoom_ok ? zoom : 1.0);
+    if (property(kTextEditorTransformedOverlayProperty).toBool()) {
+      return;
+    }
+    QPainter painter(viewport());
+    painter.setClipRect(event->rect());
+    paint_selection_highlight(painter);
+    if (hasFocus() && caret_visible()) {
+      auto caret = property(kTextEditorPreviewCaretProperty).toRect();
+      if (caret.isNull() || caret.isEmpty()) {
+        caret = text_editor_viewport_caret_rect(*this);
+        apply_text_caret_thickness(caret, text_editor_caret_width(*this), text_editor_is_vertical(*this));
+      }
+      painter.fillRect(caret.intersected(viewport()->rect()), palette().color(QPalette::Text));
+    }
+  }
+
+private:
+  bool caret_visible() const {
+    const auto flash_time = text_editor_caret_blink_phase_ms();
+    if (flash_time <= 0 || !caret_blink_clock_.isValid()) {
+      return true;
+    }
+    return ((caret_blink_clock_.elapsed() / flash_time) % 2) == 0;
+  }
+
+  void paint_selection_highlight(QPainter& painter) const {
+    const auto selection = textCursor();
+    if (!selection.hasSelection()) {
+      return;
+    }
+
+    QColor highlight = palette().color(QPalette::Highlight);
+    highlight.setAlpha(120);
+    if (property(kTextEditorPreviewPaintProperty).toBool()) {
+      const auto preview_rects = property(kTextEditorPreviewSelectionProperty).toList();
+      for (const auto& rect_value : preview_rects) {
+        const auto rect = rect_value.toRect().intersected(viewport()->rect());
+        if (!rect.isEmpty()) {
+          painter.fillRect(rect, highlight);
+        }
+      }
+      return;
+    }
+
+    const auto start = std::min(selection.selectionStart(), selection.selectionEnd());
+    const auto end = std::max(selection.selectionStart(), selection.selectionEnd());
+    const QPointF scroll_offset(-horizontalScrollBar()->value(), -verticalScrollBar()->value());
+    auto* layout = document()->documentLayout();
+    for (auto block = document()->begin(); block.isValid(); block = block.next()) {
+      const auto* text_layout = block.layout();
+      if (layout == nullptr || text_layout == nullptr) {
+        continue;
+      }
+      const auto block_start = block.position();
+      const auto block_end = block_start + block.length();
+      const auto selected_start = std::max(start, block_start);
+      const auto selected_end = std::min(end, block_end);
+      if (selected_start >= selected_end) {
+        continue;
+      }
+
+      const auto block_origin = layout->blockBoundingRect(block).topLeft() + scroll_offset;
+      for (int line_index = 0; line_index < text_layout->lineCount(); ++line_index) {
+        const auto line = text_layout->lineAt(line_index);
+        const auto line_start = block_start + line.textStart();
+        const auto line_end = line_start + line.textLength();
+        const auto line_selected_start = std::max(selected_start, line_start);
+        const auto line_selected_end = std::min(selected_end, line_end);
+        if (line_selected_start >= line_selected_end) {
+          continue;
+        }
+
+        const auto start_x = line.cursorToX(line_selected_start - block_start);
+        const auto end_x = line.cursorToX(line_selected_end - block_start);
+        QRectF highlight_rect(block_origin.x() + std::min(start_x, end_x), block_origin.y() + line.y(),
+                              std::max<qreal>(1.0, std::abs(end_x - start_x)), line.height());
+        painter.fillRect(highlight_rect.toAlignedRect().intersected(viewport()->rect()), highlight);
+      }
+    }
+  }
+
+  QElapsedTimer caret_blink_clock_;
+  QTimer caret_blink_timer_;
+  std::function<void()> composition_changed_;
+  std::function<QList<QAction*>()> context_actions_;
+};
+
+// scale_font_size lives in dialog_utils.hpp; every derived font size in the UI
+// goes through it so the point/pixel unit split is handled in one place.
+
+
+
+
+
+
+
+
+
+
+
+
+
+QString text_editor_preedit_text(const QTextEdit& editor) {
+  return editor.property(kTextEditorPreeditTextProperty).toString();
+}
+
+// The caret's position in the text the render documents lay out: the document cursor plus the
+// input method's cursor inside the composition (which those documents insert at the cursor).
+int text_editor_caret_position(const QTextEdit& editor) {
+  const auto position = editor.textCursor().position();
+  const auto preedit = text_editor_preedit_text(editor);
+  if (preedit.isEmpty()) {
+    return position;
+  }
+  return position + std::clamp(editor.property(kTextEditorPreeditCursorProperty).toInt(), 0,
+                               static_cast<int>(preedit.size()));
+}
+
+std::unique_ptr<QTextDocument> document_from_editor_in_document_units(const QTextEdit& editor, double zoom) {
+  auto document = copy_text_document_formats(*editor.document());
+  if (const auto preedit = text_editor_preedit_text(editor); !preedit.isEmpty()) {
+    QTextCursor cursor(document.get());
+    cursor.setPosition(std::clamp(editor.textCursor().position(), 0, static_cast<int>(document->characterCount()) - 1));
+    cursor.insertText(preedit, editor.currentCharFormat());
+  }
+  scale_document_font_sizes(*document, zoom > 0.0 ? 1.0 / zoom : 1.0);
+  return document;
+}
+
+constexpr auto kTextEditorCaretLayoutObjectName = "patchy.caretLayoutDocument";
+constexpr auto kTextEditorCaretLayoutGenerationProperty = "patchy.caretLayoutGeneration";
+constexpr auto kTextEditorCaretLayoutBuiltGenerationProperty = "patchy.caretLayoutBuiltGeneration";
+
+// Builds the editor's text laid out at document (1:1) resolution -- through the exact same
+// construction the rasterizer uses (build_text_render_document), so caret/selection geometry is
+// computed on the identical document the on-screen glyphs come from.  Copying the editor
+// document's formats directly is NOT equivalent: blank paragraphs carry their line height in
+// block char formats that a fragment-level copy misses, so files with empty lines (old PSDs
+// separate lines with control characters) drifted the caret off the text.
+std::unique_ptr<QTextDocument> build_text_editor_document_space_layout(const QTextEdit& editor) {
+  bool zoom_ok = false;
+  double zoom = editor.property("patchy.editorZoom").toDouble(&zoom_ok);
+  if (!zoom_ok || !(zoom > 0.0)) {
+    zoom = 1.0;
+  }
+
+  const auto source_units = document_from_editor_in_document_units(editor, zoom);
+  const auto text_size = std::max(1, editor.property("patchy.documentTextSize").toInt());
+  const auto text_width =
+      std::max(kMinimumTextBoxDocumentSize, editor.property("patchy.documentTextWidth").toInt());
+  const auto text_height =
+      std::max(kMinimumTextBoxDocumentSize, editor.property("patchy.documentTextHeight").toInt());
+  const auto anti_alias = std::clamp(editor.property("patchy.documentTextAntiAlias").toInt(), 0, 16);
+  auto family = editor.property("patchy.documentTextFamily").toString();
+  if (family.trimmed().isEmpty()) {
+    family = display_text_family_from_font(editor.font());
+  }
+  const auto stored_color = editor.property("patchy.documentTextColor").value<QColor>();
+  const auto color = stored_color.isValid() ? stored_color : QColor(Qt::black);
+  TextToolSettings settings{source_units->toPlainText(),
+                            QString(),
+                            family,
+                            text_size,
+                            editor.font().bold(),
+                            editor.font().italic(),
+                            anti_alias,
+                            text_flow_is_box(editor.property("patchy.documentTextFlow").toString()),
+                            text_width,
+                            text_height};
+  settings.photoshop_layout = text_editor_uses_photoshop_layout(editor);
+  settings.vertical = text_editor_is_vertical(editor);
+  apply_text_editor_contour(settings, editor);
+  const auto rich_text_runs = rich_text_runs_from_document(*source_units, settings, color);
+  const auto paragraph_runs = paragraph_runs_from_document(*source_units);
+  // The scales MUST mirror the render pass (update_text_editor_preview / commit_text_editor).
+  // A PSD-frame session keeps its runs in raw engine units and folds the transform's vertical
+  // scale into the glyph sizes only at render time; leaving layout_scale at its 1.0 default here
+  // laid the caret and selection out at the RAW size while the glyphs were drawn scaled, so the
+  // highlight came out wrong by exactly that factor. On the 100.32 pt entry_poster frame, one
+  // character's highlight covered a character and a half.
+  const auto frame_layout_scale =
+      settings.photoshop_layout && editor.property("patchy.usesPsdTextFrame").toBool()
+          ? text_editor_size_display_scale(editor)
+          : 1.0;
+  auto built = build_text_render_document(settings, color, text_width, paragraph_runs, rich_text_runs,
+                                          text_editor_metric_scale(editor), frame_layout_scale);
+  return std::move(built.document);
+}
+
+// Returns the editor's text laid out at document (1:1) resolution. Caret and selection geometry must
+// be derived from this layout and then scaled by the zoom: the rendered text is composited at document
+// resolution, so laying out directly from the zoom-shrunk editor font produces line metrics that do not
+// scale linearly and the caret/selection drift away from the text as the user zooms out.
+//
+// The layout is cached and rebuilt only when the text content actually changes (tracked by a generation
+// counter that is bumped on genuine edits but not when the editor is merely re-scaled for a new zoom).
+// This keeps the document-space geometry identical across zoom levels, so the caret tracks the text.
+QTextDocument* text_editor_document_space_layout(const QTextEdit& editor, double& zoom_out) {
+  bool zoom_ok = false;
+  double zoom = editor.property("patchy.editorZoom").toDouble(&zoom_ok);
+  zoom_out = (!zoom_ok || !(zoom > 0.0)) ? 1.0 : zoom;
+
+  auto& mutable_editor = const_cast<QTextEdit&>(editor);
+  const auto generation = editor.property(kTextEditorCaretLayoutGenerationProperty).toInt();
+  auto* cached = editor.findChild<QTextDocument*>(QString::fromLatin1(kTextEditorCaretLayoutObjectName),
+                                                  Qt::FindDirectChildrenOnly);
+  const auto built_generation_value = editor.property(kTextEditorCaretLayoutBuiltGenerationProperty);
+  if (cached != nullptr && built_generation_value.isValid() && built_generation_value.toInt() == generation) {
+    return cached;
+  }
+
+  delete cached;
+  auto document = build_text_editor_document_space_layout(editor);
+  auto* layout_document = document.release();
+  layout_document->setParent(&mutable_editor);
+  layout_document->setObjectName(QString::fromLatin1(kTextEditorCaretLayoutObjectName));
+  mutable_editor.setProperty(kTextEditorCaretLayoutBuiltGenerationProperty, generation);
+  return layout_document;
+}
+
+QRectF scale_document_rect_to_viewport(const QRect& document_rect, double zoom, QPointF scroll_offset) {
+  return QRectF(static_cast<qreal>(document_rect.x()) * zoom - scroll_offset.x(),
+                static_cast<qreal>(document_rect.y()) * zoom - scroll_offset.y(),
+                std::max<qreal>(1.0, static_cast<qreal>(document_rect.width()) * zoom),
+                std::max<qreal>(1.0, static_cast<qreal>(document_rect.height()) * zoom));
+}
+
+// Caret/selection geometry over the cached 1:1 layout, read through the SAME line plan the
+// rasterizer draws with -- the Photoshop leading model repositions baselines, so reading Qt's
+// natural block origins here (which is what this code used to do, and it never passed
+// photoshop_layout either) drifted the caret and the highlight off the glyphs on every
+// PS-model layer.  See ui/text_layout.hpp.
+TextLineGeometry text_editor_line_geometry(const QTextEdit& editor, const QTextDocument& layout_document) {
+  if (text_editor_is_vertical(editor)) {
+    return TextLineGeometry::from_vertical_plan(layout_document,
+                                                vertical_render_plan_for_editor(editor, layout_document).plan);
+  }
+  if (const auto area = text_editor_area(editor)) {
+    return TextLineGeometry::from_lines(layout_document, area_text_layout_plan(layout_document, *area).lines);
+  }
+  // Path text: the one line in straight space (ui/text_path_layout.hpp); callers that draw or
+  // hit-test bend it with the same plan.
+  if (const auto plan = text_editor_path_line_plan(editor, layout_document)) {
+    return TextLineGeometry::from_lines(layout_document, {plan->line});
+  }
+  return TextLineGeometry::build(layout_document,
+                                 text_flow_is_box(editor.property("patchy.documentTextFlow").toString()),
+                                 text_editor_uses_photoshop_layout(editor));
+}
+
+// Character position under a point given in the text's own document (1:1) space. Clicks resolve
+// through the same line plan the glyphs and the caret come from, so a click always lands on the
+// glyph it looks like it landed on. QTextEdit::cursorForPosition cannot: it hit-tests against
+// the editor widget's internal layout, which is laid out at an integer pixel size of
+// round(size * zoom) and so is a different layout from the one that drew the text.
+int text_editor_position_at_local_point(const QTextEdit& editor, QPointF local_point) {
+  double zoom = 1.0;
+  const auto* layout_document = text_editor_document_space_layout(editor, zoom);
+  if (layout_document == nullptr) {
+    return editor.textCursor().position();
+  }
+  if (const auto plan = text_editor_path_line_plan(editor, *layout_document)) {
+    // The click resolves from the nearest point of the contour.
+    local_point = plan->unmap(local_point);
+    // Before the first letter or past the last one (the bare line, the unused part of the
+    // range) the nearer end of the line's text wins. QTextLine::xToCursor answers there by the
+    // paragraph's direction, which names the far end for Latin text in a right-to-left
+    // paragraph; where it already names the near end its answer stands. Half a pixel inside
+    // either end counts too: Qt compares in 1/64 pixel steps and still calls a point a
+    // hundredth of a pixel past the first letter's edge "before the text".
+    if (const auto& line = plan->line.line; line.isValid() && line.textLength() > 0) {
+      const int first = line.textStart();
+      const int last = first + line.textLength();
+      const qreal x = local_point.x() - plan->line.block_origin.x();
+      const qreal first_x = line.cursorToX(first);
+      const qreal last_x = line.cursorToX(last);
+      if (x <= std::min(first_x, last_x) + 0.5 || x >= std::max(first_x, last_x) - 0.5) {
+        const bool first_is_nearer = std::abs(x - first_x) <= std::abs(x - last_x);
+        const qreal near_x = first_is_nearer ? first_x : last_x;
+        if (std::abs(line.cursorToX(line.xToCursor(x)) - near_x) > 0.5) {
+          return std::clamp(plan->line.block_position + (first_is_nearer ? first : last), 0,
+                            std::max(0, layout_document->characterCount() - 1));
+        }
+      }
+    }
+  }
+  return text_editor_line_geometry(editor, *layout_document).position_at(local_point);
+}
+
+// Same, for a point in the editor viewport's own pixels (the inverse of
+// scale_document_rect_to_viewport). It goes through text_editor_position_at_local_point, so
+// every caret-from-a-point answer, path text's unbending included, comes from one place: the
+// press that opens a session used to skip the unbending and put the caret of text on a curve
+// somewhere else than a second click did (GitHub issue 717 follow-up).
+int text_editor_position_at_viewport_point(const QTextEdit& editor, QPointF viewport_point) {
+  double zoom = 1.0;
+  const auto* layout_document = text_editor_document_space_layout(editor, zoom);
+  if (layout_document == nullptr || !(zoom > 0.0)) {
+    return editor.textCursor().position();
+  }
+  const QPointF scroll_offset(editor.horizontalScrollBar()->value(), editor.verticalScrollBar()->value());
+  return text_editor_position_at_local_point(editor, QPointF((viewport_point.x() + scroll_offset.x()) / zoom,
+                                                             (viewport_point.y() + scroll_offset.y()) / zoom));
+}
+
+// GitHub issue 74: a third click, within the double-click interval of a double-click and near
+// its point, selects the visual line. QTextEdit's own triple-click detection never runs because
+// the session handlers intercept every left press, so the two press paths track it here.
+constexpr auto kTextEditorTripleClickArmedMsProperty = "patchy.textTripleClickArmedMs";
+constexpr auto kTextEditorTripleClickPointProperty = "patchy.textTripleClickGlobalPoint";
+
+void arm_text_editor_triple_click(QTextEdit& editor, QPointF global_point) {
+  editor.setProperty(kTextEditorTripleClickArmedMsProperty, QDateTime::currentMSecsSinceEpoch());
+  editor.setProperty(kTextEditorTripleClickPointProperty, global_point);
+}
+
+// Consumes the armed double-click either way: a fourth click is a plain press again.
+bool text_editor_press_completes_triple_click(QTextEdit& editor, QPointF global_point) {
+  const auto armed = editor.property(kTextEditorTripleClickArmedMsProperty);
+  const auto point = editor.property(kTextEditorTripleClickPointProperty);
+  editor.setProperty(kTextEditorTripleClickArmedMsProperty, QVariant());
+  editor.setProperty(kTextEditorTripleClickPointProperty, QVariant());
+  if (!armed.isValid() || !point.isValid()) {
+    return false;
+  }
+  const auto elapsed = QDateTime::currentMSecsSinceEpoch() - armed.toLongLong();
+  if (elapsed < 0 || elapsed > QApplication::doubleClickInterval()) {
+    return false;
+  }
+  const auto delta = global_point - point.toPointF();
+  const auto slop = static_cast<qreal>(QApplication::startDragDistance());
+  return std::abs(delta.x()) <= slop && std::abs(delta.y()) <= slop;
+}
+
+// The document positions [start, end) a triple click at `position` selects: the visual line
+// from the same line plan clicks resolve with (QTextCursor::LineUnderCursor would answer from
+// the widget's own differently spaced layout), minus trailing whitespace and soft line
+// separators so the highlight ends with the glyphs.
+std::pair<int, int> text_editor_line_range_at(const QTextEdit& editor, int position) {
+  const auto* document = editor.document();
+  const auto maximum = std::max(0, document->characterCount() - 1);
+  position = std::clamp(position, 0, maximum);
+  double zoom = 1.0;
+  std::optional<std::pair<int, int>> range;
+  if (const auto* layout_document = text_editor_document_space_layout(editor, zoom); layout_document != nullptr) {
+    range = text_editor_line_geometry(editor, *layout_document).line_range_at(position);
+  }
+  if (!range.has_value()) {
+    const auto block = document->findBlock(position);
+    range = std::make_pair(block.position(), block.position() + std::max(0, block.length() - 1));
+  }
+  auto [start, end] = *range;
+  start = std::clamp(start, 0, maximum);
+  end = std::clamp(end, start, maximum);
+  while (end > start && document->characterAt(end - 1).isSpace()) {
+    --end;
+  }
+  return {start, end};
+}
+
+void clear_text_editor_preview_overlays(QTextEdit& editor) {
+  editor.setProperty(kTextEditorPreviewCaretProperty, QVariant());
+  editor.setProperty(kTextEditorPreviewSelectionProperty, QVariant());
+}
+
+int text_editor_caret_width(const QTextEdit& editor) noexcept {
+  if (editor.cursorWidth() <= 0) {
+    return 0;
+  }
+  return std::max(kTextEditorCaretWidth, editor.cursorWidth());
+}
+
+int text_editor_caret_blink_phase_ms() {
+  const auto flash_time = QApplication::cursorFlashTime();
+  if (flash_time <= 0) {
+    return flash_time;
+  }
+  return std::max(kMinimumTextEditorCaretBlinkPhaseMs, flash_time / kTextEditorCaretBlinkSpeedMultiplier);
+}
+
+QRect text_editor_viewport_caret_rect(const QTextEdit& editor) {
+  double zoom = 1.0;
+  const auto layout_document = text_editor_document_space_layout(editor, zoom);
+  const auto caret_document_rect =
+      text_editor_line_geometry(editor, *layout_document).caret_rect(text_editor_caret_position(editor)).toAlignedRect();
+  QRect caret;
+  if (!caret_document_rect.isEmpty()) {
+    const QPointF scroll_offset(editor.horizontalScrollBar()->value(), editor.verticalScrollBar()->value());
+    caret = scale_document_rect_to_viewport(caret_document_rect, zoom, scroll_offset).toAlignedRect();
+  }
+  if (caret.isEmpty()) {
+    caret = editor.cursorRect();
+  }
+  return caret;
+}
+
+std::vector<QRect> text_editor_viewport_selection_rects(const QTextEdit& editor, int start, int end) {
+  double zoom = 1.0;
+  const auto layout_document = text_editor_document_space_layout(editor, zoom);
+  const auto document_selection_rects = text_editor_line_geometry(editor, *layout_document).selection_rects(start, end);
+  const QPointF scroll_offset(editor.horizontalScrollBar()->value(), editor.verticalScrollBar()->value());
+  std::vector<QRect> rects;
+  rects.reserve(document_selection_rects.size());
+  for (const auto& rect : document_selection_rects) {
+    const auto aligned = scale_document_rect_to_viewport(rect.toAlignedRect(), zoom, scroll_offset).toAlignedRect();
+    if (!aligned.isEmpty()) {
+      rects.push_back(aligned);
+    }
+  }
+  return rects;
+}
+
+void update_text_editor_preview_caret(QTextEdit& editor, double zoom) {
+  Q_UNUSED(zoom);
+  if (!editor.property(kTextEditorPreviewPaintProperty).toBool()) {
+    clear_text_editor_preview_overlays(editor);
+    return;
+  }
+
+  double layout_zoom = 1.0;
+  const auto layout_document = text_editor_document_space_layout(editor, layout_zoom);
+  const auto geometry = text_editor_line_geometry(editor, *layout_document);
+  const QPointF scroll_offset(editor.horizontalScrollBar()->value(), editor.verticalScrollBar()->value());
+
+  QVariantList selection_rects;
+  const auto cursor = editor.textCursor();
+  if (cursor.hasSelection()) {
+    for (const auto& rect : geometry.selection_rects(cursor.selectionStart(), cursor.selectionEnd())) {
+      const auto aligned =
+          scale_document_rect_to_viewport(rect.toAlignedRect(), layout_zoom, scroll_offset).toAlignedRect();
+      if (!aligned.isEmpty()) {
+        selection_rects.push_back(aligned);
+      }
+    }
+  }
+  editor.setProperty(kTextEditorPreviewSelectionProperty, selection_rects);
+
+  const auto caret_document_rect = geometry.caret_rect(text_editor_caret_position(editor)).toAlignedRect();
+  auto caret = caret_document_rect.isEmpty()
+                   ? editor.cursorRect()
+                   : scale_document_rect_to_viewport(caret_document_rect, layout_zoom, scroll_offset).toAlignedRect();
+  const auto caret_width = text_editor_caret_width(editor);
+  if (caret.isEmpty() || caret_width <= 0) {
+    editor.setProperty(kTextEditorPreviewCaretProperty, QVariant());
+    return;
+  }
+  apply_text_caret_thickness(caret, caret_width, text_editor_is_vertical(editor));
+  const bool moved = editor.property(kTextEditorPreviewCaretProperty).toRect() != caret;
+  editor.setProperty(kTextEditorPreviewCaretProperty, caret);
+  if (moved && QGuiApplication::focusObject() == &editor) {
+    QGuiApplication::inputMethod()->update(Qt::ImCursorRectangle);
+  }
+}
+
+class TransformedTextEditOverlay final : public QWidget {
+  // Corners first: where a side handle sits near a corner, the corner wins the hit test (side
+  // handles also hide once their edge is too short to keep clear of the corners).
+  enum class ResizeHandle { None, TopLeft, TopRight, BottomLeft, BottomRight, Top, Bottom, Left, Right };
+
+  struct ResizeDragState {
+    ResizeHandle handle{ResizeHandle::None};
+    QTransform start_transform;
+    QPointF start_editor_point;
+    int start_width{kMinimumTextBoxDocumentSize};
+    int start_height{kMinimumTextBoxDocumentSize};
+    std::optional<VectorPath> start_area{std::nullopt};
+  };
+
+  struct ResizeGeometry {
+    QTransform transform;
+    int width{kMinimumTextBoxDocumentSize};
+    int height{kMinimumTextBoxDocumentSize};
+  };
+
+  // Path text (docs/path-text.md) has no box: three marks on the contour instead. Start and
+  // End slide the ends of the range along it; Middle slides the whole range and, dragged to the
+  // other side of the line, flips the text there (the contour reversed).
+  enum class PathHandle { None, Start, End, Middle };
+
+  struct PathDragState {
+    PathHandle handle{PathHandle::None};
+    TextPathFrame start_frame;
+    double press_distance{0.0};  // arc length of the press point on start_frame's contour
+  };
+  static constexpr double kPathHandleRadius = 4.5;
+  static constexpr double kPathHandleHitRadius = 9.0;
+
+  static constexpr std::array<ResizeHandle, 4> kCornerHandles = {
+      ResizeHandle::TopLeft,
+      ResizeHandle::TopRight,
+      ResizeHandle::BottomLeft,
+      ResizeHandle::BottomRight,
+  };
+  static constexpr std::array<ResizeHandle, 4> kSideHandles = {
+      ResizeHandle::Top,
+      ResizeHandle::Bottom,
+      ResizeHandle::Left,
+      ResizeHandle::Right,
+  };
+  static constexpr std::array<ResizeHandle, 8> kResizeHandles = {
+      ResizeHandle::TopLeft, ResizeHandle::TopRight, ResizeHandle::BottomLeft, ResizeHandle::BottomRight,
+      ResizeHandle::Top,     ResizeHandle::Bottom,   ResizeHandle::Left,       ResizeHandle::Right,
+  };
+  static constexpr double kHandleSize = 6.0;
+  static constexpr double kHandleHitMargin = 5.0;
+  // The edge bands (#684 follow-up, #176's zones): each side resizes from anywhere between the
+  // corners' hit squares, within kEdgeBandOutside outside its line and kEdgeBandInside inside it,
+  // so a click just inside the text still places the caret.
+  static constexpr double kEdgeBandOutside = 6.0;
+  static constexpr double kEdgeBandInside = 3.0;
+  // Room around the box for the bands and the corner rotate zones (kTextBoxCornerRotateReach).
+  static constexpr double kOverlayMargin = 32.0;
+
+public:
+  explicit TransformedTextEditOverlay(CanvasWidget* canvas)
+      : QWidget(canvas), canvas_(canvas), caret_blink_timer_(this) {
+    setObjectName(QString::fromLatin1(kTransformedTextEditOverlayObjectName));
+    setAttribute(Qt::WA_TranslucentBackground, true);
+    setAttribute(Qt::WA_NoSystemBackground, true);
+    setMouseTracking(true);
+    // This overlay covers the text it is editing, so it is what a click on transformed text
+    // actually hits. It must ACCEPT click focus. With Qt::NoFocus, Qt's focus-before-press walk
+    // (giveFocusAccordingToFocusPolicy) skipped past it to the CanvasWidget behind, and the
+    // editor's focus-loss auto-commit read that as clicking off: every click on transformed text
+    // ended the session instead of moving the caret, so the mouse could not select at all.
+    // Focusing the overlay is already exempt from that auto-commit (is_text_option_widget matches
+    // its objectName), and mousePressEvent hands focus straight back to the editor.
+    //
+    // A focus PROXY looks like the tidier answer and is a trap: clearing a proxy while the proxy
+    // holds focus makes Qt reassign the application focus widget, which drops the editor's focus
+    // and commits the session out from under whoever was mid-call.
+    setFocusPolicy(Qt::ClickFocus);
+    caret_blink_clock_.start();
+    const auto flash_time = text_editor_caret_blink_phase_ms();
+    caret_blink_timer_.setInterval(std::max(40, flash_time > 0 ? flash_time / 2 : 80));
+    connect(&caret_blink_timer_, &QTimer::timeout, this, [this] {
+      if (editor_ != nullptr && editor_->hasFocus()) {
+        update();
+      }
+    });
+    caret_blink_timer_.start();
+  }
+
+  [[nodiscard]] QTextEdit* editor() const noexcept {
+    return editor_;
+  }
+
+  // An editor-viewport rect's footprint on the canvas after the text transform.
+  [[nodiscard]] QRect canvas_bounds_for_editor_rect(QRectF rect) const {
+    return map_editor_rect_to_canvas(rect).boundingRect().toAlignedRect();
+  }
+
+  void configure(QTextEdit* editor, QTransform transform, std::function<void(QTextEdit*)> resize_callback) {
+    editor_ = editor;
+    text_transform_ = std::move(transform);
+    resize_callback_ = std::move(resize_callback);
+    resize_preview_transform_.reset();
+    resize_preview_document_size_.reset();
+    sync_geometry();
+  }
+
+  void sync_geometry() {
+    if (canvas_ == nullptr || editor_ == nullptr || editor_->viewport() == nullptr) {
+      hide();
+      return;
+    }
+
+    const QRectF editor_rect = editor_visual_rect().adjusted(-4.0, -4.0, 4.0, 4.0);
+    const auto canvas_polygon = map_editor_rect_to_canvas(editor_rect);
+    if (canvas_polygon.isEmpty()) {
+      hide();
+      return;
+    }
+
+    const auto overlay_geometry =
+        canvas_polygon.boundingRect()
+            .adjusted(-kOverlayMargin, -kOverlayMargin, kOverlayMargin, kOverlayMargin)
+            .toAlignedRect();
+    if (overlay_geometry.isEmpty()) {
+      hide();
+      return;
+    }
+
+    setGeometry(overlay_geometry);
+    QPolygon mask_polygon;
+    QVariantList editor_polygon;
+    const QPointF origin(overlay_geometry.topLeft());
+    for (const auto& point : canvas_polygon) {
+      mask_polygon << (point - origin).toPoint();
+      editor_polygon.push_back(point);
+    }
+    auto mask = QRegion(mask_polygon);
+    QVariantList handle_centers;
+    for (const auto handle : kCornerHandles) {
+      if (!resize_handle_shown(handle)) {
+        handle_centers.push_back(QVariant());  // path text has no box handles
+        continue;
+      }
+      const auto handle_rect = resize_handle_rect(handle);
+      mask = mask.united(QRegion(handle_rect.toAlignedRect()));
+      handle_centers.push_back(handle_rect.center() + origin);
+    }
+    // Start, End, Middle in canvas coordinates; empty for any other session.
+    QVariantList path_handle_centers;
+    if (shown_path().has_value()) {
+      for (const auto handle : {PathHandle::Start, PathHandle::End, PathHandle::Middle}) {
+        const auto center = path_handle_center(handle);
+        const QRectF hit(center.x() - kPathHandleHitRadius, center.y() - kPathHandleHitRadius,
+                         2.0 * kPathHandleHitRadius, 2.0 * kPathHandleHitRadius);
+        mask = mask.united(QRegion(hit.toAlignedRect()));
+        path_handle_centers.push_back(center + origin);
+      }
+    }
+    setProperty("patchy.transformedTextPathHandleCenters", path_handle_centers);
+    // Top, Bottom, Left, Right (issue 684); an invalid entry is a side hidden on a short edge.
+    QVariantList side_handle_centers;
+    for (const auto handle : kSideHandles) {
+      if (!resize_handle_shown(handle)) {
+        side_handle_centers.push_back(QVariant());
+        continue;
+      }
+      const auto handle_rect = resize_handle_rect(handle);
+      mask = mask.united(QRegion(handle_rect.toAlignedRect()));
+      side_handle_centers.push_back(handle_rect.center() + origin);
+      // The band outside the line too, so the overlay (and its size cursor) is under the pointer.
+      if (const auto band = edge_band_polygon(handle); !band.isEmpty()) {
+        mask = mask.united(QRegion(band.toPolygon()));
+      }
+    }
+    if (rotate_zones_offered()) {
+      // The disk around each corner; the hit test leaves out the box and its resize zones.
+      for (const auto handle : kCornerHandles) {
+        const auto center = handle_overlay_center(handle);
+        const QRectF disk(center.x() - kTextBoxCornerRotateReach, center.y() - kTextBoxCornerRotateReach,
+                          2.0 * kTextBoxCornerRotateReach, 2.0 * kTextBoxCornerRotateReach);
+        mask = mask.united(QRegion(disk.toAlignedRect(), QRegion::Ellipse));
+      }
+    }
+    setProperty("patchy.transformedTextEditorPolygon", editor_polygon);
+    setProperty("patchy.transformedTextResizeHandleCenters", handle_centers);
+    setProperty("patchy.transformedTextSideHandleCenters", side_handle_centers);
+    setMask(mask);
+    show();
+    raise();
+    update();
+  }
+
+  [[nodiscard]] bool wants_canvas_mouse_event(QPointF canvas_point, QEvent::Type event_type,
+                                              Qt::MouseButtons buttons) const {
+    if (editor_ == nullptr || !isVisible()) {
+      return false;
+    }
+    const QPointF overlay_point = canvas_point - QPointF(geometry().topLeft());
+    if (selecting_ || resize_drag_.has_value() || path_drag_.has_value()) {
+      return event_type == QEvent::MouseMove || event_type == QEvent::MouseButtonRelease;
+    }
+    if (event_type == QEvent::MouseButtonRelease) {
+      return false;
+    }
+    if (event_type == QEvent::MouseMove && (buttons & Qt::LeftButton) != 0) {
+      return false;
+    }
+    if (resize_handle_at(overlay_point) != ResizeHandle::None || path_handle_at(overlay_point) != PathHandle::None) {
+      return true;
+    }
+    if (shown_path().has_value()) {
+      // Path text takes a press only on its handles or near its line, so a click anywhere
+      // else inside the contour's bounds still clicks off.
+      return overlay_point_near_path(overlay_point);
+    }
+    if (!rect().adjusted(-2, -2, 2, 2).contains(overlay_point.toPoint())) {
+      return false;
+    }
+    const auto editor_point = map_overlay_point_to_editor(overlay_point);
+    return editor_point.has_value() && editor_local_rect().adjusted(-4, -4, 4, 4).contains(editor_point->toPoint());
+  }
+
+  // Caret index under a canvas point for a drag that began outside the session (the press that
+  // opened it). Unlike a click, a drag keeps tracking once it leaves the text's rectangle.
+  [[nodiscard]] std::optional<int> drag_cursor_position_for_canvas_point(QPointF canvas_point) const {
+    if (editor_ == nullptr) {
+      return std::nullopt;
+    }
+    const auto editor_point = map_canvas_point_to_editor(canvas_point);
+    if (!editor_point.has_value()) {
+      return std::nullopt;
+    }
+    return text_editor_position_at_local_point(*editor_, *editor_point / zoom());
+  }
+
+  [[nodiscard]] bool has_resize_handle_at_canvas_point(QPointF canvas_point) const {
+    if (editor_ == nullptr || !isVisible()) {
+      return false;
+    }
+    return resize_handle_at(canvas_point - QPointF(pos())) != ResizeHandle::None;
+  }
+
+  // The outward direction on screen (degrees, y down) of the corner whose rotate zone holds the
+  // canvas point, for corner_rotate_cursor; nothing outside the zones (#684 follow-up).
+  [[nodiscard]] std::optional<double> rotate_corner_direction_at_canvas_point(QPointF canvas_point) const {
+    if (editor_ == nullptr || !isVisible()) {
+      return std::nullopt;
+    }
+    return rotate_corner_direction_at(canvas_point - QPointF(pos()));
+  }
+
+  bool handle_canvas_mouse_event(QMouseEvent* mouse_event) {
+    if (mouse_event == nullptr) {
+      return false;
+    }
+    return handle_canvas_mouse_event(mouse_event, mouse_event->position());
+  }
+
+  bool handle_canvas_mouse_event(QMouseEvent* mouse_event, QPointF canvas_position) {
+    if (mouse_event == nullptr ||
+        !wants_canvas_mouse_event(canvas_position, mouse_event->type(), mouse_event->buttons())) {
+      return false;
+    }
+
+    const QPointF overlay_position = canvas_position - QPointF(pos());
+    QMouseEvent forwarded(mouse_event->type(), overlay_position, mouse_event->globalPosition(), mouse_event->button(),
+                          mouse_event->buttons(), mouse_event->modifiers());
+    switch (mouse_event->type()) {
+      case QEvent::MouseButtonPress:
+        mousePressEvent(&forwarded);
+        break;
+      case QEvent::MouseMove:
+        mouseMoveEvent(&forwarded);
+        break;
+      case QEvent::MouseButtonRelease:
+        mouseReleaseEvent(&forwarded);
+        break;
+      case QEvent::MouseButtonDblClick:
+        mouseDoubleClickEvent(&forwarded);
+        break;
+      default:
+        break;
+    }
+    if (!forwarded.isAccepted()) {
+      return false;
+    }
+    mouse_event->accept();
+    return true;
+  }
+
+protected:
+  void paintEvent(QPaintEvent* event) override {
+    Q_UNUSED(event);
+    if (canvas_ == nullptr || editor_ == nullptr || editor_->viewport() == nullptr) {
+      return;
+    }
+
+    QPainter painter(this);
+    painter.setRenderHint(QPainter::Antialiasing, true);
+    paint_selection(painter);
+    paint_caret(painter);
+    paint_text_box_controls(painter);
+  }
+
+  // The overflow plus explains itself on hover (issue 631); only over the marked handle and
+  // never during a resize drag. The zone rect makes Qt hide it once the pointer leaves.
+  bool event(QEvent* event) override {
+    if (event->type() == QEvent::ToolTip) {
+      auto* help = static_cast<QHelpEvent*>(event);
+      if (editor_ != nullptr && !resize_drag_.has_value() &&
+          editor_->property(kTextEditorHiddenLinesProperty).toBool() &&
+          resize_handle_at(help->pos()) == ResizeHandle::BottomRight) {
+        const auto zone = resize_handle_rect(ResizeHandle::BottomRight).adjusted(-5.0, -5.0, 5.0, 5.0).toAlignedRect();
+        QToolTip::showText(help->globalPos(), text_overflow_marker_tooltip(), this, zone);
+      } else {
+        QToolTip::hideText();
+        event->ignore();
+      }
+      return true;
+    }
+    return QWidget::event(event);
+  }
+
+  void mousePressEvent(QMouseEvent* event) override {
+    if (event->button() != Qt::LeftButton || editor_ == nullptr) {
+      event->ignore();
+      return;
+    }
+    if (const auto handle = path_handle_at(event->position()); handle != PathHandle::None) {
+      if (const auto frame = text_editor_path(*editor_)) {
+        QToolTip::hideText();
+        editor_->setFocus(Qt::MouseFocusReason);
+        const auto local = map_overlay_point_to_editor(event->position()).value_or(QPointF()) / zoom();
+        path_drag_ = PathDragState{handle, *frame,
+                                   TextPathCurve(frame->path).nearest(local.x(), local.y()).distance};
+        path_preview_.reset();
+        event->accept();
+        return;
+      }
+    }
+    if (const auto handle = resize_handle_at(event->position()); handle != ResizeHandle::None) {
+      QToolTip::hideText();
+      editor_->setFocus(Qt::MouseFocusReason);
+      // From the press point, not the handle's: a press on an edge band a few pixels off the
+      // line must not jump the edge onto the pointer.
+      resize_drag_ = ResizeDragState{handle,
+                                     text_transform_,
+                                     map_canvas_point_to_editor(event->position() + QPointF(geometry().topLeft()),
+                                                                text_transform_)
+                                         .value_or(editor_point_for_handle(handle)),
+                                     std::max(kMinimumTextBoxDocumentSize,
+                                              editor_->property("patchy.documentTextWidth").toInt()),
+                                     std::max(kMinimumTextBoxDocumentSize,
+                                              editor_->property("patchy.documentTextHeight").toInt())};
+      resize_drag_->start_area = text_editor_area(*editor_);
+      if (resize_drag_->start_area) {
+        const auto bounds = resize_drag_->start_area->bounds();
+        resize_drag_->start_width = std::max(1, static_cast<int>(std::ceil(bounds->right - bounds->left)));
+        resize_drag_->start_height = std::max(1, static_cast<int>(std::ceil(bounds->bottom - bounds->top)));
+      }
+      event->accept();
+      return;
+    }
+
+    const auto position = cursor_position_for_overlay_point(event->position());
+    if (!position.has_value()) {
+      event->ignore();
+      return;
+    }
+
+    editor_->setFocus(Qt::MouseFocusReason);
+    auto cursor = editor_->textCursor();
+    const bool shift = (event->modifiers() & Qt::ShiftModifier) != 0;
+    const bool triple_click = text_editor_press_completes_triple_click(*editor_, event->globalPosition());
+    if (triple_click && !shift) {
+      const auto [start, end] = text_editor_line_range_at(*editor_, *position);
+      selection_anchor_ = start;
+      cursor.setPosition(start);
+      cursor.setPosition(end, QTextCursor::KeepAnchor);
+      editor_->setTextCursor(cursor);
+      selecting_ = false;
+      event->accept();
+      update();
+      return;
+    }
+    if (shift) {
+      selection_anchor_ = cursor.position();
+      cursor.setPosition(selection_anchor_);
+      cursor.setPosition(*position, QTextCursor::KeepAnchor);
+    } else {
+      selection_anchor_ = *position;
+      cursor.setPosition(*position);
+    }
+    editor_->setTextCursor(cursor);
+    selecting_ = true;
+    event->accept();
+    update();
+  }
+
+  void mouseMoveEvent(QMouseEvent* event) override {
+    if (path_drag_.has_value()) {
+      // Only the overlay moves during the drag (the marks and the dashed line); the text is
+      // laid out once, on release, like a box resize.
+      path_preview_ = path_frame_for_drag(event->position());
+      sync_geometry();
+      event->accept();
+      return;
+    }
+    if (resize_drag_.has_value()) {
+      if (const auto geometry = resize_geometry_for_event(event); geometry.has_value()) {
+        resize_preview_transform_ = geometry->transform;
+        resize_preview_document_size_ = QSizeF(geometry->width, geometry->height);
+        sync_geometry();
+      }
+      event->accept();
+      return;
+    }
+    if (!selecting_ || (event->buttons() & Qt::LeftButton) == 0 || editor_ == nullptr) {
+      update_hover_cursor(event->position(), event->modifiers());
+      event->ignore();
+      return;
+    }
+    const auto position = cursor_position_for_overlay_point(event->position());
+    if (!position.has_value()) {
+      event->ignore();
+      return;
+    }
+
+    auto cursor = editor_->textCursor();
+    cursor.setPosition(selection_anchor_);
+    cursor.setPosition(*position, QTextCursor::KeepAnchor);
+    editor_->setTextCursor(cursor);
+    event->accept();
+    update();
+  }
+
+  void mouseReleaseEvent(QMouseEvent* event) override {
+    if (event->button() == Qt::LeftButton && path_drag_.has_value()) {
+      const auto frame = path_frame_for_drag(event->position());
+      const bool changed = frame.has_value() && !(*frame == path_drag_->start_frame);
+      path_drag_.reset();
+      path_preview_.reset();
+      if (changed && editor_ != nullptr) {
+        set_text_editor_path_properties(*editor_, frame);
+        schedule_resize_callback();
+      }
+      sync_geometry();
+      update_hover_cursor(event->position(), event->modifiers());
+      event->accept();
+      return;
+    }
+    if (event->button() == Qt::LeftButton && resize_drag_.has_value()) {
+      resize_text_box(event);
+      resize_drag_.reset();
+      update_hover_cursor(event->position(), event->modifiers());
+      schedule_resize_callback();
+      event->accept();
+      return;
+    }
+    if (event->button() == Qt::LeftButton && selecting_) {
+      selecting_ = false;
+      event->accept();
+      return;
+    }
+    event->ignore();
+  }
+
+  void mouseDoubleClickEvent(QMouseEvent* event) override {
+    if (event->button() != Qt::LeftButton || editor_ == nullptr) {
+      event->ignore();
+      return;
+    }
+    const auto editor_point = map_overlay_point_to_editor(event->position());
+    if (!editor_point.has_value() || !editor_local_rect().contains(editor_point->toPoint())) {
+      event->ignore();
+      return;
+    }
+
+    editor_->setFocus(Qt::MouseFocusReason);
+    arm_text_editor_triple_click(*editor_, event->globalPosition());
+    auto cursor = editor_->textCursor();
+    cursor.setPosition(text_editor_position_at_local_point(*editor_, *editor_point / zoom()));
+    cursor.select(QTextCursor::WordUnderCursor);
+    selection_anchor_ = cursor.selectionStart();
+    editor_->setTextCursor(cursor);
+    selecting_ = false;
+    event->accept();
+    update();
+  }
+
+private:
+  [[nodiscard]] double zoom() const noexcept {
+    return canvas_ == nullptr ? 1.0 : std::max(0.0001, canvas_->zoom());
+  }
+
+  [[nodiscard]] QPointF document_origin_on_canvas() const {
+    return canvas_ == nullptr ? QPointF() : QPointF(canvas_->widget_position_for_document_point(QPoint(0, 0)));
+  }
+
+  [[nodiscard]] QPointF map_editor_point_to_canvas(QPointF editor_point) const {
+    const auto current_zoom = zoom();
+    const QPointF document_local(editor_point.x() / current_zoom, editor_point.y() / current_zoom);
+    const auto document_point = active_text_transform().map(document_local);
+    if (canvas_ != nullptr && !canvas_->view_axis_aligned()) {
+      // A rotated view (docs/view-navigation-rotation.md): the canvas's own mapping turns it.
+      return canvas_->widget_position_f(document_point);
+    }
+    const auto origin = document_origin_on_canvas();
+    return QPointF(origin.x() + document_point.x() * current_zoom,
+                   origin.y() + document_point.y() * current_zoom);
+  }
+
+  [[nodiscard]] std::optional<QPointF> map_canvas_point_to_editor(QPointF canvas_point,
+                                                                  const QTransform& transform) const {
+    bool invertible = false;
+    const auto inverse = transform.inverted(&invertible);
+    if (!invertible) {
+      return std::nullopt;
+    }
+
+    const auto current_zoom = zoom();
+    const auto origin = document_origin_on_canvas();
+    const QPointF document_point = canvas_ != nullptr && !canvas_->view_axis_aligned()
+                                       ? canvas_->document_point_for_widget_position(canvas_point)
+                                       : QPointF((canvas_point.x() - origin.x()) / current_zoom,
+                                                 (canvas_point.y() - origin.y()) / current_zoom);
+    const auto document_local = inverse.map(document_point);
+    return QPointF(document_local.x() * current_zoom, document_local.y() * current_zoom);
+  }
+
+  [[nodiscard]] std::optional<QPointF> map_canvas_point_to_editor(QPointF canvas_point) const {
+    return map_canvas_point_to_editor(canvas_point, active_text_transform());
+  }
+
+  [[nodiscard]] std::optional<QPointF> map_overlay_point_to_editor(QPointF overlay_point) const {
+    return map_canvas_point_to_editor(overlay_point + QPointF(geometry().topLeft()));
+  }
+
+  [[nodiscard]] QRect editor_local_rect() const {
+    if (editor_ != nullptr) {
+      if (const auto frame = shown_path()) {
+        // The contour's bounds grown by the room glyphs take either side of the line.
+        if (const auto bounds = frame->path.bounds()) {
+          const double reach = path_text_reach();
+          return QRectF((bounds->left - reach) * zoom(), (bounds->top - reach) * zoom(),
+                        (bounds->right - bounds->left + 2.0 * reach) * zoom(),
+                        (bounds->bottom - bounds->top + 2.0 * reach) * zoom())
+              .toAlignedRect();
+        }
+      }
+      if (const auto area = text_editor_area(*editor_)) {
+        const auto bounds = area->bounds();
+        if (bounds && bounds->right > bounds->left && bounds->bottom > bounds->top) {
+          return QRectF(bounds->left * zoom(), bounds->top * zoom(),
+                        (bounds->right-bounds->left) * zoom(), (bounds->bottom-bounds->top) * zoom()).toAlignedRect();
+        }
+      }
+    }
+    return editor_ == nullptr || editor_->viewport() == nullptr ? QRect() : editor_->viewport()->rect();
+  }
+
+  [[nodiscard]] QRectF editor_visual_rect() const {
+    if (editor_ != nullptr && text_editor_has_contour(*editor_)) return QRectF(editor_local_rect());
+    if (resize_preview_document_size_.has_value()) {
+      const auto current_zoom = zoom();
+      return QRectF(0.0, 0.0, resize_preview_document_size_->width() * current_zoom,
+                    resize_preview_document_size_->height() * current_zoom);
+    }
+    const auto visible_rect_value =
+        editor_ == nullptr ? QVariant() : editor_->property(kTextEditorVisibleLocalRectProperty);
+    if (visible_rect_value.isValid()) {
+      const auto visible_rect = visible_rect_value.toRectF();
+      if (visible_rect.isValid() && !visible_rect.isEmpty()) {
+        const auto current_zoom = zoom();
+        return QRectF(visible_rect.left() * current_zoom,
+                      visible_rect.top() * current_zoom,
+                      std::max<qreal>(1.0, visible_rect.width() * current_zoom),
+                      std::max<qreal>(1.0, visible_rect.height() * current_zoom));
+      }
+    }
+    return QRectF(editor_local_rect());
+  }
+
+  [[nodiscard]] QTransform active_text_transform() const {
+    return resize_preview_transform_.value_or(text_transform_);
+  }
+
+  [[nodiscard]] std::optional<int> cursor_position_for_overlay_point(QPointF overlay_point) const {
+    if (editor_ == nullptr) {
+      return std::nullopt;
+    }
+    const auto editor_point = map_overlay_point_to_editor(overlay_point);
+    if (!editor_point.has_value() || !editor_local_rect().adjusted(-4, -4, 4, 4).contains(editor_point->toPoint())) {
+      return std::nullopt;
+    }
+    if (shown_path().has_value() && !selecting_ && !overlay_point_near_path(overlay_point)) {
+      return std::nullopt;
+    }
+    // map_canvas_point_to_editor hands back text-local coordinates scaled by the canvas zoom;
+    // the layout the glyphs came from is unscaled document space, so divide the zoom back out.
+    return text_editor_position_at_local_point(*editor_, *editor_point / zoom());
+  }
+
+  [[nodiscard]] QPolygonF map_editor_rect_to_canvas(QRectF rect) const {
+    QPolygonF polygon;
+    polygon << map_editor_point_to_canvas(rect.topLeft()) << map_editor_point_to_canvas(rect.topRight())
+            << map_editor_point_to_canvas(rect.bottomRight()) << map_editor_point_to_canvas(rect.bottomLeft());
+    return polygon;
+  }
+
+  [[nodiscard]] QPolygonF map_editor_rect_to_overlay(QRectF rect) const {
+    const QPointF overlay_origin(geometry().topLeft());
+    auto polygon = map_editor_rect_to_canvas(rect);
+    for (auto& point : polygon) {
+      point -= overlay_origin;
+    }
+    return polygon;
+  }
+
+  [[nodiscard]] QPointF editor_point_for_handle(ResizeHandle handle) const {
+    const auto rect = editor_visual_rect();
+    switch (handle) {
+      case ResizeHandle::TopLeft:
+        return rect.topLeft();
+      case ResizeHandle::TopRight:
+        return rect.topRight();
+      case ResizeHandle::BottomLeft:
+        return rect.bottomLeft();
+      case ResizeHandle::BottomRight:
+        return rect.bottomRight();
+      case ResizeHandle::Top:
+        return QPointF(rect.center().x(), rect.top());
+      case ResizeHandle::Bottom:
+        return QPointF(rect.center().x(), rect.bottom());
+      case ResizeHandle::Left:
+        return QPointF(rect.left(), rect.center().y());
+      case ResizeHandle::Right:
+        return QPointF(rect.right(), rect.center().y());
+      case ResizeHandle::None:
+        break;
+    }
+    return QPointF(rect.center());
+  }
+
+  // The handle's outward direction in editor space (x and y of -1, 0 or 1).
+  [[nodiscard]] static QPointF handle_direction(ResizeHandle handle) {
+    switch (handle) {
+      case ResizeHandle::TopLeft:
+        return {-1.0, -1.0};
+      case ResizeHandle::TopRight:
+        return {1.0, -1.0};
+      case ResizeHandle::BottomLeft:
+        return {-1.0, 1.0};
+      case ResizeHandle::BottomRight:
+        return {1.0, 1.0};
+      case ResizeHandle::Top:
+        return {0.0, -1.0};
+      case ResizeHandle::Bottom:
+        return {0.0, 1.0};
+      case ResizeHandle::Left:
+        return {-1.0, 0.0};
+      case ResizeHandle::Right:
+        return {1.0, 0.0};
+      case ResizeHandle::None:
+        break;
+    }
+    return {};
+  }
+
+  [[nodiscard]] QPointF handle_overlay_center(ResizeHandle handle) const {
+    return map_editor_rect_to_overlay(QRectF(editor_point_for_handle(handle), QSizeF(1.0, 1.0))).at(0);
+  }
+
+  // Side handles show only while both edges are long enough (issue 684): along its edge a
+  // side handle's hit area stays clear of the corners', and across the box the opposite
+  // handles' hit areas stay clear of the text between them, so a click in the middle of a
+  // one-line frame places the caret instead of grabbing the top or bottom handle. A short
+  // or thin box keeps just its corners.
+  [[nodiscard]] bool resize_handle_shown(ResizeHandle handle) const {
+    if (editor_ != nullptr && text_editor_path(*editor_).has_value()) {
+      return false;  // path text: the marks on the contour replace the box handles
+    }
+    const auto direction = handle_direction(handle);
+    if (direction.x() != 0.0 && direction.y() != 0.0) {
+      return true;
+    }
+    const auto top_edge = handle_overlay_center(ResizeHandle::TopRight) - handle_overlay_center(ResizeHandle::TopLeft);
+    const auto left_edge =
+        handle_overlay_center(ResizeHandle::BottomLeft) - handle_overlay_center(ResizeHandle::TopLeft);
+    const auto minimum_edge = 2.0 * (kHandleSize + 2.0 * kHandleHitMargin);
+    return std::hypot(top_edge.x(), top_edge.y()) >= minimum_edge &&
+           std::hypot(left_edge.x(), left_edge.y()) >= minimum_edge;
+  }
+
+  [[nodiscard]] QRectF resize_handle_rect(ResizeHandle handle) const {
+    const auto center = handle_overlay_center(handle);
+    return QRectF(center.x() - kHandleSize / 2.0, center.y() - kHandleSize / 2.0, kHandleSize, kHandleSize);
+  }
+
+  [[nodiscard]] ResizeHandle resize_handle_at(QPointF point) const {
+    for (const auto handle : kResizeHandles) {
+      if (resize_handle_shown(handle) &&
+          resize_handle_rect(handle)
+              .adjusted(-kHandleHitMargin, -kHandleHitMargin, kHandleHitMargin, kHandleHitMargin)
+              .contains(point)) {
+        return handle;
+      }
+    }
+    // The squares win; then the band along each side (shown with its side handle).
+    for (const auto handle : kSideHandles) {
+      if (resize_handle_shown(handle) && edge_band_polygon(handle).containsPoint(point, Qt::OddEvenFill)) {
+        return handle;
+      }
+    }
+    return ResizeHandle::None;
+  }
+
+  // A side's two corners, in the order the side runs.
+  [[nodiscard]] static std::pair<ResizeHandle, ResizeHandle> side_corners(ResizeHandle side) {
+    switch (side) {
+      case ResizeHandle::Top:
+        return {ResizeHandle::TopLeft, ResizeHandle::TopRight};
+      case ResizeHandle::Bottom:
+        return {ResizeHandle::BottomLeft, ResizeHandle::BottomRight};
+      case ResizeHandle::Left:
+        return {ResizeHandle::TopLeft, ResizeHandle::BottomLeft};
+      default:
+        return {ResizeHandle::TopRight, ResizeHandle::BottomRight};
+    }
+  }
+
+  // A side's resize band in overlay coordinates: between the corners' hit squares, from
+  // kEdgeBandOutside outside the drawn line to kEdgeBandInside inside it, turned with the box.
+  [[nodiscard]] QPolygonF edge_band_polygon(ResizeHandle side) const {
+    const auto [first, second] = side_corners(side);
+    const auto a = handle_overlay_center(first);
+    const auto b = handle_overlay_center(second);
+    const auto edge = b - a;
+    const auto length = std::hypot(edge.x(), edge.y());
+    const auto reach = kHandleSize / 2.0 + kHandleHitMargin;
+    if (length <= 2.0 * reach) {
+      return {};
+    }
+    const QPointF along = edge / length;
+    QPointF outward(-along.y(), along.x());
+    const auto box_center = (handle_overlay_center(ResizeHandle::TopLeft) +
+                             handle_overlay_center(ResizeHandle::BottomRight)) / 2.0;
+    const auto middle = (a + b) / 2.0;
+    if (QPointF::dotProduct(middle - box_center, outward) < 0.0) {
+      outward = -outward;
+    }
+    const auto start = a + along * reach;
+    const auto end = b - along * reach;
+    QPolygonF band;
+    band << start + outward * kEdgeBandOutside << end + outward * kEdgeBandOutside
+         << end - outward * kEdgeBandInside << start - outward * kEdgeBandInside;
+    return band;
+  }
+
+  // The size cursor nearest the handle's outward direction as drawn, so a rotated or skewed box
+  // (or a rotated view) gets the cursor that points along the drag (issue 684).
+  [[nodiscard]] Qt::CursorShape cursor_for_handle(ResizeHandle handle) const {
+    if (handle == ResizeHandle::None) {
+      return Qt::IBeamCursor;
+    }
+    const auto rect = editor_visual_rect();
+    const auto center = rect.center();
+    const auto reach = std::max(1.0, std::min(rect.width(), rect.height()) / 2.0);
+    const auto from = map_editor_point_to_canvas(center);
+    const auto to = map_editor_point_to_canvas(center + handle_direction(handle) * reach);
+    return text_box_resize_cursor_for_direction(to - from);
+  }
+
+  [[nodiscard]] bool rotate_zones_offered() const {
+    return editor_ != nullptr && !resize_drag_.has_value() && editor_->property(kTextEditorRotateZonesProperty).toBool();
+  }
+
+  // Beside a corner, outside the box and its resize zones, within the Move tool's reach: the
+  // corner's outward direction on screen (degrees, y down), for its rotate cursor.
+  [[nodiscard]] std::optional<double> rotate_corner_direction_at(QPointF point) const {
+    if (!rotate_zones_offered() || resize_handle_at(point) != ResizeHandle::None ||
+        map_editor_rect_to_overlay(editor_visual_rect()).containsPoint(point, Qt::OddEvenFill)) {
+      return std::nullopt;
+    }
+    std::optional<ResizeHandle> nearest;
+    double nearest_distance = kTextBoxCornerRotateReach;
+    for (const auto handle : kCornerHandles) {
+      const auto offset = point - handle_overlay_center(handle);
+      const auto distance = std::hypot(offset.x(), offset.y());
+      if (distance <= nearest_distance) {
+        nearest = handle;
+        nearest_distance = distance;
+      }
+    }
+    if (!nearest.has_value()) {
+      return std::nullopt;
+    }
+    const auto box_center =
+        (handle_overlay_center(ResizeHandle::TopLeft) + handle_overlay_center(ResizeHandle::BottomRight)) / 2.0;
+    const auto outward = handle_overlay_center(*nearest) - box_center;
+    return std::atan2(outward.y(), outward.x()) * 180.0 / kPi;
+  }
+
+  void update_hover_cursor(QPointF point, Qt::KeyboardModifiers modifiers) {
+    if (const auto direction = rotate_corner_direction_at(point); direction.has_value()) {
+      setCursor(corner_rotate_cursor(*direction));
+      return;
+    }
+    if (path_handle_at(point) != PathHandle::None) {
+      setCursor(Qt::PointingHandCursor);
+      return;
+    }
+    const auto handle = resize_handle_at(point);
+    // Ctrl+drag moves the text (GitHub issue 216); the resize handles keep their cursors.
+    setCursor(handle == ResizeHandle::None && modifiers.testFlag(Qt::ControlModifier) ? Qt::SizeAllCursor
+                                                                                     : cursor_for_handle(handle));
+  }
+
+  // ---- Path text (docs/path-text.md) ----
+
+  struct PathSessionGeometry {
+    TextPathLinePlan plan;
+    TextLineGeometry geometry;
+  };
+
+  // The contour and range the overlay shows: the one being dragged, else the session's.
+  [[nodiscard]] std::optional<TextPathFrame> shown_path() const {
+    if (path_preview_.has_value()) {
+      return path_preview_;
+    }
+    return editor_ == nullptr ? std::nullopt : text_editor_path(*editor_);
+  }
+
+  // The session's line plan and the straight-space geometry over it (the cached 1:1 layout).
+  [[nodiscard]] std::optional<PathSessionGeometry> session_path_geometry() const {
+    if (editor_ == nullptr || !text_editor_path(*editor_).has_value()) {
+      return std::nullopt;
+    }
+    double layout_zoom = 1.0;
+    const auto* layout_document = text_editor_document_space_layout(*editor_, layout_zoom);
+    if (layout_document == nullptr) {
+      return std::nullopt;
+    }
+    auto plan = text_editor_path_line_plan(*editor_, *layout_document);
+    if (!plan.has_value()) {
+      return std::nullopt;
+    }
+    auto geometry = TextLineGeometry::from_lines(*layout_document, {plan->line});
+    return PathSessionGeometry{std::move(*plan), std::move(geometry)};
+  }
+
+  // How far either side of the line glyphs can reach, in text-local units.
+  [[nodiscard]] double path_text_reach() const {
+    const auto size = editor_ == nullptr ? 0 : editor_->property("patchy.documentTextSize").toInt();
+    return std::max(12.0, 1.6 * static_cast<double>(std::max(1, size))) + 8.0 / zoom();
+  }
+
+  [[nodiscard]] QPointF map_local_point_to_overlay(QPointF local) const {
+    return map_editor_point_to_canvas(local * zoom()) - QPointF(geometry().topLeft());
+  }
+
+  [[nodiscard]] QPolygonF map_local_polygon_to_overlay(const QPolygonF& local) const {
+    QPolygonF mapped;
+    mapped.reserve(local.size());
+    for (const auto& point : local) {
+      mapped.push_back(map_local_point_to_overlay(point));
+    }
+    return mapped;
+  }
+
+  [[nodiscard]] bool overlay_point_near_path(QPointF overlay_point) const {
+    const auto frame = shown_path();
+    const auto editor_point = map_overlay_point_to_editor(overlay_point);
+    if (!frame.has_value() || !editor_point.has_value()) {
+      return false;
+    }
+    const auto local = *editor_point / zoom();
+    return TextPathCurve(frame->path).nearest(local.x(), local.y()).gap <= path_text_reach();
+  }
+
+  // A mark's centre in overlay coordinates: the range's start, its end, or its middle.
+  [[nodiscard]] QPointF path_handle_center(PathHandle handle) const {
+    const auto frame = shown_path();
+    if (!frame.has_value()) {
+      return {};
+    }
+    const TextPathCurve curve(frame->path);
+    const auto span = text_path_span(curve, frame->range);
+    const double along = handle == PathHandle::Start ? 0.0 : handle == PathHandle::End ? span.length : span.length / 2.0;
+    const auto sample = curve.sample(span.start_distance + along);
+    return map_local_point_to_overlay(QPointF(sample.x, sample.y));
+  }
+
+  [[nodiscard]] PathHandle path_handle_at(QPointF overlay_point) const {
+    if (!shown_path().has_value()) {
+      return PathHandle::None;
+    }
+    auto best = PathHandle::None;
+    double best_distance = kPathHandleHitRadius;
+    for (const auto handle : {PathHandle::Start, PathHandle::End, PathHandle::Middle}) {
+      const auto offset = overlay_point - path_handle_center(handle);
+      const auto distance = std::hypot(offset.x(), offset.y());
+      if (distance <= best_distance) {
+        best = handle;
+        best_distance = distance;
+      }
+    }
+    return best;
+  }
+
+  // The frame a drag has reached, from the frame it started with (never from the last move, so
+  // the result depends only on where the pointer is).
+  [[nodiscard]] std::optional<TextPathFrame> path_frame_for_drag(QPointF overlay_point) const {
+    if (!path_drag_.has_value()) {
+      return std::nullopt;
+    }
+    const auto editor_point = map_canvas_point_to_editor(overlay_point + QPointF(geometry().topLeft()), text_transform_);
+    if (!editor_point.has_value()) {
+      return path_drag_->start_frame;
+    }
+    const auto local = *editor_point / zoom();
+    auto frame = path_drag_->start_frame;
+    const TextPathCurve curve(frame.path);
+    if (!curve.valid()) {
+      return frame;
+    }
+    const auto nearest = curve.nearest(local.x(), local.y());
+    const double count = static_cast<double>(curve.segment_count());
+    // The shortest range a drag leaves: about four pixels of line.
+    const double minimum = std::min(4.0, curve.length() / 2.0);
+    const auto span = text_path_span(curve, frame.range);
+    const auto range_from_distances = [&](double start, double length) {
+      if (!curve.closed()) {
+        start = std::clamp(start, 0.0, std::max(0.0, curve.length() - length));
+        return TextPathRange{curve.parameter_at_distance(start), curve.parameter_at_distance(start + length)};
+      }
+      start = std::fmod(start, curve.length());
+      if (start < 0.0) {
+        start += curve.length();
+      }
+      const double end = start + length;
+      const double end_parameter = end > curve.length() ? curve.parameter_at_distance(end - curve.length()) + count
+                                                         : curve.parameter_at_distance(end);
+      return TextPathRange{curve.parameter_at_distance(start), end_parameter};
+    };
+    switch (path_drag_->handle) {
+      case PathHandle::Start: {
+        double length = span.start_distance + span.length - nearest.distance;
+        if (curve.closed()) {
+          length = std::fmod(length, curve.length());
+          if (length <= 0.0) {
+            length += curve.length();
+          }
+        }
+        length = std::clamp(length, minimum, curve.closed() ? curve.length() : span.start_distance + span.length);
+        frame.range = range_from_distances(span.start_distance + span.length - length, length);
+        break;
+      }
+      case PathHandle::End: {
+        double length = nearest.distance - span.start_distance;
+        if (curve.closed()) {
+          length = std::fmod(length, curve.length());
+          if (length <= 0.0) {
+            length += curve.length();
+          }
+        }
+        length = std::clamp(length, minimum, curve.closed() ? curve.length() : curve.length() - span.start_distance);
+        frame.range = range_from_distances(span.start_distance, length);
+        break;
+      }
+      case PathHandle::Middle: {
+        frame.range = range_from_distances(span.start_distance + nearest.distance - path_drag_->press_distance,
+                                           span.length);
+        // Across the line, past half the type size: the text flips to that side.
+        const auto size = editor_ == nullptr ? 0 : editor_->property("patchy.documentTextSize").toInt();
+        if (!nearest.left && nearest.gap > std::max(6.0, 0.5 * static_cast<double>(size))) {
+          const auto reversed_range = reversed_text_path_range(frame.path, frame.range);
+          frame.path = reversed_text_path(frame.path);
+          frame.range = reversed_range;
+        }
+        break;
+      }
+      case PathHandle::None:
+        break;
+    }
+    frame.range = normalized_text_path_range(frame.path, frame.range);
+    return frame;
+  }
+
+  void paint_path_caret(QPainter& painter, const PathSessionGeometry& path) const {
+    const auto caret = path.geometry.caret_rect(text_editor_caret_position(*editor_));
+    const auto caret_width = text_editor_caret_width(*editor_);
+    // A caret rect has no width; one with no height is a position the line does not hold.
+    if (!(caret.height() > 0.0) || caret_width <= 0) {
+      const_cast<TransformedTextEditOverlay*>(this)->setProperty("patchy.transformedTextCaretPolygon", QVariant());
+      return;
+    }
+    // A bar across the line where the caret stands, as wide on screen as any caret.
+    const auto top = map_local_point_to_overlay(path.plan.map(QPointF(caret.left(), caret.top())));
+    const auto bottom = map_local_point_to_overlay(path.plan.map(QPointF(caret.left(), caret.bottom())));
+    const auto along = bottom - top;
+    const auto length = std::hypot(along.x(), along.y());
+    if (!(length > 0.0)) {
+      return;
+    }
+    const QPointF side(-along.y() / length * caret_width / 2.0, along.x() / length * caret_width / 2.0);
+    QPolygonF bar;
+    bar << top - side << top + side << bottom + side << bottom - side;
+    QVariantList canvas_polygon;
+    for (const auto& point : bar) {
+      canvas_polygon.push_back(point + QPointF(geometry().topLeft()));
+    }
+    const_cast<TransformedTextEditOverlay*>(this)->setProperty("patchy.transformedTextCaretPolygon", canvas_polygon);
+    if (!editor_->hasFocus() || !caret_visible()) {
+      return;
+    }
+    painter.setPen(Qt::NoPen);
+    painter.setBrush(editor_->palette().color(QPalette::Text));
+    painter.drawPolygon(bar);
+  }
+
+  void paint_path_controls(QPainter& painter, const TextPathFrame& frame) const {
+    const auto& sub = frame.path.subpaths.front();
+    const auto& anchors = sub.anchors;
+    const auto map = [&](double x, double y) { return map_local_point_to_overlay(QPointF(x, y)); };
+    QPainterPath outline;
+    outline.moveTo(map(anchors.front().anchor_x, anchors.front().anchor_y));
+    const auto segments = static_cast<std::size_t>(text_path_segment_count(frame.path));
+    for (std::size_t i = 0; i < segments; ++i) {
+      const auto& a = anchors[i];
+      const auto& b = anchors[(i + 1) % anchors.size()];
+      outline.cubicTo(map(a.out_x, a.out_y), map(b.in_x, b.in_y), map(b.anchor_x, b.anchor_y));
+    }
+    if (sub.closed) {
+      outline.closeSubpath();
+    }
+    draw_text_box_outline(painter, outline);
+
+    // A short tick at each end of the range, standing on the side the text stands on.
+    const TextPathCurve curve(frame.path);
+    const auto span = text_path_span(curve, frame.range);
+    const double tick = std::max(6.0, 0.6 * editor_->property("patchy.documentTextSize").toInt());
+    painter.setPen(QPen(theme().resize_handle_border, 1.0));
+    for (const double along : {0.0, span.length}) {
+      const auto sample = curve.sample(span.start_distance + along);
+      painter.drawLine(map(sample.x, sample.y), map(sample.x + sample.tangent_y * tick, sample.y - sample.tangent_x * tick));
+    }
+    painter.setBrush(theme().resize_handle_bg);
+    const auto start = path_handle_center(PathHandle::Start);
+    const auto end = path_handle_center(PathHandle::End);
+    const auto middle = path_handle_center(PathHandle::Middle);
+    painter.drawEllipse(start, kPathHandleRadius, kPathHandleRadius);
+    const QRectF end_rect(end.x() - kHandleSize / 2.0 - 1.0, end.y() - kHandleSize / 2.0 - 1.0, kHandleSize + 2.0,
+                          kHandleSize + 2.0);
+    painter.drawRect(end_rect);
+    QPolygonF diamond;
+    diamond << middle + QPointF(0.0, -kPathHandleRadius - 1.0) << middle + QPointF(kPathHandleRadius + 1.0, 0.0)
+            << middle + QPointF(0.0, kPathHandleRadius + 1.0) << middle + QPointF(-kPathHandleRadius - 1.0, 0.0);
+    painter.drawPolygon(diamond);
+    // Text past the end of the range is hidden: the plus on the end mark says so (issue 631).
+    if (!path_preview_.has_value() && editor_->property(kTextEditorHiddenLinesProperty).toBool()) {
+      draw_text_overflow_marker(painter, end_rect);
+    }
+  }
+
+  [[nodiscard]] bool caret_visible() const {
+    const auto flash_time = text_editor_caret_blink_phase_ms();
+    if (flash_time <= 0 || !caret_blink_clock_.isValid()) {
+      return true;
+    }
+    return ((caret_blink_clock_.elapsed() / flash_time) % 2) == 0;
+  }
+
+  void paint_selection(QPainter& painter) const {
+    const auto cursor = editor_->textCursor();
+    if (!cursor.hasSelection()) {
+      return;
+    }
+
+    QColor highlight = editor_->palette().color(QPalette::Highlight);
+    highlight.setAlpha(120);
+    painter.setPen(Qt::NoPen);
+    painter.setBrush(highlight);
+    if (const auto path = session_path_geometry()) {
+      // Straight-space rects bent into strips along the contour.
+      for (const auto& rect : path->geometry.selection_rects(cursor.selectionStart(), cursor.selectionEnd())) {
+        painter.drawPolygon(map_local_polygon_to_overlay(path->plan.strip(rect)));
+      }
+      return;
+    }
+    const auto selection_rects =
+        text_editor_viewport_selection_rects(*editor_, cursor.selectionStart(), cursor.selectionEnd());
+    for (const auto& rect : selection_rects) {
+      painter.drawPolygon(map_editor_rect_to_overlay(QRectF(rect)));
+    }
+  }
+
+  void paint_caret(QPainter& painter) const {
+    if (const auto path = session_path_geometry()) {
+      paint_path_caret(painter, *path);
+      return;
+    }
+    auto caret = text_editor_viewport_caret_rect(*editor_);
+    const auto caret_width = text_editor_caret_width(*editor_);
+    if (caret.isEmpty() || caret_width <= 0) {
+      return;
+    }
+    apply_text_caret_thickness(caret, caret_width, text_editor_is_vertical(*editor_));
+    // Published in CANVAS coordinates whether or not this frame draws it (the caret blinks).
+    // It is where a user has to click to put the cursor back, which is the only place the
+    // transformed hit-test can be checked from outside.
+    QVariantList canvas_polygon;
+    for (const auto& point : map_editor_rect_to_canvas(QRectF(caret))) {
+      canvas_polygon.push_back(point);
+    }
+    const_cast<TransformedTextEditOverlay*>(this)->setProperty("patchy.transformedTextCaretPolygon",
+                                                               canvas_polygon);
+    if (!editor_->hasFocus() || !caret_visible()) {
+      return;
+    }
+    painter.setPen(Qt::NoPen);
+    painter.setBrush(editor_->palette().color(QPalette::Text));
+    painter.drawPolygon(map_editor_rect_to_overlay(QRectF(caret)));
+  }
+
+  void paint_text_box_controls(QPainter& painter) const {
+    const auto rect = editor_visual_rect();
+    if (rect.isEmpty()) {
+      return;
+    }
+    if (const auto frame = shown_path()) {
+      paint_path_controls(painter, *frame);
+      return;
+    }
+
+    QPainterPath outline;
+    if (const auto area = text_editor_area(*editor_)) {
+      const auto& anchors = area->subpaths.front().anchors;
+      const auto map = [&](double x, double y) {
+        const double sx = resize_preview_document_size_.has_value()
+                              ? resize_preview_document_size_->width() / std::max(1, editor_->property("patchy.documentTextWidth").toInt()) : 1.0;
+        const double sy = resize_preview_document_size_.has_value()
+                              ? resize_preview_document_size_->height() / std::max(1, editor_->property("patchy.documentTextHeight").toInt()) : 1.0;
+        return map_editor_point_to_canvas(QPointF(x * sx, y * sy) * zoom()) - QPointF(geometry().topLeft());
+      };
+      outline.moveTo(map(anchors.front().anchor_x, anchors.front().anchor_y));
+      for (std::size_t i = 0; i < anchors.size(); ++i) {
+        const auto& a = anchors[i];
+        const auto& b = anchors[(i + 1) % anchors.size()];
+        outline.cubicTo(map(a.out_x, a.out_y), map(b.in_x, b.in_y), map(b.anchor_x, b.anchor_y));
+      }
+      outline.closeSubpath();
+    } else {
+      outline.addPolygon(map_editor_rect_to_overlay(rect));
+      outline.closeSubpath();
+    }
+    draw_text_box_outline(painter, outline);
+
+    painter.setPen(QPen(theme().resize_handle_border, 1.0));
+    painter.setBrush(theme().resize_handle_bg);
+    for (const auto handle : kResizeHandles) {
+      if (resize_handle_shown(handle)) {
+        painter.drawRect(resize_handle_rect(handle));
+      }
+    }
+    if (editor_->property(kTextEditorHiddenLinesProperty).toBool()) {
+      draw_text_overflow_marker(painter, resize_handle_rect(ResizeHandle::BottomRight));
+    }
+  }
+
+  [[nodiscard]] std::optional<ResizeGeometry> resize_geometry_for_event(QMouseEvent* event) const {
+    if (canvas_ == nullptr || editor_ == nullptr || !resize_drag_.has_value()) {
+      return std::nullopt;
+    }
+
+    const auto canvas_point = QPointF(canvas_->mapFromGlobal(event->globalPosition().toPoint()));
+    const auto current_editor_point = map_canvas_point_to_editor(canvas_point, resize_drag_->start_transform);
+    if (!current_editor_point.has_value()) {
+      return std::nullopt;
+    }
+
+    const auto current_zoom = zoom();
+    const QPointF delta((current_editor_point->x() - resize_drag_->start_editor_point.x()) / current_zoom,
+                        (current_editor_point->y() - resize_drag_->start_editor_point.y()) / current_zoom);
+    double left = 0.0;
+    double top = 0.0;
+    double right = static_cast<double>(resize_drag_->start_width);
+    double bottom = static_cast<double>(resize_drag_->start_height);
+
+    switch (resize_drag_->handle) {
+      case ResizeHandle::TopLeft:
+        left = std::min(right - kMinimumTextBoxDocumentSize, delta.x());
+        top = std::min(bottom - kMinimumTextBoxDocumentSize, delta.y());
+        break;
+      case ResizeHandle::TopRight:
+        right = std::max(left + kMinimumTextBoxDocumentSize,
+                         static_cast<double>(resize_drag_->start_width) + delta.x());
+        top = std::min(bottom - kMinimumTextBoxDocumentSize, delta.y());
+        break;
+      case ResizeHandle::BottomLeft:
+        left = std::min(right - kMinimumTextBoxDocumentSize, delta.x());
+        bottom = std::max(top + kMinimumTextBoxDocumentSize,
+                          static_cast<double>(resize_drag_->start_height) + delta.y());
+        break;
+      case ResizeHandle::BottomRight:
+        right = std::max(left + kMinimumTextBoxDocumentSize,
+                         static_cast<double>(resize_drag_->start_width) + delta.x());
+        bottom = std::max(top + kMinimumTextBoxDocumentSize,
+                          static_cast<double>(resize_drag_->start_height) + delta.y());
+        break;
+      case ResizeHandle::Top:
+        top = std::min(bottom - kMinimumTextBoxDocumentSize, delta.y());
+        break;
+      case ResizeHandle::Bottom:
+        bottom = std::max(top + kMinimumTextBoxDocumentSize,
+                          static_cast<double>(resize_drag_->start_height) + delta.y());
+        break;
+      case ResizeHandle::Left:
+        left = std::min(right - kMinimumTextBoxDocumentSize, delta.x());
+        break;
+      case ResizeHandle::Right:
+        right = std::max(left + kMinimumTextBoxDocumentSize,
+                         static_cast<double>(resize_drag_->start_width) + delta.x());
+        break;
+      case ResizeHandle::None:
+        return std::nullopt;
+    }
+
+    const auto new_origin = resize_drag_->start_transform.map(QPointF(left, top));
+    QTransform adjusted(resize_drag_->start_transform.m11(),
+                        resize_drag_->start_transform.m12(),
+                        resize_drag_->start_transform.m21(),
+                        resize_drag_->start_transform.m22(),
+                        new_origin.x(),
+                        new_origin.y());
+    return ResizeGeometry{adjusted,
+                          std::max(kMinimumTextBoxDocumentSize, static_cast<int>(std::round(right - left))),
+                          std::max(kMinimumTextBoxDocumentSize, static_cast<int>(std::round(bottom - top)))};
+  }
+
+  void resize_text_box(QMouseEvent* event) {
+    const auto geometry = resize_geometry_for_event(event);
+    if (!geometry.has_value() || editor_ == nullptr) {
+      return;
+    }
+    resize_preview_transform_ = geometry->transform;
+    resize_preview_document_size_ = QSizeF(geometry->width, geometry->height);
+
+    const auto& adjusted = geometry->transform;
+    const LayerAffineTransform affine{adjusted.m11(), adjusted.m12(), adjusted.m21(),
+                                      adjusted.m22(), adjusted.dx(),  adjusted.dy()};
+    editor_->setProperty(kTextEditorTransformOverrideProperty,
+                         QString::fromStdString(serialize_layer_affine_transform(affine)));
+    editor_->setProperty(kTextEditorSourceVisibleAnchorProperty, QVariant());
+    editor_->setProperty(kTextEditorSourceVisibleSizeProperty, QVariant());
+    editor_->setProperty(kTextEditorSourceLineStartFractionProperty, QVariant());
+    editor_->setProperty(kTextEditorSourceInkOffsetProperty, QVariant());
+    editor_->setProperty(kTextEditorSourceFirstBaselineProperty, QVariant());
+    editor_->setProperty(kTextEditorSourceDocumentBaselineProperty, QVariant());
+    editor_->setProperty(kTextEditorVisibleLocalRectProperty, QVariant());
+    // Box geometry changed: drop the import-frame render rect so glyphs lay out against the live
+    // box instead of the original Photoshop frame (free helper isn't visible inside this class).
+    editor_->setProperty(kTextEditorRenderLocalRectProperty, QVariant());
+    editor_->setProperty("patchy.documentTextX", snapped_pixel_coordinate(adjusted.dx()));
+    editor_->setProperty("patchy.documentTextY", snapped_pixel_coordinate(adjusted.dy()));
+    editor_->setProperty("patchy.documentTextFlow", QString::fromLatin1(kTextFlowBox));
+    if (auto area = resize_drag_->start_area) {
+      const double sx = static_cast<double>(geometry->width) / resize_drag_->start_width;
+      const double sy = static_cast<double>(geometry->height) / resize_drag_->start_height;
+      const auto bounds = area->bounds();
+      transform_vector_path(*area, {sx, 0.0, 0.0, sy, bounds->left * (1.0-sx), bounds->top * (1.0-sy)});
+      editor_->setProperty(kTextEditorAreaProperty, QString::fromStdString(serialize_vector_path(*area)));
+    }
+    editor_->setProperty("patchy.documentTextWidth", geometry->width);
+    editor_->setProperty("patchy.documentTextHeight", geometry->height);
+    sync_geometry();
+  }
+
+  void schedule_resize_callback() {
+    if (resize_callback_pending_ || editor_ == nullptr || !resize_callback_) {
+      return;
+    }
+    resize_callback_pending_ = true;
+    QTimer::singleShot(0, this, [this, editor = QPointer<QTextEdit>(editor_)] {
+      resize_callback_pending_ = false;
+      if (editor != nullptr && resize_callback_) {
+        resize_callback_(editor);
+      }
+    });
+  }
+
+  CanvasWidget* canvas_{nullptr};
+  QPointer<QTextEdit> editor_;
+  QTransform text_transform_;
+  std::function<void(QTextEdit*)> resize_callback_;
+  bool selecting_{false};
+  bool resize_callback_pending_{false};
+  std::optional<QTransform> resize_preview_transform_;
+  std::optional<QSizeF> resize_preview_document_size_;
+  std::optional<ResizeDragState> resize_drag_;
+  std::optional<PathDragState> path_drag_;
+  // The frame as dragged, not applied to the session yet.
+  std::optional<TextPathFrame> path_preview_;
+  int selection_anchor_{0};
+  QElapsedTimer caret_blink_clock_;
+  QTimer caret_blink_timer_;
+};
+
+TransformedTextEditOverlay* transformed_text_edit_overlay_for_canvas(CanvasWidget* canvas) {
+  if (canvas == nullptr) {
+    return nullptr;
+  }
+  auto* widget = canvas->findChild<QWidget*>(QString::fromLatin1(kTransformedTextEditOverlayObjectName),
+                                             Qt::FindDirectChildrenOnly);
+  return widget == nullptr ? nullptr : static_cast<TransformedTextEditOverlay*>(widget);
+}
+
+// The rect a previewed session hands the input method as its cursor rectangle, in editor
+// viewport coordinates. Windows keeps the IME candidate list OUT of this rect (CFS_EXCLUDE),
+// so it is the drawn caret's line for horizontal text and, for vertical text, the caret's cell
+// column down to the bottom of the widget: the list then opens below the column instead of
+// covering the characters after the caret. A transformed session maps the caret through the
+// overlay's transform and back into this widget's coordinates, so the rect still lands on the
+// glyphs the overlay draws. std::nullopt for an unpreviewed session (QTextEdit's own answer).
+std::optional<QRect> text_editor_input_method_rect(const QTextEdit& editor) {
+  if (!editor.property(kTextEditorPreviewPaintProperty).toBool() || editor.viewport() == nullptr) {
+    return std::nullopt;
+  }
+  auto caret = text_editor_viewport_caret_rect(editor);
+  const auto caret_width = text_editor_caret_width(editor);
+  if (caret.isEmpty() || caret_width <= 0) {
+    return std::nullopt;
+  }
+  const bool vertical = text_editor_is_vertical(editor);
+  apply_text_caret_thickness(caret, caret_width, vertical);
+  if (vertical) {
+    caret.setBottom(std::max(caret.bottom(), editor.viewport()->rect().bottom()));
+  }
+  if (editor.property(kTextEditorTransformedOverlayProperty).toBool()) {
+    auto* canvas = qobject_cast<CanvasWidget*>(editor.parentWidget());
+    const auto* overlay = transformed_text_edit_overlay_for_canvas(canvas);
+    if (overlay != nullptr && overlay->editor() == &editor) {
+      const auto canvas_rect = overlay->canvas_bounds_for_editor_rect(QRectF(caret));
+      return QRect(editor.viewport()->mapFrom(canvas, canvas_rect.topLeft()), canvas_rect.size());
+    }
+  }
+  return caret;
+}
+
+QString document_html_for_editor(const QString& document_html, const QFont& editor_font, double zoom) {
+  QTextDocument document;
+  document.setDocumentMargin(0);
+  document.setDefaultFont(editor_font);
+  document.setHtml(document_html);
+  scale_document_font_sizes(document, zoom);
+  return document.toHtml();
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+QTextCharFormat text_editor_typing_format(const QFont& font, QColor color) {
+  QTextCharFormat format;
+  format.setFont(font);
+  set_text_display_family(format, display_text_family_from_font(font));
+  format.setForeground(QBrush(color.isValid() ? color : QColor(Qt::black)));
+  return format;
+}
+
+QTextCharFormat text_editor_reference_format(const QTextEdit& editor) {
+  auto cursor = editor.textCursor();
+  if (cursor.hasSelection()) {
+    const auto start = std::min(cursor.selectionStart(), cursor.selectionEnd());
+    const auto end = std::max(cursor.selectionStart(), cursor.selectionEnd());
+    cursor.setPosition(start);
+    if (start < end) {
+      cursor.setPosition(start + 1, QTextCursor::KeepAnchor);
+    }
+  }
+  return cursor.charFormat();
+}
+
+std::optional<double> text_leading_from_document_formats(const QTextDocument& document) {
+  for (auto block = document.begin(); block.isValid(); block = block.next()) {
+    for (auto fragment_it = block.begin(); !fragment_it.atEnd(); ++fragment_it) {
+      const auto fragment = fragment_it.fragment();
+      if (!fragment.isValid() || fragment.length() <= 0) {
+        continue;
+      }
+      const auto format = fragment.charFormat();
+      if (!format.hasProperty(kTextLeadingFormatProperty)) {
+        continue;
+      }
+      const auto leading = format.property(kTextLeadingFormatProperty).toDouble();
+      if (std::isfinite(leading) && leading > 0.0) {
+        return leading;
+      }
+    }
+  }
+  return std::nullopt;
+}
+
+int document_text_size_from_editor_format(const QTextCharFormat& format, double zoom, int fallback) noexcept {
+  if (format.hasProperty(kTextExactSizeFormatProperty)) {
+    const auto exact = format.property(kTextExactSizeFormatProperty).toDouble();
+    if (std::isfinite(exact) && exact > 0.0) {
+      return std::max(1, static_cast<int>(std::round(exact / std::max(0.001, zoom))));
+    }
+  }
+  const auto font = format.font();
+  int editor_pixel_size = font.pixelSize();
+  if (editor_pixel_size <= 0 && font.pointSizeF() > 0.0) {
+    editor_pixel_size = static_cast<int>(std::round(font.pointSizeF()));
+  }
+  if (editor_pixel_size <= 0) {
+    return std::max(1, fallback);
+  }
+  return std::max(1, static_cast<int>(std::round(static_cast<double>(editor_pixel_size) / std::max(0.001, zoom))));
+}
+
+std::optional<QColor> text_color_from_format(const QTextCharFormat& format) {
+  if (format.foreground().style() == Qt::NoBrush) {
+    return std::nullopt;
+  }
+  const auto color = format.foreground().color();
+  if (!color.isValid()) {
+    return std::nullopt;
+  }
+  return QColor(color.red(), color.green(), color.blue());
+}
+
+void merge_text_char_format(QTextEdit& editor, const QTextCharFormat& format) {
+  if (editor.toPlainText().isEmpty()) {
+    auto current = editor.currentCharFormat();
+    current.merge(format);
+    editor.setCurrentCharFormat(current);
+    return;
+  }
+
+  auto cursor = editor.textCursor();
+  if (cursor.hasSelection()) {
+    cursor.mergeCharFormat(format);
+    editor.setTextCursor(cursor);
+    return;
+  }
+
+  // No selection: Photoshop applies an options-bar change to the WHOLE type object. Qt's
+  // mergeCurrentCharFormat alone only sets the format the next typed character would get, so
+  // clicking Bold/Italic (or changing the family, size or colour) with a bare caret did nothing
+  // at all to the text already on the layer -- the run formats kept their own values and won at
+  // render time. Merge over the document with a scratch cursor so the caret and any pending
+  // typing format stay where the user left them.
+  auto whole = editor.textCursor();
+  whole.select(QTextCursor::Document);
+  whole.mergeCharFormat(format);
+  editor.mergeCurrentCharFormat(format);
+}
+
+void preserve_text_editor_typing_format(QTextEdit& editor, const QFont& font, QColor color) {
+  const auto block = editor.textCursor().block();
+  const auto empty_document = editor.toPlainText().isEmpty();
+  if (!empty_document && editor.textCursor().hasSelection()) {
+    return;
+  }
+  const auto should_preserve_format = empty_document || (block.isValid() && block.text().isEmpty());
+  if (!should_preserve_format) {
+    return;
+  }
+
+  editor.document()->setDefaultFont(font);
+  editor.setCurrentCharFormat(text_editor_typing_format(font, color));
+  editor.viewport()->update();
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+VerticalRenderPlan vertical_render_plan_for_editor(const QTextEdit& editor, const QTextDocument& layout_document) {
+  TextToolSettings settings;
+  settings.size = std::max(1, editor.property("patchy.documentTextSize").toInt());
+  settings.boxed = text_flow_is_box(editor.property("patchy.documentTextFlow").toString());
+  settings.box_width = std::max(kMinimumTextBoxDocumentSize, editor.property("patchy.documentTextWidth").toInt());
+  settings.box_height = std::max(kMinimumTextBoxDocumentSize, editor.property("patchy.documentTextHeight").toInt());
+  settings.photoshop_layout = text_editor_uses_photoshop_layout(editor);
+  settings.vertical = true;
+  apply_text_editor_contour(settings, editor);
+  // Mirrors build_text_editor_document_space_layout's scales, argument for argument.
+  const auto frame_layout_scale =
+      settings.photoshop_layout && editor.property("patchy.usesPsdTextFrame").toBool()
+          ? text_editor_size_display_scale(editor)
+          : 1.0;
+  return vertical_render_plan(layout_document, settings, 1.0, frame_layout_scale);
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+struct TransformedTextPixels {
+  PixelBuffer pixels;
+  Rect bounds{};
+  TextLayoutMetrics metrics;
+};
+
+std::optional<LayerAffineTransform> canonical_text_affine_transform_for_layer(const Layer& layer) {
+  if (const auto found = layer.metadata().find(kLayerMetadataTextTransform); found != layer.metadata().end()) {
+    return parse_layer_affine_transform(found->second);
+  }
+  if (const auto found = layer.metadata().find(kLayerMetadataPsdTextTransform); found != layer.metadata().end()) {
+    return parse_layer_affine_transform(found->second);
+  }
+  return std::nullopt;
+}
+
+std::optional<QTransform> patchy_text_transform_for_layer(const Layer& layer) {
+  const auto parsed = canonical_text_affine_transform_for_layer(layer);
+  if (!parsed.has_value()) {
+    return std::nullopt;
+  }
+  return QTransform((*parsed)[0], (*parsed)[1], (*parsed)[2], (*parsed)[3], (*parsed)[4], (*parsed)[5]);
+}
+
+QTransform qtransform_from_affine(const LayerAffineTransform& transform) {
+  return QTransform(transform[0], transform[1], transform[2], transform[3], transform[4], transform[5]);
+}
+
+std::optional<LayerAffineTransform> text_editor_transform_override(const QTextEdit& editor) {
+  const auto value = editor.property(kTextEditorTransformOverrideProperty).toString().trimmed();
+  if (value.isEmpty()) {
+    return std::nullopt;
+  }
+  return parse_layer_affine_transform(value.toStdString());
+}
+
+void set_text_editor_transform_override(QTextEdit& editor, const LayerAffineTransform& transform) {
+  editor.setProperty(kTextEditorTransformOverrideProperty,
+                     QString::fromStdString(serialize_layer_affine_transform(transform)));
+  // The raster is drawn from the anchor rounded like Photoshop (build_text_render_plan), so
+  // the document point that places it rounds the same way.
+  editor.setProperty("patchy.documentTextX", snapped_pixel_coordinate(transform[4]));
+  editor.setProperty("patchy.documentTextY", snapped_pixel_coordinate(transform[5]));
+}
+
+void set_text_editor_visible_local_rect(QTextEdit& editor, const Rect& bounds) {
+  editor.setProperty(kTextEditorVisibleLocalRectProperty,
+                     QRectF(bounds.x, bounds.y, std::max(1, bounds.width), std::max(1, bounds.height)));
+}
+
+void clear_text_editor_visible_local_rect(QTextEdit& editor) {
+  editor.setProperty(kTextEditorVisibleLocalRectProperty, QVariant());
+}
+
+void set_text_editor_render_local_rect(QTextEdit& editor, const QRectF& rect) {
+  if (const auto valid = valid_text_local_rect(rect); valid.has_value()) {
+    editor.setProperty(kTextEditorRenderLocalRectProperty, *valid);
+  }
+}
+
+void clear_text_editor_render_local_rect(QTextEdit& editor) {
+  editor.setProperty(kTextEditorRenderLocalRectProperty, QVariant());
+}
+
+std::optional<QRectF> text_editor_render_local_rect(const QTextEdit& editor) {
+  const auto value = editor.property(kTextEditorRenderLocalRectProperty);
+  if (!value.isValid()) {
+    return std::nullopt;
+  }
+  return valid_text_local_rect(value.toRectF());
+}
+
+std::optional<QPointF> text_editor_source_visible_anchor(const QTextEdit& editor) {
+  const auto value = editor.property(kTextEditorSourceVisibleAnchorProperty);
+  if (!value.isValid()) {
+    return std::nullopt;
+  }
+  const auto point = value.toPointF();
+  if (!std::isfinite(point.x()) || !std::isfinite(point.y())) {
+    return std::nullopt;
+  }
+  return point;
+}
+
+std::optional<QSizeF> text_editor_source_visible_size(const QTextEdit& editor) {
+  const auto value = editor.property(kTextEditorSourceVisibleSizeProperty);
+  if (!value.isValid()) {
+    return std::nullopt;
+  }
+  const auto size = value.toSizeF();
+  if (!std::isfinite(size.width()) || !std::isfinite(size.height()) || size.width() <= 0.0 ||
+      size.height() <= 0.0) {
+    return std::nullopt;
+  }
+  return size;
+}
+
+// The horizontal fraction of a text block's width that its justification pins in place: Photoshop
+// point text keeps the anchor at the line start for left text, the line middle for centered text,
+// and the line end for right-justified text.
+double horizontal_alignment_anchor_factor(Qt::Alignment alignment,
+                                          Qt::LayoutDirection direction = Qt::LeftToRight) {
+  // Alignment is logical (start/end): Qt draws "left" in a right-to-left paragraph flush right,
+  // and the anchor has to pin the same visual edge or the committed layer jumps by its width.
+  const auto visual = QStyle::visualAlignment(direction, alignment);
+  if ((visual & Qt::AlignHCenter) != 0) {
+    return 0.5;
+  }
+  if ((visual & Qt::AlignRight) != 0) {
+    return 1.0;
+  }
+  return 0.0;
+}
+
+// A paragraph's base direction: the explicit block direction, else the Unicode bidi default
+// (the first strong character decides).
+Qt::LayoutDirection resolved_block_direction(const QTextBlock& block) {
+  const auto direction = block.blockFormat().layoutDirection();
+  if (direction == Qt::LeftToRight || direction == Qt::RightToLeft) {
+    return direction;
+  }
+  return block.text().isRightToLeft() ? Qt::RightToLeft : Qt::LeftToRight;
+}
+
+// Multi-paragraph point text can mix justifications, but the rendered raster is placed as one
+// block; the first paragraph's justification decides which point of the block stays fixed.
+double text_editor_anchor_alignment_factor(const QTextEdit& editor) {
+  const auto block = editor.document()->begin();
+  return block.isValid()
+             ? horizontal_alignment_anchor_factor(block.blockFormat().alignment(), resolved_block_direction(block))
+             : 0.0;
+}
+
+// The first paragraph of a layer's stored paragraph runs (patchy.text.paragraph_runs): its
+// alignment name as stored and its resolved base direction.
+struct LayerFirstParagraph {
+  QString alignment{QStringLiteral("left")};
+  Qt::LayoutDirection direction{Qt::LeftToRight};
+  bool has_run{false};
+};
+
+LayerFirstParagraph layer_first_paragraph(const Layer& layer) {
+  LayerFirstParagraph result;
+  QString direction_field;
+  if (const auto found = layer.metadata().find(kLayerMetadataTextParagraphRuns); found != layer.metadata().end()) {
+    const auto lines = QString::fromStdString(found->second).split(QLatin1Char('\n'));
+    for (const auto& raw_line : lines) {
+      const auto line = raw_line.trimmed();
+      if (line.isEmpty() || line == QStringLiteral("v1") || line == QStringLiteral("v2")) {
+        continue;
+      }
+      const auto fields = line.split(QLatin1Char('\t'));
+      if (fields.size() < 3) {
+        continue;
+      }
+      result.alignment = fields[2];
+      result.has_run = true;
+      if (fields.size() >= 10) {
+        direction_field = fields[9];
+      }
+      break;
+    }
+  }
+  if (direction_field == QStringLiteral("rtl")) {
+    result.direction = Qt::RightToLeft;
+  } else if (direction_field != QStringLiteral("ltr")) {
+    // Auto: the first paragraph's own text decides, as the layout does.
+    if (const auto text = layer.metadata().find(kLayerMetadataText); text != layer.metadata().end()) {
+      const auto first_paragraph = QString::fromStdString(text->second).section(QLatin1Char('\n'), 0, 0);
+      if (first_paragraph.isRightToLeft()) {
+        result.direction = Qt::RightToLeft;
+      }
+    }
+  }
+  return result;
+}
+
+// Same as text_editor_anchor_alignment_factor, derived from a layer's stored paragraph runs for
+// paths that re-render text without an open editor (e.g. free transform of a text layer).
+double layer_anchor_alignment_factor(const Layer& layer) {
+  const auto first = layer_first_paragraph(layer);
+  return first.has_run
+             ? horizontal_alignment_anchor_factor(paragraph_alignment_from_name(first.alignment), first.direction)
+             : 0.0;
+}
+
+// What holds the lines, for the alignment the controls show and take (text_document.hpp).
+// Vertical type keeps its own rules (Top / Center / Bottom, every justify mode), so it reads
+// as a box.
+TextAlignmentFlow text_editor_alignment_flow(const QTextEdit& editor) {
+  if (text_editor_is_vertical(editor)) {
+    return TextAlignmentFlow::Box;
+  }
+  if (!editor.property(kTextEditorPathProperty).toString().isEmpty()) {
+    return TextAlignmentFlow::Path;
+  }
+  return text_flow_is_box(editor.property("patchy.documentTextFlow").toString()) ||
+                 !editor.property(kTextEditorAreaProperty).toString().isEmpty()
+             ? TextAlignmentFlow::Box
+             : TextAlignmentFlow::Point;
+}
+
+TextAlignmentFlow layer_text_alignment_flow(const Layer& layer) {
+  const auto& metadata = layer.metadata();
+  if (layer_text_is_vertical(layer)) {
+    return TextAlignmentFlow::Box;
+  }
+  if (metadata.contains(kLayerMetadataTextArea)) {
+    return TextAlignmentFlow::Box;
+  }
+  if (metadata.contains(kLayerMetadataTextPath)) {
+    return TextAlignmentFlow::Path;
+  }
+  const auto flow = metadata.find(kLayerMetadataTextFlow);
+  return flow != metadata.end() && text_flow_is_box(QString::fromStdString(flow->second))
+             ? TextAlignmentFlow::Box
+             : TextAlignmentFlow::Point;
+}
+
+// The alignment the controls show (GitHub issues 683 and 717): the side the lines stand on, so
+// a right-to-left paragraph stored "left" (its start edge) shows Right, and the plain alignment
+// for point text and text on a path. A session shows the caret's paragraph, a layer its first.
+QString text_editor_shown_alignment_name(const QTextEdit& editor) {
+  const auto block = editor.textCursor().block();
+  const auto stored = paragraph_alignment_name(block.blockFormat());
+  if (text_editor_is_vertical(editor)) {
+    return stored;
+  }
+  return shown_paragraph_alignment_name(stored, resolved_block_direction(block),
+                                        text_editor_alignment_flow(editor));
+}
+
+QString layer_shown_alignment_name(const Layer& layer) {
+  const auto first = layer_first_paragraph(layer);
+  const auto canonical = canonical_paragraph_alignment_name(first.alignment);
+  const auto stored = canonical.isEmpty() ? QStringLiteral("left") : canonical;
+  if (layer_text_is_vertical(layer)) {
+    return stored;
+  }
+  return shown_paragraph_alignment_name(stored, first.direction, layer_text_alignment_flow(layer));
+}
+
+bool text_document_has_non_left_alignment(const QTextDocument& document) {
+  for (auto block = document.begin(); block.isValid(); block = block.next()) {
+    const auto visual = QStyle::visualAlignment(resolved_block_direction(block), block.blockFormat().alignment());
+    if ((visual & (Qt::AlignHCenter | Qt::AlignRight | Qt::AlignJustify)) != 0) {
+      return true;
+    }
+  }
+  return false;
+}
+
+double text_editor_metric_scale(const QTextEdit& editor) {
+  const auto value = editor.property(kTextEditorMetricScaleProperty);
+  if (!value.isValid()) {
+    return 1.0;
+  }
+  const auto scale = value.toDouble();
+  return std::clamp(std::isfinite(scale) ? scale : 1.0, 0.5, 1.5);
+}
+
+void set_text_editor_metric_scale(QTextEdit& editor, double scale) {
+  scale = std::clamp(std::isfinite(scale) ? scale : 1.0, 0.5, 1.5);
+  if (std::abs(scale - 1.0) < 0.001) {
+    editor.setProperty(kTextEditorMetricScaleProperty, QVariant());
+    return;
+  }
+  editor.setProperty(kTextEditorMetricScaleProperty, scale);
+}
+
+double alpha_row_band_score(const std::vector<AlphaRowBand>& source_bands,
+                            const std::vector<AlphaRowBand>& candidate_bands,
+                            double scale) {
+  if (source_bands.empty() || candidate_bands.empty()) {
+    return std::numeric_limits<double>::infinity();
+  }
+  const auto source_count = static_cast<int>(source_bands.size());
+  const auto candidate_count = static_cast<int>(candidate_bands.size());
+  const auto count_delta = std::abs(candidate_count - source_count);
+  double score = static_cast<double>(count_delta) * (candidate_count > source_count ? 1000.0 : 650.0);
+
+  const auto source_span = std::max(1, alpha_row_band_span(source_bands));
+  const auto candidate_span = std::max(1, alpha_row_band_span(candidate_bands));
+  score += std::abs(static_cast<double>(candidate_span - source_span)) /
+           static_cast<double>(source_span) * 180.0;
+
+  const auto compared = std::min(source_count, candidate_count);
+  for (int index = 0; index < compared; ++index) {
+    const auto source_height = std::max(1, source_bands[static_cast<std::size_t>(index)].bottom -
+                                              source_bands[static_cast<std::size_t>(index)].top);
+    const auto candidate_height = std::max(1, candidate_bands[static_cast<std::size_t>(index)].bottom -
+                                                 candidate_bands[static_cast<std::size_t>(index)].top);
+    score += std::abs(static_cast<double>(candidate_height - source_height)) /
+             static_cast<double>(source_height) * 12.0;
+  }
+
+  score += std::max(0.0, 1.0 - scale) * 20.0;
+  return score;
+}
+
+std::optional<double> calibrated_box_text_metric_scale(const Layer& source_layer,
+                                                       const TextToolSettings& settings,
+                                                       QColor text_color,
+                                                       int text_width,
+                                                       const QString& paragraph_runs,
+                                                       const QString& rich_text_runs,
+                                                       std::optional<QRectF> render_local_rect,
+                                                       double layout_scale = 1.0) {
+  if (!settings.boxed || source_layer.pixels().empty()) {
+    return std::nullopt;
+  }
+  const auto source_bands = alpha_row_bands(source_layer.pixels());
+  if (source_bands.size() < 2U) {
+    return std::nullopt;
+  }
+
+  // Measure the whole story: the overflow lines a too-wide font pushes past the frame are what
+  // tell the scale search to run.
+  auto measured = settings;
+  measured.keep_overflow_lines = true;
+  const auto baseline = render_text_pixels_with_local_rect(measured, text_color, text_width, paragraph_runs,
+                                                           rich_text_runs, render_local_rect, 1.0, QTransform(),
+                                                           layout_scale);
+  const auto baseline_bands = alpha_row_bands(baseline.pixels);
+  const auto baseline_score = alpha_row_band_score(source_bands, baseline_bands, 1.0);
+  if (!std::isfinite(baseline_score)) {
+    return std::nullopt;
+  }
+  const auto source_count = static_cast<int>(source_bands.size());
+  const auto baseline_count = static_cast<int>(baseline_bands.size());
+  const auto source_span = std::max(1, alpha_row_band_span(source_bands));
+  const auto baseline_span = std::max(1, alpha_row_band_span(baseline_bands));
+  if (baseline_count <= source_count &&
+      std::abs(static_cast<double>(baseline_span - source_span)) <= static_cast<double>(source_span) * 0.10) {
+    return std::nullopt;
+  }
+
+  double best_scale = 1.0;
+  double best_score = baseline_score;
+  for (int step = 1; step <= 35; ++step) {
+    const auto scale = 1.0 - static_cast<double>(step) * 0.01;
+    if (scale < 0.65) {
+      break;
+    }
+    const auto candidate = render_text_pixels_with_local_rect(measured, text_color, text_width, paragraph_runs,
+                                                              rich_text_runs, render_local_rect, scale,
+                                                              QTransform(), layout_scale);
+    const auto candidate_bands = alpha_row_bands(candidate.pixels);
+    const auto score = alpha_row_band_score(source_bands, candidate_bands, scale);
+    if (score < best_score) {
+      best_score = score;
+      best_scale = scale;
+    }
+  }
+
+  if (best_scale < 0.995 && best_score + 20.0 < baseline_score) {
+    return best_scale;
+  }
+  return std::nullopt;
+}
+
+// Whether this edit session belongs to a layer using the Photoshop leading model (the session
+// captures kLayerMetadataTextLayoutMode as an editor property so previews and the commit render
+// the same layout).
+bool text_editor_uses_photoshop_layout(const QTextEdit& editor) {
+  return editor.property("patchy.textLayoutMode").toString() == QLatin1String(kTextLayoutModePhotoshop);
+}
+
+// Display scale for the options-bar size fields: an imported Photoshop text layer stores engine
+// sizes that render through the transform's vertical scale, so the spinbox shows/accepts the
+// EFFECTIVE size (engine x scale -- what Photoshop's own UI shows) while runs stay in engine
+// units. 1.0 for everything else.
+double text_editor_size_display_scale(const QTextEdit& editor) {
+  const auto value = editor.property("patchy.textSizeDisplayScale").toDouble();
+  return std::isfinite(value) && value > 0.01 ? value : 1.0;
+}
+
+// The whole document pixels a Size field value means for this session. The field shows the
+// effective (transform-folded) size for imported Photoshop text; the editor and stored runs
+// work in engine units, so the display scale is divided back out.
+int text_editor_document_size_for_points(const QTextEdit& editor, double points, const Document& document) {
+  return std::max(1, static_cast<int>(std::lround(text_points_to_pixels(points, document) /
+                                                  text_editor_size_display_scale(editor))));
+}
+
+// The font the options-bar combo should select for a stored family name. A style-split name
+// like "Arial Black" is not a family on this platform's database: raw QFont("Arial Black")
+// falls through Windows' substitution chain to Tahoma, which the combo then displays. Resolve
+// to the real family (the style rides the bold flag / the runs, not the combo).
+QFont text_font_combo_font_for_family(const QString& family) {
+  if (available_text_family_match(family).has_value()) {
+    return QFont(family);
+  }
+  if (const auto match = available_text_family_style_match(family); match.has_value()) {
+    return QFont(match->family);
+  }
+  return QFont(family);
+}
+
+std::optional<double> calibrated_box_text_metric_scale_for_editor(const QTextEdit& editor,
+                                                                  const Layer& source_layer,
+                                                                  double zoom,
+                                                                  QColor fallback_color) {
+  // The layer text is stored untrimmed: rich-text-run and paragraph-run offsets index the full
+  // document text, so trimming here would shift every run when the text starts or ends with
+  // whitespace (old PSDs often begin with a blank line).  Trim only for the emptiness check.
+  const auto text = editor.toPlainText();
+  if (text.trimmed().isEmpty() || !text_flow_is_box(editor.property("patchy.documentTextFlow").toString())) {
+    return std::nullopt;
+  }
+  const auto text_size = std::max(1, editor.property("patchy.documentTextSize").toInt());
+  const auto text_width = std::max(kMinimumTextBoxDocumentSize, editor.property("patchy.documentTextWidth").toInt());
+  const auto text_height = std::max(kMinimumTextBoxDocumentSize, editor.property("patchy.documentTextHeight").toInt());
+  const auto stored_color = editor.property("patchy.documentTextColor").value<QColor>();
+  const auto text_color = stored_color.isValid() ? stored_color : (fallback_color.isValid() ? fallback_color
+                                                                                           : QColor(Qt::black));
+  const auto text_anti_alias = std::clamp(editor.property("patchy.documentTextAntiAlias").toInt(), 0, 16);
+  auto text_family = editor.property("patchy.documentTextFamily").toString();
+  if (text_family.trimmed().isEmpty()) {
+    text_family = text_display_family_from_format(text_editor_reference_format(editor),
+                                                  display_text_family_from_font(editor.font()));
+  }
+
+  auto document_text = document_from_editor_in_document_units(editor, zoom);
+  TextToolSettings settings{text,
+                            QString(),
+                            text_family,
+                            text_size,
+                            editor.font().bold(),
+                            editor.font().italic(),
+                            text_anti_alias,
+                            true,
+                            text_width,
+                            text_height};
+  settings.photoshop_layout = text_editor_uses_photoshop_layout(editor);
+  settings.vertical = text_editor_is_vertical(editor);
+  apply_text_editor_contour(settings, editor);
+  const auto rich_text_runs = rich_text_runs_from_document(*document_text, settings, text_color);
+  const auto paragraph_runs = paragraph_runs_from_document(*document_text);
+  settings.html = document_html_from_text_runs(document_text->toPlainText(), rich_text_runs, settings, text_color);
+  const auto frame_layout_scale = settings.photoshop_layout && editor.property("patchy.usesPsdTextFrame").toBool()
+                                      ? text_editor_size_display_scale(editor)
+                                      : 1.0;
+  return calibrated_box_text_metric_scale(source_layer, settings, text_color, text_width, paragraph_runs,
+                                          rich_text_runs, text_editor_render_local_rect(editor),
+                                          frame_layout_scale);
+}
+
+Rect rendered_text_bounds_for_editor(const QTextEdit& editor, QPoint document_point,
+                                     const RenderedTextPixels& rendered) {
+  if (text_editor_render_local_rect(editor).has_value()) {
+    if (const auto anchor = text_editor_source_visible_anchor(editor); anchor.has_value()) {
+      if (const auto visible_bounds = visible_alpha_local_bounds(rendered.pixels); visible_bounds.has_value()) {
+        // The source ink sits where the session-start render put its ink, so the frame stays
+        // put while an edit grows or shrinks the ink (kTextEditorSourceInkOffsetProperty).
+        auto ink_x = static_cast<double>(visible_bounds->x);
+        auto ink_y = static_cast<double>(visible_bounds->y);
+        if (const auto source_offset = editor.property(kTextEditorSourceInkOffsetProperty);
+            source_offset.isValid() && std::isfinite(source_offset.toPointF().x()) &&
+            std::isfinite(source_offset.toPointF().y())) {
+          ink_x = source_offset.toPointF().x() - rendered.local_rect.left();
+          ink_y = source_offset.toPointF().y() - rendered.local_rect.top();
+        }
+        return Rect{snapped_pixel_coordinate(anchor->x() - ink_x), snapped_pixel_coordinate(anchor->y() - ink_y),
+                    rendered.pixels.width(), rendered.pixels.height()};
+      }
+    }
+    return Rect{snapped_pixel_coordinate(static_cast<double>(document_point.x()) + rendered.local_rect.left()),
+                snapped_pixel_coordinate(static_cast<double>(document_point.y()) + rendered.local_rect.top()),
+                rendered.pixels.width(),
+                rendered.pixels.height()};
+  }
+  // The document point is the text-local origin (point text) or the frame corner (box and area
+  // text); the buffer starts local_rect.topLeft() from it, whole pixels. Point text overhangs it
+  // where glyph ink reaches left of the line start or above its top. A Qt-natural box's buffer
+  // starts on the corner, but a Photoshop-layout box's starts above and left of it: its first
+  // line box rises over the frame top when the font's line ascent exceeds Photoshop's
+  // first-baseline ascent, plus the line bleed. Placing that buffer on the corner dropped every
+  // line once a resize had cleared the import frame's render rect (GitHub #683).
+  return Rect{document_point.x() + static_cast<std::int32_t>(std::floor(rendered.local_rect.left())),
+              document_point.y() + static_cast<std::int32_t>(std::floor(rendered.local_rect.top())),
+              rendered.pixels.width(), rendered.pixels.height()};
+}
+
+std::optional<LayerAffineTransform> anchored_text_transform_for_pixels(const QTextEdit& editor,
+                                                                       const RenderedTextPixels& rendered) {
+  const auto anchor = text_editor_source_visible_anchor(editor);
+  if (!anchor.has_value()) {
+    return std::nullopt;
+  }
+  const auto visible_bounds = visible_alpha_local_bounds(rendered.pixels);
+  if (!visible_bounds.has_value()) {
+    return std::nullopt;
+  }
+  // The anchor pins the source raster's visible top-left.  When the text is centered or
+  // right-justified the justification point -- not the left edge -- must stay fixed (Photoshop
+  // keeps each line aligned around the type anchor), so shift by the alignment fraction of the
+  // width difference between the source raster and this render (font substitution or edits
+  // change the width).  The source visible size is captured alongside the anchor on edit start.
+  auto anchor_x = anchor->x();
+  auto anchor_y = anchor->y();
+  if (const auto source_size = text_editor_source_visible_size(editor); source_size.has_value()) {
+    if (text_editor_is_vertical(editor)) {
+      // Vertical text: the first column sits at the RIGHT edge (the stack axis pins there) and
+      // the justification fraction runs along y.
+      anchor_x += source_size->width() - static_cast<double>(visible_bounds->width);
+      if (const auto factor = text_editor_anchor_alignment_factor(editor); factor > 0.0) {
+        anchor_y += factor * (source_size->height() - static_cast<double>(visible_bounds->height));
+      }
+    } else if (const auto factor = text_editor_anchor_alignment_factor(editor); factor > 0.0) {
+      // Whole pixels only, toward zero: Photoshop rasterizes from its line start rounded to a
+      // whole pixel and this render's ink shares the glyphs' side bearing, so a width that
+      // differs by the usual Qt-vs-Photoshop pixel must not slide the raster onto a half-pixel
+      // phase (centered "Hg" at tx 100.0 sits on column 72 in Photoshop, and a 0.5 px shift put
+      // it on 73; docs/text-render-calibration-pixel-grid.md, "Pixel grid").
+      anchor_x += std::trunc(factor * (source_size->width() - static_cast<double>(visible_bounds->width)));
+    }
+  }
+  if (!text_editor_is_vertical(editor)) {
+    anchor_x = snap_to_pixel_grid(anchor_x);
+    // Photoshop rounds every glyph from the UNROUNDED line start, and the render plan snaps
+    // each glyph itself (draw_line_glyphs_pixel_aligned), so the start it gets must carry the
+    // fraction the whole-pixel ink column lost. The first glyph rounds back onto that column.
+    if (text_editor_uses_photoshop_layout(editor)) {
+      const auto fraction = editor.property(kTextEditorSourceLineStartFractionProperty);
+      if (fraction.isValid() && std::isfinite(fraction.toDouble()) && std::abs(fraction.toDouble()) < 1.0) {
+        anchor_x += fraction.toDouble();
+      }
+    }
+  }
+  // The pin places the BUFFER; the transform names the text-local origin, which sits
+  // local_rect.topLeft() inside it (left of / above the buffer corner only when glyph ink
+  // overhangs the line start or top, grow_point_text_rect_to_glyph_ink).
+  auto ink_offset_x = static_cast<double>(visible_bounds->x) + rendered.local_rect.left();
+  auto ink_offset_y = static_cast<double>(visible_bounds->y) + rendered.local_rect.top();
+  // Once the session has its start render, the pin keeps THAT render's origin instead: the
+  // source ink sat where the session-start ink offset puts it, and Photoshop keeps the pen
+  // (along the reading axis) and the first baseline (horizontal text) still while the ink grows
+  // around them. Re-pinning each render's ink corner moved the whole line by a pixel whenever a
+  // style grew the ink of one word (a superscript or faux bold stroke above the line top, a bold
+  // first glyph left of the line start). An unchanged render has the same offset, so a commit
+  // without edits places exactly as before.
+  if (const auto source_offset = editor.property(kTextEditorSourceInkOffsetProperty);
+      source_offset.isValid() && std::isfinite(source_offset.toPointF().x()) &&
+      std::isfinite(source_offset.toPointF().y())) {
+    const auto offset = source_offset.toPointF();
+    if (text_editor_is_vertical(editor)) {
+      // The stack axis keeps the ink's right edge (columns grow leftward); the reading axis
+      // keeps the session-start top.
+      ink_offset_y = offset.y();
+    } else {
+      ink_offset_x = offset.x();
+      ink_offset_y = offset.y();
+      const auto source_baseline = editor.property(kTextEditorSourceFirstBaselineProperty);
+      if (source_baseline.isValid() && std::isfinite(source_baseline.toDouble()) &&
+          rendered.metrics.first_baseline.has_value() && std::isfinite(*rendered.metrics.first_baseline)) {
+        // Same document baseline: the origin moves by however much the line's ascent changed.
+        ink_offset_y += *rendered.metrics.first_baseline - source_baseline.toDouble();
+      }
+    }
+  }
+  return LayerAffineTransform{1.0, 0.0, 0.0, 1.0, anchor_x - ink_offset_x, anchor_y - ink_offset_y};
+}
+
+// Records the session-start render's ink offset and first baseline for
+// anchored_text_transform_for_pixels (see kTextEditorSourceInkOffsetProperty).
+void capture_text_editor_source_ink_offset(QTextEdit& editor, const RenderedTextPixels& rendered) {
+  const auto visible_bounds = visible_alpha_local_bounds(rendered.pixels);
+  if (!visible_bounds.has_value()) {
+    return;
+  }
+  const auto ink_offset_x = static_cast<double>(visible_bounds->x) + rendered.local_rect.left();
+  auto ink_offset_y = static_cast<double>(visible_bounds->y) + rendered.local_rect.top();
+  // Matching ink tops puts this render's first baseline at anchor - offset + baseline; where the
+  // file names Photoshop's baseline and that lands within a pixel and a half of it, put the
+  // baseline exactly there (the difference is the two rasterizers' faint top rows, not a move).
+  if (const auto document_baseline = editor.property(kTextEditorSourceDocumentBaselineProperty);
+      document_baseline.isValid() && !text_editor_is_vertical(editor) &&
+      rendered.metrics.first_baseline.has_value() && std::isfinite(*rendered.metrics.first_baseline)) {
+    if (const auto anchor = text_editor_source_visible_anchor(editor); anchor.has_value()) {
+      const auto target = document_baseline.toDouble();
+      const auto pinned = anchor->y() - ink_offset_y + *rendered.metrics.first_baseline;
+      if (std::isfinite(target) && std::abs(target - pinned) <= 1.5) {
+        ink_offset_y = anchor->y() + *rendered.metrics.first_baseline - target;
+      }
+    }
+  }
+  editor.setProperty(kTextEditorSourceInkOffsetProperty, QPointF(ink_offset_x, ink_offset_y));
+  if (rendered.metrics.first_baseline.has_value() && std::isfinite(*rendered.metrics.first_baseline)) {
+    editor.setProperty(kTextEditorSourceFirstBaselineProperty, *rendered.metrics.first_baseline);
+  }
+}
+
+bool update_text_editor_transform_from_source_anchor(QTextEdit& editor, const RenderedTextPixels& rendered) {
+  const auto transform = anchored_text_transform_for_pixels(editor, rendered);
+  if (!transform.has_value()) {
+    return false;
+  }
+  set_text_editor_transform_override(editor, *transform);
+  clear_text_editor_visible_local_rect(editor);
+  return true;
+}
+
+// `box_frame`: also render a box session that has a fixed render rect (an anchored extended box
+// preview), the way commit_text_editor does, for the session-start ink reference.
+std::optional<RenderedTextPixels> render_text_editor_pixels_for_source_anchor(const QTextEdit& editor, double zoom,
+                                                                              QColor fallback_color,
+                                                                              bool box_frame = false) {
+  // Untrimmed: run offsets index the full document text (see calibrated_box_text_metric_scale_for_editor).
+  const auto text = editor.toPlainText();
+  if (text.trimmed().isEmpty()) {
+    return std::nullopt;
+  }
+  const auto text_size = std::max(1, editor.property("patchy.documentTextSize").toInt());
+  const auto text_width = std::max(kMinimumTextBoxDocumentSize, editor.property("patchy.documentTextWidth").toInt());
+  const auto text_height = std::max(kMinimumTextBoxDocumentSize, editor.property("patchy.documentTextHeight").toInt());
+  const auto boxed_text = text_flow_is_box(editor.property("patchy.documentTextFlow").toString());
+  if ((boxed_text || editor.property("patchy.usesPsdTextFrame").toBool()) &&
+      !(box_frame && text_editor_render_local_rect(editor).has_value())) {
+    return std::nullopt;
+  }
+  const auto stored_color = editor.property("patchy.documentTextColor").value<QColor>();
+  const auto text_color = stored_color.isValid() ? stored_color : (fallback_color.isValid() ? fallback_color
+                                                                                           : QColor(Qt::black));
+  const auto text_anti_alias = std::clamp(editor.property("patchy.documentTextAntiAlias").toInt(), 0, 16);
+  auto text_family = editor.property("patchy.documentTextFamily").toString();
+  if (text_family.trimmed().isEmpty()) {
+    text_family = text_display_family_from_format(text_editor_reference_format(editor),
+                                                  display_text_family_from_font(editor.font()));
+  }
+  auto document_text = document_from_editor_in_document_units(editor, zoom);
+  TextToolSettings settings{text,
+                            QString(),
+                            text_family,
+                            text_size,
+                            editor.font().bold(),
+                            editor.font().italic(),
+                            text_anti_alias,
+                            boxed_text,
+                            text_width,
+                            text_height};
+  settings.photoshop_layout = text_editor_uses_photoshop_layout(editor);
+  settings.vertical = text_editor_is_vertical(editor);
+  apply_text_editor_contour(settings, editor);
+  const auto rich_text_runs = rich_text_runs_from_document(*document_text, settings, text_color);
+  const auto paragraph_runs = paragraph_runs_from_document(*document_text);
+  settings.html = document_html_from_text_runs(document_text->toPlainText(), rich_text_runs, settings, text_color);
+  // The same render arguments as commit_text_editor (a point session has no render rect and unit
+  // scales, so it renders as before).
+  const auto frame_layout_scale = settings.photoshop_layout && editor.property("patchy.usesPsdTextFrame").toBool()
+                                      ? text_editor_size_display_scale(editor)
+                                      : 1.0;
+  auto rendered = render_text_pixels_with_local_rect(settings, text_color, text_width, paragraph_runs, rich_text_runs,
+                                                     text_editor_render_local_rect(editor),
+                                                     text_editor_metric_scale(editor), QTransform(),
+                                                     frame_layout_scale);
+  if (rendered.pixels.empty()) {
+    return std::nullopt;
+  }
+  return rendered;
+}
+
+// Session start only: this render is the text as the layer holds it, so it also becomes the
+// reference later renders keep their origin against (capture_text_editor_source_ink_offset).
+bool update_text_editor_transform_from_source_anchor(QTextEdit& editor, double zoom, QColor fallback_color) {
+  const auto rendered = render_text_editor_pixels_for_source_anchor(editor, zoom, fallback_color);
+  if (!rendered.has_value()) {
+    return false;
+  }
+  capture_text_editor_source_ink_offset(editor, *rendered);
+  return update_text_editor_transform_from_source_anchor(editor, *rendered);
+}
+
+std::optional<QTransform> text_transform_for_editor_or_layer(const QTextEdit& editor, const Layer& layer) {
+  if (const auto override_transform = text_editor_transform_override(editor); override_transform.has_value()) {
+    return qtransform_from_affine(*override_transform);
+  }
+  return patchy_text_transform_for_layer(layer);
+}
+
+LayerAffineTransform affine_from_qtransform(const QTransform& transform) {
+  return LayerAffineTransform{transform.m11(), transform.m12(), transform.m21(),
+                              transform.m22(), transform.dx(),  transform.dy()};
+}
+
+TransformedTextPixels apply_text_transform_to_pixels(const PixelBuffer& pixels, const QTransform& transform) {
+  const auto source = qimage_from_pixel_buffer(pixels).convertToFormat(QImage::Format_RGBA8888);
+  const auto mapped = transform.mapRect(QRectF(0.0, 0.0, source.width(), source.height()));
+  const auto left = static_cast<int>(std::floor(mapped.left()));
+  const auto top = static_cast<int>(std::floor(mapped.top()));
+  const auto right = static_cast<int>(std::ceil(mapped.right()));
+  const auto bottom = static_cast<int>(std::ceil(mapped.bottom()));
+  QImage transformed(std::max(1, right - left), std::max(1, bottom - top), QImage::Format_RGBA8888);
+  transformed.fill(Qt::transparent);
+
+  QPainter painter(&transformed);
+  painter.setRenderHint(QPainter::SmoothPixmapTransform, true);
+  painter.translate(-left, -top);
+  painter.setTransform(transform, true);
+  painter.drawImage(QPointF(0.0, 0.0), source);
+  painter.end();
+
+  return TransformedTextPixels{pixels_from_image_rgba(transformed),
+                               Rect{left, top, transformed.width(), transformed.height()},
+                               TextLayoutMetrics{}};
+}
+
+// Re-rasterize a text editor session's glyphs *through* the layer transform -- vector glyphs
+// rasterized at the final scale -- so scaled/rotated point text stays crisp instead of resampling
+// the base-size bitmap.  Shared by commit_text_editor and the live edit preview so the user sees
+// the same pixels while typing that the commit will produce.  Returns std::nullopt when the
+// bitmap-resample path must be kept: box text, layouts that depend on a local-rect offset, a
+// transform with no scale/rotation, or a PSD-anchored layer whose glyph-top-aligned override is
+// absent (rendering through the raw PSD baseline transform would drop the text ~one ascent).
+// A missing (substituted) font is deliberately NOT a refusal here: the session's base raster is
+// already rendered with the substituted face, so the resample fallback preserves nothing of the
+// original glyphs -- it just delivers those same substituted glyphs blurry, rendered at engine
+// size and scaled up ~4x on files like the restaurant menu.
+std::optional<TransformedTextPixels> render_crisp_transformed_text_for_editor(
+    const QTextEdit& editor, bool psd_anchored_text, bool boxed_text, bool has_local_offset,
+    const TextToolSettings& settings, QColor text_color, int text_width, const QString& paragraph_runs,
+    const QString& rich_text_runs, const QTransform& text_transform, const QTransform& transform_for_pixels) {
+  // A translation whose x is fractional also renders through the transform: the plan rounds
+  // every glyph from that fractional line start (draw_line_glyphs_pixel_aligned), which a
+  // resample of the identity raster cannot reproduce (it smears the whole line by the fraction).
+  // Whole translations keep the byte-for-byte copy.
+  const bool fractional_translation =
+      settings.photoshop_layout && !settings.vertical &&
+      std::abs(text_transform.dx() - snap_to_pixel_grid(text_transform.dx())) > 1e-6;
+  const bool contour_text = settings.area.has_value() || settings.path.has_value();
+  if ((boxed_text && !contour_text) || (has_local_offset && !contour_text) ||
+      (!qtransform_has_non_translation_linear_part(text_transform) && !fractional_translation)) {
+    return std::nullopt;
+  }
+  if (psd_anchored_text && !text_editor_transform_override(editor).has_value()) {
+    return std::nullopt;
+  }
+  auto crisp = render_text_pixels_with_local_rect(settings, text_color, text_width, paragraph_runs,
+                                                  rich_text_runs, text_editor_render_local_rect(editor),
+                                                  text_editor_metric_scale(editor), transform_for_pixels);
+  if (crisp.pixels.empty()) {
+    return std::nullopt;
+  }
+  const Rect bounds{static_cast<std::int32_t>(std::floor(crisp.local_rect.left())),
+                    static_cast<std::int32_t>(std::floor(crisp.local_rect.top())), crisp.pixels.width(),
+                    crisp.pixels.height()};
+  return TransformedTextPixels{std::move(crisp.pixels), bounds, crisp.metrics};
+}
+
+std::vector<double> parse_space_separated_doubles(std::string_view text) {
+  std::vector<double> values;
+  std::istringstream stream{std::string(text)};
+  double value = 0.0;
+  while (stream >> value) {
+    if (std::isfinite(value)) {
+      values.push_back(value);
+    }
+  }
+  return values;
+}
+
+std::optional<QRectF> psd_text_metadata_local_rect(const Layer& layer, const char* bounds_key) {
+  const auto& metadata = layer.metadata();
+  const auto bounds_found = metadata.find(bounds_key);
+  if (bounds_found == metadata.end()) {
+    return std::nullopt;
+  }
+  const auto bounds = parse_space_separated_doubles(bounds_found->second);
+  if (bounds.size() < 4U) {
+    return std::nullopt;
+  }
+  const auto left = bounds[0];
+  const auto top = bounds[1];
+  const auto right = bounds[2];
+  const auto bottom = bounds[3];
+  if (!std::isfinite(left) || !std::isfinite(top) || !std::isfinite(right) || !std::isfinite(bottom) ||
+      right <= left || bottom <= top) {
+    return std::nullopt;
+  }
+  return QRectF(QPointF(left, top), QPointF(right, bottom));
+}
+
+std::optional<QRectF> valid_text_local_rect(QRectF rect) {
+  rect = rect.normalized();
+  if (!std::isfinite(rect.left()) || !std::isfinite(rect.top()) || !std::isfinite(rect.right()) ||
+      !std::isfinite(rect.bottom()) || rect.width() <= 0.0 || rect.height() <= 0.0) {
+    return std::nullopt;
+  }
+  return rect;
+}
+
+bool rect_extends_beyond(QRectF outer, QRectF inner) {
+  outer = outer.normalized();
+  inner = inner.normalized();
+  constexpr qreal kEpsilon = 0.5;
+  return outer.left() < inner.left() - kEpsilon || outer.top() < inner.top() - kEpsilon ||
+         outer.right() > inner.right() + kEpsilon || outer.bottom() > inner.bottom() + kEpsilon;
+}
+
+std::optional<QRectF> psd_box_text_editor_render_local_rect(const Layer& layer) {
+  const auto box = psd_text_metadata_local_rect(layer, kLayerMetadataPsdTextBoxBounds);
+  if (!box.has_value()) {
+    return std::nullopt;
+  }
+
+  QRectF editor_local(QPointF(0.0, 0.0), box->size());
+  if (const auto visual = psd_text_metadata_local_rect(layer, kLayerMetadataPsdTextBoundingBox); visual.has_value()) {
+    editor_local = editor_local.united(visual->translated(-box->topLeft()));
+  }
+  return valid_text_local_rect(editor_local);
+}
+
+std::optional<QRectF> layer_document_rect_text_local_rect(const Layer& layer, QRectF document_rect) {
+  const auto transform = canonical_text_affine_transform_for_layer(layer);
+  if (!transform.has_value()) {
+    return std::nullopt;
+  }
+  document_rect = document_rect.normalized();
+  if (!std::isfinite(document_rect.left()) || !std::isfinite(document_rect.top()) ||
+      !std::isfinite(document_rect.right()) || !std::isfinite(document_rect.bottom()) ||
+      document_rect.width() <= 0.0 || document_rect.height() <= 0.0) {
+    return std::nullopt;
+  }
+  const auto determinant = (*transform)[0] * (*transform)[3] - (*transform)[1] * (*transform)[2];
+  if (!std::isfinite(determinant) || std::abs(determinant) < 0.000001) {
+    return std::nullopt;
+  }
+  const auto map_doc_to_local = [transform, determinant](double x, double y) {
+    const auto dx = x - (*transform)[4];
+    const auto dy = y - (*transform)[5];
+    return QPointF(((*transform)[3] * dx - (*transform)[2] * dy) / determinant,
+                   (-(*transform)[1] * dx + (*transform)[0] * dy) / determinant);
+  };
+
+  const auto left = document_rect.left();
+  const auto top = document_rect.top();
+  const auto right = document_rect.right();
+  const auto bottom = document_rect.bottom();
+  const std::array<QPointF, 4> points = {
+      map_doc_to_local(left, top),
+      map_doc_to_local(right, top),
+      map_doc_to_local(right, bottom),
+      map_doc_to_local(left, bottom),
+  };
+  auto min_x = points.front().x();
+  auto max_x = points.front().x();
+  auto min_y = points.front().y();
+  auto max_y = points.front().y();
+  for (const auto& point : points) {
+    if (!std::isfinite(point.x()) || !std::isfinite(point.y())) {
+      return std::nullopt;
+    }
+    min_x = std::min(min_x, point.x());
+    max_x = std::max(max_x, point.x());
+    min_y = std::min(min_y, point.y());
+    max_y = std::max(max_y, point.y());
+  }
+  return valid_text_local_rect(QRectF(QPointF(min_x, min_y), QPointF(max_x, max_y)));
+}
+
+std::optional<QRectF> layer_visible_alpha_text_local_rect(const Layer& layer) {
+  const auto visible = visible_alpha_local_bounds(layer.pixels());
+  if (!visible.has_value()) {
+    return std::nullopt;
+  }
+  return layer_document_rect_text_local_rect(
+      layer, QRectF(static_cast<qreal>(layer.bounds().x + visible->x),
+                    static_cast<qreal>(layer.bounds().y + visible->y),
+                    static_cast<qreal>(visible->width),
+                    static_cast<qreal>(visible->height)));
+}
+
+std::optional<QRectF> patchy_box_text_editor_render_local_rect(const Layer& layer, int box_width, int box_height) {
+  const auto raster_status = layer.metadata().find(kLayerMetadataTextRasterStatus);
+  if (raster_status == layer.metadata().end() || raster_status->second != "patchy_raster") {
+    return std::nullopt;
+  }
+  const auto local_rect = layer_visible_alpha_text_local_rect(layer);
+  if (!local_rect.has_value()) {
+    return std::nullopt;
+  }
+  const QRectF frame_rect(0.0, 0.0, static_cast<qreal>(std::max(kMinimumTextBoxDocumentSize, box_width)),
+                          static_cast<qreal>(std::max(kMinimumTextBoxDocumentSize, box_height)));
+  if (!rect_extends_beyond(*local_rect, frame_rect)) {
+    return std::nullopt;
+  }
+  return valid_text_local_rect(frame_rect.united(*local_rect));
+}
+
+std::optional<QRectF> transformed_psd_text_metadata_rect(const Layer& layer, const char* bounds_key) {
+  const auto& metadata = layer.metadata();
+  const auto transform_found = metadata.find(kLayerMetadataPsdTextTransform);
+  const auto bounds_found = metadata.find(bounds_key);
+  if (transform_found == metadata.end() || bounds_found == metadata.end()) {
+    return std::nullopt;
+  }
+  const auto transform = parse_space_separated_doubles(transform_found->second);
+  const auto bounds = parse_space_separated_doubles(bounds_found->second);
+  if (transform.size() < 6U || bounds.size() < 4U) {
+    return std::nullopt;
+  }
+
+  const auto map_point = [&transform](double x, double y) {
+    return QPointF(transform[0] * x + transform[2] * y + transform[4],
+                   transform[1] * x + transform[3] * y + transform[5]);
+  };
+  const std::array<QPointF, 4> points = {
+      map_point(bounds[0], bounds[1]),
+      map_point(bounds[2], bounds[1]),
+      map_point(bounds[2], bounds[3]),
+      map_point(bounds[0], bounds[3]),
+  };
+  auto min_x = points.front().x();
+  auto max_x = points.front().x();
+  auto min_y = points.front().y();
+  auto max_y = points.front().y();
+  for (const auto& point : points) {
+    min_x = std::min(min_x, point.x());
+    max_x = std::max(max_x, point.x());
+    min_y = std::min(min_y, point.y());
+    max_y = std::max(max_y, point.y());
+  }
+  if (max_x <= min_x || max_y <= min_y) {
+    return std::nullopt;
+  }
+  return QRectF(QPointF(min_x, min_y), QPointF(max_x, max_y));
+}
+
+std::optional<QRectF> psd_text_frame_rect(const Layer& layer) {
+  return transformed_psd_text_metadata_rect(layer, kLayerMetadataPsdTextBoxBounds);
+}
+
+std::optional<QRectF> psd_point_text_visual_rect(const Layer& layer) {
+  return transformed_psd_text_metadata_rect(layer, kLayerMetadataPsdTextBoundingBox);
+}
+
+std::optional<QRectF> psd_point_text_local_visual_rect(const Layer& layer) {
+  return psd_text_metadata_local_rect(layer, kLayerMetadataPsdTextBoundingBox);
+}
+
+QPointF rect_corner(QRectF rect, int corner_index) {
+  switch (corner_index) {
+    case 0:
+      return rect.topLeft();
+    case 1:
+      return rect.topRight();
+    case 2:
+      return rect.bottomRight();
+    case 3:
+      return rect.bottomLeft();
+    default:
+      break;
+  }
+  return rect.topLeft();
+}
+
+int visual_top_left_corner_index(QRectF local_rect, const QTransform& transform) {
+  int best_index = 0;
+  auto best_point = transform.map(rect_corner(local_rect, best_index));
+  constexpr double kEpsilon = 0.000001;
+  for (int index = 1; index < 4; ++index) {
+    const auto point = transform.map(rect_corner(local_rect, index));
+    if (point.y() < best_point.y() - kEpsilon ||
+        (std::abs(point.y() - best_point.y()) <= kEpsilon && point.x() < best_point.x())) {
+      best_index = index;
+      best_point = point;
+    }
+  }
+  return best_index;
+}
+
+LayerAffineTransform affine_with_local_translation(const LayerAffineTransform& transform, QPointF delta) {
+  return LayerAffineTransform{
+      transform[0],
+      transform[1],
+      transform[2],
+      transform[3],
+      transform[0] * delta.x() + transform[2] * delta.y() + transform[4],
+      transform[1] * delta.x() + transform[3] * delta.y() + transform[5],
+  };
+}
+
+std::optional<LayerAffineTransform> psd_point_text_local_bounds_transform_for_pixels(const Layer& layer,
+                                                                                    const RenderedTextPixels& rendered,
+                                                                                    bool boxed_text,
+                                                                                    double alignment_factor) {
+  if (boxed_text || !layer.metadata().contains(kLayerMetadataPsdTextTransform) ||
+      !layer.metadata().contains(kLayerMetadataPsdTextBoundingBox)) {
+    return std::nullopt;
+  }
+  // A free transform (no text-content change) composes a new patchy text transform that diverges
+  // from the PSD source, so layer_patchy_text_transform_overrides_psd_source() becomes true.  We
+  // still want to align the editor to the live glyphs here: the PSD glyph metrics (psd_local_rect)
+  // remain valid because committing an actual text edit clears the PSD source entirely (see
+  // store_patchy_text_metadata -> clear_layer_psd_text_source), so reaching this point with the PSD
+  // transform still present means only the position/scale changed.  Anchoring to the PSD baseline
+  // instead would make a scaled/rotated PSD point-text layer jump down ~one ascent on edit.
+  const auto transform = canonical_text_affine_transform_for_layer(layer);
+  if (!transform.has_value() || !affine_transform_has_non_translation_linear_part(*transform)) {
+    return std::nullopt;
+  }
+  const auto psd_local_rect = psd_point_text_local_visual_rect(layer);
+  const auto visible_bounds = visible_alpha_local_bounds(rendered.pixels);
+  if (!psd_local_rect.has_value() || !visible_bounds.has_value()) {
+    return std::nullopt;
+  }
+
+  // Pixel (0, 0) of the identity render is local point local_rect.topLeft().
+  const QRectF visible_rect(rendered.local_rect.left() + visible_bounds->x, rendered.local_rect.top() + visible_bounds->y,
+                            visible_bounds->width, visible_bounds->height);
+  const auto transform_qt = qtransform_from_affine(*transform);
+  const auto anchor_index = visual_top_left_corner_index(*psd_local_rect, transform_qt);
+  auto delta = rect_corner(*psd_local_rect, anchor_index) - rect_corner(visible_rect, anchor_index);
+  // The reading axis (local x) always pins the justification point: line STARTS for left text
+  // (factor 0), the middle for centered, the ends for right-justified. Both rects live in the
+  // same local text space, so interpolating between their left and right edges by the fraction
+  // stays correct under the layer's linear transform (including flips). The visual-corner pick
+  // above chose its corner by DOCUMENT orientation -- under a 90-degree rotation that is the
+  // line-END corner, and pinning it slid left-justified rotated text along its reading axis by
+  // any line-length delta (the SNES back-panel jump). The vertical component keeps the
+  // visual-top-corner anchoring.
+  delta.setX((psd_local_rect->left() + alignment_factor * psd_local_rect->width()) -
+             (visible_rect.left() + alignment_factor * visible_rect.width()));
+  if (!std::isfinite(delta.x()) || !std::isfinite(delta.y())) {
+    return std::nullopt;
+  }
+  auto pinned = affine_with_local_translation(*transform, delta);
+  // The pin puts Patchy's ink on Photoshop's DECLARED box, which is fractional. Photoshop's own
+  // raster starts at the LINE START rounded to a whole document pixel, halves up: the anchor plus
+  // the advance box's left edge (the ink box less Patchy's own side bearing stands in when the
+  // TySh carries no `bounds`). Patchy's raster origin (local x 0) is its line start, so for an
+  // axis-aligned transform move it onto that rounded column: the re-render lands on Photoshop's
+  // columns (centered "Hg" at tx 100.0 -> column 72, at 100.3 -> 73;
+  // docs/text-render-calibration-pixel-grid.md, "Pixel grid") and a translation-only commit copies
+  // whole pixels instead of resampling at a half-pixel phase. Rotated or sheared layers keep the
+  // plain pin.
+  if (std::abs((*transform)[1]) <= 1e-9 && std::abs((*transform)[2]) <= 1e-9 && std::abs(pinned[0]) > 1e-9) {
+    const auto advance_rect = psd_text_metadata_local_rect(layer, kLayerMetadataPsdTextBounds);
+    const double line_start_psd_x =
+        advance_rect.has_value() ? advance_rect->left() : psd_local_rect->left() - visible_rect.left();
+    const auto photoshop_start_x = transform_qt.map(QPointF(line_start_psd_x, 0.0)).x();
+    // The pin's own correction (the justification fraction of the width difference between
+    // Photoshop's ink and this render's) survives in WHOLE local pixels: the usual sub-pixel
+    // Qt-vs-Photoshop width difference must not move the start off Photoshop's column, while a
+    // substituted face that is much wider keeps its right edge or centre where Photoshop had it.
+    const auto width_correction = std::trunc((pinned[4] - photoshop_start_x) / pinned[0]) * pinned[0];
+    // The start keeps its fraction: the render plan rounds every glyph from it in document
+    // space (draw_line_glyphs_pixel_aligned), which puts the first glyph on this same rounded
+    // column and the rest where Photoshop's own per-glyph rounding puts them. Vertical type
+    // draws through the cell plan instead and keeps the whole-pixel start.
+    const auto origin_x = photoshop_start_x + width_correction;
+    const auto document_shift =
+        (layer_text_is_vertical(layer) ? snap_to_pixel_grid(origin_x) : origin_x) - pinned[4];
+    if (std::isfinite(document_shift)) {
+      pinned = affine_with_local_translation(pinned, QPointF(document_shift / pinned[0], 0.0));
+    }
+  }
+  return pinned;
+}
+
+// Fallback for PSDs whose TySh descriptor predates the bounds/boundingBox fields (Photoshop
+// CS-era files import them as a degenerate "0 0 0 0"): without the local glyph rect, align in
+// document space instead.  Pin the bounding box of the re-rendered glyphs -- mapped through the
+// layer transform -- to the imported raster's visible bounds: the justification fraction
+// horizontally and the visible top vertically (matching the local-bounds variant's anchoring).
+// A local translation shifts the mapped bounding box rigidly, so the pin is exact for any
+// invertible affine.
+std::optional<LayerAffineTransform> psd_point_text_document_bounds_transform_for_pixels(
+    const Layer& layer, const RenderedTextPixels& rendered, bool boxed_text, double alignment_factor) {
+  if (boxed_text || !layer.metadata().contains(kLayerMetadataPsdTextTransform)) {
+    return std::nullopt;
+  }
+  const auto transform = canonical_text_affine_transform_for_layer(layer);
+  if (!transform.has_value() || !affine_transform_has_non_translation_linear_part(*transform)) {
+    return std::nullopt;
+  }
+  const auto source_visible = visible_alpha_local_bounds(layer.pixels());
+  const auto render_visible = visible_alpha_local_bounds(rendered.pixels);
+  if (!source_visible.has_value() || !render_visible.has_value()) {
+    return std::nullopt;
+  }
+  const QRectF source_doc(static_cast<double>(layer.bounds().x + source_visible->x),
+                          static_cast<double>(layer.bounds().y + source_visible->y),
+                          static_cast<double>(source_visible->width),
+                          static_cast<double>(source_visible->height));
+  // Pixel (0, 0) of the identity render is local point local_rect.topLeft().
+  const QRectF render_local(rendered.local_rect.left() + render_visible->x,
+                            rendered.local_rect.top() + render_visible->y, render_visible->width,
+                            render_visible->height);
+  const auto transform_qt = qtransform_from_affine(*transform);
+  const auto mapped = transform_qt.mapRect(render_local);
+  if (!(mapped.width() > 0.0) || !(mapped.height() > 0.0)) {
+    return std::nullopt;
+  }
+  // Pin the TEXT-SPACE anchor point -- the justification fraction along the reading axis, the
+  // first-line side on the stack axis -- not a fixed document corner: under a 90-degree
+  // rotation the document's top edge is the line-END side, and pinning it slid left-justified
+  // rotated text along its reading axis by any line-length delta (the SNES back-panel jump).
+  // The source ink box is only known in document space, so pin the fractionally-corresponding
+  // point of the two document boxes: the local anchor's normalized position inside the mapped
+  // render box picks the same relative point of the source box for any invertible affine.
+  const QPointF local_anchor(render_local.left() + alignment_factor * render_local.width(),
+                             render_local.top());
+  const auto mapped_anchor = transform_qt.map(local_anchor);
+  const auto u = (mapped_anchor.x() - mapped.left()) / mapped.width();
+  const auto v = (mapped_anchor.y() - mapped.top()) / mapped.height();
+  const QPointF source_anchor(source_doc.left() + u * source_doc.width(),
+                              source_doc.top() + v * source_doc.height());
+  const QPointF document_delta = source_anchor - mapped_anchor;
+  // affine_with_local_translation applies the transform's linear part to the delta, so convert
+  // the document-space displacement back into local text space.
+  bool invertible = false;
+  const auto linear_inverse =
+      QTransform((*transform)[0], (*transform)[1], (*transform)[2], (*transform)[3], 0.0, 0.0)
+          .inverted(&invertible);
+  if (!invertible) {
+    return std::nullopt;
+  }
+  const auto local_delta = linear_inverse.map(document_delta);
+  if (!std::isfinite(local_delta.x()) || !std::isfinite(local_delta.y())) {
+    return std::nullopt;
+  }
+  auto pinned = affine_with_local_translation(*transform, local_delta);
+  // Photoshop rasterized this layer from its line start rounded to a whole pixel, and its ink
+  // column is that start plus the glyphs' side bearing, which this render shares. Without the
+  // TySh advance box the start is recovered from the raster: the source ink column less the
+  // render's own bearing (scaled), rounded. Put Patchy's raster origin (local x 0, its line
+  // start) there instead of on the fractional centre pin, so the Dungeon Scroll buttons re-render
+  // on their own columns (docs/text-render-calibration-pixel-grid.md, "Pixel grid").
+  // Axis-aligned only.
+  if (std::abs(pinned[1]) <= 1e-9 && std::abs(pinned[2]) <= 1e-9 && std::abs(pinned[0]) > 1e-9) {
+    const auto photoshop_start_x = source_doc.left() - render_local.left() * pinned[0];
+    // As in the local-bounds variant: keep the pin's justification correction in whole local
+    // pixels so a substituted wider face stays justified while same-face renders land on
+    // Photoshop's column.
+    const auto width_correction = std::trunc((pinned[4] - photoshop_start_x) / pinned[0]) * pinned[0];
+    auto origin_x = snap_to_pixel_grid(photoshop_start_x + width_correction);
+    // Without the advance box the fraction of Photoshop's line start is estimated from the
+    // TySh anchor less the justification fraction of this render's width (a whole-pixel start
+    // column is all the raster can say); the plan then rounds every glyph from it.
+    if (!layer_text_is_vertical(layer)) {
+      const auto start_estimate = (*transform)[4] - alignment_factor * mapped.width();
+      if (std::isfinite(start_estimate)) {
+        origin_x += start_estimate - snap_to_pixel_grid(start_estimate);
+      }
+    }
+    const auto document_shift = origin_x - pinned[4];
+    if (std::isfinite(document_shift)) {
+      pinned = affine_with_local_translation(pinned, QPointF(document_shift / pinned[0], 0.0));
+    }
+  }
+  return pinned;
+}
+
+bool update_text_editor_transform_from_psd_local_bounds(QTextEdit& editor, const Layer& layer,
+                                                        const RenderedTextPixels& rendered, bool boxed_text) {
+  const auto alignment_factor = text_editor_anchor_alignment_factor(editor);
+  auto transform =
+      psd_point_text_local_bounds_transform_for_pixels(layer, rendered, boxed_text, alignment_factor);
+  if (!transform.has_value()) {
+    transform =
+        psd_point_text_document_bounds_transform_for_pixels(layer, rendered, boxed_text, alignment_factor);
+  }
+  if (!transform.has_value()) {
+    return false;
+  }
+  set_text_editor_transform_override(editor, *transform);
+  if (const auto visible_bounds = visible_alpha_local_bounds(rendered.pixels); visible_bounds.has_value()) {
+    set_text_editor_visible_local_rect(
+        editor, Rect{visible_bounds->x + static_cast<std::int32_t>(std::floor(rendered.local_rect.left())),
+                     visible_bounds->y + static_cast<std::int32_t>(std::floor(rendered.local_rect.top())),
+                     visible_bounds->width, visible_bounds->height});
+  }
+  return true;
+}
+
+bool layer_text_is_vertical(const Layer& layer) {
+  const auto found = layer.metadata().find(kLayerMetadataTextOrientation);
+  return found != layer.metadata().end() && found->second == kTextOrientationVertical;
+}
+
+
+std::optional<QPointF> layer_source_visible_anchor(const Layer& layer) {
+  if (const auto visible_bounds = visible_alpha_local_bounds(layer.pixels()); visible_bounds.has_value()) {
+    return QPointF(static_cast<double>(layer.bounds().x + visible_bounds->x),
+                   static_cast<double>(layer.bounds().y + visible_bounds->y));
+  }
+  return std::nullopt;
+}
+
+std::optional<QRectF> psd_point_text_source_visible_rect(const Layer& layer) {
+  if (const auto visible_bounds = visible_alpha_local_bounds(layer.pixels()); visible_bounds.has_value()) {
+    return QRectF(static_cast<double>(layer.bounds().x + visible_bounds->x),
+                  static_cast<double>(layer.bounds().y + visible_bounds->y),
+                  static_cast<double>(visible_bounds->width), static_cast<double>(visible_bounds->height));
+  }
+  if (const auto visual_rect = psd_point_text_visual_rect(layer); visual_rect.has_value()) {
+    return visual_rect;
+  }
+  return std::nullopt;
+}
+
+struct LayerTextRenderInputs {
+  TextToolSettings settings;
+  QColor color;
+  std::int32_t max_width{320};
+  QString paragraph_runs;
+  QString rich_text_runs;
+};
+
+std::optional<LayerTextRenderInputs> text_render_inputs_from_layer(const Layer& layer) {
+  if (text_geometry_is_protected(layer)) return std::nullopt;
+  const auto& metadata = layer.metadata();
+  // Untrimmed: the stored run offsets index the full text (leading blank lines included).
+  const auto text = [&metadata] {
+    const auto found = metadata.find(kLayerMetadataText);
+    return found == metadata.end() ? QString() : QString::fromStdString(found->second);
+  }();
+  if (text.trimmed().isEmpty()) {
+    return std::nullopt;
+  }
+
+  const auto value = [&metadata](const char* key) -> std::optional<QString> {
+    const auto found = metadata.find(key);
+    if (found == metadata.end()) {
+      return std::nullopt;
+    }
+    return QString::fromStdString(found->second);
+  };
+
+  const auto html = value(kLayerMetadataTextHtml).value_or(QString());
+  const auto paragraph_runs = value(kLayerMetadataTextParagraphRuns).value_or(QString());
+  const auto rich_text_runs = value(kLayerMetadataTextRuns).value_or(QString());
+  auto family = value(kLayerMetadataTextFont).value_or(default_text_family());
+  if (family.compare(QStringLiteral("PSD Text"), Qt::CaseInsensitive) == 0) {
+    family = default_text_family();
+  }
+  const auto size = value(kLayerMetadataTextSize).has_value()
+                        ? std::max(1, std::atoi(value(kLayerMetadataTextSize)->toUtf8().constData()))
+                        : 36;
+  const auto anti_alias =
+      value(kLayerMetadataTextAntiAlias).has_value()
+          ? std::clamp(std::atoi(value(kLayerMetadataTextAntiAlias)->toUtf8().constData()), 0, 16)
+          : kDefaultTextAntiAlias;
+  const auto color_value = value(kLayerMetadataTextColor).value_or(QStringLiteral("#000000"));
+  const QColor color(color_value);
+  const auto boxed = text_flow_is_box(value(kLayerMetadataTextFlow).value_or(QString::fromLatin1(kTextFlowPoint)));
+  const auto box_width =
+      value(kLayerMetadataTextBoxWidth).has_value()
+          ? std::max(kMinimumTextBoxDocumentSize, std::atoi(value(kLayerMetadataTextBoxWidth)->toUtf8().constData()))
+          : std::max(kMinimumTextBoxDocumentSize, layer.bounds().width);
+  const auto box_height =
+      value(kLayerMetadataTextBoxHeight).has_value()
+          ? std::max(kMinimumTextBoxDocumentSize, std::atoi(value(kLayerMetadataTextBoxHeight)->toUtf8().constData()))
+          : std::max(kMinimumTextBoxDocumentSize, layer.bounds().height);
+  TextToolSettings settings{text, html, family, size,
+                            value(kLayerMetadataTextBold).value_or(QString()) == QStringLiteral("true"),
+                            value(kLayerMetadataTextItalic).value_or(QString()) == QStringLiteral("true"),
+                            anti_alias,
+                            boxed,
+                            box_width,
+                            box_height};
+  settings.photoshop_layout =
+      value(kLayerMetadataTextLayoutMode).value_or(QString()) == QLatin1String(kTextLayoutModePhotoshop);
+  settings.vertical =
+      value(kLayerMetadataTextOrientation).value_or(QString()) == QLatin1String(kTextOrientationVertical);
+  settings.area = text_area_for_layer(layer);
+  if (auto frame = text_path_frame_for_layer(layer)) {
+    settings.path = std::move(frame->path);
+    settings.path_range = frame->range;
+  }
+  return LayerTextRenderInputs{std::move(settings), color.isValid() ? color : QColor(Qt::black),
+                               layer.bounds().width > 0 ? layer.bounds().width : 320, paragraph_runs,
+                               rich_text_runs};
+}
+
+std::optional<RenderedTextPixels> render_text_layer_from_metadata(const Layer& layer) {
+  const auto inputs = text_render_inputs_from_layer(layer);
+  if (!inputs.has_value()) {
+    return std::nullopt;
+  }
+  return render_text_pixels_with_local_rect(inputs->settings, inputs->color, inputs->max_width,
+                                            inputs->paragraph_runs, inputs->rich_text_runs);
+}
+
+std::optional<PixelBuffer> render_text_layer_pixels_from_metadata(const Layer& layer) {
+  auto rendered = render_text_layer_from_metadata(layer);
+  if (!rendered.has_value()) {
+    return std::nullopt;
+  }
+  return std::move(rendered->pixels);
+}
+
+// Document-space Photoshop anchor of a vertical point layer: the layer raster is the plan's
+// buffer placed at the layer bounds (a commit), or that buffer ink-trimmed (a transform
+// re-render), so a fresh identity render of the layer's own text recovers the offset.
+std::optional<QPointF> vertical_text_layer_anchor(const Layer& layer) {
+  const auto inputs = text_render_inputs_from_layer(layer);
+  if (!inputs.has_value() || !inputs->settings.vertical || inputs->settings.boxed) {
+    return std::nullopt;
+  }
+  const auto plan = build_text_render_plan(inputs->settings, inputs->color, inputs->max_width, inputs->paragraph_runs,
+                                           inputs->rich_text_runs, std::nullopt, 1.0, QTransform(), 1.0);
+  if (!plan.vertical || !plan.vertical_plan.valid) {
+    return std::nullopt;
+  }
+  QPointF offset = plan.vertical_plan.anchor;
+  const auto buffer_width = static_cast<int>(std::ceil(plan.local_rect.right()));
+  const auto buffer_height = static_cast<int>(std::ceil(plan.local_rect.bottom()));
+  const auto& pixels = layer.pixels();
+  if ((pixels.width() != buffer_width || pixels.height() != buffer_height) &&
+      visible_alpha_local_bounds(pixels).has_value()) {
+    if (const auto rendered = render_text_layer_pixels_from_metadata(layer); rendered.has_value()) {
+      if (const auto visible = visible_alpha_local_bounds(*rendered); visible.has_value()) {
+        offset -= QPointF(static_cast<double>(visible->x), static_cast<double>(visible->y));
+      }
+    }
+  }
+  return QPointF(static_cast<double>(layer.bounds().x), static_cast<double>(layer.bounds().y)) + offset;
+}
+
+// Re-render a text layer's glyphs *through* the layer transform so a scaled/rotated layer stays
+// crisp (vector glyphs rasterized at the final scale) instead of resampling an already-baked bitmap.
+// Box text is opt-in (`allow_boxed`): the plan renderer draws a frame through any affine, but the
+// pixels-only callers (Affinity/SVG artistic text, PDF pending text) rely on the point-only refusal,
+// so they keep the default. A boxed render keeps its full frame buffer (no ink crop), the way a
+// box commit does, so the layer bounds stay the frame the next edit session opens on.
+std::optional<TransformedTextPixels> render_text_layer_pixels_through_transform(const Layer& layer,
+                                                                               const QTransform& transform,
+                                                                               bool allow_boxed = false) {
+  auto inputs = text_render_inputs_from_layer(layer);
+  if (!inputs.has_value() || (inputs->settings.boxed && !allow_boxed)) {
+    return std::nullopt;
+  }
+  const auto rendered = render_text_pixels_with_local_rect(inputs->settings, inputs->color, inputs->max_width,
+                                                           inputs->paragraph_runs, inputs->rich_text_runs,
+                                                           std::nullopt, 1.0, transform);
+  if (rendered.pixels.empty()) {
+    return std::nullopt;
+  }
+  const auto origin_x = static_cast<std::int32_t>(std::floor(rendered.local_rect.left()));
+  const auto origin_y = static_cast<std::int32_t>(std::floor(rendered.local_rect.top()));
+  // Trim transparent margins (e.g. the bounding box of rotated glyphs, or any residual padding) so the
+  // layer bounds -- and therefore the free-transform handles -- hug the inked glyphs.
+  if (const auto visible = visible_alpha_local_bounds(rendered.pixels);
+      !inputs->settings.boxed && visible.has_value() &&
+      (visible->x > 0 || visible->y > 0 || visible->width < rendered.pixels.width() ||
+       visible->height < rendered.pixels.height())) {
+    const auto cropped = qimage_from_pixel_buffer(rendered.pixels)
+                             .convertToFormat(QImage::Format_RGBA8888)
+                             .copy(visible->x, visible->y, visible->width, visible->height);
+    return TransformedTextPixels{pixels_from_image_rgba(cropped),
+                                 Rect{origin_x + visible->x, origin_y + visible->y, visible->width, visible->height},
+                                 rendered.metrics};
+  }
+  return TransformedTextPixels{rendered.pixels,
+                               Rect{origin_x, origin_y, rendered.pixels.width(), rendered.pixels.height()},
+                               rendered.metrics};
+}
+
+// An imported type layer whose transform is still the PSD's own: Photoshop's raster kept as
+// the preview (`psd_raster_preview`), or a preview regenerated at import, which keeps the
+// baseline-anchored transform too. An editor commit clears the PSD keys
+// (store_patchy_text_metadata -> clear_layer_psd_text_source), so a PSD transform the Patchy
+// transform still equals means the layer was never re-anchored to a layout top.
+bool layer_is_imported_text_preview(const Layer& layer) {
+  if (const auto status = layer.metadata().find(kLayerMetadataTextRasterStatus);
+      status != layer.metadata().end() && status->second == "psd_raster_preview") {
+    return true;
+  }
+  return layer.metadata().contains(kLayerMetadataPsdTextTransform) &&
+         !layer_patchy_text_transform_overrides_psd_source(layer);
+}
+
+// The text-local -> document transform that draws an imported preview's re-layout where its
+// raster sits. A PSD transform anchors point text at the FIRST BASELINE (docs/
+// text-render-calibration.md), while the render plan's local space has the layout top at 0,
+// so drawing through it directly lands the text ~one ascent low. Box text is simple: the
+// PSD box's top-left in text space IS the plan's local origin (the editor opens a PSD-frame
+// session at that corner and commits there). Point text is placed the way a commit places
+// it: the re-rendered ink pinned to the source raster's ink (the justification fraction
+// along the reading axis, the top on the stack axis; anchored_text_transform_for_pixels),
+// and a scaled/rotated layer through the free-transform alignment helpers.
+std::optional<QTransform> imported_preview_text_plan_transform(const Layer& layer,
+                                                               const LayerTextRenderInputs& inputs) {
+  const auto canonical = canonical_text_affine_transform_for_layer(layer);
+  if (!canonical.has_value()) {
+    return std::nullopt;
+  }
+  const bool has_linear_part = affine_transform_has_non_translation_linear_part(*canonical);
+  if (inputs.settings.boxed) {
+    if (const auto box = psd_text_metadata_local_rect(layer, kLayerMetadataPsdTextBoxBounds); box.has_value()) {
+      return qtransform_from_affine(affine_with_local_translation(*canonical, box->topLeft()));
+    }
+    if (has_linear_part) {
+      return std::nullopt;
+    }
+  }
+  const auto rendered = render_text_pixels_with_local_rect(inputs.settings, inputs.color, inputs.max_width,
+                                                           inputs.paragraph_runs, inputs.rich_text_runs);
+  if (rendered.pixels.empty()) {
+    return std::nullopt;
+  }
+  const auto factor = layer_anchor_alignment_factor(layer);
+  if (has_linear_part) {
+    auto aligned = psd_point_text_local_bounds_transform_for_pixels(layer, rendered, false, factor);
+    if (!aligned.has_value()) {
+      aligned = psd_point_text_document_bounds_transform_for_pixels(layer, rendered, false, factor);
+    }
+    if (!aligned.has_value()) {
+      return std::nullopt;
+    }
+    return qtransform_from_affine(*aligned);
+  }
+  const auto ink = visible_alpha_local_bounds(rendered.pixels);
+  const auto source = psd_point_text_source_visible_rect(layer);
+  if (!ink.has_value() || !source.has_value()) {
+    return std::nullopt;
+  }
+  // Pixel (0,0) of the identity render is local point local_rect.topLeft().
+  const double ink_left = rendered.local_rect.left() + static_cast<double>(ink->x);
+  const double ink_top = rendered.local_rect.top() + static_cast<double>(ink->y);
+  const double tx = source->left() + factor * (source->width() - static_cast<double>(ink->width)) - ink_left;
+  const double ty = source->top() - ink_top;
+  if (!std::isfinite(tx) || !std::isfinite(ty)) {
+    return std::nullopt;
+  }
+  return QTransform::fromTranslate(tx, ty);
+}
+
+std::string quoted_font_list(const QStringList& families) {
+  std::string names;
+  for (const auto& family : families) {
+    if (!names.empty()) {
+      names += ", ";
+    }
+    names += '"';
+    names += family.toStdString();
+    names += '"';
+  }
+  return names;
+}
+
+}  // namespace
+
+bool draw_text_layer_to_painter(const Layer& layer, QPainter& painter, bool missing_fonts_as_images,
+                                std::string* note) {
+  const auto refuse = [note](std::string reason) {
+    if (note != nullptr) {
+      *note = std::move(reason);
+    }
+    return false;
+  };
+  if (note != nullptr) {
+    note->clear();
+  }
+  if (!layer_is_text(layer)) {
+    return false;
+  }
+  // A placeholder raster has no type preview at all; embedding it is the only honest form.
+  if (const auto status = layer.metadata().find(kLayerMetadataTextRasterStatus);
+      status != layer.metadata().end() && status->second == "placeholder") {
+    return refuse("no type preview");
+  }
+  // Warped text is a resampled surface, not a glyph plan.
+  if (const auto found = layer.metadata().find(kLayerMetadataTextWarp); found != layer.metadata().end()) {
+    if (const auto warp = parse_text_warp(found->second); warp.has_value() && !text_warp_is_identity(*warp)) {
+      return refuse("warped text");
+    }
+  }
+  const auto inputs = text_render_inputs_from_layer(layer);
+  if (!inputs.has_value()) {
+    return false;
+  }
+  // Fonts the layer names that cannot draw its text. Drawing substitutes Qt's fallback face
+  // (what an edit would do); the caller may prefer the layer's pixels instead. An imported
+  // preview with no font name at all ("PSD Text") draws in the UI font, which is just as
+  // much a substitution (the free-transform re-render refuses it the same way).
+  const bool imported_preview = layer_is_imported_text_preview(layer);
+  const auto problems = text_font_problems_for_layer(layer);
+  auto missing = problems.not_installed;
+  if (const auto font = layer.metadata().find(kLayerMetadataTextFont);
+      imported_preview &&
+      (font == layer.metadata().end() || QString::fromStdString(font->second).trimmed().isEmpty() ||
+       QString::fromStdString(font->second).compare(QStringLiteral("PSD Text"), Qt::CaseInsensitive) == 0)) {
+    missing.push_front(QStringLiteral("unknown"));
+  }
+  // Name the real cause: a font that is installed but holds no glyph for the text is not
+  // "not installed", and the note is what tells the user which font to go and fix.
+  std::string font_problem;
+  if (!missing.isEmpty()) {
+    font_problem = missing.size() == 1 ? "font " + quoted_font_list(missing) + " is not installed"
+                                       : "fonts " + quoted_font_list(missing) + " are not installed";
+  }
+  if (!problems.no_glyphs.isEmpty()) {
+    if (!font_problem.empty()) {
+      font_problem += "; ";
+    }
+    font_problem += problems.no_glyphs.size() == 1
+                        ? "font " + quoted_font_list(problems.no_glyphs) + " has no glyphs for this text"
+                        : "fonts " + quoted_font_list(problems.no_glyphs) + " have no glyphs for their text";
+  }
+  missing += problems.no_glyphs;
+  if (!missing.isEmpty() && missing_fonts_as_images) {
+    return refuse(font_problem);
+  }
+  // The canonical text-local -> document transform is the authority the layer's raster was
+  // derived from (refresh_text_layer_raster adopts a bounds translation when none is stored).
+  QTransform transform = QTransform::fromTranslate(layer.bounds().x, layer.bounds().y);
+  if (imported_preview) {
+    const auto placed = imported_preview_text_plan_transform(layer, *inputs);
+    if (!placed.has_value()) {
+      return refuse("the imported type preview could not be placed");
+    }
+    transform = *placed;
+  } else if (const auto canonical = patchy_text_transform_for_layer(layer); canonical.has_value()) {
+    transform = *canonical;
+  }
+  // Imported box text wraps where Photoshop wrapped it: the same advance calibration the
+  // editor applies when it opens such a layer (Qt's advances for the face can run a few
+  // percent wide, pushing a word onto a line Photoshop's raster does not have).
+  double metric_scale = 1.0;
+  if (imported_preview && inputs->settings.boxed) {
+    // Candidates are compared against the source raster's line bands, so render them at
+    // the raster's scale: the transform's vertical scale on the runs (layout_scale) with
+    // the box already in document units, the PSD-frame editor session's arrangement.
+    const auto vertical_scale = std::hypot(transform.m21(), transform.m22());
+    auto calibration_settings = inputs->settings;
+    double layout_scale = 1.0;
+    if (std::isfinite(vertical_scale) && vertical_scale > 0.01 && std::abs(vertical_scale - 1.0) > 0.0001) {
+      layout_scale = vertical_scale;
+      calibration_settings.box_width = std::max(
+          kMinimumTextBoxDocumentSize, static_cast<int>(std::lround(inputs->settings.box_width * vertical_scale)));
+      calibration_settings.box_height = std::max(
+          kMinimumTextBoxDocumentSize, static_cast<int>(std::lround(inputs->settings.box_height * vertical_scale)));
+    }
+    metric_scale = calibrated_box_text_metric_scale(layer, calibration_settings, inputs->color, inputs->max_width,
+                                                    inputs->paragraph_runs, inputs->rich_text_runs, std::nullopt,
+                                                    layout_scale)
+                       .value_or(1.0);
+  }
+  auto plan = build_text_render_plan(inputs->settings, inputs->color, inputs->max_width,
+                                     inputs->paragraph_runs, inputs->rich_text_runs, std::nullopt,
+                                     metric_scale, transform, 1.0);
+  if (plan.built.document == nullptr) {
+    return false;
+  }
+  // Strong anti-aliasing's extra weight is a raster effect: stroked glyph paths would turn the
+  // PDF's real text into outlines.
+  plan.strong_stroke = 0.0;
+  painter.save();
+  draw_text_render_plan(plan, painter);
+  painter.restore();
+  if (note != nullptr && !missing.isEmpty()) {
+    *note = "text uses a substitute font: " + font_problem;
+  }
+  return true;
+}
+
+namespace {
+
+// First-line baseline y in the text render's local space (layout top = 0): the PSD
+// writer anchors a warped point-text transform here, matching Photoshop's own
+// warped files (box top = -ascent, baseline at the transform origin), so a type
+// re-render in Photoshop lands where Patchy's raster is instead of one descent
+// lower.
+std::optional<double> first_line_baseline_for_text_inputs(const LayerTextRenderInputs& inputs) {
+  const auto built = build_text_render_document(inputs.settings, inputs.color, inputs.max_width,
+                                                inputs.paragraph_runs, inputs.rich_text_runs, 1.0);
+  if (built.document == nullptr) {
+    return std::nullopt;
+  }
+  built.document->size();  // QTextDocument lays out lazily; force it or lineCount() is 0
+  for (auto block = built.document->begin(); block.isValid(); block = block.next()) {
+    const auto* layout = block.layout();
+    if (layout == nullptr || layout->lineCount() < 1) {
+      continue;
+    }
+    const auto line = layout->lineAt(0);
+    if (!line.isValid()) {
+      continue;
+    }
+    const double baseline = layout->position().y() + line.y() + line.ascent();
+    if (std::isfinite(baseline) && baseline > 0.0) {
+      return baseline;
+    }
+  }
+  return std::nullopt;
+}
+
+// Photoshop's own warp box for the text, in the same layout space as the first baseline
+// above; nullopt where it is not modelled (vertical and area type), so callers keep the
+// render rect.
+std::optional<QRectF> photoshop_warp_box_for_text_inputs(const LayerTextRenderInputs& inputs) {
+  if (inputs.settings.vertical || inputs.settings.area || inputs.settings.path) {
+    return std::nullopt;
+  }
+  const auto built = build_text_render_document(inputs.settings, inputs.color, inputs.max_width,
+                                                inputs.paragraph_runs, inputs.rich_text_runs, 1.0);
+  if (built.document == nullptr) {
+    return std::nullopt;
+  }
+  built.document->size();  // QTextDocument lays out lazily; force it or lineCount() is 0
+  const QRectF frame(0.0, 0.0, static_cast<qreal>(built.text_width),
+                     static_cast<qreal>(std::max(kMinimumTextBoxDocumentSize,
+                                                 static_cast<int>(std::lround(inputs.settings.box_height)))));
+  return photoshop_warp_box(*built.document, inputs.settings.boxed, frame);
+}
+
+// Photoshop Warp Text rendering: the unwarped glyph raster (supersampled so the
+// warp samples crisp ink) is resampled through the style warp surface composed with
+// the text-local -> document transform. The warp box defaults to the fresh layout
+// rect when the stored box is empty (Photoshop re-derives its box on every layout
+// change; for BOX text that means the dragged FRAME, corner effects and all - the
+// wt_*_para_smalltext captures pin that a short line in a big box rides the warp
+// surface's shoulder in Photoshop too). `effective_warp` receives the warp with the
+// box actually used so callers can persist it. Returns nullopt for identity warps
+// or unknown styles so callers fall back to the unwarped paths.
+std::optional<TransformedTextPixels> render_warped_text_pixels_for_layer(const LayerTextRenderInputs& inputs,
+                                                                         TextWarp warp,
+                                                                         const QTransform& text_to_document,
+                                                                         TextWarp* effective_warp = nullptr) {
+  if (text_warp_is_identity(warp) || !can_generate_style_warp_mesh(warp.style)) {
+    return std::nullopt;
+  }
+  const auto base = render_text_pixels_with_local_rect(inputs.settings, inputs.color, inputs.max_width,
+                                                       inputs.paragraph_runs, inputs.rich_text_runs);
+  if (base.pixels.empty()) {
+    return std::nullopt;
+  }
+  const QRectF window = base.local_rect;
+  if (warp.bounds_right - warp.bounds_left <= 0.0 || warp.bounds_bottom - warp.bounds_top <= 0.0) {
+    // Photoshop's box, not the padded raster rect: Photoshop checks the stored box against its
+    // own layout on open and prompts to update the layer when they differ by a pixel or two.
+    const auto box = photoshop_warp_box_for_text_inputs(inputs).value_or(window);
+    warp.bounds_left = box.left();
+    warp.bounds_top = box.top();
+    warp.bounds_right = box.right();
+    warp.bounds_bottom = box.bottom();
+    warp.baseline = inputs.settings.boxed
+                        ? 0.0  // box-text transforms anchor at the frame origin (PS convention)
+                        : first_line_baseline_for_text_inputs(inputs).value_or(0.0);
+  }
+  if (effective_warp != nullptr) {
+    *effective_warp = warp;
+  }
+  // Supersample the source raster within a memory budget (RGBA bytes).
+  int supersample = 3;
+  const double base_area = window.width() * window.height();
+  if (base_area * 9.0 * 4.0 > 256.0 * 1024.0 * 1024.0) {
+    supersample = 2;
+  }
+  if (base_area * 4.0 * 4.0 > 256.0 * 1024.0 * 1024.0) {
+    supersample = 1;
+  }
+  QImage source;
+  QRectF source_window = window;
+  if (supersample > 1) {
+    const auto scaled = render_text_pixels_with_local_rect(
+        inputs.settings, inputs.color, inputs.max_width, inputs.paragraph_runs, inputs.rich_text_runs,
+        std::nullopt, 1.0, QTransform::fromScale(supersample, supersample));
+    if (!scaled.pixels.empty()) {
+      source = qimage_from_pixel_buffer(scaled.pixels).convertToFormat(QImage::Format_RGBA8888);
+      source_window =
+          QRectF(scaled.local_rect.left() / supersample, scaled.local_rect.top() / supersample,
+                 scaled.local_rect.width() / supersample, scaled.local_rect.height() / supersample);
+    }
+  }
+  if (source.isNull()) {
+    source = qimage_from_pixel_buffer(base.pixels).convertToFormat(QImage::Format_RGBA8888);
+    source_window = window;
+  }
+  // Restrict the resample window to the INKED part of the raster (plus the warp
+  // box, whose whole span shapes the lattice sizing): a box-text frame is mostly
+  // empty, and running the surface across all of it would both extrapolate far
+  // outside the warp box and starve the lattice resolution where the ink is.
+  if (const auto ink = visible_alpha_local_bounds(base.pixels); ink.has_value()) {
+    const QRectF ink_window = QRectF(window.left() + ink->x, window.top() + ink->y,
+                                     ink->width, ink->height)
+                                  .adjusted(-1.0, -1.0, 1.0, 1.0)
+                                  .intersected(source_window);
+    if (ink_window.isValid() && ink_window.width() > 0.0 && ink_window.height() > 0.0 &&
+        ink_window != source_window) {
+      const double scale_x = source.width() / source_window.width();
+      const double scale_y = source.height() / source_window.height();
+      const int crop_x = std::clamp(
+          static_cast<int>(std::floor((ink_window.left() - source_window.left()) * scale_x)), 0,
+          source.width() - 1);
+      const int crop_y = std::clamp(
+          static_cast<int>(std::floor((ink_window.top() - source_window.top()) * scale_y)), 0,
+          source.height() - 1);
+      const int crop_width = std::clamp(
+          static_cast<int>(std::ceil(ink_window.width() * scale_x)), 1, source.width() - crop_x);
+      const int crop_height = std::clamp(
+          static_cast<int>(std::ceil(ink_window.height() * scale_y)), 1, source.height() - crop_y);
+      source = source.copy(crop_x, crop_y, crop_width, crop_height);
+      source_window = QRectF(source_window.left() + crop_x / scale_x,
+                             source_window.top() + crop_y / scale_y, crop_width / scale_x,
+                             crop_height / scale_y);
+    }
+  }
+  const auto mesh = generate_text_warp_mesh(warp);
+  if (!mesh.has_value()) {
+    return std::nullopt;
+  }
+  const std::array<double, 6> affine{text_to_document.m11(), text_to_document.m21(),
+                                     text_to_document.dx(),  text_to_document.m12(),
+                                     text_to_document.m22(), text_to_document.dy()};
+  const auto grid = build_warp_surface_grid_over_window(
+      *mesh, warp.bounds_left, warp.bounds_top, warp.bounds_right, warp.bounds_bottom,
+      source_window.left(), source_window.top(), source_window.right(), source_window.bottom(),
+      source.width(), source.height(), affine, 4.0, 192);
+  if (!grid.has_value()) {
+    return std::nullopt;
+  }
+  auto warped = resample_warped_rgba8(source, *grid, CanvasWidget::TransformInterpolation::Bilinear);
+  if (warped.image.isNull() || warped.bounds.width <= 0 || warped.bounds.height <= 0) {
+    return std::nullopt;
+  }
+  auto pixels = pixels_from_image_rgba(warped.image);
+  // Trim transparent margins so the layer bounds hug the warped ink.
+  if (const auto visible = visible_alpha_local_bounds(pixels);
+      visible.has_value() && (visible->x > 0 || visible->y > 0 || visible->width < pixels.width() ||
+                              visible->height < pixels.height())) {
+    const auto cropped =
+        warped.image.convertToFormat(QImage::Format_RGBA8888)
+            .copy(visible->x, visible->y, visible->width, visible->height);
+    return TransformedTextPixels{pixels_from_image_rgba(cropped),
+                                 Rect{warped.bounds.x + visible->x, warped.bounds.y + visible->y,
+                                      visible->width, visible->height},
+                                 base.metrics};
+  }
+  return TransformedTextPixels{std::move(pixels), warped.bounds, base.metrics};
+}
+
+bool layer_has_active_text_warp(const Layer& layer) {
+  const auto warp = text_warp_from_layer(layer);
+  return warp.has_value() && !text_warp_is_identity(*warp);
+}
+
+// The unwarped text-local -> document transform to EDIT a warped layer through. A warped
+// layer's raster is the warped ink, so none of the raster-derived anchors the plain text
+// session uses can place the caret; the stored transform is the authority for everything
+// except Move, which translates the bounds without touching text metadata. Re-render the
+// warp once from the stored state (stored box kept, so the probe reproduces the last
+// render instead of re-deriving geometry) and fold the bounds delta into the translation.
+// For an unmoved layer the delta is zero.
+QTransform warped_text_session_transform(const Layer& layer) {
+  auto base = patchy_text_transform_for_layer(layer).value_or(
+      QTransform::fromTranslate(layer.bounds().x, layer.bounds().y));
+  const auto warp = text_warp_from_layer(layer);
+  if (!warp.has_value() || text_warp_is_identity(*warp)) {
+    return base;
+  }
+  const auto inputs = text_render_inputs_from_layer(layer);
+  if (!inputs.has_value()) {
+    return base;
+  }
+  const auto probe = render_warped_text_pixels_for_layer(*inputs, *warp, base);
+  if (!probe.has_value()) {
+    return base;
+  }
+  const auto delta_x = static_cast<qreal>(layer.bounds().x - probe->bounds.x);
+  const auto delta_y = static_cast<qreal>(layer.bounds().y - probe->bounds.y);
+  if (delta_x != 0.0 || delta_y != 0.0) {
+    base *= QTransform::fromTranslate(delta_x, delta_y);
+  }
+  return base;
+}
+
+// True when the inline session edits a layer carrying an active Warp Text. A provisional
+// (new-text) layer can never be warped, so only the re-edit id is consulted.
+bool text_editor_layer_is_warped(const Document& doc, const QTextEdit& editor) {
+  if (!editor.property("patchy.editingLayerId").isValid()) {
+    return false;
+  }
+  const auto* layer =
+      doc.find_layer(static_cast<LayerId>(editor.property("patchy.editingLayerId").toULongLong()));
+  return layer != nullptr && layer_has_active_text_warp(*layer);
+}
+
+void clear_layer_psd_text_source(Layer& layer) {
+  layer.metadata().erase(kLayerMetadataTextSourceBlock);
+  layer.metadata().erase(kLayerMetadataPsdTextTransform);
+  layer.metadata().erase(kLayerMetadataPsdTextBounds);
+  layer.metadata().erase(kLayerMetadataPsdTextBoundingBox);
+  layer.metadata().erase(kLayerMetadataPsdTextBoxBounds);
+  layer.metadata().erase(kLayerMetadataPsdTextTailBounds);
+  layer.metadata().erase(kLayerMetadataPsdTextIndex);
+}
+
+// Flattens the layer tree into compositor paint order (depth-first pre-order). doc.layers()[0] is the
+// bottom of the stack, so an id's position in this list is its global bottom-to-top stacking order --
+// used to order an arbitrary multi-selection (across folders) and pick the bottom-most merge target.
+void collect_layer_render_order(const std::vector<Layer>& layers, std::vector<LayerId>& out) {
+  for (const auto& layer : layers) {
+    out.push_back(layer.id());
+    collect_layer_render_order(layer.children(), out);
+  }
+}
+
+void store_patchy_text_metadata(Layer& layer, const TextToolSettings& settings, QColor color,
+                                const QString& rich_text_runs, const QString& paragraph_runs, int text_width,
+                                int text_height) {
+  layer.metadata()[kLayerMetadataText] = settings.text.toStdString();
+  layer.metadata()[kLayerMetadataTextHtml] = settings.html.toStdString();
+  layer.metadata()[kLayerMetadataTextRuns] = rich_text_runs.toStdString();
+  layer.metadata()[kLayerMetadataTextParagraphRuns] = paragraph_runs.toStdString();
+  layer.metadata()[kLayerMetadataTextFlow] = text_flow_metadata_value(settings.boxed).toStdString();
+  if (settings.area) {
+    layer.metadata()[kLayerMetadataTextArea] = serialize_vector_path(*settings.area);
+  } else {
+    layer.metadata().erase(kLayerMetadataTextArea);
+  }
+  if (text_settings_on_path(settings)) {
+    layer.metadata()[kLayerMetadataTextPath] = serialize_vector_path(*settings.path);
+    layer.metadata()[kLayerMetadataTextPathRange] =
+        serialize_text_path_range(normalized_text_path_range(*settings.path, settings.path_range));
+  } else {
+    layer.metadata().erase(kLayerMetadataTextPath);
+    layer.metadata().erase(kLayerMetadataTextPathRange);
+  }
+  layer.metadata()[kLayerMetadataTextBoxWidth] = std::to_string(std::max(1, text_width));
+  layer.metadata()[kLayerMetadataTextBoxHeight] = std::to_string(std::max(1, text_height));
+  layer.metadata()[kLayerMetadataTextFont] = settings.family.toStdString();
+  layer.metadata()[kLayerMetadataTextSize] = std::to_string(settings.size);
+  layer.metadata()[kLayerMetadataTextColor] = color.name(QColor::HexRgb).toStdString();
+  layer.metadata()[kLayerMetadataTextBold] = settings.bold ? "true" : "false";
+  layer.metadata()[kLayerMetadataTextItalic] = settings.italic ? "true" : "false";
+  layer.metadata()[kLayerMetadataTextAntiAlias] = std::to_string(std::clamp(settings.anti_alias, 0, 16));
+  if (settings.vertical) {
+    layer.metadata()[kLayerMetadataTextOrientation] = kTextOrientationVertical;
+  } else {
+    layer.metadata().erase(kLayerMetadataTextOrientation);
+  }
+  layer.metadata()[kLayerMetadataTextRasterStatus] = "patchy_raster";
+  // The layout metrics describe one specific render; every caller stores the fresh ones right
+  // after this (store_text_layout_metrics) so a stale inset never outlives its raster.
+  layer.metadata().erase(kLayerMetadataTextFirstBaseline);
+  layer.metadata().erase(kLayerMetadataTextBoxBaselineInset);
+  layer.metadata().erase(kLayerMetadataTextAutoLeading);
+  layer.metadata().erase(kLayerMetadataTextRasterTop);
+  layer.metadata().erase(kLayerMetadataTextAnchorX);
+  layer.metadata().erase(kLayerMetadataTextFileAnchor);
+  layer.metadata().erase(kLayerMetadataTextFileBox);
+  clear_layer_psd_text_source(layer);
+}
+
+// Records the render's layout metrics (see TextLayoutMetrics) on the layer whose pixels it
+// became; a metric that does not apply is erased so the PSD writer falls back to its raster
+// heuristics rather than trusting a value from an older render.
+void store_text_layout_metrics(Layer& layer, const TextLayoutMetrics& metrics) {
+  const auto store = [&layer](const char* key, const std::optional<double>& value) {
+    if (value.has_value() && std::isfinite(*value)) {
+      layer.metadata()[key] = QString::number(*value, 'g', 12).toStdString();
+    } else {
+      layer.metadata().erase(key);
+    }
+  };
+  store(kLayerMetadataTextFirstBaseline, metrics.first_baseline);
+  store(kLayerMetadataTextBoxBaselineInset, metrics.box_baseline_inset);
+  store(kLayerMetadataTextAutoLeading, metrics.auto_leading);
+  store(kLayerMetadataTextRasterTop, metrics.raster_top);
+  store(kLayerMetadataTextAnchorX, metrics.anchor_x);
+  // The file's anchor belongs to the render that carried it over (commit_text_editor records it
+  // again after this); any other render places the text itself.
+  layer.metadata().erase(kLayerMetadataTextFileAnchor);
+}
+
+// The document point a point-text layer's file anchored it at (Photoshop's click point: the first
+// baseline at the first line's justification point), while the layer still knows it:
+// - a layer whose render carried the anchor over (kLayerMetadataTextFileAnchor): that text-local
+//   point through the layer's transform, so a move or a free transform since took it along;
+// - an imported layer nothing has re-rendered: its transform's translation (the PSD transform,
+//   moved or transformed with the layer). A file Patchy wrote before the anchor fix has a
+//   centered or right-aligned layer's translation at the line box's LEFT edge; such a layer is
+//   told apart by its stored ink box, which then starts at the anchor instead of straddling or
+//   ending at it, and is left to the renderer's own measure.
+// Warped point text counts: its transform maps the unwarped text-local space the anchor is in.
+// Nothing for box, area and vertical text, whose anchors follow other rules.
+std::optional<QPointF> point_text_file_anchor_in_document(const Layer& layer) {
+  if (!layer_is_text(layer) || layer_text_is_vertical(layer) || text_layer_has_contour(layer)) {
+    return std::nullopt;
+  }
+  const auto& metadata = layer.metadata();
+  if (const auto flow = metadata.find(kLayerMetadataTextFlow);
+      flow != metadata.end() && text_flow_is_box(QString::fromStdString(flow->second))) {
+    return std::nullopt;
+  }
+  const auto transform = canonical_text_affine_transform_for_layer(layer);
+  if (!transform.has_value()) {
+    return std::nullopt;
+  }
+  if (const auto stored = metadata.find(kLayerMetadataTextFileAnchor); stored != metadata.end()) {
+    const auto fields = QString::fromStdString(stored->second).split(QLatin1Char(' '), Qt::SkipEmptyParts);
+    bool ok_x = false;
+    bool ok_y = false;
+    const QPointF local(fields.value(0).toDouble(&ok_x), fields.value(1).toDouble(&ok_y));
+    if (fields.size() != 2 || !ok_x || !ok_y || !std::isfinite(local.x()) || !std::isfinite(local.y())) {
+      return std::nullopt;
+    }
+    return qtransform_from_affine(*transform).map(local);
+  }
+  if (!metadata.contains(kLayerMetadataPsdTextTransform)) {
+    return std::nullopt;
+  }
+  const auto status = metadata.find(kLayerMetadataTextRasterStatus);
+  const bool photoshop_raster = status != metadata.end() && status->second == "psd_raster_preview";
+  if (!photoshop_raster) {
+    // A Patchy raster (a file Patchy saved, reopened; or a preview regenerated at import): the
+    // transform has to be the file's own, and its anchor where the alignment says it is.
+    if (layer_patchy_text_transform_overrides_psd_source(layer)) {
+      return std::nullopt;
+    }
+    // A record without an ink box (Photoshop CS-era files; every block Patchy writes has one)
+    // cannot be one of those, so its anchor stands.
+    const auto factor = layer_anchor_alignment_factor(layer);
+    if (factor > 0.0) {
+      const auto ink = psd_text_metadata_local_rect(layer, kLayerMetadataPsdTextBoundingBox);
+      if (ink.has_value() && ink->width() > 1.0 &&
+          std::abs(ink->left() + factor * ink->width()) > 0.25 * ink->width() + 2.0) {
+        return std::nullopt;
+      }
+    }
+  }
+  const QPointF anchor((*transform)[4], (*transform)[5]);
+  if (!std::isfinite(anchor.x()) || !std::isfinite(anchor.y())) {
+    return std::nullopt;
+  }
+  return anchor;
+}
+
+// The size of the text box a box-text layer's file gave it, in text-local units, while the
+// layer still knows it: the size a render carried over (kLayerMetadataTextFileBox), else an
+// imported layer's PSD box. Photoshop's boxes are fractional; Patchy's are whole pixels.
+std::optional<QSizeF> box_text_file_size(const Layer& layer) {
+  if (!layer_is_text(layer) || text_layer_has_contour(layer) || layer_has_active_text_warp(layer)) {
+    return std::nullopt;
+  }
+  const auto& metadata = layer.metadata();
+  const auto flow = metadata.find(kLayerMetadataTextFlow);
+  if (flow == metadata.end() || !text_flow_is_box(QString::fromStdString(flow->second))) {
+    return std::nullopt;
+  }
+  // Photoshop-layout layers only: a Qt-natural box Patchy wrote stores its /BoxBounds taller by
+  // the baseline inset (text_geometry_for_layer), which is not the box's size.
+  if (const auto mode = metadata.find(kLayerMetadataTextLayoutMode);
+      mode == metadata.end() || mode->second != kTextLayoutModePhotoshop) {
+    return std::nullopt;
+  }
+  QSizeF size;
+  if (const auto stored = metadata.find(kLayerMetadataTextFileBox); stored != metadata.end()) {
+    const auto fields = QString::fromStdString(stored->second).split(QLatin1Char(' '), Qt::SkipEmptyParts);
+    bool ok_width = false;
+    bool ok_height = false;
+    size = QSizeF(fields.value(0).toDouble(&ok_width), fields.value(1).toDouble(&ok_height));
+    if (fields.size() != 2 || !ok_width || !ok_height) {
+      return std::nullopt;
+    }
+  } else if (const auto box = psd_text_metadata_local_rect(layer, kLayerMetadataPsdTextBoxBounds); box.has_value()) {
+    size = box->size();
+  } else {
+    return std::nullopt;
+  }
+  if (!std::isfinite(size.width()) || !std::isfinite(size.height()) || !(size.width() >= 1.0) ||
+      !(size.height() >= 1.0)) {
+    return std::nullopt;
+  }
+  return size;
+}
+
+// Records `anchor` (a document point, point_text_file_anchor_in_document before the commit) on a
+// freshly committed layer as a point of the text-local space its new transform maps.
+void store_point_text_file_anchor(Layer& layer, const QPointF& anchor) {
+  const auto transform = canonical_text_affine_transform_for_layer(layer);
+  if (!transform.has_value()) {
+    return;
+  }
+  bool invertible = false;
+  const auto inverse = qtransform_from_affine(*transform).inverted(&invertible);
+  if (!invertible) {
+    return;
+  }
+  const auto local = inverse.map(anchor);
+  if (!std::isfinite(local.x()) || !std::isfinite(local.y())) {
+    return;
+  }
+  layer.metadata()[kLayerMetadataTextFileAnchor] =
+      (QString::number(local.x(), 'g', 17) + QLatin1Char(' ') + QString::number(local.y(), 'g', 17)).toStdString();
+}
+
+// Version number of a serialized runs string ("v3" -> 3); 0 when the first line is not a tag.
+int text_runs_format_version(const QStringList& lines) {
+  if (lines.isEmpty()) {
+    return 0;
+  }
+  const auto tag = lines[0].trimmed();
+  if (tag.size() < 2 || tag[0] != QLatin1Char('v')) {
+    return 0;
+  }
+  bool ok = false;
+  const int version = tag.mid(1).toInt(&ok);
+  return ok ? version : 0;
+}
+
+// Scale per-run font sizes, explicit leading and baseline shifts in serialized rich-text runs.
+// Format (see rich_text_runs_from_document): line 0 is the version tag, each subsequent line is
+// "start\tlength\tsize\tbold\titalic\tcolor\tfamily[\tleading[\ttracking]]". Sizes are doubles
+// from v3 on (v4-v6 only append columns, so they keep the double sizes), the leading column may
+// be the literal "auto" (scale-free), and tracking is in 1/1000-em units and never scales. Gating
+// the double path on exactly "v3" left v4+ fractional sizes unscaled (toInt fails on "16.2").
+QString scale_rich_text_runs(const QString& runs, double scale) {
+  if (runs.trimmed().isEmpty() || !std::isfinite(scale) || std::abs(scale - 1.0) < 0.0001) {
+    return runs;
+  }
+  auto lines = runs.split(QLatin1Char('\n'));
+  const bool double_sizes = text_runs_format_version(lines) >= 3;
+  for (int i = 1; i < lines.size(); ++i) {
+    auto fields = lines[i].split(QLatin1Char('\t'));
+    if (fields.size() < 3) {
+      continue;
+    }
+    bool ok = false;
+    if (double_sizes) {
+      if (const double size = fields[2].toDouble(&ok); ok && std::isfinite(size) && size > 0.0) {
+        fields[2] = QString::number(std::clamp(size * scale, 1.0, 8192.0), 'g', 17);
+      }
+    } else if (const int size = fields[2].toInt(&ok); ok) {
+      fields[2] = QString::number(std::clamp(static_cast<int>(std::lround(size * scale)), 1, 8192));
+    }
+    if (fields.size() >= 8 && fields[7] != QStringLiteral("auto")) {
+      if (const double leading = fields[7].toDouble(&ok); ok && std::isfinite(leading) && leading > 0.0) {
+        fields[7] = QString::number(leading * scale, 'g', 17);
+      }
+    }
+    if (fields.size() >= 16) {
+      if (const double shift = fields[15].toDouble(&ok); ok && std::isfinite(shift)) {
+        fields[15] = QString::number(shift * scale, 'g', 17);
+      }
+    }
+    lines[i] = fields.join(QLatin1Char('\t'));
+  }
+  return lines.join(QLatin1Char('\n'));
+}
+
+// Scale the text-local layout metrics of a serialized paragraph-runs string: fields 3-7 (text
+// indent, left/right/top/bottom margins) are document pixels that the renderer multiplies by the
+// layout scale (apply_paragraph_runs_to_document), so a size fold that left them alone shifted
+// every indented paragraph. Alignment (field 2) and the auto-leading fraction (field 8) are
+// scale-free; v1 lines carry only the alignment.
+QString scale_paragraph_runs(const QString& paragraph_runs, double scale) {
+  if (paragraph_runs.trimmed().isEmpty() || !std::isfinite(scale) || std::abs(scale - 1.0) < 0.0001) {
+    return paragraph_runs;
+  }
+  auto lines = paragraph_runs.split(QLatin1Char('\n'));
+  for (int i = 1; i < lines.size(); ++i) {
+    auto fields = lines[i].split(QLatin1Char('\t'));
+    if (fields.size() < 8) {
+      continue;
+    }
+    for (int field = 3; field <= 7; ++field) {
+      bool ok = false;
+      if (const double value = fields[field].toDouble(&ok); ok && std::isfinite(value)) {
+        fields[field] = QString::number(value * scale, 'g', 17);
+      }
+    }
+    lines[i] = fields.join(QLatin1Char('\t'));
+  }
+  return lines.join(QLatin1Char('\n'));
+}
+
+// Fold the vertical scale of a Patchy text layer's transform into its font size -- matching how
+// imported PSD text records the *visual* size -- and return the residual matrix (vertical scale
+// removed, rotation/aspect/translation kept) to render and store.  Updates the size-bearing metadata
+// (base size, per-run sizes, paragraph metrics, regenerated HTML, and for box text the frame dims,
+// which are text-local units and must grow with the runs to cover the same document area) so the
+// Type panel and PSD export show the new point size.  Returns the input transform unchanged when
+// there is no meaningful scale to fold.
+QTransform fold_text_transform_scale_into_font_size(Layer& layer, const QTransform& transform) {
+  auto inputs = text_render_inputs_from_layer(layer);
+  if (!inputs.has_value()) {
+    return transform;
+  }
+  const double vertical_scale = std::hypot(transform.m21(), transform.m22());
+  if (!std::isfinite(vertical_scale) || vertical_scale <= 0.01) {
+    return transform;
+  }
+  const int old_size = std::max(1, inputs->settings.size);
+  const int new_size = std::clamp(static_cast<int>(std::lround(old_size * vertical_scale)), 1, 8192);
+  if (new_size == old_size) {
+    return transform;
+  }
+  const double applied_scale = static_cast<double>(new_size) / static_cast<double>(old_size);
+  const QTransform residual(transform.m11() / applied_scale, transform.m12() / applied_scale,
+                            transform.m21() / applied_scale, transform.m22() / applied_scale, transform.dx(),
+                            transform.dy());
+
+  const auto& metadata = layer.metadata();
+  const auto string_value = [&metadata](const char* key) -> QString {
+    const auto found = metadata.find(key);
+    return found == metadata.end() ? QString() : QString::fromStdString(found->second);
+  };
+  const auto int_value = [&metadata](const char* key, int fallback) -> int {
+    const auto found = metadata.find(key);
+    return found == metadata.end() ? fallback : std::max(1, std::atoi(found->second.c_str()));
+  };
+  const auto rich_runs = string_value(kLayerMetadataTextRuns);
+  const auto paragraph_runs = string_value(kLayerMetadataTextParagraphRuns);
+  auto box_width = int_value(kLayerMetadataTextBoxWidth, inputs->settings.box_width);
+  auto box_height = int_value(kLayerMetadataTextBoxHeight, inputs->settings.box_height);
+  auto settings = inputs->settings;
+  settings.size = new_size;
+  if (settings.area) {
+    transform_vector_path(*settings.area, {applied_scale, 0.0, 0.0, applied_scale, 0.0, 0.0});
+  }
+  if (settings.path) {
+    transform_vector_path(*settings.path, {applied_scale, 0.0, 0.0, applied_scale, 0.0, 0.0});
+  }
+  if (settings.boxed) {
+    box_width = std::max(kMinimumTextBoxDocumentSize, static_cast<int>(std::lround(box_width * applied_scale)));
+    box_height = std::max(kMinimumTextBoxDocumentSize, static_cast<int>(std::lround(box_height * applied_scale)));
+    settings.box_width = box_width;
+    settings.box_height = box_height;
+  }
+  const auto scaled_runs = scale_rich_text_runs(rich_runs, applied_scale);
+  const auto scaled_paragraph_runs = scale_paragraph_runs(paragraph_runs, applied_scale);
+  settings.html = document_html_from_text_runs(settings.text, scaled_runs, settings, inputs->color);
+  store_patchy_text_metadata(layer, settings, inputs->color, scaled_runs, scaled_paragraph_runs, box_width,
+                             box_height);
+  layer.metadata()[kLayerMetadataTextTransform] =
+      serialize_layer_affine_transform(affine_from_qtransform(residual));
+  return residual;
+}
+
+// The committed box origin is the integer document point, except that an anchor whose
+// Photoshop rounding already IS that point keeps its fraction: Photoshop stores fractional
+// click points (tx 100.4) and renders from their rounding, so overwriting 100.4 with 100
+// would shift the layer on the next Photoshop open whenever the fraction was >= .5.
+LayerAffineTransform committed_text_transform(QPoint document_point,
+                                              const std::optional<LayerAffineTransform>& active_transform) {
+  auto transform = active_transform.value_or(LayerAffineTransform{1.0, 0.0, 0.0, 1.0, 0.0, 0.0});
+  if (!active_transform.has_value() || snapped_pixel_coordinate(transform[4]) != document_point.x()) {
+    transform[4] = static_cast<double>(document_point.x());
+  }
+  if (!active_transform.has_value() || snapped_pixel_coordinate(transform[5]) != document_point.y()) {
+    transform[5] = static_cast<double>(document_point.y());
+  }
+  return transform;
+}
+
+struct RasterizedLayerPixels {
+  PixelBuffer pixels;
+  Rect bounds;
+};
+
+std::optional<RasterizedLayerPixels> render_rasterized_layer_pixels(const Document& document, const Layer& source,
+                                                                    bool include_layer_style) {
+  if (!layer_has_rasterizable_content(source)) {
+    return std::nullopt;
+  }
+
+  auto layer = source;
+  layer.set_visible(true);
+  layer.set_opacity(1.0F);
+  if (!include_layer_style) {
+    layer.set_fill_opacity(1.0F);
+  }
+  layer.set_blend_mode(BlendMode::Normal);
+  layer.clear_mask();
+  // Blend If remains a live advanced-blending option on the source layer; do
+  // not bake it into text/smart-object pixels or a Rasterize Layer Style result.
+  layer.set_blend_if_payload({}, true);
+  if (!include_layer_style) {
+    layer.layer_style() = {};
+  }
+
+  if ((layer.kind() == LayerKind::Text || layer.pixels().empty()) && layer_is_text(layer)) {
+    auto text_pixels = render_text_layer_pixels_from_metadata(layer);
+    if (!text_pixels.has_value() || text_pixels->empty()) {
+      return std::nullopt;
+    }
+    const auto origin = layer.bounds().empty() ? Rect{} : layer.bounds();
+    layer.set_pixels(std::move(*text_pixels));
+    layer.set_bounds(Rect{origin.x, origin.y, layer.pixels().width(), layer.pixels().height()});
+  }
+  if (layer.pixels().empty()) {
+    return std::nullopt;
+  }
+
+  auto bounds = include_layer_style ? layer_render_bounds(layer) : layer_pixel_bounds(layer);
+  bounds = intersect_rect(bounds, Rect::from_size(document.width(), document.height()));
+  if (bounds.empty()) {
+    return std::nullopt;
+  }
+
+  Document raster_document(document.width(), document.height(), document.format());
+  // A 16/32-bit document rasterizes at its depth (docs/high-bit-depth.md).
+  const auto depth = document.color_state().bit_depth;
+  raster_document.color_state().bit_depth = depth;
+  raster_document.add_layer(std::move(layer));
+  const ScopedDocumentDepthRender depth_render;
+  const auto image =
+      qimage_from_document_rect(raster_document, QRect(bounds.x, bounds.y, bounds.width, bounds.height), true);
+  if (image.isNull()) {
+    return std::nullopt;
+  }
+  return RasterizedLayerPixels{pixels_from_image_at_depth(image, depth), bounds};
+}
+
+std::optional<Layer> renderable_merge_layer_copy(const Layer& source) {
+  if (!layer_has_rasterizable_content(source)) {
+    return std::nullopt;
+  }
+
+  auto layer = source;
+  if ((layer.kind() == LayerKind::Text || layer.pixels().empty()) && layer_is_text(layer)) {
+    auto text_pixels = render_text_layer_pixels_from_metadata(layer);
+    if (!text_pixels.has_value() || text_pixels->empty()) {
+      return std::nullopt;
+    }
+    const auto origin = layer.bounds().empty() ? Rect{} : layer.bounds();
+    layer.set_pixels(std::move(*text_pixels));
+    layer.set_bounds(Rect{origin.x, origin.y, layer.pixels().width(), layer.pixels().height()});
+  }
+  if (layer.kind() != LayerKind::Pixel || layer.pixels().empty()) {
+    return std::nullopt;
+  }
+  return layer;
+}
+
+QString rasterized_text_layer_name(const Layer& layer) {
+  auto name = QString::fromStdString(layer.name()).trimmed();
+  const QStringList prefixes = {
+      QStringLiteral("Text: "),
+      QCoreApplication::translate(kMainWindowTranslationContext, "Text: %1").arg(QString()),
+  };
+  for (const auto& prefix : prefixes) {
+    if (prefix.isEmpty() || !name.startsWith(prefix, Qt::CaseInsensitive)) {
+      continue;
+    }
+    const auto stripped = name.mid(prefix.size()).trimmed();
+    if (!stripped.isEmpty()) {
+      return stripped;
+    }
+  }
+  return name;
+}
+
+QString text_layer_auto_name(const QString& text) {
+  auto name = text.simplified();
+  if (name.size() > 24) {
+    name = name.left(24) + QStringLiteral("...");
+  }
+  return name;
+}
+
+// True when the layer's current name was derived from its text content -- bare, or with the
+// legacy "Text: " prefix older Patchy builds added -- rather than chosen by the user (or carried
+// in from the source PSD).  Auto-derived names follow the text on commit; chosen names stay.
+bool text_layer_name_is_auto(const Layer& layer) {
+  const auto current = QString::fromStdString(layer.name()).trimmed();
+  if (current.isEmpty()) {
+    return true;
+  }
+  const auto found = layer.metadata().find(kLayerMetadataText);
+  const auto auto_name = text_layer_auto_name(
+      found == layer.metadata().end() ? QString() : QString::fromStdString(found->second));
+  if (auto_name.isEmpty()) {
+    return false;
+  }
+  if (current == auto_name) {
+    return true;
+  }
+  const QStringList prefixes = {
+      QStringLiteral("Text: "),
+      QCoreApplication::translate(kMainWindowTranslationContext, "Text: %1").arg(QString()),
+  };
+  for (const auto& prefix : prefixes) {
+    if (!prefix.isEmpty() && current.compare(prefix + auto_name, Qt::CaseInsensitive) == 0) {
+      return true;
+    }
+  }
+  return false;
+}
+
+}  // namespace
+
+std::optional<TextLayerOutlines> text_layer_outlines(const Layer& layer, std::string* error) {
+  const auto fail = [error](std::string reason) -> std::optional<TextLayerOutlines> {
+    if (error != nullptr) {
+      *error = std::move(reason);
+    }
+    return std::nullopt;
+  };
+  if (error != nullptr) {
+    error->clear();
+  }
+  if (!layer_is_text(layer)) {
+    return fail("not a text layer");
+  }
+  if (const auto status = layer.metadata().find(kLayerMetadataTextRasterStatus);
+      status != layer.metadata().end() && status->second == "placeholder") {
+    return fail("the layer has no type to convert");
+  }
+  TextLayerOutlines result;
+  OutlineRecordingDevice device;
+  const auto warp = text_warp_from_layer(layer);
+  if (warp.has_value() && !text_warp_is_identity(*warp)) {
+    // The raster path (render_warped_text_pixels_for_layer) resamples the unwarped render,
+    // laid out in plan-local space, through the warp surface over the warp box composed with
+    // the text-local -> document transform. The outlines take the same route point by point.
+    const auto inputs = text_render_inputs_from_layer(layer);
+    if (!inputs.has_value()) {
+      return fail("the text could not be laid out");
+    }
+    const auto text_to_document = warped_text_session_transform(layer);
+    TextWarp effective = *warp;
+    if (!render_warped_text_pixels_for_layer(*inputs, *warp, text_to_document, &effective).has_value()) {
+      return fail("the warp could not be applied");
+    }
+    const auto mesh = generate_text_warp_mesh(effective);
+    const double box_width = effective.bounds_right - effective.bounds_left;
+    const double box_height = effective.bounds_bottom - effective.bounds_top;
+    if (!mesh.has_value() || !(box_width > 0.0) || !(box_height > 0.0)) {
+      return fail("the warp could not be applied");
+    }
+    auto plan = build_text_render_plan(inputs->settings, inputs->color, inputs->max_width, inputs->paragraph_runs,
+                                       inputs->rich_text_runs, std::nullopt, 1.0, QTransform(), 1.0);
+    if (plan.built.document == nullptr) {
+      return fail("the text could not be laid out");
+    }
+    plan.strong_stroke = 0.0;
+    {
+      QPainter painter(&device);
+      draw_text_render_plan(plan, painter);
+    }
+    const auto map = [&](QPointF point) {
+      const auto surface = evaluate_warp_mesh(*mesh, (point.x() - effective.bounds_left) / box_width,
+                                              (point.y() - effective.bounds_top) / box_height);
+      return text_to_document.map(QPointF(surface[0], surface[1]));
+    };
+    for (const auto& paint : device.paints()) {
+      result.paints.push_back(TextOutlinePaint{map_outline_path(paint.path, map, 4.0), paint.color});
+    }
+  } else {
+    std::string note;
+    {
+      QPainter painter(&device);
+      if (!draw_text_layer_to_painter(layer, painter, false, &note)) {
+        return fail(note.empty() ? std::string("the text could not be laid out") : note);
+      }
+    }
+    result.note = std::move(note);
+    result.paints = device.paints();
+  }
+  result.skipped_glyph_images = device.skipped_images();
+  if (result.paints.empty()) {
+    return fail("the text has no outlines");
+  }
+  return result;
+}
+
+// Re-rasterize a text layer through its stored (already composed) transform. Shared by the
+// free-transform commit callback and the Image Size re-render pass, so both land the same
+// pixels for the same transform. Returns false when the layer keeps whatever raster the caller
+// already produced (the resampled bitmap), which is the right answer for imported text whose
+// font is missing or whose glyph alignment is unknown. Declared in main_window_shared.hpp
+// for Convert to Layers.
+bool rerender_text_layer_through_stored_transform(Layer& layer) {
+  const auto transform = canonical_text_affine_transform_for_layer(layer);
+  if (!transform.has_value()) {
+    return false;
+  }
+  if (text_geometry_is_protected(layer)) return false;
+  if (text_layer_has_contour(std::as_const(layer))) {
+    auto rendered = render_text_layer_pixels_through_transform(layer, qtransform_from_affine(*transform), true);
+    if (!rendered) return false;
+    rendered->pixels = convert_pixel_buffer_depth(rendered->pixels, std::as_const(layer).pixels().format().bit_depth,
+                                                  SampleKind::Color);
+    layer.set_pixels(std::move(rendered->pixels));
+    layer.set_bounds(rendered->bounds);
+    store_text_layout_metrics(layer, rendered->metrics);
+    return true;
+  }
+  if (const auto warp = text_warp_from_layer(layer); warp.has_value() && !text_warp_is_identity(*warp)) {
+    if (layer.metadata().contains(kLayerMetadataPsdTextTransform)) {
+      // Imported warped text keeps Photoshop's raster; transforms resample it
+      // (re-rendering would need the PSD glyph alignment the warp box predates).
+      return false;
+    }
+    // Patchy-authored warped text: fold scale into the point size like the
+    // unwarped path, then re-render through the warp surface with a box freshly
+    // derived from the (possibly rescaled) layout.
+    const auto residual = fold_text_transform_scale_into_font_size(layer, qtransform_from_affine(*transform));
+    const auto inputs = text_render_inputs_from_layer(layer);
+    if (!inputs.has_value()) {
+      return false;
+    }
+    TextWarp refreshed = *warp;
+    refreshed.bounds_left = 0.0;
+    refreshed.bounds_top = 0.0;
+    refreshed.bounds_right = 0.0;
+    refreshed.bounds_bottom = 0.0;
+    auto rendered = render_warped_text_pixels_for_layer(*inputs, refreshed, residual, &refreshed);
+    if (!rendered.has_value()) {
+      return false;
+    }
+    layer.set_pixels(std::move(rendered->pixels));
+    layer.set_bounds(rendered->bounds);
+    store_text_layout_metrics(layer, rendered->metrics);
+    layer.metadata()[kLayerMetadataTextWarp] = serialize_text_warp(refreshed);
+    return true;
+  }
+  if (layer.metadata().contains(kLayerMetadataPsdTextTransform)) {
+    // PSD type layers anchor their transform at the typographic baseline, so rendering the glyph
+    // raster (top-left origin) through it directly would drop the text ~one ascent.  Render crisp
+    // through the glyph-top-aligned transform instead (the same alignment the editor uses), keeping
+    // the imported size + matrix representation.  Falls back to the resampled bitmap when it can't be
+    // aligned (box text, missing PSD glyph metrics, or a pure move with no scale).
+    //
+    // Only do this when the original font is installed: re-rasterizing a missing font would
+    // substitute a generic face (e.g. Arial), so the decorative type would change appearance on
+    // scale.  In that case keep the resampled bitmap, which preserves the imported glyph shapes.
+    const auto font_value = layer.metadata().find(kLayerMetadataTextFont);
+    const QString family =
+        font_value == layer.metadata().end() ? QString() : QString::fromStdString(font_value->second);
+    const bool font_substituted = family.trimmed().isEmpty() ||
+                                  family.compare(QStringLiteral("PSD Text"), Qt::CaseInsensitive) == 0 ||
+                                  !missing_text_families_for_layer(layer).isEmpty();
+    if (font_substituted) {
+      return false;
+    }
+    const auto flow = layer.metadata().find(kLayerMetadataTextFlow);
+    const bool boxed =
+        flow != layer.metadata().end() && text_flow_is_box(QString::fromStdString(flow->second));
+    const auto base = render_text_layer_from_metadata(layer);
+    if (!base.has_value() || base->pixels.empty()) {
+      return false;
+    }
+    const auto aligned = psd_point_text_local_bounds_transform_for_pixels(layer, *base, boxed,
+                                                                          layer_anchor_alignment_factor(layer));
+    if (!aligned.has_value()) {
+      return false;
+    }
+    auto rendered = render_text_layer_pixels_through_transform(layer, qtransform_from_affine(*aligned));
+    if (!rendered.has_value()) {
+      return false;
+    }
+    layer.set_pixels(std::move(rendered->pixels));
+    layer.set_bounds(rendered->bounds);
+    store_text_layout_metrics(layer, rendered->metrics);
+    return true;
+  }
+  // Patchy-authored text (point or box): fold the transform's scale into the point size (so the
+  // Type panel and a saved PSD show the new size, matching imported text), then re-rasterize
+  // through the residual. Box text draws its frame through the residual too; for a uniform scale
+  // that residual is a pure translation, so the frame commits crisp at the folded size.
+  const auto residual = fold_text_transform_scale_into_font_size(layer, qtransform_from_affine(*transform));
+  auto rendered = render_text_layer_pixels_through_transform(layer, residual, /*allow_boxed*/ true);
+  if (!rendered.has_value()) {
+    return false;
+  }
+  layer.set_pixels(std::move(rendered->pixels));
+  layer.set_bounds(rendered->bounds);
+  store_text_layout_metrics(layer, rendered->metrics);
+  return true;
+}
+
+bool text_transform_keeps_missing_font_pixels(const Layer& layer) {
+  // Mirrors rerender_text_layer_through_stored_transform: area text re-renders whatever its font,
+  // and only the imported (PSD-transform) branch keeps the pixels of a missing font.
+  return layer_is_text(layer) && !text_layer_has_contour(layer) &&
+         layer.metadata().contains(kLayerMetadataPsdTextTransform) &&
+         !missing_text_families_for_layer(layer).isEmpty();
+}
+
+MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent) {
+  // First, so the workers overlap everything below (docs/startup-performance.md).
+  start_library_preloads();
+  // Startup phases (docs/startup-performance.md); each is one bool test when tracing is off.
+  startup_trace::Scope recovery_phase("mw.recovery_start");
+  // Installed before the first statusBar() call so every showMessage goes through the
+  // subclass that hosts the zoom percentage box (see ui/zoom_status_bar.hpp).
+  zoom_status_bar_ = new ZoomStatusBar(this);
+  setStatusBar(zoom_status_bar_);
+#ifndef Q_OS_WASM
+  start_document_recovery();
+#endif
+  recovery_phase.end();
+  startup_trace::Scope filters_phase("mw.filters_codecs");
+  register_builtin_filters(filters_);
+  install_ico_png_codec();
+  install_rttex_jpeg_codec();
+  filters_phase.end();
+  startup_trace::Scope tabs_phase("mw.tabs_start_panel");
+  print_page_layout_ = load_stored_print_page_layout();
+  // Diagnostic kill switch for the per-stroke history entries (docs/performance-strokes.md).
+  if (bool ok = false; qEnvironmentVariableIntValue("PATCHY_STROKE_PATCH_HISTORY", &ok) == 0 && ok) {
+    stroke_patch_history_enabled_ = false;
+  }
+  if (use_custom_window_chrome()) {
+    setWindowFlag(Qt::FramelessWindowHint, true);
+  }
+  document_tabs_ = new QTabWidget(this);
+  document_tabs_->setObjectName(QStringLiteral("documentTabs"));
+  document_tabs_->setDocumentMode(true);
+  document_tabs_->setTabsClosable(true);
+  document_tabs_->setMovable(true);
+  setAcceptDrops(true);
+  document_tabs_->setAcceptDrops(true);
+#ifdef Q_OS_WASM
+  // External file drops arrive through the page-side glue as MEMFS paths.
+  // Qt 6.8 registered no browser drop listeners at all; Qt 6.10 registers its
+  // own on the window element, so if the native path ever starts delivering
+  // dropped files too (a dropped file opening twice), gate one path off.
+  wasm_files::install_web_drop_target([this](const QString& path) { handle_web_file_drop(path); });
+  // 1 Hz publisher of globalThis.patchyMemStats, inert unless the page opts
+  // in with PATCHY_MEM_STATS/PATCHY_MEM_LOG; the timer only fires once the
+  // event loop runs, so installing this early is safe.
+  install_wasm_memory_telemetry(*this);
+  // Qt's pending-event queue crashes the tab when a nested event loop drains
+  // it under an outer sendPendingEvents batch; see wasm_event_guard.hpp. The
+  // suspend-resume control exists once QApplication is constructed.
+  install_wasm_pending_event_queue_guard();
+  // A bare Alt tap otherwise moves browser focus to Chrome's menu button and
+  // hotkeys die until the app is clicked; see wasm_event_guard.hpp.
+  install_wasm_alt_key_guard();
+  // The wasm-only dialogs that call QDialog::exec directly (the save-name
+  // prompt in dialog_utils_wasm.cpp) also need the app-wide dialog guards.
+  ensure_wasm_dialog_guards();
+#endif
+  // A click on a menu separator would otherwise close the menu (GitHub issue 317).
+  install_menu_separator_click_guard();
+  // Panel and options-bar sliders drag through the same move coalescing as the dialogs' (GitHub #601).
+  ensure_slider_drag_coalescing();
+  document_tabs_->installEventFilter(this);
+  suppress_native_tab_bar_base(*document_tabs_);
+  if (auto* tab_bar = document_tabs_->findChild<QTabBar*>(); tab_bar != nullptr) {
+    // Named so the theme can dim the current tab while a float window holds
+    // the active document (refresh_document_tab_active_state).
+    tab_bar->setObjectName(QStringLiteral("documentTabBar"));
+    tab_bar->setContextMenuPolicy(Qt::CustomContextMenu);
+    connect(tab_bar, &QWidget::customContextMenuRequested, this, &MainWindow::show_document_tab_context_menu);
+    // Tear-off gesture: dragging a tab out of the bar floats its document.
+    tab_bar->installEventFilter(this);
+    // Layer drags from the Layers panel drop onto document tabs; file drags
+    // stay unaccepted here and propagate to the tab widget as before.
+    tab_bar->setAcceptDrops(true);
+    // Clicking the already-current tab emits no currentChanged, but it must
+    // still activate that document when a float window holds the active one.
+    connect(tab_bar, &QTabBar::tabBarClicked, this, [this](int index) {
+      if (document_tabs_ == nullptr || index < 0 || index != document_tabs_->currentIndex()) {
+        return;
+      }
+      auto* canvas = dynamic_cast<CanvasWidget*>(document_tabs_->widget(index));
+      if (canvas != nullptr && canvas != canvas_) {
+        activate_document_canvas(canvas);
+      }
+    });
+  }
+  // The document tabs share the central area with the panel column, which
+  // create_docks adds as the splitter's second widget (docs/right-docks.md).
+  workspace_splitter_ = new QSplitter(Qt::Horizontal, this);
+  workspace_splitter_->setObjectName(QStringLiteral("workspaceSplitter"));
+  workspace_splitter_->setHandleWidth(7);
+  workspace_splitter_->addWidget(document_tabs_);
+  setCentralWidget(workspace_splitter_);
+  connect(document_tabs_, &QTabWidget::currentChanged, this, [this](int index) { activate_document_tab(index); });
+  connect(document_tabs_, &QTabWidget::tabCloseRequested, this, [this](int index) { close_document_tab(index); });
+  start_panel_ = new StartPanel(document_tabs_);
+  start_panel_->hide();
+  connect(start_panel_, &StartPanel::new_document_requested, this, [this] { create_new_document(); });
+  connect(start_panel_, &StartPanel::open_requested, this, [this] { open_document(); });
+  connect(start_panel_, &StartPanel::recent_file_requested, this,
+          [this](const QString& path) { open_recent_document(path); });
+  connect(start_panel_, &StartPanel::recent_file_context_menu_requested, this,
+          [this](const QString& path, const QPoint& global_position) {
+            show_start_panel_recent_context_menu(path, global_position);
+          });
+  connect(start_panel_, &StartPanel::recent_file_remove_requested, this,
+          [this](const QString& path) { remove_recent_path(path, /*is_folder=*/false); });
+  connect(QApplication::clipboard(), &QClipboard::dataChanged, this,
+          [this] {
+            clear_internal_clipboard_on_external_change();
+            refresh_paste_without_document_state();
+          });
+  layer_opacity_apply_timer_ = new QTimer(this);
+  layer_opacity_apply_timer_->setSingleShot(true);
+  layer_opacity_apply_timer_->setInterval(kLayerOpacityApplyDelayMs);
+  connect(layer_opacity_apply_timer_, &QTimer::timeout, this, [this] { apply_pending_layer_opacity(); });
+  layer_opacity_idle_timer_ = new QTimer(this);
+  layer_opacity_idle_timer_->setSingleShot(true);
+  layer_opacity_idle_timer_->setInterval(kLayerOpacityIdleFinishDelayMs);
+  connect(layer_opacity_idle_timer_, &QTimer::timeout, this, [this] { finish_pending_layer_opacity_edit(); });
+  // Outlasts the canvas's two-digit window (800 ms), so "0" then "5" stays one undo entry.
+  layer_opacity_digit_finish_timer_ = new QTimer(this);
+  layer_opacity_digit_finish_timer_->setSingleShot(true);
+  layer_opacity_digit_finish_timer_->setInterval(1000);
+  connect(layer_opacity_digit_finish_timer_, &QTimer::timeout, this, [this] { finish_pending_layer_opacity_edit(); });
+  layer_fill_opacity_apply_timer_ = new QTimer(this);
+  layer_fill_opacity_apply_timer_->setSingleShot(true);
+  layer_fill_opacity_apply_timer_->setInterval(kLayerOpacityApplyDelayMs);
+  connect(layer_fill_opacity_apply_timer_, &QTimer::timeout, this,
+          [this] { apply_pending_layer_fill_opacity(); });
+  layer_fill_opacity_idle_timer_ = new QTimer(this);
+  layer_fill_opacity_idle_timer_->setSingleShot(true);
+  layer_fill_opacity_idle_timer_->setInterval(kLayerOpacityIdleFinishDelayMs);
+  connect(layer_fill_opacity_idle_timer_, &QTimer::timeout, this,
+          [this] { finish_pending_layer_fill_opacity_edit(); });
+  layer_blend_idle_timer_ = new QTimer(this);
+  layer_blend_idle_timer_->setSingleShot(true);
+  layer_blend_idle_timer_->setInterval(kLayerBlendIdleFinishDelayMs);
+  connect(layer_blend_idle_timer_, &QTimer::timeout, this, [this] { finish_pending_layer_blend_edit(); });
+  layer_blend_preview_timer_ = new QTimer(this);
+  layer_blend_preview_timer_->setSingleShot(true);
+  layer_blend_preview_timer_->setInterval(kLayerOpacityApplyDelayMs);
+  connect(layer_blend_preview_timer_, &QTimer::timeout, this, [this] { apply_pending_layer_blend_preview(); });
+  tool_settings_save_timer_ = new QTimer(this);
+  tool_settings_save_timer_->setSingleShot(true);
+  tool_settings_save_timer_->setInterval(kToolSettingsSaveDelayMs);
+  connect(tool_settings_save_timer_, &QTimer::timeout, this, [this] { save_tool_settings(); });
+  tabs_phase.end();
+  startup_trace::Scope color_phase("mw.input_color_settings");
+  load_pen_input_settings();
+  load_color_settings();
+  set_working_cmyk_space(cmyk_working_space_for(stored_cmyk_working_settings()));
+  color_phase.end();
+  // Startup opens with an empty workspace (the start panel); no document is
+  // auto-created. The one-time load_tool_settings() runs when the first
+  // document session brings a canvas (startup_tool_settings_pending_).
+
+  startup_trace::Scope actions_phase("mw.actions");
+  tool_palette_factor_ = toolbar_icon_size_factor(stored_toolbar_icon_size());
+  create_actions();
+  restore_startup_tool_selection();
+  actions_phase.end();
+  startup_trace::Scope recent_phase("mw.view_recent");
+  load_view_settings();
+  configure_window_chrome();
+  load_recent_files();
+  rebuild_recent_files_menu();
+  load_recent_folders();
+  rebuild_recent_folders_menu();
+  // The first existence check waits for the event loop, off the startup path.
+  QTimer::singleShot(0, this, [this] { schedule_recent_history_check(true); });
+  auto* recent_history_timer = new QTimer(this);
+  recent_history_timer->setInterval(2000);
+  connect(recent_history_timer, &QTimer::timeout, this, [this] {
+    // Refresh the idle start panel without deleting a live menu's filter row. The push
+    // is a no-op unless the panel's rows differ from the list, which then heals them.
+    if (start_panel_->isVisible() && QApplication::activePopupWidget() == nullptr) {
+      refresh_recent_history();
+      start_panel_->set_recent_files(recent_files_);
+    }
+  });
+  recent_history_timer->start();
+  update_start_panel_visibility();
+  recent_phase.end();
+#ifdef Q_OS_WIN
+  // Plug-in folders are probed on a worker after the window is up, so a folder
+  // full of .8bf files never delays the first paint (docs/plugins.md). The
+  // in-flight flag is raised now so a wait for the scan cannot miss it.
+  legacy_plugin_scan_in_flight_ = true;
+  QTimer::singleShot(0, this, [this] {
+    legacy_plugin_scan_in_flight_ = false;
+    start_legacy_plugin_scan(false);
+  });
+#endif
+#ifndef Q_OS_WASM
+  // GIMP files bake their layer effects through Patchy's GEGL
+  // (docs/xcf-layer-effects.md, "Layer effects").
+  install_xcf_effect_runner();
+  // The GEGL filter scan (docs/gegl-filters.md) reuses its cached list unless GEGL or the
+  // helper changed; like the legacy scan it never delays the first paint. Offscreen runs
+  // (the UI tests, --headless) scan on first use instead (ensure_gegl_filters_scanned).
+  if (QGuiApplication::platformName() != QLatin1String("offscreen")) {
+    gegl_filter_scan_in_flight_ = true;
+    QTimer::singleShot(0, this, [this] {
+      gegl_filter_scan_in_flight_ = false;
+      start_gegl_filter_scan();
+    });
+  }
+#endif
+  startup_trace::Scope docks_phase("mw.docks");
+  create_docks();
+  docks_phase.end();
+  startup_trace::Scope hotkeys_phase("mw.panel_entries_hotkeys");
+  default_collapsed_panels_ = collapsed_panel_names();
+  default_panel_order_ = panel_column_->section_order();
+  default_tab_groups_ = panel_column_->tab_groups();
+  install_window_panel_entries();
+  hotkey_registry_.apply_to_actions();
+  refresh_crop_key_hints();  // the Overlay tooltip names the O key only while a tool still holds it
+  // The shortcut set's tool modifiers (GitHub issue 302): Alt, or Ctrl for GIMP-style and Krita-style.
+  set_active_tool_modifier_style(load_active_tool_modifier_style());
+  hotkeys_phase.end();
+  // Script hotkeys must work from the first keypress, before File > Scripts was ever
+  // opened: register every script's command now (docs/scripting.md "Script hotkeys").
+  startup_trace::Scope scripts_phase("mw.scripts");
+  refresh_script_commands(scan_scripts(bundled_scripts_directory(), user_scripts_directory()));
+  scripts_phase.end();
+  startup_trace::Scope refresh_phase("mw.initial_refresh");
+  refresh_layer_list();
+  refresh_layer_controls();
+  update_document_action_state();  update_undo_redo_actions();
+  qApp->installEventFilter(this);
+  refresh_phase.end();
+
+  startup_trace::Scope layout_phase("mw.geometry_layout");
+  refresh_document_window_title();
+  setWindowIcon(patchy_app_icon());
+  if (!restore_window_geometry()) {
+    resize(1280, 860);
+    clamp_window_to_available_screen();
+  }
+  restore_panel_layout();
+  layout_phase.end();
+  startup_trace::Scope stylesheet_phase("mw.stylesheet");
+  setStyleSheet(photoshop_style(tool_palette_factor_));
+  stylesheet_phase.end();
+  const startup_trace::Scope status_phase("mw.status_bar");
+  // Connected after the first sheet is applied: connecting earlier would let a
+  // scheme change restyle a half-built window.
+  connect(&ThemeManager::instance(), &ThemeManager::color_scheme_changed, this,
+          [this] { apply_color_scheme(); });
+  install_theme_extras();
+  ensure_native_resizable_frame();
+  mask_edit_mode_chip_ = new QToolButton(statusBar());
+  mask_edit_mode_chip_->setObjectName(QStringLiteral("maskEditModeChip"));
+  mask_edit_mode_chip_->setCursor(Qt::PointingHandCursor);
+  mask_edit_mode_chip_->setFocusPolicy(Qt::NoFocus);
+  bind_widget_text(mask_edit_mode_chip_, QT_TRANSLATE_NOOP("patchy::ui::MainWindow", "Editing layer mask (click to exit)"));
+  bind_tooltip(mask_edit_mode_chip_, QT_TRANSLATE_NOOP("patchy::ui::MainWindow", "Paint tools are editing the layer mask. Click to edit the layer pixels again."));
+  connect(mask_edit_mode_chip_, &QToolButton::clicked, this, [this] {
+    if (canvas_ != nullptr && canvas_->quick_mask_active()) {
+      quick_mask_trace(QStringLiteral("status bar chip clicked"));
+      toggle_quick_mask_mode();
+    } else if (canvas_ != nullptr && (CanvasWidget::is_component_preview(canvas_->layer_edit_target()) ||
+                                      (canvas_->layer_edit_target() == CanvasWidget::LayerEditTarget::Content &&
+                                       !channel_view_is_composite(canvas_->channel_view())))) {
+      // A view of some color channels: back to all of them.
+      set_channel_edit_target(ChannelPanel::RowKind::Composite, 0, false, true);
+    } else {
+      set_layer_edit_target_ui(CanvasWidget::LayerEditTarget::Content, true);
+    }
+  });
+  statusBar()->addPermanentWidget(mask_edit_mode_chip_);
+  mask_edit_mode_chip_->hide();
+  palette_mode_chip_ = new QToolButton(statusBar());
+  palette_mode_chip_->setObjectName(QStringLiteral("paletteModeChip"));
+  palette_mode_chip_->setCursor(Qt::PointingHandCursor);
+  palette_mode_chip_->setFocusPolicy(Qt::NoFocus);
+  connect(palette_mode_chip_, &QToolButton::clicked, this, [this] {
+    show_panel(QStringLiteral("paletteDock"));
+  });
+  statusBar()->addPermanentWidget(palette_mode_chip_);
+  palette_mode_chip_->hide();
+  // Selected-point count for the per-point path tools; permanent so it
+  // survives showMessage (the hover hints share the same status bar).
+  path_point_count_chip_ = new QLabel(statusBar());
+  path_point_count_chip_->setObjectName(QStringLiteral("pathPointCountChip"));
+  statusBar()->addPermanentWidget(path_point_count_chip_);
+  path_point_count_chip_->hide();
+  register_retranslation([this] { refresh_path_point_count_chip(); });
+  // 32-bit documents (docs/high-bit-depth.md): Photoshop's preview exposure, which
+  // changes the display only.
+  hdr_exposure_spin_ = new QDoubleSpinBox(statusBar());
+  hdr_exposure_spin_->setObjectName(QStringLiteral("hdrPreviewExposureSpin"));
+  hdr_exposure_spin_->setRange(-20.0, 20.0);
+  hdr_exposure_spin_->setDecimals(2);
+  hdr_exposure_spin_->setSingleStep(0.25);
+  configure_toolbar_spinbox(hdr_exposure_spin_, 130);
+  bind_tooltip(hdr_exposure_spin_,
+               QT_TRANSLATE_NOOP("patchy::ui::MainWindow",
+                                 "32-bit preview exposure in stops. It changes the display, not the pixels."));
+  connect(hdr_exposure_spin_, &QDoubleSpinBox::valueChanged, this, [this](double stops) {
+    if (!has_active_document() || canvas_ == nullptr) {
+      return;
+    }
+    auto& state = document().color_state();
+    if (state.bit_depth != BitDepth::Float32 || state.view_exposure_stops == static_cast<float>(stops)) {
+      return;
+    }
+    state.view_exposure_stops = static_cast<float>(stops);
+    canvas_->document_changed();
+  });
+  statusBar()->addPermanentWidget(hdr_exposure_spin_);
+  hdr_exposure_spin_->hide();
+  register_retranslation([this] { refresh_hdr_exposure_control(); });
+  palette_compliance_timer_ = new QTimer(this);
+  palette_compliance_timer_->setSingleShot(true);
+  palette_compliance_timer_->setInterval(400);
+  connect(palette_compliance_timer_, &QTimer::timeout, this, [this] { run_palette_compliance_check(); });
+  // The zoom box plus 100% and Fit buttons, one manually positioned group at the
+  // status bar's left end (GitHub issue 159; see ZoomStatusBar).
+  zoom_status_controls_ = new QWidget(zoom_status_bar_);
+  zoom_status_controls_->setObjectName(QStringLiteral("statusZoomControls"));
+  auto* zoom_controls_layout = new QHBoxLayout(zoom_status_controls_);
+  zoom_controls_layout->setContentsMargins(0, 0, 0, 0);
+  zoom_controls_layout->setSpacing(3);
+  zoom_controls_layout->setSizeConstraint(QLayout::SetFixedSize);
+  zoom_status_edit_ = new ZoomPercentEdit(zoom_status_controls_);
+  bind_tooltip(zoom_status_edit_, QT_TRANSLATE_NOOP("patchy::ui::MainWindow",
+                                                    "Zoom percentage. Type a new value and press Enter, scroll the "
+                                                    "wheel over it, or drag sideways to zoom."));
+  zoom_controls_layout->addWidget(zoom_status_edit_);
+  const auto add_zoom_button = [this, zoom_controls_layout](const QString& object_name, const char* text,
+                                                            const char* tooltip) {
+    auto* button = new QToolButton(zoom_status_controls_);
+    button->setObjectName(object_name);
+    button->setAutoRaise(true);
+    button->setFocusPolicy(Qt::NoFocus);
+    bind_widget_text(button, text);
+    bind_tooltip(button, tooltip);
+    zoom_controls_layout->addWidget(button);
+    return button;
+  };
+  // A chevron inside the box, like an options-bar field's, opens the zoom presets
+  // (800% down to 12.5%, the current view checked; GitHub issue 159).
+  auto* zoom_presets_menu = new QMenu(zoom_status_edit_);
+  zoom_presets_menu->setObjectName(QStringLiteral("statusZoomPresetsMenu"));
+  auto* zoom_presets_group = new QActionGroup(zoom_presets_menu);
+  for (const double percent : {800.0, 400.0, 200.0, 100.0, 50.0, 25.0, 12.5}) {
+    auto* action = zoom_presets_menu->addAction(ZoomPercentEdit::format_zoom_text(percent / 100.0));
+    action->setCheckable(true);
+    action->setData(percent);
+    action->setActionGroup(zoom_presets_group);
+    action->setProperty(kViewNavigationActionProperty, true);  // allowed during automation (mcp_activity.cpp)
+    connect(action, &QAction::triggered, this, [this, percent] {
+      if (canvas_ != nullptr && has_active_document()) {
+        canvas_->set_view_zoom_centered(percent / 100.0);
+      }
+    });
+  }
+  connect(zoom_presets_menu, &QMenu::aboutToShow, this, [this, zoom_presets_menu] {
+    const double current = canvas_ != nullptr && has_active_document() ? canvas_->view_zoom() * 100.0 : 0.0;
+    for (auto* action : zoom_presets_menu->actions()) {
+      action->setChecked(std::abs(action->data().toDouble() - current) < 0.005);
+    }
+  });
+  auto* zoom_presets = zoom_status_edit_->addAction(
+      themed_glyph_icon(QStringLiteral("status-zoom-presets"), 12.0, &ThemePalette::status_text,
+                        [](QPainter& painter, const QColor& ink) {
+                          painter.setRenderHint(QPainter::Antialiasing, true);
+                          painter.setPen(QPen(ink, 1.6, Qt::SolidLine, Qt::RoundCap, Qt::RoundJoin));
+                          painter.drawPolyline(QPolygonF{QPointF(2.5, 4.5), QPointF(6.0, 8.0), QPointF(9.5, 4.5)});
+                        }),
+      QLineEdit::TrailingPosition);
+  zoom_presets->setObjectName(QStringLiteral("statusZoomPresetsAction"));
+  register_retranslation([zoom_presets] { zoom_presets->setToolTip(tr("Zoom presets")); });
+  zoom_presets->setToolTip(tr("Zoom presets"));
+  connect(zoom_presets, &QAction::triggered, this, [this, zoom_presets_menu] {
+    // The status bar sits at the window's foot, so the list opens upward from the box.
+    const auto box = zoom_status_edit_->mapToGlobal(QPoint(0, 0));
+    zoom_presets_menu->popup(box - QPoint(0, zoom_presets_menu->sizeHint().height()));
+  });
+  auto* zoom_fit = add_zoom_button(QStringLiteral("statusZoomFitButton"),
+                                   QT_TRANSLATE_NOOP("patchy::ui::MainWindow", "Fit"),
+                                   QT_TRANSLATE_NOOP("patchy::ui::MainWindow", "Fit on Screen"));
+  connect(zoom_status_edit_, &ZoomPercentEdit::zoom_percent_committed, this, [this](double percent) {
+    if (canvas_ != nullptr && has_active_document()) {
+      canvas_->set_view_zoom_centered(percent / 100.0);
+    }
+  });
+  connect(zoom_status_edit_, &ZoomPercentEdit::zoom_step_requested, this, [this](bool zoom_in) {
+    if (canvas_ != nullptr && has_active_document()) {
+      canvas_->set_view_zoom_centered(next_zoom_ladder_step(canvas_->view_zoom(), zoom_in));
+    }
+  });
+  connect(zoom_status_edit_, &ZoomPercentEdit::zoom_scrub_requested, this, [this](double factor) {
+    if (canvas_ != nullptr && has_active_document()) {
+      canvas_->set_view_zoom_centered(canvas_->view_zoom() * factor);
+    }
+  });
+  connect(zoom_fit, &QToolButton::clicked, this, [this] {
+    if (canvas_ != nullptr && has_active_document()) {
+      canvas_->fit_to_view();
+    }
+  });
+  // Document info after Fit (GitHub issues 202 and 206; docs/view-navigation-status-bar.md): the
+  // active document's dimensions, resolution, color mode and depth, with the profile
+  // and memory use in its tooltip, in a fixed-width field between two separators.
+  const auto add_status_separator = [this, zoom_controls_layout] {
+    auto* line = new QFrame(zoom_status_controls_);
+    line->setObjectName(QStringLiteral("statusInfoSeparator"));
+    line->setFrameShape(QFrame::VLine);
+    line->setFrameShadow(QFrame::Plain);
+    line->setFixedSize(7, 15);
+    zoom_controls_layout->addWidget(line);
+    return line;
+  };
+  auto* info_separator_before = add_status_separator();
+  status_document_info_label_ = new StatusDocumentInfoLabel(zoom_status_controls_);
+  zoom_controls_layout->addWidget(status_document_info_label_);
+  status_document_info_label_->set_separators(info_separator_before, add_status_separator());
+  // The selection's X, Y, W and H after it, only while there is a selection (GitHub issue 355).
+  status_selection_info_label_ = new StatusSelectionInfoLabel(zoom_status_controls_);
+  zoom_controls_layout->addWidget(status_selection_info_label_);
+  register_retranslation(
+      [this] { status_selection_info_label_->setToolTip(StatusSelectionInfoLabel::tooltip_text()); });
+  status_selection_info_label_->setToolTip(StatusSelectionInfoLabel::tooltip_text());
+  connect(zoom_status_bar_, &ZoomStatusBar::resized, this, [this] { refresh_status_document_info(); });
+  register_retranslation([this] { refresh_status_document_info(); });
+  zoom_status_bar_->set_left_widget(zoom_status_controls_);
+  refresh_document_info();
+  statusBar()->showMessage(tr("Ready"));
+}
+
+bool MainWindow::handle_spacebar_canvas_pan_event(QObject* watched, QEvent* event) {
+  if (canvas_ == nullptr || event == nullptr) {
+    return false;
+  }
+
+  // Cancel an in-progress spacebar pan when focus genuinely leaves the app, but
+  // not for intra-app window switches. Clicking the canvas while a non-modal
+  // child dialog is focused deactivates that dialog and activates the main
+  // window; that WindowDeactivate must be ignored, otherwise the pan we armed on
+  // the keypress is disarmed the instant the canvas press arrives and the drag
+  // never grabs. The application stays Active across intra-app transitions, so
+  // gate WindowDeactivate on the app no longer being active.
+  if ((spacebar_canvas_pan_down_ || spacebar_canvas_pan_dragging_) &&
+      (event->type() == QEvent::ApplicationDeactivate ||
+       (event->type() == QEvent::WindowDeactivate &&
+        QGuiApplication::applicationState() != Qt::ApplicationActive))) {
+    reset_spacebar_canvas_pan();
+    return false;
+  }
+
+  auto* widget = qobject_cast<QWidget*>(watched);
+  if (widget == nullptr) {
+    widget = QApplication::focusWidget();
+  }
+
+  const auto target_in_window = spacebar_canvas_pan_target_in_window(widget);
+  const auto target_is_canvas = spacebar_canvas_pan_target_is_canvas(widget);
+  switch (event->type()) {
+    case QEvent::KeyPress: {
+      auto* key_event = static_cast<QKeyEvent*>(event);
+      if (key_event->key() != Qt::Key_Space || !target_in_window || target_is_canvas ||
+          spacebar_canvas_pan_blocked_by_text_input(widget)) {
+        return false;
+      }
+      if (!key_event->isAutoRepeat()) {
+        spacebar_canvas_pan_down_ = true;
+        canvas_->set_spacebar_panning(true);
+        update_spacebar_canvas_pan_cursor(spacebar_canvas_pan_dragging_ ? Qt::ClosedHandCursor : Qt::OpenHandCursor);
+      }
+      key_event->accept();
+      return true;
+    }
+    case QEvent::KeyRelease: {
+      auto* key_event = static_cast<QKeyEvent*>(event);
+      if (key_event->key() != Qt::Key_Space || (!spacebar_canvas_pan_down_ && !spacebar_canvas_pan_dragging_)) {
+        return false;
+      }
+      if (!key_event->isAutoRepeat()) {
+        spacebar_canvas_pan_down_ = false;
+        canvas_->set_spacebar_panning(false);
+        if (spacebar_canvas_pan_dragging_) {
+          update_spacebar_canvas_pan_cursor(Qt::ClosedHandCursor);
+        } else {
+          clear_spacebar_canvas_pan_cursor();
+        }
+      }
+      key_event->accept();
+      return true;
+    }
+    case QEvent::MouseButtonPress: {
+      auto* mouse_event = static_cast<QMouseEvent*>(event);
+      if (!spacebar_canvas_pan_down_ || mouse_event->button() != Qt::LeftButton || !target_in_window) {
+        return false;
+      }
+      if (target_is_canvas) {
+        spacebar_canvas_pan_dragging_ = true;
+        update_spacebar_canvas_pan_cursor(Qt::ClosedHandCursor);
+        return false;
+      }
+      if (!canvas_->begin_pan_at_global_position(mouse_event->globalPosition().toPoint())) {
+        return false;
+      }
+      spacebar_canvas_pan_dragging_ = true;
+      update_spacebar_canvas_pan_cursor(Qt::ClosedHandCursor);
+      mouse_event->accept();
+      return true;
+    }
+    case QEvent::MouseMove: {
+      auto* mouse_event = static_cast<QMouseEvent*>(event);
+      if (!spacebar_canvas_pan_dragging_ || (mouse_event->buttons() & Qt::LeftButton) == 0 || !target_in_window) {
+        return false;
+      }
+      update_spacebar_canvas_pan_cursor(Qt::ClosedHandCursor);
+      if (target_is_canvas) {
+        return false;
+      }
+      if (!canvas_->pan_to_global_position(mouse_event->globalPosition().toPoint())) {
+        return false;
+      }
+      mouse_event->accept();
+      return true;
+    }
+    case QEvent::MouseButtonRelease: {
+      auto* mouse_event = static_cast<QMouseEvent*>(event);
+      if (!spacebar_canvas_pan_dragging_ || mouse_event->button() != Qt::LeftButton) {
+        return false;
+      }
+      spacebar_canvas_pan_dragging_ = false;
+      if (target_is_canvas) {
+        if (spacebar_canvas_pan_down_) {
+          update_spacebar_canvas_pan_cursor(Qt::OpenHandCursor);
+        } else {
+          clear_spacebar_canvas_pan_cursor();
+        }
+        return false;
+      }
+      static_cast<void>(canvas_->end_pan());
+      if (spacebar_canvas_pan_down_) {
+        update_spacebar_canvas_pan_cursor(Qt::OpenHandCursor);
+      } else {
+        clear_spacebar_canvas_pan_cursor();
+      }
+      mouse_event->accept();
+      return true;
+    }
+    default:
+      break;
+  }
+
+  return false;
+}
+
+// The 0-9 opacity keys work anywhere in the main window, as in Photoshop (GitHub issue 562), not
+// only while the canvas has focus: a digit pressed with the tool palette, a panel or an options
+// bar button focused goes to the active canvas. Text fields, spin boxes, editable combos (the
+// text-input guard the spacebar pan uses), dialogs, float windows, menus and the canvas itself,
+// whose keyPressEvent handles them, keep theirs. A digit the tool does not take goes on as usual.
+bool MainWindow::handle_opacity_digit_key_event(QObject* watched, QEvent* event) {
+  if (event->type() != QEvent::KeyPress || canvas_ == nullptr || shutting_down_ || !has_active_document()) {
+    return false;
+  }
+  auto* key_event = static_cast<QKeyEvent*>(event);
+  if (key_event->key() < Qt::Key_0 || key_event->key() > Qt::Key_9) {
+    return false;
+  }
+  // An application filter sees the press once per widget it propagates through: only the first
+  // delivery, to the focus widget (or this window when nothing has focus), counts.
+  auto* widget = qobject_cast<QWidget*>(watched);
+  auto* focus = QApplication::focusWidget();
+  if (widget == nullptr || widget != (focus != nullptr ? focus : static_cast<QWidget*>(this)) ||
+      widget->window() != this || QApplication::activeModalWidget() != nullptr ||
+      QApplication::activePopupWidget() != nullptr) {
+    return false;
+  }
+  for (const QWidget* current = widget; current != nullptr; current = current->parentWidget()) {
+    if (qobject_cast<const CanvasWidget*>(current) != nullptr) {
+      return false;
+    }
+  }
+  if (spacebar_canvas_pan_blocked_by_text_input(widget) ||
+      !canvas_->handle_opacity_digit_key(key_event->key(), key_event->modifiers(), key_event->isAutoRepeat())) {
+    return false;
+  }
+  key_event->accept();
+  return true;
+}
+
+bool MainWindow::spacebar_canvas_pan_target_in_window(QWidget* widget) const noexcept {
+  if (widget == nullptr) {
+    return false;
+  }
+  // Script canvas windows own their keyboard completely: games poll held keys
+  // (Space is a common action button), so the spacebar pan must never engage or
+  // swallow key events while one has focus.
+  if (widget->window() != nullptr &&
+      widget->window()->objectName() == QLatin1String("scriptCanvasWindowDialog")) {
+    return false;
+  }
+  if (widget == this || isAncestorOf(widget) || widget->window() == this) {
+    return true;
+  }
+  // Non-modal child dialogs (layer style, adjustment, filter, ...) are separate
+  // top-level windows, so the checks above miss them and spacebar panning would
+  // not engage until the canvas is clicked. Walk the dialog's owner chain: if it
+  // is ultimately parented to this window, treat its focus widget as in-window so
+  // holding Space pans the canvas behind the dialog (Photoshop behavior). The
+  // text-input guard still keeps Space typing into the dialog's fields.
+  for (QWidget* owner = widget->window(); owner != nullptr;) {
+    if (owner == this) {
+      return true;
+    }
+    QWidget* parent = owner->parentWidget();
+    owner = parent != nullptr ? parent->window() : nullptr;
+  }
+  return false;
+}
+
+bool MainWindow::spacebar_canvas_pan_target_is_canvas(QWidget* widget) const noexcept {
+  return canvas_ != nullptr && widget != nullptr && (widget == canvas_ || canvas_->isAncestorOf(widget));
+}
+
+bool MainWindow::spacebar_canvas_pan_blocked_by_text_input(QWidget* widget) const noexcept {
+  for (auto* current = widget; current != nullptr; current = current->parentWidget()) {
+    // An options-bar control reached with Tab takes Space as its own key (a button presses, a
+    // checkbox toggles); one focused by a click leaves Space to the pan (GitHub issue 440).
+    if (current->hasFocus() && current->property(kOptionsBarKeyboardFocusProperty).toBool()) {
+      return true;
+    }
+    if (qobject_cast<QLineEdit*>(current) != nullptr || qobject_cast<QTextEdit*>(current) != nullptr ||
+        qobject_cast<QPlainTextEdit*>(current) != nullptr || qobject_cast<QAbstractSpinBox*>(current) != nullptr) {
+      return true;
+    }
+    if (const auto* combo = qobject_cast<QComboBox*>(current); combo != nullptr && combo->isEditable()) {
+      return true;
+    }
+    if (current == this) {
+      break;
+    }
+  }
+  return false;
+}
+
+void MainWindow::update_spacebar_canvas_pan_cursor(Qt::CursorShape cursor) {
+  // The spacebar pan and the pen-hover override share the single application
+  // override-cursor slot; release the pen override before taking it over.
+  set_canvas_pen_cursor_override(false);
+  const QCursor next_cursor(cursor);
+  if (spacebar_canvas_pan_cursor_active_) {
+    QApplication::changeOverrideCursor(next_cursor);
+  } else {
+    QApplication::setOverrideCursor(next_cursor);
+    spacebar_canvas_pan_cursor_active_ = true;
+  }
+}
+
+void MainWindow::set_canvas_pen_cursor_override(bool active) {
+  if (active) {
+    // Qt does not reliably deliver enter/leave events for a pen crossing widget
+    // borders (QTBUG-65199), so a plain setCursor on the canvas is not applied
+    // until a real mouse event arrives. Drive the tool cursor through the
+    // application override cursor instead, which updates immediately while the
+    // pen hovers over the canvas. Never stack on top of the spacebar override.
+    if (canvas_ == nullptr || spacebar_canvas_pan_cursor_active_) {
+      return;
+    }
+    const QCursor cursor = canvas_->cursor();
+    if (canvas_pen_cursor_active_) {
+      QApplication::changeOverrideCursor(cursor);
+    } else {
+      QApplication::setOverrideCursor(cursor);
+      canvas_pen_cursor_active_ = true;
+    }
+  } else {
+    if (!canvas_pen_cursor_active_) {
+      return;
+    }
+    canvas_pen_cursor_active_ = false;
+    QApplication::restoreOverrideCursor();
+  }
+}
+
+void MainWindow::update_pen_cursor_override(QObject* watched, QEvent* event) {
+  if (canvas_ == nullptr) {
+    return;
+  }
+  switch (event->type()) {
+    case QEvent::TabletMove:
+    case QEvent::TabletPress:
+    case QEvent::TabletRelease: {
+      // Each tablet event is dispatched both to the native window object (a
+      // QWindow) and to the target widget. Ignore the non-widget delivery;
+      // otherwise the override would be cleared by the window event and re-set
+      // by the widget event, making the cursor flicker between arrow and brush.
+      auto* widget = qobject_cast<QWidget*>(watched);
+      if (widget == nullptr) {
+        break;
+      }
+      if (spacebar_canvas_pan_target_is_canvas(widget)) {
+        set_canvas_pen_cursor_override(true);
+      } else {
+        set_canvas_pen_cursor_override(false);
+      }
+      break;
+    }
+    case QEvent::TabletLeaveProximity:
+      set_canvas_pen_cursor_override(false);
+      break;
+    case QEvent::MouseMove:
+    case QEvent::MouseButtonPress:
+    case QEvent::MouseButtonRelease: {
+      // Only a genuine mouse event hands control back to Qt's per-widget cursor
+      // handling. While a pen hovers, Windows also emits companion mouse-move
+      // events flagged as synthesized; clearing on those would make the cursor
+      // flip-flop between the arrow and the brush, so they are ignored here.
+      auto* mouse_event = static_cast<QMouseEvent*>(event);
+      if (mouse_event->source() == Qt::MouseEventNotSynthesized) {
+        set_canvas_pen_cursor_override(false);
+      }
+      break;
+    }
+    case QEvent::WindowDeactivate:
+    case QEvent::ApplicationDeactivate:
+      set_canvas_pen_cursor_override(false);
+      break;
+    default:
+      break;
+  }
+}
+
+void MainWindow::update_pen_hover_tooltip(QObject* watched, QEvent* event) {
+  // Qt only wakes its tooltip machinery on genuine mouse hover, so a stylus
+  // hovering over a toolbar button never shows the tip. While a pen hovers,
+  // Windows emits companion mouse-move events flagged as synthesized; we use
+  // those to drive a tooltip ourselves, mirroring Qt's hover-delay behavior.
+  switch (event->type()) {
+    case QEvent::MouseMove: {
+      auto* mouse_event = static_cast<QMouseEvent*>(event);
+      if (mouse_event->source() == Qt::MouseEventNotSynthesized) {
+        // A real mouse hands tooltips back to Qt; drop any pen-driven tip.
+        cancel_pen_hover_tooltip();
+        break;
+      }
+      const QPoint global_pos = mouse_event->globalPosition().toPoint();
+      auto* widget = qApp->widgetAt(global_pos);
+      if (widget == nullptr || widget->toolTip().isEmpty()) {
+        cancel_pen_hover_tooltip();
+        break;
+      }
+      // Restart the delay whenever the pen moves to a different target so the
+      // tip only appears once the pen settles, like the mouse behavior.
+      if (widget != pen_hover_tooltip_widget_.data()) {
+        pen_hover_tooltip_widget_ = widget;
+        pen_hover_tooltip_global_pos_ = global_pos;
+        if (pen_hover_tooltip_timer_ == nullptr) {
+          pen_hover_tooltip_timer_ = new QTimer(this);
+          pen_hover_tooltip_timer_->setSingleShot(true);
+          connect(pen_hover_tooltip_timer_, &QTimer::timeout, this, &MainWindow::show_pen_hover_tooltip);
+        }
+        const int delay = std::max(1, style()->styleHint(QStyle::SH_ToolTip_WakeUpDelay));
+        pen_hover_tooltip_timer_->start(delay);
+      } else {
+        pen_hover_tooltip_global_pos_ = global_pos;
+      }
+      break;
+    }
+    case QEvent::TabletPress:
+    case QEvent::TabletRelease:
+    case QEvent::TabletLeaveProximity:
+    case QEvent::MouseButtonPress:
+    case QEvent::MouseButtonRelease:
+    case QEvent::WindowDeactivate:
+    case QEvent::ApplicationDeactivate:
+      cancel_pen_hover_tooltip();
+      break;
+    default:
+      break;
+  }
+  Q_UNUSED(watched);
+}
+
+void MainWindow::show_pen_hover_tooltip() {
+  auto* widget = pen_hover_tooltip_widget_.data();
+  if (widget == nullptr) {
+    return;
+  }
+  // Only show if the pen is still resting over the same widget.
+  if (qApp->widgetAt(pen_hover_tooltip_global_pos_) != widget) {
+    return;
+  }
+  const QString text = widget->toolTip();
+  if (text.isEmpty()) {
+    return;
+  }
+  QToolTip::showText(pen_hover_tooltip_global_pos_, text, widget);
+}
+
+void MainWindow::cancel_pen_hover_tooltip() {
+  if (pen_hover_tooltip_timer_ != nullptr) {
+    pen_hover_tooltip_timer_->stop();
+  }
+  pen_hover_tooltip_widget_.clear();
+}
+
+void MainWindow::clear_spacebar_canvas_pan_cursor() {
+  if (!spacebar_canvas_pan_cursor_active_) {
+    return;
+  }
+  spacebar_canvas_pan_cursor_active_ = false;
+  QApplication::restoreOverrideCursor();
+}
+
+void MainWindow::reset_spacebar_canvas_pan() {
+  spacebar_canvas_pan_down_ = false;
+  spacebar_canvas_pan_dragging_ = false;
+  if (canvas_ != nullptr) {
+    static_cast<void>(canvas_->end_pan());
+    canvas_->set_spacebar_panning(false);
+  }
+  clear_spacebar_canvas_pan_cursor();
+}
+
+bool MainWindow::eventFilter(QObject* watched, QEvent* event) {
+#ifdef Q_OS_WASM
+  // A press dispatched while the wasm main thread was busy is only queued by
+  // the platform plugin, so its preventDefault ran too late and the browser's
+  // mousedown default already blurred Qt's DOM focus helper - after which no
+  // keydown reaches Qt at all (docs/wasm-input.md). By the time this filter
+  // sees the press the theft has already happened, so heal here: the helper
+  // only re-focuses Qt when DOM focus actually fell to the page body.
+  if (event->type() == QEvent::MouseButtonPress || event->type() == QEvent::TabletPress) {
+    wasm_files::restore_qt_dom_focus();
+  }
+#endif
+  // A Gradient Fill commit still being baked in the background (GitHub #714 follow-up) lands
+  // before a command can read the document: at a key that is not a bare modifier, and at a
+  // press on anything but its canvas (File > Save, a panel, a toolbar). The canvas decides for
+  // its own presses, and a key during a drag there belongs to the drag (Esc, Shift).
+  if (pending_gradient_fill_bake_ != nullptr && watched->isWidgetType()) {
+    bool lands = false;
+    switch (event->type()) {
+      case QEvent::KeyPress:
+      case QEvent::ShortcutOverride: {
+        const int key = static_cast<QKeyEvent*>(event)->key();
+        lands = key != Qt::Key_Shift && key != Qt::Key_Control && key != Qt::Key_Alt && key != Qt::Key_Meta &&
+                key != Qt::Key_AltGr && key != Qt::Key_unknown &&
+                !(canvas_ != nullptr && canvas_->pointer_gesture_active());
+        break;
+      }
+      case QEvent::MouseButtonPress:
+      case QEvent::MouseButtonDblClick:
+      case QEvent::TabletPress:
+      case QEvent::ContextMenu:
+        lands = watched != canvas_;
+        break;
+      default:
+        break;
+    }
+    if (lands) {
+      finish_pending_gradient_fill_bake();
+    }
+  }
+  // The type size field's slider popup leaves the keyboard on the field when it closes; a live
+  // session gets it back like any other options-bar pick (GitHub issue 175).
+  if (event->type() == QEvent::Hide && watched->isWidgetType() &&
+      watched->objectName() == QStringLiteral("textSizePopup")) {
+    QTimer::singleShot(0, this, [this] { return_keyboard_to_text_editor(); });
+  }
+  // A canvas cursor change made while a popup had the pointer (a slider popup's quick value,
+  // a brush tip pick) lands on the whole main window; put back the cursor of what is under
+  // the pointer once the popup is gone (GitHub issue 293).
+  if (event->type() == QEvent::Hide && watched->isWidgetType() &&
+      static_cast<QWidget*>(watched)->windowType() == Qt::Popup) {
+    QTimer::singleShot(0, this, [] { refresh_cursor_under_pointer(); });
+  }
+  if (handle_spacebar_canvas_pan_event(watched, event)) {
+    return true;
+  }
+  if (handle_opacity_digit_key_event(watched, event)) {
+    return true;
+  }
+  if (handle_crop_option_key_event(watched, event)) {
+    return true;
+  }
+  if (handle_options_bar_focus_event(watched, event)) {
+    return true;
+  }
+  if (event->type() == QEvent::MouseButtonPress && watched->isWidgetType() &&
+      handle_text_ctrl_move_press(static_cast<QWidget*>(watched), static_cast<QMouseEvent*>(event))) {
+    return true;
+  }
+  if ((event->type() == QEvent::KeyPress || event->type() == QEvent::KeyRelease) && canvas_ != nullptr &&
+      canvas_->tool() == CanvasTool::Text) {
+    if (auto* key_event = static_cast<QKeyEvent*>(event);
+        key_event->key() == Qt::Key_Control && !key_event->isAutoRepeat()) {
+      // The event reports the modifiers from before this key: fold the key in.
+      apply_text_editor_ctrl_cursor(event->type() == QEvent::KeyPress);
+    }
+  }
+
+  // The start panel is a manual overlay of the tab area (no layout owns it).
+  if (watched == document_tabs_ && event->type() == QEvent::Resize && start_panel_ != nullptr &&
+      start_panel_->isVisible()) {
+    start_panel_->setGeometry(document_tabs_->rect());
+  }
+
+  if (event->type() == QEvent::ShortcutOverride && canvas_key_command_yields(*static_cast<QKeyEvent*>(event))) {
+    // The focused field or list takes the key itself (GitHub issue 584).
+    event->accept();
+    return true;
+  }
+  if (event->type() == QEvent::ShortcutOverride) {
+    if (auto* editor = qobject_cast<QTextEdit*>(watched);
+        editor != nullptr && editor->objectName() == QStringLiteral("inlineTextEditor")) {
+      auto* key_event = static_cast<QKeyEvent*>(event);
+      if (key_event->matches(QKeySequence::Bold) || key_event->matches(QKeySequence::Italic)) {
+        key_event->accept();
+        return true;
+      }
+      // AltGr arrives as Ctrl+Alt on Windows: a character it types (the euro sign on many
+      // layouts is AltGr+E) is text here, not Ctrl+Alt+E (#475) or another Ctrl+Alt hotkey.
+      const auto modifiers = key_event->modifiers() & ~(Qt::ShiftModifier | Qt::KeypadModifier);
+      if (modifiers == (Qt::ControlModifier | Qt::AltModifier) && !key_event->text().isEmpty() &&
+          key_event->text().front().isPrint()) {
+        key_event->accept();
+        return true;
+      }
+#if defined(Q_OS_MACOS)
+      // Option(+Shift)+letter types accented letters and symbols on a Mac, so it stays text
+      // here rather than a Shift+Option blend mode key (#531).
+      if (modifiers == Qt::AltModifier && !key_event->text().isEmpty() && key_event->text().front().isPrint()) {
+        key_event->accept();
+        return true;
+      }
+#endif
+    }
+  }
+
+  if (event->type() == QEvent::FocusIn && !shutting_down_) {
+    // Focusing a document canvas makes its document active. Tab switches do this
+    // through currentChanged; this covers the paths that move focus without a
+    // tab change, such as programmatic focus or a click on a float's canvas.
+    // Qt re-focuses the main window's remembered focus child (typically the
+    // tabbed canvas) with ActiveWindowFocusReason BEFORE delivering the click
+    // that re-activated the window, so a panel, menu, or title-bar click while
+    // a float holds the active document must not count as the user choosing
+    // that canvas; popup and menu-bar focus round trips are the same. The
+    // stale focus is dropped one event later so canvas key handlers cannot
+    // edit a document the panels are not showing. A real press on a canvas
+    // activates it through the MouseButtonPress branch below.
+    const auto reason = static_cast<QFocusEvent*>(event)->reason();
+    const bool window_refocus = reason == Qt::ActiveWindowFocusReason || reason == Qt::PopupFocusReason ||
+                                reason == Qt::MenuBarFocusReason;
+    if (auto* canvas = qobject_cast<CanvasWidget*>(watched);
+        canvas != nullptr && canvas != canvas_ && session_for_canvas(canvas) != nullptr) {
+      if (!window_refocus) {
+        activate_document_canvas(canvas);
+      } else if (reason == Qt::ActiveWindowFocusReason) {
+        QPointer<CanvasWidget> stale(canvas);
+        QTimer::singleShot(0, this, [this, stale] {
+          if (stale != nullptr && stale != canvas_ && stale->hasFocus()) {
+            stale->clearFocus();
+          }
+        });
+      }
+    }
+  }
+
+  if ((event->type() == QEvent::MouseButtonPress || event->type() == QEvent::TabletPress) && !shutting_down_) {
+    // A press on a non-active canvas activates its document (clicking the
+    // visible tab page while a float holds the active document). The FocusIn
+    // path cannot cover it: the canvas may already hold keyboard focus, so
+    // mousePressEvent's setFocus is a no-op there. The processing-wait guard
+    // mirrors mousePressEvent's own early return.
+    if (auto* canvas = qobject_cast<CanvasWidget*>(watched);
+        canvas != nullptr && canvas != canvas_ && !canvas->processing_render_wait_active() &&
+        session_for_canvas(canvas) != nullptr) {
+      activate_document_canvas(canvas);
+    }
+  }
+
+  update_pen_cursor_override(watched, event);
+  update_pen_hover_tooltip(watched, event);
+
+  if (event->type() == QEvent::KeyPress) {
+    if (auto* editor = qobject_cast<QTextEdit*>(watched);
+        editor != nullptr && editor->objectName() == QStringLiteral("inlineTextEditor")) {
+      auto* key_event = static_cast<QKeyEvent*>(event);
+      std::optional<LayerId> layer_id;
+      if (editor->property("patchy.editingLayerId").isValid()) {
+        layer_id = static_cast<LayerId>(editor->property("patchy.editingLayerId").toULongLong());
+      }
+      // A held key (Enter, Backspace, a letter) repeats about as fast as the preview debounce, so
+      // every repeat used to push the preview back and the glyphs froze while the caret and the
+      // box moved on (GitHub issue 413). The edit a repeat makes previews at once.
+      editor->setProperty(kTextEditorPreviewNowProperty, key_event->isAutoRepeat());
+      if (key_event->key() == Qt::Key_Escape) {
+        // Preferences > Tools "Use Esc to commit text" (GitHub issue 173); off, Esc cancels.
+        // An untouched placeholder is dropped either way (issue 415).
+        if (escape_commits_text_ && !editor->property(kTextEditorTypeMaskProperty).toBool() &&
+            !text_editor_shows_untouched_placeholder(*editor, tr("Type"))) {
+          commit_text_editor(editor,
+                             QPoint(editor->property("patchy.documentTextX").toInt(),
+                                    editor->property("patchy.documentTextY").toInt()),
+                             layer_id);
+        } else {
+          cancel_text_editor(editor, layer_id);
+        }
+        key_event->accept();
+        return true;
+      }
+      // Ctrl/Cmd+Return commits, and so does the keypad Enter key on its own
+      // (Qt reports it as Key_Enter with KeypadModifier; on Mac laptops fn+Return
+      // arrives the same way). Plain Return stays a line break (GitHub issue 71).
+      const bool keypad_enter =
+          key_event->key() == Qt::Key_Enter && (key_event->modifiers() & Qt::KeypadModifier) != 0;
+      if ((key_event->key() == Qt::Key_Return || key_event->key() == Qt::Key_Enter) &&
+          ((key_event->modifiers() & Qt::ControlModifier) != 0 || keypad_enter)) {
+        const QPoint document_point(editor->property("patchy.documentTextX").toInt(),
+                                    editor->property("patchy.documentTextY").toInt());
+        commit_text_editor(editor, document_point, layer_id);
+        key_event->accept();
+        return true;
+      }
+      if (key_event->matches(QKeySequence::Bold)) {
+        toggle_text_bold_face();
+        key_event->accept();
+        return true;
+      }
+      if (key_event->matches(QKeySequence::Italic)) {
+        toggle_text_italic_face();
+        key_event->accept();
+        return true;
+      }
+    }
+  }
+
+  if (event->type() == QEvent::KeyPress) {
+    for (auto* recent_list_menu : {&recent_files_list_menu_, &recent_folders_list_menu_}) {
+      if (recent_list_menu->filter_edit != nullptr && watched == recent_list_menu->filter_edit &&
+          handle_recent_list_filter_key(*recent_list_menu, *static_cast<QKeyEvent*>(event))) {
+        return true;
+      }
+    }
+  }
+
+  if (auto* recent_menu = qobject_cast<QMenu*>(watched);
+      recent_menu != nullptr && recent_menu->property(kRecentFilesMenuProperty).toBool()) {
+    switch (event->type()) {
+      case QEvent::MouseButtonPress: {
+        auto* mouse_event = static_cast<QMouseEvent*>(event);
+        if (mouse_event->button() == Qt::RightButton) {
+          mouse_event->accept();
+          return true;
+        }
+        break;
+      }
+      case QEvent::MouseButtonRelease: {
+        auto* mouse_event = static_cast<QMouseEvent*>(event);
+        if (mouse_event->button() == Qt::RightButton) {
+          show_recent_file_context_menu(recent_menu, mouse_event->pos());
+          mouse_event->accept();
+          return true;
+        }
+        break;
+      }
+      case QEvent::ContextMenu: {
+        auto* context_event = static_cast<QContextMenuEvent*>(event);
+        show_recent_file_context_menu(recent_menu, context_event->pos());
+        context_event->accept();
+        return true;
+      }
+      default:
+        break;
+    }
+  }
+
+  if (auto* scripts_menu = qobject_cast<QMenu*>(watched);
+      scripts_menu != nullptr && scripts_menu->property(kScriptsMenuProperty).toBool()) {
+    // Same shape as the recent-files menus above: a QMenu triggers its entry on ANY
+    // button's release, so the right button is swallowed and opens the context menu.
+    switch (event->type()) {
+      case QEvent::MouseButtonPress: {
+        auto* mouse_event = static_cast<QMouseEvent*>(event);
+        if (mouse_event->button() == Qt::RightButton) {
+          mouse_event->accept();
+          return true;
+        }
+        break;
+      }
+      case QEvent::MouseButtonRelease: {
+        auto* mouse_event = static_cast<QMouseEvent*>(event);
+        if (mouse_event->button() == Qt::RightButton) {
+          show_script_context_menu(scripts_menu, mouse_event->pos());
+          mouse_event->accept();
+          return true;
+        }
+        break;
+      }
+      case QEvent::ContextMenu: {
+        auto* context_event = static_cast<QContextMenuEvent*>(event);
+        show_script_context_menu(scripts_menu, context_event->pos());
+        context_event->accept();
+        return true;
+      }
+      default:
+        break;
+    }
+  }
+
+  if (handle_layer_action_button_drag_event(watched, event)) {
+    return true;
+  }
+
+  if (handle_cross_document_layer_drag_event(watched, event)) {
+    return true;
+  }
+
+  if (handle_right_dock_resize_event(watched, event)) {
+    return true;
+  }
+
+  if (auto* viewport = qobject_cast<QWidget*>(watched);
+      viewport != nullptr && viewport->parentWidget() != nullptr &&
+      viewport->parentWidget()->objectName() == QStringLiteral("inlineTextEditor")) {
+    if (handle_text_editor_viewport_mouse_event(qobject_cast<QTextEdit*>(viewport->parentWidget()), event)) {
+      return true;
+    }
+  }
+
+  // The wheel over the inline editor (its frame or its viewport) navigates the canvas exactly as
+  // it does anywhere else: scroll, Ctrl/Shift sideways, Alt and wheel-zoom mode zoom (GitHub
+  // issue 413). QTextEdit would otherwise scroll its own document inside the box, and Ctrl+wheel
+  // would zoom the editor's font.
+  if (event->type() == QEvent::Wheel && canvas_ != nullptr) {
+    QTextEdit* wheel_editor = qobject_cast<QTextEdit*>(watched);
+    if (wheel_editor == nullptr) {
+      if (auto* viewport = qobject_cast<QWidget*>(watched); viewport != nullptr) {
+        wheel_editor = qobject_cast<QTextEdit*>(viewport->parentWidget());
+      }
+    }
+    if (wheel_editor != nullptr && wheel_editor->objectName() == QStringLiteral("inlineTextEditor")) {
+      auto* wheel_event = static_cast<QWheelEvent*>(event);
+      const auto global = wheel_event->globalPosition();
+      QWheelEvent forwarded(canvas_->mapFromGlobal(global), global, wheel_event->pixelDelta(),
+                            wheel_event->angleDelta(), wheel_event->buttons(), wheel_event->modifiers(),
+                            wheel_event->phase(), wheel_event->inverted(), wheel_event->source(),
+                            wheel_event->pointingDevice() != nullptr ? wheel_event->pointingDevice()
+                                                                     : QPointingDevice::primaryPointingDevice());
+      QApplication::sendEvent(canvas_, &forwarded);
+      reset_text_editor_scroll(wheel_editor);
+      refresh_document_info();
+      wheel_event->accept();
+      return true;
+    }
+  }
+
+  if (canvas_ != nullptr) {
+    auto* widget = qobject_cast<QWidget*>(watched);
+    if (widget != nullptr && (widget == canvas_ || canvas_->isAncestorOf(widget))) {
+      auto* editor = canvas_->findChild<QTextEdit*>(QStringLiteral("inlineTextEditor"));
+      // A corner rotate zone, or the drag it started (the canvas holds the grab), comes first: the
+      // zones lie outside the box, where the overlay and the click-off commit would take the press.
+      if ((text_box_rotate_drag_.has_value() ||
+           (editor != nullptr && !editor->property(kTextEditorFinishedProperty).toBool())) &&
+          handle_text_box_rotate_event(editor, event)) {
+        return true;
+      }
+      if (editor != nullptr && !editor->property(kTextEditorFinishedProperty).toBool() &&
+          handle_text_editor_transform_overlay_event(editor, event)) {
+        return true;
+      }
+    }
+  }
+
+  if (watched == canvas_ && canvas_ != nullptr) {
+    // A mouse event arriving while the canvas sits in a blocking processing wait is wasm's
+    // re-entrant DOM delivery into the nested wait loop; the canvas's own guards drop the press
+    // and park the release. It must not touch the swallow flag: the click-off text commit runs
+    // INSIDE the press delivery (focus walk -> focus-loss commit -> undo-snapshot wait), so the
+    // release otherwise cleared the flag before the press that armed it resumed, and the resumed
+    // press plus the replayed release opened a brand-new text session from a single click off.
+    if (swallow_next_canvas_left_press_ && !canvas_->processing_render_wait_active()) {
+      if (event->type() == QEvent::MouseButtonPress) {
+        auto* mouse_event = static_cast<QMouseEvent*>(event);
+        swallow_next_canvas_left_press_ = false;
+        if (mouse_event->button() == Qt::LeftButton) {
+          mouse_event->accept();
+          return true;
+        }
+      } else if (event->type() == QEvent::MouseButtonRelease || event->type() == QEvent::MouseButtonDblClick) {
+        swallow_next_canvas_left_press_ = false;
+      }
+    }
+    auto* editor = canvas_->findChild<QTextEdit*>(QStringLiteral("inlineTextEditor"));
+    if (editor != nullptr && !editor->property(kTextEditorFinishedProperty).toBool()) {
+      switch (event->type()) {
+        case QEvent::MouseButtonPress: {
+          auto* mouse_event = static_cast<QMouseEvent*>(event);
+          if (mouse_event->button() == Qt::LeftButton) {
+            if (auto* handle = text_editor_resize_handle_at(mouse_event->pos()); handle != nullptr) {
+              return handle_text_editor_resize_event(handle, editor, event);
+            }
+            if (commit_active_text_editor()) {
+              mouse_event->accept();
+              return true;
+            }
+          }
+          break;
+        }
+        case QEvent::MouseMove:
+        case QEvent::MouseButtonRelease: {
+          const auto handle_name = editor->property("patchy.activeTextResizeHandleName").toString();
+          if (!handle_name.isEmpty()) {
+            if (auto* handle = canvas_->findChild<QWidget*>(handle_name, Qt::FindDirectChildrenOnly);
+                handle != nullptr && handle->property("patchy.textResizeHandle").toBool()) {
+              return handle_text_editor_resize_event(handle, editor, event);
+            }
+          }
+          break;
+        }
+        default:
+          break;
+      }
+    }
+  }
+
+  if (auto* handle = qobject_cast<QWidget*>(watched);
+      handle != nullptr && handle->property("patchy.textResizeHandle").toBool()) {
+    auto* editor = canvas_ == nullptr ? nullptr : canvas_->findChild<QTextEdit*>(QStringLiteral("inlineTextEditor"));
+    if (editor == nullptr) {
+      return false;
+    }
+    return handle_text_editor_resize_event(handle, editor, event);
+  }
+
+  if (handle_window_resize_event(watched, event)) {
+    return true;
+  }
+
+  if (watched == menuBar()) {
+    // StyleChange too: the bar's margins, which size the controls' reserve, come from QSS.
+    if (event->type() == QEvent::Resize || event->type() == QEvent::Show || event->type() == QEvent::StyleChange) {
+      position_window_chrome_controls();
+    }
+    // A full-screen window has no title bar to drag (screen modes, GitHub issue 212);
+    // Windows already skips its HTCAPTION answer there, so these events arrive on every
+    // custom-chrome platform. Only the double-click stays: it leaves full screen, as it
+    // restores a maximized window.
+    const auto title_bar_event =
+        isFullScreen() && event->type() != QEvent::MouseButtonDblClick ? QEvent::None : event->type();
+
+    // The blank menu-bar area is the window title bar. On a real Windows window it
+    // answers WM_NCHITTEST with HTCAPTION (MainWindow::nativeEvent), so the OS handles
+    // drag, double-click and the restore-on-drag of a maximized window and none of these
+    // events arrive. On Linux (X11 and Wayland) and on the offscreen test platform they
+    // do, and this path keeps the native contract: a plain click never changes the window
+    // state, a double-click toggles maximize, and a drag that leaves the drag threshold
+    // hands the window to the window system (startSystemMove: the compositor restores a
+    // maximized window under the cursor, snaps and tiles it, GNOME's edge tiling
+    // included). Where no system move exists (offscreen, a window manager without
+    // _NET_WM_MOVERESIZE) Qt moves the window itself. The system move waits for the
+    // threshold on purpose: started from the press, a compositor grab would span every
+    // click, and the second press of a double-click would maximize a window the
+    // compositor was still dragging.
+    switch (title_bar_event) {
+      case QEvent::MouseButtonDblClick: {
+        auto* mouse_event = static_cast<QMouseEvent*>(event);
+        if (mouse_event->button() == Qt::LeftButton && title_bar_drag_area_contains(mouse_event->pos())) {
+          chrome_title_press_pending_ = false;
+          chrome_dragging_ = false;
+          if (isFullScreen()) {
+            if (screen_mode_ != ScreenMode::Standard) {
+              set_screen_mode(ScreenMode::Standard);
+            }
+          } else {
+            isMaximized() ? restore_window_from_maximize() : showMaximized();
+          }
+          mouse_event->accept();
+          return true;
+        }
+        break;
+      }
+      case QEvent::MouseButtonPress: {
+        auto* mouse_event = static_cast<QMouseEvent*>(event);
+        if (mouse_event->button() == Qt::LeftButton && title_bar_drag_area_contains(mouse_event->pos())) {
+          chrome_title_press_pending_ = true;
+          chrome_drag_press_global_ = mouse_event->globalPosition().toPoint();
+          chrome_dragging_ = false;
+          mouse_event->accept();
+          return true;
+        }
+        break;
+      }
+      case QEvent::MouseMove: {
+        auto* mouse_event = static_cast<QMouseEvent*>(event);
+        if ((mouse_event->buttons() & Qt::LeftButton) == 0) {
+          break;
+        }
+        const QPoint global_position = mouse_event->globalPosition().toPoint();
+        if (chrome_title_press_pending_) {
+          if ((global_position - chrome_drag_press_global_).manhattanLength() < QApplication::startDragDistance()) {
+            mouse_event->accept();
+            return true;
+          }
+          chrome_title_press_pending_ = false;
+          if (auto* handle = windowHandle(); handle != nullptr && handle->startSystemMove()) {
+            mouse_event->accept();
+            return true;
+          }
+          if (isMaximized()) {
+            // Restored under the cursor, so the drag anchors where the pointer is now.
+            restore_maximized_under_cursor(global_position);
+            chrome_drag_position_ = global_position - frameGeometry().topLeft();
+          } else {
+            // Anchored at the press, so the motion spent on the threshold is not lost.
+            chrome_drag_position_ = chrome_drag_press_global_ - frameGeometry().topLeft();
+          }
+          chrome_dragging_ = true;
+        }
+        if (chrome_dragging_) {
+          if (!isMaximized() && !isFullScreen()) {
+            move(global_position - chrome_drag_position_);
+          }
+          mouse_event->accept();
+          return true;
+        }
+        break;
+      }
+      case QEvent::MouseButtonRelease:
+        chrome_dragging_ = false;
+        chrome_title_press_pending_ = false;
+        break;
+      default:
+        break;
+    }
+  }
+
+  if (document_tabs_ != nullptr && watched == document_tabs_->tabBar()) {
+    auto* tab_bar = document_tabs_->tabBar();
+    switch (event->type()) {
+      case QEvent::MouseButtonPress: {
+        auto* mouse_event = static_cast<QMouseEvent*>(event);
+        if (mouse_event->button() == Qt::LeftButton) {
+          tab_tear_press_index_ = tab_bar->tabAt(mouse_event->position().toPoint());
+          tab_tear_press_global_ = mouse_event->globalPosition().toPoint();
+        }
+        break;
+      }
+      case QEvent::MouseMove: {
+#ifndef Q_OS_WASM
+        // Float windows are off on wasm (see float_document_session); straying
+        // vertically must not end QTabBar's reorder drag with the synthetic
+        // release tear_off_document_tab sends.
+        auto* mouse_event = static_cast<QMouseEvent*>(event);
+        if (tab_tear_press_index_ >= 0 && (mouse_event->buttons() & Qt::LeftButton) != 0) {
+          const auto global = mouse_event->globalPosition().toPoint();
+          const QRect bar_rect(tab_bar->mapToGlobal(QPoint(0, 0)), tab_bar->size());
+          // Leaving the bar VERTICALLY tears the tab off; horizontal movement is
+          // QTabBar's own reorder drag.
+          constexpr int kTearOffMargin = 24;
+          if (global.y() < bar_rect.top() - kTearOffMargin || global.y() > bar_rect.bottom() + kTearOffMargin) {
+            const auto tear_index = tab_tear_press_index_;
+            tab_tear_press_index_ = -1;
+            tear_off_document_tab(tear_index, global);
+            return true;
+          }
+        }
+#endif
+        break;
+      }
+      case QEvent::MouseButtonRelease:
+        tab_tear_press_index_ = -1;
+        break;
+      default:
+        break;
+    }
+    return QMainWindow::eventFilter(watched, event);
+  }
+
+  if (watched != document_tabs_) {
+    return QMainWindow::eventFilter(watched, event);
+  }
+
+  switch (event->type()) {
+    case QEvent::DragEnter:
+      return accept_open_file_drag(static_cast<QDragEnterEvent*>(event));
+    case QEvent::DragMove:
+      return accept_open_file_drag(static_cast<QDragMoveEvent*>(event));
+    case QEvent::Drop:
+      return open_dropped_files(static_cast<QDropEvent*>(event));
+    default:
+      break;
+  }
+  return QMainWindow::eventFilter(watched, event);
+}
+
+
+void MainWindow::changeEvent(QEvent* event) {
+  if (event->type() == QEvent::LanguageChange) {
+    retranslate_ui();
+  }
+  if (event->type() == QEvent::ActivationChange && isActiveWindow() && canvas_ != nullptr &&
+      QApplication::activeModalWidget() == nullptr) {
+    // Windows resets the cursor to an arrow when the window is re-activated;
+    // re-apply the tool cursor so a hovering pen shows the brush immediately
+    // instead of waiting for the first move event. Not while a modal dialog is up: the
+    // window is blocked and shows the arrow (GitHub issue 504, Alt+Tab back to Patchy).
+    canvas_->refresh_tool_cursor();
+  }
+  if (event->type() == QEvent::WindowStateChange) {
+    // Maximize/restore/fullscreen each use a different frameless client rect (see
+    // nativeEvent's WM_NCCALCSIZE handling). Drop any in-flight edge-resize state left over
+    // from the transition and re-sync the frame so edge-resize hit-testing and the dock
+    // separators line up with the new geometry.
+    chrome_resizing_ = false;
+    chrome_resize_edges_ = Qt::Edges{};
+    clear_window_resize_cursor();
+#ifdef Q_OS_WIN
+    // An OS snap (drag-to-top, Win+Up) maximizes with a real native zoom, but Qt restores
+    // this frameless window with a plain resize that leaves WS_MAXIMIZE set. A stale zoom
+    // bit keeps WM_NCCALCSIZE in its maximized branch and makes the next startSystemMove()
+    // run DefWindowProc's restore-on-drag against Windows' stale placement, teleporting
+    // the window far from the cursor. Strip the bit in place without touching geometry.
+    // Not while a return from full screen to maximized settles: its restored report is
+    // stale and the window stays zoomed (set_screen_mode, GitHub issue 491).
+    if (!settling_maximized_return_ && !isMaximized() && !isFullScreen() && !isMinimized()) {
+      HWND hwnd = reinterpret_cast<HWND>(winId());
+      const LONG_PTR style = GetWindowLongPtrW(hwnd, GWL_STYLE);
+      if ((style & WS_MAXIMIZE) != 0) {
+        SetWindowLongPtrW(hwnd, GWL_STYLE, style & ~WS_MAXIMIZE);
+        SetWindowPos(hwnd, nullptr, 0, 0, 0, 0,
+                     SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED);
+      }
+    }
+    if (!settling_maximized_return_ && !isMaximized()) {
+      maximized_return_normal_geometry_ = QRect();
+    }
+#endif
+    if (!settling_maximized_return_) {
+      resync_native_frame_geometry();
+    }
+    // The window system or the maximize control left full screen on its own (macOS's
+    // green button, a compositor): Standard takes the chrome back (screen modes).
+    schedule_screen_mode_window_state_sync();
+  }
+  QMainWindow::changeEvent(event);
+}
+
+void MainWindow::closeEvent(QCloseEvent* event) {
+  // On a cancelled close, floats an OS session-end closeAllWindows already hid
+  // (DocumentFloatWindow::closeEvent accepts without closing while
+  // isSavingSession) must come back, or their documents stay open but unreachable.
+  const auto restore_hidden_floats = [this] {
+    for (const auto& target_session : sessions_) {
+      if (target_session->float_window != nullptr && !target_session->float_window->isVisible()) {
+        target_session->float_window->show();
+      }
+    }
+  };
+  if (preview_dialog_edit_locked()) {
+    show_preview_dialog_edit_lock_message();
+    restore_hidden_floats();
+    event->ignore();
+    return;
+  }
+  // Tear down any active inline text editor before shutdown.  Left alive, its
+  // QTextEdit (caret-blink timer, event filters, signal lambdas referencing
+  // canvas_ and the document) is destroyed after the session's Document is
+  // freed, dereferencing freed memory.  Committing matches every other path
+  // that leaves an edit (focus loss, tool change, tab switch) and preserves
+  // the typed text so it counts toward the unsaved-changes prompt below.
+  finish_active_text_editor();
+  // Newest first: an Edit Contents child is appended after its parent, and answering
+  // Save for the child commits into the parent and marks it modified, so the parent
+  // must be asked afterwards (close_all_document_tabs walks the same direction).
+  // Each answered document closes at once, Yes and No alike, so Cancel on a later
+  // prompt keeps only the documents not yet answered (GitHub issue 359). Unmodified
+  // documents stay open until the quit is settled.
+  // One batch: the prompt offers No to All while two or more documents wait (local-041).
+  const auto session_ids = sessions_.ids();
+  const CloseBatchScope close_batch(*this, session_ids);
+  for (auto id_it = session_ids.rbegin(); id_it != session_ids.rend(); ++id_it) {
+    auto* target_session = session_with_id(*id_it);
+    if (target_session == nullptr || !session_is_modified(*target_session)) {
+      continue;
+    }
+    // A Save must write the real layer visibility, not the frame the animation
+    // preview is showing (close_document_session stops it for the same reason).
+    if (animation_preview_window_ != nullptr) {
+      animation_preview_window_->stop_playback_for(&target_session->document);
+    }
+    if (!confirm_close_session(*target_session)) {
+      restore_hidden_floats();
+      event->ignore();
+      return;
+    }
+    if (auto* answered = session_with_id(*id_it);
+        answered != nullptr && !close_document_session(*answered, CloseConfirmation::AlreadyConfirmed)) {
+      restore_hidden_floats();
+      event->ignore();
+      return;
+    }
+  }
+  // A one-click update (download_and_install_update): every document is settled, so hand
+  // over to the installer, which waits for this process to exit. If it cannot start, stay
+  // open rather than quit with nothing updated.
+  if (pending_update_install_.has_value()) {
+    const auto launch = *std::exchange(pending_update_install_, std::nullopt);
+    const auto result = update_installer_launcher_for_tests_ ? update_installer_launcher_for_tests_(launch)
+                                                             : launch_update_installer(launch);
+    if (!result.started()) {
+      restore_hidden_floats();
+      event->ignore();
+      // After this close event has been refused, not from inside it.
+      QTimer::singleShot(0, this, [this, result, url = launch.browser_download_url] {
+        show_update_launch_failure(result, url);
+      });
+      return;
+    }
+  }
+  // A full-screen mode's hidden bars and panels are not the layout to keep, and the
+  // next start is always Standard (screen modes, GitHub issue 212); nor is Hide Panels.
+  set_panels_hidden(false);
+  restore_standard_screen_chrome();
+  save_window_geometry();
+  save_panel_layout();
+  // Flush any tool-option change still waiting on the save debounce; the timer
+  // will not fire once the window is gone.
+  flush_pending_brush_rotation();
+  save_tool_settings();
+  if (color_settings_save_pending_) {
+    color_settings_save_pending_ = false;
+    save_color_settings();
+  }
+#ifndef Q_OS_WASM
+  // A consented quit: no more recovery writes, and the destructor drops the folder.
+  if (recovery_coordinator_ != nullptr) {
+    recovery_coordinator_->stop_timer();
+  }
+#endif
+  // Close the tile preview with the main window: left visible, it has no visible
+  // transient parent anymore, so it blocks lastWindowClosed and the process
+  // lingers headless with only the preview on screen.
+  if (tile_preview_window_ != nullptr) {
+    tile_preview_window_->close();
+  }
+  // The floating brush windows are Qt::Tool windows too; hidden without recording them
+  // closed, so the ones open now come back with the next launch.
+  if (brush_tip_picker_ != nullptr) {
+    brush_tip_picker_->hide_window_for_shutdown();
+  }
+  if (brush_dynamics_button_ != nullptr) {
+    brush_dynamics_button_->hide_window_for_shutdown();
+  }
+  hide_shape_appearance_panel_for_shutdown();  // a Qt::Tool window as well
+  // Same hazard: the animation preview is a Qt::Tool window too (closing it also stops
+  // playback and restores layer visibility while the sessions are still alive).
+  if (animation_preview_window_ != nullptr) {
+    animation_preview_window_->close();
+  }
+  // Same hazard for floated documents (they are top-level windows): hide, not
+  // close - every session was already confirmed above, and close() would run
+  // the float's own close request and re-prompt.
+  for (const auto& target_session : sessions_) {
+    if (target_session->float_window != nullptr) {
+      target_session->float_window->hide();
+    }
+  }
+  event->accept();
+}
+
+void MainWindow::dragEnterEvent(QDragEnterEvent* event) {
+  if (!accept_open_file_drag(event)) {
+    QMainWindow::dragEnterEvent(event);
+  }
+}
+
+void MainWindow::dragMoveEvent(QDragMoveEvent* event) {
+  if (!accept_open_file_drag(event)) {
+    QMainWindow::dragMoveEvent(event);
+  }
+}
+
+void MainWindow::dropEvent(QDropEvent* event) {
+  if (!open_dropped_files(event)) {
+    QMainWindow::dropEvent(event);
+  }
+}
+
+MainWindow::~MainWindow() {
+  // Runs before member destruction. Closing the window can deliver a focus-out to a
+  // still-open inline text editor while the session list is being (or has been) torn
+  // down; the commit path must see this flag and bail before touching any member
+  // container (observed as an uncaught "No active document" on macOS teardown).
+  shutting_down_ = true;
+  // Delete the Edit in Default App temp copies (best effort: a bounded quit can skip this).
+  while (!external_smart_object_edits_.empty()) {
+    stop_external_smart_object_edits_for_session(external_smart_object_edits_.front().session_id);
+  }
+#ifndef Q_OS_WASM
+  // Reaching the destructor means the process is exiting on purpose (a crash never
+  // gets here): the recovery folder is deleted by whichever owner releases it last,
+  // the coordinator or a background write still running (main() waits for those).
+  if (recovery_coordinator_ != nullptr) {
+    recovery_coordinator_->discard_folder_on_release();
+  }
+#endif
+  // The color-picker palette hook captures this window; drop it so a picker
+  // created after teardown (tests build windows serially) cannot call into a
+  // destroyed MainWindow.
+  set_color_picker_document_palette_editor({});
+  set_color_picker_document_palette_name_editor({});
+  set_color_picker_document_palette({}, false);
+  // Detach every canvas from its Document while sessions_ is still intact.
+  // Member destruction frees the session Documents BEFORE ~QWidget runs, and
+  // ~QWidget still delivers close/deactivate focus-out events to the live child
+  // canvases, whose handlers (set_tool's transform-controls rect, stroke/mask
+  // finishes) walk canvas->document_ — the same ordering rule
+  // close_document_session enforces by destroying the canvas before erasing the
+  // session. Without this, teardown walks a freed Document (heap corruption
+  // that surfaced as the linux full-suite pen-test segfault).
+  for (const auto& session : sessions_) {
+    if (session != nullptr && session->canvas != nullptr) {
+      session->canvas->set_document(nullptr);
+    }
+  }
+}
+
+void MainWindow::show_status_error(const QString& text) {
+  zoom_status_bar_->show_error_message(text);
+}
+
+void MainWindow::show_import_notes_status(const QStringList& notices) {
+  if (notices.isEmpty()) {
+    return;
+  }
+  auto text = notices.front();
+  if (notices.size() > 1) {
+    text += tr(" (+%n more import note(s))", nullptr, static_cast<int>(notices.size()) - 1);
+  }
+  zoom_status_bar_->show_notice_message(text);
+}
+
+void MainWindow::configure_canvas(CanvasWidget* canvas) {
+  canvas->setObjectName(QStringLiteral("canvas"));
+  canvas->set_clone_source_changed_callback([this, canvas] {
+    if (canvas == canvas_) {
+      refresh_clone_source_panel();
+    }
+  });
+  // A canvas can be born while a preview dialog holds the edit lock (drag & drop,
+  // second-instance open); every canvas joins the lock here so no creation path
+  // can produce an editable canvas behind an open preview dialog.
+  canvas->set_edit_locked(preview_dialog_edit_locked());
+  apply_canvas_aid_settings(canvas);
+  apply_pen_input_settings(canvas);
+  // History callbacks resolve the canvas's OWN session at fire time: with float
+  // windows two canvases are live at once, and an edit (or an async completion)
+  // must never snapshot whichever document happens to be active.
+  canvas->set_before_edit_callback([this, canvas](QString label) {
+    if (scripted_stroke_undo_suppressed_) {
+      return;  // Stroke Path already pushed one snapshot for the whole command
+    }
+    if (auto* target_session = session_for_canvas(canvas); target_session != nullptr) {
+      push_undo_snapshot(*target_session, std::move(label));
+    }
+  });
+  canvas->set_edit_run_before_edit_callback([this, canvas](QString label, std::uint64_t run_token) {
+    if (scripted_stroke_undo_suppressed_) {
+      return;
+    }
+    if (auto* target_session = session_for_canvas(canvas); target_session != nullptr) {
+      push_undo_snapshot(*target_session, std::move(label), run_token);
+    }
+  });
+  canvas->set_paint_stroke_history_callback([this, canvas](const CanvasWidget::PaintStrokeHistoryEvent& event) {
+    handle_paint_stroke_history_event(canvas, event);
+  });
+  // The Patch tool's Enter with an outline and no drag opens the Remove
+  // Object dialog, the same command as the Edit menu entry.
+  canvas->set_remove_object_requested_callback([this, canvas] {
+    if (canvas == canvas_) {
+      remove_object_dialog();
+    }
+  });
+  canvas->set_smart_filter_mask_committed_callback(
+      [this, canvas](LayerId layer_id, QString label, PixelBuffer pixels,
+                     QRegion) {
+        return commit_smart_filter_mask_edit(
+            canvas, layer_id, std::move(label), std::move(pixels));
+      });
+  canvas->set_selection_history_callback(
+      [this, canvas](QString label, CanvasWidget::SelectionSnapshot before, bool coalesce) {
+        if (auto* target_session = session_for_canvas(canvas); target_session != nullptr) {
+          push_selection_history(*target_session, std::move(label), std::move(before), coalesce);
+        }
+      });
+  canvas->set_quick_mask_changed_callback([this, canvas] {
+    QTimer::singleShot(0, this, [this, canvas] {
+      if (canvas == canvas_) {
+        refresh_quick_mask_ui();
+      }
+    });
+  });
+  canvas->set_selection_mode_changed_callback([this, canvas](CanvasWidget::SelectionMode mode) {
+    if (canvas == canvas_) {
+      update_selection_mode_buttons(mode);
+      // Canvas-driven mode changes (Quick Select's auto New->Add after a stroke) must land in
+      // the per-tool store too, or the next document would revert the tool to New. The equality
+      // gate filters the transient Shift/Alt overrides reported by the modifier event filter,
+      // which do not change the canvas's stored mode.
+      if (mode == canvas->selection_mode()) {
+        if (const auto index = CanvasWidget::selection_tool_index(current_tool_); index >= 0) {
+          selection_modes_[static_cast<std::size_t>(index)] = mode;
+        }
+      }
+    }
+  });
+  canvas->set_color_picked_callback([this, canvas](QColor color) {
+    canvas->set_primary_color(color);
+    if (color_dialog_ != nullptr &&
+        color_dialog_->property("patchy.colorTarget").toString() == QStringLiteral("foreground")) {
+      if (auto* picker = color_dialog_->findChild<PatchyColorPicker*>(
+              QStringLiteral("patchyAdvancedColorPicker"))) {
+        // Blocked so the panel's currentColorChanged callback does not echo back into
+        // set_primary_color and stomp the status message below.
+        const QSignalBlocker blocker(picker);
+        picker->setCurrentColor(color);
+      }
+    }
+    apply_picked_color_to_selected_shapes(color);
+    refresh_color_buttons();
+    auto message = tr("Picked color %1, %2, %3 (%4)")
+                                 .arg(color.red())
+                                 .arg(color.green())
+                                 .arg(color.blue())
+                                 .arg(color.name(QColor::HexRgb).toUpper());
+    if (has_active_document()) {
+      const auto name = palette_color_name(std::as_const(document()),
+          {static_cast<std::uint8_t>(color.red()), static_cast<std::uint8_t>(color.green()), static_cast<std::uint8_t>(color.blue())});
+      if (!name.empty()) { message += QStringLiteral(" | ") + QString::fromUtf8(name.data(), static_cast<qsizetype>(name.size())); }
+    }
+    statusBar()->showMessage(message);
+  });
+  // The pick's colors were reported per move; they are saved once it ends (GitHub #478).
+  canvas->set_color_pick_finished_callback([this] { finish_color_panel_drag(); });
+  // The Eyedropper's Alt+click (GitHub issue 150): the canvas already holds the
+  // new background color; mirror it into the color well and say so.
+  canvas->set_background_color_picked_callback([this, canvas](QColor color) {
+    if (canvas != canvas_) {
+      return;
+    }
+    refresh_color_buttons();
+    statusBar()->showMessage(tr("Picked background color %1, %2, %3 (%4)")
+                                 .arg(color.red())
+                                 .arg(color.green())
+                                 .arg(color.blue())
+                                 .arg(color.name(QColor::HexRgb).toUpper()));
+  });
+  canvas->set_pen_button_action_callback(
+      [this](PenButtonAction action) { handle_pen_button_action(action); });
+  canvas->set_brush_settings_changed_callback([this, canvas] {
+    if (canvas != canvas_) {
+      return;
+    }
+    sync_brush_controls_from_canvas();
+    refresh_gradient_controls_from_canvas();
+    save_tool_settings();
+    refresh_document_info();
+  });
+  canvas->set_text_requested_callback([this, canvas](QPoint point, QRect requested_text_box) {
+    // A click on a path or a shape's edge sets the text along it; inside a closed shape it
+    // fills the shape (docs/path-text.md, docs/area-text.md).
+    auto path = requested_text_box.isValid() ? std::nullopt : canvas->text_path_at(QPointF(point));
+    add_text_at(point, requested_text_box, true,
+                requested_text_box.isValid() || path.has_value() ? std::nullopt : canvas->text_area_at(point),
+                std::nullopt, std::move(path));
+  });
+  canvas->set_text_entry_selection_drag_callback([this, canvas](QPointF widget_point, bool begin) {
+    return canvas == canvas_ && extend_text_entry_selection(widget_point, begin);
+  });
+  canvas->set_shape_appearance_requested_callback([this, canvas] {
+    if (canvas == canvas_) {
+      edit_active_shape_appearance();
+    }
+  });
+  canvas->set_crop_commit_requested_callback([this, canvas](QRect rect, double angle_degrees) {
+    if (canvas != canvas_) {
+      return;
+    }
+    commit_crop_rect(rect, angle_degrees);
+  });
+  canvas->set_perspective_crop_commit_requested_callback([this, canvas](std::array<QPointF, 4> quad) {
+    if (canvas != canvas_) {
+      return;
+    }
+    commit_perspective_crop_quad(quad);
+  });
+  canvas->set_ruler_changed_callback([this, canvas] {
+    if (canvas != canvas_) {
+      return;
+    }
+    refresh_ruler_readout();
+  });
+  canvas->set_crop_session_changed_callback([this, canvas] {
+    if (canvas != canvas_) {
+      return;
+    }
+    refresh_options_bar();
+    refresh_document_info();
+  });
+  canvas->set_artboard_edit_requested_callback([this, canvas](const ArtboardEditRequest& request) {
+    if (canvas != canvas_) {
+      return;
+    }
+    handle_artboard_edit(request);
+  });
+  canvas->set_layers_moved_callback([this, canvas](const std::vector<LayerId>& /*moved*/) {
+    if (canvas != canvas_) {
+      return;
+    }
+    refresh_after_artboard_nesting();
+  });
+  canvas->set_artboard_auto_nest(artboard_auto_nest_);
+  canvas->set_vector_tool_mode(current_vector_tool_mode_);
+  canvas->set_pen_auto_add_delete(current_pen_auto_add_delete_);
+  canvas->set_vector_shape_drawn_callback(
+      [this, canvas](patchy::LiveShapeKind kind, QRectF bounds, QPointF line_start, QPointF line_end) {
+        if (canvas != canvas_) {
+          return;
+        }
+        handle_vector_shape_drawn(kind, bounds, line_start, line_end);
+      });
+  canvas->set_gradient_fill_drawn_callback([this, canvas](QPoint from, QPoint to) {
+    if (canvas != canvas_) {
+      return;
+    }
+    handle_gradient_fill_drawn(from, to);
+  });
+  canvas->set_gradient_fill_pending_flush_callback([this, canvas] {
+    if (canvas == canvas_) {
+      finish_pending_gradient_fill_bake();
+    }
+  });
+  canvas->set_gradient_fill_edit_callback([this, canvas](LayerId layer_id, const LayerStyleGradient& gradient,
+                                                         GradientFillEditPhase phase, std::uint64_t serial,
+                                                         const QString& undo_label, GradientHandleTarget target) {
+    if (canvas != canvas_) {
+      return;
+    }
+    handle_gradient_fill_handle_edit(layer_id, gradient, phase, serial, undo_label, target);
+  });
+  canvas->set_shape_resize_callback(
+      [this, canvas](const ShapeBoxEdit& edit, ShapeResizePhase phase, std::uint64_t serial) {
+        if (canvas != canvas_) {
+          return;
+        }
+        handle_shape_box_edit(edit, phase, serial);
+      });
+  canvas->set_shape_point_callback([this, canvas](LayerId layer_id, const LiveShapeParams& to,
+                                                  ShapeResizePhase phase, std::uint64_t serial) {
+    if (canvas != canvas_) {
+      return;
+    }
+    handle_shape_point_edit(layer_id, to, phase, serial);
+  });
+  canvas->set_gradient_fill_stop_color_requested_callback(
+      [this, canvas](LayerId layer_id, int stop_index, GradientHandleTarget target) {
+        if (canvas != canvas_) {
+          return;
+        }
+        handle_gradient_fill_stop_color_requested(layer_id, stop_index, target);
+      });
+  canvas->set_shape_create_requested_callback([this, canvas](CanvasTool tool, QPointF document_point) {
+    if (canvas != canvas_) {
+      return;
+    }
+    handle_shape_create_requested(tool, document_point);
+  });
+  canvas->set_vector_path_committed_callback(
+      [this, canvas](patchy::VectorPath path, bool closed, VectorPathSource source) {
+        if (canvas != canvas_) {
+          return;
+        }
+        handle_vector_path_committed(std::move(path), closed, source);
+      });
+  canvas->set_polygon_committed_callback([this, canvas](patchy::LiveShapeParams params) {
+    if (canvas != canvas_ || !has_active_document()) {
+      return;
+    }
+    params.resolution = document().print_settings().horizontal_ppi;
+    commit_live_shape(std::move(params));
+  });
+  canvas->set_path_display_dismiss_callback([this, canvas] {
+    if (canvas != canvas_) {
+      return;
+    }
+    handle_paths_panel_deselect();
+    refresh_paths_panel();
+  });
+  canvas->set_path_load_selection_callback([this, canvas] {
+    if (canvas != canvas_ || paths_panel_ == nullptr) {
+      return;
+    }
+    if (const auto row = paths_panel_->selected_row(); row.has_value()) {
+      load_path_as_selection(static_cast<int>(row->kind), row->id);
+    }
+  });
+  canvas->set_path_edited_callback([this, canvas] {
+    if (canvas != canvas_) {
+      return;
+    }
+    refresh_paths_panel();
+    sync_vector_shape_size_spins();  // sizes and live rows follow point edits (GitHub #521)
+  });
+  canvas->set_path_selection_changed_callback([this, canvas] {
+    if (canvas != canvas_) {
+      return;
+    }
+    refresh_path_point_count_chip();
+    refresh_path_component_controls();  // size fields and live rows follow the components
+    refresh_combine_shapes_action_states();
+  });
+  canvas->set_path_retarget_callback([this, canvas](std::optional<patchy::DocumentPathId> id) {
+    if (canvas != canvas_) {
+      return;
+    }
+    // A Path/Direct Select pick (GitHub #521): a document path becomes the Paths-panel
+    // target, or the target drops so the active layer's own path takes over.
+    if (id.has_value()) {
+      target_document_path_row(*id);
+      return;
+    }
+    active_document_path_id_.reset();
+    path_row_hidden_for_layer_.reset();
+    canvas_->set_active_document_path(std::nullopt);
+    refresh_paths_panel();
+  });
+  canvas->set_shape_layers_emptied_callback([this, canvas](const std::vector<LayerId>& ids) {
+    if (canvas != canvas_) {
+      return;
+    }
+    remove_layers_in_open_undo_step(ids);
+  });
+  // A shape drawn as pixels stays editable until it is committed (GitHub issue 716); the
+  // bar's size pair and Undo follow it.
+  canvas->set_pixel_shapes_stay_pending(true);
+  canvas->set_pending_pixel_shape_changed_callback([this, canvas] {
+    if (canvas == canvas_) {
+      refresh_shape_draw_controls();
+      update_undo_redo_actions();
+    }
+  });
+  canvas->set_shape_preview_appearance_callback(
+      [this]() -> std::optional<CanvasWidget::ShapePreviewAppearance> {
+        // Pulled at draw time from the application-wide options-bar state, so
+        // the preview can never desync from what the commit will produce.
+        // The same content the release commits, so alignment, join and cap
+        // cannot drift between the preview and the shape layer (issue 125).
+        const auto content = current_shape_appearance_content(current_tool_ == CanvasTool::Line);
+        CanvasWidget::ShapePreviewAppearance appearance;
+        appearance.fill = vector_fill_preview_brush(content.fill);
+        appearance.stroke_enabled = content.stroke.enabled;
+        appearance.stroke = vector_fill_preview_brush(content.stroke.content);
+        appearance.stroke_width = content.stroke.width;
+        appearance.stroke_alignment = content.stroke.alignment;
+        appearance.stroke_join = content.stroke.join;
+        appearance.stroke_cap = content.stroke.cap;
+        appearance.stroke_miter_limit = content.stroke.miter_limit;
+        appearance.stroke_dashes = content.stroke.dashes;
+        appearance.stroke_dash_offset = content.stroke.dash_offset;
+        appearance.line_weight = static_cast<int>(std::lround(current_vector_line_weight_));
+        return appearance;
+      });
+  canvas->set_polygon_sides(
+      findChild<QSpinBox*>(QStringLiteral("polygonSidesSpin")) != nullptr
+          ? findChild<QSpinBox*>(QStringLiteral("polygonSidesSpin"))->value()
+          : 5);
+  canvas->set_polygon_star_inset(
+      findChild<QSpinBox*>(QStringLiteral("polygonStarInsetSpin")) != nullptr
+          ? findChild<QSpinBox*>(QStringLiteral("polygonStarInsetSpin"))->value()
+          : 0);
+  canvas->set_layer_opacity_digit_callback([this, canvas](int percent) {
+    if (canvas == canvas_) {
+      set_layer_opacity_from_digit_keys(percent);
+    }
+  });
+  canvas->set_airbrush_flow_digit_callback([this, canvas] {
+    if (canvas == canvas_) {
+      show_airbrush_flow_digit_cue();
+    }
+  });
+  canvas->set_active_layer_changed_callback([this, canvas](LayerId layer_id) {
+    if (canvas != canvas_) {
+      return;
+    }
+    reveal_layer_in_layer_list(layer_id);
+    refresh_layer_controls();
+    refresh_options_bar();
+    // The Paths panel's transient layer-path row (and its auto-targeting)
+    // follows the active layer; canvas-driven changes (Move-tool auto-select)
+    // bypass set_active_layer_from_selection.
+    refresh_paths_panel();
+  });
+  canvas->set_layer_selection_requested_callback([this, canvas](std::vector<LayerId> layer_ids,
+                                                                LayerId active_id) {
+    if (canvas != canvas_) {
+      return;
+    }
+    select_layers_in_layer_list(layer_ids, active_id);
+    refresh_layer_controls();
+    refresh_options_bar();
+    refresh_paths_panel();
+  });
+  // Alt-drag with the Move tool duplicates the dragged layers first (GitHub
+  // issue 69): the copies land above the originals, selected, and the drag
+  // continues with them. duplicate_layers already selects the copies.
+  canvas->set_move_duplicate_requested_callback([this, canvas](std::vector<LayerId> roots) {
+    if (canvas != canvas_) {
+      return false;
+    }
+    return !duplicate_layers(std::move(roots)).empty();
+  });
+  canvas->set_status_callback([this](QString message) { statusBar()->showMessage(message); });
+  canvas->set_selection_context_actions_callback([this] { return selection_context_actions_; });
+  canvas->set_selection_tool_context_actions_callback([this] { return selection_tool_context_actions_; });
+  canvas->set_zoom_tool_context_actions_callback([this] { return zoom_tool_context_actions_; });
+  // Session menus (GitHub issue 323): a right-click during a transform or a crop.
+  canvas->set_transform_session_context_actions_callback([this, canvas] {
+    return canvas == canvas_ ? transform_session_context_actions() : QList<QAction*>{};
+  });
+  canvas->set_crop_context_actions_callback([this, canvas] {
+    return canvas == canvas_ ? crop_context_actions() : QList<QAction*>{};
+  });
+  // Screen modes (GitHub issue 212): the way back from a full screen without menus.
+  canvas->set_screen_mode_context_actions_callback([this] {
+    return screen_mode_ == ScreenMode::Standard ? QList<QAction*>{} : QList<QAction*>{exit_full_screen_action_};
+  });
+  canvas->set_unused_escape_callback([this, canvas] { return canvas->window() == this && exit_full_screen_on_escape(); });
+  canvas->set_brush_rotate_callback([this, canvas](int degrees) { return canvas == canvas_ && rotate_brush_tip(degrees); });
+  // A right-click on the active shape layer: the Layer > Shape and Edit menus'
+  // own QActions (docs/tools.md, "Canvas right-click menu").
+  canvas->set_shape_context_actions_callback([this] {
+    return QList<QAction*>{layer_shape_appearance_action_, free_transform_action_, path_simplify_action_,
+                           nullptr, define_custom_shape_action_, layer_rasterize_action_};
+  });
+  // A Move-tool right-click on any other active leaf layer (pixel, text, smart
+  // object): Free Transform, as the shape section offers it.
+  // A text layer adds the Type menu's outline commands (GitHub issue 598).
+  canvas->set_layer_context_actions_callback([this] {
+    QList<QAction*> actions{free_transform_action_};
+    const auto& doc = std::as_const(document());
+    const auto active_id = doc.active_layer_id();
+    const auto* active = active_id.has_value() ? doc.find_layer(*active_id) : nullptr;
+    if (active != nullptr && layer_is_text(*active)) {
+      actions.append({nullptr, type_convert_to_shape_action_, type_create_work_path_action_});
+      // Text on a path can be flipped from here too (docs/path-text.md).
+      refresh_flip_text_on_path_action_state();
+      if (type_flip_text_on_path_action_ != nullptr && type_flip_text_on_path_action_->isEnabled()) {
+        actions.append(type_flip_text_on_path_action_);
+      }
+    }
+    return actions;
+  });
+  // A path-tool right-click on a path: the Paths panel's commands for that path
+  // (GitHub issue 396; docs/vector-commands.md, "Path context menu").
+  canvas->set_path_context_actions_callback([this, canvas] {
+    if (canvas != canvas_) {
+      return QList<QAction*>{};
+    }
+    target_canvas_path_in_paths_panel();
+    QList<QAction*> actions;
+    // Combine Shapes for two or more selected shape layers or components (GitHub #521).
+    const auto tool = canvas_->tool();
+    if (tool == CanvasTool::PathSelect || tool == CanvasTool::DirectSelect) {
+      refresh_combine_shapes_action_states();
+      if (layer_combine_actions_[0] != nullptr && layer_combine_actions_[0]->isEnabled()) {
+        for (auto* action : layer_combine_actions_) {
+          actions.append(action);
+        }
+        actions.append(nullptr);
+      }
+    }
+    // The selected shapes' clipboard, color and new-layer commands (GitHub #555).
+    if (tool == CanvasTool::PathSelect || tool == CanvasTool::DirectSelect) {
+      refresh_path_edit_action_states();
+      actions.append({path_merge_shapes_action_, path_split_shapes_action_, nullptr, path_shapes_cut_action_,
+                      path_shapes_copy_action_,
+                      path_shapes_paste_action_, nullptr,
+                      path_shapes_color_action_, path_shapes_to_new_layer_action_,
+                      path_shapes_copy_to_new_layer_action_, nullptr});
+    }
+    actions.append({path_make_selection_action_, nullptr, path_fill_action_, path_stroke_action_,
+                    nullptr, path_simplify_action_, nullptr, path_duplicate_action_, path_delete_action_});
+    return actions;
+  });
+  canvas->set_vector_preview_status_callback([this, canvas](QString message, bool notice) {
+    if (canvas == canvas_) {
+      refresh_vector_preview_action();
+      // Progress belongs in the tooltip. A resource failure gets at most one
+      // notice per window, and never replaces an unrelated status message.
+      if (notice && !message.isEmpty() && vector_preview_notices_shown_.insert(message).second &&
+          statusBar()->currentMessage().isEmpty()) {
+        statusBar()->showMessage(message, 5000);
+      }
+    }
+  });
+  canvas->set_error_status_callback([this](QString message) { show_status_error(message); });
+  canvas->set_ruler_unit_change_requested_callback(
+      [this](MeasurementUnit unit) { set_ruler_unit_preference(unit); });
+  canvas->set_backdrop_color_change_requested_callback(
+      [this](std::optional<QColor> color) { set_canvas_backdrop_color_preference(color); });
+  canvas->set_custom_backdrop_color_requested_callback([this] { choose_custom_canvas_backdrop_color(); });
+  canvas->set_info_callback([this, canvas](CanvasInfoState info) {
+    if (canvas != canvas_) {
+      return;
+    }
+    update_canvas_info(std::move(info));
+  });
+  canvas->set_document_changed_callback([this, canvas](CanvasWidget::DocumentChangeReason reason) {
+    if (canvas != canvas_) {
+      return;
+    }
+    if (canvas->editing_document_channel()) {
+      if (reason == CanvasWidget::DocumentChangeReason::BrushStrokePreview) {
+        pending_channel_thumbnail_refresh_ = true;
+        return;
+      }
+      pending_channel_thumbnail_refresh_ = false;
+      refresh_channel_panel();
+      refresh_document_info();
+      return;
+    }
+    if (reason == CanvasWidget::DocumentChangeReason::BrushStrokePreview) {
+      pending_layer_thumbnail_refresh_ = true;
+      return;
+    }
+    if (layer_blend_preview_.has_value()) {
+      return;  // a hovered blend mode; the rows refresh when the list closes
+    }
+    if (pending_layer_thumbnail_refresh_ || reason == CanvasWidget::DocumentChangeReason::BrushStrokeFinished) {
+      pending_layer_thumbnail_refresh_ = false;
+    }
+    refresh_layer_thumbnails();
+    schedule_derived_channel_thumbnails();
+    // Visibility changes come from many places (eyes, Alt-click solo, undo, scripts).
+    refresh_merge_visible_action_state();
+  });
+  canvas->set_view_changed_callback([this, canvas] { handle_canvas_view_changed(canvas); });
+  canvas->set_transform_controls_changed_callback([this, canvas] {
+    if (canvas == canvas_) {
+      refresh_options_bar();
+      // Session steps (GitHub issue 225) change what Undo and Redo do.
+      update_undo_redo_actions();
+    }
+  });
+  canvas->set_smart_object_transform_render_callback([this, canvas](LayerId id) -> bool {
+    auto* owner_session = session_for_canvas(canvas);
+    if (owner_session == nullptr) {
+      return false;
+    }
+    auto* layer = owner_session->document.find_layer(id);
+    if (layer == nullptr) {
+      return false;
+    }
+    const auto parent_document_dir =
+        owner_session->path.isEmpty()
+            ? QString()
+            : QFileInfo(owner_session->path).absolutePath();
+    const auto refreshed = refresh_smart_object_layer_preview(
+        owner_session->document, *layer, canvas->transform_interpolation(),
+        true, parent_document_dir);
+    if (!refreshed) {
+      // A linked file that is missing or unreadable keeps the resampled preview the
+      // commit produced (the caller's fallback); say which file, not "cache".
+      const auto link_problem = linked_smart_object_problem_message(
+          std::as_const(owner_session->document), std::as_const(*layer), parent_document_dir);
+      show_status_error(link_problem.isEmpty() ? tr("Could not rebuild the Smart Filter preview and cache")
+                                               : link_problem);
+    }
+    return refreshed;
+  });
+  canvas->set_smart_object_source_image_callback(
+      [this, canvas](LayerId id, QString* error) -> std::optional<QImage> {
+        auto* owner_session = session_for_canvas(canvas);
+        const auto* layer = owner_session != nullptr ? std::as_const(owner_session->document).find_layer(id)
+                                                     : nullptr;
+        if (layer == nullptr || !layer_is_smart_object(*layer)) {
+          return std::nullopt;
+        }
+        const auto parent_document_dir =
+            owner_session->path.isEmpty() ? QString() : QFileInfo(owner_session->path).absolutePath();
+        const auto* source =
+            std::as_const(owner_session->document).metadata().smart_objects.find(smart_object_source_uuid(*layer));
+        auto image = source != nullptr ? decode_smart_object_source_image(*source, parent_document_dir)
+                                       : std::nullopt;
+        if (!image.has_value() && error != nullptr) {
+          *error = linked_smart_object_problem_message(std::as_const(owner_session->document), *layer,
+                                                       parent_document_dir);
+        }
+        if (image.has_value()) {
+          image = smart_object_image_for_document(*image, std::as_const(owner_session->document));
+        }
+        return image;
+      });
+  canvas->set_smart_object_paint_prompt_callback(
+      [this, canvas](LayerId id) { prompt_paint_on_smart_object(canvas, id); });
+  canvas->set_text_layer_transform_render_callback([this, canvas](LayerId id) -> bool {
+    auto* session = session_for_canvas(canvas);
+    if (session == nullptr) {
+      return false;
+    }
+    auto* layer = session->document.find_layer(id);
+    if (layer == nullptr || !layer_is_text(*layer)) {
+      return false;
+    }
+    return rerender_text_layer_through_stored_transform(*layer);
+  });
+  canvas->set_missing_font_transform_confirm_callback([this, canvas](const std::vector<LayerId>& ids) {
+    const auto* session = session_for_canvas(canvas);
+    return session == nullptr || confirm_missing_font_transform(session->document, ids);
+  });
+}
+
+void MainWindow::rerender_text_layers_through_transforms(DocumentSession& target) {
+  // Const walk on purpose (see rerender_smart_object_previews): the non-const children()
+  // accessor bumps every visited layer's revisions, so only the layers that really get
+  // re-rendered are cast back. A pure-translation transform means Canvas Size / Crop-style
+  // moves that already ride in the bounds; nothing to re-render there. Locks are ignored
+  // like the core resize ignores them: a locked layer was resampled too, and refusing here
+  // would leave it the one blurry raster in the document.
+  std::function<void(const std::vector<Layer>&)> refresh_layers = [&](const std::vector<Layer>& layers) {
+    for (const auto& const_layer : layers) {
+      if (!const_layer.children().empty()) {
+        refresh_layers(const_layer.children());
+      }
+      if (!layer_is_text(const_layer) || !layer_has_non_translation_text_transform(const_layer)) {
+        continue;
+      }
+      auto& layer = const_cast<Layer&>(const_layer);
+      if (rerender_text_layer_through_stored_transform(layer)) {
+        // Only a real re-render is a Patchy raster; a kept Photoshop preview (missing font)
+        // stays psd_raster_preview so its warning, badge and PDF placement remain truthful.
+        layer.metadata()[kLayerMetadataTextRasterStatus] = "patchy_raster";
+      }
+    }
+  };
+  refresh_layers(std::as_const(target.document).layers());
+}
+
+int MainWindow::automatic_text_size_px(std::optional<int> box_height) const {
+  if (!has_active_document()) {
+    return 48;
+  }
+  const auto& doc = std::as_const(*this).document();
+  const auto shorter = static_cast<double>(std::max(1, std::min(doc.width(), doc.height())));
+  // 1/16 of the shorter side: 48 px on the 1024x768 default, ~68 on 1080p, ~312 on 5000.
+  auto size = std::clamp(static_cast<int>(std::lround(shorter / 16.0)), 8, 1024);
+  if (box_height.has_value()) {
+    // A dragged frame fits at least two lines.
+    size = std::clamp(*box_height / 2, 8, size);
+  }
+  return size;
+}
+
+// Scripting (layer.textPath): replaces the session's contour and range, given in document
+// coordinates; nullopt turns path text back into a rectangular paragraph frame.
+void MainWindow::set_text_editor_path(QTextEdit& editor, const std::optional<TextPathFrame>& document_frame) {
+  auto frame = document_frame;
+  if (frame) {
+    const auto affine = text_editor_transform_override(editor).value_or(LayerAffineTransform{
+        1.0, 0.0, 0.0, 1.0, editor.property("patchy.documentTextX").toDouble(),
+        editor.property("patchy.documentTextY").toDouble()});
+    bool invertible = false;
+    const auto inverse = qtransform_from_affine(affine).inverted(&invertible);
+    if (!invertible) return;
+    transform_vector_path(frame->path, affine_from_qtransform(inverse));
+    frame->range = normalized_text_path_range(frame->path, frame->range);
+    set_text_editor_path_properties(editor, frame);
+    editor.setProperty(kTextEditorAreaProperty, QVariant());
+    const auto bounds = frame->path.bounds();
+    editor.setProperty("patchy.documentTextWidth", std::max(16, static_cast<int>(std::ceil(bounds->right))));
+    editor.setProperty("patchy.documentTextHeight", std::max(16, static_cast<int>(std::ceil(bounds->bottom))));
+    editor.setProperty("patchy.documentTextFlow", QStringLiteral("box"));
+    editor.setProperty("patchy.textLayoutMode", QString::fromLatin1(kTextLayoutModePhotoshop));
+  } else {
+    set_text_editor_path_properties(editor, std::nullopt);
+  }
+  editor.setProperty("patchy.usesPsdTextFrame", false);
+  clear_text_editor_render_local_rect(editor);
+  editor.setProperty(kTextEditorSourceVisibleAnchorProperty, QVariant());
+  mark_text_editor_changed(&editor);
+  relayout_text_editor(&editor, true);
+  schedule_text_editor_preview(&editor);
+}
+
+void MainWindow::set_text_editor_area(QTextEdit& editor, const std::optional<VectorPath>& document_area) {
+  auto area = document_area;
+  if (area) {
+    const auto affine = text_editor_transform_override(editor).value_or(LayerAffineTransform{
+        1.0, 0.0, 0.0, 1.0, editor.property("patchy.documentTextX").toDouble(),
+        editor.property("patchy.documentTextY").toDouble()});
+    bool invertible = false;
+    const auto inverse = qtransform_from_affine(affine).inverted(&invertible);
+    if (!invertible) return;
+    transform_vector_path(*area, affine_from_qtransform(inverse));
+    editor.setProperty(kTextEditorAreaProperty, QString::fromStdString(serialize_vector_path(*area)));
+    set_text_editor_path_properties(editor, std::nullopt);
+    const auto bounds = area->bounds();
+    editor.setProperty("patchy.documentTextWidth", std::max(16, static_cast<int>(std::ceil(bounds->right))));
+    editor.setProperty("patchy.documentTextHeight", std::max(16, static_cast<int>(std::ceil(bounds->bottom))));
+    editor.setProperty("patchy.documentTextFlow", QStringLiteral("box"));
+    editor.setProperty("patchy.textLayoutMode", QString::fromLatin1(kTextLayoutModePhotoshop));
+  } else {
+    editor.setProperty(kTextEditorAreaProperty, QVariant());
+  }
+  editor.setProperty("patchy.usesPsdTextFrame", false);
+  clear_text_editor_render_local_rect(editor);
+  editor.setProperty(kTextEditorSourceVisibleAnchorProperty, QVariant());
+  mark_text_editor_changed(&editor);
+  relayout_text_editor(&editor, true);
+  schedule_text_editor_preview(&editor);
+}
+
+namespace {
+
+// A point-text editor's minimum screen size: `pixels` at 100% and above, the same document
+// size below it (never under 8 px, so the box keeps a hit area). A fixed screen floor held the
+// box at its old screen size while the view zoomed out, and the relayout wrote that floor back
+// into the session's document size, so the box came back wider at 100% (GitHub issue 707).
+int text_editor_screen_floor(int pixels, double zoom) {
+  return std::max(8, static_cast<int>(std::lround(pixels * std::min(1.0, zoom))));
+}
+
+}  // namespace
+
+void MainWindow::add_text_at(QPoint document_point, QRect requested_text_box, bool show_editor,
+                             std::optional<VectorPath> requested_area, std::optional<LayerId> target_text_layer,
+                             std::optional<TextPathFrame> requested_path) {
+  if (canvas_ == nullptr) {
+    return;
+  }
+  if (canvas_->free_transform_active()) {
+    canvas_->finish_free_transform();
+  }
+  // Type Mask (GitHub issue 670) always starts new mask text: no text layer is opened and no
+  // shape's area is filled; the session's commit makes a selection instead of a layer.
+  const bool type_mask = show_editor && current_tool_ == CanvasTool::TypeMask && !target_text_layer.has_value();
+  if (type_mask) {
+    requested_area.reset();
+    requested_path.reset();
+  }
+  if (show_editor && !is_type_tool(current_tool_)) {
+    if (type_tool_action_ != nullptr) {
+      type_tool_action_->trigger();
+    } else {
+      current_tool_ = CanvasTool::Text;
+      canvas_->set_tool(current_tool_);
+      refresh_options_bar();
+      refresh_document_info();
+    }
+  }
+  if (canvas_->findChild<QTextEdit*>(QStringLiteral("inlineTextEditor")) != nullptr) {
+    finish_active_text_editor();
+  }
+
+  const QPoint requested_document_point = document_point;
+  // The press's own point, between whole pixels, when the canvas delivered this request from a
+  // press: a re-edit's caret resolves from it, as an in-session click resolves from the pointer.
+  // A whole document pixel is many screen pixels at zoom, and its corner is not where the
+  // click was.
+  QPointF requested_document_point_f(requested_document_point);
+  if (const auto precise = canvas_->text_request_precise_point();
+      precise.has_value() && std::abs(precise->x() - (requested_document_point.x() + 0.5)) <= 1.0 &&
+      std::abs(precise->y() - (requested_document_point.y() + 0.5)) <= 1.0) {
+    requested_document_point_f = *precise;
+  }
+  // The same point as the transformed overlay will read it once the session is open. The
+  // overlay places the document on whole screen pixels (its origin is the rounded widget
+  // position of the document's corner), so the opening click of a session that edits through
+  // it resolves that way too; otherwise it and a second click at the same spot differ by the
+  // rounding wherever the middle of a letter falls between the two.
+  const QPointF requested_overlay_point = [&] {
+    if (!canvas_->view_axis_aligned()) {
+      return requested_document_point_f;
+    }
+    const auto exact_origin = canvas_->widget_position_f(QPointF(0.0, 0.0));
+    const QPointF overlay_origin(canvas_->widget_position_for_document_point(QPoint(0, 0)));
+    return requested_document_point_f + (exact_origin - overlay_origin) / std::max(0.0001, canvas_->zoom());
+  }();
+  if (requested_area && valid_text_area(*requested_area)) {
+    const auto bounds = requested_area->bounds();
+    const auto left = std::floor(bounds->left), top = std::floor(bounds->top);
+    requested_text_box = QRect(static_cast<int>(left), static_cast<int>(top),
+                               std::max(16, static_cast<int>(std::ceil(bounds->right - left))),
+                               std::max(16, static_cast<int>(std::ceil(bounds->bottom - top))));
+    translate_vector_path(*requested_area, -left, -top);
+  }
+  // Text along a path (docs/path-text.md): like an area, the contour becomes text-local, with
+  // the origin at its floored bounds corner, and the frame is the contour's bounds.
+  if (requested_path && !requested_area && valid_text_path(requested_path->path)) {
+    const auto bounds = requested_path->path.bounds();
+    const auto left = std::floor(bounds->left), top = std::floor(bounds->top);
+    requested_text_box = QRect(static_cast<int>(left), static_cast<int>(top),
+                               std::max(16, static_cast<int>(std::ceil(bounds->right - left))),
+                               std::max(16, static_cast<int>(std::ceil(bounds->bottom - top))));
+    translate_vector_path(requested_path->path, -left, -top);
+    requested_path->range = normalized_text_path_range(requested_path->path, requested_path->range);
+  } else {
+    requested_path.reset();
+  }
+  const bool creating_area = requested_area.has_value() || requested_path.has_value();
+  auto area_text = std::move(requested_area);
+  auto path_text = std::move(requested_path);
+  std::optional<LayerId> editing_layer;
+  std::optional<bool> editing_layer_was_visible;
+  std::optional<LayerId> restore_active_layer = document().active_layer_id();
+  bool editing_layer_needs_preview = false;
+  bool editing_layer_expensive_preview = false;
+  bool editing_layer_uses_source_raster_preview = false;
+  bool editing_layer_force_baked_preview = false;
+  bool editing_layer_uses_psd_text_frame = false;
+  bool editing_layer_has_transformed_preview = false;
+  bool editing_layer_uses_extended_box_preview = false;
+  bool editing_layer_uses_line_aware_box_preview = false;
+  std::optional<QPointF> editing_layer_source_visible_anchor;
+  std::optional<QSizeF> editing_layer_source_visible_size;
+  std::optional<double> editing_layer_source_line_start_fraction;
+  std::optional<double> editing_layer_source_document_baseline;
+  std::optional<QRectF> editing_layer_render_local_rect;
+  bool editing_layer_is_warped_text = false;
+  std::optional<QTransform> editing_layer_warp_session_transform;
+  QString initial_text;
+  QString initial_html;
+  QString initial_rich_text_runs;
+  QString initial_paragraph_runs;
+  bool photoshop_text_layout = area_text.has_value() || path_text.has_value();
+  double text_size_display_scale = 1.0;
+  std::optional<QPointF> initial_cursor_local_position;
+  QString family = text_font_combo_ != nullptr ? text_options_bar_family() : default_text_family();
+  int document_text_size = text_size_spin_ != nullptr ? text_points_to_pixels(text_size_spin_->value(), document()) : 48;
+  // New text starts on the face the style picker shows, the way Photoshop seeds new type from
+  // its toolbar state. The flags carry the four standard faces; an exotic pick (Black, Demi)
+  // additionally travels as the recorded style below.
+  const auto picker_style = current_text_style_name();
+  const auto picker_flags = text_style_flags_for_style(family, picker_style);
+  bool text_bold = picker_flags.bold;
+  bool text_italic = picker_flags.italic;
+  QString text_style =
+      !picker_style.isEmpty() && !text_style_is_flag_expressible(picker_style) ? picker_style : QString();
+  int text_anti_alias = text_anti_alias_;
+  QColor text_color = canvas_->primary_color();
+  bool boxed_text = requested_text_box.isValid() && requested_text_box.width() >= kMinimumTextBoxDocumentSize &&
+                    requested_text_box.height() >= kMinimumTextBoxDocumentSize;
+  if (boxed_text) {
+    requested_text_box = requested_text_box.normalized();
+    document_point = requested_text_box.topLeft();
+  }
+  // New type starts horizontal unless the toggle armed it; a re-edit takes the layer's.
+  bool vertical_text = text_vertical_next_;
+  text_vertical_next_ = false;
+  // Where the vertical layout's Photoshop anchor stays pinned for the session (relayout moves
+  // the widget origin around it as columns grow). A new session anchors at the click.
+  std::optional<QPointF> vertical_anchor = QPointF(document_point);
+  int document_editor_width =
+      boxed_text ? requested_text_box.width() : std::max(160, std::min(520, document().width() - document_point.x() - 8));
+  int document_editor_height = boxed_text ? requested_text_box.height() : 96;
+  if (const auto active = document().active_layer_id(); active.has_value()) {
+    if (auto* layer = document().find_layer(*active);
+        !type_mask && !creating_area && layer != nullptr && layer_is_text(*layer) &&
+        (target_text_layer == active ||
+         canvas_->type_tool_hits_text_layer(std::as_const(*layer), document_point))) {
+      if (text_geometry_is_protected(*layer)) {
+        show_status_error(tr("This text boundary is preserved but cannot be edited."));
+        return;
+      }
+      area_text = text_area_for_layer(*layer);
+      path_text = text_path_frame_for_layer(*layer);
+      if (layer_id_locks_image_pixels(*active)) {
+        show_status_error(tr("Layer pixels are locked."));
+        return;
+      }
+      editing_layer = *active;
+      editing_layer_was_visible = layer->visible();
+      vertical_text = layer_text_is_vertical(*layer);
+      vertical_anchor.reset();
+      initial_text = QString::fromStdString(layer->metadata().at(kLayerMetadataText));
+      if (const auto found = layer->metadata().find(kLayerMetadataTextHtml); found != layer->metadata().end()) {
+        initial_html = QString::fromStdString(found->second);
+      }
+      if (const auto found = layer->metadata().find(kLayerMetadataTextRuns); found != layer->metadata().end()) {
+        initial_rich_text_runs = QString::fromStdString(found->second);
+      }
+      if (const auto found = layer->metadata().find(kLayerMetadataTextParagraphRuns); found != layer->metadata().end()) {
+        initial_paragraph_runs = QString::fromStdString(found->second);
+      }
+      if (const auto found = layer->metadata().find(kLayerMetadataTextFont); found != layer->metadata().end()) {
+        const auto stored_family = QString::fromStdString(found->second);
+        if (stored_family.compare(QStringLiteral("PSD Text"), Qt::CaseInsensitive) != 0) {
+          family = canonical_text_display_family(stored_family);
+        }
+      }
+      if (const auto found = layer->metadata().find(kLayerMetadataTextSize); found != layer->metadata().end()) {
+        document_text_size = std::max(1, std::atoi(found->second.c_str()));
+      }
+      if (const auto found = layer->metadata().find(kLayerMetadataTextColor); found != layer->metadata().end()) {
+        const QColor stored(QString::fromStdString(found->second));
+        if (stored.isValid()) {
+          text_color = stored;
+        }
+      }
+      if (const auto found = layer->metadata().find(kLayerMetadataTextBold); found != layer->metadata().end()) {
+        text_bold = found->second == "true";
+      }
+      if (const auto found = layer->metadata().find(kLayerMetadataTextItalic); found != layer->metadata().end()) {
+        text_italic = found->second == "true";
+      }
+      // The layer's own runs carry its faces; the picker's leftover selection must not leak in.
+      text_style.clear();
+      if (const auto found = layer->metadata().find(kLayerMetadataTextAntiAlias); found != layer->metadata().end()) {
+        text_anti_alias = std::clamp(std::atoi(found->second.c_str()), 0, 16);
+      }
+      if (const auto found = layer->metadata().find(kLayerMetadataTextLayoutMode);
+          found != layer->metadata().end()) {
+        photoshop_text_layout = found->second == kTextLayoutModePhotoshop;
+      }
+      // The options bar shows the EFFECTIVE size (stored size x the transform's vertical scale)
+      // for any layer whose transform carries scale, not only Photoshop-layout imports: a
+      // Patchy layer resized by Image Size before the fold existed (or one whose fold rounded
+      // a residual) renders through that scale too, and showing the raw size made a typed size
+      // land text-local and get multiplied by the matrix again on render.
+      if (const auto affine = canonical_text_affine_transform_for_layer(*layer); affine.has_value()) {
+        const auto vertical_scale = std::hypot((*affine)[2], (*affine)[3]);
+        if (std::isfinite(vertical_scale) && vertical_scale > 0.01) {
+          text_size_display_scale = vertical_scale;
+        }
+      }
+      bool source_raster_preview = false;
+      if (const auto found = layer->metadata().find(kLayerMetadataTextRasterStatus);
+          found != layer->metadata().end()) {
+        source_raster_preview = found->second == "psd_raster_preview";
+        editing_layer_uses_source_raster_preview = *editing_layer_was_visible && source_raster_preview;
+      }
+      // A hidden layer warns too (GitHub issue 177): the session substitutes the font all the
+      // same, and only the raster preview, not the prompt, depends on the layer being shown.
+      if (source_raster_preview && !cli_automation_mode_ && !text_font_replacements_.has_value()) {
+        // Automation (run_cli_export) substitutes silently: the whole point of its edit
+        // sessions is forcing Patchy's own render, and a prompt would block unattended runs.
+        // Resolve Missing Fonts already has the user's answer for every family it swaps.
+        QStringList glyphless_fonts;
+        const auto missing_fonts = missing_text_families_for_psd_raster_preview(
+            family, initial_rich_text_runs, initial_text, &glyphless_fonts);
+        // Name the face each font will be drawn in: the substitute table's pick (issue 463) or
+        // Qt's fallback, the same substituted_text_family the session uses below.
+        QStringList substitutions;
+        for (const auto& name : missing_fonts + glyphless_fonts) {
+          const auto used = substituted_text_family(name, initial_text);
+          if (used.compare(name, Qt::CaseInsensitive) != 0) {
+            substitutions.push_back(tr("%1 will be replaced with %2.").arg(name, used));
+          }
+        }
+        if (!confirm_psd_raster_preview_font_substitution(this, missing_fonts, glyphless_fonts, substitutions)) {
+          statusBar()->showMessage(tr("Canceled text edit"));
+          return;
+        }
+      }
+      // The substitution the warning promises actually happens here: the session works in the
+      // face that draws, so committing stores a font the layer really uses. The per-run families
+      // are substituted on the built document below; this is the base family the editor, the
+      // options bar and the commit all read.
+      if (text_font_replacements_.has_value()) {
+        if (const auto chosen = text_font_replacements_->value(text_font_replacement_key(family));
+            !chosen.isEmpty()) {
+          family = chosen;
+        }
+      } else {
+        family = substituted_text_family(family, initial_text);
+      }
+      show_text_family_in_options_bar(family);
+      if (text_size_spin_ != nullptr) {
+        // Blocked like the family combo: an unblocked write fires the size slot, which with no
+        // live editor yet would start a layer edit from inside this session's setup.
+        QSignalBlocker blocker(text_size_spin_);
+        text_size_spin_->setValue(text_points_for_display(
+            text_size_spin_->value(),
+            std::max(1, static_cast<int>(std::lround(document_text_size * text_size_display_scale))), document()));
+      }
+      // The first run's face, so the picker opens on what the layer actually uses rather than
+      // on whatever the last session left behind; the layer's flags describe the face when no
+      // style is recorded.
+      refresh_text_style_combo(family, first_text_run_style_name(initial_rich_text_runs), text_bold,
+                               text_italic);
+      show_text_anti_alias(text_anti_alias);
+      boxed_text = text_flow_is_box(
+          layer->metadata().contains(kLayerMetadataTextFlow)
+              ? QString::fromStdString(layer->metadata().at(kLayerMetadataTextFlow))
+              : QString::fromLatin1(kTextFlowPoint));
+      auto text_transform = patchy_text_transform_for_layer(*layer);
+      const auto psd_frame = psd_text_frame_rect(*layer);
+      const bool using_psd_frame = psd_frame.has_value() && boxed_text && !area_text && !path_text;
+      if (vertical_text && !boxed_text &&
+          (!text_transform.has_value() || !qtransform_has_non_translation_linear_part(*text_transform)) &&
+          !layer->metadata().contains(kLayerMetadataPsdTextTransform) && !layer_has_active_text_warp(*layer)) {
+        // A Patchy vertical point layer re-edits around its own layout anchor, recovered from the
+        // raster (the raster is the plan's buffer, ink-trimmed at most), never the ink edges,
+        // which move with the first column's glyph widths.
+        vertical_anchor = vertical_text_layer_anchor(*layer);
+        text_transform.reset();
+      }
+      editing_layer_uses_psd_text_frame = layer_should_edit_with_psd_text_frame(*layer, boxed_text) && using_psd_frame;
+      editing_layer_is_warped_text = layer_has_active_text_warp(*layer);
+      if (editing_layer_is_warped_text && !editing_layer_uses_psd_text_frame) {
+        // A warped layer's raster (and so every raster-derived anchor below) is the WARPED
+        // ink; the session edits the UNWARPED text, placed by the Move-corrected stored
+        // transform. The commit re-renders the warp through this same transform.
+        text_transform = warped_text_session_transform(*layer);
+        editing_layer_warp_session_transform = text_transform;
+      }
+      editing_layer_has_transformed_preview =
+          text_transform.has_value() && qtransform_has_non_translation_linear_part(*text_transform) &&
+          !editing_layer_uses_psd_text_frame;
+      if (text_transform.has_value() && !editing_layer_uses_psd_text_frame) {
+        const auto text_affine_transform = canonical_text_affine_transform_for_layer(*layer);
+        // A PSD-imported point-text layer stores its transform translation at the typographic
+        // baseline, which sits well below the visible glyph top.  When the transform is a pure
+        // translation we anchor the editor to the live visible glyph top instead of the transform
+        // origin so the caret lands on the glyphs.  The anchor is derived from the current raster,
+        // so it stays valid for any translation-only point text -- a fresh PSD import, a layer the
+        // user moved, or one already committed by Patchy (whose transform origin would drop the
+        // editor onto the baseline and make the text jump down ~one ascent on edit).  Capturing it
+        // every session also records the visible width, which the commit needs to keep the
+        // justification point of centered/right text pinned across repeated edits.
+        const bool can_use_psd_visual_origin =
+            !boxed_text && !editing_layer_is_warped_text && text_affine_transform.has_value() &&
+            !affine_transform_has_non_translation_linear_part(*text_affine_transform);
+        const auto psd_visible_rect =
+            can_use_psd_visual_origin ? psd_point_text_source_visible_rect(*layer) : std::optional<QRectF>{};
+        if (psd_visible_rect.has_value()) {
+          editing_layer_source_visible_anchor = psd_visible_rect->topLeft();
+          editing_layer_source_visible_size = psd_visible_rect->size();
+          // Photoshop's line start: the anchor plus the advance box's left edge (0 for left
+          // text, minus half the width for centered), fractional in the file. Keep what its
+          // whole-pixel rounding drops so the re-render rounds each glyph from the same start.
+          // The canonical transform serves both a fresh import and a layer Patchy already
+          // committed (its stored tx keeps the fraction, committed_text_transform).
+          if (!layer_text_is_vertical(*layer)) {
+            const auto advance_rect = psd_text_metadata_local_rect(*layer, kLayerMetadataPsdTextBounds);
+            const double line_start = (*text_affine_transform)[4] +
+                                      (advance_rect.has_value()
+                                           ? advance_rect->left()
+                                           : -layer_anchor_alignment_factor(*layer) * psd_visible_rect->width());
+            if (std::isfinite(line_start)) {
+              editing_layer_source_line_start_fraction = line_start - snap_to_pixel_grid(line_start);
+            }
+            // Photoshop's raster of a whole-pixel anchor: its first baseline sits exactly on the
+            // anchor's y. A fractional y keeps the ink pin: Photoshop's small hinted sizes put that
+            // baseline a row off either rounding (psd-tools clip-adjustment.psd, ty 21.19, draws
+            // its "a" down to row 21; docs/text-render-calibration-pixel-grid.md).
+            if (const auto status = layer->metadata().find(kLayerMetadataTextRasterStatus);
+                status != layer->metadata().end() && status->second == "psd_raster_preview" &&
+                layer->metadata().contains(kLayerMetadataPsdTextTransform) &&
+                std::isfinite((*text_affine_transform)[5]) &&
+                std::abs((*text_affine_transform)[5] - std::round((*text_affine_transform)[5])) <= 1e-6) {
+              editing_layer_source_document_baseline = std::round((*text_affine_transform)[5]);
+            }
+          }
+          document_point = QPoint(snapped_pixel_coordinate(psd_visible_rect->left()),
+                                  snapped_pixel_coordinate(psd_visible_rect->top()));
+        } else {
+          bool invertible = false;
+          const auto inverse = text_transform->inverted(&invertible);
+          if (invertible) {
+            initial_cursor_local_position = inverse.map(requested_overlay_point);
+          }
+          const auto transformed_origin = text_transform->map(QPointF(0.0, 0.0));
+          document_point = QPoint(snapped_pixel_coordinate(transformed_origin.x()),
+                                  snapped_pixel_coordinate(transformed_origin.y()));
+        }
+      } else if (using_psd_frame) {
+        document_point = QPoint(snapped_pixel_coordinate(psd_frame->left()),
+                                snapped_pixel_coordinate(psd_frame->top()));
+        document_editor_width = psd_text_frame_extent_pixels(psd_frame->width());
+        document_editor_height = psd_text_frame_extent_pixels(psd_frame->height());
+      } else {
+        document_point = QPoint(layer->bounds().x, layer->bounds().y);
+      }
+      if (boxed_text && (!using_psd_frame || (text_transform.has_value() && !editing_layer_uses_psd_text_frame))) {
+        if (const auto found = layer->metadata().find(kLayerMetadataTextBoxWidth); found != layer->metadata().end()) {
+          document_editor_width = std::max(kMinimumTextBoxDocumentSize, std::atoi(found->second.c_str()));
+        } else {
+          document_editor_width = std::max(kMinimumTextBoxDocumentSize, layer->bounds().width);
+        }
+        if (const auto found = layer->metadata().find(kLayerMetadataTextBoxHeight); found != layer->metadata().end()) {
+          document_editor_height = std::max(kMinimumTextBoxDocumentSize, std::atoi(found->second.c_str()));
+        } else {
+          document_editor_height = std::max(kMinimumTextBoxDocumentSize, layer->bounds().height);
+        }
+      } else if (!boxed_text) {
+        if (const auto found = layer->metadata().find(kLayerMetadataTextBoxWidth); found != layer->metadata().end()) {
+          document_editor_width = std::max(160, std::atoi(found->second.c_str()));
+        } else {
+          document_editor_width = std::max(160, layer->bounds().width);
+        }
+        if (const auto found = layer->metadata().find(kLayerMetadataTextBoxHeight); found != layer->metadata().end()) {
+          document_editor_height = std::max(64, std::atoi(found->second.c_str()));
+        } else {
+          document_editor_height = std::max(64, layer->bounds().height + document_text_size);
+        }
+      }
+      if (boxed_text && !area_text && !path_text) {
+        const QRectF frame_rect(0.0, 0.0, static_cast<qreal>(document_editor_width),
+                                static_cast<qreal>(document_editor_height));
+        if (editing_layer_uses_psd_text_frame) {
+          editing_layer_uses_line_aware_box_preview = true;
+          editing_layer_render_local_rect = psd_box_text_editor_render_local_rect(*layer).value_or(frame_rect);
+          if (rect_extends_beyond(*editing_layer_render_local_rect, frame_rect)) {
+            editing_layer_uses_extended_box_preview = true;
+            if (!editing_layer_source_visible_anchor.has_value() && !editing_layer_is_warped_text) {
+              editing_layer_source_visible_anchor = layer_source_visible_anchor(*layer);
+            }
+          }
+        } else if (!editing_layer_is_warped_text) {
+          const auto raster_status = layer->metadata().find(kLayerMetadataTextRasterStatus);
+          const bool patchy_box_raster =
+              raster_status != layer->metadata().end() && raster_status->second == "patchy_raster";
+          const bool patchy_box_raster_uses_line_aware_preview =
+              patchy_box_raster && layer->metadata().contains(kLayerMetadataTextLineAwareBoxPreview);
+          const bool patchy_box_raster_has_linear_transform =
+              text_transform.has_value() && qtransform_has_non_translation_linear_part(*text_transform);
+          if (!patchy_box_raster_has_linear_transform) {
+            if (const auto render_rect =
+                    patchy_box_text_editor_render_local_rect(*layer, document_editor_width, document_editor_height);
+                render_rect.has_value()) {
+              editing_layer_render_local_rect = *render_rect;
+              editing_layer_uses_extended_box_preview = true;
+              editing_layer_uses_line_aware_box_preview = true;
+              editing_layer_source_visible_anchor = layer_source_visible_anchor(*layer);
+            } else if (patchy_box_raster_uses_line_aware_preview) {
+              editing_layer_render_local_rect = frame_rect;
+              editing_layer_uses_line_aware_box_preview = true;
+            }
+          } else if (patchy_box_raster_uses_line_aware_preview) {
+            editing_layer_render_local_rect = frame_rect;
+            editing_layer_uses_line_aware_box_preview = true;
+          }
+        }
+      }
+      editing_layer_needs_preview = *editing_layer_was_visible &&
+                                    (layer_requires_text_editor_preview(*layer) ||
+                                     editing_layer_uses_extended_box_preview ||
+                                     editing_layer_uses_line_aware_box_preview);
+      // Text edits show the live render from the very start of the session.  Once the user is
+      // past the substitution warning (it only appears when a font is missing; cancelling it
+      // returned above), keeping Photoshop's raster on screen made the caret and selection
+      // unmatchable: they are computed from Patchy's layout, which wraps and meters differently
+      // from Photoshop's raster (hyphenation, substituted faces), and the font swap then landed
+      // mid-typing.  Showing the live render immediately keeps glyphs, caret, and selection in
+      // one geometry.  Applying the session -- even with no text change -- commits that live
+      // render (apply keeps what you saw); Escape is the way to leave Photoshop's original
+      // pixels untouched.
+      if (editing_layer_uses_source_raster_preview && editing_layer_was_visible.value_or(true)) {
+        editing_layer_uses_source_raster_preview = false;
+      }
+      // Plain text would otherwise render with the editor's own widget glyphs, which are
+      // rasterized differently from render_text_pixels (the committed layer's renderer):
+      // entering/leaving edit then visibly shifts the text and changes its antialiasing.  Drive
+      // the edit through the same live baked-preview path that effect text uses (the glyphs are
+      // re-rasterized by render_text_pixels every keystroke), so the on-screen result comes from
+      // the exact renderer the commit uses -- no shift, and the caret still lands on the glyphs.
+      // Box text used to be excluded here and so kept the visible shift on entry
+      // (ui_text_edit_entry_leaves_the_pixels_alone covers both flows now).
+      // Transformed text never reaches this block: a non-translation transform already counts as
+      // requiring a preview (layer_requires_text_editor_preview), so those sessions render live
+      // through the regular preview path from the start.
+      if (editing_layer_was_visible.value_or(true) && !editing_layer_needs_preview) {
+        editing_layer_needs_preview = true;
+        editing_layer_force_baked_preview = true;
+      }
+      const auto document_bounds = Rect::from_size(document().width(), document().height());
+      editing_layer_expensive_preview =
+          editing_layer_needs_preview && layer_style_preview_is_expensive(*layer, document_bounds);
+      // The edited layer is NOT hidden here. It stays on screen showing its committed pixels
+      // until the live preview is actually ready to replace them (hide_text_editor_source_layer,
+      // called from update_text_editor_preview). Hiding it up front blanked the text for however
+      // long the first preview took, which on a styled layer is the whole
+      // kExpensiveTextEditorPreviewDelayMs debounce.
+    }
+  }
+
+  std::optional<LayerId> provisional_layer;
+  if (!show_editor && !editing_layer.has_value()) {
+    return;
+  }
+  if (!editing_layer.has_value() && text_size_spin_ != nullptr &&
+      std::abs(text_size_spin_->value() - text_size_auto_points_) < 0.0005) {
+    // Still on the automatic size: scale it to this document (48 px on the 1024x768 default,
+    // ~312 px on a 5000x5000 canvas, where 48 px was unreadable) and to a dragged box.
+    document_text_size = automatic_text_size_px(boxed_text ? std::optional<int>(document_editor_height) : std::nullopt);
+    const QSignalBlocker blocker(text_size_spin_);
+    text_size_spin_->setValue(text_pixels_to_points(document_text_size, document()));
+    // The field rounds to its decimals, so remember what it holds, not the raw conversion.
+    text_size_auto_points_ = text_size_spin_->value();
+  }
+  if (!editing_layer.has_value()) {
+    // Photoshop shows the new type layer the moment the tool clicks, so a NEW session inserts
+    // a provisional (1x1 transparent, marker-tagged) text layer immediately. No undo snapshot
+    // and no modified flag here: commit removes it again before taking the single "Type"
+    // snapshot and recreates the committed layer under the same id, while cancel and an empty
+    // commit remove it outright, leaving history exactly as before the click.
+    TextToolSettings placeholder_settings{tr("Type"),
+                                          QString(),
+                                          family,
+                                          document_text_size,
+                                          text_bold,
+                                          text_italic,
+                                          text_anti_alias,
+                                          boxed_text,
+                                          document_editor_width,
+                                          document_editor_height};
+    placeholder_settings.vertical = vertical_text;
+    placeholder_settings.area = area_text;
+    if (path_text) {
+      placeholder_settings.path = path_text->path;
+      placeholder_settings.path_range = path_text->range;
+    }
+    Layer provisional(document().allocate_layer_id(), placeholder_settings.text.toStdString(),
+                      make_solid_pixels(1, 1, QColor(0, 0, 0, 0), area_text || path_text
+                          ? with_bit_depth(PixelFormat::rgba8(), document().color_state().bit_depth)
+                          : PixelFormat::rgba8()));
+    provisional.set_bounds(Rect{document_point.x(), document_point.y(), 1, 1});
+    store_patchy_text_metadata(provisional, placeholder_settings, text_color, QString(), QString(),
+                               document_editor_width, document_editor_height);
+    provisional.metadata()[kLayerMetadataProvisionalTextMarker] = "true";
+    if (type_mask) {
+      // The preview takes the provisional's opacity: at zero the letters only cut the clear
+      // shape out of the tint (CanvasWidget::draw_type_mask_overlay), showing the image.
+      provisional.set_name(tr("Type Mask").toStdString());
+      provisional.set_opacity(0.0F);
+    }
+    provisional_layer = provisional.id();
+    document().add_layer(std::move(provisional));
+    refresh_layer_list();
+    refresh_layer_controls();
+    canvas_->document_changed_effect_bounds(QRect(document_point, QSize(1, 1)));
+    // A brand-new session previews through render_text_pixels as well, over the provisional
+    // layer. Without it the session that CREATES the text was the odd one out: its glyphs came
+    // from the editor widget and so did its caret and highlight, at the widget's own zoom-scaled
+    // metrics, while every re-edit used the shared layout. Selecting text therefore drew a
+    // different-sized highlight before the first commit than after it.
+    editing_layer_needs_preview = true;
+    editing_layer_force_baked_preview = true;
+    // The provisional layer is the one the user sees selected from the moment they click, so it
+    // is what the preview insert must restore as active -- not whatever was active before.
+    restore_active_layer = provisional_layer;
+  }
+
+  auto* editor = new InlineTextEdit(canvas_);
+  editor->setObjectName(QStringLiteral("inlineTextEditor"));
+  editor->set_context_actions_callback(
+      [this] { return QList<QAction*>{type_convert_to_shape_action_, type_create_work_path_action_}; });
+  editor->setAcceptRichText(true);
+  auto editor_font = render_text_font_for_display_family(
+      family, std::max(8, static_cast<int>(std::round(document_text_size * canvas_->zoom()))), text_bold,
+      text_italic, text_anti_alias, text_style);
+  editor->setFont(editor_font);
+  editor->document()->setDocumentMargin(0);
+  editor->document()->setDefaultFont(editor_font);
+  editor->setFrameShape(QFrame::NoFrame);
+  editor->setAttribute(Qt::WA_TranslucentBackground, true);
+  editor->viewport()->setAttribute(Qt::WA_TranslucentBackground, true);
+  editor->viewport()->setAutoFillBackground(false);
+  editor->setLineWrapMode(boxed_text && !vertical_text ? QTextEdit::WidgetWidth : QTextEdit::NoWrap);
+  editor->setVerticalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
+  editor->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
+  editor->setProperty(kTextEditorOrientationProperty,
+                      vertical_text ? QString::fromLatin1(kTextOrientationVertical) : QString());
+  if (vertical_text && !boxed_text && vertical_anchor.has_value()) {
+    editor->setProperty(kTextEditorVerticalAnchorProperty, *vertical_anchor);
+  }
+  editor->setProperty("patchy.documentTextSize", document_text_size);
+  editor->setProperty("patchy.documentTextWidth", document_editor_width);
+  editor->setProperty("patchy.documentTextHeight", document_editor_height);
+  editor->setProperty("patchy.documentTextFlow", text_flow_metadata_value(boxed_text));
+  if (area_text) {
+    editor->setProperty(kTextEditorAreaProperty, QString::fromStdString(serialize_vector_path(*area_text)));
+  }
+  if (path_text) {
+    set_text_editor_path_properties(*editor, path_text);
+  }
+  editor->setProperty("patchy.documentTextAntiAlias", text_anti_alias);
+  editor->setProperty("patchy.textLayoutMode",
+                      photoshop_text_layout ? QString::fromLatin1(kTextLayoutModePhotoshop) : QString());
+  editor->setProperty("patchy.textSizeDisplayScale", text_size_display_scale);
+  editor->setProperty("patchy.documentTextFamily", family);
+  editor->setProperty("patchy.editorZoom", canvas_->zoom());
+  editor->setProperty("patchy.documentTextColor", text_color);
+  editor->setProperty("patchy.documentTextX", document_point.x());
+  editor->setProperty("patchy.documentTextY", document_point.y());
+  editor->setProperty(kTextEditorPreviewEnabledProperty, editing_layer_needs_preview);
+  editor->setProperty(kTextEditorPreviewExpensiveProperty, editing_layer_expensive_preview);
+  // "The glyphs come from somewhere other than this widget" -- true from the first frame of any
+  // previewed session, because until the preview lands the committed layer is still showing.
+  // The editor therefore never paints its own glyphs over text that is already on screen.
+  editor->setProperty(kTextEditorPreviewPaintProperty,
+                      editing_layer_uses_source_raster_preview || editing_layer_needs_preview);
+  editor->setProperty(kTextEditorPreviewGenerationProperty, 0);
+  editor->setProperty(kTextEditorChangedProperty, false);
+  editor->setProperty(kTextEditorSourceRasterPreviewProperty, editing_layer_uses_source_raster_preview);
+  editor->setProperty(kTextEditorForceBakedPreviewProperty, editing_layer_force_baked_preview);
+  editor->setProperty(kTextEditorExtendedBoxPreviewProperty, editing_layer_uses_extended_box_preview);
+  editor->setProperty(kTextEditorLineAwareBoxPreviewProperty, editing_layer_uses_line_aware_box_preview);
+  editor->setProperty("patchy.usesPsdTextFrame", editing_layer_uses_psd_text_frame);
+  if (editing_layer_render_local_rect.has_value()) {
+    set_text_editor_render_local_rect(*editor, *editing_layer_render_local_rect);
+  }
+  if (editing_layer_source_visible_anchor.has_value()) {
+    editor->setProperty(kTextEditorSourceVisibleAnchorProperty, QVariant::fromValue(*editing_layer_source_visible_anchor));
+  }
+  if (editing_layer_source_visible_size.has_value()) {
+    editor->setProperty(kTextEditorSourceVisibleSizeProperty, QVariant::fromValue(*editing_layer_source_visible_size));
+  }
+  if (editing_layer_source_line_start_fraction.has_value()) {
+    editor->setProperty(kTextEditorSourceLineStartFractionProperty, *editing_layer_source_line_start_fraction);
+  }
+  if (editing_layer_source_document_baseline.has_value()) {
+    editor->setProperty(kTextEditorSourceDocumentBaselineProperty, *editing_layer_source_document_baseline);
+  }
+  if (restore_active_layer.has_value()) {
+    editor->setProperty("patchy.restoreActiveLayerId", QVariant::fromValue<qulonglong>(*restore_active_layer));
+  }
+  if (editing_layer.has_value()) {
+    editor->setProperty("patchy.editingLayerId", QVariant::fromValue<qulonglong>(*editing_layer));
+  }
+  if (provisional_layer.has_value()) {
+    editor->setProperty(kTextEditorProvisionalLayerProperty, QVariant::fromValue<qulonglong>(*provisional_layer));
+  }
+  if (type_mask) {
+    const auto modifiers = canvas_->type_mask_press_modifiers();
+    const bool add = modifiers.testFlag(Qt::ShiftModifier);
+    const bool subtract = modifiers.testFlag(Qt::AltModifier);
+    editor->setProperty(kTextEditorTypeMaskProperty, true);
+    editor->setProperty(kTextEditorTypeMaskOperationProperty, add && subtract ? 3 : add ? 1 : subtract ? 2 : 0);
+    canvas_->set_type_mask_overlay(CanvasWidget::TypeMaskOverlay{});
+  }
+  if (editing_layer_was_visible.has_value()) {
+    editor->setProperty("patchy.editingLayerWasVisible", *editing_layer_was_visible);
+  }
+  set_themed_style(*editor, inline_text_editor_style(text_color, editor_font.pixelSize()));
+  if (!initial_rich_text_runs.trimmed().isEmpty()) {
+    auto document_font =
+        render_text_font_for_display_family(family, std::max(1, document_text_size), text_bold, text_italic,
+                                            text_anti_alias);
+    editor->setPlainText(initial_text.isEmpty() && !((area_text || path_text) && editing_layer) ? tr("Type") : initial_text);
+    apply_patchy_text_runs_to_document(*editor->document(), initial_rich_text_runs, document_font, text_color,
+                                       canvas_->zoom(), text_anti_alias);
+    if (!initial_paragraph_runs.trimmed().isEmpty()) {
+      apply_paragraph_runs_to_document(*editor->document(), initial_paragraph_runs, canvas_->zoom());
+    }
+    apply_text_smoothing_to_document(*editor->document(), text_anti_alias);
+    auto typing_format = text_editor_typing_format(editor_font, text_color);
+    if (const auto leading = text_leading_from_document_formats(*editor->document()); leading.has_value()) {
+      typing_format.setProperty(kTextLeadingFormatProperty, *leading);
+    }
+    editor->setCurrentCharFormat(typing_format);
+  } else if (!initial_html.trimmed().isEmpty()) {
+    auto document_font =
+        render_text_font_for_display_family(family, std::max(1, document_text_size), text_bold, text_italic,
+                                            text_anti_alias);
+    editor->setHtml(document_html_for_editor(initial_html, document_font, canvas_->zoom()));
+    if (!initial_paragraph_runs.trimmed().isEmpty()) {
+      apply_paragraph_runs_to_document(*editor->document(), initial_paragraph_runs, canvas_->zoom());
+    }
+    apply_text_smoothing_to_document(*editor->document(), text_anti_alias);
+  } else {
+    editor->setPlainText(initial_text.isEmpty() && !((area_text || path_text) && editing_layer) ? tr("Type") : initial_text);
+    QTextCursor cursor(editor->document());
+    cursor.select(QTextCursor::Document);
+    auto format = text_editor_typing_format(editor_font, text_color);
+    // The exact document size in editor units, so the commit does not recover the size from
+    // the whole-pixel editor font divided by the zoom (see the rich-text runs applier).
+    format.setProperty(kTextExactSizeFormatProperty, document_text_size * canvas_->zoom());
+    if (!text_style.isEmpty()) {
+      format.setProperty(kTextStyleNameFormatProperty, text_style);
+    }
+    cursor.mergeCharFormat(format);
+    editor->setCurrentCharFormat(format);
+    if (!initial_paragraph_runs.trimmed().isEmpty()) {
+      apply_paragraph_runs_to_document(*editor->document(), initial_paragraph_runs, canvas_->zoom());
+    }
+    apply_text_smoothing_to_document(*editor->document(), text_anti_alias);
+  }
+  // Whatever built the document above (runs, HTML or plain text), every run now names a family
+  // that can actually draw it, so what the session renders is what the commit records.
+  substitute_missing_document_font_families(
+      *editor->document(), text_font_replacements_.has_value() ? &*text_font_replacements_ : nullptr);
+  if (editing_layer.has_value() && editing_layer_uses_line_aware_box_preview && !editing_layer_is_warped_text &&
+      photoshop_text_layout) {
+    // Warped layers skip the calibration: it band-matches a fresh unwarped render against
+    // the layer raster, which holds the WARPED ink. So does Qt-natural text: its raster is
+    // Patchy's own render at the natural advances, and a box whose lines overflow it holds
+    // fewer lines than the whole story, which the search read as a wide font and squeezed
+    // every glyph on each re-edit (GitHub issue 683).
+    if (auto* layer = document().find_layer(*editing_layer); layer != nullptr) {
+      if (const auto scale =
+              calibrated_box_text_metric_scale_for_editor(*editor, *layer, canvas_->zoom(), text_color);
+          scale.has_value()) {
+        set_text_editor_metric_scale(*editor, *scale);
+      }
+    }
+  }
+  if ((area_text || path_text) && editing_layer) {
+    if (const auto* layer = std::as_const(document()).find_layer(*editing_layer)) {
+      set_text_editor_transform_override(*editor, text_area_transform(*layer));
+      bool invertible = false;
+      const auto inverse = qtransform_from_affine(text_area_transform(*layer)).inverted(&invertible);
+      if (invertible) initial_cursor_local_position = inverse.map(requested_overlay_point);
+    }
+  } else if (editing_layer_warp_session_transform.has_value()) {
+    // Warped layer: the entry-time session transform is the geometry authority for the whole
+    // session (the anchor and PSD-local-bounds paths below both read the warped raster).
+    set_text_editor_transform_override(*editor, affine_from_qtransform(*editing_layer_warp_session_transform));
+    document_point = QPoint(editor->property("patchy.documentTextX").toInt(),
+                            editor->property("patchy.documentTextY").toInt());
+  } else if (editing_layer_source_visible_anchor.has_value()) {
+    if (boxed_text) {
+      // An anchored box session places its buffer from the anchor (rendered_text_bounds_for_editor)
+      // and needs the same session-start ink reference as point text.
+      if (const auto rendered = render_text_editor_pixels_for_source_anchor(*editor, canvas_->zoom(), text_color, true);
+          rendered.has_value()) {
+        capture_text_editor_source_ink_offset(*editor, *rendered);
+      }
+    }
+    update_text_editor_transform_from_source_anchor(*editor, canvas_->zoom(), text_color);
+    document_point = QPoint(editor->property("patchy.documentTextX").toInt(),
+                            editor->property("patchy.documentTextY").toInt());
+  } else if (editing_layer.has_value()) {
+    if (auto* layer = document().find_layer(*editing_layer); layer != nullptr) {
+      if (const auto rendered = render_text_editor_pixels_for_source_anchor(*editor, canvas_->zoom(), text_color);
+          rendered.has_value() &&
+          update_text_editor_transform_from_psd_local_bounds(*editor, *layer, *rendered, boxed_text)) {
+        document_point = QPoint(editor->property("patchy.documentTextX").toInt(),
+                                editor->property("patchy.documentTextY").toInt());
+        if (const auto transform = text_editor_transform_override(*editor); transform.has_value()) {
+          bool invertible = false;
+          const auto inverse = qtransform_from_affine(*transform).inverted(&invertible);
+          if (invertible) {
+            initial_cursor_local_position = inverse.map(requested_document_point_f);
+          }
+        }
+      }
+    }
+  }
+  if (!show_editor) {
+    // Character-panel edits use the same geometry, font substitution and commit
+    // pipeline as typing, without taking focus or replacing the warped raster.
+    editor->setProperty(kTextEditorPreviewEnabledProperty, false);
+    editor->setTextCursor(QTextCursor(editor->document()));
+    return;
+  }
+  if (!editing_layer.has_value()) {
+    editor->selectAll();
+  }
+  const auto widget_point = canvas_->widget_position_for_document_point(document_point);
+  editor->setGeometry(widget_point.x(), widget_point.y(),
+                      std::max(text_editor_screen_floor(80, canvas_->zoom()),
+                               static_cast<int>(std::round(document_editor_width * canvas_->zoom()))),
+                      std::max(text_editor_screen_floor(32, canvas_->zoom()),
+                               static_cast<int>(std::round(document_editor_height * canvas_->zoom()))));
+  const auto resize_editor = [editor = QPointer<QTextEdit>(editor), this] {
+    if (editor == nullptr) {
+      return;
+    }
+    if (editor->property("patchy.relayoutingTextEditor").toBool()) {
+      return;
+    }
+    relayout_text_editor(editor, true);
+    reset_text_editor_scroll(editor);
+    schedule_text_editor_preview(editor);
+  };
+  connect(editor, &QTextEdit::textChanged, editor, [this, editor = QPointer<QTextEdit>(editor), resize_editor] {
+    if (editor == nullptr) {
+      return;
+    }
+    substitute_uncovered_characters_in_editor(*editor);
+    mark_text_editor_changed(editor);
+    resize_editor();
+  });
+  editor->set_composition_changed_callback([this, editor = QPointer<QTextEdit>(editor), resize_editor] {
+    if (editor == nullptr) {
+      return;
+    }
+    mark_text_editor_changed(editor);
+    resize_editor();
+  });
+  const auto lock_scroll = [editor = QPointer<QTextEdit>(editor)] {
+    if (editor != nullptr) {
+      reset_text_editor_scroll(editor);
+    }
+  };
+  connect(editor->horizontalScrollBar(), &QScrollBar::valueChanged, editor, [lock_scroll](int) { lock_scroll(); });
+  connect(editor->verticalScrollBar(), &QScrollBar::valueChanged, editor, [lock_scroll](int) { lock_scroll(); });
+  connect(editor->horizontalScrollBar(), &QScrollBar::rangeChanged, editor, [lock_scroll](int, int) { lock_scroll(); });
+  connect(editor->verticalScrollBar(), &QScrollBar::rangeChanged, editor, [lock_scroll](int, int) { lock_scroll(); });
+  connect(editor, &QTextEdit::cursorPositionChanged, editor, [this, editor = QPointer<QTextEdit>(editor)] {
+    if (editor == nullptr) {
+      return;
+    }
+    reset_text_editor_scroll(editor);
+    sync_text_options_from_active_editor();
+    sync_text_alignment_buttons_from_editor();
+    update_text_editor_preview_caret(*editor, canvas_ != nullptr ? canvas_->zoom() : 1.0);
+    update_text_editor_transform_overlay(editor);
+    // Own the invalidation: the caret and highlight are painted from the shared layout, whose
+    // geometry Qt knows nothing about, so the damage region QWidgetTextControl computes from
+    // its OWN layout cannot be trusted to cover them.
+    editor->viewport()->update();
+  });
+  connect(editor, &QTextEdit::selectionChanged, editor, [this, editor = QPointer<QTextEdit>(editor)] {
+    sync_text_options_from_active_editor();
+    if (editor != nullptr) {
+      update_text_editor_preview_caret(*editor, canvas_ != nullptr ? canvas_->zoom() : 1.0);
+      update_text_editor_transform_overlay(editor);
+      editor->viewport()->update();
+    }
+  });
+  editor->show();
+  editor->installEventFilter(this);
+  editor->viewport()->installEventFilter(this);
+  resize_editor();
+  if (editing_layer.has_value()) {
+    QPointF click_viewport_point;
+    if (initial_cursor_local_position.has_value()) {
+      click_viewport_point = *initial_cursor_local_position * canvas_->zoom();
+    } else {
+      const auto click_widget_point = canvas_->widget_position_f(requested_document_point_f);
+      click_viewport_point = click_widget_point - QPointF(editor->viewport()->mapTo(canvas_, QPoint(0, 0)));
+    }
+    auto cursor = editor->textCursor();
+    cursor.setPosition(text_editor_position_at_viewport_point(*editor, click_viewport_point));
+    editor->setTextCursor(cursor);
+  }
+  update_text_editor_handles(editor);
+  if (editor->property(kTextEditorPreviewEnabledProperty).toBool() &&
+      (!editor->property(kTextEditorPreviewExpensiveProperty).toBool() || editing_layer_has_transformed_preview)) {
+    update_text_editor_preview(editor);
+  }
+  schedule_text_editor_preview(editor);
+  editor->setFocus(Qt::OtherFocusReason);
+  sync_text_options_from_active_editor();
+  sync_text_alignment_buttons_from_editor();
+  update_text_editor_preview_caret(*editor, canvas_->zoom());
+  refresh_text_color_button();
+
+  auto committed = std::make_shared<bool>(false);
+  const auto commit = [this, editor = QPointer<QTextEdit>(editor), editing_layer, committed] {
+    if (*committed || editor == nullptr) {
+      return;
+    }
+    *committed = true;
+    const QPoint current_document_point(editor->property("patchy.documentTextX").toInt(),
+                                        editor->property("patchy.documentTextY").toInt());
+    commit_text_editor(editor, current_document_point, editing_layer);
+  };
+  auto* shortcut = new QShortcut(QKeySequence(Qt::CTRL | Qt::Key_Return), editor);
+  connect(shortcut, &QShortcut::activated, editor, commit);
+  auto* cancel_shortcut = new QShortcut(QKeySequence(Qt::Key_Escape), editor);
+  cancel_shortcut->setContext(Qt::WidgetWithChildrenShortcut);
+  connect(cancel_shortcut, &QShortcut::activated, editor,
+          [this, editor = QPointer<QTextEdit>(editor), editing_layer, committed, commit] {
+            if (*committed || editor == nullptr) {
+              return;
+            }
+            if (escape_commits_text_ && !editor->property(kTextEditorTypeMaskProperty).toBool() &&
+                !text_editor_shows_untouched_placeholder(*editor, tr("Type"))) {
+              commit();
+              return;
+            }
+            *committed = true;
+            cancel_text_editor(editor, editing_layer);
+          });
+  // Focus that leaves the editor for nowhere (switching to another app with Alt+Tab, Cmd+Tab or the
+  // Dock, or activating a Patchy window with nothing focusable) parks the session instead of
+  // committing it (GitHub issue 330). Qt hands focus back to the editor when its window is active
+  // again; focus landing anywhere else from there counts as leaving the editor.
+  auto focus_parked = std::make_shared<bool>(false);
+  connect(qApp, &QApplication::focusChanged, editor,
+          [this, editor = QPointer<QTextEdit>(editor), commit, focus_parked](QWidget* old, QWidget* now) {
+    if (shutting_down_ || editor == nullptr) {
+      return;
+    }
+    const auto parked = std::exchange(*focus_parked, false);
+    const auto left_editor = old == editor || editor->isAncestorOf(old) || (parked && old == nullptr);
+    if (left_editor && now == nullptr) {
+      *focus_parked = true;
+      return;
+    }
+    const auto entered_editor = now == editor || editor->isAncestorOf(now);
+    const auto entered_canvas = canvas_ != nullptr && (now == canvas_ || canvas_->isAncestorOf(now));
+    const auto text_color_dialog_has_focus_change = [this](QWidget* widget) {
+      if (color_dialog_ == nullptr) {
+        return false;
+      }
+      const auto target = color_dialog_->property("patchy.colorTarget").toString();
+      return (target == QStringLiteral("text") || target == QStringLiteral("foreground")) &&
+             (widget == color_dialog_ || color_dialog_->isAncestorOf(widget));
+    };
+    if (text_color_dialog_has_focus_change(old) || text_color_dialog_has_focus_change(now)) {
+      return;
+    }
+    if (canvas_ != nullptr && now == canvas_ &&
+        text_editor_resize_handle_at(canvas_->mapFromGlobal(QCursor::pos())) != nullptr) {
+      return;
+    }
+    // A press in a corner rotate zone (a NoFocus widget hands focus to the canvas behind it), or
+    // the turn it started, is not a click off (#684 follow-up).
+    if (canvas_ != nullptr && now == canvas_ &&
+        (text_box_rotate_drag_.has_value() ||
+         text_box_rotate_zone_at(*editor, QPointF(canvas_->mapFromGlobal(QCursor::pos()))).has_value())) {
+      return;
+    }
+    if (canvas_ != nullptr && now == canvas_) {
+      auto* overlay = transformed_text_edit_overlay_for_canvas(canvas_);
+      if (overlay != nullptr && overlay->editor() == editor &&
+          overlay->has_resize_handle_at_canvas_point(QPointF(canvas_->mapFromGlobal(QCursor::pos())))) {
+        return;
+      }
+    }
+    if (((left_editor && !entered_editor) || entered_canvas) && !entered_editor && !is_text_option_widget(now)) {
+      if (entered_canvas && (QApplication::mouseButtons() & Qt::LeftButton) != 0) {
+        swallow_next_canvas_left_press_ = true;
+      }
+      commit();
+    }
+  });
+  refresh_options_bar();  // shows the session apply/cancel buttons
+  if (editing_layer.has_value()) {
+    // The session already draws the layer's missing fonts in installed faces: the panel's
+    // badge goes now, not at commit (GitHub issue 178), and comes back if the edit is canceled.
+    refresh_layer_thumbnails();
+  }
+}
+
+void MainWindow::cancel_text_editor(QTextEdit* editor, std::optional<LayerId> layer_id) {
+  if (!mark_text_editor_finished(editor)) {
+    return;
+  }
+  if (canvas_ != nullptr && editor->property(kTextEditorTypeMaskProperty).toBool()) {
+    canvas_->set_type_mask_overlay(std::nullopt);
+  }
+  const auto restore_existing_visibility =
+      editor->property("patchy.editingLayerWasVisible").isValid()
+          ? editor->property("patchy.editingLayerWasVisible").toBool()
+          : true;
+  // Reveal before removing, so the original pixels take over from the preview without a gap.
+  restore_text_editor_source_layer(editor, restore_existing_visibility);
+  remove_text_editor_preview(editor);
+  remove_text_editor_transform_overlay(editor);
+  remove_text_editor_handles(editor);
+  editor->hide();
+  editor->setParent(nullptr);
+  editor->deleteLater();
+
+  // A canceled NEW session removes the layer that appeared at click time, Photoshop-style,
+  // leaving history and the modified state exactly as before the click.
+  if (const auto removed_provisional = take_provisional_text_layer(editor); removed_provisional.has_value()) {
+    canvas_->document_changed_effect_bounds(QRect(QPoint(editor->property("patchy.documentTextX").toInt(),
+                                                         editor->property("patchy.documentTextY").toInt()),
+                                                  QSize(1, 1)));
+    refresh_layer_list();
+    refresh_layer_controls();
+  }
+  if (layer_id.has_value() && canvas_ != nullptr && has_active_document()) {
+    if (auto* layer = document().find_layer(*layer_id); layer != nullptr) {
+      layer->set_visible(restore_existing_visibility);
+      canvas_->document_changed_effect_bounds(to_qrect(layer_render_bounds(*layer)));
+      refresh_layer_list();
+      refresh_layer_controls();
+    }
+  }
+  refresh_text_color_button();
+  refresh_options_bar();  // hides the session apply/cancel buttons
+  statusBar()->showMessage(tr("Canceled text edit"));
+}
+
+void MainWindow::commit_text_editor(QTextEdit* editor, QPoint document_point, std::optional<LayerId> layer_id) {
+  if (shutting_down_) {
+    return;
+  }
+  if (!mark_text_editor_finished(editor)) {
+    return;
+  }
+  const bool type_mask = editor->property(kTextEditorTypeMaskProperty).toBool();
+  const int type_mask_operation = editor->property(kTextEditorTypeMaskOperationProperty).toInt();
+  if (type_mask && canvas_ != nullptr) {
+    canvas_->set_type_mask_overlay(std::nullopt);
+  }
+  if (canvas_ == nullptr || !has_active_document()) {
+    // A stray commit with no canvas/document to rasterize into (e.g. a focus
+    // change while the owning tab is torn down): drop the edit but still
+    // dismantle the editor chrome.  The helpers below tolerate a null
+    // canvas_; document() would throw.
+    remove_text_editor_preview(editor);
+    remove_text_editor_transform_overlay(editor);
+    remove_text_editor_handles(editor);
+    editor->hide();
+    editor->setParent(nullptr);
+    editor->deleteLater();
+    refresh_options_bar();  // hides the session apply/cancel buttons
+    return;
+  }
+  // An open IME composition is on screen (the preview draws it), so a commit keeps it. The
+  // platform context commits it into the document synchronously where it can (Windows sends
+  // the commit string from reset); where nothing arrives, insert what was being composed.
+  if (!text_editor_preedit_text(*editor).isEmpty()) {
+    if (auto* input_method = QGuiApplication::inputMethod(); input_method != nullptr) {
+      input_method->commit();
+      input_method->reset();
+    }
+    if (const auto preedit = text_editor_preedit_text(*editor); !preedit.isEmpty()) {
+      auto cursor = editor->textCursor();
+      cursor.insertText(preedit, editor->currentCharFormat());
+      editor->setTextCursor(cursor);
+    }
+    editor->setProperty(kTextEditorPreeditTextProperty, QVariant());
+    editor->setProperty(kTextEditorPreeditCursorProperty, QVariant());
+  }
+  // The provisional layer inserted at click time comes out before anything else: the undo
+  // snapshot below must capture the pre-click document, and every dropped-commit path must
+  // leave the document as if the click never happened.
+  const auto removed_provisional = take_provisional_text_layer(editor);
+  // Untrimmed: the stored text must keep indexing the rich-text/paragraph runs, which are
+  // extracted from the full editor document -- old PSDs often start with a blank line, and
+  // trimming here shifted every run on the next edit session.  Trim only for the emptiness test.
+  const auto text = editor->toPlainText();
+  // Applying always keeps what the session showed.  A box/PSD-frame session still displays
+  // Photoshop's raster (kTextEditorSourceRasterPreviewProperty), so an unchanged apply keeps that
+  // raster; a point-text session shows the live render from entry, so applying commits it even
+  // with no text change -- snapping back to the raster after the user saw the live layout was
+  // jarring.  Escape is the way to leave the original pixels untouched.
+  const auto source_raster_unchanged = editor->property(kTextEditorSourceRasterPreviewProperty).toBool() &&
+                                       !editor->property(kTextEditorChangedProperty).toBool();
+  const auto restore_existing_visibility =
+      editor->property("patchy.editingLayerWasVisible").isValid()
+          ? editor->property("patchy.editingLayerWasVisible").toBool()
+          : true;
+  const auto restore_hidden_text_layer = [this, layer_id, restore_existing_visibility, removed_provisional,
+                                          document_point] {
+    if (removed_provisional.has_value()) {
+      // A dropped commit of a NEW session: the provisional layer is already removed, the panel
+      // row just has to vanish (its pixels were a 1x1 transparent placeholder).
+      canvas_->document_changed_effect_bounds(QRect(document_point, QSize(1, 1)));
+      refresh_layer_list();
+      refresh_layer_controls();
+    }
+    if (!layer_id.has_value()) {
+      return;
+    }
+    if (auto* layer = document().find_layer(*layer_id); layer != nullptr) {
+      layer->set_visible(restore_existing_visibility);
+      canvas_->document_changed_effect_bounds(to_qrect(layer_render_bounds(*layer)));
+      refresh_layer_list();
+      refresh_layer_controls();
+    }
+  };
+  // Capture the regions this commit must repaint again AFTER the layer mutation below: the
+  // restore/remove pair refreshes them with the PRE-commit composite, and when the committed
+  // bounds land elsewhere (a warped layer's re-render, or any edit that shrinks the ink) the
+  // difference kept showing the old pixels until a manual F5.
+  QRect pre_commit_dirty;
+  if (layer_id.has_value()) {
+    if (const auto* layer = std::as_const(document()).find_layer(*layer_id); layer != nullptr) {
+      pre_commit_dirty = pre_commit_dirty.united(to_qrect(layer_render_bounds(*layer)));
+    }
+  }
+  if (editor->property("patchy.textPreviewLayerId").isValid()) {
+    const auto preview_id = static_cast<LayerId>(editor->property("patchy.textPreviewLayerId").toULongLong());
+    if (const auto* preview = std::as_const(document()).find_layer(preview_id); preview != nullptr) {
+      pre_commit_dirty = pre_commit_dirty.united(to_qrect(layer_render_bounds(*preview)));
+    }
+  }
+  // Reveal the edited layer in the SAME step that takes the preview away. Its committed pixels
+  // are still intact here, so the text simply keeps showing until the new render replaces it a
+  // few statements below. Removing the preview on its own left a window with neither on screen,
+  // and the widget teardown and options-bar relayout that follow are enough to get a paint
+  // delivered inside it -- the flash you see when a session ends.
+  restore_text_editor_source_layer(editor, restore_existing_visibility);
+  remove_text_editor_preview(editor);
+  remove_text_editor_transform_overlay(editor);
+  remove_text_editor_handles(editor);
+  editor->hide();
+  editor->setParent(nullptr);
+  editor->deleteLater();
+  // The editor is detached, so this hides the session apply/cancel buttons on
+  // every path below (early returns included).
+  refresh_options_bar();
+  if (source_raster_unchanged) {
+    restore_hidden_text_layer();
+    refresh_text_color_button();
+    return;
+  }
+  if (text.trimmed().isEmpty()) {
+    restore_hidden_text_layer();
+    if (layer_id.has_value() && !layer_id_locks_image_pixels(*layer_id)) {
+      if (!text_commit_snapshot_suppressed_) {
+        push_undo_snapshot(tr("Type"));
+      }
+      if (auto* layer = document().find_layer(*layer_id); layer != nullptr) {
+        auto& metadata = layer->metadata();
+        metadata[kLayerMetadataText] = text.toStdString();
+        if (const auto area = text_editor_area(*editor)) {
+          metadata[kLayerMetadataTextArea] = serialize_vector_path(*area);
+        } else {
+          metadata.erase(kLayerMetadataTextArea);
+        }
+        if (const auto frame = text_editor_path(*editor)) {
+          metadata[kLayerMetadataTextPath] = serialize_vector_path(frame->path);
+          metadata[kLayerMetadataTextPathRange] = serialize_text_path_range(frame->range);
+        } else {
+          metadata.erase(kLayerMetadataTextPath);
+          metadata.erase(kLayerMetadataTextPathRange);
+        }
+        metadata[kLayerMetadataTextHtml].clear();
+        metadata[kLayerMetadataTextRuns].clear();
+        metadata[kLayerMetadataTextParagraphRuns].clear();
+        metadata[kLayerMetadataTextRasterStatus] = "patchy_raster";
+        clear_layer_psd_text_source(*layer);
+        const auto bounds = std::as_const(*layer).bounds();
+        const auto format = text_layer_has_contour(std::as_const(*layer))
+            ? with_bit_depth(PixelFormat::rgba8(), document().color_state().bit_depth) : PixelFormat::rgba8();
+        layer->set_pixels(PixelBuffer(1, 1, format));
+        layer->set_bounds(Rect{bounds.x, bounds.y, 1, 1});
+      }
+      canvas_->document_changed_effect_bounds(pre_commit_dirty);
+      refresh_layer_list();
+      refresh_layer_controls();
+    }
+    return;
+  }
+
+  const auto text_size = std::max(1, editor->property("patchy.documentTextSize").toInt());
+  const auto text_width =
+      std::max(kMinimumTextBoxDocumentSize, editor->property("patchy.documentTextWidth").toInt());
+  const auto text_height =
+      std::max(kMinimumTextBoxDocumentSize, editor->property("patchy.documentTextHeight").toInt());
+  const auto boxed_text =
+      text_flow_is_box(editor->property("patchy.documentTextFlow").toString());
+  const auto text_color = editor->property("patchy.documentTextColor").value<QColor>().isValid()
+                              ? editor->property("patchy.documentTextColor").value<QColor>()
+                              : canvas_->primary_color();
+  const auto text_anti_alias = std::clamp(editor->property("patchy.documentTextAntiAlias").toInt(), 0, 16);
+  auto text_family = editor->property("patchy.documentTextFamily").toString();
+  if (text_family.trimmed().isEmpty()) {
+    text_family = text_display_family_from_format(text_editor_reference_format(*editor),
+                                                  display_text_family_from_font(editor->font()));
+  }
+  auto document_text = document_from_editor_in_document_units(*editor, canvas_->zoom());
+  TextToolSettings settings{text,
+                            QString(),
+                            text_family,
+                            text_size,
+                            editor->font().bold(),
+                            editor->font().italic(),
+                            text_anti_alias,
+                            boxed_text,
+                            text_width,
+                            text_height};
+  settings.photoshop_layout = text_editor_uses_photoshop_layout(*editor);
+  settings.vertical = text_editor_is_vertical(*editor);
+  apply_text_editor_contour(settings, *editor);
+  const auto rich_text_runs = rich_text_runs_from_document(*document_text, settings, text_color);
+  const auto paragraph_runs = paragraph_runs_from_document(*document_text);
+  settings.html = document_html_from_text_runs(document_text->toPlainText(), rich_text_runs, settings, text_color);
+  // A PSD-frame box session works in a document-space frame while its runs stay in raw engine
+  // units; fold the transform's vertical scale into the glyph sizes for the render.
+  const auto frame_layout_scale = settings.photoshop_layout && editor->property("patchy.usesPsdTextFrame").toBool()
+                                      ? text_editor_size_display_scale(*editor)
+                                      : 1.0;
+  auto rendered = render_text_pixels_with_local_rect(settings, text_color, text_width, paragraph_runs,
+                                                     rich_text_runs, text_editor_render_local_rect(*editor),
+                                                     text_editor_metric_scale(*editor), QTransform(),
+                                                     frame_layout_scale);
+  if (rendered.pixels.empty()) {
+    restore_hidden_text_layer();
+    return;
+  }
+  if (!boxed_text && !editor->property("patchy.usesPsdTextFrame").toBool()) {
+    bool updated_transform = false;
+    bool warped_text_layer = false;
+    if (layer_id.has_value()) {
+      if (auto* layer = document().find_layer(*layer_id); layer != nullptr) {
+        // Warped layers commit through the entry-set session transform; the raster-derived
+        // updates below would re-anchor the text at the warped ink and drift it every commit.
+        warped_text_layer = layer_has_active_text_warp(*layer);
+        if (!warped_text_layer) {
+          updated_transform = update_text_editor_transform_from_psd_local_bounds(*editor, *layer, rendered,
+                                                                                boxed_text);
+        }
+      }
+    }
+    if (!updated_transform && !warped_text_layer) {
+      update_text_editor_transform_from_source_anchor(*editor, rendered);
+    }
+    document_point = QPoint(editor->property("patchy.documentTextX").toInt(),
+                            editor->property("patchy.documentTextY").toInt());
+  }
+
+  auto committed_bounds = rendered_text_bounds_for_editor(*editor, document_point, rendered);
+  auto pixels = std::move(rendered.pixels);
+  const auto local_text_height = pixels.height();
+  std::optional<QTransform> text_transform;
+  std::optional<LayerAffineTransform> text_affine_transform;
+  bool psd_anchored_text = false;
+  if (layer_id.has_value()) {
+    if (auto* layer = document().find_layer(*layer_id); layer != nullptr) {
+      psd_anchored_text = layer->metadata().contains(kLayerMetadataPsdTextTransform);
+      if (const auto override_transform = text_editor_transform_override(*editor); override_transform.has_value()) {
+        text_affine_transform = *override_transform;
+        text_transform = qtransform_from_affine(*override_transform);
+      } else {
+        text_transform = patchy_text_transform_for_layer(*layer);
+        text_affine_transform = canonical_text_affine_transform_for_layer(*layer);
+      }
+    }
+  } else if (const auto override_transform = text_editor_transform_override(*editor);
+             override_transform.has_value() && affine_transform_has_non_translation_linear_part(*override_transform)) {
+    // New box text the session turned with a corner rotate zone (#684 follow-up) commits
+    // through that transform, as a re-edit of a turned layer does.
+    text_affine_transform = *override_transform;
+    text_transform = qtransform_from_affine(*override_transform);
+  }
+  // Warp Text: a warped layer re-renders through the warp surface instead of the
+  // affine paths below. The warp box is re-derived from the fresh layout so the
+  // bend follows the edited text (Photoshop recomputes its box on every change).
+  std::optional<TextWarp> committed_warp_used;
+  QTransform committed_warp_transform;
+  if (layer_id.has_value()) {
+    if (auto* warp_layer = document().find_layer(*layer_id); warp_layer != nullptr) {
+      if (auto warp = text_warp_from_layer(*warp_layer); warp.has_value() && !text_warp_is_identity(*warp)) {
+        LayerTextRenderInputs warp_inputs{settings, text_color, text_width, paragraph_runs, rich_text_runs};
+        TextWarp refreshed = *warp;
+        refreshed.bounds_left = 0.0;
+        refreshed.bounds_top = 0.0;
+        refreshed.bounds_right = 0.0;
+        refreshed.bounds_bottom = 0.0;
+        if (text_transform.has_value() && (qtransform_has_non_translation_linear_part(*text_transform) ||
+                                           text_editor_transform_override(*editor).has_value())) {
+          // The session override IS the unwarped text-local -> document map (set at entry,
+          // Move-corrected). Reconstructing it from the floored document_point drifted the
+          // layer by the warped-vs-unwarped ink offset on every commit.
+          committed_warp_transform = *text_transform;
+        } else {
+          committed_warp_transform =
+              QTransform::fromTranslate(static_cast<qreal>(committed_bounds.x) - rendered.local_rect.left(),
+                                        static_cast<qreal>(committed_bounds.y) - rendered.local_rect.top());
+        }
+        if (auto warped = render_warped_text_pixels_for_layer(warp_inputs, refreshed,
+                                                              committed_warp_transform, &refreshed);
+            warped.has_value()) {
+          pixels = std::move(warped->pixels);
+          committed_bounds = warped->bounds;
+          committed_warp_used = refreshed;
+        }
+      }
+    }
+  }
+  const auto anchor_places_rendered_pixels =
+      text_transform.has_value() && text_editor_render_local_rect(*editor).has_value() &&
+      text_editor_source_visible_anchor(*editor).has_value() &&
+      !qtransform_has_non_translation_linear_part(*text_transform);
+  if (!committed_warp_used.has_value() && text_transform.has_value() &&
+      !editor->property("patchy.usesPsdTextFrame").toBool() && !anchor_places_rendered_pixels) {
+    auto transform_for_pixels = *text_transform;
+    const bool rendered_off_origin =
+        std::abs(rendered.local_rect.left()) > 0.0001 || std::abs(rendered.local_rect.top()) > 0.0001;
+    const bool has_local_offset = text_editor_render_local_rect(*editor).has_value() && rendered_off_origin;
+    // Point text whose glyph ink overhangs the origin renders into a buffer that starts left of
+    // or above it (grow_point_text_rect_to_glyph_ink), and so does Photoshop-layout box text,
+    // whose first line box starts above the frame top (first baseline at the typographic
+    // ascender, GitHub issue 373); the resample below maps that buffer, so it needs the offset
+    // folded in. The crisp path re-renders the plan through the transform and derives its
+    // bounds from the plan's own rect, so it must get the plain transform.
+    const bool point_local_offset = !text_editor_render_local_rect(*editor).has_value() && rendered_off_origin;
+    if (has_local_offset || point_local_offset) {
+      transform_for_pixels = qtransform_from_affine(
+          affine_with_local_translation(affine_from_qtransform(*text_transform), rendered.local_rect.topLeft()));
+    }
+    // For a scaled/rotated point-text layer, re-rasterize the glyphs *through* the transform so the
+    // committed result stays crisp instead of resampling the base-size bitmap (which is what made an
+    // edit of a scaled PSD layer go blocky).  Eligibility rules live on the shared helper.
+    bool used_crisp = false;
+    if (auto crisp = render_crisp_transformed_text_for_editor(*editor, psd_anchored_text, boxed_text,
+                                                              has_local_offset, settings, text_color, text_width,
+                                                              paragraph_runs, rich_text_runs, *text_transform,
+                                                              *text_transform);
+        crisp.has_value()) {
+      committed_bounds = crisp->bounds;
+      pixels = std::move(crisp->pixels);
+      used_crisp = true;
+    }
+    if (!used_crisp) {
+      auto transformed = apply_text_transform_to_pixels(pixels, transform_for_pixels);
+      pixels = std::move(transformed.pixels);
+      committed_bounds = transformed.bounds;
+    }
+  }
+
+  if (layer_id.has_value() && layer_id_locks_image_pixels(*layer_id)) {
+    restore_hidden_text_layer();
+    refresh_text_color_button();
+    show_status_error(tr("Layer pixels are locked."));
+    return;
+  }
+
+  if (layer_id.has_value()) {
+    if (auto* layer = document().find_layer(*layer_id); layer != nullptr) {
+      layer->set_visible(restore_existing_visibility);
+    }
+  }
+  // The layer the commit ends up owning, so the final repaint can be bounded to it.
+  if (settings.area || settings.path) {
+    pixels = convert_pixel_buffer_depth(pixels, document().color_state().bit_depth, SampleKind::Color);
+  }
+  std::optional<LayerId> committed_layer_id = layer_id;
+  const auto name = text_layer_auto_name(settings.text);
+  // A PSD-frame session rendered a document-space frame around raw-unit runs; persist the box
+  // dims back in the runs' raw engine space so the stored runs + box + transform stay one
+  // consistent coordinate system for re-edits and metadata re-renders.
+  auto stored_box_width = text_width;
+  auto stored_box_height = boxed_text ? text_height : local_text_height;
+  if (std::abs(frame_layout_scale - 1.0) > 0.0001) {
+    stored_box_width = std::max(1, static_cast<int>(std::lround(text_width / frame_layout_scale)));
+    if (boxed_text) {
+      stored_box_height = std::max(1, static_cast<int>(std::lround(text_height / frame_layout_scale)));
+    }
+  }
+  // Transformed point text: the session width arrived in document pixels (the imported layer's
+  // raster width) while the stored height is text-local -- persisting that mix made the next
+  // session map the document width through the transform AGAIN (a ~4x-scaled menu layer grew a
+  // dashed edit rect several canvases wide). Store the base render's local width instead so
+  // width and height live in the same text-local space as the runs.
+  if (!boxed_text && settings.photoshop_layout && text_transform.has_value() &&
+      qtransform_has_non_translation_linear_part(*text_transform)) {
+    stored_box_width = std::max(1, static_cast<int>(std::ceil(rendered.local_rect.width())));
+  }
+  const auto commit_into_layer = [&](Layer& layer, PixelBuffer committed_pixels) {
+    // Follow the text content only for auto-derived names; a name the user (or the source PSD)
+    // chose stays put.  No "Text: " prefix -- the layer list already shows a type badge.
+    if (text_layer_name_is_auto(layer)) {
+      layer.set_name(name.toStdString());
+    }
+    // Before the layer's file geometry is cleared: where its file anchored it, the alignment
+    // that anchor belongs to, and the transform it is expressed through (see the end).
+    const auto file_anchor = std::as_const(layer).metadata().contains(kLayerMetadataTextTransform) ||
+                                     std::as_const(layer).metadata().contains(kLayerMetadataPsdTextTransform)
+                                 ? point_text_file_anchor_in_document(std::as_const(layer))
+                                 : std::nullopt;
+    const auto previous_alignment_factor = layer_anchor_alignment_factor(std::as_const(layer));
+    const auto file_box = box_text_file_size(std::as_const(layer));
+    const auto previous_file_anchor_text = [&]() -> std::optional<std::string> {
+      const auto& previous = std::as_const(layer).metadata();
+      const auto anchor = previous.find(kLayerMetadataTextFileAnchor);
+      const auto transform = previous.find(kLayerMetadataTextTransform);
+      if (anchor == previous.end() || transform == previous.end()) {
+        return std::nullopt;
+      }
+      return transform->second + '\n' + anchor->second;
+    }();
+    layer.set_pixels(std::move(committed_pixels));
+    layer.set_bounds(committed_bounds);
+    layer.set_visible(restore_existing_visibility);
+    store_patchy_text_metadata(layer, settings, text_color, rich_text_runs, paragraph_runs, stored_box_width,
+                               boxed_text ? stored_box_height : local_text_height);
+    store_text_layout_metrics(layer, rendered.metrics);
+    if (settings.photoshop_layout) {
+      // Imported layers keep their marker through store (it never clears the key); a native
+      // layer that opted in via the Character panel's leading controls persists it here.
+      layer.metadata()[kLayerMetadataTextLayoutMode] = kTextLayoutModePhotoshop;
+    }
+    if (editor->property(kTextEditorLineAwareBoxPreviewProperty).toBool()) {
+      layer.metadata()[kLayerMetadataTextLineAwareBoxPreview] = "true";
+    } else {
+      layer.metadata().erase(kLayerMetadataTextLineAwareBoxPreview);
+    }
+    if (boxed_text) {
+      layer.metadata()[kLayerMetadataTextTransform] =
+          serialize_layer_affine_transform(committed_text_transform(document_point, text_affine_transform));
+    } else if (text_affine_transform.has_value()) {
+      layer.metadata()[kLayerMetadataTextTransform] = serialize_layer_affine_transform(*text_affine_transform);
+    } else if (!settings.vertical) {
+      // Horizontal point text always records its pen: the raster may start left of or above
+      // it (glyph ink overhanging the line start or top, grow_point_text_rect_to_glyph_ink),
+      // so the layer corner no longer identifies the text origin for the next session or the
+      // PSD writer. Vertical point text keeps recovering its anchor from the raster.
+      layer.metadata()[kLayerMetadataTextTransform] =
+          serialize_layer_affine_transform(committed_text_transform(document_point, std::nullopt));
+    }
+    if (committed_warp_used.has_value()) {
+      layer.metadata()[kLayerMetadataTextWarp] = serialize_text_warp(*committed_warp_used);
+      // The warp render mapped text-local space through this transform; store exactly it
+      // (overriding the boxed branch's floored write above) so later re-renders and the
+      // next session entry's probe agree with the raster to the sub-pixel.
+      layer.metadata()[kLayerMetadataTextTransform] = serialize_layer_affine_transform(
+          LayerAffineTransform{committed_warp_transform.m11(), committed_warp_transform.m12(),
+                               committed_warp_transform.m21(), committed_warp_transform.m22(),
+                               committed_warp_transform.dx(), committed_warp_transform.dy()});
+    }
+    // Horizontal point text that came from a file keeps the anchor the file gave it (Photoshop's
+    // click point) when the commit kept the first paragraph's alignment: the session pins the
+    // text to where it was, so that document point is still the anchor, and a PSD save writes
+    // it back exactly (kLayerMetadataTextFileAnchor). A changed alignment moves the anchor to
+    // another point of the line; the renderer's own measure serves then.
+    if (file_anchor.has_value() && !boxed_text && !settings.vertical && !settings.area.has_value() &&
+        std::abs(previous_alignment_factor - layer_anchor_alignment_factor(std::as_const(layer))) < 1e-9) {
+      const auto committed_transform = std::as_const(layer).metadata().find(kLayerMetadataTextTransform);
+      if (previous_file_anchor_text.has_value() && committed_transform != std::as_const(layer).metadata().end() &&
+          previous_file_anchor_text->starts_with(committed_transform->second + '\n')) {
+        // The same transform as before: the same local point, digit for digit, so a commit that
+        // changes nothing leaves the layer's metadata equal (no History step, GitHub issue 387).
+        layer.metadata()[kLayerMetadataTextFileAnchor] =
+            previous_file_anchor_text->substr(committed_transform->second.size() + 1U);
+      } else {
+        store_point_text_file_anchor(layer, *file_anchor);
+      }
+    }
+    // Box text that came from a file keeps the file's fractional box while the committed
+    // whole-pixel box is still that box (within a pixel: the session rounds it, sometimes up).
+    if (file_box.has_value() && boxed_text && !settings.area.has_value() && !settings.path.has_value() &&
+        !committed_warp_used.has_value() &&
+        std::abs(file_box->width() - stored_box_width) <= 1.0 &&
+        std::abs(file_box->height() - stored_box_height) <= 1.0) {
+      layer.metadata()[kLayerMetadataTextFileBox] =
+          (QString::number(file_box->width(), 'g', 17) + QLatin1Char(' ') + QString::number(file_box->height(), 'g', 17))
+              .toStdString();
+    }
+  };
+  // A commit that would leave an existing layer exactly as it was (a session applied with
+  // nothing changed) adds no History step and leaves the document unmodified (GitHub issue
+  // 387). The commit runs on a copy first and the result is compared with the layer.
+  if (layer_id.has_value() && !text_commit_snapshot_suppressed_) {
+    if (const auto* current = std::as_const(document()).find_layer(*layer_id); current != nullptr) {
+      Layer candidate = *current;
+      commit_into_layer(candidate, pixels);
+      const auto& committed = std::as_const(candidate);
+      if (committed.name() == current->name() && committed.bounds() == current->bounds() &&
+          committed.visible() == current->visible() && committed.metadata() == current->metadata() &&
+          pixel_buffers_equal(committed.pixels(), current->pixels())) {
+        canvas_->document_changed_effect_bounds(pre_commit_dirty.united(to_qrect(layer_render_bounds(*current))));
+        refresh_layer_list();
+        refresh_layer_controls();
+        refresh_text_color_button();
+        return;
+      }
+    }
+  }
+  // A multi-layer hidden-session pass (apply_text_character_edit) snapshots once for all
+  // of its commits. Type Mask's step is the selection's own, taken below.
+  if (!text_commit_snapshot_suppressed_ && !type_mask) {
+    push_undo_snapshot(tr("Type"));
+  }
+  if (layer_id.has_value()) {
+    if (auto* layer = document().find_layer(*layer_id); layer != nullptr) {
+      commit_into_layer(*layer, std::move(pixels));
+    }
+  } else {
+    // Reuse the provisional's id when one was just removed: the row the user has watched since
+    // the click keeps identifying the same layer across the commit.
+    const auto new_layer_id =
+        removed_provisional.has_value() ? *removed_provisional : document().allocate_layer_id();
+    committed_layer_id = new_layer_id;
+    Layer text_layer(new_layer_id, name.toStdString(), std::move(pixels));
+    // committed_bounds, not the document point: the buffer starts left of or above the pen when
+    // glyph ink overhangs it (rendered_text_bounds_for_editor).
+    text_layer.set_bounds(
+        Rect{committed_bounds.x, committed_bounds.y, text_layer.pixels().width(), text_layer.pixels().height()});
+    store_patchy_text_metadata(text_layer, settings, text_color, rich_text_runs, paragraph_runs, text_width,
+                               boxed_text ? text_height : text_layer.pixels().height());
+    store_text_layout_metrics(text_layer, rendered.metrics);
+    if (settings.photoshop_layout) {
+      text_layer.metadata()[kLayerMetadataTextLayoutMode] = kTextLayoutModePhotoshop;
+    }
+    if (editor->property(kTextEditorLineAwareBoxPreviewProperty).toBool()) {
+      text_layer.metadata()[kLayerMetadataTextLineAwareBoxPreview] = "true";
+    }
+    if (boxed_text || !settings.vertical) {
+      // Point text records its pen too (see the existing-layer branch above). A box the
+      // session turned keeps its turn (text_affine_transform is set only then).
+      text_layer.metadata()[kLayerMetadataTextTransform] =
+          serialize_layer_affine_transform(committed_text_transform(document_point, text_affine_transform));
+    }
+    if (type_mask) {
+      // The text layer is only the outline source: the letters become the selection and the
+      // document keeps no layer. The provisional row is already gone; repaint where the
+      // preview drew and refresh the panel.
+      restore_hidden_text_layer();
+      canvas_->document_changed_effect_bounds(pre_commit_dirty);
+      static_cast<void>(apply_type_mask_selection(text_layer, type_mask_operation));
+      refresh_text_color_button();
+      return;
+    }
+    document().add_layer(std::move(text_layer));
+  }
+  refresh_layer_list();
+  refresh_layer_controls();
+  // Bounded, not a full recomposite (a full document_changed() here cost a whole recomposite
+  // per commit). The rect must union the pre-commit regions captured above with the committed
+  // layer's own effect bounds: the restore/remove invalidations ran BEFORE the pixels changed,
+  // so on their own they leave the old render baked in wherever the new bounds do not cover.
+  bool bounded_refresh = false;
+  if (committed_layer_id.has_value()) {
+    if (const auto* committed = std::as_const(document()).find_layer(*committed_layer_id);
+        committed != nullptr) {
+      canvas_->document_changed_effect_bounds(
+          pre_commit_dirty.united(to_qrect(layer_render_bounds(*committed))));
+      bounded_refresh = true;
+    }
+  }
+  if (!bounded_refresh) {
+    canvas_->document_changed();
+  }
+  refresh_text_color_button();
+  statusBar()->showMessage(tr("Created text layer"));
+}
+
+bool MainWindow::commit_active_text_editor() {
+  if (canvas_ == nullptr) {
+    return false;
+  }
+  auto* editor = canvas_->findChild<QTextEdit*>(QStringLiteral("inlineTextEditor"));
+  if (editor == nullptr) {
+    return false;
+  }
+  const QPoint document_point(editor->property("patchy.documentTextX").toInt(),
+                              editor->property("patchy.documentTextY").toInt());
+  std::optional<LayerId> layer_id;
+  if (editor->property("patchy.editingLayerId").isValid()) {
+    layer_id = static_cast<LayerId>(editor->property("patchy.editingLayerId").toULongLong());
+  }
+  commit_text_editor(editor, document_point, layer_id);
+  return true;
+}
+
+bool MainWindow::cancel_active_text_editor() {
+  if (canvas_ == nullptr) {
+    return false;
+  }
+  auto* editor = canvas_->findChild<QTextEdit*>(QStringLiteral("inlineTextEditor"));
+  if (editor == nullptr) {
+    return false;
+  }
+  std::optional<LayerId> layer_id;
+  if (editor->property("patchy.editingLayerId").isValid()) {
+    layer_id = static_cast<LayerId>(editor->property("patchy.editingLayerId").toULongLong());
+  }
+  cancel_text_editor(editor, layer_id);
+  return true;
+}
+
+void MainWindow::finish_active_text_editor() {
+  // Every caller needs the document as it will be (a save, an export, a command, a script, a
+  // tool, layer or document switch): a pending pixel shape is painted first (GitHub issue 716).
+  if (canvas_ != nullptr) {
+    canvas_->commit_pending_pixel_shape();
+  }
+  if (!commit_active_text_editor()) {
+    return;
+  }
+  QApplication::processEvents(QEventLoop::ExcludeUserInputEvents);
+}
+
+int MainWindow::cli_append_text_to_text_layers(const QString& suffix) {
+  if (canvas_ == nullptr || !has_active_document() || suffix.isEmpty()) {
+    return 0;
+  }
+  // Collect ids up front: committing a session rewrites rasters/bounds but never ids.
+  std::vector<LayerId> text_layer_ids;
+  std::function<void(const std::vector<Layer>&)> collect = [&](const std::vector<Layer>& layers) {
+    for (const auto& layer : layers) {
+      if (layer_is_text(layer)) {
+        text_layer_ids.push_back(layer.id());
+      }
+      collect(layer.children());
+    }
+  };
+  collect(std::as_const(document()).layers());
+
+  int mutated = 0;
+  for (const auto id : text_layer_ids) {
+    const auto* layer = std::as_const(document()).find_layer(id);
+    if (layer == nullptr || layer_id_locks_image_pixels(id)) {
+      continue;
+    }
+    // Explicit layer edits must also reach fully overflowed frames with no raster bounds.
+    const auto bounds = layer->bounds();
+    const QPoint anchor(bounds.x + std::max(1, bounds.width) / 2, bounds.y + std::max(1, bounds.height) / 2);
+    document().set_active_layer(id);
+    add_text_at(anchor, {}, true, std::nullopt, id);
+    QTextEdit* editor = nullptr;
+    QElapsedTimer wait;
+    wait.start();
+    while (wait.elapsed() < 5000) {
+      editor = canvas_->findChild<QTextEdit*>(QStringLiteral("inlineTextEditor"));
+      if (editor != nullptr) {
+        break;
+      }
+      QApplication::processEvents(QEventLoop::ExcludeUserInputEvents, 50);
+    }
+    if (editor == nullptr) {
+      continue;
+    }
+    if (editor->property("patchy.editingLayerId").toULongLong() != static_cast<qulonglong>(id)) {
+      // Defensive: the session latched onto some other layer; leave it untouched.
+      cancel_active_text_editor();
+      continue;
+    }
+    auto cursor = editor->textCursor();
+    cursor.movePosition(QTextCursor::End);
+    editor->setTextCursor(cursor);
+    editor->insertPlainText(suffix);
+    QApplication::processEvents(QEventLoop::ExcludeUserInputEvents);
+    finish_active_text_editor();
+    QApplication::processEvents(QEventLoop::ExcludeUserInputEvents);
+    ++mutated;
+  }
+  return mutated;
+}
+
+void MainWindow::paste_lorem_ipsum() {
+  if (canvas_ == nullptr || !has_active_document() || preview_dialog_edit_locked()) {
+    return;
+  }
+  // The standard placeholder paragraph. It is Latin filler, the same in every language, so it is
+  // never translated (the menu entry is).
+  static const auto lorem = QStringLiteral(
+      "Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod tempor incididunt ut labore et "
+      "dolore magna aliqua. Ut enim ad minim veniam, quis nostrud exercitation ullamco laboris nisi ut aliquip ex "
+      "ea commodo consequat. Duis aute irure dolor in reprehenderit in voluptate velit esse cillum dolore eu fugiat "
+      "nulla pariatur. Excepteur sint occaecat cupidatat non proident, sunt in culpa qui officia deserunt mollit "
+      "anim id est laborum.");
+  auto* editor = canvas_->findChild<QTextEdit*>(QStringLiteral("inlineTextEditor"));
+  if (editor != nullptr && !editor->property(kTextEditorFinishedProperty).toBool()) {
+    // An open session: at the caret, replacing any selected text, like a paste. The session's
+    // commit is the undo step.
+    apply_text_character_edit([](QTextEdit& session) {
+      session.insertPlainText(lorem);
+      return true;
+    });
+    return;
+  }
+  if (!text_character_target_layer_ids().empty()) {
+    // Selected text layers, no session: after each layer's text, a space apart, through the
+    // hidden sessions of apply_text_character_edit (one "Type" step for all of them).
+    apply_text_character_edit([](QTextEdit& session) {
+      const auto existing = session.toPlainText();
+      auto cursor = session.textCursor();
+      cursor.movePosition(QTextCursor::End);
+      session.setTextCursor(cursor);
+      session.insertPlainText(existing.isEmpty() || existing.back().isSpace() ? lorem
+                                                                              : QLatin1Char(' ') + lorem);
+      return true;
+    });
+    return;
+  }
+  // Nothing to add to: a new paragraph text layer at the view center, in the Type tool's
+  // current options. A paragraph is one long line as point text, so it gets a frame 60% as wide
+  // as the visible part of the document, fitted to the text's height below.
+  const auto& doc = std::as_const(*this).document();
+  const auto zoom = std::max(0.0001, canvas_->zoom());
+  const auto center = canvas_->view_center_document_point();
+  const auto visible_width = std::min(static_cast<double>(doc.width()), canvas_->width() / zoom);
+  const int box_width = std::max(64, static_cast<int>(std::lround(visible_width * 0.6)));
+  // Tall enough that the automatic size stays the document's (a short frame shrinks it).
+  const int box_height = std::max(64, doc.height());
+  const int left = static_cast<int>(std::lround(center.x() - box_width / 2.0));
+  const int center_y = static_cast<int>(std::lround(center.y()));
+  // add_text_at opens the active layer when the point lands inside it; a new layer is wanted.
+  document().clear_active_layer();
+  add_text_at(QPoint(left, center_y), QRect(left, center_y, box_width, box_height), true);
+  editor = canvas_->findChild<QTextEdit*>(QStringLiteral("inlineTextEditor"));
+  if (editor == nullptr || editor->property(kTextEditorFinishedProperty).toBool()) {
+    return;
+  }
+  editor->insertPlainText(lorem);
+  fit_text_editor_box_height_to_text(*editor, center_y);
+  finish_active_text_editor();
+}
+
+void MainWindow::fit_text_editor_box_height_to_text(QTextEdit& editor, int center_y) {
+  if (!text_flow_is_box(editor.property("patchy.documentTextFlow").toString()) || text_editor_is_vertical(editor)) {
+    return;
+  }
+  // Bumps the layout generation, so the document-space layout below holds the new text.
+  mark_text_editor_changed(&editor);
+  double layout_zoom = 1.0;
+  const auto* layout_document = text_editor_document_space_layout(editor, layout_zoom);
+  if (layout_document == nullptr) {
+    return;
+  }
+  const auto bounds = text_editor_line_geometry(editor, *layout_document).bounding_rect();
+  if (!bounds.isValid() || bounds.bottom() <= 0.0) {
+    return;
+  }
+  // A quarter of the size below the last line, so its descenders never count as overflow.
+  const auto size = std::max(1, editor.property("patchy.documentTextSize").toInt());
+  const int height = std::max(kMinimumTextBoxDocumentSize, static_cast<int>(std::ceil(bounds.bottom() + size / 4.0)));
+  editor.setProperty("patchy.documentTextY", center_y - height / 2);
+  editor.setProperty("patchy.documentTextHeight", height);
+  relayout_text_editor(&editor, false);
+  schedule_text_editor_preview(&editor);
+}
+
+bool MainWindow::apply_text_warp_to_layer(Layer& layer, const patchy::TextWarp& warp) {
+  const auto inputs = text_render_inputs_from_layer(layer);
+  if (!inputs.has_value()) {
+    return false;
+  }
+  const auto metadata_value = [&layer](const char* key) -> QString {
+    const auto found = layer.metadata().find(key);
+    return found == layer.metadata().end() ? QString() : QString::fromStdString(found->second);
+  };
+  // Resolve the text-local -> document transform in the space the Qt render uses.
+  // Imported Photoshop previews anchor their transform at the typographic baseline
+  // while the Qt raster is top-left-origin, so point text adopts the glyph-aligned
+  // transform (the layer becomes Patchy-rendered from here on).
+  QTransform transform;
+  bool have_transform = false;
+  bool adopt_transform = false;
+  std::optional<QRectF> imported_box;
+  const bool imported_preview =
+      metadata_value(kLayerMetadataTextRasterStatus) != QStringLiteral("patchy_raster") &&
+      layer.metadata().contains(kLayerMetadataPsdTextTransform);
+  if (imported_preview && inputs->settings.boxed) {
+    // Box text: the frame origin is the transform origin in both engines, so no ink
+    // alignment is needed; adopting Photoshop's box keeps its exact warp geometry
+    // (the 'bounds' top hangs the first line's ascent-to-cap gap above the frame).
+    if (const auto psd_bounds = psd_text_metadata_local_rect(layer, kLayerMetadataPsdTextBounds);
+        psd_bounds.has_value()) {
+      imported_box = *psd_bounds;
+    }
+  }
+  if (imported_preview && !inputs->settings.boxed) {
+    const auto base = render_text_pixels_with_local_rect(inputs->settings, inputs->color, inputs->max_width,
+                                                         inputs->paragraph_runs, inputs->rich_text_runs);
+    if (!base.pixels.empty()) {
+      if (const auto aligned = psd_point_text_local_bounds_transform_for_pixels(
+              layer, base, false, layer_anchor_alignment_factor(layer));
+          aligned.has_value()) {
+        transform = qtransform_from_affine(*aligned);
+        have_transform = true;
+        adopt_transform = true;
+      } else if (const auto canonical = canonical_text_affine_transform_for_layer(layer);
+                 canonical.has_value()) {
+        // Pure-translation import (the alignment helper above only handles
+        // scaled/rotated layers): pin the re-rendered ink to the imported
+        // boundingBox in text-local space, honoring the justification anchor.
+        const auto psd_local_rect = psd_point_text_local_visual_rect(layer);
+        const auto visible = visible_alpha_local_bounds(base.pixels);
+        if (psd_local_rect.has_value() && visible.has_value()) {
+          // Pixel (0, 0) of the identity render is local point local_rect.topLeft().
+          const QRectF visible_rect(base.local_rect.left() + visible->x, base.local_rect.top() + visible->y,
+                                    visible->width, visible->height);
+          QPointF delta = psd_local_rect->topLeft() - visible_rect.topLeft();
+          const auto factor = layer_anchor_alignment_factor(layer);
+          if (factor > 0.0) {
+            delta.setX((psd_local_rect->left() + factor * psd_local_rect->width()) -
+                       (visible_rect.left() + factor * visible_rect.width()));
+          }
+          if (std::isfinite(delta.x()) && std::isfinite(delta.y())) {
+            transform = qtransform_from_affine(affine_with_local_translation(*canonical, delta));
+            have_transform = true;
+            adopt_transform = true;
+            // Photoshop's own warp box (the imported 'bounds'), expressed in the
+            // raster's local space, keeps the re-render's warp geometry exact.
+            if (const auto psd_bounds =
+                    psd_text_metadata_local_rect(layer, kLayerMetadataPsdTextBounds);
+                psd_bounds.has_value()) {
+              imported_box = psd_bounds->translated(-delta);
+            }
+          }
+        }
+      }
+    }
+  }
+  if (!have_transform) {
+    if (const auto canonical = canonical_text_affine_transform_for_layer(layer); canonical.has_value()) {
+      transform = qtransform_from_affine(*canonical);
+      have_transform = true;
+    }
+  }
+  if (!have_transform) {
+    transform = QTransform::fromTranslate(layer.bounds().x, layer.bounds().y);
+    adopt_transform = true;
+  }
+
+  TextWarp requested = warp;
+  // The reference box is re-derived from the live layout (Photoshop recomputes its
+  // warp box on every text change), except for aligned imports where Photoshop's
+  // own box is available; a stored box never goes stale here.
+  if (imported_box.has_value()) {
+    requested.bounds_left = imported_box->left();
+    requested.bounds_top = imported_box->top();
+    requested.bounds_right = imported_box->right();
+    requested.bounds_bottom = imported_box->bottom();
+  } else {
+    requested.bounds_left = 0.0;
+    requested.bounds_top = 0.0;
+    requested.bounds_right = 0.0;
+    requested.bounds_bottom = 0.0;
+  }
+  if (!text_warp_is_identity(requested)) {
+    TextWarp effective = requested;
+    auto rendered = render_warped_text_pixels_for_layer(*inputs, requested, transform, &effective);
+    if (!rendered.has_value()) {
+      return false;
+    }
+    layer.set_pixels(std::move(rendered->pixels));
+    layer.set_bounds(rendered->bounds);
+    store_text_layout_metrics(layer, rendered->metrics);
+    layer.metadata()[kLayerMetadataTextWarp] = serialize_text_warp(effective);
+  } else {
+    // Style None: back to the plain affine text render (box text included, drawn through the
+    // transform rather than resampled).
+    auto rendered = render_text_layer_pixels_through_transform(layer, transform, /*allow_boxed*/ true);
+    if (!rendered.has_value()) {
+      const auto base = render_text_pixels_with_local_rect(inputs->settings, inputs->color, inputs->max_width,
+                                                           inputs->paragraph_runs, inputs->rich_text_runs);
+      if (base.pixels.empty()) {
+        return false;
+      }
+      if (qtransform_has_non_translation_linear_part(transform)) {
+        auto transformed = apply_text_transform_to_pixels(
+            base.pixels, qtransform_from_affine(affine_with_local_translation(
+                             affine_from_qtransform(transform), base.local_rect.topLeft())));
+        rendered = TransformedTextPixels{std::move(transformed.pixels), transformed.bounds, base.metrics};
+      } else {
+        const auto mapped = transform.map(base.local_rect.topLeft());
+        rendered = TransformedTextPixels{base.pixels,
+                                         Rect{static_cast<std::int32_t>(std::floor(mapped.x())),
+                                              static_cast<std::int32_t>(std::floor(mapped.y())),
+                                              base.pixels.width(), base.pixels.height()},
+                                         base.metrics};
+      }
+    }
+    layer.set_pixels(std::move(rendered->pixels));
+    layer.set_bounds(rendered->bounds);
+    store_text_layout_metrics(layer, rendered->metrics);
+    layer.metadata().erase(kLayerMetadataTextWarp);
+  }
+  if (adopt_transform || !layer.metadata().contains(kLayerMetadataTextTransform)) {
+    layer.metadata()[kLayerMetadataTextTransform] = serialize_layer_affine_transform(
+        LayerAffineTransform{transform.m11(), transform.m12(), transform.m21(), transform.m22(),
+                             transform.dx(), transform.dy()});
+  }
+  layer.metadata()[kLayerMetadataTextRasterStatus] = "patchy_raster";
+  return true;
+}
+
+namespace {
+
+// Character-panel edits depend on each fragment's own exact size (mixed-size selections), so
+// they mutate per-fragment formats instead of merging one uniform format. Applies to the
+// selection, or the whole document when nothing is selected, plus the typing format so newly
+// typed characters inherit the change.
+void mutate_text_editor_character_formats(QTextEdit& editor,
+                                          const std::function<void(QTextCharFormat&)>& mutate) {
+  auto* document = editor.document();
+  if (document == nullptr) {
+    return;
+  }
+  const auto selection = editor.textCursor();
+  const int document_end = std::max(0, static_cast<int>(document->characterCount()) - 1);
+  const int begin = selection.hasSelection() ? selection.selectionStart() : 0;
+  const int end = selection.hasSelection() ? selection.selectionEnd() : document_end;
+  struct FormatRange {
+    int position{0};
+    int length{0};
+    QTextCharFormat format;
+  };
+  std::vector<FormatRange> ranges;
+  for (auto block = document->begin(); block.isValid(); block = block.next()) {
+    for (auto fragment_it = block.begin(); !fragment_it.atEnd(); ++fragment_it) {
+      const auto fragment = fragment_it.fragment();
+      if (!fragment.isValid() || fragment.length() <= 0) {
+        continue;
+      }
+      const int from = std::max(begin, fragment.position());
+      const int to = std::min(end, fragment.position() + fragment.length());
+      if (from >= to) {
+        continue;
+      }
+      auto format = fragment.charFormat();
+      mutate(format);
+      ranges.push_back(FormatRange{from, to - from, std::move(format)});
+    }
+  }
+  for (const auto& range : ranges) {
+    QTextCursor cursor(document);
+    cursor.setPosition(range.position);
+    cursor.setPosition(range.position + range.length, QTextCursor::KeepAnchor);
+    cursor.setCharFormat(range.format);
+  }
+  auto typing = editor.currentCharFormat();
+  mutate(typing);
+  editor.setCurrentCharFormat(typing);
+}
+
+// The vertical-scale-free FontSize basis of a format, tolerating formats whose pixel size
+// already folds an older vertical scale in (photoshop_char_exact_size would double-fold it).
+double character_format_size_basis(const QTextCharFormat& format) {
+  if (format.hasProperty(kTextExactSizeFormatProperty)) {
+    const auto exact = format.property(kTextExactSizeFormatProperty).toDouble();
+    if (std::isfinite(exact) && exact > 0.0) {
+      return exact;
+    }
+  }
+  double old_vertical = 1.0;
+  if (format.hasProperty(kTextVerticalScaleFormatProperty)) {
+    const auto value = format.property(kTextVerticalScaleFormatProperty).toDouble();
+    if (std::isfinite(value) && value > 0.01 && value < 100.0) {
+      old_vertical = value;
+    }
+  }
+  const auto font = format.font();
+  if (font.pixelSize() > 0) {
+    return static_cast<double>(font.pixelSize()) / old_vertical;
+  }
+  return font.pointSizeF() > 0.0 ? font.pointSizeF() : 12.0;
+}
+
+double character_format_scale_property(const QTextCharFormat& format, int property_id) {
+  if (format.hasProperty(property_id)) {
+    const auto value = format.property(property_id).toDouble();
+    if (std::isfinite(value) && value > 0.01 && value < 100.0) {
+      return value;
+    }
+  }
+  return 1.0;
+}
+
+}  // namespace
+
+namespace {
+
+// Character-panel numbers apply on Enter, focus loss or a +/- click, never per keystroke:
+// with keyboard tracking on, deleting the "2" of "-200" applied "-00" at once, the apply
+// re-synced the panel from the layer and the field went blank under the user's cursor.
+template <typename Spin>
+void configure_text_character_spin(Spin* spin) {
+  spin->setKeyboardTracking(false);
+  spin->setButtonSymbols(QAbstractSpinBox::PlusMinus);
+  spin->setAccelerated(true);
+}
+
+}  // namespace
+
+void MainWindow::open_text_character_dialog() {
+  if (text_character_dialog_ != nullptr) {
+    text_character_dialog_->show();
+    text_character_dialog_->raise();
+    text_character_dialog_->activateWindow();
+    sync_text_character_dialog_from_editor();
+    return;
+  }
+  auto* dialog = new QDialog(this);
+  dialog->setAttribute(Qt::WA_DeleteOnClose);
+  dialog->setObjectName(QStringLiteral("textCharacterDialog"));
+  dialog->setWindowTitle(tr("Character"));
+  text_character_dialog_ = dialog;
+  auto* layout = new QFormLayout(dialog);
+
+  text_character_hint_label_ = new QLabel(tr("Select a text layer or click in text with the Type tool to edit these settings."), dialog);
+  text_character_hint_label_->setObjectName(QStringLiteral("textCharacterHint"));
+  text_character_hint_label_->setWordWrap(true);
+  set_themed_style(*text_character_hint_label_, QStringLiteral("color: @hint_text;"));
+  layout->addRow(text_character_hint_label_);
+
+  // Character styles first (GitHub issue 346): two centred rows of eight toggles, each split in
+  // fours by a gap, so the buttons never widen the dialog's fields. The first row holds faux
+  // bold, faux italic, the bars, the caps and the scripts; the second the OpenType features. The
+  // buttons keep no focus, so the keyboard stays in a live text session.
+  {
+    const auto make_button = [](QWidget* parent, const char* object_name, int icon, const QString& name,
+                                const QString& detail) {
+      auto* button = new QPushButton(parent);
+      button->setObjectName(QLatin1String(object_name));
+      button->setCheckable(true);
+      button->setFocusPolicy(Qt::NoFocus);
+      button->setIcon(text_character_style_icon(icon));
+      button->setIconSize(QSize(20, 20));
+      button->setFixedSize(30, 26);
+      button->setToolTip(detail.isEmpty() ? name : name + QLatin1Char('\n') + detail);
+      button->setAccessibleName(name);
+      return button;
+    };
+    struct StyleButton {
+      const char* object_name;
+      QString tooltip;
+    };
+    // In apply_text_character_style_to_active_editor order; the icon is
+    // text_character_style_icon(index), or index + 2 past the faux pair's 8 and 9.
+    const std::array<StyleButton, 14> styles{{
+        {"textCharacterAllCapsButton", tr("All Caps")},
+        {"textCharacterSmallCapsButton", tr("Small Caps")},
+        {"textCharacterSuperscriptButton", tr("Superscript")},
+        {"textCharacterSubscriptButton", tr("Subscript")},
+        {"textCharacterUnderlineButton", tr("Underline")},
+        {"textCharacterStrikethroughButton", tr("Strikethrough")},
+        {"textCharacterOrdinalsButton", tr("Ordinals (fonts that have them)")},
+        {"textCharacterFractionsButton", tr("Fractions (fonts that have them)")},
+        {"textCharacterLigaturesButton", tr("Standard Ligatures (fonts that have them)")},
+        {"textCharacterContextualAlternatesButton", tr("Contextual Alternates (fonts that have them)")},
+        {"textCharacterDiscretionaryLigaturesButton", tr("Discretionary Ligatures (fonts that have them)")},
+        {"textCharacterSwashButton", tr("Swash (fonts that have them)")},
+        {"textCharacterStylisticAlternatesButton", tr("Stylistic Alternates (fonts that have them)")},
+        {"textCharacterTitlingAlternatesButton", tr("Titling Alternates (fonts that have them)")},
+    }};
+    auto* rows = new QWidget(dialog);
+    rows->setObjectName(QStringLiteral("textCharacterStyleRow"));
+    auto* rows_layout = new QVBoxLayout(rows);
+    rows_layout->setContentsMargins(0, 0, 0, 0);
+    rows_layout->setSpacing(2);
+    const auto style_button = [&](int index, QWidget* parent) {
+      const auto& style = styles[static_cast<std::size_t>(index)];
+      auto* button = make_button(parent, style.object_name, index < 8 ? index : index + 2, style.tooltip, QString());
+      connect(button, &QPushButton::toggled, this,
+              [this, index](bool on) { apply_text_character_style_to_active_editor(index, on); });
+      text_character_style_buttons_[static_cast<std::size_t>(index)] = button;
+      return button;
+    };
+    // -1 and -2 are the faux pair; every other entry is a style index.
+    constexpr std::array<std::array<int, 8>, 2> kRows{{{-1, -2, 4, 5, 0, 1, 2, 3}, {8, 9, 10, 11, 12, 13, 6, 7}}};
+    for (std::size_t r = 0; r < kRows.size(); ++r) {
+      auto* row = new QWidget(rows);
+      row->setObjectName(r == 0 ? QStringLiteral("textCharacterStyleRow1") : QStringLiteral("textCharacterStyleRow2"));
+      auto* row_layout = new QHBoxLayout(row);
+      row_layout->setContentsMargins(0, 0, 0, 0);
+      row_layout->setSpacing(2);
+      row_layout->addStretch(1);
+      for (std::size_t slot = 0; slot < kRows[r].size(); ++slot) {
+        if (slot == 4) {
+          row_layout->addSpacing(8);
+        }
+        const int entry = kRows[r][slot];
+        QPushButton* button = nullptr;
+        if (entry == -1) {
+          button = text_character_faux_bold_ = make_button(
+              row, "textCharacterFauxBold", 8, tr("Faux bold"),
+              tr("Thicken the current face synthetically instead of switching to the family's bold face"));
+        } else if (entry == -2) {
+          button = text_character_faux_italic_ = make_button(
+              row, "textCharacterFauxItalic", 9, tr("Faux italic"),
+              tr("Slant the current face synthetically instead of switching to the family's italic face"));
+        } else {
+          button = style_button(entry, row);
+        }
+        row_layout->addWidget(button);
+      }
+      row_layout->addStretch(1);
+      rows_layout->addWidget(row);
+    }
+    layout->addRow(rows);
+  }
+
+  text_character_leading_spin_ = new UnitSpinBox(SpinUnit::Points, dialog);
+  text_character_leading_spin_->setObjectName(QStringLiteral("textCharacterLeadingSpin"));
+  text_character_leading_spin_->set_context_provider([this] {
+    return UnitConversionContext{has_active_document() ? text_size_ppi(document()) : 300.0, 0.0};
+  });
+  text_character_leading_spin_->setDecimals(2);
+  text_character_leading_spin_->setRange(0.01, 10000.0);
+  text_character_leading_spin_->setSingleStep(0.5);
+  text_character_leading_spin_->setToolTip(tr("Line spacing (Photoshop leading). Entering a value turns Auto leading off."));
+  configure_dialog_spinbox(text_character_leading_spin_);
+  configure_text_character_spin(text_character_leading_spin_);
+  layout->addRow(tr("Leading:"), text_character_leading_spin_);
+  // Auto leading sits directly under the field it governs.
+  text_character_auto_leading_ = new QCheckBox(tr("Auto leading"), dialog);
+  text_character_auto_leading_->setObjectName(QStringLiteral("textCharacterAutoLeading"));
+  layout->addRow(QString(), text_character_auto_leading_);
+
+  text_character_tracking_spin_ = new QSpinBox(dialog);
+  text_character_tracking_spin_->setObjectName(QStringLiteral("textCharacterTrackingSpin"));
+  text_character_tracking_spin_->setRange(-1000, 1000);
+  text_character_tracking_spin_->setSingleStep(10);
+  text_character_tracking_spin_->setToolTip(tr("Space between characters, in 1/1000 em (Photoshop tracking)"));
+  configure_dialog_spinbox(text_character_tracking_spin_);
+  configure_text_character_spin(text_character_tracking_spin_);
+  layout->addRow(tr("Tracking:"), text_character_tracking_spin_);
+
+  text_character_h_scale_spin_ = new QSpinBox(dialog);
+  text_character_h_scale_spin_->setObjectName(QStringLiteral("textCharacterHScaleSpin"));
+  text_character_h_scale_spin_->setRange(1, 1000);
+  text_character_h_scale_spin_->setSuffix(tr(" %"));
+  configure_dialog_spinbox(text_character_h_scale_spin_);
+  configure_text_character_spin(text_character_h_scale_spin_);
+  layout->addRow(tr("Horizontal scale:"), text_character_h_scale_spin_);
+
+  text_character_v_scale_spin_ = new QSpinBox(dialog);
+  text_character_v_scale_spin_->setObjectName(QStringLiteral("textCharacterVScaleSpin"));
+  text_character_v_scale_spin_->setRange(1, 1000);
+  text_character_v_scale_spin_->setSuffix(tr(" %"));
+  configure_dialog_spinbox(text_character_v_scale_spin_);
+  configure_text_character_spin(text_character_v_scale_spin_);
+  layout->addRow(tr("Vertical scale:"), text_character_v_scale_spin_);
+
+  text_character_rotate_roman_ = new QCheckBox(tr("Rotate Latin (vertical text)"), dialog);
+  text_character_rotate_roman_->setObjectName(QStringLiteral("textCharacterRotateRoman"));
+  text_character_rotate_roman_->setToolTip(
+      tr("Lay Latin letters on their side along the column instead of upright (Photoshop's Standard Vertical Roman Alignment)"));
+  layout->addRow(QString(), text_character_rotate_roman_);
+
+  // Anti-aliasing (GitHub issue 673: off the options bar, so the panel carries it next to Type >
+  // Anti-Alias). Like the menu it also sets what the next new layer takes, so it stays enabled
+  // with no text to edit.
+  text_character_anti_alias_combo_ = new QComboBox(dialog);
+  text_character_anti_alias_combo_->setObjectName(QStringLiteral("textCharacterAntiAliasCombo"));
+  text_character_anti_alias_combo_->setToolTip(tr("How smooth the text's edges are (anti-aliasing)"));
+  text_character_anti_alias_combo_->addItem(tr("None"), kTextAntiAliasNone);
+  text_character_anti_alias_combo_->addItem(tr("Sharp"), kTextAntiAliasSharp);
+  text_character_anti_alias_combo_->addItem(tr("Crisp"), kTextAntiAliasCrisp);
+  text_character_anti_alias_combo_->addItem(tr("Strong"), kTextAntiAliasStrong);
+  text_character_anti_alias_combo_->addItem(tr("Smooth"), kTextAntiAliasSmooth);
+  text_character_anti_alias_combo_->addItem(tr("Windows LCD"), kTextAntiAliasWindowsLcd);
+  text_character_anti_alias_combo_->addItem(tr("Windows"), kTextAntiAliasWindows);
+  set_text_smoothing_combo_value(text_character_anti_alias_combo_, text_anti_alias_);
+  layout->addRow(tr("Anti-alias:"), text_character_anti_alias_combo_);
+  connect(text_character_anti_alias_combo_, QOverload<int>::of(&QComboBox::activated), this, [this](int) {
+    choose_text_anti_alias(text_smoothing_combo_value(text_character_anti_alias_combo_));
+  });
+
+  connect(text_character_auto_leading_, &QCheckBox::toggled, this,
+          [this](bool) { apply_text_character_leading_to_active_editor(); });
+  connect(text_character_faux_bold_, &QPushButton::toggled, this,
+          [this](bool on) { apply_text_character_faux_bold_to_active_editor(on); });
+  connect(text_character_faux_italic_, &QPushButton::toggled, this,
+          [this](bool on) { apply_text_character_faux_italic_to_active_editor(on); });
+  connect(text_character_rotate_roman_, &QCheckBox::toggled, this,
+          [this](bool) { apply_text_character_rotate_roman_to_active_editor(); });
+  connect(text_character_leading_spin_, &QDoubleSpinBox::valueChanged, this, [this](double) {
+    // Photoshop's leading field is never locked: entering a value is what turns Auto off.
+    if (text_character_auto_leading_ != nullptr && text_character_auto_leading_->isChecked()) {
+      const QSignalBlocker blocker(text_character_auto_leading_);
+      text_character_auto_leading_->setChecked(false);
+    }
+    apply_text_character_leading_to_active_editor();
+  });
+  connect(text_character_tracking_spin_, &QSpinBox::valueChanged, this,
+          [this](int) { apply_text_character_tracking_to_active_editor(); });
+  connect(text_character_h_scale_spin_, &QSpinBox::valueChanged, this,
+          [this](int) { apply_text_character_glyph_scales_to_active_editor(); });
+  connect(text_character_v_scale_spin_, &QSpinBox::valueChanged, this,
+          [this](int) { apply_text_character_glyph_scales_to_active_editor(); });
+
+  // Sub-control gotcha: the spin-button style must land AFTER all children exist.
+  append_themed_style(*dialog, dialog_spinbox_button_style());
+  sync_text_character_dialog_from_editor();
+  return_keyboard_after_text_panel_edits(*dialog);
+  run_non_modal_dialog(*dialog);
+  // WA_DeleteOnClose destroyed the dialog when the nested loop unwound.
+  text_character_hint_label_ = nullptr;
+  text_character_auto_leading_ = nullptr;
+  text_character_leading_spin_ = nullptr;
+  text_character_tracking_spin_ = nullptr;
+  text_character_h_scale_spin_ = nullptr;
+  text_character_v_scale_spin_ = nullptr;
+  text_character_faux_bold_ = nullptr;
+  text_character_faux_italic_ = nullptr;
+  text_character_rotate_roman_ = nullptr;
+  text_character_anti_alias_combo_ = nullptr;
+  text_character_style_buttons_.fill(nullptr);
+}
+
+std::vector<LayerId> MainWindow::text_character_target_layer_ids() const {
+  if (canvas_ == nullptr || !has_active_document() || preview_dialog_edit_locked() ||
+      canvas_->free_transform_active() || canvas_->warp_transform_active()) {
+    return {};
+  }
+  // The active layer leads so text_character_target_layer() keeps answering what the panel
+  // and the options bar show; the rest of the panel selection follows in row order.
+  std::vector<LayerId> ids;
+  const auto active = document().active_layer_id();
+  const auto accept = [&](LayerId id) {
+    if (std::ranges::find(ids, id) != ids.end()) {
+      return;
+    }
+    const auto* layer = std::as_const(document()).find_layer(id);
+    if (layer != nullptr && layer_is_text(*layer) && !layer_id_locks_image_pixels(id)) {
+      ids.push_back(id);
+    }
+  };
+  if (active.has_value()) {
+    accept(*active);
+  }
+  for (const auto id : selected_or_active_layer_ids()) {
+    accept(id);
+  }
+  return ids;
+}
+
+const Layer* MainWindow::text_character_target_layer() const {
+  const auto ids = text_character_target_layer_ids();
+  return ids.empty() ? nullptr : std::as_const(document()).find_layer(ids.front());
+}
+
+void MainWindow::edit_text_layer(LayerId id) {
+  if (canvas_ == nullptr || !has_active_document() || preview_dialog_edit_locked()) {
+    return;
+  }
+  finish_active_text_editor();
+  const auto* layer = std::as_const(document()).find_layer(id);
+  if (layer == nullptr || !layer_is_text(*layer)) {
+    return;
+  }
+  const auto bounds = layer->bounds();
+  document().set_active_layer(id);
+  reveal_layer_in_layer_list(id);
+  add_text_at(QPoint(bounds.x + bounds.width / 2, bounds.y + bounds.height / 2), {}, true, std::nullopt, id);
+  if (auto* editor = canvas_->findChild<QTextEdit*>(QStringLiteral("inlineTextEditor"));
+      editor != nullptr && editor->property("patchy.editingLayerId").toULongLong() == id) {
+    editor->selectAll();
+    editor->setFocus(Qt::OtherFocusReason);
+  }
+}
+
+void MainWindow::apply_text_character_edit(const std::function<bool(QTextEdit&)>& edit) {
+  if (canvas_ == nullptr || preview_dialog_edit_locked()) {
+    return;
+  }
+  // The bar's toggles read the result again even when a refused edit left the layer as it was.
+  text_options_toggles_sync_key_.clear();
+  const QPointer<QWidget> previous_focus(QApplication::focusWidget());
+  auto* editor = canvas_->findChild<QTextEdit*>(QStringLiteral("inlineTextEditor"));
+  const bool session_open = editor != nullptr && !editor->property(kTextEditorFinishedProperty).toBool();
+  if (session_open) {
+    if (edit(*editor)) {
+      mark_text_editor_changed(editor);
+      schedule_text_editor_preview(editor);
+    }
+    sync_text_character_dialog_from_editor();
+    return;
+  }
+
+  // No session: every selected unlocked text layer gets the edit through its own hidden
+  // session (Photoshop applies a Character or options-bar change to all selected type
+  // layers), committed as ONE "Type" undo step. A nested call (a widget the hidden session
+  // rewrites firing its slot) must not start a second pass.
+  const auto targets = text_character_target_layer_ids();
+  if (targets.empty() || applying_text_options_to_layers_) {
+    sync_text_character_dialog_from_editor();
+    return;
+  }
+  applying_text_options_to_layers_ = true;
+  const auto original_active = document().active_layer_id();
+  const auto original_selection = selected_layer_ids();
+  // A refused layer's status error (its lambda showed one) must outlive the commits that
+  // follow it, which put their own "Type" label on the bar.
+  QString refusal_message;
+  const auto cleanup = qScopeGuard([this, previous_focus, original_active, original_selection, &refusal_message] {
+    applying_text_options_to_layers_ = false;
+    text_commit_snapshot_suppressed_ = false;
+    if (original_active.has_value() && document().find_layer(*original_active) != nullptr) {
+      document().set_active_layer(*original_active);
+    }
+    // Every commit rebuilds the layer rows, which collapses a multi-selection to the active
+    // row; put the selection back so a second change works on the same set.
+    if (original_selection.size() > 1U) {
+      select_layers_in_layer_list(original_selection, original_active.value_or(original_selection.front()));
+    }
+    refresh_layer_controls();
+    sync_text_options_from_active_layer();
+    sync_text_alignment_buttons_from_editor();
+    refresh_text_color_button();
+    sync_text_character_dialog_from_editor();
+    if (!refusal_message.isEmpty()) {
+      show_status_error(refusal_message);
+    }
+    // Commit refreshes can temporarily disable the panel while snapshotting.
+    // Keep subsequent typing in the control that initiated the layer edit.
+    if (previous_focus != nullptr && previous_focus->isEnabled()) {
+      previous_focus->setFocus(Qt::OtherFocusReason);
+    }
+  });
+  bool snapshot_taken = false;
+  for (const auto id : targets) {
+    const auto* layer = std::as_const(document()).find_layer(id);
+    if (layer == nullptr) {
+      continue;
+    }
+    const auto bounds = layer->bounds();
+    document().set_active_layer(id);
+    add_text_at(QPoint(bounds.x + bounds.width / 2, bounds.y + bounds.height / 2), {}, false, std::nullopt, id);
+    QPointer<QTextEdit> hidden = canvas_->findChild<QTextEdit*>(QStringLiteral("inlineTextEditor"));
+    if (hidden == nullptr) {
+      continue;
+    }
+    // Keep refreshes during the commit from treating the hidden transaction as
+    // an interactive session. The layer stays visible throughout.
+    hidden->setObjectName(QString());
+    if (!edit(*hidden)) {
+      // Refused for this layer (faux bold on warped text); the others still get the edit.
+      refusal_message = statusBar()->currentMessage();
+      cancel_text_editor(hidden, id);
+      statusBar()->showMessage(refusal_message);
+      continue;
+    }
+    mark_text_editor_changed(hidden);
+    const QPoint origin(hidden->property("patchy.documentTextX").toInt(),
+                        hidden->property("patchy.documentTextY").toInt());
+    // The first commit that reaches a push site takes the snapshot (it still holds every
+    // layer's pre-edit state); the later commits skip theirs.
+    text_commit_snapshot_suppressed_ = snapshot_taken;
+    const auto depth_before = session().history.undo_stack().size();
+    commit_text_editor(hidden, origin, id);
+    snapshot_taken = snapshot_taken || session().history.undo_stack().size() != depth_before;
+  }
+}
+
+void MainWindow::sync_text_character_dialog_from_editor() {
+  // The Paragraph panel and the options bar's style toggles mirror the same session-or-layer
+  // state at every one of these sites.
+  sync_text_paragraph_dialog_from_editor();
+  sync_text_options_bar_toggles();
+  if (text_character_dialog_ == nullptr || text_character_auto_leading_ == nullptr ||
+      text_character_leading_spin_ == nullptr || text_character_tracking_spin_ == nullptr ||
+      text_character_h_scale_spin_ == nullptr || text_character_v_scale_spin_ == nullptr ||
+      text_character_faux_bold_ == nullptr || text_character_faux_italic_ == nullptr ||
+      text_character_hint_label_ == nullptr) {
+    return;
+  }
+  auto* editor =
+      canvas_ != nullptr ? canvas_->findChild<QTextEdit*>(QStringLiteral("inlineTextEditor")) : nullptr;
+  const bool session_open = editor != nullptr && !editor->property(kTextEditorFinishedProperty).toBool();
+  const auto* layer = session_open ? nullptr : text_character_target_layer();
+  const auto inputs = layer != nullptr ? text_render_inputs_from_layer(*layer) : std::nullopt;
+  const bool enabled = !preview_dialog_edit_locked() && (session_open || inputs.has_value());
+  text_character_hint_label_->setVisible(!enabled);
+  text_character_auto_leading_->setEnabled(enabled);
+  text_character_tracking_spin_->setEnabled(enabled);
+  text_character_h_scale_spin_->setEnabled(enabled);
+  text_character_v_scale_spin_->setEnabled(enabled);
+  text_character_faux_bold_->setEnabled(enabled);
+  text_character_faux_italic_->setEnabled(enabled);
+  for (auto* button : text_character_style_buttons_) {
+    if (button != nullptr) {
+      button->setEnabled(enabled);
+    }
+  }
+  // Only vertical text has a Roman orientation to choose.
+  const bool vertical_target =
+      session_open ? text_editor_is_vertical(*editor) : (layer != nullptr && layer_text_is_vertical(*layer));
+  if (text_character_rotate_roman_ != nullptr) {
+    text_character_rotate_roman_->setEnabled(enabled && vertical_target);
+  }
+  if (!enabled) {
+    text_character_leading_spin_->setEnabled(false);
+    return;
+  }
+  QTextCharFormat format;
+  double zoom = 1.0;
+  double display_scale = 1.0;
+  if (session_open) {
+    format = text_editor_reference_format(*editor);
+    zoom = std::max(0.0001, canvas_->zoom());
+    display_scale = text_editor_size_display_scale(*editor);
+  } else {
+    const auto built = build_text_render_document(inputs->settings, inputs->color, inputs->max_width,
+                                                   inputs->paragraph_runs, inputs->rich_text_runs, 1.0);
+    format = QTextCursor(built.document.get()).charFormat();
+    if (const auto affine = canonical_text_affine_transform_for_layer(*layer); affine.has_value()) {
+      const auto scale = std::hypot((*affine)[2], (*affine)[3]);
+      if (std::isfinite(scale) && scale > 0.01) {
+        display_scale = scale;
+      }
+    }
+  }
+  const auto to_display_pt = [this, zoom, display_scale](double editor_px) {
+    return editor_px / zoom * display_scale * 72.0 / text_size_ppi(document());
+  };
+  const auto fixed_leading = format.hasProperty(kTextLeadingFormatProperty)
+                                 ? format.property(kTextLeadingFormatProperty).toDouble()
+                                 : 0.0;
+  const bool has_fixed = std::isfinite(fixed_leading) && fixed_leading > 0.0;
+  const bool auto_leading = format.hasProperty(kTextAutoLeadingFormatProperty)
+                                ? format.property(kTextAutoLeadingFormatProperty).toBool()
+                                : !has_fixed;
+  QSignalBlocker block_auto(text_character_auto_leading_);
+  QSignalBlocker block_leading(text_character_leading_spin_);
+  QSignalBlocker block_tracking(text_character_tracking_spin_);
+  QSignalBlocker block_h(text_character_h_scale_spin_);
+  QSignalBlocker block_v(text_character_v_scale_spin_);
+  QSignalBlocker block_faux_bold(text_character_faux_bold_);
+  QSignalBlocker block_faux_italic(text_character_faux_italic_);
+  text_character_faux_bold_->setChecked(format.hasProperty(kTextFauxBoldFormatProperty) &&
+                                        format.property(kTextFauxBoldFormatProperty).toBool());
+  text_character_faux_italic_->setChecked(format.hasProperty(kTextFauxItalicFormatProperty) &&
+                                          format.property(kTextFauxItalicFormatProperty).toBool());
+  {
+    const auto styles = text_character_styles_from_format(format);
+    const std::array<bool, 14> checked{styles.caps == 2,
+                                       styles.caps == 1,
+                                       styles.baseline == 1,
+                                       styles.baseline == 2,
+                                       styles.underline,
+                                       styles.strikethrough,
+                                       styles.ordinals,
+                                       styles.fractions,
+                                       styles.ligatures,
+                                       styles.contextual_alternates,
+                                       styles.discretionary_ligatures,
+                                       styles.swash,
+                                       styles.stylistic_alternates,
+                                       styles.titling_alternates};
+    for (std::size_t index = 0; index < checked.size(); ++index) {
+      if (auto* button = text_character_style_buttons_[index]; button != nullptr) {
+        const QSignalBlocker block_style(button);
+        button->setChecked(checked[index]);
+      }
+    }
+  }
+  if (text_character_rotate_roman_ != nullptr) {
+    QSignalBlocker block_rotate(text_character_rotate_roman_);
+    text_character_rotate_roman_->setChecked(format.hasProperty(kTextRotatedRomanFormatProperty) &&
+                                             format.property(kTextRotatedRomanFormatProperty).toBool());
+  }
+  text_character_auto_leading_->setChecked(auto_leading);
+  text_character_leading_spin_->setEnabled(true);
+  const auto leading_pt = auto_leading || !has_fixed
+                              ? to_display_pt(1.2 * character_format_size_basis(format))
+                              : to_display_pt(fixed_leading);
+  text_character_leading_spin_->setValue(std::clamp(leading_pt, text_character_leading_spin_->minimum(),
+                                                    text_character_leading_spin_->maximum()));
+  const auto tracking = format.hasProperty(kTextTrackingFormatProperty)
+                            ? format.property(kTextTrackingFormatProperty).toDouble()
+                            : 0.0;
+  text_character_tracking_spin_->setValue(
+      std::clamp(static_cast<int>(std::lround(std::isfinite(tracking) ? tracking : 0.0)), -1000, 1000));
+  text_character_h_scale_spin_->setValue(std::clamp(
+      static_cast<int>(std::lround(character_format_scale_property(format, kTextHorizontalScaleFormatProperty) * 100.0)),
+      1, 1000));
+  text_character_v_scale_spin_->setValue(std::clamp(
+      static_cast<int>(std::lround(character_format_scale_property(format, kTextVerticalScaleFormatProperty) * 100.0)),
+      1, 1000));
+}
+
+void MainWindow::apply_text_character_leading_to_active_editor() {
+  if (canvas_ == nullptr || text_character_auto_leading_ == nullptr || text_character_leading_spin_ == nullptr) {
+    return;
+  }
+  const bool auto_leading = text_character_auto_leading_->isChecked();
+  const auto leading_pt = text_character_leading_spin_->value();
+  apply_text_character_edit([this, auto_leading, leading_pt](QTextEdit& editor) {
+    const auto zoom = std::max(0.0001, canvas_->zoom());
+    const auto display_scale = text_editor_size_display_scale(editor);
+    const auto leading_editor_px =
+        auto_leading ? 0.0
+                     : std::max(0.0, leading_pt * text_size_ppi(document()) / 72.0 /
+                                         display_scale * zoom);
+    mutate_text_editor_character_formats(editor, [auto_leading, leading_editor_px](QTextCharFormat& format) {
+      format.setProperty(kTextAutoLeadingFormatProperty, auto_leading);
+      format.setProperty(kTextLeadingFormatProperty, leading_editor_px);
+    });
+    // Explicit leading only renders under the Photoshop layout model; a native layer edited
+    // through the panel opts in for this session, and the commit persists the marker.
+    editor.setProperty("patchy.textLayoutMode", QString::fromLatin1(kTextLayoutModePhotoshop));
+    return true;
+  });
+}
+
+void MainWindow::apply_text_character_tracking_to_active_editor() {
+  if (canvas_ == nullptr || text_character_tracking_spin_ == nullptr) {
+    return;
+  }
+  const auto tracking = static_cast<double>(text_character_tracking_spin_->value());
+  apply_text_character_edit([tracking](QTextEdit& editor) {
+    mutate_text_editor_character_formats(editor, [tracking](QTextCharFormat& format) {
+      format.setProperty(kTextTrackingFormatProperty, tracking);
+      // Photoshop tracking: 1/1000 em of the FontSize basis, scaled by the horizontal glyph
+      // scale (the whole advance scales with H; V never affects it).
+      const auto size_basis = character_format_size_basis(format);
+      const auto horizontal = character_format_scale_property(format, kTextHorizontalScaleFormatProperty);
+      auto font = format.font();
+      font.setLetterSpacing(QFont::AbsoluteSpacing, tracking / 1000.0 * size_basis * horizontal);
+      format.setFont(font);
+    });
+    return true;
+  });
+}
+
+void MainWindow::apply_text_character_glyph_scales_to_active_editor() {
+  if (canvas_ == nullptr || text_character_h_scale_spin_ == nullptr || text_character_v_scale_spin_ == nullptr) {
+    return;
+  }
+  const auto horizontal = std::clamp(text_character_h_scale_spin_->value(), 1, 1000) / 100.0;
+  const auto vertical = std::clamp(text_character_v_scale_spin_->value(), 1, 1000) / 100.0;
+  apply_text_character_edit([horizontal, vertical](QTextEdit& editor) {
+    mutate_text_editor_character_formats(editor, [horizontal, vertical](QTextCharFormat& format) {
+      const auto exact = character_format_size_basis(format);
+      format.setProperty(kTextExactSizeFormatProperty, exact);
+      format.setProperty(kTextHorizontalScaleFormatProperty, horizontal);
+      format.setProperty(kTextVerticalScaleFormatProperty, vertical);
+      auto font = format.font();
+      if (font.pixelSize() > 0 || font.pointSizeF() <= 0.0) {
+        font.setPixelSize(std::max(1, static_cast<int>(std::lround(exact * vertical))));
+      }
+      const auto stretch_ratio = horizontal / vertical;
+      set_stretch_for_advance_ratio(
+          font, stretch_ratio,
+          std::clamp(static_cast<int>(std::lround(stretch_ratio * 100.0)), 1, 400));
+      const auto tracking = format.hasProperty(kTextTrackingFormatProperty)
+                                ? format.property(kTextTrackingFormatProperty).toDouble()
+                                : 0.0;
+      if (std::isfinite(tracking) && std::abs(tracking) > 0.0001) {
+        font.setLetterSpacing(QFont::AbsoluteSpacing, tracking / 1000.0 * exact * horizontal);
+      }
+      format.setFont(font);
+    });
+    return true;
+  });
+}
+
+void MainWindow::open_text_paragraph_dialog() {
+  if (text_paragraph_dialog_ != nullptr) {
+    text_paragraph_dialog_->show();
+    text_paragraph_dialog_->raise();
+    text_paragraph_dialog_->activateWindow();
+    sync_text_paragraph_dialog_from_editor();
+    return;
+  }
+  auto* dialog = new QDialog(this);
+  dialog->setAttribute(Qt::WA_DeleteOnClose);
+  dialog->setObjectName(QStringLiteral("textParagraphDialog"));
+  dialog->setWindowTitle(tr("Paragraph"));
+  text_paragraph_dialog_ = dialog;
+  auto* layout = new QFormLayout(dialog);
+
+  text_paragraph_hint_label_ =
+      new QLabel(tr("Select a text layer or click in text with the Type tool to edit these settings."), dialog);
+  text_paragraph_hint_label_->setObjectName(QStringLiteral("textParagraphHint"));
+  text_paragraph_hint_label_->setWordWrap(true);
+  set_themed_style(*text_paragraph_hint_label_, QStringLiteral("color: @hint_text;"));
+  layout->addRow(text_paragraph_hint_label_);
+
+  text_paragraph_align_combo_ = new QComboBox(dialog);
+  text_paragraph_align_combo_->setObjectName(QStringLiteral("textParagraphAlignCombo"));
+  text_paragraph_align_combo_->addItem(tr("Left"), QStringLiteral("left"));
+  text_paragraph_align_combo_->addItem(tr("Center"), QStringLiteral("center"));
+  text_paragraph_align_combo_->addItem(tr("Right"), QStringLiteral("right"));
+  text_paragraph_align_combo_->addItem(tr("Justify (last line left)"), QStringLiteral("justify"));
+  text_paragraph_align_combo_->addItem(tr("Justify (last line centered)"), QStringLiteral("justifyCenter"));
+  text_paragraph_align_combo_->addItem(tr("Justify (last line right)"), QStringLiteral("justifyRight"));
+  text_paragraph_align_combo_->addItem(tr("Justify all"), QStringLiteral("justifyAll"));
+  text_paragraph_align_combo_->setToolTip(
+      tr("Paragraph alignment. The Justify choices spread each line of a text box across it and differ in where "
+         "the last line goes; point text stays flush left"));
+  layout->addRow(tr("Alignment:"), text_paragraph_align_combo_);
+
+  // Paragraph direction lives here, as in Photoshop's Paragraph panel, next to a mirror of the
+  // options bar's Vertical toggle; the bar keeps only the toggle (GitHub issue 91).
+  text_direction_combo_ = new QComboBox(dialog);
+  text_direction_combo_->setObjectName(QStringLiteral("textDirectionCombo"));
+  text_direction_combo_->setToolTip(tr("Paragraph direction (auto follows the first strong character)"));
+  text_direction_combo_->addItem(tr("Auto"), static_cast<int>(Qt::LayoutDirectionAuto));
+  text_direction_combo_->addItem(tr("Left to right"), static_cast<int>(Qt::LeftToRight));
+  text_direction_combo_->addItem(tr("Right to left"), static_cast<int>(Qt::RightToLeft));
+  layout->addRow(tr("Direction:"), text_direction_combo_);
+  text_paragraph_vertical_check_ = new QCheckBox(tr("Vertical"), dialog);
+  text_paragraph_vertical_check_->setObjectName(QStringLiteral("textParagraphVerticalCheck"));
+  text_paragraph_vertical_check_->setToolTip(tr("Vertical text: columns read top to bottom, right to left"));
+  layout->addRow(QString(), text_paragraph_vertical_check_);
+
+  const auto make_metric_spin = [this, dialog, layout](const char* object_name, const QString& label,
+                                                        const QString& tooltip) {
+    auto* spin = new UnitSpinBox(SpinUnit::Points, dialog);
+    spin->setObjectName(QString::fromLatin1(object_name));
+    spin->set_context_provider([this] {
+      return UnitConversionContext{has_active_document() ? text_size_ppi(document()) : 300.0, 0.0};
+    });
+    spin->setDecimals(2);
+    spin->setRange(-10000.0, 10000.0);
+    spin->setSingleStep(1.0);
+    spin->setToolTip(tooltip);
+    configure_dialog_spinbox(spin);
+    configure_text_character_spin(spin);
+    layout->addRow(label, spin);
+    return spin;
+  };
+  text_paragraph_first_line_indent_spin_ = make_metric_spin(
+      "textParagraphFirstLineIndentSpin", tr("First line indent:"),
+      tr("Indent of each paragraph's first line; negative with a left indent makes a hanging indent"));
+  text_paragraph_start_indent_spin_ =
+      make_metric_spin("textParagraphStartIndentSpin", tr("Left indent:"), tr("Space between the box edge and every line's start"));
+  text_paragraph_end_indent_spin_ =
+      make_metric_spin("textParagraphEndIndentSpin", tr("Right indent:"), tr("Space between every line's end and the box edge"));
+  text_paragraph_space_before_spin_ =
+      make_metric_spin("textParagraphSpaceBeforeSpin", tr("Space before:"), tr("Extra space above each paragraph"));
+  text_paragraph_space_after_spin_ =
+      make_metric_spin("textParagraphSpaceAfterSpin", tr("Space after:"), tr("Extra space below each paragraph"));
+
+  connect(text_paragraph_align_combo_, QOverload<int>::of(&QComboBox::currentIndexChanged), this,
+          [this](int) { apply_text_paragraph_alignment_from_dialog(); });
+  connect(text_direction_combo_, QOverload<int>::of(&QComboBox::currentIndexChanged), this, [this](int index) {
+    if (index < 0 || text_direction_combo_ == nullptr) {
+      return;
+    }
+    apply_text_direction_to_active_editor(
+        static_cast<Qt::LayoutDirection>(text_direction_combo_->itemData(index).toInt()));
+  });
+  // Same path as the options-bar toggle, which follows through the shared sync.
+  connect(text_paragraph_vertical_check_, &QCheckBox::toggled, this,
+          [this](bool checked) { apply_text_orientation(checked); });
+  for (auto* spin : {text_paragraph_first_line_indent_spin_, text_paragraph_start_indent_spin_,
+                     text_paragraph_end_indent_spin_, text_paragraph_space_before_spin_,
+                     text_paragraph_space_after_spin_}) {
+    connect(spin, &QDoubleSpinBox::valueChanged, this, [this](double) { apply_text_paragraph_metrics_to_active_editor(); });
+  }
+
+  // Sub-control gotcha: the spin-button style must land AFTER all children exist.
+  append_themed_style(*dialog, dialog_spinbox_button_style());
+  sync_text_paragraph_dialog_from_editor();
+  sync_text_orientation_controls_from_editor();
+  return_keyboard_after_text_panel_edits(*dialog);
+  run_non_modal_dialog(*dialog);
+  // WA_DeleteOnClose destroyed the dialog when the nested loop unwound.
+  text_paragraph_hint_label_ = nullptr;
+  text_paragraph_align_combo_ = nullptr;
+  text_direction_combo_ = nullptr;
+  text_paragraph_vertical_check_ = nullptr;
+  text_paragraph_first_line_indent_spin_ = nullptr;
+  text_paragraph_start_indent_spin_ = nullptr;
+  text_paragraph_end_indent_spin_ = nullptr;
+  text_paragraph_space_before_spin_ = nullptr;
+  text_paragraph_space_after_spin_ = nullptr;
+}
+
+void MainWindow::sync_text_paragraph_dialog_from_editor() {
+  if (text_paragraph_dialog_ == nullptr || text_paragraph_hint_label_ == nullptr ||
+      text_paragraph_align_combo_ == nullptr || text_paragraph_first_line_indent_spin_ == nullptr ||
+      text_paragraph_start_indent_spin_ == nullptr || text_paragraph_end_indent_spin_ == nullptr ||
+      text_paragraph_space_before_spin_ == nullptr || text_paragraph_space_after_spin_ == nullptr) {
+    return;
+  }
+  auto* editor =
+      canvas_ != nullptr ? canvas_->findChild<QTextEdit*>(QStringLiteral("inlineTextEditor")) : nullptr;
+  const bool session_open = editor != nullptr && !editor->property(kTextEditorFinishedProperty).toBool();
+  const auto* layer = session_open ? nullptr : text_character_target_layer();
+  const auto inputs = layer != nullptr ? text_render_inputs_from_layer(*layer) : std::nullopt;
+  const bool enabled = !preview_dialog_edit_locked() && (session_open || inputs.has_value());
+  text_paragraph_hint_label_->setVisible(!enabled);
+  text_paragraph_align_combo_->setEnabled(enabled);
+  for (QWidget* control : {static_cast<QWidget*>(text_direction_combo_),
+                           static_cast<QWidget*>(text_paragraph_vertical_check_)}) {
+    if (control != nullptr) {
+      control->setEnabled(enabled);
+    }
+  }
+  for (auto* spin : {text_paragraph_first_line_indent_spin_, text_paragraph_start_indent_spin_,
+                     text_paragraph_end_indent_spin_, text_paragraph_space_before_spin_,
+                     text_paragraph_space_after_spin_}) {
+    spin->setEnabled(enabled);
+  }
+  if (!enabled) {
+    return;
+  }
+  QTextBlockFormat format;
+  QString alignment_name;
+  // The justify entries are off for point text and text on a path (one line, no justify choice).
+  bool justify_available = true;
+  double zoom = 1.0;
+  double display_scale = 1.0;
+  if (session_open) {
+    // The caret's paragraph, the one a bare-caret edit changes.
+    format = editor->textCursor().blockFormat();
+    alignment_name = text_editor_shown_alignment_name(*editor);
+    justify_available = text_editor_alignment_flow(*editor) == TextAlignmentFlow::Box;
+    zoom = std::max(0.0001, canvas_->zoom());
+    display_scale = text_editor_size_display_scale(*editor);
+  } else {
+    const auto built = build_text_render_document(inputs->settings, inputs->color, inputs->max_width,
+                                                  inputs->paragraph_runs, inputs->rich_text_runs, 1.0);
+    format = built.document->begin().blockFormat();
+    alignment_name = layer_shown_alignment_name(*layer);
+    justify_available = layer_text_alignment_flow(*layer) == TextAlignmentFlow::Box;
+    if (const auto affine = canonical_text_affine_transform_for_layer(*layer); affine.has_value()) {
+      const auto scale = std::hypot((*affine)[2], (*affine)[3]);
+      if (std::isfinite(scale) && scale > 0.01) {
+        display_scale = scale;
+      }
+    }
+  }
+  const auto to_display_pt = [this, zoom, display_scale](double editor_px) {
+    return editor_px / zoom * display_scale * 72.0 / text_size_ppi(document());
+  };
+  const QSignalBlocker block_align(text_paragraph_align_combo_);
+  const auto align_index = text_paragraph_align_combo_->findData(alignment_name);
+  text_paragraph_align_combo_->setCurrentIndex(std::max(0, align_index));
+  if (auto* model = qobject_cast<QStandardItemModel*>(text_paragraph_align_combo_->model()); model != nullptr) {
+    for (int row = 0; row < model->rowCount(); ++row) {
+      if (auto* item = model->item(row);
+          item != nullptr && item->data(Qt::UserRole).toString().startsWith(QStringLiteral("justify"))) {
+        item->setEnabled(justify_available);
+      }
+    }
+  }
+  const auto set_metric = [&to_display_pt](UnitSpinBox* spin, double editor_px) {
+    const QSignalBlocker blocker(spin);
+    const auto pt = to_display_pt(std::isfinite(editor_px) ? editor_px : 0.0);
+    spin->setValue(std::clamp(pt, spin->minimum(), spin->maximum()));
+  };
+  set_metric(text_paragraph_first_line_indent_spin_, format.textIndent());
+  set_metric(text_paragraph_start_indent_spin_, format.leftMargin());
+  set_metric(text_paragraph_end_indent_spin_, format.rightMargin());
+  set_metric(text_paragraph_space_before_spin_, format.topMargin());
+  set_metric(text_paragraph_space_after_spin_, format.bottomMargin());
+}
+
+void MainWindow::apply_text_paragraph_alignment_from_dialog() {
+  if (text_paragraph_align_combo_ == nullptr) {
+    return;
+  }
+  apply_text_alignment_to_active_editor(text_paragraph_align_combo_->currentData().toString());
+}
+
+void MainWindow::apply_text_paragraph_metrics_to_active_editor() {
+  if (canvas_ == nullptr || applying_text_options_to_layers_ || !has_active_document() ||
+      text_paragraph_first_line_indent_spin_ == nullptr || text_paragraph_start_indent_spin_ == nullptr ||
+      text_paragraph_end_indent_spin_ == nullptr || text_paragraph_space_before_spin_ == nullptr ||
+      text_paragraph_space_after_spin_ == nullptr) {
+    return;
+  }
+  // The panel shows points; the paragraph runs and Photoshop's sheets store document pixels.
+  const auto ppi = text_size_ppi(document());
+  const auto to_document_px = [ppi](double pt) { return pt * ppi / 72.0; };
+  TextParagraphMetrics metrics;
+  metrics.first_line_indent = to_document_px(text_paragraph_first_line_indent_spin_->value());
+  metrics.start_indent = to_document_px(text_paragraph_start_indent_spin_->value());
+  metrics.end_indent = to_document_px(text_paragraph_end_indent_spin_->value());
+  metrics.space_before = to_document_px(text_paragraph_space_before_spin_->value());
+  metrics.space_after = to_document_px(text_paragraph_space_after_spin_->value());
+  auto* editor = canvas_->findChild<QTextEdit*>(QStringLiteral("inlineTextEditor"));
+  if (editor != nullptr && !editor->property(kTextEditorFinishedProperty).toBool()) {
+    // The live session: the selection's paragraphs (a bare caret edits its own paragraph).
+    apply_text_paragraph_metrics_to_editor(*editor, metrics);
+    relayout_text_editor(editor, true);
+    schedule_text_editor_preview(editor);
+    return;
+  }
+  // No session: paragraph-level like the alignment buttons, so the hidden session selects the
+  // whole object first.
+  apply_text_character_edit([this, metrics](QTextEdit& target) {
+    auto cursor = target.textCursor();
+    cursor.select(QTextCursor::Document);
+    target.setTextCursor(cursor);
+    apply_text_paragraph_metrics_to_editor(target, metrics);
+    return true;
+  });
+}
+
+void MainWindow::apply_text_paragraph_metrics_to_editor(QTextEdit& editor, const TextParagraphMetrics& metrics) {
+  if (metrics.empty()) {
+    return;
+  }
+  // Block margins live in editor pixels (document px * zoom, the scale apply_paragraph_runs_to_document
+  // opened the session with); a PSD-frame session divides by its display scale like leading does.
+  const auto zoom = canvas_ != nullptr ? std::max(0.0001, canvas_->zoom()) : 1.0;
+  const auto display_scale = text_editor_size_display_scale(editor);
+  const auto to_editor_px = [zoom, display_scale](double document_px) {
+    return (std::isfinite(document_px) ? document_px : 0.0) / display_scale * zoom;
+  };
+  QTextBlockFormat format;
+  if (metrics.first_line_indent.has_value()) {
+    format.setTextIndent(to_editor_px(*metrics.first_line_indent));
+  }
+  if (metrics.start_indent.has_value()) {
+    format.setLeftMargin(to_editor_px(*metrics.start_indent));
+  }
+  if (metrics.end_indent.has_value()) {
+    format.setRightMargin(to_editor_px(*metrics.end_indent));
+  }
+  if (metrics.space_before.has_value()) {
+    format.setTopMargin(to_editor_px(*metrics.space_before));
+  }
+  if (metrics.space_after.has_value()) {
+    format.setBottomMargin(to_editor_px(*metrics.space_after));
+  }
+  // mergeBlockFormat covers every block the selection touches, the caret's block alone otherwise.
+  auto cursor = editor.textCursor();
+  cursor.mergeBlockFormat(format);
+  mark_text_editor_changed(&editor);
+}
+
+// The family the session is actually set in: the run under the caret first, the options-bar combo
+// otherwise. Both Bold and Italic need it to ask whether the real face exists.
+QString MainWindow::current_text_family_for_editor(const QTextEdit& editor) const {
+  const auto fallback =
+      text_font_combo_ != nullptr ? text_font_combo_->currentFont().family() : default_text_family();
+  return text_display_family_from_format(text_editor_reference_format(editor), fallback);
+}
+
+QString MainWindow::current_text_style_name() const {
+  if (text_style_combo_ == nullptr) {
+    return {};
+  }
+  return text_style_combo_->currentData().toString();
+}
+
+namespace {
+
+// A family the options bar shows marked missing (GitHub issue 652): named, and neither an
+// installed family nor an installed family + face.
+bool text_family_missing_from_computer(const QString& family) {
+  return !family.trimmed().isEmpty() && !available_text_family_match(family).has_value() &&
+         !available_text_family_style_match(family).has_value();
+}
+
+// A missing font's family and face as the bar shows them, split the way Photoshop names a
+// missing font (GitHub issue 669): "Museo Sans Rounded 500" shows "Museo Sans Rounded" + "500".
+std::pair<QString, QString> missing_text_family_parts(const QString& family) {
+  const auto parts = split_font_family_and_style(family.trimmed().toStdString());
+  return {QString::fromStdString(parts.family), QString::fromStdString(parts.style)};
+}
+
+constexpr const char* kTextStyleComboShowsMissingProperty = "patchy.showsMissingFontStyle";
+
+}  // namespace
+
+void MainWindow::refresh_text_style_combo(const QString& family, const QString& preferred,
+                                          bool fallback_bold, bool fallback_italic) {
+  if (text_style_combo_ == nullptr) {
+    return;
+  }
+  QSignalBlocker blocker(text_style_combo_);
+  text_style_combo_->clear();
+  if (text_style_combo_->property(kTextStyleComboShowsMissingProperty).toBool()) {
+    text_style_combo_->setProperty(kTextStyleComboShowsMissingProperty, false);
+    text_style_combo_->setPlaceholderText(QString());
+    text_style_combo_->setFont(QFont());  // nothing set explicitly: inherit the bar's font again
+    apply_bound_translation(text_style_combo_);  // back to "Font style"
+  }
+  fill_text_style_combo(family, preferred, fallback_bold, fallback_italic);
+  if (!text_family_missing_from_computer(family)) {
+    return;
+  }
+  // A missing font's face is marked like its family (GitHub issue 669): italic, with the face
+  // its name carries ("500") shown in place of a row, since the list holds only faces that can
+  // draw. current_text_style_name() then reads empty, so new type starts Regular in the
+  // installed family the font picker is parked on.
+  auto shown_style = missing_text_family_parts(family).second;
+  if (const auto recorded = preferred.trimmed();
+      shown_style.isEmpty() && !recorded.isEmpty() &&
+      text_style_combo_->findData(recorded, Qt::UserRole, Qt::MatchFixedString) < 0) {
+    shown_style = recorded;
+  }
+  text_style_combo_->setProperty(kTextStyleComboShowsMissingProperty, true);
+  QFont italic;
+  italic.setItalic(true);  // only the italic attribute is explicit; the rest still inherits
+  text_style_combo_->setFont(italic);
+  if (!shown_style.isEmpty()) {
+    text_style_combo_->setPlaceholderText(shown_style);
+    text_style_combo_->setCurrentIndex(-1);
+  }
+  text_style_combo_->setToolTip(QCoreApplication::translate("patchy::ui::FontPickerCombo",
+                                                            "Font is missing on this computer: %1")
+                                    .arg(family.trimmed()));
+}
+
+void MainWindow::fill_text_style_combo(const QString& family, const QString& preferred, bool fallback_bold,
+                                       bool fallback_italic) {
+  // Each row previews its own face, the way Photoshop renders its style list.
+  const auto query_family = text_style_query_family(family);
+  const auto db_styles = QFontDatabase::styles(query_family);
+  const auto ui_point_size = text_style_combo_->font().pointSize();
+  const auto style_item_font = [&](const QString& style) {
+    QFont item_font(query_family);
+    if (ui_point_size > 0) {
+      item_font.setPointSize(ui_point_size);
+    }
+    const auto flags = text_style_flags_for_style(family, style);
+    item_font.setBold(flags.bold);
+    item_font.setItalic(flags.italic);
+    for (const auto& available : db_styles) {
+      if (available.compare(style, Qt::CaseInsensitive) == 0) {
+        item_font.setStyleName(available);
+        break;
+      }
+    }
+    return item_font;
+  };
+  // Regular is the face every family has and the one nothing needs to record, so it is the
+  // empty style everywhere below the UI; only the picker spells it out. It sits at its weight in
+  // Photoshop's order (available_text_family_styles), not on top (issue 649); a family that
+  // lists no Regular or Normal face still gets the row, sorted in at weight 400.
+  const auto is_regular_key = [](const QString& style) {
+    const auto key = style.trimmed().toCaseFolded();
+    return key.isEmpty() || key == QStringLiteral("regular") || key == QStringLiteral("normal");
+  };
+  auto styles = available_text_family_styles(family);
+  if (std::none_of(styles.cbegin(), styles.cend(), is_regular_key)) {
+    styles.append(QStringLiteral("Regular"));
+    styles = order_text_family_styles(family, styles);
+  }
+  bool regular_added = false;
+  for (const auto& style : styles) {
+    if (is_regular_key(style)) {
+      if (regular_added) {
+        continue;  // Regular and Normal both name the one empty style
+      }
+      regular_added = true;
+      text_style_combo_->addItem(tr("Regular"), QString());
+      text_style_combo_->setItemData(text_style_combo_->count() - 1, style_item_font(QStringLiteral("Regular")),
+                                     Qt::FontRole);
+      continue;
+    }
+    text_style_combo_->addItem(style, style);
+    text_style_combo_->setItemData(text_style_combo_->count() - 1, style_item_font(style), Qt::FontRole);
+  }
+  // Prefer the requested face, then the one the caller's bold/italic flags describe, then the
+  // flags-equivalent of the requested face (a family switch keeps Bold when the new family has
+  // no face by the old family's spelling), then Regular.
+  const auto preferred_flags = text_style_flags_for_name(preferred);
+  const QStringList candidates{preferred.trimmed(),
+                               real_face_style_name(family, fallback_bold, fallback_italic),
+                               real_face_style_name(family, preferred_flags.bold, preferred_flags.italic)};
+  for (const auto& candidate : candidates) {
+    if (candidate.isEmpty()) {
+      continue;
+    }
+    for (int index = 0; index < text_style_combo_->count(); ++index) {
+      if (text_style_combo_->itemData(index).toString().compare(candidate, Qt::CaseInsensitive) == 0) {
+        text_style_combo_->setCurrentIndex(index);
+        return;
+      }
+    }
+  }
+  for (int index = 0; index < text_style_combo_->count(); ++index) {
+    if (text_style_combo_->itemData(index).toString().isEmpty()) {
+      text_style_combo_->setCurrentIndex(index);  // Regular, wherever its weight put it
+      return;
+    }
+  }
+  text_style_combo_->setCurrentIndex(0);
+}
+
+void MainWindow::apply_text_style_to_active_editor() {
+  if (canvas_ == nullptr || text_style_combo_ == nullptr || applying_text_options_to_layers_) {
+    return;
+  }
+  const auto style = current_text_style_name();
+  auto* editor = canvas_->findChild<QTextEdit*>(QStringLiteral("inlineTextEditor"));
+  if (editor != nullptr) {
+    if (editor->property(kTextEditorFinishedProperty).toBool()) {
+      return;
+    }
+    apply_text_style_to_editor(*editor, style);
+    relayout_text_editor(editor, true);
+    schedule_text_editor_preview(editor);
+    refresh_text_color_button();
+    return;
+  }
+  // No session: every selected text layer, each resolving the face against its own family.
+  apply_text_character_edit([this, style](QTextEdit& target) {
+    apply_text_style_to_editor(target, style);
+    return true;
+  });
+}
+
+void MainWindow::apply_text_style_to_editor(QTextEdit& editor, const QString& style) {
+  const auto family_fallback =
+      text_font_combo_ != nullptr ? text_font_combo_->currentFont().family() : QString();
+  const auto family = text_display_family_from_format(text_editor_reference_format(editor), family_fallback);
+  const auto flags = text_style_flags_for_style(family, style);
+  // A pick the flags can already express lives in the flags alone, matching the PSD reader:
+  // ordinary Bold/Italic text stays on runs v3/v4 and only a face like Black or Demi records
+  // the style name.
+  const bool record_style = !style.isEmpty() && !text_style_is_flag_expressible(style);
+  mutate_text_editor_character_formats(editor, [&style, &family, flags, record_style](QTextCharFormat& format) {
+    auto font = format.font();
+    font.setBold(flags.bold);
+    font.setItalic(flags.italic);
+    font.setStyleName(QString());
+    if (!style.isEmpty()) {
+      for (const auto& available : QFontDatabase::styles(text_style_query_family(family))) {
+        if (available.compare(style, Qt::CaseInsensitive) == 0) {
+          font.setStyleName(available);
+          break;
+        }
+      }
+    }
+    format.setFont(font);
+    if (record_style) {
+      format.setProperty(kTextStyleNameFormatProperty, style);
+    } else {
+      format.clearProperty(kTextStyleNameFormatProperty);
+    }
+  });
+  mark_text_editor_changed(&editor);
+}
+
+void MainWindow::apply_text_character_faux_bold_to_active_editor(bool faux_bold) {
+  if (canvas_ == nullptr) {
+    return;
+  }
+  apply_text_character_edit([this, faux_bold](QTextEdit& editor) {
+    if (faux_bold && text_editor_layer_is_warped(document(), editor)) {
+      // Photoshop parity, the reverse direction: enabling faux bold on warped type is refused
+      // (unchecking stays allowed so imported faux+warp layers can be fixed).
+      // The panel and bar toggles read the layer again once the edit pass is over.
+      show_status_error(tr("Faux bold is not available on warped text. Remove the text warp first."));
+      return false;
+    }
+    mutate_text_editor_character_formats(editor, [faux_bold](QTextCharFormat& format) {
+      // The stroke itself is applied at render time (apply_faux_bold_to_document); the format only
+      // carries the flag, so the same run keeps working after a colour or size change.
+      format.setProperty(kTextFauxBoldFormatProperty, faux_bold);
+    });
+    return true;
+  });
+}
+
+void MainWindow::apply_text_character_faux_italic_to_active_editor(bool faux_italic) {
+  if (canvas_ == nullptr) {
+    return;
+  }
+  apply_text_character_edit([faux_italic](QTextEdit& editor) {
+    mutate_text_editor_character_formats(editor, [faux_italic](QTextCharFormat& format) {
+      // A flag only; the shear happens at render time, so it follows later size and face edits.
+      format.setProperty(kTextFauxItalicFormatProperty, faux_italic);
+    });
+    return true;
+  });
+}
+
+void MainWindow::apply_text_character_style_to_active_editor(int style, bool on) {
+  if (canvas_ == nullptr || style < 0 || style >= static_cast<int>(text_character_style_buttons_.size())) {
+    return;
+  }
+  // The other half of an exclusive pair shows off at once; the edit below writes it.
+  const int partner = style <= 3 ? (style ^ 1) : -1;
+  if (on && partner >= 0) {
+    if (auto* button = text_character_style_buttons_[static_cast<std::size_t>(partner)]; button != nullptr) {
+      const QSignalBlocker blocker(button);
+      button->setChecked(false);
+    }
+  }
+  apply_text_character_edit([style, on](QTextEdit& editor) {
+    mutate_text_editor_character_formats(editor, [style, on](QTextCharFormat& format) {
+      // Flags only, like faux bold: build_text_render_document draws them, so the text keeps
+      // its case and size (apply_text_character_styles_to_document).
+      switch (style) {
+        case 0:
+        case 1: {
+          const int caps = style == 0 ? 2 : 1;
+          const int current = format.property(kTextFontCapsFormatProperty).toInt();
+          format.setProperty(kTextFontCapsFormatProperty, on ? caps : (current == caps ? 0 : current));
+          break;
+        }
+        case 2:
+        case 3: {
+          const int baseline = style == 2 ? 1 : 2;
+          const int current = format.property(kTextFontBaselineFormatProperty).toInt();
+          format.setProperty(kTextFontBaselineFormatProperty, on ? baseline : (current == baseline ? 0 : current));
+          break;
+        }
+        case 4:
+          format.setProperty(kTextUnderlineFormatProperty, on);
+          break;
+        case 5:
+          format.setProperty(kTextStrikethroughFormatProperty, on);
+          break;
+        case 6:
+          format.setProperty(kTextOrdinalsFormatProperty, on);
+          break;
+        case 7:
+          format.setProperty(kTextFractionsFormatProperty, on);
+          break;
+        case 8:
+          format.setProperty(kTextLigaturesOffFormatProperty, !on);
+          break;
+        case 9:
+          format.setProperty(kTextContextualAlternatesFormatProperty, on);
+          break;
+        case 10:
+          format.setProperty(kTextDiscretionaryLigaturesFormatProperty, on);
+          break;
+        case 11:
+          format.setProperty(kTextSwashFormatProperty, on);
+          break;
+        case 12:
+          format.setProperty(kTextStylisticAlternatesFormatProperty, on);
+          break;
+        default:
+          format.setProperty(kTextTitlingAlternatesFormatProperty, on);
+          break;
+      }
+    });
+    return true;
+  });
+}
+
+void MainWindow::apply_text_character_rotate_roman_to_active_editor() {
+  if (canvas_ == nullptr || text_character_rotate_roman_ == nullptr) {
+    return;
+  }
+  const bool rotated = text_character_rotate_roman_->isChecked();
+  apply_text_character_edit([rotated](QTextEdit& editor) {
+    mutate_text_editor_character_formats(editor, [rotated](QTextCharFormat& format) {
+      // A flag only; the vertical plan decides per cluster (CJK stays upright).
+      format.setProperty(kTextRotatedRomanFormatProperty, rotated);
+    });
+    return true;
+  });
+}
+
+void MainWindow::request_warp_text_dialog() {
+  if (canvas_ == nullptr) {
+    return;
+  }
+  // The dialog operates on the committed layer, so an open inline edit commits first. Photoshop
+  // keeps the type in edit mode across Warp Text, so a live session reopens afterwards with its
+  // selection: a still-selected "Type" placeholder stays replaceable (GitHub issue 175).
+  std::optional<std::pair<int, int>> resume_selection;
+  if (const auto* live = canvas_->findChild<QTextEdit*>(QStringLiteral("inlineTextEditor"));
+      live != nullptr && !live->property(kTextEditorFinishedProperty).toBool() && live->isVisible()) {
+    resume_selection = std::pair{live->textCursor().anchor(), live->textCursor().position()};
+  }
+  commit_active_text_editor();
+  const bool dialog_ran = run_warp_text_dialog_on_active_layer();
+  if (!dialog_ran || !resume_selection.has_value() || canvas_ == nullptr || !has_active_document()) {
+    return;
+  }
+  const auto active = document().active_layer_id();
+  const auto* layer = active.has_value() ? std::as_const(document()).find_layer(*active) : nullptr;
+  if (layer == nullptr || !layer_is_text(*layer)) {
+    return;
+  }
+  resume_text_editing(*active, *resume_selection);
+}
+
+void MainWindow::resume_text_editing(LayerId id, std::pair<int, int> selection) {
+  if (canvas_ == nullptr || !has_active_document()) {
+    return;
+  }
+  edit_text_layer(id);
+  if (auto* editor = canvas_->findChild<QTextEdit*>(QStringLiteral("inlineTextEditor"));
+      editor != nullptr && editor->property("patchy.editingLayerId").toULongLong() == id) {
+    const int end = std::max(0, editor->document()->characterCount() - 1);
+    QTextCursor cursor(editor->document());
+    cursor.setPosition(std::clamp(selection.first, 0, end));
+    cursor.setPosition(std::clamp(selection.second, 0, end), QTextCursor::KeepAnchor);
+    editor->setTextCursor(cursor);
+    return_keyboard_to_text_editor();  // a modal dialog takes the window's activation with it
+  }
+}
+
+bool MainWindow::handle_text_ctrl_move_press(QWidget* watched, QMouseEvent* event) {
+  if (canvas_ == nullptr || watched == nullptr || event->button() != Qt::LeftButton ||
+      !event->modifiers().testFlag(Qt::ControlModifier) || canvas_->tool() != CanvasTool::Text ||
+      (watched != canvas_ && !canvas_->isAncestorOf(watched)) || !has_active_document()) {
+    return false;
+  }
+  const auto canvas_point = watched->mapTo(canvas_, event->position().toPoint());
+  auto* editor = canvas_->findChild<QTextEdit*>(QStringLiteral("inlineTextEditor"));
+  const bool session_open = editor != nullptr && !editor->property(kTextEditorFinishedProperty).toBool();
+  if (watched == canvas_) {
+    // Off the session's text, over another text layer: commit like any click off (Qt's focus
+    // walk may already have, arming the press swallow), then let the canvas start the drag.
+    if (!canvas_->text_layer_move_target_at(canvas_point)) {
+      return false;
+    }
+    if (session_open) {
+      commit_active_text_editor();
+    }
+    swallow_next_canvas_left_press_ = false;
+    return false;
+  }
+  if (!session_open ||
+      (watched != editor && !editor->isAncestorOf(watched) &&
+       watched->objectName() != QLatin1String(kTransformedTextEditOverlayObjectName))) {
+    return false;
+  }
+  // On the session's own text: commit, drag the committed layer, then type on where the caret
+  // was. The editor that took this press goes away with the commit, so the canvas grabs the
+  // rest of the gesture.
+  const auto text_cursor = editor->textCursor();
+  const std::pair selection{text_cursor.anchor(), text_cursor.position()};
+  std::optional<LayerId> layer_id;
+  if (editor->property("patchy.editingLayerId").isValid()) {
+    layer_id = static_cast<LayerId>(editor->property("patchy.editingLayerId").toULongLong());
+  }
+  commit_active_text_editor();
+  swallow_next_canvas_left_press_ = false;
+  event->accept();
+  if (!layer_id.has_value() || std::as_const(document()).find_layer(*layer_id) == nullptr) {
+    layer_id = document().active_layer_id();
+  }
+  const auto* layer = layer_id.has_value() ? std::as_const(document()).find_layer(*layer_id) : nullptr;
+  if (layer == nullptr || !layer_is_text(*layer)) {
+    return true;  // nothing was committed (an empty new session)
+  }
+  const auto id = *layer_id;
+  const auto resume = [this, id, selection] {
+    if (canvas_ != nullptr && canvas_->tool() == CanvasTool::Text) {
+      resume_text_editing(id, selection);
+    }
+  };
+  if (!canvas_->begin_text_layer_move(id, canvas_point, [this, resume] { QTimer::singleShot(0, this, resume); })) {
+    resume();  // position-locked: back to typing
+  }
+  return true;
+}
+
+void MainWindow::apply_text_editor_ctrl_cursor(bool ctrl_held) {
+  auto* editor = canvas_ == nullptr ? nullptr : canvas_->findChild<QTextEdit*>(QStringLiteral("inlineTextEditor"));
+  if (editor == nullptr || editor->property(kTextEditorFinishedProperty).toBool()) {
+    return;
+  }
+  const auto shape = ctrl_held ? Qt::SizeAllCursor : Qt::IBeamCursor;
+  if (editor->viewport() != nullptr) {
+    editor->viewport()->setCursor(shape);
+  }
+  if (auto* overlay = transformed_text_edit_overlay_for_canvas(canvas_);
+      overlay != nullptr && overlay->editor() == editor) {
+    overlay->setCursor(shape);
+  }
+}
+
+bool MainWindow::run_warp_text_dialog_on_active_layer() {
+  auto& doc = document();
+  select_only_layer_if_none_active();
+  const auto active_id = doc.active_layer_id();
+  Layer* layer = active_id.has_value() ? doc.find_layer(*active_id) : nullptr;
+  if (layer == nullptr || !layer_is_text(*layer)) {
+    show_status_error(tr("Select a text layer to warp."));
+    return false;
+  }
+  if (layer_id_locks_image_pixels(layer->id())) {
+    show_status_error(tr("Layer pixels are locked."));
+    return false;
+  }
+  if (text_layer_uses_faux_bold(*layer)) {
+    // Photoshop parity: it refuses to warp type with Faux Bold anywhere in the layer, so
+    // Patchy must not author a PSD Photoshop itself would not create. Faux italic warps fine.
+    show_status_error(tr("Faux bold text cannot be warped. Turn off faux bold in the Character panel first."));
+    return false;
+  }
+  const auto layer_id = layer->id();
+  const auto original_pixels = layer->pixels();
+  const auto original_bounds = layer->bounds();
+  const auto original_metadata = layer->metadata();
+  const auto initial = text_warp_from_layer(*layer).value_or(TextWarp{});
+
+  const auto restore_original = [&, layer_id] {
+    if (auto* target = document().find_layer(layer_id); target != nullptr) {
+      target->set_pixels(PixelBuffer(original_pixels));
+      target->set_bounds(original_bounds);
+      target->metadata() = original_metadata;
+    }
+  };
+  const auto preview = [&, layer_id](const TextWarp& warp) {
+    auto* target = document().find_layer(layer_id);
+    if (target == nullptr) {
+      return;
+    }
+    // Reset first so consecutive previews never compound.
+    target->set_pixels(PixelBuffer(original_pixels));
+    target->set_bounds(original_bounds);
+    target->metadata() = original_metadata;
+    // A pristine unwarped layer with style None stays untouched (keeps an imported
+    // Photoshop raster bit for bit until a real warp is chosen).
+    if (!text_warp_is_identity(warp) || text_warp_from_layer(*target).has_value()) {
+      apply_text_warp_to_layer(*target, warp);
+    }
+    canvas_->document_changed();
+    refresh_layer_list();
+  };
+  const auto result = ui::request_text_warp(this, initial, preview);
+  restore_original();
+  const auto warp_settings_equal = [](const TextWarp& a, const TextWarp& b) {
+    if (text_warp_is_identity(a) && text_warp_is_identity(b)) {
+      return true;
+    }
+    return a.style == b.style && a.rotate == b.rotate && a.value == b.value &&
+           a.perspective == b.perspective && a.perspective_other == b.perspective_other;
+  };
+  if (!result.has_value() || warp_settings_equal(*result, initial)) {
+    canvas_->document_changed();
+    refresh_layer_list();
+    return true;
+  }
+  push_undo_snapshot(tr("Warp Text"));
+  bool applied = false;
+  if (auto* target = document().find_layer(layer_id); target != nullptr) {
+    applied = apply_text_warp_to_layer(*target, *result);
+  }
+  if (!applied) {
+    show_status_error(tr("Could not warp the text layer."));
+  } else {
+    statusBar()->showMessage(text_warp_is_identity(*result) ? tr("Removed text warp")
+                                                            : tr("Warped text layer"));
+  }
+  canvas_->document_changed();
+  refresh_layer_list();
+  refresh_layer_controls();
+  return true;
+}
+
+// SVG post-open pass. The Qt-free SVG reader stores each <text> element's
+// content and font as ordinary patchy.text.* metadata plus a pending-render
+// marker with the SVG baseline point and text-anchor; this renders the glyphs
+// through the internal text pipeline and positions the layer so the first
+// baseline lands on that point (start/middle/end anchoring against the
+// rendered width). Runs on the main thread before the document becomes a
+// session (fonts are not worker-thread material).
+void MainWindow::render_pending_svg_text_layers(Document& target) {
+  const auto process = [&](auto&& self, std::vector<Layer>& layers) -> void {
+    for (auto& layer : layers) {
+      if (!layer.children().empty()) {
+        self(self, layer.children());
+      }
+      auto& metadata = layer.metadata();
+      if (!metadata.contains(kLayerMetadataSvgPendingText)) {
+        continue;
+      }
+      const auto take_double = [&metadata](const char* key) {
+        const auto found = metadata.find(key);
+        return found == metadata.end() ? 0.0 : QString::fromStdString(found->second).toDouble();
+      };
+      const double baseline_x = take_double(kLayerMetadataSvgTextBaselineX);
+      const double baseline_y = take_double(kLayerMetadataSvgTextBaselineY);
+      const auto anchor_entry = metadata.find(kLayerMetadataSvgTextAnchor);
+      const auto anchor = anchor_entry == metadata.end() ? std::string("start") : anchor_entry->second;
+      metadata.erase(kLayerMetadataSvgPendingText);
+      metadata.erase(kLayerMetadataSvgTextAnchor);
+      metadata.erase(kLayerMetadataSvgTextBaselineX);
+      metadata.erase(kLayerMetadataSvgTextBaselineY);
+
+      auto rendered_text = render_text_layer_from_metadata(layer);
+      if (!rendered_text.has_value() || rendered_text->pixels.empty()) {
+        continue;  // stays an empty text layer; the text tool can still edit it
+      }
+      auto pixels = std::optional<PixelBuffer>(std::move(rendered_text->pixels));
+      const auto inputs = text_render_inputs_from_layer(layer);
+      double ascent = inputs.has_value() ? static_cast<double>(inputs->settings.size) : 0.0;
+      if (inputs.has_value()) {
+        QFont font(inputs->settings.family);
+        font.setPixelSize(std::max(1, inputs->settings.size));
+        font.setBold(inputs->settings.bold);
+        font.setItalic(inputs->settings.italic);
+        ascent = QFontMetricsF(font).ascent();
+      }
+      const double shift = anchor == "middle" ? pixels->width() / 2.0 : anchor == "end" ? pixels->width() : 0.0;
+      // The buffer starts local_rect.topLeft() from the text origin (overhanging glyph ink).
+      const Rect placed{static_cast<std::int32_t>(std::lround(baseline_x - shift + rendered_text->local_rect.left())),
+                        static_cast<std::int32_t>(std::lround(baseline_y - ascent + rendered_text->local_rect.top())),
+                        pixels->width(), pixels->height()};
+      // set_pixels resets bounds to the buffer at the origin, so the bounds
+      // must follow it (the text-commit ordering convention).
+      layer.set_pixels(std::move(*pixels));
+      layer.set_bounds(placed);
+      store_text_layout_metrics(layer, rendered_text->metrics);
+      metadata[kLayerMetadataTextRasterStatus] = "patchy_raster";
+    }
+  };
+  process(process, target.layers());
+}
+
+void MainWindow::render_pending_af_text_layers(Document& target) {
+  const auto process = [&](auto&& self, std::vector<Layer>& layers) -> void {
+    for (auto& layer : layers) {
+      if (!layer.children().empty()) {
+        self(self, layer.children());
+      }
+      auto& metadata = layer.metadata();
+      if (!metadata.contains(kLayerMetadataAfPendingText)) {
+        continue;
+      }
+      std::array<double, 4> frame{0.0, 0.0, 0.0, 0.0};
+      if (const auto found = metadata.find(kLayerMetadataAfTextFrame); found != metadata.end()) {
+        const QStringList parts = QString::fromStdString(found->second).split(' ');
+        for (int i = 0; i < 4 && i < parts.size(); ++i) {
+          frame[static_cast<std::size_t>(i)] = parts[i].toDouble();
+        }
+      }
+      const double affinity_ascent = [&] {
+        const auto found = metadata.find(kLayerMetadataAfTextAscent);
+        return found == metadata.end() ? 0.0 : QString::fromStdString(found->second).toDouble();
+      }();
+      const int align = [&] {
+        const auto found = metadata.find(kLayerMetadataAfTextAlign);
+        return found == metadata.end() ? 0 : QString::fromStdString(found->second).toInt();
+      }();
+      const auto af_transform = [&]() -> std::optional<LayerAffineTransform> {
+        const auto found = metadata.find(kLayerMetadataAfTextXfrm);
+        if (found == metadata.end()) {
+          return std::nullopt;
+        }
+        const QStringList parts = QString::fromStdString(found->second).split(' ');
+        if (parts.size() != 6) {
+          return std::nullopt;
+        }
+        LayerAffineTransform values{};
+        for (int i = 0; i < 6; ++i) {
+          values[static_cast<std::size_t>(i)] = parts[i].toDouble();
+        }
+        return values;
+      }();
+      metadata.erase(kLayerMetadataAfPendingText);
+      metadata.erase(kLayerMetadataAfTextFrame);
+      metadata.erase(kLayerMetadataAfTextAscent);
+      metadata.erase(kLayerMetadataAfTextAlign);
+      metadata.erase(kLayerMetadataAfTextXfrm);
+
+      // Artistic text anchors its baseline at frame-top + Affinity's ascent;
+      // re-anchor with Patchy's own ascent so the baseline stays put. Frame
+      // text puts the first line's CAP at the frame top (pinned against
+      // Affinity's render), so back out Patchy's ascent-above-cap leading.
+      // Mixed-style imports carry patchy.text.runs; the anchor tracks the
+      // tallest run intersecting the FIRST line (Affinity anchors on the
+      // line's max ascent), not the layer-level first style.
+      const auto inputs = text_render_inputs_from_layer(layer);
+      const QFontMetricsF metrics = [&] {
+        QFontMetricsF result{QFont{}};
+        if (!inputs.has_value()) {
+          return result;
+        }
+        QFont font(inputs->settings.family);
+        font.setPixelSize(std::max(1, inputs->settings.size));
+        font.setBold(inputs->settings.bold);
+        font.setItalic(inputs->settings.italic);
+        result = QFontMetricsF(font);
+        if (!inputs->rich_text_runs.trimmed().isEmpty()) {
+          const auto newline = inputs->settings.text.indexOf(QLatin1Char('\n'));
+          const auto first_line_end =
+              newline < 0 ? inputs->settings.text.size() : static_cast<qsizetype>(newline);
+          for (const auto& raw_line : inputs->rich_text_runs.split(QLatin1Char('\n'))) {
+            const auto fields = raw_line.trimmed().split(QLatin1Char('\t'));
+            if (fields.size() < 7) {
+              continue;  // version header / malformed line
+            }
+            bool start_ok = false;
+            bool length_ok = false;
+            bool size_ok = false;
+            const int start = fields[0].toInt(&start_ok);
+            const int length = fields[1].toInt(&length_ok);
+            const double size = fields[2].toDouble(&size_ok);
+            if (!start_ok || !length_ok || !size_ok || length <= 0 ||
+                static_cast<qsizetype>(start) >= first_line_end) {
+              continue;
+            }
+            QFont run_font(QString::fromUtf8(QByteArray::fromPercentEncoding(fields[6].toLatin1())));
+            run_font.setPixelSize(std::max(1, static_cast<int>(std::lround(size))));
+            run_font.setBold(fields[3].toInt() != 0);
+            run_font.setItalic(fields[4].toInt() != 0);
+            const QFontMetricsF run_metrics(run_font);
+            if (run_metrics.ascent() > result.ascent()) {
+              result = run_metrics;
+            }
+          }
+        }
+        return result;
+      }();
+      const double anchored_top = affinity_ascent > 0.0
+                                      ? frame[1] + affinity_ascent - metrics.ascent()
+                                      : frame[1] - (metrics.ascent() - metrics.capHeight());
+
+      // Rotated/sheared artistic text: anchor in NODE-LOCAL space, then render
+      // the glyphs through the node affine (crisp, exact) and stamp the
+      // standard transformed-text metadata so edits keep re-rendering through
+      // it. The wire marker order is a b tx c d ty; QTransform wants
+      // (m11, m12, m21, m22, dx, dy) with x' = m11 x + m21 y + dx.
+      if (af_transform.has_value() && inputs.has_value() && !inputs->settings.boxed) {
+        const auto& t = *af_transform;
+        const QTransform affine(t[0], t[3], t[1], t[4], t[2], t[5]);
+        const QTransform combined = QTransform::fromTranslate(frame[0], anchored_top) * affine;
+        if (auto rendered = render_text_layer_pixels_through_transform(layer, combined)) {
+          layer.set_pixels(std::move(rendered->pixels));
+          layer.set_bounds(rendered->bounds);
+          store_text_layout_metrics(layer, rendered->metrics);
+          metadata[kLayerMetadataTextTransform] = serialize_layer_affine_transform(
+              {combined.m11(), combined.m12(), combined.m21(), combined.m22(), combined.dx(),
+               combined.dy()});
+          metadata[kLayerMetadataTextRasterStatus] = "patchy_raster";
+          continue;
+        }
+      }
+
+      auto rendered_text = render_text_layer_from_metadata(layer);
+      if (!rendered_text.has_value() || rendered_text->pixels.empty()) {
+        continue;  // stays an empty text layer; the text tool can still edit it
+      }
+      auto pixels = std::optional<PixelBuffer>(std::move(rendered_text->pixels));
+      // The buffer starts local_rect.topLeft() from the text origin (overhanging glyph ink).
+      double top = anchored_top + rendered_text->local_rect.top();
+      double left = frame[0] + rendered_text->local_rect.left();
+      const double frame_width = frame[2] - frame[0];
+      if (align > 0 && frame_width > 0.0) {
+        const double slack = frame_width - pixels->width();
+        left = frame[0] + (align == 1 ? slack / 2.0 : slack);
+      }
+      const Rect placed{static_cast<std::int32_t>(std::lround(left)),
+                        static_cast<std::int32_t>(std::lround(top)), pixels->width(),
+                        pixels->height()};
+      // set_pixels resets bounds to the buffer at the origin, so the bounds
+      // must follow it (the text-commit ordering convention).
+      layer.set_pixels(std::move(*pixels));
+      layer.set_bounds(placed);
+      store_text_layout_metrics(layer, rendered_text->metrics);
+      metadata[kLayerMetadataTextRasterStatus] = "patchy_raster";
+    }
+  };
+  process(process, target.layers());
+}
+
+namespace {
+
+// Draws a GIMP text layer's text as Patchy's raster, GIMP's text box starting at the layer's
+// top-left (docs/xcf-text-layers.md, "Text layers"), and adds `outline` (the parts of a
+// kLayerMetadataXcfPendingOutline value, or none) as a Stroke style. False, with the layer
+// unchanged, when the text draws nothing.
+bool draw_xcf_text_layer(Layer& layer, const QStringList& outline) {
+  auto rendered_text = render_text_layer_from_metadata(layer);
+  if (!rendered_text.has_value() || rendered_text->pixels.empty()) {
+    return false;
+  }
+  // The buffer starts local_rect.topLeft() from the text origin (overhanging glyph ink).
+  const auto origin = std::as_const(layer).bounds();
+  auto pixels = convert_pixel_buffer_depth(rendered_text->pixels, std::as_const(layer).pixels().format().bit_depth,
+                                           SampleKind::Color);
+  const Rect placed{origin.x + static_cast<std::int32_t>(std::lround(rendered_text->local_rect.left())),
+                    origin.y + static_cast<std::int32_t>(std::lround(rendered_text->local_rect.top())),
+                    pixels.width(), pixels.height()};
+  // set_pixels resets bounds to the buffer at the origin, so the bounds
+  // must follow it (the text-commit ordering convention).
+  layer.set_pixels(std::move(pixels));
+  layer.set_bounds(placed);
+  store_text_layout_metrics(layer, rendered_text->metrics);
+  layer.metadata()[kLayerMetadataTextRasterStatus] = "patchy_raster";
+  if (outline.size() < 5) {
+    return true;
+  }
+  LayerStroke stroke;
+  stroke.enabled = true;
+  stroke.position = outline[0] == QLatin1String("inside")    ? LayerStrokePosition::Inside
+                    : outline[0] == QLatin1String("outside") ? LayerStrokePosition::Outside
+                                                             : LayerStrokePosition::Center;
+  stroke.size = std::clamp(outline[1].toFloat(), 1.0F, 250.0F);
+  const QColor color(outline[2]);
+  if (color.isValid()) {
+    stroke.color = RgbColor{static_cast<std::uint8_t>(color.red()), static_cast<std::uint8_t>(color.green()),
+                            static_cast<std::uint8_t>(color.blue())};
+  }
+  stroke.opacity = std::clamp(outline[3].toFloat(), 0.0F, 1.0F);
+  layer.layer_style().strokes.push_back(stroke);
+  if (outline[4] == QLatin1String("nofill")) {
+    layer.set_fill_opacity(0.0F);
+  }
+  return true;
+}
+
+}  // namespace
+
+void MainWindow::render_pending_xcf_text_layers(Document& target) {
+  const auto process = [&](auto&& self, std::vector<Layer>& layers) -> void {
+    for (auto& layer : layers) {
+      if (!layer.children().empty()) {
+        self(self, layer.children());
+      }
+      auto& metadata = layer.metadata();
+      const auto found = metadata.find(kLayerMetadataXcfPendingOutline);
+      if (found == metadata.end()) {
+        continue;
+      }
+      const QStringList parts = QString::fromStdString(found->second).split(QLatin1Char(' '));
+      metadata.erase(found);
+      if (parts.size() < 5 || !layer_is_text(std::as_const(layer))) {
+        continue;
+      }
+      // When nothing draws, GIMP's raster, outline included, stays until the text is edited.
+      (void)draw_xcf_text_layer(layer, parts);
+    }
+  };
+  process(process, target.layers());
+}
+
+namespace {
+
+// The text layer the text GIMP stored on a painted-on layer makes, in its place: the paint is
+// dropped, as GIMP does when its text is edited; name, opacity, blend mode, mask, locks and
+// everything else stay. nullopt when there is no stored text or it draws nothing.
+std::optional<Layer> text_layer_from_stored_gimp_text(Layer layer) {
+  const auto box = take_stored_xcf_text(layer);
+  if (!box.has_value()) {
+    return std::nullopt;
+  }
+  QStringList outline;
+  if (const auto found = std::as_const(layer).metadata().find(kLayerMetadataXcfPendingOutline);
+      found != std::as_const(layer).metadata().end()) {
+    outline = QString::fromStdString(found->second).split(QLatin1Char(' '));
+    layer.metadata().erase(kLayerMetadataXcfPendingOutline);
+  }
+  layer.set_bounds(*box);
+  if (!draw_xcf_text_layer(layer, outline)) {
+    return std::nullopt;
+  }
+  return layer;
+}
+
+std::size_t count_stored_gimp_text_layers(const std::vector<Layer>& layers) {
+  std::size_t count = 0;
+  for (const auto& layer : layers) {
+    count += (layer_has_stored_xcf_text(layer) ? 1U : 0U) + count_stored_gimp_text_layers(layer.children());
+  }
+  return count;
+}
+
+// Replaces each painted-on GIMP text layer with its text, or (copies) adds the text as a
+// hidden, unlocked layer above it, named by `copy_name` ("%1" is the layer's name). Returns
+// how many layers got text.
+int make_text_from_stored_gimp_text(Document& document, std::vector<Layer>& layers, bool copies,
+                                    const QString& copy_name) {
+  int made = 0;
+  for (std::size_t index = 0; index < layers.size(); ++index) {
+    if (!layers[index].children().empty()) {
+      made += make_text_from_stored_gimp_text(document, layers[index].children(), copies, copy_name);
+    }
+    if (!layer_has_stored_xcf_text(std::as_const(layers[index]))) {
+      continue;
+    }
+    if (!copies) {
+      if (auto text = text_layer_from_stored_gimp_text(std::as_const(layers[index]))) {
+        layers[index] = std::move(*text);
+        ++made;
+      }
+      continue;
+    }
+    auto text = text_layer_from_stored_gimp_text(std::as_const(layers[index]).clone_with_id(document.allocate_layer_id()));
+    clear_stored_xcf_text(layers[index]);
+    if (!text.has_value()) {
+      continue;
+    }
+    text->set_name(copy_name.arg(QString::fromStdString(std::as_const(layers[index]).name())).toStdString());
+    text->set_visible(false);
+    text->set_lock_flags(kLayerLockNone);
+    // Vectors run bottom to top: above is the next index.
+    layers.insert(layers.begin() + static_cast<std::ptrdiff_t>(index) + 1, std::move(*text));
+    ++index;
+    ++made;
+  }
+  return made;
+}
+
+}  // namespace
+
+namespace {
+
+QString painted_gimp_text_policy() {
+  const auto policy =
+      app_settings().value(QStringLiteral("imports/xcfPaintedTextLayers"), QStringLiteral("ask")).toString();
+  return policy == QStringLiteral("pixels") || policy == QStringLiteral("text") || policy == QStringLiteral("copies")
+             ? policy
+             : QStringLiteral("ask");
+}
+
+}  // namespace
+
+bool MainWindow::painted_gimp_text_question_pending(const DocumentSession& target) const {
+  // Scripts, MCP, batch runs and tests never wait on a question: they keep GIMP's pixels.
+  return !unattended_automation() && painted_gimp_text_policy() == QStringLiteral("ask") &&
+         count_stored_gimp_text_layers(std::as_const(target.document).layers()) > 0;
+}
+
+QStringList MainWindow::offer_painted_gimp_text_conversion(DocumentSession& target, QStringList& notices) {
+  QStringList answered;
+  const auto count = count_stored_gimp_text_layers(std::as_const(target.document).layers());
+  if (count == 0) {
+    return answered;
+  }
+  const auto key = QStringLiteral("imports/xcfPaintedTextLayers");
+  auto settings = app_settings();
+  auto policy = painted_gimp_text_policy();
+  if (policy == QStringLiteral("ask")) {
+    policy = QStringLiteral("pixels");
+    if (!unattended_automation()) {
+      QMessageBox box(this);
+      box.setObjectName(QStringLiteral("xcfPaintedTextMessageBox"));
+      box.setIcon(QMessageBox::Question);
+      box.setWindowTitle(tr("GIMP Text Layers"));
+      box.setText(tr("Text layers in this GIMP file that were painted on after their text was set: %1")
+                      .arg(static_cast<qulonglong>(count)));
+      box.setInformativeText(
+          tr("Keep them as pixel layers, as GIMP draws them, or make editable text from the text GIMP stored. "
+             "Converting drops the paint, as GIMP does when you edit its text. Text-layer copies go above each "
+             "layer, hidden, so the file still looks as GIMP drew it."));
+      auto* keep_button = box.addButton(tr("Keep as Pixel Layers"), QMessageBox::AcceptRole);
+      keep_button->setObjectName(QStringLiteral("xcfPaintedTextKeepButton"));
+      auto* convert_button = box.addButton(tr("Convert to Text Layers"), QMessageBox::ActionRole);
+      convert_button->setObjectName(QStringLiteral("xcfPaintedTextConvertButton"));
+      auto* copies_button = box.addButton(tr("Add Text-Layer Copies"), QMessageBox::ActionRole);
+      copies_button->setObjectName(QStringLiteral("xcfPaintedTextCopiesButton"));
+      box.setDefaultButton(keep_button);
+      box.setEscapeButton(keep_button);
+      auto* dont_ask = new QCheckBox(tr("Don't ask again"), &box);
+      dont_ask->setObjectName(QStringLiteral("xcfPaintedTextDontAskCheck"));
+      box.setCheckBox(dont_ask);
+      exec_dialog(box);
+      if (box.clickedButton() == convert_button) {
+        policy = QStringLiteral("text");
+      } else if (box.clickedButton() == copies_button) {
+        policy = QStringLiteral("copies");
+      }
+      if (dont_ask->isChecked()) {
+        settings.setValue(key, policy);
+      }
+      // The user just chose: the notes about it stay out of the Import Notes box (#551).
+      answered.push_back(translate_data_text(xcf::painted_text_layers_notice()));
+    }
+  }
+  if (policy == QStringLiteral("pixels")) {
+    return answered;  // the reader's notice already says they opened as pixel layers
+  }
+  const bool copies = policy == QStringLiteral("copies");
+  auto layers = std::as_const(target.document).layers();
+  const int made = make_text_from_stored_gimp_text(target.document, layers, copies, tr("%1 (text)"));
+  if (made == 0) {
+    return answered;
+  }
+  push_undo_snapshot(target, copies ? tr("Add GIMP Text Copies") : tr("Convert GIMP Text"));
+  target.document.layers() = std::move(layers);
+  notices.removeAll(translate_data_text(xcf::painted_text_layers_notice()));
+  notices.push_back(copies ? tr("Text layers painted on in GIMP kept their pixels; editable text copies of them were "
+                                "added above them, hidden.")
+                           : tr("Text layers painted on in GIMP became editable text; their paint was dropped."));
+  if (!answered.isEmpty()) {
+    answered.push_back(notices.back());
+  }
+  if (target.canvas != nullptr) {
+    target.canvas->document_changed();
+  }
+  if (&target == active_session()) {
+    refresh_layer_list();
+    refresh_layer_controls();
+  }
+  return answered;
+}
+
+void MainWindow::render_pending_pdf_text_layers(Document& target) {
+  const auto process = [&](auto&& self, std::vector<Layer>& layers) -> void {
+    for (auto& layer : layers) {
+      if (!layer.children().empty()) {
+        self(self, layer.children());
+      }
+      auto& metadata = layer.metadata();
+      if (!metadata.contains(kLayerMetadataPdfPendingText)) {
+        continue;
+      }
+      const auto transform = [&]() -> std::optional<LayerAffineTransform> {
+        const auto found = metadata.find(kLayerMetadataPdfTextXfrm);
+        if (found == metadata.end()) {
+          return std::nullopt;
+        }
+        const QStringList parts = QString::fromStdString(found->second).split(' ');
+        if (parts.size() != 6) {
+          return std::nullopt;
+        }
+        LayerAffineTransform values{};
+        for (int i = 0; i < 6; ++i) {
+          values[static_cast<std::size_t>(i)] = parts[i].toDouble();
+        }
+        return values;
+      }();
+      const double intended_width = [&] {
+        const auto found = metadata.find(kLayerMetadataPdfTextIntendedWidth);
+        return found == metadata.end() ? 0.0 : QString::fromStdString(found->second).toDouble();
+      }();
+      metadata.erase(kLayerMetadataPdfPendingText);
+      metadata.erase(kLayerMetadataPdfTextXfrm);
+      metadata.erase(kLayerMetadataPdfTextIntendedWidth);
+
+      // GitHub issue 155: the reader's size is the Tf operand in text-space units, and the
+      // points-to-pixels scale (plus any Tm scale; "1 Tf 12 0 0 12 Tm" is what many
+      // producers write) lives in the matrix. Left there, everything the editor sizes in
+      // text-local units (the 3 px caret, the minimum point-text box, the editor font) is
+      // multiplied by it. Fold the em's document height into the font size first, so the
+      // stored transform keeps only rotation, aspect, flip and position.
+      if (transform.has_value()) {
+        const double em_pixels = std::hypot((*transform)[2], (*transform)[3]);
+        if (const auto unfolded = text_render_inputs_from_layer(layer);
+            unfolded.has_value() && std::isfinite(em_pixels) && em_pixels > 0.0) {
+          const double scale = em_pixels / std::max(1, unfolded->settings.size);
+          static_cast<void>(fold_text_transform_scale_into_font_size(layer, QTransform::fromScale(scale, scale)));
+        }
+      }
+
+      const auto inputs = text_render_inputs_from_layer(layer);
+      if (!transform.has_value() || !inputs.has_value()) {
+        continue;  // stays an empty but editable text layer
+      }
+      const double layout_size = std::max(1, inputs->settings.size);
+
+      // The reader's matrix maps GLYPH space (em square = 1 unit, baseline at the
+      // origin, y up) to document pixels; the wire order is a b c d e f with
+      // x' = a x + c y + e. Patchy renders point text in a local y-down space at
+      // the metadata pixel size with the baseline `ascent` below the top, so the
+      // bridge maps local -> glyph space: divide by the pixel size, flip y, and
+      // lift the baseline. Any scale difference (a 39 pt run imported at 150 ppi
+      // renders 81 px tall) lives in the reader's matrix, and the transform render
+      // path draws glyphs crisply at the final scale.
+      QFont metrics_font(inputs->settings.family);
+      metrics_font.setPixelSize(static_cast<int>(layout_size));
+      metrics_font.setBold(inputs->settings.bold);
+      metrics_font.setItalic(inputs->settings.italic);
+      const QFontMetricsF metrics(metrics_font);
+
+      // A substituted font's advances differ from the embedded original's, so the
+      // run would come out the wrong length. The PDF recorded the intended width;
+      // measure what this font produces and absorb the difference into the
+      // transform's x scale, clamped so a wildly wrong substitute cannot smear the
+      // glyphs into unreadability.
+      double width_correction = 1.0;
+      const auto& t = *transform;
+      if (intended_width > 0.0) {
+        const double measured_local = metrics.horizontalAdvance(inputs->settings.text);
+        const double glyph_units_per_local = 1.0 / layout_size;
+        const double measured_document = measured_local * glyph_units_per_local * std::hypot(t[0], t[1]);
+        if (measured_document > 1e-6) {
+          width_correction = std::clamp(intended_width / measured_document, 0.7, 1.4);
+        }
+      }
+
+      const QTransform local_to_glyph(width_correction / layout_size, 0.0, 0.0, -1.0 / layout_size, 0.0,
+                                      metrics.ascent() / layout_size);
+      const QTransform glyph_to_document(t[0], t[1], t[2], t[3], t[4], t[5]);
+      const QTransform combined = local_to_glyph * glyph_to_document;
+      if (auto rendered = render_text_layer_pixels_through_transform(layer, combined)) {
+        layer.set_pixels(std::move(rendered->pixels));
+        layer.set_bounds(rendered->bounds);
+        store_text_layout_metrics(layer, rendered->metrics);
+        metadata[kLayerMetadataTextTransform] = serialize_layer_affine_transform(
+            {combined.m11(), combined.m12(), combined.m21(), combined.m22(), combined.dx(), combined.dy()});
+        metadata[kLayerMetadataTextRasterStatus] = "patchy_raster";
+      }
+    }
+  };
+  process(process, target.layers());
+}
+
+// Writer-made PSDs (ag-psd's test files, GitHub issue 272) can carry a type layer whose raster is
+// empty, and the reader stands its bitmap placeholder in. Photoshop lays such a layer out from
+// its engine data when it updates it, the first baseline on the TySh anchor at the first line's
+// justification point (docs/text-render-calibration.md), so do the same at open: the
+// Photoshop-layout plan pinned there and drawn through the file's transform. The result is the
+// layer's preview (psd_raster_preview), so the transform and a save's type block stay the
+// file's and an edit re-lays out from the same anchor. Vertical and warped type, and a layout
+// that draws nothing, keep the placeholder.
+void MainWindow::lay_out_raster_less_imported_text(Document& target) {
+  const auto plan_transform = [](const Layer& layer) -> std::optional<QTransform> {
+    const auto canonical = canonical_text_affine_transform_for_layer(layer);
+    const auto inputs = text_render_inputs_from_layer(layer);
+    if (!canonical.has_value() || !inputs.has_value()) {
+      return std::nullopt;
+    }
+    if (inputs->settings.boxed) {
+      // The plan's local origin is the box's top-left corner (imported_preview_text_plan_transform).
+      const auto box = psd_text_metadata_local_rect(layer, kLayerMetadataPsdTextBoxBounds);
+      return qtransform_from_affine(box.has_value() ? affine_with_local_translation(*canonical, box->topLeft())
+                                                    : *canonical);
+    }
+    const auto plan = build_text_render_plan(inputs->settings, inputs->color, inputs->max_width,
+                                             inputs->paragraph_runs, inputs->rich_text_runs, std::nullopt, 1.0,
+                                             QTransform(), 1.0);
+    if (plan.line_render_items.empty()) {
+      return std::nullopt;
+    }
+    const auto& first = plan.line_render_items.front();
+    const auto line_rect = first.line.naturalTextRect().translated(first.block_origin);
+    const double baseline = first.block_origin.y() + first.line.y() + first.line.ascent();
+    const QPointF anchor(line_rect.left() + layer_anchor_alignment_factor(layer) * line_rect.width(), baseline);
+    if (!std::isfinite(anchor.x()) || !std::isfinite(anchor.y())) {
+      return std::nullopt;
+    }
+    return qtransform_from_affine(affine_with_local_translation(*canonical, -anchor));
+  };
+  const auto process = [&](auto&& self, std::vector<Layer>& layers) -> void {
+    for (auto& layer : layers) {
+      if (!layer.children().empty()) {
+        self(self, layer.children());
+      }
+      auto& metadata = layer.metadata();
+      const auto status = metadata.find(kLayerMetadataTextRasterStatus);
+      if (!layer_is_text(layer) || status == metadata.end() || status->second != "placeholder" ||
+          !metadata.contains(kLayerMetadataPsdTextTransform) || layer_text_is_vertical(layer) ||
+          layer_has_active_text_warp(layer)) {
+        continue;
+      }
+      const auto transform = plan_transform(std::as_const(layer));
+      if (!transform.has_value()) {
+        continue;
+      }
+      auto rendered = render_text_layer_pixels_through_transform(layer, *transform, /*allow_boxed*/ true);
+      if (!rendered.has_value() || !visible_alpha_local_bounds(rendered->pixels).has_value()) {
+        continue;
+      }
+      layer.set_pixels(convert_pixel_buffer_depth(rendered->pixels, std::as_const(layer).pixels().format().bit_depth,
+                                                  SampleKind::Color));
+      layer.set_bounds(rendered->bounds);
+      metadata[kLayerMetadataTextRasterStatus] = "psd_raster_preview";
+    }
+  };
+  process(process, target.layers());
+}
+
+// A Patchy PSD written before the layout metrics existed reopens with its raster kept and no
+// metrics, so a re-save would fall back to the writer's raster heuristics (box top, ink bottom).
+// Patchy's layout is deterministic, so laying the layer's text out again reproduces the kept
+// raster's geometry when its fonts are installed; record the metrics from that layout without
+// touching the pixels. Point layers still anchored by the old ink-bottom convention (transform
+// == the PSD's, stored boundingBox bottom at the origin) move ty onto the real first baseline,
+// with the PSD-local rects shifted along so the unedited-import invariants hold.
+void MainWindow::record_text_layout_metrics_for_reopened_text(Document& target) {
+  const auto process = [&](auto&& self, std::vector<Layer>& layers) -> void {
+    for (auto& layer : layers) {
+      if (!layer.children().empty()) {
+        self(self, layer.children());
+      }
+      auto& metadata = layer.metadata();
+      const auto value = [&metadata](const char* key) -> std::optional<std::string_view> {
+        const auto found = metadata.find(key);
+        if (found == metadata.end()) {
+          return std::nullopt;
+        }
+        return std::string_view(found->second);
+      };
+      if (!layer_is_text(layer) || metadata.contains(kLayerMetadataTextFirstBaseline) ||
+          value(kLayerMetadataTextRasterStatus) != "patchy_raster" ||
+          (value(kLayerMetadataTextSourceBlock) != "TySh" && value(kLayerMetadataTextSourceBlock) != "tySh") ||
+          value(kLayerMetadataTextLayoutMode) == kTextLayoutModePhotoshop || layer_text_is_vertical(layer) ||
+          layer_has_active_text_warp(layer) || !missing_text_families_for_layer(layer).isEmpty()) {
+        continue;
+      }
+      const auto rendered = render_text_layer_from_metadata(layer);
+      if (!rendered.has_value() || rendered->pixels.empty() || !rendered->metrics.first_baseline.has_value()) {
+        continue;
+      }
+      auto metrics = rendered->metrics;
+      // The inset read back from the file describes the raster that is actually kept; keep it.
+      if (const auto stored_inset = value(kLayerMetadataTextBoxBaselineInset); stored_inset.has_value()) {
+        metrics.box_baseline_inset = QString::fromUtf8(stored_inset->data(), static_cast<int>(stored_inset->size())).toDouble();
+      }
+      const bool boxed = text_flow_is_box(QString::fromStdString(std::string(value(kLayerMetadataTextFlow).value_or(""))));
+      if (!boxed && !layer_patchy_text_transform_overrides_psd_source(layer)) {
+        const auto transform = canonical_text_affine_transform_for_layer(layer);
+        const auto psd_bounding_box = parse_space_separated_doubles(
+            std::string(value(kLayerMetadataPsdTextBoundingBox).value_or("")));
+        const auto kept_ink = visible_alpha_local_bounds(layer.pixels());
+        const auto fresh_ink = visible_alpha_local_bounds(rendered->pixels);
+        if (transform.has_value() && !affine_transform_has_non_translation_linear_part(*transform) &&
+            psd_bounding_box.size() >= 4U && std::abs(psd_bounding_box[3]) < 0.5 && psd_bounding_box[1] < -0.5 &&
+            kept_ink.has_value() && fresh_ink.has_value() && kept_ink->height == fresh_ink->height &&
+            kept_ink->y == fresh_ink->y) {
+          const double ink_bottom = static_cast<double>(kept_ink->y + kept_ink->height);
+          // first_baseline is origin-relative; the kept raster's rows start at local_rect.top().
+          const double delta = *rendered->metrics.first_baseline - rendered->local_rect.top() - ink_bottom;
+          if (std::isfinite(delta) && std::abs(delta) > 0.01) {
+            auto moved = *transform;
+            moved[5] += delta;
+            const auto serialized = serialize_layer_affine_transform(moved);
+            metadata[kLayerMetadataTextTransform] = serialized;
+            metadata[kLayerMetadataPsdTextTransform] = serialized;
+            for (const char* key : {kLayerMetadataPsdTextBounds, kLayerMetadataPsdTextBoundingBox}) {
+              auto rect = parse_space_separated_doubles(std::string(value(key).value_or("")));
+              if (rect.size() < 4U) {
+                continue;
+              }
+              rect[1] -= delta;
+              rect[3] -= delta;
+              QStringList parts;
+              for (std::size_t index = 0; index < 4U; ++index) {
+                parts.push_back(QString::number(rect[index], 'g', 17));
+              }
+              metadata[key] = parts.join(QLatin1Char(' ')).toStdString();
+            }
+          }
+        }
+      }
+      store_text_layout_metrics(layer, metrics);
+    }
+  };
+  process(process, target.layers());
+}
+
+std::size_t MainWindow::pdf_page_task_window(double largest_page_bytes) {
+  const auto threads = std::max<std::size_t>(1, std::min<std::size_t>(4, std::thread::hardware_concurrency() / 2));
+  const double budget_bytes = std::max(1024.0, static_cast<double>(total_physical_ram_mb()) / 8.0) * 1024.0 * 1024.0;
+  // A decode holds the resampled image and the layer pixels at once (the source image is
+  // usually far smaller); a fingerprint holds the composite and its image.
+  const double per_task_bytes = std::max(1.0, largest_page_bytes * 2.0);
+  return static_cast<std::size_t>(std::clamp(budget_bytes / per_task_bytes, 1.0, static_cast<double>(threads)));
+}
+
+void MainWindow::render_pending_pdf_image_layers(Document& target) {
+  Document* const targets[] = {&target};
+  render_pending_pdf_image_layers(targets, /*stamp_sources=*/true);
+}
+
+void MainWindow::render_pending_pdf_image_layers(std::span<Document* const> targets, bool stamp_sources) {
+  struct Job {
+    Document* document;
+    Layer* layer;
+    SmartObjectPlacement placement;
+    const SmartObjectSource* source;
+    bool last_of_document{false};
+  };
+  std::vector<Job> jobs;
+  // Documents with nothing to decode whose original page image still wants its fingerprint.
+  std::vector<Document*> stamp_only;
+  const auto wants_stamp = [stamp_sources](const Document& document) {
+    const auto& source = document.metadata().pdf_source_page;
+    return stamp_sources && source != nullptr && !source->composite_hash_valid;
+  };
+  for (auto* target : targets) {
+    const auto first_job = jobs.size();
+    const auto collect = [&](auto&& self, std::vector<Layer>& layers) -> void {
+      for (auto& layer : layers) {
+        if (!layer.children().empty()) {
+          self(self, layer.children());
+        }
+        auto& metadata = layer.metadata();
+        if (!metadata.contains(kLayerMetadataPdfPendingImage)) {
+          continue;
+        }
+        metadata.erase(kLayerMetadataPdfPendingImage);
+        const auto placement = smart_object_placement_from_layer(layer);
+        if (!placement.has_value()) {
+          continue;
+        }
+        const auto* source = std::as_const(*target).metadata().smart_objects.find(placement->uuid);
+        if (source == nullptr) {
+          continue;
+        }
+        jobs.push_back({target, &layer, *placement, source});
+      }
+    };
+    collect(collect, target->layers());
+    if (jobs.size() > first_job) {
+      jobs.back().last_of_document = true;
+    } else if (wants_stamp(std::as_const(*target))) {
+      stamp_only.push_back(target);
+    }
+  }
+  if (jobs.empty() && stamp_only.empty()) {
+    return;
+  }
+  ++open_progress_stats_.pdf_image_passes;
+  open_progress_stats_.pdf_images += static_cast<int>(jobs.size());
+
+  // Decoding and resampling every page image was most of an open's wait (16 scanned pages,
+  // about 0.4 s each, all on this thread). They run on workers, a few at a time to bound
+  // memory, while this thread keeps painting the open's progress dialog once the wait is
+  // noticeable. One pass covers every page of the import, so the count runs over all of
+  // them and different pages decode side by side. The documents are not attached to a
+  // session yet, so nothing else touches them meanwhile.
+  std::optional<OpenProgress> own_progress;
+  if (open_progress_ == nullptr) {
+    own_progress.emplace(*this, tr("Opening PDF"), QString(), QStringLiteral("pdfPageImagesProgressDialog"));
+  }
+  auto& progress = *open_progress_;
+  using Decoded = std::optional<std::pair<PixelBuffer, Rect>>;
+  const auto decode = [](const SmartObjectSource* source, SmartObjectPlacement placement, BitDepth depth) -> Decoded {
+    const auto image = decode_smart_object_source_image(*source);
+    if (!image.has_value()) {
+      return std::nullopt;
+    }
+    auto rendered = render_smart_object_pixels(*image, placement, CanvasWidget::TransformInterpolation::Bicubic);
+    if (!rendered.has_value()) {
+      return std::nullopt;
+    }
+    return std::make_pair(pixels_from_image_at_depth(rendered->image, depth), rendered->bounds);
+  };
+  double largest_page_bytes = 0.0;
+  for (const auto* target : targets) {
+    largest_page_bytes = std::max(largest_page_bytes, 4.0 * static_cast<double>(target->width()) *
+                                                          static_cast<double>(target->height()));
+  }
+  const std::size_t window = pdf_page_task_window(largest_page_bytes);
+  open_progress_stats_.pdf_image_window = static_cast<int>(window);
+
+  using Stamp = std::shared_ptr<const PdfSourcePage>;
+  struct PendingStamp {
+    Document* document;
+    std::future<Stamp> future;
+  };
+  std::deque<std::future<Decoded>> decodes;
+  std::deque<PendingStamp> stamps;
+  std::size_t applied = 0;
+  const auto show_step = [&] {
+    if (!jobs.empty()) {
+      const auto shown = std::min(applied + 1, jobs.size());
+      progress.set_step(
+          tr("Preparing page image %1 of %2...").arg(static_cast<int>(shown)).arg(static_cast<int>(jobs.size())),
+          static_cast<int>(applied), static_cast<int>(jobs.size()));
+    }
+  };
+  const auto pump = [&] {
+    show_step();
+    progress.pump();
+  };
+  // An editable page that is one image carries its source bytes from the reader, but its
+  // pixels only exist now: fingerprint the composite so an unchanged page can export those
+  // bytes. Flattened pages arrive already stamped. The composite and its hash run on a
+  // worker (about a second for a 115 Mpx page); nothing changes the document until the
+  // pass returns.
+  const auto launch_stamp = [&](Document* document) {
+    if (!wants_stamp(std::as_const(*document))) {
+      return;
+    }
+    stamps.push_back({document, launch_async([document, source = std::as_const(*document).metadata().pdf_source_page] {
+                        const UiProfileScope profile_scope("pdf_images.source_stamp");
+                        return stamped_pdf_source_page(std::as_const(*document), source);
+                      })});
+  };
+  const auto finish_stamp = [&](bool wait) {
+    auto& oldest = stamps.front();
+    while (oldest.future.wait_for(std::chrono::milliseconds(wait ? 15 : 0)) != std::future_status::ready) {
+      if (!wait) {
+        return false;
+      }
+      pump();
+    }
+    if (auto stamped = oldest.future.get(); stamped != nullptr) {
+      oldest.document->metadata().pdf_source_page = std::move(stamped);
+    }
+    stamps.pop_front();
+    return true;
+  };
+  const auto apply_oldest_decode = [&] {
+    show_step();
+    auto& future = decodes.front();
+    while (future.wait_for(std::chrono::milliseconds(15)) != std::future_status::ready) {
+      pump();
+    }
+    auto result = future.get();
+    decodes.pop_front();
+    const auto& job = jobs[applied];
+    ++applied;
+    if (result.has_value()) {
+      auto& layer = *job.layer;
+      layer.set_pixels(std::move(result->first));
+      layer.set_bounds(result->second);
+      layer.metadata()[kLayerMetadataSmartObjectRasterStatus] = kSmartObjectRasterStatusPatchy;
+    }
+    if (job.last_of_document) {
+      launch_stamp(job.document);
+    }
+  };
+  // Frees a slot: a finished fingerprint first, else the oldest decode (which may start
+  // its document's fingerprint in the slot it gave up), else the oldest fingerprint.
+  const auto make_room = [&] {
+    while (decodes.size() + stamps.size() >= window) {
+      if (!stamps.empty() && finish_stamp(/*wait=*/false)) {
+        continue;
+      }
+      if (!decodes.empty()) {
+        apply_oldest_decode();
+      } else {
+        finish_stamp(/*wait=*/true);
+      }
+    }
+  };
+  for (auto* document : stamp_only) {
+    make_room();
+    launch_stamp(document);
+  }
+  for (const auto& job : jobs) {
+    make_room();
+    decodes.push_back(launch_async([decode, source = job.source, placement = job.placement,
+                                    depth = std::as_const(*job.document).color_state().bit_depth] {
+      const UiProfileScope profile_scope("pdf_images.decode");
+      return decode(source, placement, depth);
+    }));
+  }
+  while (!decodes.empty()) {
+    apply_oldest_decode();
+  }
+  while (!stamps.empty()) {
+    finish_stamp(/*wait=*/true);
+  }
+  show_step();
+}
+
+std::vector<LayerId> MainWindow::rasterize_target_layer_ids(std::vector<LayerId> selected_ids) const {
+  // A selected folder stands for its contents: rasterizing a selection that
+  // includes folders reaches every layer inside them, collapsed or not, so the
+  // walk goes through the document tree rather than the panel's rows.
+  std::vector<LayerId> ids;
+  ids.reserve(selected_ids.size());
+  std::set<LayerId> seen;
+  const auto& doc = document();
+  for (const auto id : selected_ids) {
+    if (!seen.insert(id).second) {
+      continue;
+    }
+    ids.push_back(id);
+    const auto* layer = doc.find_layer(id);
+    if (layer == nullptr || layer->kind() != LayerKind::Group) {
+      continue;
+    }
+    std::vector<LayerId> descendants;
+    collect_layer_descendant_ids(*layer, descendants);
+    for (const auto descendant : descendants) {
+      if (seen.insert(descendant).second) {
+        ids.push_back(descendant);
+      }
+    }
+  }
+  return ids;
+}
+
+void MainWindow::rasterize_active_layers() {
+  finish_active_text_editor();
+  rasterize_layer_ids(rasterize_target_layer_ids(selected_or_active_layer_ids()));
+}
+
+void MainWindow::rasterize_layer_ids(const std::vector<LayerId>& ids) {
+  if (ids.empty()) {
+    return;
+  }
+
+  struct PendingRasterize {
+    LayerId id{};
+    RasterizedLayerPixels pixels;
+    Rect before;
+    bool clear_text{false};
+    bool clear_smart_object{false};
+    bool clear_vector{false};
+  };
+  auto& doc = document();
+  std::vector<PendingRasterize> pending;
+  pending.reserve(ids.size());
+  for (const auto id : ids) {
+    const auto* layer = doc.find_layer(id);
+    if (layer == nullptr || layer_id_locks_image_pixels(id) || !layer_can_rasterize(*layer)) {
+      continue;
+    }
+    auto rasterized = render_rasterized_layer_pixels(doc, *layer, false);
+    if (!rasterized.has_value()) {
+      continue;
+    }
+    pending.push_back(PendingRasterize{id, std::move(*rasterized), layer_render_bounds(*layer),
+                                       layer->kind() == LayerKind::Text || layer_is_text(*layer),
+                                       layer_is_smart_object(*layer), layer_is_vector_shape(*layer)});
+  }
+  if (pending.empty()) {
+    if (std::any_of(ids.begin(), ids.end(), [this](LayerId id) { return layer_id_locks_image_pixels(id); })) {
+      show_status_error(tr("Layer pixels are locked."));
+      return;
+    }
+    show_status_error(tr("No rasterizable layers selected"));
+    return;
+  }
+
+  push_undo_snapshot(pending.size() == 1U ? tr("Rasterize layer") : tr("Rasterize layers"));
+  Rect affected;
+  for (auto& change : pending) {
+    auto* layer = doc.find_layer(change.id);
+    if (layer == nullptr) {
+      continue;
+    }
+    affected = unite_rect(affected, change.before);
+    layer->set_pixels(std::move(change.pixels.pixels));
+    layer->set_bounds(change.pixels.bounds);
+    if (change.clear_text) {
+      layer->set_name(rasterized_text_layer_name(*layer).toStdString());
+      clear_layer_text_metadata(*layer);
+    }
+    if (change.clear_smart_object) {
+      // The pixels already are the preview; dropping the metadata and the preserved
+      // placed-layer blocks makes this a plain pixel layer everywhere, resave included.
+      strip_layer_smart_object_data(doc, *layer);
+    }
+    if (change.clear_vector) {
+      strip_layer_vector_data(*layer);
+    }
+    affected = unite_rect(affected, layer_render_bounds(*layer));
+  }
+  refresh_layer_list();
+  refresh_layer_controls();
+  canvas_->document_changed(affected.empty() ? QRect() : to_qrect(affected));
+  statusBar()->showMessage(pending.size() == 1U ? tr("Rasterized layer") : tr("Rasterized layers"));
+}
+
+void MainWindow::rasterize_active_layer_styles() {
+  finish_active_text_editor();
+  const auto ids = rasterize_target_layer_ids(selected_or_active_layer_ids());
+  if (ids.empty()) {
+    return;
+  }
+
+  struct PendingRasterizeStyle {
+    LayerId id{};
+    RasterizedLayerPixels pixels;
+    Rect before;
+    bool clear_text{false};
+  };
+  auto& doc = document();
+  std::vector<PendingRasterizeStyle> pending;
+  pending.reserve(ids.size());
+  for (const auto id : ids) {
+    const auto* layer = doc.find_layer(id);
+    if (layer == nullptr || layer_id_locks_image_pixels(id) || !layer_can_rasterize_layer_style(*layer)) {
+      continue;
+    }
+    auto rasterized = render_rasterized_layer_pixels(doc, *layer, true);
+    if (!rasterized.has_value()) {
+      continue;
+    }
+    pending.push_back(PendingRasterizeStyle{id, std::move(*rasterized), layer_render_bounds(*layer),
+                                            layer->kind() == LayerKind::Text || layer_is_text(*layer)});
+  }
+  if (pending.empty()) {
+    if (std::any_of(ids.begin(), ids.end(), [this](LayerId id) { return layer_id_locks_image_pixels(id); })) {
+      show_status_error(tr("Layer pixels are locked."));
+      return;
+    }
+    show_status_error(tr("No layer styles to rasterize"));
+    return;
+  }
+
+  push_undo_snapshot(pending.size() == 1U ? tr("Rasterize layer style") : tr("Rasterize layer styles"));
+  Rect affected;
+  for (auto& change : pending) {
+    auto* layer = doc.find_layer(change.id);
+    if (layer == nullptr) {
+      continue;
+    }
+    affected = unite_rect(affected, change.before);
+    layer->set_pixels(std::move(change.pixels.pixels));
+    layer->set_bounds(change.pixels.bounds);
+    clear_layer_psd_style_source(*layer);
+    layer->layer_style() = {};
+    layer->set_fill_opacity(1.0F);
+    if (change.clear_text) {
+      layer->set_name(rasterized_text_layer_name(*layer).toStdString());
+      clear_layer_text_metadata(*layer);
+    }
+    // Baking effects into the pixels breaks the preview's tie to the placed source, so
+    // a smart object also demotes to a plain pixel layer here - and so does a
+    // shape layer (the cache is no longer a pure path render).
+    strip_layer_smart_object_data(doc, *layer);
+    strip_layer_vector_data(*layer);
+    affected = unite_rect(affected, layer_render_bounds(*layer));
+  }
+  refresh_layer_list();
+  refresh_layer_controls();
+  canvas_->document_changed(affected.empty() ? QRect() : to_qrect(affected));
+  statusBar()->showMessage(pending.size() == 1U ? tr("Rasterized layer style") : tr("Rasterized layer styles"));
+}
+
+void MainWindow::merge_down() {
+  if (canvas_ != nullptr) {
+    canvas_->finish_free_transform();
+  }
+  finish_active_text_editor();
+
+  select_only_layer_if_none_active();
+  auto ids = selected_or_active_layer_ids();
+  if (ids.empty()) {
+    show_status_error(tr("Select a layer to merge down"));
+    return;
+  }
+
+  auto& doc = document();
+
+  // Normalize the selection: dedupe, drop ids missing from the tree, and drop any id whose ancestor
+  // group is also selected (the folder already contains it, so merging both would double-count).
+  const std::set<LayerId> selected(ids.begin(), ids.end());
+  std::set<LayerId> seen_ids;
+  std::vector<LayerId> normalized;
+  normalized.reserve(ids.size());
+  for (const auto id : ids) {
+    if (!seen_ids.insert(id).second) {
+      continue;
+    }
+    if (std::as_const(doc).find_layer(id) == nullptr) {
+      continue;
+    }
+    std::vector<LayerId> ancestors;
+    if (collect_layer_ancestor_groups(std::as_const(doc).layers(), id, ancestors) &&
+        std::any_of(ancestors.begin(), ancestors.end(),
+                    [&selected](LayerId ancestor) { return selected.count(ancestor) != 0; })) {
+      continue;
+    }
+    normalized.push_back(id);
+  }
+
+  if (normalized.empty()) {
+    show_status_error(tr("Select a layer to merge down"));
+    return;
+  }
+
+  // Order the selection bottom-to-top by global compositor paint order so blend modes composite
+  // correctly and the bottom-most item becomes the merge target.
+  std::vector<LayerId> render_order;
+  collect_layer_render_order(std::as_const(doc).layers(), render_order);
+  const auto stack_position = [&render_order](LayerId id) {
+    return static_cast<std::size_t>(
+        std::distance(render_order.begin(), std::find(render_order.begin(), render_order.end(), id)));
+  };
+  std::sort(normalized.begin(), normalized.end(),
+            [&stack_position](LayerId lhs, LayerId rhs) { return stack_position(lhs) < stack_position(rhs); });
+
+  // Build the bottom-to-top merge list. A single folder flattens in place (Photoshop "Merge Group");
+  // a single non-folder merges with the layer directly below it ("Merge Down"); several selected
+  // items merge the whole selection together.
+  std::vector<LayerId> merge_list;
+  if (normalized.size() == 1U) {
+    const auto id = normalized.front();
+    const auto* single = std::as_const(doc).find_layer(id);
+    if (single != nullptr && single->kind() == LayerKind::Group) {
+      merge_list = {id};
+    } else {
+      const auto location = find_layer_location(std::as_const(doc).layers(), id);
+      if (!location.has_value() || location->index == 0U) {
+        show_status_error(tr("No layer below to merge"));
+        return;
+      }
+      merge_list = {(*location->siblings)[location->index - 1U].id(), id};
+    }
+  } else {
+    merge_list = normalized;  // already sorted bottom-to-top
+  }
+
+  // Vectors, including shapes inside selected folders, use the preserving
+  // planner. Bitmap-only Merge Down retains its established flattening behavior.
+  if (merge_selection_contains_vectors(std::as_const(doc), merge_list)) {
+    auto plan = plan_layer_merge(std::as_const(doc), merge_list);
+    std::optional<Document> prepared;
+    const bool simple_shapes = merge_list.size() > 1 && plan.changed && plan.result_ids.size() == 1 &&
+        std::all_of(merge_list.begin(), merge_list.end(), [&](LayerId id) {
+          const auto* layer = std::as_const(doc).find_layer(id);
+          return layer != nullptr && layer_is_vector_shape(*layer);
+        });
+    if (!simple_shapes) {
+      // The dialog owns a const snapshot, so closing a tab cannot invalidate a
+      // readout callback. The edit lock prevents concurrent document edits.
+      const auto session_id = active_session()->session_id;
+      const Document source = std::as_const(doc);
+      auto edit_lock = lock_preview_dialog_edits();
+      const auto options = show_layer_merge_dialog(this, source, merge_list, false, &prepared);
+      if (!options.has_value() || active_session() == nullptr || active_session()->session_id != session_id) {
+        return;
+      }
+      plan = plan_layer_merge(std::as_const(doc), merge_list, *options);
+    }
+    if (!plan.changed) {
+      return;
+    }
+    const auto merging_session = active_session()->session_id;
+    auto merge_edit_lock = lock_preview_dialog_edits();
+    try {
+      if (!prepared) {
+        prepared = render_layer_merge_with_processing(canvas_, std::as_const(doc), plan, [](const Layer& layer) -> std::optional<Layer> {
+          if (layer.kind() == LayerKind::Group || layer.kind() == LayerKind::Adjustment) {
+            return layer;
+          }
+          return renderable_merge_layer_copy(layer);
+        });
+      }
+    } catch (const std::exception&) {
+      show_status_error(tr("Could not merge the layers. The original layers are unchanged."));
+      return;
+    }
+    if (active_session() == nullptr || active_session()->session_id != merging_session) { return; }
+    merge_edit_lock.release();
+    push_undo_snapshot(tr("Merge down"));
+    doc = std::move(*prepared);
+    if (canvas_ != nullptr) {
+      canvas_->clear_path_edit_selection();
+      canvas_->set_layer_edit_target(CanvasWidget::LayerEditTarget::Content);
+      canvas_->set_selected_layer_ids(plan.result_ids);
+    }
+    refresh_layer_list();
+    refresh_layer_controls();
+    refresh_document_info();
+    path_row_hidden_for_layer_.reset();
+    refresh_paths_panel();
+    if (canvas_ != nullptr) {
+      canvas_->document_changed();
+    }
+    statusBar()->showMessage(simple_shapes ? tr("Merged shapes down") : tr("Merged layers"));
+    return;
+  }
+
+  // Render the visible items into a scratch document. Hidden items contribute nothing and are simply
+  // dropped from the render -- they are still removed below, matching how Photoshop discards hidden
+  // layers when merging. Folders and adjustment layers are added as-is so the compositor flattens or
+  // applies them; anything the compositor can't draw is skipped the same way. The merged pixels land
+  // in the bottom-most visible item, which keeps its id and name.
+  const auto merging_session = active_session()->session_id;
+  auto merge_edit_lock = lock_preview_dialog_edits();
+  const QPointer<CanvasWidget> processing_canvas(canvas_);
+  if (processing_canvas) { processing_canvas->begin_processing_operation(tr("Merging layers...")); }
+  const auto finish_processing = qScopeGuard([processing_canvas] {
+    if (processing_canvas) { processing_canvas->end_processing_operation(); }
+  });
+  Rect affected;
+  Document merge_document(doc.width(), doc.height(), doc.format());
+  merge_document.metadata().patterns = std::as_const(doc).metadata().patterns;
+  // A 16/32-bit document merges at its depth (docs/high-bit-depth.md).
+  const auto merge_depth = std::as_const(doc).color_state().bit_depth;
+  merge_document.color_state().bit_depth = merge_depth;
+  LayerId target_id = 0;
+  // A hidden folder that holds the whole merge hides its result too, so only the items' own
+  // visibility and that of folders below the shared ones count (Photoshop; GitHub issue 389).
+  const auto shared_groups = layer_shared_ancestor_groups(std::as_const(doc).layers(), merge_list);
+  const auto draws_in_merge = [&doc, &shared_groups](LayerId id) {
+    std::vector<LayerId> ancestors;
+    (void)collect_layer_ancestor_groups(std::as_const(doc).layers(), id, ancestors);
+    const auto* layer = std::as_const(doc).find_layer(id);
+    return layer != nullptr && layer->visible() &&
+        std::all_of(ancestors.begin(), ancestors.end(), [&](LayerId ancestor) {
+          const auto* group = std::as_const(doc).find_layer(ancestor);
+          return shared_groups.contains(ancestor) || (group != nullptr && group->visible());
+        });
+  };
+  for (const auto id : merge_list) {
+    const auto* layer = std::as_const(doc).find_layer(id);
+    if (layer == nullptr) {
+      show_status_error(tr("Select a layer to merge down"));
+      return;
+    }
+    if (!draws_in_merge(id)) {
+      continue;
+    }
+    std::optional<Layer> renderable;
+    if (layer->kind() == LayerKind::Group || layer->kind() == LayerKind::Adjustment) {
+      renderable = *layer;
+    } else {
+      renderable = renderable_merge_layer_copy(*layer);
+    }
+    if (!renderable.has_value()) {
+      continue;
+    }
+    if (target_id == 0) {
+      target_id = id;
+    }
+    affected = unite_rect(affected, layer_render_bounds(*layer));
+    auto& added = merge_document.add_layer(std::move(*renderable));
+    affected = unite_rect(affected, layer_render_bounds(added));
+    if (processing_canvas) { processing_canvas->tick_processing_operation(); }
+  }
+
+  if (target_id == 0) {
+    statusBar()->showMessage(tr("Nothing to merge down"));
+    return;
+  }
+  if (layer_id_locks_image_pixels(target_id)) {
+    show_status_error(tr("Target layer pixels are locked. Unlock image pixels to merge down."));
+    return;
+  }
+
+  auto merge_bounds = affected;
+  merge_bounds = intersect_rect(merge_bounds, Rect::from_size(doc.width(), doc.height()));
+  if (merge_bounds.empty()) {
+    statusBar()->showMessage(tr("Nothing to merge down"));
+    return;
+  }
+
+  auto image_future = launch_async([merge_document = std::move(merge_document), merge_bounds] {
+    const ScopedDocumentDepthRender depth_render;
+    return qimage_from_document_rect(merge_document, QRect(merge_bounds.x, merge_bounds.y, merge_bounds.width, merge_bounds.height), true);
+  });
+  if (processing_canvas) {
+    processing_canvas->wait_for_processing_operation([&image_future] {
+      return image_future.wait_for(std::chrono::milliseconds(16)) == std::future_status::ready;
+    });
+  }
+  QImage image;
+  try { image = image_future.get(); }
+  catch (const std::exception&) {
+    show_status_error(tr("Could not merge the layers. The original layers are unchanged."));
+    return;
+  }
+  if (active_session() == nullptr || active_session()->session_id != merging_session) { return; }
+  if (image.isNull()) {
+    statusBar()->showMessage(tr("Nothing to merge down"));
+    return;
+  }
+  auto merged_pixels = pixels_from_image_at_depth(image, merge_depth);
+
+  merge_edit_lock.release();
+  // A merge into the Background keeps it one (Photoshop; GitHub issue 274): opaque RGB over the
+  // whole canvas, which an opaque full-canvas target already is.
+  const auto canvas_rect = Rect::from_size(doc.width(), doc.height());
+  if (layer_is_document_background(target_id) && merge_bounds == canvas_rect) {
+    merged_pixels = composite_onto_white(merged_pixels);
+  }
+  push_undo_snapshot(tr("Merge down"));
+  const auto target_location = find_layer_location(doc.layers(), target_id);
+  if (!target_location.has_value()) {
+    refresh_layer_list();
+    refresh_layer_controls();
+    show_status_error(tr("Select a layer to merge down"));
+    return;
+  }
+
+  Layer& target = (*target_location->siblings)[target_location->index];
+  if (target.kind() != LayerKind::Pixel) {
+    // A folder/adjustment/text target can't simply hold the merged pixels; replace it in place with a
+    // fresh pixel layer that keeps its id and name (dropping any now-flattened children/metadata).
+    Layer merged(target_id, target.name(), std::move(merged_pixels));
+    merged.set_bounds(merge_bounds);
+    target = std::move(merged);
+  } else {
+    target.set_pixels(std::move(merged_pixels));
+    target.set_bounds(merge_bounds);
+    target.set_opacity(1.0F);
+    target.set_fill_opacity(1.0F);
+    target.set_blend_mode(BlendMode::Normal);
+    target.clear_mask();
+    target.layer_style() = {};
+    clear_layer_text_metadata(target);
+    strip_layer_smart_object_data(doc, target);
+    strip_layer_vector_data(target);
+    clear_layer_psd_style_source(target);
+    target.set_visible(true);
+  }
+
+  // Remove every other merged item by id. remove_layer searches the whole tree, so cross-folder
+  // selections are handled; do not touch the `target` reference after this -- erasing siblings can
+  // invalidate it.
+  for (const auto id : merge_list) {
+    if (id != target_id) {
+      doc.remove_layer(id);
+    }
+  }
+  doc.set_active_layer(target_id);
+  affected = unite_rect(affected, merge_bounds);
+  refresh_layer_list();
+  refresh_layer_controls();
+  canvas_->document_changed(to_qrect(affected));
+  statusBar()->showMessage(merge_list.size() == 2U ? tr("Merged layer down") : tr("Merged layers down"));
+}
+
+QColor MainWindow::current_text_color() const {
+  if (canvas_ != nullptr) {
+    if (const auto* editor = canvas_->findChild<QTextEdit*>(QStringLiteral("inlineTextEditor")); editor != nullptr) {
+      if (const auto color = text_color_from_format(text_editor_reference_format(*editor)); color.has_value()) {
+        return *color;
+      }
+      const auto color = editor->property("patchy.documentTextColor").value<QColor>();
+      if (color.isValid()) {
+        return color;
+      }
+    }
+    return canvas_->primary_color();
+  }
+  return QColor(Qt::black);
+}
+
+void MainWindow::sync_text_options_from_active_editor() {
+  if (canvas_ == nullptr) {
+    return;
+  }
+  auto* editor = canvas_->findChild<QTextEdit*>(QStringLiteral("inlineTextEditor"));
+  if (editor == nullptr || editor->property(kTextEditorFinishedProperty).toBool()) {
+    sync_text_options_from_active_layer();
+    return;
+  }
+  // The session owns the bar; the next no-session sync must re-read its layer.
+  text_options_layer_sync_key_.clear();
+
+  const auto format = text_editor_reference_format(*editor);
+  const auto format_font = format.font();
+  const auto display_family = text_display_family_from_format(
+      format, editor->property("patchy.documentTextFamily").toString());
+  if (!display_family.trimmed().isEmpty()) {
+    show_text_family_in_options_bar(display_family);
+  }
+  if (!display_family.trimmed().isEmpty()) {
+    editor->setProperty("patchy.documentTextFamily", display_family);
+  }
+
+  const auto document_text_size = document_text_size_from_editor_format(
+      format, canvas_->zoom(), std::max(1, editor->property("patchy.documentTextSize").toInt()));
+  if (text_size_spin_ != nullptr) {
+    QSignalBlocker blocker(text_size_spin_);
+    const auto display_size = std::max(
+        1, static_cast<int>(std::lround(document_text_size * text_editor_size_display_scale(*editor))));
+    // A size the user just typed (50) stays as typed while it names the same pixel size, rather
+    // than turning into the pixel size's exact points (50.26 at 95.99 ppi, GitHub issue 371).
+    text_size_spin_->setValue(
+        std::clamp(text_points_for_display(text_size_spin_->value(), display_size, document()),
+                   text_size_spin_->minimum(), text_size_spin_->maximum()));
+  }
+
+  // A run with no recorded face still lands on the style its bold/italic flags describe.
+  refresh_text_style_combo(display_family.trimmed().isEmpty()
+                               ? (text_font_combo_ != nullptr ? text_font_combo_->currentFont().family() : QString())
+                               : display_family,
+                           format.property(kTextStyleNameFormatProperty).toString(), format_font.bold(),
+                           format_font.italic());
+  show_text_anti_alias(editor->property("patchy.documentTextAntiAlias").toInt());
+
+  if (const auto color = text_color_from_format(format); color.has_value()) {
+    editor->setProperty("patchy.documentTextColor", *color);
+  }
+  refresh_text_color_button();
+  sync_text_character_dialog_from_editor();
+}
+
+void MainWindow::show_text_family_in_options_bar(const QString& family) {
+  if (text_font_combo_ == nullptr) {
+    return;
+  }
+  {
+    QSignalBlocker blocker(text_font_combo_);
+    text_font_combo_->setCurrentFont(text_font_combo_font_for_family(family));
+  }
+  // A family this computer lacks has no row to show: the closed control names it instead, marked
+  // missing (GitHub issue 652), while it stays parked on the installed row new type starts from.
+  // Like Photoshop, the field shows the family without its face words; the style field shows
+  // the face (refresh_text_style_combo, GitHub issue 669).
+  if (auto* picker = qobject_cast<FontPickerCombo*>(text_font_combo_); picker != nullptr) {
+    if (text_family_missing_from_computer(family)) {
+      picker->set_missing_family(family, missing_text_family_parts(family).first);
+    } else {
+      picker->set_missing_family(QString());
+    }
+  }
+}
+
+void MainWindow::sync_text_options_from_active_layer() {
+  if (canvas_ == nullptr || text_font_combo_ == nullptr || text_size_spin_ == nullptr) {
+    return;
+  }
+  // A session (live, or tearing down) owns the bar; a hidden session has no object name and
+  // reaches here through the commit refreshes with the layer it just wrote, which is right.
+  if (canvas_->findChild<QTextEdit*>(QStringLiteral("inlineTextEditor")) != nullptr) {
+    return;
+  }
+  const auto* layer = text_character_target_layer();
+  if (layer == nullptr) {
+    // Nothing to mirror: the bar keeps what it shows (the next new layer's seed), and the
+    // next text layer to become active is read afresh. A missing family left over from the
+    // last mirrored layer is not what it shows: the combo displays another row, so put
+    // currentFont() back on that row before anything seeds new type from it (GitHub issue 180).
+    text_options_layer_sync_key_.clear();
+    if (const auto shown = text_options_bar_family();
+        shown.compare(text_font_combo_->currentFont().family(), Qt::CaseInsensitive) != 0) {
+      show_text_family_in_options_bar(shown);
+      refresh_text_style_combo(shown, current_text_style_name());
+    } else if (auto* picker = qobject_cast<FontPickerCombo*>(text_font_combo_); picker != nullptr) {
+      picker->set_missing_family(QString());
+    }
+    return;
+  }
+  const auto& metadata = layer->metadata();
+  const auto read = [&metadata](const char* key) {
+    const auto found = metadata.find(key);
+    return found == metadata.end() ? QString() : QString::fromStdString(found->second);
+  };
+  // The same reads add_text_at does when it opens the layer, minus the font substitution
+  // prompt: this only shows what the layer records.
+  auto family = read(kLayerMetadataTextFont);
+  if (family.trimmed().isEmpty() || family.compare(QStringLiteral("PSD Text"), Qt::CaseInsensitive) == 0) {
+    family = text_font_combo_->currentFont().family();
+  } else {
+    family = canonical_text_display_family(family);
+  }
+  const auto size_text = read(kLayerMetadataTextSize);
+  const int document_text_size = size_text.isEmpty() ? 48 : std::max(1, size_text.toInt());
+  double size_display_scale = 1.0;
+  if (const auto affine = canonical_text_affine_transform_for_layer(*layer); affine.has_value()) {
+    const auto vertical_scale = std::hypot((*affine)[2], (*affine)[3]);
+    if (std::isfinite(vertical_scale) && vertical_scale > 0.01) {
+      size_display_scale = vertical_scale;
+    }
+  }
+  bool text_bold = read(kLayerMetadataTextBold) == QStringLiteral("true");
+  bool text_italic = read(kLayerMetadataTextItalic) == QStringLiteral("true");
+  const auto runs = read(kLayerMetadataTextRuns);
+  // A face pick lives in the runs (columns 3 and 4 of the first line), not the layer-level
+  // keys, so the picker must read them or a Bold pick shows Regular straight after applying.
+  for (const auto& raw_line : runs.split(QLatin1Char('\n'))) {
+    const auto fields = raw_line.trimmed().split(QLatin1Char('\t'));
+    if (fields.size() < 7) {
+      continue;  // version header / malformed line
+    }
+    text_bold = fields[3].toInt() != 0;
+    text_italic = fields[4].toInt() != 0;
+    break;
+  }
+  const auto style = first_text_run_style_name(runs);
+  const auto anti_alias_text = read(kLayerMetadataTextAntiAlias);
+  const int text_anti_alias = anti_alias_text.isEmpty() ? text_anti_alias_
+                                                         : std::clamp(anti_alias_text.toInt(), 0, 16);
+  const auto key = QStringLiteral("%1|%2|%3|%4|%5|%6|%7|%8")
+                       .arg(static_cast<qulonglong>(layer->id()))
+                       .arg(family)
+                       .arg(document_text_size)
+                       .arg(size_display_scale)
+                       .arg(text_bold ? 1 : 0)
+                       .arg(text_italic ? 1 : 0)
+                       .arg(style)
+                       .arg(text_anti_alias);
+  if (key == text_options_layer_sync_key_) {
+    return;
+  }
+  text_options_layer_sync_key_ = key;
+  show_text_family_in_options_bar(family);
+  {
+    QSignalBlocker blocker(text_size_spin_);
+    const auto display_size =
+        std::max(1, static_cast<int>(std::lround(document_text_size * size_display_scale)));
+    text_size_spin_->setValue(std::clamp(text_points_for_display(text_size_spin_->value(), display_size, document()),
+                                         text_size_spin_->minimum(), text_size_spin_->maximum()));
+  }
+  refresh_text_style_combo(family, style, text_bold, text_italic);
+  show_text_anti_alias(text_anti_alias);
+}
+
+void MainWindow::remove_text_editor_transform_overlay(QTextEdit* editor) {
+  if (editor != nullptr) {
+    const auto was_active = editor->property(kTextEditorTransformedOverlayProperty).toBool();
+    editor->setProperty(kTextEditorTransformedOverlayProperty, false);
+    if (was_active && editor->viewport() != nullptr) {
+      editor->viewport()->update();
+    }
+  }
+
+  auto* overlay = transformed_text_edit_overlay_for_canvas(canvas_);
+  if (overlay == nullptr || (editor != nullptr && overlay->editor() != editor)) {
+    return;
+  }
+  overlay->hide();
+  overlay->deleteLater();
+}
+
+void MainWindow::update_text_editor_transform_overlay(QTextEdit* editor) {
+  // Area and path text: an owned contour places the lines, so the overlay always edits them.
+  const bool area = editor != nullptr && text_editor_has_contour(*editor);
+  // A rotated view edits new point text through the overlay too (its provisional layer).
+  const bool rotated_view = canvas_ != nullptr && !canvas_->view_axis_aligned();
+  // So does new box text the session itself turned with a corner rotate zone (#684 follow-up).
+  const auto override_transform = editor == nullptr ? std::nullopt : text_editor_transform_override(*editor);
+  const bool turned_in_session =
+      override_transform.has_value() && affine_transform_has_non_translation_linear_part(*override_transform);
+  const auto target_id = editor == nullptr ? QVariant() : editor->property("patchy.editingLayerId").isValid()
+      ? editor->property("patchy.editingLayerId")
+      : (area || rotated_view || turned_in_session) ? editor->property(kTextEditorProvisionalLayerProperty)
+                                                    : QVariant();
+  if (editor != nullptr) {
+    editor->setProperty(kTextEditorRotateZonesProperty, text_editor_box_rotatable(*editor));
+  }
+  if (canvas_ == nullptr || editor == nullptr || editor->property(kTextEditorFinishedProperty).toBool() ||
+      !editor->property(kTextEditorPreviewPaintProperty).toBool() ||
+      editor->property("patchy.usesPsdTextFrame").toBool() ||
+      !target_id.isValid()) {
+    remove_text_editor_transform_overlay(editor);
+    return;
+  }
+
+  const auto layer_id = static_cast<LayerId>(target_id.toULongLong());
+  auto* layer = document().find_layer(layer_id);
+  if (layer == nullptr) {
+    remove_text_editor_transform_overlay(editor);
+    return;
+  }
+
+  auto transform = text_transform_for_editor_or_layer(*editor, *layer);
+  if ((area || rotated_view) && !transform) {
+    transform = QTransform::fromTranslate(editor->property("patchy.documentTextX").toDouble(),
+                                          editor->property("patchy.documentTextY").toDouble());
+  }
+  // A rotated view edits even plain text through the overlay: the inline editor is an
+  // upright widget and cannot turn with the canvas (docs/view-navigation-rotation.md).
+  if (!transform.has_value() ||
+      (!area && !qtransform_has_non_translation_linear_part(*transform) && !rotated_view)) {
+    remove_text_editor_transform_overlay(editor);
+    return;
+  }
+
+  auto* overlay = transformed_text_edit_overlay_for_canvas(canvas_);
+  if (overlay == nullptr) {
+    overlay = new TransformedTextEditOverlay(canvas_);
+  }
+
+  const auto was_active = editor->property(kTextEditorTransformedOverlayProperty).toBool();
+  editor->setProperty(kTextEditorTransformedOverlayProperty, true);
+  overlay->configure(editor, *transform, [this](QTextEdit* active_editor) {
+    mark_text_editor_changed(active_editor);
+    relayout_text_editor(active_editor, false);
+    schedule_text_editor_preview(active_editor);
+  });
+  if (!was_active && editor->viewport() != nullptr) {
+    editor->viewport()->update();
+  }
+}
+
+void MainWindow::relayout_text_editor(QTextEdit* editor, bool allow_point_auto_expand) {
+  if (canvas_ == nullptr || editor == nullptr) {
+    return;
+  }
+  if (editor->property("patchy.relayoutingTextEditor").toBool()) {
+    return;
+  }
+  struct RelayoutGuard {
+    QTextEdit* editor = nullptr;
+    ~RelayoutGuard() {
+      if (editor != nullptr) {
+        editor->setProperty("patchy.relayoutingTextEditor", false);
+      }
+    }
+  } guard{editor};
+  editor->setProperty("patchy.relayoutingTextEditor", true);
+  const UiProfileScope profile_scope("text_edit.relayout");
+  const auto zoom = std::max(0.0001, canvas_->zoom());
+  const auto boxed = text_flow_is_box(editor->property("patchy.documentTextFlow").toString());
+  const QPoint document_point(editor->property("patchy.documentTextX").toInt(),
+                              editor->property("patchy.documentTextY").toInt());
+  bool old_zoom_ok = false;
+  const auto old_zoom = editor->property("patchy.editorZoom").toDouble(&old_zoom_ok);
+  if (old_zoom_ok && old_zoom > 0.0 && std::abs(old_zoom - zoom) > 0.0001) {
+    editor->setProperty("patchy.editorZoom", zoom);
+    scale_document_font_sizes(*editor->document(), zoom / old_zoom);
+  } else if (!old_zoom_ok) {
+    editor->setProperty("patchy.editorZoom", zoom);
+  }
+  const auto text_color = editor->property("patchy.documentTextColor").value<QColor>().isValid()
+                              ? editor->property("patchy.documentTextColor").value<QColor>()
+                              : canvas_->primary_color();
+  const auto document_text_size = std::max(1, editor->property("patchy.documentTextSize").toInt());
+  auto editor_font = editor->font();
+  editor_font.setPixelSize(std::max(8, static_cast<int>(std::round(document_text_size * zoom))));
+  configure_text_font_smoothing(editor_font, std::clamp(editor->property("patchy.documentTextAntiAlias").toInt(), 0, 16));
+  editor->setFont(editor_font);
+  editor->document()->setDefaultFont(editor_font);
+  apply_text_smoothing_to_document(*editor->document(),
+                                   std::clamp(editor->property("patchy.documentTextAntiAlias").toInt(), 0, 16));
+  set_themed_style(*editor, inline_text_editor_style(text_color, editor_font.pixelSize()));
+  preserve_text_editor_typing_format(*editor, editor_font, text_color);
+  auto document_editor_width =
+      std::max(kMinimumTextBoxDocumentSize, editor->property("patchy.documentTextWidth").toInt());
+  auto document_editor_height =
+      std::max(kMinimumTextBoxDocumentSize, editor->property("patchy.documentTextHeight").toInt());
+
+  const bool vertical = text_editor_is_vertical(*editor);
+  QTextOption option;
+  option.setWrapMode(boxed && !vertical ? QTextOption::WordWrap : QTextOption::NoWrap);
+  option.setUseDesignMetrics(true);
+  editor->document()->setDefaultTextOption(option);
+  editor->setLineWrapMode(boxed && !vertical ? QTextEdit::WidgetWidth : QTextEdit::NoWrap);
+
+  int width = std::max(1, static_cast<int>(std::round(document_editor_width * zoom)));
+  int height = std::max(1, static_cast<int>(std::round(document_editor_height * zoom)));
+  QPoint document_point_for_geometry = document_point;
+  if (vertical) {
+    // The widget's rect is the hit area, so it covers the vertical plan's whole buffer (cells
+    // plus bleed), and for point text the widget origin follows the layout so the Photoshop
+    // anchor (first column axis, alignment point along y) stays where the session pinned it:
+    // vertical text grows leftward as columns are added.
+    editor->document()->setTextWidth(-1);
+    double layout_zoom = 1.0;
+    if (const auto* layout_document = text_editor_document_space_layout(*editor, layout_zoom);
+        layout_document != nullptr) {
+      const auto vertical_plan = vertical_render_plan_for_editor(*editor, *layout_document);
+      width = std::max(8, static_cast<int>(std::ceil(vertical_plan.local_rect.width() * zoom)));
+      height = std::max(8, static_cast<int>(std::ceil(vertical_plan.local_rect.height() * zoom)));
+      if (!boxed) {
+        document_editor_width = std::max(1, static_cast<int>(std::ceil(vertical_plan.local_rect.width())));
+        document_editor_height = std::max(1, static_cast<int>(std::ceil(vertical_plan.local_rect.height())));
+        editor->setProperty("patchy.documentTextWidth", document_editor_width);
+        editor->setProperty("patchy.documentTextHeight", document_editor_height);
+        const auto anchor_value = editor->property(kTextEditorVerticalAnchorProperty);
+        if (anchor_value.isValid() && !text_editor_transform_override(*editor).has_value()) {
+          const auto anchor = anchor_value.toPointF();
+          document_point_for_geometry =
+              QPoint(static_cast<int>(std::lround(anchor.x() - vertical_plan.plan.anchor.x())),
+                     static_cast<int>(std::lround(anchor.y() - vertical_plan.plan.anchor.y())));
+          editor->setProperty("patchy.documentTextX", document_point_for_geometry.x());
+          editor->setProperty("patchy.documentTextY", document_point_for_geometry.y());
+        }
+      }
+    }
+  } else if (boxed) {
+    editor->document()->setTextWidth(width);
+  } else {
+    editor->document()->setTextWidth(-1);
+    // The floors are document sizes at or below 100% (text_editor_screen_floor), so the box
+    // scales with the zoom (GitHub issue 707). Below 8 px the editor's own font stops shrinking
+    // (its pixel size floor), so its measurements overstate the text there: the glyph layout
+    // gives the content's size instead.
+    const auto width_floor = text_editor_screen_floor(80, zoom);
+    const auto height_floor = text_editor_screen_floor(32, zoom);
+    const auto glyph_layout_bounds = [&] {
+      double layout_zoom = 1.0;
+      const auto* layout_document = text_editor_document_space_layout(*editor, layout_zoom);
+      return layout_document != nullptr ? text_editor_line_geometry(*editor, *layout_document).bounding_rect()
+                                        : QRectF();
+    };
+    std::optional<QRectF> floor_font_layout;
+    if (static_cast<double>(document_text_size) * zoom < 8.0) {
+      if (const auto bounds = glyph_layout_bounds(); bounds.isValid() && bounds.width() > 0.0) {
+        floor_font_layout = bounds;
+      }
+    }
+    const auto content_width =
+        (floor_font_layout.has_value() ? static_cast<int>(std::ceil(floor_font_layout->right() * zoom))
+                                       : static_cast<int>(std::ceil(editor->document()->idealWidth()))) +
+        6;
+    if (text_document_has_non_left_alignment(*editor->document())) {
+      // QTextEdit lays aligned NoWrap text out against the viewport width, so any slack between
+      // the widget and the content shifts the editor's glyphs/caret away from the rendered layer
+      // pixels, which lay out against the tight ideal width.  Track the content exactly (shrink
+      // as well as grow) for centered/right point text; left text keeps the roomier behavior.
+      width = std::max(width_floor, content_width);
+      document_editor_width =
+          std::max(1, static_cast<int>(std::ceil(static_cast<double>(width) / zoom)));
+    } else {
+      // Only text that outgrows the box widens the session, never the screen floor or the
+      // rounding of the scaled width (that crept up a few pixels on every zoom step).
+      if (allow_point_auto_expand && content_width > width) {
+        width = content_width;
+        document_editor_width = std::max(document_editor_width,
+                                         static_cast<int>(std::ceil(static_cast<double>(content_width) / zoom)));
+      }
+      width = std::max(width_floor, width);
+    }
+    editor->setProperty("patchy.documentTextWidth", document_editor_width);
+    editor->document()->setTextWidth(width);
+    // Height comes from the layout the GLYPHS use, not from the editor document's own. They are
+    // not the same under the Photoshop leading model: 40 px leading against Qt's natural ~29
+    // left the widget a third too short, and since the widget's rect is the hit area, the last
+    // line could not be clicked at all -- the click fell through to the canvas and committed the
+    // session instead.
+    auto text_height = std::max(
+        height_floor,
+        floor_font_layout.has_value() ? 0 : static_cast<int>(std::ceil(editor->document()->size().height())) + 2);
+    if (const auto layout_bounds = glyph_layout_bounds(); layout_bounds.isValid() && layout_bounds.height() > 0.0) {
+      text_height = std::max(text_height, static_cast<int>(std::ceil(layout_bounds.bottom() * zoom)) + 2);
+    }
+    const auto minimum_height = std::max(
+        height_floor, static_cast<int>(std::ceil(static_cast<double>(document_text_size) * zoom * 1.45)));
+    height = std::max(text_height, minimum_height);
+    document_editor_height = std::max(kMinimumTextBoxDocumentSize,
+                                      static_cast<int>(std::ceil(static_cast<double>(height) / zoom)));
+    editor->setProperty("patchy.documentTextHeight", document_editor_height);
+  }
+
+  const auto widget_point = canvas_->widget_position_for_document_point(document_point_for_geometry);
+  editor->setGeometry(widget_point.x(), widget_point.y(), std::max(1, width), std::max(1, height));
+  update_text_editor_transform_overlay(editor);
+  update_text_editor_handles(editor);
+  editor->updateGeometry();
+  reset_text_editor_scroll(editor);
+  update_text_editor_preview_caret(*editor, zoom);
+  editor->update();
+}
+
+void MainWindow::update_text_editor_handles(QTextEdit* editor) {
+  if (canvas_ == nullptr || editor == nullptr) {
+    return;
+  }
+  refresh_text_editor_hidden_lines(editor);
+  editor->setProperty(kTextEditorRotateZonesProperty, text_editor_box_rotatable(*editor));
+  if (editor->property(kTextEditorTransformedOverlayProperty).toBool()) {
+    remove_text_editor_handles(editor);
+    return;
+  }
+
+  struct HandleSpec {
+    const char* name;
+    const char* corner;
+    Qt::CursorShape cursor;
+  };
+  // Corners, then the side handles (issue 684); the drag reads the edges from the corner name.
+  static constexpr std::array<HandleSpec, 8> kHandles = {{
+      {"textBoxResizeHandleTopLeft", "topLeft", Qt::SizeFDiagCursor},
+      {"textBoxResizeHandleTopRight", "topRight", Qt::SizeBDiagCursor},
+      {"textBoxResizeHandleBottomLeft", "bottomLeft", Qt::SizeBDiagCursor},
+      {"textBoxResizeHandleBottomRight", "bottomRight", Qt::SizeFDiagCursor},
+      {"textBoxResizeHandleTop", "top", Qt::SizeVerCursor},
+      {"textBoxResizeHandleBottom", "bottom", Qt::SizeVerCursor},
+      {"textBoxResizeHandleLeft", "left", Qt::SizeHorCursor},
+      {"textBoxResizeHandleRight", "right", Qt::SizeHorCursor},
+  }};
+
+  const auto editor_rect = editor->geometry();
+  const auto handle_size = 9;
+  // Side handles show only while both edges are long enough that their hit areas
+  // (text_editor_resize_handle_at: 8 px around the handle) stay clear of the corners' along
+  // the edge and of the opposite handle's across the box, where the text is.
+  const auto side_handle_minimum_edge = 2 * (handle_size + 2 * 8);
+  const bool box_too_small_for_side_handles =
+      editor_rect.width() < side_handle_minimum_edge || editor_rect.height() < side_handle_minimum_edge;
+  const auto middle = QPoint(editor_rect.left() + (editor_rect.width() + 1) / 2,
+                             editor_rect.top() + (editor_rect.height() + 1) / 2);
+
+  // The edge bands (#684 follow-up, #176's zones): invisible strips along each side that resize
+  // like its side handle, from kBandOutside outside the line to kBandInside inside it (a click
+  // further in places the caret), between the corners' hit squares (handle square plus
+  // text_editor_resize_handle_at's 8 px). Created before the handles, so the squares stay on top.
+  struct BandSpec {
+    const char* name;
+    const char* corner;
+    Qt::CursorShape cursor;
+  };
+  static constexpr std::array<BandSpec, 4> kBands = {{
+      {"textBoxResizeBandTop", "top", Qt::SizeVerCursor},
+      {"textBoxResizeBandBottom", "bottom", Qt::SizeVerCursor},
+      {"textBoxResizeBandLeft", "left", Qt::SizeHorCursor},
+      {"textBoxResizeBandRight", "right", Qt::SizeHorCursor},
+  }};
+  constexpr int kBandOutside = 6;
+  constexpr int kBandInside = 3;
+  const int corner_reach = handle_size / 2 + 8 + 1;
+  // The lines the handles sit on: top and left on the first row and column, bottom and right
+  // just past the last.
+  const int line_left = editor_rect.left();
+  const int line_top = editor_rect.top();
+  const int line_right = editor_rect.right() + 1;
+  const int line_bottom = editor_rect.bottom() + 1;
+  for (const auto& spec : kBands) {
+    auto* band = canvas_->findChild<QWidget*>(QString::fromLatin1(spec.name), Qt::FindDirectChildrenOnly);
+    if (band == nullptr) {
+      band = new QWidget(canvas_);
+      band->setObjectName(QString::fromLatin1(spec.name));
+      band->setProperty("patchy.textResizeHandle", true);
+      band->setProperty("patchy.textResizeBand", true);
+      band->setProperty("patchy.textResizeCorner", QString::fromLatin1(spec.corner));
+      band->setCursor(spec.cursor);
+      band->setFocusPolicy(Qt::NoFocus);
+      // Nothing to see: the application sheet would otherwise paint the strip as a panel.
+      set_themed_style(*band, QStringLiteral("#%1 { background: transparent; border: none; }")
+                                  .arg(QString::fromLatin1(spec.name)));
+      band->installEventFilter(this);
+    }
+    const auto corner = QString::fromLatin1(spec.corner);
+    QRect band_rect;
+    if (corner == QStringLiteral("top")) {
+      band_rect = QRect(QPoint(line_left + corner_reach, line_top - kBandOutside),
+                        QPoint(line_right - corner_reach, line_top + kBandInside - 1));
+    } else if (corner == QStringLiteral("bottom")) {
+      band_rect = QRect(QPoint(line_left + corner_reach, line_bottom - kBandInside),
+                        QPoint(line_right - corner_reach, line_bottom + kBandOutside - 1));
+    } else if (corner == QStringLiteral("left")) {
+      band_rect = QRect(QPoint(line_left - kBandOutside, line_top + corner_reach),
+                        QPoint(line_left + kBandInside - 1, line_bottom - corner_reach));
+    } else {
+      band_rect = QRect(QPoint(line_right - kBandInside, line_top + corner_reach),
+                        QPoint(line_right + kBandOutside - 1, line_bottom - corner_reach));
+    }
+    // Shown with the side handles (the same short-box rule), never hidden mid-drag.
+    const bool dragging = editor->property("patchy.activeTextResizeHandleName").toString() == band->objectName();
+    if ((box_too_small_for_side_handles && !dragging) || band_rect.isEmpty()) {
+      band->hide();
+      continue;
+    }
+    band->setGeometry(band_rect);
+    band->show();
+    band->raise();
+  }
+
+  // The corner rotate zones (#684 follow-up, #176's green zones): beside each corner, within the
+  // Move tool's reach, outside the box and every resize zone (the handles' hit squares, the
+  // bands). Invisible, masked to that shape so the rotate cursor shows only there; a press
+  // rotates the box about its center (handle_text_box_rotate_event).
+  {
+    QRegion resize_zones;
+    for (const auto* name : {"textBoxResizeBandTop", "textBoxResizeBandBottom", "textBoxResizeBandLeft",
+                             "textBoxResizeBandRight"}) {
+      if (auto* band = canvas_->findChild<QWidget*>(QString::fromLatin1(name), Qt::FindDirectChildrenOnly);
+          band != nullptr && band->isVisible()) {
+        resize_zones += band->geometry();
+      }
+    }
+    const auto handle_hit = [](QPoint center) { return QRect(center.x() - 12, center.y() - 12, 25, 25); };
+    const std::array<QPoint, 4> corner_points = {QPoint(line_left, line_top), QPoint(line_right, line_top),
+                                                 QPoint(line_left, line_bottom), QPoint(line_right, line_bottom)};
+    for (const auto& point : corner_points) {
+      resize_zones += handle_hit(point);
+    }
+    if (!box_too_small_for_side_handles) {
+      for (const auto& point : {QPoint(middle.x(), line_top), QPoint(middle.x(), line_bottom),
+                                QPoint(line_left, middle.y()), QPoint(line_right, middle.y())}) {
+        resize_zones += handle_hit(point);
+      }
+    }
+    const QRect box_rect(QPoint(line_left, line_top), QPoint(line_right - 1, line_bottom - 1));
+    const bool rotatable = editor->property(kTextEditorRotateZonesProperty).toBool();
+    static constexpr std::array<const char*, 4> kZoneNames = {"textBoxRotateZoneTopLeft", "textBoxRotateZoneTopRight",
+                                                              "textBoxRotateZoneBottomLeft",
+                                                              "textBoxRotateZoneBottomRight"};
+    static constexpr std::array<double, 4> kZoneDirections = {225.0, 315.0, 135.0, 45.0};
+    const auto reach = static_cast<int>(std::ceil(kTextBoxCornerRotateReach));
+    for (std::size_t index = 0; index < kZoneNames.size(); ++index) {
+      auto* zone = canvas_->findChild<QWidget*>(QString::fromLatin1(kZoneNames[index]), Qt::FindDirectChildrenOnly);
+      if (!rotatable) {
+        if (zone != nullptr) {
+          zone->hide();
+        }
+        continue;
+      }
+      if (zone == nullptr) {
+        zone = new QWidget(canvas_);
+        zone->setObjectName(QString::fromLatin1(kZoneNames[index]));
+        zone->setProperty("patchy.textRotateZone", true);
+        zone->setCursor(corner_rotate_cursor(kZoneDirections[index]));
+        zone->setFocusPolicy(Qt::NoFocus);
+        set_themed_style(*zone, QStringLiteral("#%1 { background: transparent; border: none; }")
+                                    .arg(QString::fromLatin1(kZoneNames[index])));
+        zone->installEventFilter(this);
+      }
+      const auto& corner = corner_points[index];
+      const QRect zone_rect(corner.x() - reach, corner.y() - reach, 2 * reach + 1, 2 * reach + 1);
+      QRegion shape(zone_rect, QRegion::Ellipse);
+      shape -= QRegion(box_rect);
+      shape -= resize_zones;
+      zone->setGeometry(zone_rect);
+      zone->setMask(shape.translated(-zone_rect.topLeft()));
+      zone->show();
+      zone->raise();
+    }
+  }
+
+  for (const auto& spec : kHandles) {
+    auto* handle = canvas_->findChild<QWidget*>(QString::fromLatin1(spec.name), Qt::FindDirectChildrenOnly);
+    if (handle == nullptr) {
+      handle = new TextBoxResizeHandle(canvas_);
+      handle->setObjectName(QString::fromLatin1(spec.name));
+      handle->setProperty("patchy.textResizeHandle", true);
+      handle->setProperty("patchy.textResizeCorner", QString::fromLatin1(spec.corner));
+      handle->setCursor(spec.cursor);
+      handle->setFocusPolicy(Qt::NoFocus);
+      handle->setAttribute(Qt::WA_StyledBackground, true);
+      handle->setMouseTracking(true);
+      // An id selector, not a bare sheet: the overflow tooltip (issue 631) is a child of the
+      // handle, and a selector-less sheet would paint it as a white square with pale text.
+      set_themed_style(*handle, QStringLiteral("#%1 { background: @resize_handle_bg; "
+                                               "border: 1px solid @resize_handle_border; border-radius: 1px; }")
+                                    .arg(QString::fromLatin1(spec.name)));
+      handle->installEventFilter(this);
+    }
+    QPoint position;
+    const auto corner = QString::fromLatin1(spec.corner);
+    if (corner == QStringLiteral("topLeft")) {
+      position = editor_rect.topLeft();
+    } else if (corner == QStringLiteral("topRight")) {
+      position = editor_rect.topRight() + QPoint(1, 0);
+    } else if (corner == QStringLiteral("bottomLeft")) {
+      position = editor_rect.bottomLeft() + QPoint(0, 1);
+    } else if (corner == QStringLiteral("bottomRight")) {
+      position = editor_rect.bottomRight() + QPoint(1, 1);
+    } else if (corner == QStringLiteral("top")) {
+      position = QPoint(middle.x(), editor_rect.top());
+    } else if (corner == QStringLiteral("bottom")) {
+      position = QPoint(middle.x(), editor_rect.bottom() + 1);
+    } else if (corner == QStringLiteral("left")) {
+      position = QPoint(editor_rect.left(), middle.y());
+    } else {
+      position = QPoint(editor_rect.right() + 1, middle.y());
+    }
+    const bool vertical_side = corner == QStringLiteral("left") || corner == QStringLiteral("right");
+    const bool horizontal_side = corner == QStringLiteral("top") || corner == QStringLiteral("bottom");
+    if ((horizontal_side || vertical_side) && box_too_small_for_side_handles) {
+      // Not while it is the one being dragged: hiding a grabbing widget drops the drag.
+      if (editor->property("patchy.activeTextResizeHandleName").toString() != handle->objectName()) {
+        handle->hide();
+        continue;
+      }
+    }
+    handle->setGeometry(position.x() - handle_size / 2, position.y() - handle_size / 2, handle_size, handle_size);
+    const bool overflow_marker =
+        corner == QStringLiteral("bottomRight") && editor->property(kTextEditorHiddenLinesProperty).toBool();
+    if (handle->property(kTextResizeHandleOverflowProperty).toBool() != overflow_marker) {
+      handle->setProperty(kTextResizeHandleOverflowProperty, overflow_marker);
+      handle->update();
+    }
+    handle->setToolTip(overflow_marker ? text_overflow_marker_tooltip() : QString());
+    handle->show();
+    handle->raise();
+  }
+}
+
+namespace {
+
+// Everything the session's layout depends on, so a pan, a repaint or a handle hover does not
+// lay the story out again (refresh_text_editor_hidden_lines).
+QString text_editor_hidden_lines_key(const QTextEdit& editor, double zoom) {
+  QStringList parts{QString::number(editor.document()->revision()),
+                    QString::number(editor.property("patchy.documentTextWidth").toInt()),
+                    QString::number(editor.property("patchy.documentTextHeight").toInt()),
+                    QString::number(editor.property("patchy.documentTextSize").toInt()),
+                    editor.property("patchy.documentTextFamily").toString(),
+                    editor.property("patchy.documentTextFlow").toString(),
+                    editor.property(kTextEditorAreaProperty).toString(),
+                    editor.property(kTextEditorPathProperty).toString(),
+                    editor.property(kTextEditorPathRangeProperty).toString(),
+                    editor.property(kTextEditorPreeditTextProperty).toString(),
+                    editor.property("patchy.textLayoutMode").toString(),
+                    QString::number(editor.property("patchy.textSizeDisplayScale").toDouble(), 'g', 8),
+                    QString::number(zoom, 'g', 8)};
+  return parts.join(QLatin1Char('|'));
+}
+
+// Whether the session's committed render would hide lines, from the same plan the preview and
+// commit draw (build_text_render_plan; no raster). Point text never hides a line.
+bool text_editor_render_hides_lines(const QTextEdit& editor, double zoom) {
+  const bool boxed = text_flow_is_box(editor.property("patchy.documentTextFlow").toString());
+  const auto area = text_editor_area(editor);
+  if (!boxed && !area) {
+    return false;
+  }
+  auto document_text = document_from_editor_in_document_units(editor, zoom);
+  if (document_text == nullptr || document_text->toPlainText().trimmed().isEmpty()) {
+    return false;
+  }
+  const auto text_width = std::max(kMinimumTextBoxDocumentSize, editor.property("patchy.documentTextWidth").toInt());
+  const auto text_height =
+      std::max(kMinimumTextBoxDocumentSize, editor.property("patchy.documentTextHeight").toInt());
+  auto text_family = editor.property("patchy.documentTextFamily").toString();
+  if (text_family.trimmed().isEmpty()) {
+    text_family = text_display_family_from_format(text_editor_reference_format(editor),
+                                                  display_text_family_from_font(editor.font()));
+  }
+  // Color does not move a line, so the preview's fallback (the primary color) is not needed.
+  const QColor text_color(Qt::black);  // color-literal-ok: layout input only, never drawn
+  TextToolSettings settings{document_text->toPlainText(),
+                            QString(),
+                            text_family,
+                            std::max(1, editor.property("patchy.documentTextSize").toInt()),
+                            editor.font().bold(),
+                            editor.font().italic(),
+                            std::clamp(editor.property("patchy.documentTextAntiAlias").toInt(), 0, 16),
+                            boxed,
+                            text_width,
+                            text_height};
+  settings.photoshop_layout = text_editor_uses_photoshop_layout(editor);
+  settings.vertical = text_editor_is_vertical(editor);
+  settings.area = area;
+  if (auto frame = text_editor_path(editor)) {
+    settings.path = std::move(frame->path);
+    settings.path_range = frame->range;
+  }
+  const auto paragraph_runs = paragraph_runs_from_document(*document_text);
+  const auto rich_text_runs = rich_text_runs_from_document(*document_text, settings, text_color);
+  settings.html = document_html_from_text_runs(document_text->toPlainText(), rich_text_runs, settings, text_color);
+  const auto frame_layout_scale = settings.photoshop_layout && editor.property("patchy.usesPsdTextFrame").toBool()
+                                      ? text_editor_size_display_scale(editor)
+                                      : 1.0;
+  const auto plan = build_text_render_plan(settings, text_color, text_width, paragraph_runs, rich_text_runs,
+                                           text_editor_render_local_rect(editor), text_editor_metric_scale(editor),
+                                           QTransform(), frame_layout_scale);
+  return plan.hidden_lines;
+}
+
+}  // namespace
+
+void MainWindow::set_text_editor_hidden_lines(QTextEdit* editor, bool hidden) {
+  if (canvas_ == nullptr || editor == nullptr) {
+    return;
+  }
+  editor->setProperty(kTextEditorHiddenLinesKeyProperty, text_editor_hidden_lines_key(*editor, canvas_->zoom()));
+  if (editor->property(kTextEditorHiddenLinesProperty).toBool() == hidden) {
+    return;
+  }
+  editor->setProperty(kTextEditorHiddenLinesProperty, hidden);
+  if (auto* handle = canvas_->findChild<QWidget*>(QStringLiteral("textBoxResizeHandleBottomRight"),
+                                                  Qt::FindDirectChildrenOnly);
+      handle != nullptr) {
+    handle->setProperty(kTextResizeHandleOverflowProperty, hidden);
+    handle->setToolTip(hidden ? text_overflow_marker_tooltip() : QString());
+    handle->update();
+  }
+  // Once everything fits, a tooltip still showing for the plus goes with it.
+  if (!hidden && QToolTip::isVisible() && QToolTip::text() == text_overflow_marker_tooltip()) {
+    QToolTip::hideText();
+  }
+  if (auto* overlay = transformed_text_edit_overlay_for_canvas(canvas_); overlay != nullptr) {
+    overlay->update();
+  }
+}
+
+void MainWindow::refresh_text_editor_hidden_lines(QTextEdit* editor) {
+  if (canvas_ == nullptr || editor == nullptr || editor->property(kTextEditorFinishedProperty).toBool()) {
+    return;
+  }
+  // A rendered live preview reports the fact itself (update_text_editor_preview); laying the
+  // story out here as well would double every keystroke's layout.
+  if (editor->property(kTextEditorPreviewEnabledProperty).toBool() &&
+      !editor->property(kTextEditorSourceRasterPreviewProperty).toBool()) {
+    return;
+  }
+  const auto key = text_editor_hidden_lines_key(*editor, canvas_->zoom());
+  if (editor->property(kTextEditorHiddenLinesKeyProperty).toString() == key) {
+    return;
+  }
+  set_text_editor_hidden_lines(editor, text_editor_render_hides_lines(*editor, canvas_->zoom()));
+}
+
+QWidget* MainWindow::text_editor_resize_handle_at(QPoint canvas_position) const {
+  if (canvas_ == nullptr) {
+    return nullptr;
+  }
+  QWidget* best_handle = nullptr;
+  int best_distance = std::numeric_limits<int>::max();
+  const auto handles = canvas_->findChildren<QWidget*>(QString(), Qt::FindDirectChildrenOnly);
+  // The squares (with 8 px around them) first; an edge band only where no square reaches.
+  QWidget* band_hit = nullptr;
+  for (auto* handle : handles) {
+    if (handle == nullptr || !handle->isVisible() || !handle->property("patchy.textResizeHandle").toBool()) {
+      continue;
+    }
+    if (handle->property("patchy.textResizeBand").toBool()) {
+      if (band_hit == nullptr && handle->geometry().contains(canvas_position)) {
+        band_hit = handle;
+      }
+      continue;
+    }
+    const auto hit_rect = handle->geometry().adjusted(-8, -8, 8, 8);
+    if (!hit_rect.contains(canvas_position)) {
+      continue;
+    }
+    const auto delta = hit_rect.center() - canvas_position;
+    const auto distance = delta.x() * delta.x() + delta.y() * delta.y();
+    if (distance < best_distance) {
+      best_distance = distance;
+      best_handle = handle;
+    }
+  }
+  return best_handle != nullptr ? best_handle : band_hit;
+}
+
+bool MainWindow::handle_text_editor_resize_event(QWidget* handle, QTextEdit* editor, QEvent* event) {
+  if (canvas_ == nullptr || handle == nullptr || editor == nullptr) {
+    return false;
+  }
+  switch (event->type()) {
+    case QEvent::MouseButtonPress: {
+      auto* mouse_event = static_cast<QMouseEvent*>(event);
+      if (mouse_event->button() != Qt::LeftButton) {
+        break;
+      }
+      QToolTip::hideText();  // a drag on the overflow plus (issue 631) drops its tooltip
+      handle->setProperty("patchy.dragStartGlobal", mouse_event->globalPosition().toPoint());
+      handle->setProperty("patchy.dragStartX", editor->property("patchy.documentTextX").toInt());
+      handle->setProperty("patchy.dragStartY", editor->property("patchy.documentTextY").toInt());
+      handle->setProperty("patchy.dragStartWidth", editor->property("patchy.documentTextWidth").toInt());
+      handle->setProperty("patchy.dragStartHeight", editor->property("patchy.documentTextHeight").toInt());
+      editor->setProperty("patchy.activeTextResizeHandleName", handle->objectName());
+      handle->grabMouse();
+      mouse_event->accept();
+      return true;
+    }
+    case QEvent::MouseMove: {
+      auto* mouse_event = static_cast<QMouseEvent*>(event);
+      if ((mouse_event->buttons() & Qt::LeftButton) == 0 ||
+          !handle->property("patchy.dragStartGlobal").isValid()) {
+        break;
+      }
+      // Each move re-lays out the story, and Wayland delivers every motion: only the newest
+      // move of an event-loop pass resizes (docs/interactive-previews-drag-coalescing.md).
+      if (defer_widget_drag_move(*handle, *mouse_event)) {
+        mouse_event->accept();
+        return true;
+      }
+      const auto start_global = handle->property("patchy.dragStartGlobal").toPoint();
+      const auto delta = mouse_event->globalPosition().toPoint() - start_global;
+      const auto zoom = std::max(0.0001, canvas_->zoom());
+      const auto delta_x = static_cast<int>(std::round(static_cast<double>(delta.x()) / zoom));
+      const auto delta_y = static_cast<int>(std::round(static_cast<double>(delta.y()) / zoom));
+      const auto start_x = handle->property("patchy.dragStartX").toInt();
+      const auto start_y = handle->property("patchy.dragStartY").toInt();
+      const auto start_width = std::max(kMinimumTextBoxDocumentSize, handle->property("patchy.dragStartWidth").toInt());
+      const auto start_height = std::max(kMinimumTextBoxDocumentSize, handle->property("patchy.dragStartHeight").toInt());
+      auto left = start_x;
+      auto top = start_y;
+      auto right = start_x + start_width;
+      auto bottom = start_y + start_height;
+      // Corners name two edges ("topLeft"), side handles one ("left"; issue 684).
+      const auto corner = handle->property("patchy.textResizeCorner").toString();
+      if (corner.contains(QStringLiteral("left"), Qt::CaseInsensitive)) {
+        left = std::min(right - kMinimumTextBoxDocumentSize, start_x + delta_x);
+      }
+      if (corner.contains(QStringLiteral("right"), Qt::CaseInsensitive)) {
+        right = std::max(left + kMinimumTextBoxDocumentSize, start_x + start_width + delta_x);
+      }
+      if (corner.contains(QStringLiteral("top"), Qt::CaseInsensitive)) {
+        top = std::min(bottom - kMinimumTextBoxDocumentSize, start_y + delta_y);
+      }
+      if (corner.contains(QStringLiteral("bottom"), Qt::CaseInsensitive)) {
+        bottom = std::max(top + kMinimumTextBoxDocumentSize, start_y + start_height + delta_y);
+      }
+      mark_text_editor_changed(editor);
+      editor->setProperty("patchy.documentTextFlow", QString::fromLatin1(kTextFlowBox));
+      editor->setProperty(kTextEditorSourceVisibleAnchorProperty, QVariant());
+      editor->setProperty(kTextEditorSourceVisibleSizeProperty, QVariant());
+      editor->setProperty(kTextEditorSourceInkOffsetProperty, QVariant());
+      editor->setProperty(kTextEditorSourceFirstBaselineProperty, QVariant());
+      // Dragging the box invalidates the import-frame caches: drop the anchor/local-rect so the
+      // glyphs lay out against the live box rather than the original Photoshop frame.
+      clear_text_editor_render_local_rect(*editor);
+      clear_text_editor_visible_local_rect(*editor);
+      // Retarget (rather than drop) any text transform to the new box origin. Clearing it would let
+      // text_transform_for_editor_or_layer() fall back to the layer's original import transform,
+      // which re-pins the rendered glyphs at their old position while the caret/markers move -- the
+      // regression this fixes. The handle path only runs for translation-only text (rotated/skewed
+      // text uses the overlay resize path), so a pure-translation override is sufficient here.
+      bool retarget_transform = text_editor_transform_override(*editor).has_value();
+      if (!retarget_transform && editor->property("patchy.editingLayerId").isValid()) {
+        const auto layer_id = static_cast<LayerId>(editor->property("patchy.editingLayerId").toULongLong());
+        if (const auto* layer = document().find_layer(layer_id); layer != nullptr) {
+          retarget_transform = patchy_text_transform_for_layer(*layer).has_value();
+        }
+      }
+      if (retarget_transform) {
+        set_text_editor_transform_override(
+            *editor, LayerAffineTransform{1.0, 0.0, 0.0, 1.0, static_cast<double>(left),
+                                          static_cast<double>(top)});
+      } else {
+        editor->setProperty(kTextEditorTransformOverrideProperty, QVariant());
+      }
+      editor->setProperty("patchy.documentTextX", left);
+      editor->setProperty("patchy.documentTextY", top);
+      editor->setProperty("patchy.documentTextWidth", std::max(kMinimumTextBoxDocumentSize, right - left));
+      editor->setProperty("patchy.documentTextHeight", std::max(kMinimumTextBoxDocumentSize, bottom - top));
+      relayout_text_editor(editor, false);
+      schedule_text_editor_preview(editor);
+      mouse_event->accept();
+      return true;
+    }
+    case QEvent::MouseButtonRelease: {
+      auto* mouse_event = static_cast<QMouseEvent*>(event);
+      flush_widget_drag_move();  // a move recorded right before the release lands first
+      handle->setProperty("patchy.dragStartGlobal", QVariant());
+      editor->setProperty("patchy.activeTextResizeHandleName", QVariant());
+      handle->releaseMouse();
+      mouse_event->accept();
+      return true;
+    }
+    default:
+      break;
+  }
+  return false;
+}
+
+// Left-button selection inside a flat (untransformed) inline editor. QTextEdit's own mouse
+// handling resolves a click against its internal layout, which is laid out at an integer pixel
+// size of round(size * zoom) and is therefore NOT the layout the glyphs were drawn from: the
+// click and the caret it produced could disagree, badly so on Photoshop-leading text where the
+// two layouts drift a line apart. Everything else (right-click menu, middle click, release)
+// falls through to QTextEdit untouched.
+bool MainWindow::handle_text_editor_viewport_mouse_event(QTextEdit* editor, QEvent* event) {
+  if (editor == nullptr || event == nullptr || editor->property(kTextEditorFinishedProperty).toBool()) {
+    return false;
+  }
+  // A transformed session routes its clicks through the overlay, which does its own mapping.
+  if (editor->property(kTextEditorTransformedOverlayProperty).toBool()) {
+    return false;
+  }
+  if (event->type() != QEvent::MouseButtonPress && event->type() != QEvent::MouseMove &&
+      event->type() != QEvent::MouseButtonDblClick) {
+    return false;
+  }
+
+  auto* mouse_event = static_cast<QMouseEvent*>(event);
+  if (event->type() == QEvent::MouseMove) {
+    if ((mouse_event->buttons() & Qt::LeftButton) == 0) {
+      return false;
+    }
+  } else if (mouse_event->button() != Qt::LeftButton) {
+    return false;
+  }
+
+  const auto position = text_editor_position_at_viewport_point(*editor, mouse_event->position());
+  auto cursor = editor->textCursor();
+  switch (event->type()) {
+    case QEvent::MouseButtonPress: {
+      editor->setFocus(Qt::MouseFocusReason);
+      const bool shift = (mouse_event->modifiers() & Qt::ShiftModifier) != 0;
+      const bool triple_click = text_editor_press_completes_triple_click(*editor, mouse_event->globalPosition());
+      if (triple_click && !shift) {
+        const auto [start, end] = text_editor_line_range_at(*editor, position);
+        cursor.setPosition(start);
+        cursor.setPosition(end, QTextCursor::KeepAnchor);
+      } else {
+        cursor.setPosition(position, shift ? QTextCursor::KeepAnchor : QTextCursor::MoveAnchor);
+      }
+      break;
+    }
+    case QEvent::MouseMove:
+      cursor.setPosition(position, QTextCursor::KeepAnchor);
+      break;
+    case QEvent::MouseButtonDblClick:
+      arm_text_editor_triple_click(*editor, mouse_event->globalPosition());
+      cursor.setPosition(position);
+      cursor.select(QTextCursor::WordUnderCursor);
+      break;
+    default:
+      return false;
+  }
+  editor->setTextCursor(cursor);
+  mouse_event->accept();
+  return true;
+}
+
+// The drag half of the Type-tool press that opened a session on an existing layer. That press
+// went to the canvas, so Qt delivers the rest of the gesture there too and the editor-side
+// handlers above never see it; the canvas forwards it here. `begin` records the caret add_text_at
+// placed as the anchor, every later call selects from it to the pointer.
+bool MainWindow::extend_text_entry_selection(QPointF canvas_point, bool begin) {
+  auto* editor = canvas_ == nullptr ? nullptr : canvas_->findChild<QTextEdit*>(QStringLiteral("inlineTextEditor"));
+  if (editor == nullptr || !editor->isVisible() || editor->property(kTextEditorFinishedProperty).toBool()) {
+    text_entry_selection_editor_ = nullptr;
+    return false;
+  }
+  if (begin) {
+    text_entry_selection_editor_ = editor;
+    text_entry_selection_anchor_ = editor->textCursor().position();
+    return true;
+  }
+  if (text_entry_selection_editor_ != editor) {
+    return false;
+  }
+
+  std::optional<int> position;
+  if (editor->property(kTextEditorTransformedOverlayProperty).toBool()) {
+    const auto* overlay = transformed_text_edit_overlay_for_canvas(canvas_);
+    if (overlay != nullptr && overlay->editor() == editor) {
+      position = overlay->drag_cursor_position_for_canvas_point(canvas_point);
+    }
+  } else if (editor->viewport() != nullptr) {
+    position = text_editor_position_at_viewport_point(
+        *editor, canvas_point - QPointF(editor->viewport()->mapTo(canvas_, QPoint(0, 0))));
+  }
+  if (!position.has_value()) {
+    return true;  // still this gesture; the pointer just has no answer here
+  }
+  auto cursor = editor->textCursor();
+  const auto anchor = std::clamp(text_entry_selection_anchor_, 0, std::max(0, editor->document()->characterCount() - 1));
+  if (cursor.anchor() != anchor || cursor.position() != *position) {
+    cursor.setPosition(anchor);
+    cursor.setPosition(*position, QTextCursor::KeepAnchor);
+    editor->setTextCursor(cursor);
+  }
+  return true;
+}
+
+bool MainWindow::handle_text_editor_transform_overlay_event(QTextEdit* editor, QEvent* event) {
+  if (canvas_ == nullptr || editor == nullptr) {
+    return false;
+  }
+  if (event->type() != QEvent::MouseButtonPress && event->type() != QEvent::MouseMove &&
+      event->type() != QEvent::MouseButtonRelease && event->type() != QEvent::MouseButtonDblClick) {
+    return false;
+  }
+
+  auto* overlay = transformed_text_edit_overlay_for_canvas(canvas_);
+  if (overlay == nullptr || overlay->editor() != editor || !overlay->isVisible()) {
+    return false;
+  }
+
+  auto* mouse_event = static_cast<QMouseEvent*>(event);
+  const QPointF canvas_position = QPointF(canvas_->mapFromGlobal(mouse_event->globalPosition().toPoint()));
+  return overlay->handle_canvas_mouse_event(mouse_event, canvas_position);
+}
+
+bool MainWindow::text_editor_box_rotatable(const QTextEdit& editor) const {
+  if (!text_flow_is_box(editor.property("patchy.documentTextFlow").toString()) || text_editor_has_contour(editor) ||
+      text_editor_is_vertical(editor) || editor.property(kTextEditorTypeMaskProperty).toBool() ||
+      editor.property(kTextEditorFinishedProperty).toBool()) {
+    return false;
+  }
+  if (!editor.property("patchy.editingLayerId").isValid() || !has_active_document()) {
+    return true;
+  }
+  const auto layer_id = static_cast<LayerId>(editor.property("patchy.editingLayerId").toULongLong());
+  const auto* layer = std::as_const(*this).document().find_layer(layer_id);
+  if (layer == nullptr || layer_has_active_text_warp(*layer)) {
+    return false;
+  }
+  if (editor.property("patchy.usesPsdTextFrame").toBool()) {
+    // The frame session works in document units with the runs in engine units; only an
+    // unscaled frame leaves it without a scale to carry into the transform.
+    if (const auto found = layer->metadata().find(kLayerMetadataPsdTextTransform); found != layer->metadata().end()) {
+      if (const auto transform = parse_layer_affine_transform(found->second);
+          transform.has_value() && (std::abs((*transform)[0] - 1.0) > 1e-6 || std::abs((*transform)[3] - 1.0) > 1e-6)) {
+        return false;
+      }
+    }
+  }
+  return true;
+}
+
+std::optional<double> MainWindow::text_box_rotate_zone_at(QTextEdit& editor, QPointF canvas_point) const {
+  if (canvas_ == nullptr || !editor.property(kTextEditorRotateZonesProperty).toBool()) {
+    return std::nullopt;
+  }
+  if (editor.property(kTextEditorTransformedOverlayProperty).toBool()) {
+    auto* overlay = transformed_text_edit_overlay_for_canvas(canvas_);
+    if (overlay == nullptr || overlay->editor() != &editor) {
+      return std::nullopt;
+    }
+    return overlay->rotate_corner_direction_at_canvas_point(canvas_point);
+  }
+  if (text_editor_resize_handle_at(canvas_point.toPoint()) != nullptr) {
+    return std::nullopt;
+  }
+  const auto zones = canvas_->findChildren<QWidget*>(QString(), Qt::FindDirectChildrenOnly);
+  for (auto* zone : zones) {
+    if (zone == nullptr || !zone->isVisible() || !zone->property("patchy.textRotateZone").toBool()) {
+      continue;
+    }
+    const auto local = canvas_point.toPoint() - zone->pos();
+    if (zone->rect().contains(local) && (zone->mask().isEmpty() || zone->mask().contains(local))) {
+      const auto center = QPointF(editor.geometry().topLeft()) + QPointF(editor.geometry().width(),
+                                                                          editor.geometry().height()) / 2.0;
+      const auto outward = canvas_point - center;
+      return std::atan2(outward.y(), outward.x()) * 180.0 / kPi;
+    }
+  }
+  return std::nullopt;
+}
+
+bool MainWindow::handle_text_box_rotate_event(QTextEdit* editor, QEvent* event) {
+  if (canvas_ == nullptr) {
+    return false;
+  }
+  const auto type = event->type();
+  if (type != QEvent::MouseButtonPress && type != QEvent::MouseMove && type != QEvent::MouseButtonRelease &&
+      type != QEvent::MouseButtonDblClick) {
+    return false;
+  }
+  auto* mouse_event = static_cast<QMouseEvent*>(event);
+  if (text_box_rotate_drag_.has_value()) {
+    QTextEdit* drag_editor = text_box_rotate_drag_->editor;
+    if (drag_editor == nullptr || drag_editor != editor || drag_editor->property(kTextEditorFinishedProperty).toBool()) {
+      // The session ended mid-turn (Escape, a commit): drop the drag and the canvas grab.
+      text_box_rotate_drag_.reset();
+      canvas_->releaseMouse();
+      if (type == QEvent::MouseButtonRelease) {
+        mouse_event->accept();
+        return true;
+      }
+      return false;
+    }
+    switch (type) {
+      case QEvent::MouseMove:
+        // Each turn re-renders the preview, and Wayland delivers every motion: only the newest
+        // move of an event-loop pass turns (docs/interactive-previews-drag-coalescing.md).
+        if (defer_widget_drag_move(*canvas_, *mouse_event)) {
+          mouse_event->accept();
+          return true;
+        }
+        apply_text_box_rotate_drag(mouse_event->globalPosition(), mouse_event->modifiers());
+        break;
+      case QEvent::MouseButtonRelease:
+        if (mouse_event->button() != Qt::LeftButton) {
+          break;
+        }
+        flush_widget_drag_move();  // a move recorded right before the release lands first
+        if (text_box_rotate_drag_.has_value()) {
+          apply_text_box_rotate_drag(mouse_event->globalPosition(), mouse_event->modifiers());
+          const bool turned = text_box_rotate_drag_->turned;
+          text_box_rotate_drag_.reset();
+          canvas_->releaseMouse();
+          if (turned) {
+            update_text_editor_preview(editor);
+          }
+        }
+        break;
+      default:
+        break;
+    }
+    mouse_event->accept();
+    return true;
+  }
+  if (editor == nullptr || type != QEvent::MouseButtonPress || mouse_event->button() != Qt::LeftButton ||
+      editor->property(kTextEditorFinishedProperty).toBool()) {
+    return false;
+  }
+  const QPointF canvas_point(canvas_->mapFromGlobal(mouse_event->globalPosition().toPoint()));
+  const auto direction = text_box_rotate_zone_at(*editor, canvas_point);
+  if (!direction.has_value()) {
+    return false;
+  }
+  QToolTip::hideText();
+  TextBoxRotateDrag drag;
+  drag.editor = editor;
+  // The transform the session shows the box through: its override, the turned layer's own on
+  // the overlay, or the flat box's origin.
+  drag.start_transform = QTransform::fromTranslate(editor->property("patchy.documentTextX").toDouble(),
+                                                   editor->property("patchy.documentTextY").toDouble());
+  if (const auto override_transform = text_editor_transform_override(*editor); override_transform.has_value()) {
+    drag.start_transform = qtransform_from_affine(*override_transform);
+  } else if (editor->property(kTextEditorTransformedOverlayProperty).toBool() &&
+             editor->property("patchy.editingLayerId").isValid()) {
+    const auto layer_id = static_cast<LayerId>(editor->property("patchy.editingLayerId").toULongLong());
+    if (const auto* layer = std::as_const(document()).find_layer(layer_id); layer != nullptr) {
+      if (const auto transform = text_transform_for_editor_or_layer(*editor, *layer); transform.has_value()) {
+        drag.start_transform = *transform;
+      }
+    }
+  }
+  const auto width = std::max(kMinimumTextBoxDocumentSize, editor->property("patchy.documentTextWidth").toInt());
+  const auto height = std::max(kMinimumTextBoxDocumentSize, editor->property("patchy.documentTextHeight").toInt());
+  drag.center = drag.start_transform.map(QPointF(width / 2.0, height / 2.0));
+  const auto pointer = canvas_->document_point_for_widget_position(canvas_point) - drag.center;
+  drag.start_pointer_degrees = std::atan2(pointer.y(), pointer.x()) * 180.0 / kPi;
+  drag.start_box_degrees = std::atan2(drag.start_transform.m12(), drag.start_transform.m11()) * 180.0 / kPi;
+  text_box_rotate_drag_ = drag;
+  // Typing goes on in the session after the turn.
+  editor->setFocus(Qt::MouseFocusReason);
+  canvas_->grabMouse(corner_rotate_cursor(*direction));
+  mouse_event->accept();
+  return true;
+}
+
+void MainWindow::apply_text_box_rotate_drag(QPointF global_position, Qt::KeyboardModifiers modifiers) {
+  if (canvas_ == nullptr || !text_box_rotate_drag_.has_value()) {
+    return;
+  }
+  auto& drag = *text_box_rotate_drag_;
+  QTextEdit* editor = drag.editor;
+  if (editor == nullptr || editor->property(kTextEditorFinishedProperty).toBool()) {
+    return;
+  }
+  const QPointF canvas_point(canvas_->mapFromGlobal(global_position.toPoint()));
+  const auto pointer = canvas_->document_point_for_widget_position(canvas_point) - drag.center;
+  if (std::hypot(pointer.x(), pointer.y()) < 1e-6) {
+    return;
+  }
+  auto delta = std::atan2(pointer.y(), pointer.x()) * 180.0 / kPi - drag.start_pointer_degrees;
+  if ((modifiers & Qt::ShiftModifier) != 0) {
+    // The Move tool's snap: the box's own angle lands on a multiple of 15 degrees.
+    const auto snapped = std::round((drag.start_box_degrees + delta) / 15.0) * 15.0;
+    delta = snapped - drag.start_box_degrees;
+  }
+  delta = std::remainder(delta, 360.0);
+  if (!drag.turned) {
+    if (std::abs(delta) < 1e-6) {
+      return;
+    }
+    // The first move that turns the box readies the session for a transform: the glyphs come
+    // from the live preview (rendered through the transform), a source raster can no longer
+    // stand for them, and a PSD-frame session (offered only unscaled) leaves the frame path, which
+    // holds no rotation (GitHub issue 373).
+    drag.turned = true;
+    mark_text_editor_changed(editor);
+    editor->setProperty("patchy.usesPsdTextFrame", false);
+    editor->setProperty(kTextEditorSourceRasterPreviewProperty, false);
+    editor->setProperty(kTextEditorForceBakedPreviewProperty, true);
+    editor->setProperty(kTextEditorPreviewEnabledProperty, true);
+    editor->setProperty(kTextEditorPreviewPaintProperty, true);
+  }
+  const auto turn = QTransform::fromTranslate(-drag.center.x(), -drag.center.y()) * QTransform().rotate(delta) *
+                    QTransform::fromTranslate(drag.center.x(), drag.center.y());
+  set_text_editor_transform_override(*editor, affine_from_qtransform(drag.start_transform * turn));
+  update_text_editor_transform_overlay(editor);
+  relayout_text_editor(editor, false);
+  update_text_editor_preview(editor);
+}
+
+void MainWindow::remove_text_editor_handles(QTextEdit* /*editor*/) {
+  if (canvas_ == nullptr) {
+    return;
+  }
+  const auto handles = canvas_->findChildren<QWidget*>(QString(), Qt::FindDirectChildrenOnly);
+  for (auto* handle : handles) {
+    if (handle != nullptr &&
+        (handle->property("patchy.textResizeHandle").toBool() || handle->property("patchy.textRotateZone").toBool())) {
+      // Unnamed first: a session started before the deferred delete runs (a script, a test)
+      // would otherwise find this handle by name, show it, and lose it a moment later.
+      handle->setObjectName(QString());
+      handle->setProperty("patchy.textResizeHandle", false);
+      handle->setProperty("patchy.textRotateZone", false);
+      handle->hide();
+      handle->deleteLater();
+    }
+  }
+}
+
+void MainWindow::mark_text_editor_changed(QTextEdit* editor) {
+  if (canvas_ == nullptr || editor == nullptr || editor->property(kTextEditorFinishedProperty).toBool()) {
+    return;
+  }
+  if (editor->property("patchy.relayoutingTextEditor").toBool()) {
+    return;
+  }
+  editor->setProperty(kTextEditorChangedProperty, true);
+  editor->setProperty(kTextEditorCaretLayoutGenerationProperty,
+                      editor->property(kTextEditorCaretLayoutGenerationProperty).toInt() + 1);
+  if (!editor->property(kTextEditorSourceRasterPreviewProperty).toBool()) {
+    return;
+  }
+
+  editor->setProperty(kTextEditorSourceRasterPreviewProperty, false);
+  // The Photoshop raster can no longer represent the edited text.  Plain point text previously
+  // fell back to the editor widget's own glyph painting here, but the widget lays aligned text
+  // out against its own width -- centered/right-justified text then shows one layout while
+  // editing and a different one after commit.  Hand the session to the live baked preview
+  // instead, so the on-screen glyphs come from render_text_pixels, the same rasterizer the
+  // commit uses (the installed-font flow already edits this way from the start).
+  const bool adopt_baked_preview =
+      !text_flow_is_box(editor->property("patchy.documentTextFlow").toString()) &&
+      !editor->property("patchy.usesPsdTextFrame").toBool() &&
+      !editor->property(kTextEditorPreviewEnabledProperty).toBool();
+  if (adopt_baked_preview) {
+    editor->setProperty(kTextEditorForceBakedPreviewProperty, true);
+    editor->setProperty(kTextEditorPreviewEnabledProperty, true);
+  }
+  editor->setProperty(kTextEditorPreviewPaintProperty,
+                      adopt_baked_preview ||
+                          editor->property(kTextEditorExtendedBoxPreviewProperty).toBool() ||
+                          editor->property(kTextEditorLineAwareBoxPreviewProperty).toBool());
+  update_text_editor_transform_overlay(editor);
+  clear_text_editor_preview_overlays(*editor);
+  remove_text_editor_preview(editor);
+
+  if (editor->property("patchy.editingLayerId").isValid()) {
+    const auto layer_id = static_cast<LayerId>(editor->property("patchy.editingLayerId").toULongLong());
+    if (auto* layer = document().find_layer(layer_id); layer != nullptr && layer->visible()) {
+      layer->set_visible(false);
+      canvas_->document_changed_effect_bounds(to_qrect(layer_render_bounds(*layer)));
+      refresh_layer_list();
+      refresh_layer_controls();
+    }
+  }
+  if (adopt_baked_preview) {
+    // Render the first live preview immediately: the editor no longer paints its own glyphs and
+    // the debounced preview pass would otherwise leave the text invisible for a beat.
+    update_text_editor_preview(editor);
+  }
+}
+
+void MainWindow::schedule_text_editor_preview(QTextEdit* editor) {
+  if (editor == nullptr || editor->property(kTextEditorFinishedProperty).toBool()) {
+    return;
+  }
+  if (editor->property(kTextEditorSourceRasterPreviewProperty).toBool()) {
+    editor->setProperty("patchy.textPreviewPending", false);
+    update_text_editor_preview(editor);
+    return;
+  }
+  if (!editor->property(kTextEditorPreviewEnabledProperty).toBool()) {
+    editor->setProperty(kTextEditorPreviewPaintProperty, false);
+    update_text_editor_transform_overlay(editor);
+    clear_text_editor_preview_overlays(*editor);
+    refresh_text_editor_hidden_lines(editor);
+    editor->setProperty("patchy.textPreviewPending", false);
+    remove_text_editor_preview(editor);
+    editor->viewport()->update();
+    return;
+  }
+  if (editor->property(kTextEditorExtendedBoxPreviewProperty).toBool() &&
+      !editor->property(kTextEditorSourceRasterPreviewProperty).toBool()) {
+    editor->setProperty("patchy.textPreviewPending", false);
+    update_text_editor_preview(editor);
+    return;
+  }
+
+  const auto generation = editor->property(kTextEditorPreviewGenerationProperty).toInt() + 1;
+  editor->setProperty(kTextEditorPreviewGenerationProperty, generation);
+  const auto expensive_preview = editor->property(kTextEditorPreviewExpensiveProperty).toBool();
+  const auto transformed_preview = editor->property(kTextEditorTransformedOverlayProperty).toBool();
+  const auto slow_preview = expensive_preview && !transformed_preview;
+  if (!slow_preview && editor->property(kTextEditorPreviewNowProperty).toBool()) {
+    // An auto-repeated key (see eventFilter): draw this edit now, so the glyphs keep up with the
+    // caret and the box while the key is held. The bumped generation retires queued previews.
+    editor->setProperty(kTextEditorPreviewNowProperty, false);
+    editor->setProperty("patchy.textPreviewPending", false);
+    update_text_editor_preview(editor);
+    return;
+  }
+  // An expensive style (a wide glow, a big shadow) is re-rendered on a longer debounce, but the
+  // LAST good preview keeps drawing until the new one is ready. This used to tear the preview
+  // layer out and let the editor widget paint raw glyphs for the whole delay, so every keystroke
+  // on styled text flashed between two different rasterizations.
+  // The delay counts from the oldest edit not drawn yet, never from the latest one: typing
+  // faster than the delay must not hold the preview back until the typing stops.
+  const auto now = text_editor_preview_clock_ms();
+  if (!editor->property("patchy.textPreviewPending").toBool() ||
+      !editor->property(kTextEditorPreviewPendingSinceProperty).isValid()) {
+    editor->setProperty(kTextEditorPreviewPendingSinceProperty, now);
+  }
+  const auto pending_for = now - editor->property(kTextEditorPreviewPendingSinceProperty).toLongLong();
+  const auto delay = slow_preview ? kExpensiveTextEditorPreviewDelayMs : kTextEditorPreviewDelayMs;
+  editor->setProperty("patchy.textPreviewPending", true);
+  QTimer::singleShot(static_cast<int>(std::clamp<qint64>(delay - pending_for, 0, delay)),
+                     editor,
+                     [this, editor = QPointer<QTextEdit>(editor), generation] {
+    if (editor == nullptr) {
+      return;
+    }
+    if (editor->property(kTextEditorFinishedProperty).toBool() ||
+        !editor->property(kTextEditorPreviewEnabledProperty).toBool()) {
+      editor->setProperty("patchy.textPreviewPending", false);
+      return;
+    }
+    if (editor->property(kTextEditorPreviewGenerationProperty).toInt() != generation) {
+      return;
+    }
+    editor->setProperty("patchy.textPreviewPending", false);
+    update_text_editor_preview(editor);
+  });
+}
+
+void MainWindow::update_text_editor_preview(QTextEdit* editor) {
+  if (canvas_ == nullptr || editor == nullptr || editor->property(kTextEditorFinishedProperty).toBool()) {
+    return;
+  }
+  if (canvas_->processing_render_wait_active()) {
+    // A canvas render is compositing this document on a worker thread, and its wait pumps
+    // timers: swapping the preview layer's pixels and bounds now races that read (an access
+    // violation in layer_alpha_mask on a styled layer). Preview once the wait is over.
+    QTimer::singleShot(kTextEditorPreviewDelayMs, editor, [this, editor = QPointer<QTextEdit>(editor)] {
+      if (editor != nullptr) {
+        update_text_editor_preview(editor);
+      }
+    });
+    return;
+  }
+  if (editor->property(kTextEditorSourceRasterPreviewProperty).toBool()) {
+    editor->setProperty(kTextEditorPreviewPaintProperty, true);
+    editor->setProperty("patchy.textPreviewPending", false);
+    remove_text_editor_preview(editor);
+    update_text_editor_preview_caret(*editor, canvas_->zoom());
+    update_text_editor_transform_overlay(editor);
+    refresh_text_editor_hidden_lines(editor);
+    editor->viewport()->update();
+    return;
+  }
+  const UiProfileScope profile_scope("text_edit.preview");
+  auto& doc = document();
+  // The preview sits over the layer being edited, or over the provisional layer a new session
+  // just inserted, so new text previews exactly like a re-edit.
+  std::optional<LayerId> editing_layer_id;
+  if (editor->property("patchy.editingLayerId").isValid()) {
+    editing_layer_id = static_cast<LayerId>(editor->property("patchy.editingLayerId").toULongLong());
+  } else if (editor->property(kTextEditorProvisionalLayerProperty).isValid()) {
+    editing_layer_id = static_cast<LayerId>(editor->property(kTextEditorProvisionalLayerProperty).toULongLong());
+  }
+  auto* source = editing_layer_id.has_value() ? doc.find_layer(*editing_layer_id) : nullptr;
+  const auto source_was_visible = !editor->property("patchy.editingLayerWasVisible").isValid() ||
+                                  editor->property("patchy.editingLayerWasVisible").toBool();
+  const auto extended_box_preview = editor->property(kTextEditorExtendedBoxPreviewProperty).toBool();
+  const auto line_aware_box_preview = editor->property(kTextEditorLineAwareBoxPreviewProperty).toBool();
+  // Plain installed-font point text carries no layer effect, so it would not normally need a preview;
+  // force one anyway (kTextEditorForceBakedPreviewProperty) so its on-screen glyphs come from the same
+  // render_text_pixels rasterizer the committed layer uses -- no antialiasing/position shift on edit.
+  const auto force_baked_preview = editor->property(kTextEditorForceBakedPreviewProperty).toBool();
+  // A rotated view always previews on the canvas: the editor widget cannot turn with it, so the
+  // transformed overlay edits over the turned preview (docs/view-navigation-rotation.md).
+  const auto rotated_view = !canvas_->view_axis_aligned();
+  const auto needs_text_preview =
+      source != nullptr && source_was_visible &&
+      (layer_requires_text_editor_preview(*source) || extended_box_preview || line_aware_box_preview ||
+       force_baked_preview || rotated_view);
+  editor->setProperty(kTextEditorPreviewEnabledProperty, needs_text_preview);
+  if (!needs_text_preview) {
+    // No preview: the editor widget itself draws the glyphs, so the committed layer has to go.
+    // The vacated region must repaint or the hidden layer's pixels stay baked in the render cache.
+    if (const auto vacated = hide_text_editor_source_layer(editor); !vacated.isEmpty()) {
+      canvas_->document_changed_effect_bounds(vacated);
+    }
+    editor->setProperty(kTextEditorPreviewPaintProperty, false);
+    update_text_editor_transform_overlay(editor);
+    clear_text_editor_preview_overlays(*editor);
+    refresh_text_editor_hidden_lines(editor);
+    editor->viewport()->update();
+    remove_text_editor_preview(editor);
+    return;
+  }
+
+  // Untrimmed: run offsets index the full document text (see commit_text_editor). The
+  // composition is part of it here, so a first kana in an empty session previews too.
+  auto document_text = document_from_editor_in_document_units(*editor, canvas_->zoom());
+  const auto text = document_text->toPlainText();
+  if (text.trimmed().isEmpty()) {
+    // As above: consume the vacated region, or an all-deleted session leaves a ghost on screen.
+    if (const auto vacated = hide_text_editor_source_layer(editor); !vacated.isEmpty()) {
+      canvas_->document_changed_effect_bounds(vacated);
+    }
+    set_text_editor_hidden_lines(editor, false);
+    editor->setProperty(kTextEditorPreviewPaintProperty, false);
+    update_text_editor_transform_overlay(editor);
+    clear_text_editor_preview_overlays(*editor);
+    editor->viewport()->update();
+    remove_text_editor_preview(editor);
+    return;
+  }
+
+  const auto text_size = std::max(1, editor->property("patchy.documentTextSize").toInt());
+  const auto text_width =
+      std::max(kMinimumTextBoxDocumentSize, editor->property("patchy.documentTextWidth").toInt());
+  const auto text_height =
+      std::max(kMinimumTextBoxDocumentSize, editor->property("patchy.documentTextHeight").toInt());
+  const auto boxed_text =
+      text_flow_is_box(editor->property("patchy.documentTextFlow").toString());
+  const auto text_color = editor->property("patchy.documentTextColor").value<QColor>().isValid()
+                              ? editor->property("patchy.documentTextColor").value<QColor>()
+                              : canvas_->primary_color();
+  const auto text_anti_alias = std::clamp(editor->property("patchy.documentTextAntiAlias").toInt(), 0, 16);
+  auto text_family = editor->property("patchy.documentTextFamily").toString();
+  if (text_family.trimmed().isEmpty()) {
+    text_family = text_display_family_from_format(text_editor_reference_format(*editor),
+                                                  display_text_family_from_font(editor->font()));
+  }
+  TextToolSettings settings{text,
+                            QString(),
+                            text_family,
+                            text_size,
+                            editor->font().bold(),
+                            editor->font().italic(),
+                            text_anti_alias,
+                            boxed_text,
+                            text_width,
+                            text_height};
+  settings.photoshop_layout = text_editor_uses_photoshop_layout(*editor);
+  settings.vertical = text_editor_is_vertical(*editor);
+  apply_text_editor_contour(settings, *editor);
+  const auto paragraph_runs = paragraph_runs_from_document(*document_text);
+  const auto rich_text_runs = rich_text_runs_from_document(*document_text, settings, text_color);
+  settings.html = document_html_from_text_runs(document_text->toPlainText(), rich_text_runs, settings, text_color);
+  const auto frame_layout_scale = settings.photoshop_layout && editor->property("patchy.usesPsdTextFrame").toBool()
+                                      ? text_editor_size_display_scale(*editor)
+                                      : 1.0;
+  auto rendered = render_text_pixels_with_local_rect(settings, text_color, text_width, paragraph_runs,
+                                                     rich_text_runs, text_editor_render_local_rect(*editor),
+                                                     text_editor_metric_scale(*editor), QTransform(),
+                                                     frame_layout_scale);
+  set_text_editor_hidden_lines(editor, rendered.hidden_lines);
+  if (rendered.pixels.empty()) {
+    editor->setProperty(kTextEditorPreviewPaintProperty, false);
+    update_text_editor_transform_overlay(editor);
+    clear_text_editor_preview_overlays(*editor);
+    editor->viewport()->update();
+    remove_text_editor_preview(editor);
+    return;
+  }
+  if (!boxed_text && !editor->property("patchy.usesPsdTextFrame").toBool() &&
+      !(source != nullptr && layer_has_active_text_warp(*source))) {
+    // Warped layers keep the entry-set session transform: both updates below re-derive
+    // geometry from the layer raster, which holds the WARPED ink.
+    bool updated_transform = false;
+    if (source != nullptr) {
+      updated_transform = update_text_editor_transform_from_psd_local_bounds(*editor, *source, rendered,
+                                                                            boxed_text);
+    }
+    if (!updated_transform) {
+      update_text_editor_transform_from_source_anchor(*editor, rendered);
+    }
+  }
+
+  const QPoint document_point(editor->property("patchy.documentTextX").toInt(),
+                              editor->property("patchy.documentTextY").toInt());
+  auto preview_bounds = rendered_text_bounds_for_editor(*editor, document_point, rendered);
+  auto pixels = std::move(rendered.pixels);
+  if (source != nullptr) {
+    if (const auto transform = text_transform_for_editor_or_layer(*editor, *source);
+        transform.has_value() && !editor->property("patchy.usesPsdTextFrame").toBool() &&
+        !(text_editor_render_local_rect(*editor).has_value() &&
+          text_editor_source_visible_anchor(*editor).has_value() &&
+          !qtransform_has_non_translation_linear_part(*transform))) {
+      const bool rendered_off_origin =
+          std::abs(rendered.local_rect.left()) > 0.0001 || std::abs(rendered.local_rect.top()) > 0.0001;
+      const bool has_local_offset = text_editor_render_local_rect(*editor).has_value() && rendered_off_origin;
+      // Same split as commit_text_editor: an overhanging point-text buffer is resampled with its
+      // offset folded in, while the crisp re-render takes the plain transform.
+      const bool point_local_offset = !text_editor_render_local_rect(*editor).has_value() && rendered_off_origin;
+      auto transform_for_pixels = *transform;
+      if (has_local_offset || point_local_offset) {
+        transform_for_pixels = qtransform_from_affine(
+            affine_with_local_translation(affine_from_qtransform(*transform), rendered.local_rect.topLeft()));
+      }
+      // Show the same crisp glyphs the commit will produce: previewing a scaled-up text layer by
+      // resampling its base-size bitmap left the text blurry for the whole edit session (then it
+      // snapped sharp on commit), which made small-point/large-scale PSD text unreadable while typing.
+      if (auto crisp = render_crisp_transformed_text_for_editor(
+              *editor, source->metadata().contains(kLayerMetadataPsdTextTransform), boxed_text,
+              has_local_offset, settings, text_color, text_width, paragraph_runs, rich_text_runs, *transform,
+              *transform);
+          crisp.has_value()) {
+        pixels = std::move(crisp->pixels);
+        preview_bounds = crisp->bounds;
+      } else {
+        auto transformed = apply_text_transform_to_pixels(pixels, transform_for_pixels);
+        pixels = std::move(transformed.pixels);
+        preview_bounds = transformed.bounds;
+      }
+    }
+  }
+  std::optional<LayerId> restore_active_layer;
+  if (editor->property("patchy.restoreActiveLayerId").isValid()) {
+    restore_active_layer = static_cast<LayerId>(editor->property("patchy.restoreActiveLayerId").toULongLong());
+  }
+
+  QRect dirty = to_qrect(preview_bounds);
+  if (settings.area || settings.path) {
+    pixels = convert_pixel_buffer_depth(pixels, doc.color_state().bit_depth, SampleKind::Color);
+  }
+  if (editor->property("patchy.textPreviewLayerId").isValid()) {
+    const auto preview_id = static_cast<LayerId>(editor->property("patchy.textPreviewLayerId").toULongLong());
+    if (auto* layer = doc.find_layer(preview_id); layer != nullptr) {
+      dirty = dirty.united(to_qrect(layer_render_bounds(*layer)));
+      layer->set_pixels(std::move(pixels));
+      layer->set_bounds(preview_bounds);
+      layer->set_opacity(source->opacity());
+      layer->set_fill_opacity(source->fill_opacity());
+      layer->set_blend_mode(source->blend_mode());
+      layer->layer_style() = source->layer_style();
+      dirty = dirty.united(to_qrect(layer_render_bounds(*layer)));
+      dirty = dirty.united(hide_text_editor_source_layer(editor));
+      canvas_->document_changed_effect_bounds(dirty);
+      editor->setProperty(kTextEditorPreviewPaintProperty, true);
+      update_text_editor_preview_caret(*editor, canvas_->zoom());
+      update_text_editor_transform_overlay(editor);
+      editor->viewport()->update();
+      return;
+    }
+    editor->setProperty("patchy.textPreviewLayerId", QVariant());
+  }
+
+  Layer preview(doc.allocate_layer_id(), tr("Text Preview").toStdString(), std::move(pixels));
+  preview.set_bounds(preview_bounds);
+  preview.metadata()["patchy.internal.text_preview"] = "true";
+  preview.set_opacity(source->opacity());
+  preview.set_fill_opacity(source->fill_opacity());
+  preview.set_blend_mode(source->blend_mode());
+  preview.layer_style() = source->layer_style();
+  const auto preview_id = preview.id();
+  insert_layer_after_anchor(doc, std::move(preview), editing_layer_id);
+  editor->setProperty("patchy.textPreviewLayerId", QVariant::fromValue<qulonglong>(preview_id));
+  if (editor->property(kTextEditorTypeMaskProperty).toBool()) {
+    canvas_->set_type_mask_overlay(CanvasWidget::TypeMaskOverlay{preview_id});
+  }
+  if (restore_active_layer.has_value() && doc.find_layer(*restore_active_layer) != nullptr) {
+    doc.set_active_layer(*restore_active_layer);
+  }
+  if (auto* layer = doc.find_layer(preview_id); layer != nullptr) {
+    dirty = dirty.united(to_qrect(layer_render_bounds(*layer)));
+  }
+  // The committed pixels stay on screen until exactly here: preview in, source out, one repaint.
+  dirty = dirty.united(hide_text_editor_source_layer(editor));
+  canvas_->document_changed_effect_bounds(dirty);
+  editor->setProperty(kTextEditorPreviewPaintProperty, true);
+  update_text_editor_preview_caret(*editor, canvas_->zoom());
+  update_text_editor_transform_overlay(editor);
+  editor->viewport()->update();
+}
+
+// Takes the edited layer off screen, once, at the moment something else is ready to draw its
+// text. Returns the region it vacated so the caller can fold it into ONE repaint together with
+// whatever replaced it -- hiding and revealing in separate repaints is what a user sees as a
+// flash. Idempotent: an already-hidden layer returns an empty rect.
+// The counterpart of hide_text_editor_source_layer, for session teardown: puts the edited layer
+// back on screen before its preview goes away, so the text is continuously visible across the
+// handover. Its pixels are still the committed ones at that point, which is exactly what should
+// show if the commit turns out to be a no-op.
+void MainWindow::restore_text_editor_source_layer(QTextEdit* editor, bool visible) {
+  if (canvas_ == nullptr || editor == nullptr || !editor->property("patchy.editingLayerId").isValid() ||
+      !has_active_document()) {
+    return;
+  }
+  const auto layer_id = static_cast<LayerId>(editor->property("patchy.editingLayerId").toULongLong());
+  auto* layer = document().find_layer(layer_id);
+  if (layer == nullptr || layer->visible() == visible) {
+    return;
+  }
+  layer->set_visible(visible);
+  canvas_->document_changed_effect_bounds(to_qrect(layer_render_bounds(*layer)));
+}
+
+QRect MainWindow::hide_text_editor_source_layer(QTextEdit* editor) {
+  if (canvas_ == nullptr || editor == nullptr || !editor->property("patchy.editingLayerId").isValid()) {
+    return {};
+  }
+  const auto layer_id = static_cast<LayerId>(editor->property("patchy.editingLayerId").toULongLong());
+  auto* layer = document().find_layer(layer_id);
+  if (layer == nullptr || !layer->visible()) {
+    return {};
+  }
+  const auto vacated = to_qrect(layer_render_bounds(*layer));
+  layer->set_visible(false);
+  return vacated;
+}
+
+void MainWindow::remove_text_editor_preview(QTextEdit* editor) {
+  if (canvas_ == nullptr || editor == nullptr || !editor->property("patchy.textPreviewLayerId").isValid()) {
+    return;
+  }
+  auto& doc = document();
+  const auto preview_id = static_cast<LayerId>(editor->property("patchy.textPreviewLayerId").toULongLong());
+  QRect dirty;
+  if (auto* layer = doc.find_layer(preview_id); layer != nullptr) {
+    dirty = to_qrect(layer_render_bounds(*layer));
+  }
+  const auto removed = doc.remove_layer(preview_id);
+  editor->setProperty("patchy.textPreviewLayerId", QVariant());
+  if (editor->property("patchy.restoreActiveLayerId").isValid()) {
+    const auto restore_id = static_cast<LayerId>(editor->property("patchy.restoreActiveLayerId").toULongLong());
+    if (doc.find_layer(restore_id) != nullptr) {
+      doc.set_active_layer(restore_id);
+    }
+  }
+  if (removed) {
+    canvas_->document_changed_effect_bounds(dirty);
+  }
+}
+
+std::optional<LayerId> MainWindow::take_provisional_text_layer(QTextEdit* editor) {
+  if (editor == nullptr || !editor->property(kTextEditorProvisionalLayerProperty).isValid()) {
+    return std::nullopt;
+  }
+  const auto provisional_id =
+      static_cast<LayerId>(editor->property(kTextEditorProvisionalLayerProperty).toULongLong());
+  editor->setProperty(kTextEditorProvisionalLayerProperty, QVariant());
+  if (canvas_ == nullptr || !has_active_document()) {
+    return std::nullopt;
+  }
+  auto& doc = document();
+  // Only remove the exact marker-tagged layer this session created: layer ids restart per
+  // document, so after a tab switch or a mid-edit undo the id may be gone or belong to an
+  // unrelated layer that must not be deleted.
+  const auto* layer = std::as_const(doc).find_layer(provisional_id);
+  if (layer == nullptr || !layer->metadata().contains(kLayerMetadataProvisionalTextMarker)) {
+    return std::nullopt;
+  }
+  doc.remove_layer(provisional_id);
+  if (editor->property("patchy.restoreActiveLayerId").isValid()) {
+    const auto restore_id = static_cast<LayerId>(editor->property("patchy.restoreActiveLayerId").toULongLong());
+    if (doc.find_layer(restore_id) != nullptr) {
+      doc.set_active_layer(restore_id);
+    }
+  }
+  return provisional_id;
+}
+
+void MainWindow::sync_rotate_view_angle_spin() {
+  if (rotate_view_angle_spin_ == nullptr) {
+    return;
+  }
+  const auto angle = canvas_ != nullptr ? canvas_->view_rotation() : 0.0;
+  if (std::abs(rotate_view_angle_spin_->value() - angle) < 0.05) {
+    return;
+  }
+  syncing_rotate_view_angle_ = true;
+  rotate_view_angle_spin_->setValue(angle);
+  syncing_rotate_view_angle_ = false;
+}
+
+void MainWindow::handle_canvas_view_changed(CanvasWidget* canvas) {
+  if (canvas == nullptr || canvas != canvas_) {
+    return;
+  }
+  refresh_document_info();
+  sync_rotate_view_angle_spin();
+  auto* editor = canvas->findChild<QTextEdit*>(QStringLiteral("inlineTextEditor"));
+  if (editor == nullptr || editor->property(kTextEditorFinishedProperty).toBool()) {
+    return;
+  }
+  relayout_text_editor(editor, false);
+  reset_text_editor_scroll(editor);
+  if (!canvas->view_axis_aligned() && !editor->property(kTextEditorPreviewPaintProperty).toBool()) {
+    // The view turned mid-session: switch to the canvas preview the overlay edits over.
+    schedule_text_editor_preview(editor);
+  }
+}
+
+void MainWindow::apply_text_alignment_to_active_editor(const QString& alignment) {
+  if (canvas_ == nullptr || applying_text_options_to_layers_) {
+    return;
+  }
+  auto* editor = canvas_->findChild<QTextEdit*>(QStringLiteral("inlineTextEditor"));
+  // `alignment` is what a control shows: a side, which each paragraph stores by its direction.
+  if (editor != nullptr) {
+    apply_shown_text_alignment_to_editor(*editor, alignment);
+    sync_text_alignment_buttons_from_editor();
+    schedule_text_editor_preview(editor);
+    return;
+  }
+  // No session: paragraph-level like the direction combo, so the hidden session selects the
+  // whole object first (a bare caret would align only the first paragraph).
+  apply_text_character_edit([this, alignment](QTextEdit& target) {
+    auto cursor = target.textCursor();
+    cursor.select(QTextCursor::Document);
+    target.setTextCursor(cursor);
+    apply_shown_text_alignment_to_editor(target, alignment);
+    return true;
+  });
+  sync_text_alignment_buttons_from_editor();
+}
+
+void MainWindow::apply_shown_text_alignment_to_editor(QTextEdit& editor, const QString& alignment) {
+  if (text_editor_is_vertical(editor)) {
+    apply_text_alignment_to_editor(editor, alignment);
+    return;
+  }
+  // Each paragraph the selection touches stores the name for its own direction (GitHub issue
+  // 683), so Right puts a left-to-right and a right-to-left paragraph both on the right. Point
+  // text and text on a path take a justify mode as its plain alignment (issue 717).
+  const auto flow = text_editor_alignment_flow(editor);
+  const auto selection = editor.textCursor();
+  auto* document = editor.document();
+  QTextCursor edit(document);
+  edit.beginEditBlock();
+  for (auto block = document->findBlock(selection.selectionStart());
+       block.isValid() && block.position() <= selection.selectionEnd(); block = block.next()) {
+    QTextBlockFormat format;
+    set_paragraph_alignment(format,
+                            stored_paragraph_alignment_name(alignment, resolved_block_direction(block), flow));
+    // A cursor with no selection merges into its own block only.
+    QTextCursor(block).mergeBlockFormat(format);
+  }
+  edit.endEditBlock();
+  mark_text_editor_changed(&editor);
+}
+
+void MainWindow::apply_text_alignment_to_editor(QTextEdit& editor, const QString& alignment) {
+  // QTextEdit::setAlignment, plus the justified last line Qt has no alignment flag for.
+  QTextBlockFormat format;
+  set_paragraph_alignment(format, alignment);
+  auto cursor = editor.textCursor();
+  cursor.mergeBlockFormat(format);
+  editor.setTextCursor(cursor);
+  mark_text_editor_changed(&editor);
+}
+
+void MainWindow::apply_text_orientation(bool vertical, bool remember_default) {
+  if (canvas_ == nullptr) {
+    return;
+  }
+  auto* editor = canvas_->findChild<QTextEdit*>(QStringLiteral("inlineTextEditor"));
+  const bool session_open = editor != nullptr && !editor->property(kTextEditorFinishedProperty).toBool();
+  if (session_open) {
+    if (text_editor_is_vertical(*editor) == vertical) {
+      sync_text_orientation_controls_from_editor();
+      return;
+    }
+    editor->setProperty(kTextEditorOrientationProperty,
+                        vertical ? QString::fromLatin1(kTextOrientationVertical) : QString());
+    if (vertical && !editor->property(kTextEditorVerticalAnchorProperty).isValid()) {
+      // Switching a live session: the widget origin (the layout top-left) becomes the anchor.
+      editor->setProperty(kTextEditorVerticalAnchorProperty,
+                          QPointF(editor->property("patchy.documentTextX").toInt(),
+                                  editor->property("patchy.documentTextY").toInt()));
+    }
+    mark_text_editor_changed(editor);
+    relayout_text_editor(editor, true);
+    sync_text_orientation_controls_from_editor();
+    schedule_text_editor_preview(editor);
+    return;
+  }
+  // No session: the selected text layer converts through a hidden session (one undo step),
+  // the Character-panel pattern. Nothing selected: the next new layer takes the orientation.
+  // Type Mask never edits a layer, so there the toggle always arms its next session.
+  if (const auto* layer = current_tool_ == CanvasTool::TypeMask ? nullptr : text_character_target_layer();
+      layer != nullptr) {
+    if (layer_text_is_vertical(*layer) != vertical) {
+      apply_text_character_edit([vertical](QTextEdit& target) {
+        target.setProperty(kTextEditorOrientationProperty,
+                           vertical ? QString::fromLatin1(kTextOrientationVertical) : QString());
+        return true;
+      });
+    }
+  } else if (remember_default) {
+    // Nothing to convert: arm the next new layer (one shot), so the button stays checked until
+    // that layer exists.
+    text_vertical_next_ = vertical;
+  }
+  sync_text_orientation_controls_from_editor();
+}
+
+void MainWindow::apply_text_direction_to_active_editor(Qt::LayoutDirection direction) {
+  if (canvas_ == nullptr) {
+    return;
+  }
+  auto* editor = canvas_->findChild<QTextEdit*>(QStringLiteral("inlineTextEditor"));
+  const bool session_open = editor != nullptr && !editor->property(kTextEditorFinishedProperty).toBool();
+  const auto apply = [direction](QTextEdit& target) {
+    // Paragraph-level, like alignment: every paragraph the selection touches, or the caret's.
+    auto cursor = target.textCursor();
+    QTextBlockFormat format;
+    format.setLayoutDirection(direction);
+    cursor.mergeBlockFormat(format);
+    return true;
+  };
+  if (session_open) {
+    apply(*editor);
+    mark_text_editor_changed(editor);
+    relayout_text_editor(editor, true);
+    // The alignment buttons show sides, which a paragraph's direction swaps (GitHub issue 683).
+    sync_text_alignment_buttons_from_editor();
+    schedule_text_editor_preview(editor);
+    return;
+  }
+  if (text_character_target_layer() != nullptr) {
+    apply_text_character_edit([apply](QTextEdit& target) {
+      auto cursor = target.textCursor();
+      cursor.select(QTextCursor::Document);
+      target.setTextCursor(cursor);
+      return apply(target);
+    });
+  }
+  sync_text_alignment_buttons_from_editor();
+}
+
+void MainWindow::sync_text_orientation_controls_from_editor() {
+  // The direction combo and the Vertical check exist only while the Paragraph panel is open.
+  if (canvas_ == nullptr || text_orientation_button_ == nullptr) {
+    return;
+  }
+  const auto* editor = canvas_->findChild<QTextEdit*>(QStringLiteral("inlineTextEditor"));
+  const bool session_open = editor != nullptr && !editor->property(kTextEditorFinishedProperty).toBool();
+  bool vertical = text_vertical_next_;
+  auto direction = Qt::LayoutDirectionAuto;
+  if (session_open) {
+    vertical = text_editor_is_vertical(*editor);
+    direction = editor->textCursor().blockFormat().layoutDirection();
+  } else if (const auto* layer = current_tool_ == CanvasTool::TypeMask ? nullptr : text_character_target_layer();
+             layer != nullptr) {
+    vertical = layer_text_is_vertical(*layer);
+    if (const auto found = layer->metadata().find(kLayerMetadataTextParagraphRuns);
+        found != layer->metadata().end()) {
+      for (const auto& raw_line : QString::fromStdString(found->second).split(QLatin1Char('\n'))) {
+        const auto fields = raw_line.trimmed().split(QLatin1Char('\t'));
+        if (fields.size() < 10) {
+          continue;
+        }
+        direction = fields[9] == QStringLiteral("rtl")   ? Qt::RightToLeft
+                    : fields[9] == QStringLiteral("ltr") ? Qt::LeftToRight
+                                                         : Qt::LayoutDirectionAuto;
+        break;
+      }
+    }
+  }
+  {
+    QSignalBlocker blocker(text_orientation_button_);
+    text_orientation_button_->setChecked(vertical);
+  }
+  if (text_paragraph_vertical_check_ != nullptr) {
+    QSignalBlocker blocker(text_paragraph_vertical_check_);
+    text_paragraph_vertical_check_->setChecked(vertical);
+  }
+  if (text_direction_combo_ != nullptr) {
+    QSignalBlocker blocker(text_direction_combo_);
+    const auto index = text_direction_combo_->findData(static_cast<int>(direction));
+    text_direction_combo_->setCurrentIndex(std::max(0, index));
+  }
+  if (text_rtl_button_ != nullptr) {
+    // Auto shows unchecked: only an explicit right to left paragraph checks the toggle.
+    QSignalBlocker blocker(text_rtl_button_);
+    text_rtl_button_->setChecked(direction == Qt::RightToLeft);
+  }
+  if (text_justify_button_ != nullptr) {
+    text_justify_button_->setIcon(text_alignment_icon(Qt::AlignJustify, vertical));
+  }
+  // Vertical text aligns along the column: the buttons read Top / Center / Bottom, and their
+  // glyphs turn into columns.
+  const auto set_tip = [](QPushButton* button, const char* horizontal, const char* vertical_tip, bool is_vertical,
+                          Qt::Alignment alignment) {
+    if (button != nullptr) {
+      button->setToolTip(tr(is_vertical ? vertical_tip : horizontal));
+      button->setIcon(text_alignment_icon(alignment, is_vertical));
+    }
+  };
+  set_tip(text_align_left_button_, QT_TR_NOOP("Align Left"), QT_TR_NOOP("Align Top"), vertical, Qt::AlignLeft);
+  set_tip(text_align_center_button_, QT_TR_NOOP("Align Center"), QT_TR_NOOP("Align Center (Vertical)"), vertical,
+          Qt::AlignHCenter);
+  set_tip(text_align_right_button_, QT_TR_NOOP("Align Right"), QT_TR_NOOP("Align Bottom"), vertical,
+          Qt::AlignRight);
+}
+
+void MainWindow::sync_text_alignment_buttons_from_editor() {
+  if (text_align_left_button_ == nullptr || text_align_center_button_ == nullptr ||
+      text_align_right_button_ == nullptr || canvas_ == nullptr) {
+    return;
+  }
+  // L / C / R show the last line and Justify sits on top (GitHub issue 673); Justify all has no
+  // last-line alignment, so it shows Justify alone. The name is the shown one: the side the
+  // lines stand on (issue 683), never a justify mode for point text or text on a path, where
+  // Justify is off (issue 717).
+  const auto name = current_text_alignment_name();
+  if (text_justify_button_ != nullptr) {
+    text_justify_button_->setEnabled(current_text_justify_available());
+  }
+  const bool justified = name.startsWith(QStringLiteral("justify"));
+  const bool left = name == QStringLiteral("left") || name == QStringLiteral("justify");
+  const bool center = name == QStringLiteral("center") || name == QStringLiteral("justifyCenter");
+  const bool right = name == QStringLiteral("right") || name == QStringLiteral("justifyRight");
+  const auto set_checked = [](QPushButton* button, bool checked) {
+    if (button != nullptr) {
+      QSignalBlocker blocker(button);
+      button->setChecked(checked);
+    }
+  };
+  // An exclusive group refuses to uncheck its last checked button.
+  if (text_alignment_group_ != nullptr) {
+    text_alignment_group_->setExclusive(false);
+  }
+  set_checked(text_align_left_button_, left);
+  set_checked(text_align_center_button_, center);
+  set_checked(text_align_right_button_, right);
+  if (text_alignment_group_ != nullptr) {
+    text_alignment_group_->setExclusive(true);
+  }
+  set_checked(text_justify_button_, justified);
+  sync_text_orientation_controls_from_editor();
+  // The Paragraph panel's alignment combo follows the buttons (no-op while it is closed).
+  sync_text_paragraph_dialog_from_editor();
+}
+
+void MainWindow::refresh_type_menu_states() {
+  if (type_alignment_menu_ == nullptr || type_direction_menu_ == nullptr || type_orientation_menu_ == nullptr ||
+      type_anti_alias_menu_ == nullptr || type_opentype_menu_ == nullptr) {
+    return;
+  }
+  // Read like the options bar and the Character and Paragraph panels: the live session, else
+  // the first selected editable text layer; with neither, the values the next new layer takes.
+  auto* editor =
+      canvas_ != nullptr ? canvas_->findChild<QTextEdit*>(QStringLiteral("inlineTextEditor")) : nullptr;
+  const bool editable = has_active_document() && canvas_ != nullptr && !preview_dialog_edit_locked();
+  refresh_flip_text_on_path_action_state();
+  const bool session_open =
+      editable && editor != nullptr && !editor->property(kTextEditorFinishedProperty).toBool();
+  const auto* layer = editable && !session_open ? text_character_target_layer() : nullptr;
+  const auto inputs = layer != nullptr ? text_render_inputs_from_layer(*layer) : std::nullopt;
+  const bool has_target = session_open || inputs.has_value();
+  QString alignment_name = QStringLiteral("left");
+  auto direction = Qt::LayoutDirectionAuto;
+  bool vertical = text_vertical_next_;
+  int anti_alias = text_anti_alias_;
+  QTextCharFormat format;
+  if (session_open) {
+    alignment_name = text_editor_shown_alignment_name(*editor);
+    direction = editor->textCursor().blockFormat().layoutDirection();
+    vertical = text_editor_is_vertical(*editor);
+    anti_alias = std::clamp(editor->property("patchy.documentTextAntiAlias").toInt(), 0, 16);
+    format = text_editor_reference_format(*editor);
+  } else if (inputs.has_value()) {
+    const auto built = build_text_render_document(inputs->settings, inputs->color, inputs->max_width,
+                                                  inputs->paragraph_runs, inputs->rich_text_runs, 1.0);
+    const auto block = built.document->begin().blockFormat();
+    alignment_name = layer_shown_alignment_name(*layer);
+    direction = block.layoutDirection();
+    vertical = layer_text_is_vertical(*layer);
+    if (const auto found = layer->metadata().find(kLayerMetadataTextAntiAlias);
+        found != layer->metadata().end() && !found->second.empty()) {
+      anti_alias = std::clamp(QString::fromStdString(found->second).toInt(), 0, 16);
+    }
+    format = QTextCursor(built.document.get()).charFormat();
+  }
+  const auto styles = text_character_styles_from_format(format);
+  // In apply_text_character_style_to_active_editor order, as the Character panel checks them.
+  const std::array<bool, 14> style_checked{styles.caps == 2,
+                                           styles.caps == 1,
+                                           styles.baseline == 1,
+                                           styles.baseline == 2,
+                                           styles.underline,
+                                           styles.strikethrough,
+                                           styles.ordinals,
+                                           styles.fractions,
+                                           styles.ligatures,
+                                           styles.contextual_alternates,
+                                           styles.discretionary_ligatures,
+                                           styles.swash,
+                                           styles.stylistic_alternates,
+                                           styles.titling_alternates};
+  for (auto* action : type_alignment_menu_->actions()) {
+    action->setChecked(action->data().toString() == alignment_name);
+  }
+  for (auto* action : type_direction_menu_->actions()) {
+    action->setChecked(action->data().toInt() == static_cast<int>(direction));
+  }
+  for (auto* action : type_orientation_menu_->actions()) {
+    action->setChecked((action->data().toInt() != 0) == vertical);
+  }
+  for (auto* action : type_anti_alias_menu_->actions()) {
+    action->setChecked(action->data().toInt() == anti_alias);
+  }
+  for (auto* action : type_opentype_menu_->actions()) {
+    const auto index = action->data().toInt();
+    action->setChecked(has_target && index >= 0 && index < static_cast<int>(style_checked.size()) &&
+                       style_checked[static_cast<std::size_t>(index)]);
+  }
+  // Paragraph and character settings need text to change; orientation and smoothing also set
+  // what the Type tool's next new layer takes, as their options-bar controls do.
+  const bool text_tool = editable && is_type_tool(current_tool_);
+  type_alignment_menu_->menuAction()->setEnabled(has_target);
+  type_direction_menu_->menuAction()->setEnabled(has_target);
+  type_opentype_menu_->menuAction()->setEnabled(has_target);
+  type_orientation_menu_->menuAction()->setEnabled(has_target || text_tool);
+  type_anti_alias_menu_->menuAction()->setEnabled(has_target || text_tool);
+}
+
+void MainWindow::apply_text_family_to_active_editor() {
+  if (canvas_ == nullptr || applying_text_options_to_layers_) {
+    return;
+  }
+  auto* editor = canvas_->findChild<QTextEdit*>(QStringLiteral("inlineTextEditor"));
+  if (editor != nullptr) {
+    const auto family =
+        text_font_combo_ != nullptr
+            ? text_font_combo_->currentFont().family()
+            : text_display_family_from_format(text_editor_reference_format(*editor),
+                                              editor->property("patchy.documentTextFamily").toString());
+    apply_text_family_to_editor(*editor, family);
+    relayout_text_editor(editor, true);
+    schedule_text_editor_preview(editor);
+    return;
+  }
+  // No session: the selected text layers (issue 31). The value is read BEFORE the hidden
+  // sessions open, since each one rewrites the bar from the layer it edits.
+  if (text_font_combo_ == nullptr) {
+    return;
+  }
+  const auto family = text_font_combo_->currentFont().family();
+  apply_text_character_edit([this, family](QTextEdit& target) {
+    apply_text_family_to_editor(target, family);
+    return true;
+  });
+}
+
+void MainWindow::apply_text_family_to_format(QTextCharFormat& format, const QString& family) const {
+  format.setFontFamilies(render_text_families_for_display_family(family));
+  set_text_display_family(format, family);
+}
+
+void MainWindow::apply_text_family_to_editor(QTextEdit& editor, const QString& family) {
+  QTextCharFormat format;
+  format.setFontFamilies(render_text_families_for_display_family(family));
+  set_text_display_family(format, family);
+  merge_text_char_format(editor, format);
+  auto editor_font = editor.font();
+  editor_font.setFamilies(render_text_families_for_display_family(family));
+  editor.setFont(editor_font);
+  editor.document()->setDefaultFont(editor_font);
+  editor.setProperty("patchy.documentTextFamily", family);
+  mark_text_editor_changed(&editor);
+}
+
+void MainWindow::apply_text_size_to_active_editor() {
+  if (canvas_ == nullptr || applying_text_options_to_layers_) {
+    return;
+  }
+  const std::optional<double> points =
+      text_size_spin_ != nullptr ? std::optional<double>(text_size_spin_->value()) : std::nullopt;
+  auto* editor = canvas_->findChild<QTextEdit*>(QStringLiteral("inlineTextEditor"));
+  if (editor != nullptr) {
+    const UiProfileScope profile_scope("text_edit.apply_size");
+    // The field steps by a quarter point and the text by whole document pixels, so most
+    // values of a scrub land on the size the selection already has (three of four at 72
+    // ppi), and each would lay the box out and render the preview again for nothing
+    // (GitHub #700). During a scrub nothing else edits the session, so a step whose
+    // selection, pixel size, zoom and document revision all match the last one applied is
+    // skipped. A caret without a selection only sets the typing format, which leaves no
+    // trace in the revision, so it always applies.
+    constexpr auto kAppliedSizeProperty = "patchy.scrubAppliedTextSize";
+    const auto cursor = editor->textCursor();
+    const bool scrubbing = points.has_value() && spin_box_scrub_active(text_size_spin_) && cursor.hasSelection();
+    const auto step_key = [&] {
+      return QVariantList{cursor.selectionStart(), cursor.selectionEnd(),
+                          text_editor_document_size_for_points(*editor, *points, document()), canvas_->zoom(),
+                          editor->document()->revision()};
+    };
+    if (scrubbing && editor->property(kAppliedSizeProperty).toList() == step_key()) {
+      return;
+    }
+    apply_text_size_to_editor(*editor, points);
+    relayout_text_editor(editor, true);
+    schedule_text_editor_preview(editor);
+    refresh_text_color_button();
+    editor->setProperty(kAppliedSizeProperty, scrubbing ? QVariant(step_key()) : QVariant());
+    return;
+  }
+  if (!points.has_value()) {
+    return;
+  }
+  apply_text_character_edit([this, points](QTextEdit& target) {
+    apply_text_size_to_editor(target, points);
+    return true;
+  });
+}
+
+void MainWindow::apply_text_size_to_editor(QTextEdit& editor, std::optional<double> points) {
+  const auto document_text_size = points.has_value()
+                                      ? text_editor_document_size_for_points(editor, *points, document())
+                                      : std::max(1, editor.property("patchy.documentTextSize").toInt());
+  const auto editor_pixel_size = std::max(8, static_cast<int>(std::round(document_text_size * canvas_->zoom())));
+  QTextCharFormat format;
+  format.setProperty(QTextFormat::FontPixelSize, editor_pixel_size);
+  format.setProperty(kTextExactSizeFormatProperty, document_text_size * canvas_->zoom());
+  editor.setProperty("patchy.documentTextSize", document_text_size);
+  merge_text_char_format(editor, format);
+  auto editor_font = editor.font();
+  editor_font.setPixelSize(editor_pixel_size);
+  editor.setFont(editor_font);
+  editor.document()->setDefaultFont(editor_font);
+  mark_text_editor_changed(&editor);
+}
+
+// Ctrl+B during a text session: the Bold FACE when the family ships one, Photoshop's faux bold
+// when it does not. The current state folds the faux flag in, so a second press always turns
+// the axis off (the old button path read only font().bold() and could never clear faux bold).
+// The toggle names one of the four flag faces, so any recorded exotic face gives way to it
+// (Ctrl+B on a Black run selects the Bold face, which is what Photoshop does).
+void MainWindow::toggle_text_bold_face() {
+  if (canvas_ == nullptr) {
+    return;
+  }
+  auto* editor = canvas_->findChild<QTextEdit*>(QStringLiteral("inlineTextEditor"));
+  if (editor == nullptr || editor->property(kTextEditorFinishedProperty).toBool()) {
+    return;
+  }
+
+  const auto reference = text_editor_reference_format(*editor);
+  const bool active =
+      reference.font().bold() || reference.property(kTextFauxBoldFormatProperty).toBool();
+  const bool enable = !active;
+  const auto family = current_text_family_for_editor(*editor);
+  const bool real_face = enable && family_offers_face_axis(family, true);
+  if (enable && !real_face && text_editor_layer_is_warped(document(), *editor)) {
+    // Only the FAUX fallback is refused on warped text (Photoshop parity); a family that
+    // ships a real Bold face keeps toggling normally.
+    show_status_error(tr("Faux bold is not available on warped text. Remove the text warp first."));
+    return;
+  }
+  QTextCharFormat format;
+  format.setFontWeight(real_face ? QFont::Bold : QFont::Normal);
+  format.setProperty(kTextFauxBoldFormatProperty, enable && !real_face);
+  format.setProperty(QTextFormat::FontStyleName, QString());
+  format.setProperty(kTextStyleNameFormatProperty, QString());
+  merge_text_char_format(*editor, format);
+  auto editor_font = editor->font();
+  editor_font.setBold(real_face);
+  editor->setFont(editor_font);
+  editor->document()->setDefaultFont(editor_font);
+
+  mark_text_editor_changed(editor);
+  relayout_text_editor(editor, true);
+  schedule_text_editor_preview(editor);
+  refresh_text_style_combo(family, QString(), real_face, reference.font().italic());
+  sync_text_character_dialog_from_editor();
+  refresh_text_color_button();
+}
+
+// Same fallback as Bold: no real italic face means faux italic, not a shortcut that does
+// nothing.
+void MainWindow::toggle_text_italic_face() {
+  if (canvas_ == nullptr) {
+    return;
+  }
+  auto* editor = canvas_->findChild<QTextEdit*>(QStringLiteral("inlineTextEditor"));
+  if (editor == nullptr || editor->property(kTextEditorFinishedProperty).toBool()) {
+    return;
+  }
+
+  const auto reference = text_editor_reference_format(*editor);
+  const bool active =
+      reference.font().italic() || reference.property(kTextFauxItalicFormatProperty).toBool();
+  const bool enable = !active;
+  const auto family = current_text_family_for_editor(*editor);
+  const bool real_face = enable && family_offers_face_axis(family, false);
+  QTextCharFormat format;
+  format.setFontItalic(real_face);
+  format.setProperty(kTextFauxItalicFormatProperty, enable && !real_face);
+  format.setProperty(QTextFormat::FontStyleName, QString());
+  format.setProperty(kTextStyleNameFormatProperty, QString());
+  merge_text_char_format(*editor, format);
+  auto editor_font = editor->font();
+  editor_font.setItalic(real_face);
+  editor->setFont(editor_font);
+  editor->document()->setDefaultFont(editor_font);
+
+  mark_text_editor_changed(editor);
+  relayout_text_editor(editor, true);
+  schedule_text_editor_preview(editor);
+  refresh_text_style_combo(family, QString(), reference.font().bold(), real_face);
+  sync_text_character_dialog_from_editor();
+  refresh_text_color_button();
+}
+
+void MainWindow::apply_text_color_to_active_editor() {
+  if (canvas_ == nullptr) {
+    return;
+  }
+  auto* editor = canvas_->findChild<QTextEdit*>(QStringLiteral("inlineTextEditor"));
+  if (editor == nullptr) {
+    return;
+  }
+
+  const auto text_color = editor->property("patchy.documentTextColor").value<QColor>().isValid()
+                              ? editor->property("patchy.documentTextColor").value<QColor>()
+                              : canvas_->primary_color();
+  apply_text_color_to_editor(*editor, text_color);
+  relayout_text_editor(editor, true);
+  schedule_text_editor_preview(editor);
+  refresh_text_color_button();
+}
+
+void MainWindow::return_keyboard_to_text_editor() {
+  if (canvas_ == nullptr || applying_text_options_to_layers_) {
+    return;
+  }
+  auto* editor = canvas_->findChild<QTextEdit*>(QStringLiteral("inlineTextEditor"));
+  if (editor == nullptr || editor->property(kTextEditorFinishedProperty).toBool() || !editor->isVisible()) {
+    return;
+  }
+  // From a Character/Paragraph panel the keyboard sits in another window; give the canvas's
+  // window the keyboard back too, or the keys would keep going to the panel.
+  if (auto* window = editor->window(); window != nullptr && !window->isActiveWindow()) {
+    window->activateWindow();
+  }
+  editor->setFocus(Qt::OtherFocusReason);
+}
+
+void MainWindow::return_keyboard_after_text_panel_edits(QWidget& panel) {
+  for (auto* spin : panel.findChildren<QAbstractSpinBox*>()) {
+    // Enter, not focus loss: leaving the field already put the keyboard somewhere on purpose.
+    connect(spin, &QAbstractSpinBox::editingFinished, this, [this, spin = QPointer<QAbstractSpinBox>(spin)] {
+      if (spin != nullptr && spin->hasFocus() && QApplication::activePopupWidget() == nullptr) {
+        return_keyboard_to_text_editor();
+      }
+    });
+  }
+  for (auto* check : panel.findChildren<QCheckBox*>()) {
+    connect(check, &QCheckBox::clicked, this, [this](bool) { return_keyboard_to_text_editor(); });
+  }
+  for (auto* combo : panel.findChildren<QComboBox*>()) {
+    connect(combo, QOverload<int>::of(&QComboBox::activated), this, [this](int) { return_keyboard_to_text_editor(); });
+  }
+}
+
+void MainWindow::apply_text_color_to_editor(QTextEdit& editor, QColor color) {
+  QTextCharFormat format;
+  format.setForeground(QBrush(color));
+  merge_text_char_format(editor, format);
+  mark_text_editor_changed(&editor);
+}
+
+void MainWindow::apply_text_color_to_selected_layers_debounced(QColor color) {
+  // The picker fires per change (a wheel drag is dozens); each no-session apply commits and
+  // re-renders every selected layer as an undo step, so wait for the picker to settle.
+  constexpr int kSettleDelayMs = 200;
+  const auto generation = ++text_layer_color_apply_generation_;
+  QTimer::singleShot(kSettleDelayMs, this, [this, color, generation] {
+    if (generation != text_layer_color_apply_generation_ || canvas_ == nullptr) {
+      return;
+    }
+    // A session opened meanwhile owns its own color.
+    if (canvas_->findChild<QTextEdit*>(QStringLiteral("inlineTextEditor")) != nullptr) {
+      return;
+    }
+    apply_text_character_edit([this, color](QTextEdit& target) {
+      target.setProperty("patchy.documentTextColor", color);
+      apply_text_color_to_editor(target, color);
+      return true;
+    });
+  });
+}
+
+void MainWindow::apply_primary_color_to_active_text_editor(QColor color) {
+  if (canvas_ == nullptr) {
+    return;
+  }
+  auto* editor = canvas_->findChild<QTextEdit*>(QStringLiteral("inlineTextEditor"));
+  if (editor == nullptr || editor->property(kTextEditorFinishedProperty).toBool()) {
+    return;
+  }
+
+  color.setAlpha(255);
+  editor->setProperty("patchy.documentTextColor", color);
+  apply_text_color_to_active_editor();
+}
+
+void MainWindow::show_text_anti_alias(int value) {
+  text_anti_alias_ = std::clamp(value, 0, 16);
+  set_text_smoothing_combo_value(text_character_anti_alias_combo_, text_anti_alias_);
+}
+
+void MainWindow::choose_text_anti_alias(int value) {
+  show_text_anti_alias(value);
+  apply_text_smoothing_to_active_editor();
+  save_tool_settings();
+  refresh_document_info();
+}
+
+QString MainWindow::current_text_alignment_name() const {
+  const auto* editor =
+      canvas_ != nullptr ? canvas_->findChild<QTextEdit*>(QStringLiteral("inlineTextEditor")) : nullptr;
+  // The shown name: sides for a right-to-left paragraph, the plain alignment outside a box.
+  if (editor != nullptr) {
+    return text_editor_shown_alignment_name(*editor);
+  }
+  if (const auto* layer = text_character_target_layer(); layer != nullptr) {
+    // No session: the active text layer's first paragraph (column 2 of patchy.text.paragraph_runs).
+    return layer_shown_alignment_name(*layer);
+  }
+  return QStringLiteral("left");
+}
+
+bool MainWindow::current_text_justify_available() const {
+  const auto* editor =
+      canvas_ != nullptr ? canvas_->findChild<QTextEdit*>(QStringLiteral("inlineTextEditor")) : nullptr;
+  if (editor != nullptr) {
+    return text_editor_alignment_flow(*editor) == TextAlignmentFlow::Box;
+  }
+  if (const auto* layer = text_character_target_layer(); layer != nullptr) {
+    return layer_text_alignment_flow(*layer) == TextAlignmentFlow::Box;
+  }
+  return true;
+}
+
+void MainWindow::apply_text_alignment_base_from_options_bar(const QString& base) {
+  // Justify stays on: the button picks the last line (GitHub issue 673).
+  if (text_justify_button_ != nullptr && text_justify_button_->isChecked()) {
+    apply_text_alignment_to_active_editor(base == QStringLiteral("center")  ? QStringLiteral("justifyCenter")
+                                          : base == QStringLiteral("right") ? QStringLiteral("justifyRight")
+                                                                            : QStringLiteral("justify"));
+    return;
+  }
+  apply_text_alignment_to_active_editor(base);
+}
+
+void MainWindow::apply_text_justify_from_options_bar(bool on) {
+  // The last line follows the checked L / C / R; Justify all (none checked) turns off to Left.
+  const bool center = text_align_center_button_ != nullptr && text_align_center_button_->isChecked();
+  const bool right = text_align_right_button_ != nullptr && text_align_right_button_->isChecked();
+  if (on) {
+    apply_text_alignment_to_active_editor(center  ? QStringLiteral("justifyCenter")
+                                          : right ? QStringLiteral("justifyRight")
+                                                  : QStringLiteral("justify"));
+  } else {
+    apply_text_alignment_to_active_editor(center  ? QStringLiteral("center")
+                                          : right ? QStringLiteral("right")
+                                                  : QStringLiteral("left"));
+  }
+}
+
+void MainWindow::sync_text_options_bar_toggles() {
+  if (canvas_ == nullptr || text_faux_bold_button_ == nullptr || text_faux_italic_button_ == nullptr ||
+      text_underline_button_ == nullptr || text_rtl_button_ == nullptr) {
+    return;
+  }
+  // The toggles show only with the Type tools; a tool switch refreshes them through
+  // refresh_options_bar.
+  if (!is_type_tool(current_tool_)) {
+    text_options_toggles_sync_key_.clear();
+    return;
+  }
+  auto* editor = canvas_->findChild<QTextEdit*>(QStringLiteral("inlineTextEditor"));
+  const bool editable = has_active_document() && !preview_dialog_edit_locked();
+  const bool session_open =
+      editable && editor != nullptr && !editor->property(kTextEditorFinishedProperty).toBool();
+  // Type Mask never edits a layer, so there only its own session counts.
+  const auto* layer =
+      editable && !session_open && current_tool_ != CanvasTool::TypeMask ? text_character_target_layer() : nullptr;
+  if (!session_open) {
+    // A layer is read through a render document; skip that while it has not changed.
+    const auto key = layer == nullptr
+                         ? QStringLiteral("none|%1").arg(editable ? 1 : 0)
+                         : QStringLiteral("%1|%2|%3|%4")
+                               .arg(reinterpret_cast<quintptr>(&document()))
+                               .arg(static_cast<qulonglong>(layer->id()))
+                               .arg(static_cast<qulonglong>(layer->render_revision()))
+                               .arg(static_cast<qulonglong>(layer->content_revision()));
+    if (key == text_options_toggles_sync_key_) {
+      return;
+    }
+    text_options_toggles_sync_key_ = key;
+  } else {
+    text_options_toggles_sync_key_.clear();
+  }
+  const auto inputs = layer != nullptr ? text_render_inputs_from_layer(*layer) : std::nullopt;
+  const bool enabled = session_open || inputs.has_value();
+  QTextCharFormat format;
+  if (session_open) {
+    format = text_editor_reference_format(*editor);
+  } else if (inputs.has_value()) {
+    const auto built = build_text_render_document(inputs->settings, inputs->color, inputs->max_width,
+                                                  inputs->paragraph_runs, inputs->rich_text_runs, 1.0);
+    format = QTextCursor(built.document.get()).charFormat();
+  }
+  const auto set = [enabled](QPushButton* button, bool checked) {
+    QSignalBlocker blocker(button);
+    button->setEnabled(enabled);
+    button->setChecked(enabled && checked);
+  };
+  set(text_faux_bold_button_, format.property(kTextFauxBoldFormatProperty).toBool());
+  set(text_faux_italic_button_, format.property(kTextFauxItalicFormatProperty).toBool());
+  set(text_underline_button_, text_character_styles_from_format(format).underline);
+  // Direction is paragraph-level and sync_text_orientation_controls_from_editor checks it.
+  text_rtl_button_->setEnabled(enabled);
+}
+
+void MainWindow::apply_text_smoothing_to_active_editor() {
+  if (canvas_ == nullptr || applying_text_options_to_layers_) {
+    return;
+  }
+  const auto text_anti_alias = text_anti_alias_;
+  auto* editor = canvas_->findChild<QTextEdit*>(QStringLiteral("inlineTextEditor"));
+  if (editor != nullptr) {
+    apply_text_smoothing_to_editor(*editor, text_anti_alias);
+    relayout_text_editor(editor, true);
+    schedule_text_editor_preview(editor);
+    return;
+  }
+  apply_text_character_edit([this, text_anti_alias](QTextEdit& target) {
+    apply_text_smoothing_to_editor(target, text_anti_alias);
+    return true;
+  });
+}
+
+void MainWindow::apply_text_smoothing_to_editor(QTextEdit& editor, int text_anti_alias) {
+  editor.setProperty("patchy.documentTextAntiAlias", text_anti_alias);
+
+  auto editor_font = editor.font();
+  configure_text_font_smoothing(editor_font, text_anti_alias);
+  editor.setFont(editor_font);
+  editor.document()->setDefaultFont(editor_font);
+
+  const auto cursor = editor.textCursor();
+  apply_text_smoothing_to_document(*editor.document(), text_anti_alias);
+  editor.setTextCursor(cursor);
+  editor.setCurrentCharFormat(text_format_with_smoothing(editor.currentCharFormat(), text_anti_alias));
+  mark_text_editor_changed(&editor);
+}
+
+bool MainWindow::is_text_option_widget(QWidget* widget) const {
+  if (widget == nullptr) {
+    return false;
+  }
+  if (widget->property("patchy.textResizeHandle").toBool()) {
+    return true;
+  }
+  if (widget->objectName() == QString::fromLatin1(kTransformedTextEditOverlayObjectName)) {
+    return true;
+  }
+  const auto owns = [widget](const QWidget* candidate) {
+    return candidate != nullptr && (widget == candidate || candidate->isAncestorOf(widget));
+  };
+  const auto in_named_ancestor = [widget](QStringView object_name) {
+    for (auto* current = widget; current != nullptr; current = current->parentWidget()) {
+      if (current->objectName() == object_name) {
+        return true;
+      }
+    }
+    return false;
+  };
+  return owns(text_font_combo_) || owns(text_style_combo_) || owns(text_size_spin_) ||
+         owns(text_faux_bold_button_) || owns(text_faux_italic_button_) || owns(text_underline_button_) ||
+         owns(text_color_button_) || owns(text_align_left_button_) || owns(text_justify_button_) ||
+         owns(text_orientation_button_) || owns(text_rtl_button_) || owns(text_direction_combo_) ||
+         owns(text_align_center_button_) || owns(text_align_right_button_) || owns(text_apply_button_) ||
+         owns(text_cancel_button_) || owns(text_character_button_) || owns(text_paragraph_button_) ||
+         owns(primary_color_button_) ||
+         // The Color and Swatches panels recolor the session's selection like the Foreground
+         // Color window, so a click in them must not commit it (GitHub issue 371).
+         owns(color_dock_panel_) || owns(palette_panel_) ||
+         // The Character and Paragraph panels edit the LIVE session; focus moving into them
+         // must not commit.
+         in_named_ancestor(QStringLiteral("textCharacterDialog")) ||
+         in_named_ancestor(QStringLiteral("textParagraphDialog")) ||
+         // The font picker popup is a Qt::Popup window, so isAncestorOf-based ownership stops
+         // at its boundary; without the name match, focusing its search box would auto-commit
+         // an open inline text editor.
+         in_named_ancestor(QString::fromLatin1(kFontPickerPopupObjectName)) ||
+         // The size field's slider popup is a Qt::Popup too (parentWidget still reaches it).
+         in_named_ancestor(QStringLiteral("textSizePopup"));
+}
+
+MainWindow::PreviewDialogEditLock MainWindow::lock_preview_dialog_edits() {
+  return PreviewDialogEditLock(*this);
+}
+
+void MainWindow::begin_preview_dialog_edit_lock() {
+  ++preview_dialog_edit_lock_depth_;
+  if (preview_dialog_edit_lock_depth_ != 1) {
+    return;
+  }
+  // The stay-open Shape Appearance window's gesture ends here, and the window greys out
+  // until the lock is released (sync_shape_appearance_panel below).
+  end_live_shape_appearance_run();
+  preview_dialog_edit_lock_canvas_ = canvas_;
+  // Every session's canvas locks, not just the active one: a document in a float
+  // window stays clickable while the dialog is open, and activation snap-back
+  // alone would still let its first click land an edit.
+  for (const auto& target_session : sessions_) {
+    if (target_session->canvas != nullptr) {
+      target_session->canvas->set_edit_locked(true);
+    }
+  }
+  // A filter dialog that lets the selection change keeps the selection tools live on
+  // its own canvas only (local-028).
+  if (preview_selection_session_ != nullptr && canvas_ != nullptr) {
+    canvas_->set_selection_sampling_callback([this] { prepare_preview_selection_sampling(); });
+    canvas_->set_selection_edits_allowed_while_locked(true);
+  }
+  if (document_tabs_ != nullptr) {
+    if (auto* tab_bar = document_tabs_->tabBar(); tab_bar != nullptr) {
+      tab_bar->setEnabled(false);
+    }
+  }
+  update_document_action_state();
+  update_undo_redo_actions();
+  sync_shape_appearance_panel();
+}
+
+void MainWindow::end_preview_dialog_edit_lock() {
+  if (preview_dialog_edit_lock_depth_ <= 0) {
+    preview_dialog_edit_lock_depth_ = 0;
+    return;
+  }
+  --preview_dialog_edit_lock_depth_;
+  if (preview_dialog_edit_lock_depth_ != 0) {
+    return;
+  }
+  for (const auto& target_session : sessions_) {
+    if (target_session->canvas != nullptr) {
+      target_session->canvas->set_selection_edits_allowed_while_locked(false);
+      target_session->canvas->set_selection_sampling_callback({});
+      target_session->canvas->set_edit_locked(false);
+    }
+  }
+  preview_dialog_edit_lock_canvas_ = nullptr;
+  if (document_tabs_ != nullptr) {
+    if (auto* tab_bar = document_tabs_->tabBar(); tab_bar != nullptr) {
+      tab_bar->setEnabled(true);
+    }
+  }
+  update_document_action_state();
+  update_undo_redo_actions();
+  refresh_layer_controls();
+}
+
+bool MainWindow::preview_dialog_edit_locked() const noexcept {
+  return preview_dialog_edit_lock_depth_ > 0;
+}
+
+namespace {
+
+// The palette tools a filter dialog that lets the selection change leaves live; the
+// canvas side is CanvasWidget::selection_tool_passes_edit_lock.
+bool tool_passes_preview_selection_lock(CanvasTool tool) noexcept {
+  switch (tool) {
+    case CanvasTool::Marquee:
+    case CanvasTool::EllipticalMarquee:
+    case CanvasTool::Lasso:
+    case CanvasTool::PolygonLasso:
+    case CanvasTool::MagneticLasso:
+    case CanvasTool::MagicWand:
+    case CanvasTool::QuickSelect:
+    case CanvasTool::ObjectSelect:
+      return true;
+    default:
+      return false;
+  }
+}
+
+}  // namespace
+
+bool MainWindow::document_action_enabled_during_preview_lock(const QAction* action) const {
+  if (action == nullptr) {
+    return false;
+  }
+  const auto object_name = action->objectName();
+  if (object_name == QStringLiteral("viewZoomInAction") ||
+      object_name == QStringLiteral("viewZoomOutAction") ||
+      object_name == QStringLiteral("viewFitOnScreenAction") ||
+      object_name == QStringLiteral("viewActualPixelsAction") ||
+      object_name == QStringLiteral("viewZoom200Action") ||
+      object_name == QStringLiteral("viewExtrasAction") ||
+      object_name == QStringLiteral("viewToggleRulersAction") ||
+      object_name == QStringLiteral("viewToggleGridAction") ||
+      object_name == QStringLiteral("viewToggleGuidesAction") ||
+      object_name == QStringLiteral("viewToggleSnapAction") ||
+      object_name == QStringLiteral("viewSnapToMenu") ||
+      object_name == QStringLiteral("viewSnapToGuidesAction") ||
+      object_name == QStringLiteral("viewSnapToGridAction") ||
+      object_name == QStringLiteral("viewSnapToDocumentAction") ||
+      object_name == QStringLiteral("viewSnapToLayersAction") ||
+      object_name == QStringLiteral("viewSnapToSelectionAction") ||
+      object_name == QStringLiteral("windowForceRefreshAction") ||
+      object_name.startsWith(QStringLiteral("viewScroll"))) {
+    return true;
+  }
+  // Under a filter dialog that lets the selection change (local-028), the Select
+  // commands and the selection tools stay live; nothing else that edits the document.
+  if (preview_selection_session_ != nullptr) {
+    static const QSet<QString> selection_actions{
+        QStringLiteral("editSelectAllAction"),   QStringLiteral("editDeselectAction"),
+        QStringLiteral("selectReselectAction"),  QStringLiteral("selectInverseAction"),
+        QStringLiteral("selectGrowAction"),      QStringLiteral("selectSimilarAction"),
+        QStringLiteral("selectExpandAction"),    QStringLiteral("selectContractAction"),
+        QStringLiteral("selectBorderAction"),    QStringLiteral("selectLayerTransparencyAction"),
+        QStringLiteral("selectSmoothAction"),    QStringLiteral("selectFeatherAction"),
+    };
+    if (selection_actions.contains(object_name)) {
+      return true;
+    }
+  }
+  if (action->data().isValid()) {
+    const auto tool = static_cast<CanvasTool>(action->data().toInt());
+    if (preview_selection_session_ != nullptr && tool_passes_preview_selection_lock(tool)) {
+      return true;
+    }
+    return tool == CanvasTool::Pan || tool == CanvasTool::Zoom;
+  }
+  return false;
+}
+
+void MainWindow::prepare_preview_selection_sampling() {
+  if (preview_selection_session_ != nullptr && preview_selection_session_->show_original) {
+    auto show_original = preview_selection_session_->show_original;
+    show_original();
+  }
+}
+
+bool MainWindow::show_preview_dialog_edit_lock_message() {
+  show_status_error(tr("Finish the open dialog before editing the document"));
+  return true;
+}
+
+bool MainWindow::refuse_layer_dialog_during_transform() {
+  if (canvas_ == nullptr) {
+    return false;
+  }
+  if (!canvas_->free_transform_active() && !canvas_->warp_transform_active() &&
+      !canvas_->path_transform_active()) {
+    return false;
+  }
+  show_status_error(tr("Finish the transform first: press Enter to apply it or Esc to cancel it"));
+  return true;
+}
+
+bool command_works_without_document(const QAction& action, const QString& command_id) {
+  if (action.property(kWorksWithoutDocumentProperty).toBool()) {
+    return true;
+  }
+  switch (action.menuRole()) {
+    case QAction::AboutRole:
+    case QAction::AboutQtRole:
+    case QAction::PreferencesRole:
+    case QAction::QuitRole:
+      return true;
+    default:
+      break;
+  }
+  // Commands that open, create or import a document, change app-wide settings, or
+  // run a script (scripts check for a document themselves).
+  static const QSet<QString> ids{
+      QStringLiteral("file.new"),
+      QStringLiteral("file.open"),
+      QStringLiteral("file.open_clipboard"),
+      QStringLiteral("file.open_folder"),
+      QStringLiteral("file.import_scanner"),
+      QStringLiteral("file.import_photocopy"),
+      QStringLiteral("file.import_divide_photos"),
+      QStringLiteral("file.import_scan_book_pdf"),
+      QStringLiteral("file.import_sprite_sheet"),
+      QStringLiteral("file.import_image_sequence"),
+      QStringLiteral("file.preferences"),
+      QStringLiteral("file.quit"),
+      QStringLiteral("edit.define_custom_shape_svg"),
+      QStringLiteral("plugins.open_folder"),
+      QStringLiteral("plugins.rescan"),
+      QStringLiteral("view.vector_preview"),  // a preference, also in Preferences
+      QStringLiteral("view.pixel_grid"),      // a preference
+  };
+  if (ids.contains(command_id)) {
+    return true;
+  }
+  for (const auto* prefix : {"help.", "script.", "file.scripts."}) {
+    if (command_id.startsWith(QLatin1String(prefix))) {
+      return true;
+    }
+  }
+  const auto name = action.objectName();
+  return name == QStringLiteral("fileClearRecentAction") || name == QStringLiteral("fileClearRecentFoldersAction") ||
+         name.startsWith(QStringLiteral("windowSetScreenSize"));
+}
+
+void MainWindow::register_document_action(QAction* action) {
+  if (action == nullptr) {
+    return;
+  }
+  document_actions_.push_back(action);
+}
+
+void MainWindow::register_tool_action(QAction* action) {
+  if (action == nullptr) {
+    return;
+  }
+  action->setProperty(kWorksWithoutDocumentProperty, true);
+  tool_actions_.push_back(action);
+}
+
+void MainWindow::unregister_document_action(QAction* action) {
+  std::erase(document_actions_, action);
+}
+
+void MainWindow::register_hotkey(QAction* action, QString id, QList<QKeySequence> default_shortcuts,
+                                 QString category) {
+  hotkey_registry_.register_command(action, std::move(id), std::move(default_shortcuts), std::move(category));
+}
+
+void MainWindow::register_hotkey(QAction* action, QString id, QKeySequence default_shortcut, QString category) {
+  QList<QKeySequence> defaults;
+  if (!default_shortcut.isEmpty()) {
+    defaults << default_shortcut;
+  }
+  register_hotkey(action, std::move(id), std::move(defaults), std::move(category));
+}
+
+void MainWindow::register_document_widget(QWidget* widget) {
+  if (widget == nullptr) {
+    return;
+  }
+  document_widgets_.push_back(widget);
+}
+
+void MainWindow::update_document_action_state() {
+  const bool has_document = has_active_document();
+  const bool locked = preview_dialog_edit_locked();
+  for (auto* action : document_actions_) {
+    if (action != nullptr) {
+      action->setEnabled(has_document && (!locked || document_action_enabled_during_preview_lock(action)));
+    }
+  }
+  for (auto* widget : document_widgets_) {
+    if (widget != nullptr) {
+      widget->setEnabled(has_document && !locked);
+    }
+  }
+  // Tools are picked with or without a document, like Photoshop (local-008): the next
+  // document starts with the tool chosen on the home screen.
+  for (auto* action : tool_actions_) {
+    if (action != nullptr) {
+      action->setEnabled(!locked || (preview_selection_session_ != nullptr && action->data().isValid() &&
+                                     tool_passes_preview_selection_lock(
+                                         static_cast<CanvasTool>(action->data().toInt()))));
+    }
+  }
+  if (primary_color_button_ != nullptr) {
+    primary_color_button_->setEnabled(has_document && !locked);
+  }
+  if (secondary_color_button_ != nullptr) {
+    secondary_color_button_->setEnabled(has_document && !locked);
+  }
+  if (layer_list_ != nullptr) {
+    auto* layer_list = dynamic_cast<LayerListWidget*>(layer_list_);
+    const bool eyes_only = locked && preview_lock_allows_layer_visibility_ && layer_list != nullptr;
+    if (layer_list != nullptr) {
+      layer_list->set_visibility_only(eyes_only);
+    }
+    layer_list_->setEnabled(has_document && (!locked || eyes_only));
+  }
+  refresh_add_layer_mask_button_state();
+  refresh_layer_styles_button_state();
+  refresh_layer_link_action_states();
+  refresh_revert_action();
+  update_legacy_plugin_repeat_actions();
+  update_last_filter_action();
+  // 16/32-bit documents (docs/high-bit-depth.md): a 32-bit document offers only the
+  // filters with a linear-light kernel, and no Filter Gallery, Liquify or Auto All.
+  const auto document_depth =
+      has_document ? std::as_const(document()).color_state().bit_depth : BitDepth::UInt8;
+  // Indexed color is 8-bit only (refresh_bit_depth_actions; the loop above re-enabled them).
+  if (image_mode_indexed_action_ != nullptr && document_depth != BitDepth::UInt8) {
+    image_mode_indexed_action_->setEnabled(false);
+  }
+  if (has_document && std::as_const(document()).palette_editing().has_value()) {
+    for (auto* action : {image_mode_16_bit_action_, image_mode_32_bit_action_}) {
+      if (action != nullptr) {
+        action->setEnabled(false);
+      }
+    }
+  }
+  if (document_depth != BitDepth::UInt8) {
+    for (auto* action : document_actions_) {
+      const auto filter_id = action != nullptr ? action->property("patchy.filterIdentifier").toString() : QString();
+      if (!filter_id.isEmpty() &&
+          deep_filter_support(filter_id.toStdString(), document_depth) == DeepFilterSupport::Unsupported) {
+        action->setEnabled(false);
+      }
+    }
+    for (const auto& command : hotkey_registry_.commands()) {
+      if (command.action == nullptr) {
+        continue;
+      }
+      const bool unavailable =
+          document_depth == BitDepth::Float32 &&
+          (command.id == QStringLiteral("filter.gallery") || command.id == QStringLiteral("filter.liquify") ||
+           command.id == QStringLiteral("filter.perspective_planes") ||
+           command.id == QStringLiteral("image.auto_all"));
+      if (unavailable) {
+        command.action->setEnabled(false);
+      }
+    }
+  }
+  const bool quick_mask_view =
+      canvas_ != nullptr && canvas_->quick_mask_active();
+  const bool smart_filter_mask_view =
+      canvas_ != nullptr && canvas_->editing_smart_filter_mask();
+  const bool channel_view = canvas_ != nullptr &&
+                            (quick_mask_view || smart_filter_mask_view ||
+                             canvas_->layer_edit_target() == CanvasWidget::LayerEditTarget::DocumentChannel ||
+                             CanvasWidget::is_component_preview(canvas_->layer_edit_target()));
+  const bool writable_channel =
+      quick_mask_view || smart_filter_mask_view ||
+      (channel_view && canvas_->document_channel_is_editable());
+  const auto set_command_enabled = [this, has_document, locked](const QString& id, bool enabled) {
+    if (const auto* command = hotkey_registry_.find_command(id); command != nullptr && command->action != nullptr) {
+      command->action->setEnabled(has_document && !locked && enabled);
+    }
+  };
+  if (channel_view) {
+    for (auto* action : document_actions_) {
+      if (action != nullptr && action->property("patchy.channelViewBlocked").toBool()) {
+        action->setEnabled(false);
+      }
+    }
+    for (const auto& id : {QStringLiteral("edit.cut"), QStringLiteral("edit.copy"),
+                           QStringLiteral("edit.copy_merged"), QStringLiteral("edit.paste"),
+                           QStringLiteral("edit.free_transform"), QStringLiteral("edit.warp_transform"),
+                           QStringLiteral("layer.flip_horizontal"), QStringLiteral("layer.flip_vertical"),
+                           QStringLiteral("layer.align_left"), QStringLiteral("layer.align_horizontal_centers"),
+                           QStringLiteral("layer.align_right"), QStringLiteral("layer.align_top"),
+                           QStringLiteral("layer.align_vertical_centers"), QStringLiteral("layer.align_bottom"),
+                           QStringLiteral("layer.distribute_left"),
+                           QStringLiteral("layer.distribute_horizontal_centers"),
+                           QStringLiteral("layer.distribute_right"), QStringLiteral("layer.distribute_top"),
+                           QStringLiteral("layer.distribute_vertical_centers"),
+                           QStringLiteral("layer.distribute_bottom"),
+                           QStringLiteral("layer.distribute_horizontal_spacing"),
+                           QStringLiteral("layer.distribute_vertical_spacing"),
+                           QStringLiteral("tools.move"), QStringLiteral("tools.clone"),
+                           QStringLiteral("tools.smudge"), QStringLiteral("tools.type"),
+                           QStringLiteral("tools.type_mask"), QStringLiteral("image.levels"), QStringLiteral("image.curves"),
+                           QStringLiteral("image.hue_saturation"), QStringLiteral("image.color_balance"),
+                           QStringLiteral("image.black_white"), QStringLiteral("image.vibrance"),
+                           QStringLiteral("image.exposure"), QStringLiteral("image.channel_mixer"),
+                           QStringLiteral("image.photo_filter"), QStringLiteral("image.gradient_map"),
+                           QStringLiteral("image.selective_color"), QStringLiteral("image.color_lookup")}) {
+      set_command_enabled(id, false);
+    }
+    for (const auto& command : hotkey_registry_.commands()) {
+      if (command.id.startsWith(QStringLiteral("patchy.filters.")) && command.action != nullptr) {
+        command.action->setEnabled(false);
+      }
+    }
+    set_command_enabled(QStringLiteral("filter.gallery"), false);
+    for (const auto& id : {QStringLiteral("layer.fill"), QStringLiteral("layer.fill_background"),
+                           QStringLiteral("edit.fill"),
+                           QStringLiteral("layer.clear"), QStringLiteral("tools.brush"),
+                           QStringLiteral("tools.eraser"), QStringLiteral("tools.gradient"),
+                           QStringLiteral("tools.line"), QStringLiteral("tools.rect"),
+                           QStringLiteral("tools.ellipse"), QStringLiteral("tools.fill")}) {
+      set_command_enabled(id, writable_channel);
+    }
+    if (quick_mask_view || smart_filter_mask_view) {
+      for (auto* action : document_actions_) {
+        if (action != nullptr && quick_mask_view &&
+            action->property("patchy.quickMaskBlocked").toBool()) {
+          action->setEnabled(false);
+        }
+      }
+      for (const auto& id : {
+               QStringLiteral("tools.move"),
+               QStringLiteral("tools.marquee"),
+               QStringLiteral("tools.elliptical_marquee"),
+               QStringLiteral("tools.lasso"),
+               QStringLiteral("tools.polygonal_lasso"),
+               QStringLiteral("tools.magnetic_lasso"),
+               QStringLiteral("tools.magic_wand"),
+               QStringLiteral("tools.quick_select"),
+               QStringLiteral("select.deselect"),
+               QStringLiteral("select.reselect"),
+               QStringLiteral("select.grow"),
+               QStringLiteral("select.similar"),
+               QStringLiteral("select.expand"),
+               QStringLiteral("select.contract"),
+               QStringLiteral("select.border"),
+               QStringLiteral("select.smooth"),
+               QStringLiteral("select.feather"),
+               QStringLiteral("select.layer_transparency"),
+               QStringLiteral("edit.stroke_selection"),
+               QStringLiteral("edit.remove_object")}) {
+        set_command_enabled(id, false);
+      }
+    }
+  }
+  const auto* current_session = active_session();
+  const bool active_floated = current_session != nullptr && current_session->float_window != nullptr;
+  const bool any_floated = any_document_floated();
+  const bool any_docked = document_tabs_ != nullptr && document_tabs_->count() > 0;
+  if (float_document_action_ != nullptr) {
+    float_document_action_->setEnabled(has_document && !locked && !active_floated);
+  }
+  if (dock_document_action_ != nullptr) {
+    dock_document_action_->setEnabled(has_document && !locked && active_floated);
+  }
+  if (consolidate_tabs_action_ != nullptr) {
+    consolidate_tabs_action_->setEnabled(has_document && !locked && any_floated);
+  }
+  if (float_all_action_ != nullptr) {
+    float_all_action_->setEnabled(has_document && !locked && any_docked);
+  }
+  if (tile_windows_action_ != nullptr) {
+    tile_windows_action_->setEnabled(has_document && !locked);
+  }
+  if (cascade_windows_action_ != nullptr) {
+    cascade_windows_action_->setEnabled(has_document && !locked);
+  }
+  if (paths_panel_ != nullptr) {
+    // Keep after the broad document-action pass above, which just blanket-enabled
+    // the five path actions: Fill/Stroke/Make Selection/Delete follow the panel's
+    // row selection (set_document_available re-runs refresh_action_states).
+    paths_panel_->set_document_available(has_document && !locked);
+  }
+  if (channel_panel_ != nullptr) {
+    // Keep these panel-specific rules after the broad document action pass above:
+    // component/spot rows and full-capacity documents intentionally disable a
+    // subset of the channel actions even though a document is active.
+    channel_panel_->set_document_available(has_document && !locked);
+    const bool has_capacity = has_document &&
+                              std::as_const(document()).channels().size() <
+                                  std::as_const(document()).maximum_saved_channel_count();
+    channel_panel_->set_channel_creation_available(!locked && has_capacity &&
+                                                   !quick_mask_view);
+  }
+  refresh_convert_for_smart_filters_action_state();
+  refresh_options_bar();
+  // Every document action was just set from has_document alone, Distribute included, so
+  // reapply the layer-count rule (Distribute needs three units). The Windows plug-in scan
+  // rebuilds its menu after startup and lands here with a one-layer document open.
+  refresh_layer_alignment_action_states();
+  refresh_merge_visible_action_state();  // two visible layers, or one with something to apply
+  refresh_paste_without_document_state();  // a file path copied as text opens with no document
+}
+
+void MainWindow::refresh_convert_for_smart_filters_action_state() {
+  if (filter_convert_smart_filters_action_ == nullptr) {
+    return;
+  }
+
+  const bool has_document = has_active_document();
+  const bool channel_view =
+      canvas_ != nullptr &&
+      (canvas_->quick_mask_active() || canvas_->editing_smart_filter_mask() ||
+       canvas_->layer_edit_target() == CanvasWidget::LayerEditTarget::DocumentChannel ||
+       CanvasWidget::is_component_preview(canvas_->layer_edit_target()));
+  const Layer* active_layer = nullptr;
+  if (has_document) {
+    const auto active_id = std::as_const(document()).active_layer_id();
+    if (active_id.has_value()) {
+      active_layer = std::as_const(document()).find_layer(*active_id);
+    }
+  }
+  const bool eligible =
+      active_layer != nullptr && active_layer->kind() == LayerKind::Pixel &&
+      !layer_is_smart_object(*active_layer) &&
+      active_layer->pixels().format().bit_depth == BitDepth::UInt8 &&
+      active_layer->pixels().format().channels >= 3U;
+  filter_convert_smart_filters_action_->setEnabled(
+      has_document && !preview_dialog_edit_locked() && !channel_view && eligible);
+}
+
+void MainWindow::show_about() {
+  // The About dialog's Update button is an explicit request, so the prompt opens even for a
+  // version the user chose not to be asked about at startup (updates/skippedVersion).
+  show_about_splash(this, [this](const UpdateInfo& update) { show_update_available(update); });
+}
+
+}  // namespace patchy::ui
+
+// AUTOMOC generates this here instead of in the shared mocs_compilation.cpp, so a
+// change to this class's header rebuilds this object only (docs/building-incremental.md).
+#include "moc_main_window.cpp"

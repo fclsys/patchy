@@ -1,0 +1,159 @@
+# JPEG XR (.jxr/.wdp/.hdp): WIC codec, 32-bit HDR, tone map
+
+Full record for the JPEG XR reader and writer. Read this before touching `jxr_document_io.*`
+or the tone-map constants. Registry and filter-table wiring rules live in
+[file-formats.md](file-formats.md); the no-vendored-codec boundary lives in
+[legal-licensing.md](legal-licensing.md#format-copyright-trademarks-and-assets). Its basis: Patchy ships no JPEG XR codec, so the binary
+contains no JPEG XR coding steps; the format is friendlier than HEVC (Open Specification Promise,
+2006-2009 priorities) but was never claim-reviewed, so vendoring a codec needs that review first.
+
+## What the format is and why it is here
+
+JPEG XR (ISO/IEC 29199-2, ITU-T T.832) is Microsoft's HD Photo / Windows Media Photo. A
+TIFF-like container whose magic is `49 49 BC` plus a nonzero version byte; the version byte
+is what separates it from TIFF, which shares the `49 49` little-endian byte order mark and
+carries `2A 00` there. Lossy or lossless, alpha, tiling, and, unusually for a photo format,
+8/16/32-bit integer **and 16/32-bit float** channels.
+
+That float capability is the reason Patchy supports it: NVIDIA's in-game capture (GeForce
+Experience / NVIDIA App) writes HDR game screenshots as `.jxr` in 32-bit float scRGB, and
+the Windows Game Bar writes 16-bit half. Windows opens them because the Windows Imaging
+Component has carried a JPEG XR codec since Vista.
+
+## Windows only, by design
+
+Both the decoder (`CLSID_WICWmpDecoder`) and the encoder are in-box on every supported
+Windows, so unlike HEIF there is no Store package to probe, no missing-codec markers, no
+Store deep link, and no codec of Patchy's own. It shares `patchy_formats`' Windows link
+of `windowscodecs` and `ole32` with the HEIF reader.
+
+Linux has no codec Patchy will use ([issue 269](https://github.com/SethRobinson/Patchy/issues/269)):
+the distributions' jxrlib is Microsoft's 2013 CodePlex release or a 2017 snapshot of it, which
+lack the fuzzing fixes and have publicly known crashes. Qt ships no JPEG XR plugin, so
+`read_jxr` and `write_jxr` always throw there. The whole filter-table row is gated on
+`jxr::is_available()`, following the PDF row's conditional-open pattern, so no platform
+offers an open or a save that could only fail.
+
+Files:
+
+- `jxr_document_io.{hpp,cpp}`: extensions, sniff, the tone map, the Document-level writers,
+  and the non-Windows throwing stubs. Qt-free and platform-neutral, so the tone map is
+  pinned by tests on every platform.
+- `jxr_document_io_win.cpp`: WIC decode and encode.
+- `wic_com.hpp`: `ComPtr`, `CoInitGuard`, `hresult_text`, `create_srgb_transform`,
+  `classify_pixel_format` and `copy_rgba_float`, shared with `heif_document_io_win.cpp`. Windows-only, included only from sources guarded by
+  `WIN32` in CMakeLists.txt.
+
+`jxr::jxr_extensions()` is the single source of truth for the registry, the dialog table
+and the writer branch. `.wdp` and `.hdp` are the pre-standardization HD Photo extensions
+the same codec handles.
+
+## Read and write, unlike the other platform-codec format
+
+The registry row carries a real writer. That is deliberate and load-bearing: a null writer
+is what makes `is_read_only_source_extension` route Save to Save As with a `.psd` default,
+which is right for HEIF and camera raw and wrong here. `ui_jxr_opens_and_saves_as_a_read_write_format`
+pins the difference.
+
+Save As and Export raise a quality plus Lossless dialog, persisting `saveOptions/jxrQuality`
+(default 90) and `saveOptions/jxrLossless` (default false). Those keys are a compatibility
+contract; never rename them. Scripts pass `{quality, lossless}` to `doc.saveAs`/`exportAs`
+(docs/scripting.md "Explicit save options").
+
+Encoder details:
+
+- WIC's `Lossless` property overrides `ImageQuality`, so the two are never written together
+  and the dialog greys the slider out when Lossless is checked.
+- `UseCodecOptions` stays false (its default), so the codec maps `ImageQuality` onto its own
+  Quality/Overlap/Subsampling table rather than Patchy guessing at those three.
+- An opaque flatten writes a 24bpp BGR frame, an alpha-carrying one 32bpp BGRA, so an
+  ordinary screenshot does not grow a pointless alpha plane.
+- `SetPixelFormat` negotiates: WIC may not honor the request, so pixels are packed to
+  whatever it returns, not to what was asked for.
+- Output is always 8-bit, so an HDR capture is written back through the 8-bit flatten (a
+  32-bit document narrows like every 8-bit writer, a tone-mapped one as it is), which the
+  dialog's `jxrSaveNote` says.
+
+## Float frames: 32-bit with deep editing, tone map without
+
+The reader splits on the frame's numeric representation, read through
+`IWICPixelFormatInfo2::GetNumericRepresentation`. That is deliberately not a match against a
+list of float GUIDs: the query keeps working if the codec grows a format.
+
+- **Integer** frames take the same path as HEIF: format converter to 32bppBGRA, then the
+  file's ICC profile to sRGB through `IWICColorTransform`, then BGRA to RGBA. A notice
+  reports the reduction when the source was deeper than 8 bits per channel.
+- **Float and fixed** frames convert to 128bppRGBAFloat, which also unpremultiplies a
+  `128bppPRGBAFloat` source. **No color transform runs on this path**: scRGB is implied by
+  the pixel format rather than by an embedded profile, so a transform would double-correct.
+  With deep editing on (the default) they open as a 32-bit linear document holding the
+  scRGB values as stored ([high-bit-depth.md](high-bit-depth.md)): scRGB is linear sRGB, so
+  values above 1.0 and the negative components of out-of-gamut colors carry over unchanged;
+  non-finite colors become 0, alpha clamps to 0..1 with NaN as opaque, and alpha is kept
+  only when some pixel is translucent. scRGB 1.0 (80 nits) is taken as SDR white, the same
+  reading as the tone map; the 32-bit preview exposure brings highlights into view. With
+  deep editing off they go through `tone_map_scrgb_to_rgba8` to an 8-bit document and a
+  notice reports the tone map. Integer frames stay 8-bit either way.
+
+Density follows the HEIF reader's rule exactly: WIC reports 96 DPI when a file records no
+density, so that reading means untagged and takes Photoshop's 72 PPI convention. A file
+genuinely tagged 96 is indistinguishable and gets the same treatment. `jxr` therefore must
+NOT join `kDensitylessFormats` in `main_window_files.cpp`.
+
+### Why the tone curve has the shape it has
+
+scRGB is linear-light with sRGB primaries where 1.0 is the 80 nit reference white. An HDR
+capture legitimately carries values far above 1.0, about 12.5 for a 1000 nit highlight, and
+may carry small negative components for out-of-gamut colors. Three options were measured
+against a synthesized float ramp before choosing:
+
+| Approach | scRGB 0.25 | 0.5 | 1.0 (SDR white) | 12.5 | Verdict |
+|---|---|---|---|---|---|
+| Clamp at 1.0 (the 32-bit PSD rule) | 137 | 188 | 255 | 255 | Every highlight flattens to white |
+| Hable filmic, white point 11.2 | 85 | 115 | 150 | 255 | SDR content opens dark and washed out |
+| **Knee 0.5, ceiling 12.5 (shipped)** | **137** | **188** | **225** | **255** | SDR exact below the knee, 30 codes of highlight |
+
+`highlight_rolloff` is therefore the identity at and below a knee of **0.5**, so shadows and
+midtones come out byte-identical to a plain SDR conversion, and above it a rational rolloff
+that places scRGB **12.5** exactly on display white with slope 1 at the knee, so the two
+halves meet without a visible crease. The scale that satisfies both constraints is
+`(1 - knee) * (max - knee) / (max - 1)`.
+
+Alpha is linear coverage and takes neither the curve nor the sRGB transfer. Negative and NaN
+color components floor at 0; a NaN alpha sorts to opaque instead.
+
+The constants sit in one named block in jxr_document_io.cpp so a future develop dialog
+(exposure and ceiling sliders) can turn them into parameters without moving the math.
+Nothing else should hard-code them. DDS float sources reuse this curve ([dds.md](dds.md)).
+
+## Tests and known gaps
+
+`tests/core/jxr_tests.cpp` plus two UI tests in `tests/ui/flat_image_format_tests.cpp`.
+
+`test-fixtures/jxr/hdr-ramp.jxr` is self-authored (provenance in NOTICE-THIRD-PARTY.md): an
+8x2 lossless 128bppRGBAFloat scRGB ramp whose row 0 walks 0..1 and row 1 walks 1..12.5. It
+is the regression guard for the entire float path at once: pixel-format classification, WIC
+preserving values above 1.0 through the float conversion, and the curve. A decoder that
+clamped at 1.0 would flatten row 1 to a single value and move the expectations by 30 or
+more, far outside the tolerance. `jxr_hdr_fixture_tone_maps_instead_of_clipping` reads it
+with deep editing off (the test default); `jxr_hdr_fixture_opens_as_linear_32_bit_with_deep_editing`
+reads it with deep editing on and checks the stored float values.
+
+Conventions this format follows:
+
+- Statistics and tolerances, never byte pins, for anything the platform codec touched. Same
+  rule as HEIF and camera raw. The lossless round trip is the one exact comparison, and it
+  compares decoded pixels, never encoder bytes.
+- Codec-dependent tests `[SKIP]` where `jxr::is_available()` is false. The sniff, registry
+  routing and tone-map tests are pure logic and run on every platform.
+- Real captures dropped into untracked `local-test-fixtures/jxr/` are decoded and reported
+  by `jxr_reads_real_captures_if_available`, which asserts the frame has range and did not
+  blow out to white.
+
+Known gap: EXIF orientation is not applied. Camera-produced JPEG XR is rare and NVIDIA
+captures carry none. Adding it means moving `heif::apply_exif_orientation` to a
+format-neutral home and reusing it rather than writing a second copy.
+
+Float decode uses bounded row batches for WIC `CopyPixels`, whose buffer size is
+a UINT. The full float sample buffer retains size_t addressing, including the
+16384-square case whose byte count is exactly 4 GiB.

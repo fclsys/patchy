@@ -1,0 +1,402 @@
+#include "ui/palette_convert_dialog.hpp"
+
+#include "core/palette_presets.hpp"
+#include "formats/palette_io.hpp"
+#include "ui/dialog_utils.hpp"
+#include "ui/theme_palette.hpp"
+#include "ui/theme_qss.hpp"
+#include "ui/zoomable_image_preview.hpp"
+#include "ui/localization.hpp"
+
+#include <QComboBox>
+#include <QDialog>
+#include <QDialogButtonBox>
+#include <QFile>
+#include <QFileInfo>
+#include <QFormLayout>
+#include <QHBoxLayout>
+#include <QImage>
+#include <QLabel>
+#include <QMessageBox>
+#include <QPainter>
+#include <QSpinBox>
+#include <QStandardItemModel>
+#include <QTimer>
+#include <QVBoxLayout>
+
+#include <algorithm>
+#include <cmath>
+#include <cstdint>
+#include <filesystem>
+#include <functional>
+#include <optional>
+#include <utility>
+#include <vector>
+
+namespace patchy::ui {
+
+namespace {
+
+// Fixed source rows before the presets; presets follow, "From file..." is last.
+enum SourceRow : int {
+  kSourceOptimized = 0,
+  kSourceExact = 1,
+  kSourceCurrent = 2,
+  kSourceFirstPreset = 3,
+};
+
+// Pixel budget for the exact full-resolution zoom window. Documents at or under
+// it are converted whole (so the Floyd-Steinberg preview pattern never shifts
+// while panning); larger ones convert just the visible window, and mid zooms
+// whose window would exceed the budget fall back to the scaled overview image.
+constexpr std::int64_t kMaxZoomWindowPixels = 2'000'000;
+// Extra full-resolution pixels converted around the visible window so small pans
+// redraw from cache instead of re-running the conversion.
+constexpr int kZoomWindowMargin = 128;
+
+[[nodiscard]] QImage qimage_from_rgb8(const PixelBuffer& pixels) {
+  QImage image(pixels.width(), pixels.height(), QImage::Format_RGB32);
+  for (std::int32_t y = 0; y < pixels.height(); ++y) {
+    for (std::int32_t x = 0; x < pixels.width(); ++x) {
+      const auto* px = pixels.pixel(x, y);
+      image.setPixel(x, y, qRgb(px[0], px[1], px[2]));
+    }
+  }
+  return image;
+}
+
+// Zoomable, pannable conversion preview (ZoomableImagePreview: fit-to-window
+// by default; the zoom buttons, mouse wheel, and double-click zoom, dragging
+// pans). Two conversion caches drive the paint: the dialog's debounced refresh
+// supplies the converted downscaled overview (fast, always available), and
+// while zoomed past the overview's resolution the widget converts an exact
+// full-resolution window on demand through the dialog-supplied converter
+// callback.
+class ConvertPreviewWidget final : public ZoomableImagePreview {
+public:
+  using WindowConverter = std::function<QImage(const QImage& source_window)>;
+
+  explicit ConvertPreviewWidget(QWidget* parent) : ZoomableImagePreview(parent) {
+    setObjectName(QStringLiteral("paletteConvertPreview"));
+    // Keyboard focus stays with the dialog's controls; the preview is mouse-only.
+    setFocusPolicy(Qt::NoFocus);
+  }
+
+  void set_source(QImage full_resolution, QImage fit_scaled) {
+    full_ = std::move(full_resolution);
+    fit_source_ = std::move(fit_scaled);
+    set_logical_size(full_.size());
+  }
+
+  void set_window_converter(WindowConverter converter) { convert_window_ = std::move(converter); }
+
+  // The dialog's debounced refresh pushes the converted overview here (null when
+  // the current settings resolve no palette) and invalidates the zoom window.
+  void set_fit_converted(QImage image) {
+    fit_converted_ = std::move(image);
+    window_converted_ = QImage();
+    window_rect_ = QRect();
+    publish_state();
+    update();
+  }
+
+protected:
+  void paint_backdrop(QPainter& painter) override { painter.fillRect(rect(), theme().canvas_backdrop); }
+
+  void paint_content(QPainter& painter, const QRectF& image_rect) override {
+    if (full_.isNull() || fit_converted_.isNull()) {
+      return;
+    }
+    const auto z = zoom();
+    if (z <= 0.0) {
+      return;
+    }
+    const QPointF top_left = image_rect.topLeft();
+    const auto fit_scale = full_.width() > 0 ? static_cast<double>(fit_source_.width()) / full_.width() : 1.0;
+
+    bool drew_exact = false;
+    if (convert_window_ && z > fit_scale * 1.0001) {
+      const auto visible = visible_document_rect(top_left, z);
+      if (!visible.isEmpty()) {
+        if (window_converted_.isNull() || !window_rect_.contains(visible)) {
+          const auto window = conversion_window_for(visible);
+          if (!window.isEmpty()) {
+            window_converted_ = convert_window_(full_.copy(window));
+            window_rect_ = window;
+          }
+        }
+        if (!window_converted_.isNull() && window_rect_.contains(visible)) {
+          const QRectF target(top_left + QPointF(window_rect_.x() * z, window_rect_.y() * z),
+                              QSizeF(window_rect_.width() * z, window_rect_.height() * z));
+          painter.setRenderHint(QPainter::SmoothPixmapTransform, z < 1.0);
+          painter.drawImage(target, window_converted_);
+          drew_exact = true;
+        }
+      }
+    }
+    if (!drew_exact) {
+      // Overview fallback: the whole-image conversion of the downscaled copy.
+      // Crisp only when that copy is already full resolution and we are at or
+      // past 100%; every other case is a resample and smooths.
+      painter.setRenderHint(QPainter::SmoothPixmapTransform, !(fit_scale >= 1.0 && z >= 1.0));
+      painter.drawImage(image_rect, fit_converted_);
+    }
+    painter.setRenderHint(QPainter::SmoothPixmapTransform, false);
+    painter.setPen(QColor(20, 22, 26));
+    painter.drawRect(image_rect.adjusted(-1.0, -1.0, 0.0, 0.0));
+  }
+
+private:
+  [[nodiscard]] QRect visible_document_rect(QPointF top_left, double z) const {
+    const auto x0 = static_cast<int>(std::floor(-top_left.x() / z));
+    const auto y0 = static_cast<int>(std::floor(-top_left.y() / z));
+    const auto x1 = static_cast<int>(std::ceil((width() - top_left.x()) / z)) + 1;
+    const auto y1 = static_cast<int>(std::ceil((height() - top_left.y()) / z)) + 1;
+    return QRect(x0, y0, x1 - x0, y1 - y0).intersected(full_.rect());
+  }
+
+  [[nodiscard]] QRect conversion_window_for(QRect visible) const {
+    const auto total = static_cast<std::int64_t>(full_.width()) * full_.height();
+    if (total <= kMaxZoomWindowPixels) {
+      // Convert the whole image: the cache then survives every pan/zoom and the
+      // Floyd-Steinberg pattern matches what the real conversion will produce.
+      return full_.rect();
+    }
+    auto window = visible.adjusted(-kZoomWindowMargin, -kZoomWindowMargin, kZoomWindowMargin, kZoomWindowMargin);
+    // Align the origin DOWN to a multiple of 8 so the ordered-dither matrices
+    // (indexed by buffer-local coordinates in apply_palette_to_pixels) keep
+    // whole-image phase; Floyd-Steinberg windows are approximate by nature.
+    window.setLeft(std::max(0, (window.left() / 8) * 8));
+    window.setTop(std::max(0, (window.top() / 8) * 8));
+    window = window.intersected(full_.rect());
+    if (static_cast<std::int64_t>(window.width()) * window.height() > kMaxZoomWindowPixels) {
+      return {};
+    }
+    return window;
+  }
+
+  QImage full_;
+  QImage fit_source_;
+  QImage fit_converted_;
+  QImage window_converted_;
+  QRect window_rect_;
+  WindowConverter convert_window_;
+};
+
+}  // namespace
+
+std::optional<PaletteConvertSettings> request_palette_convert_settings(
+    QWidget* parent, const PixelBuffer& flattened_rgb8, const std::optional<Palette>& current_palette) {
+  QDialog dialog(parent);
+  dialog.setObjectName(QStringLiteral("paletteConvertDialog"));
+  dialog.setWindowTitle(QObject::tr("Convert to Indexed (Palette)"));
+  auto* layout = new QVBoxLayout(&dialog);
+
+  auto* form = new QFormLayout();
+  form->setHorizontalSpacing(10);
+  form->setVerticalSpacing(6);
+  auto* source_combo = new QComboBox(&dialog);
+  source_combo->setObjectName(QStringLiteral("paletteConvertSourceCombo"));
+  source_combo->addItem(QObject::tr("Optimized (median cut)"));
+  source_combo->addItem(QObject::tr("Exact image colors"));
+  source_combo->addItem(QObject::tr("Current palette"));
+  const auto presets = builtin_palette_presets();
+  for (const auto& preset : presets) {
+    source_combo->addItem(translate_data_text(preset.english_name));
+  }
+  source_combo->addItem(QObject::tr("From file..."));
+  const auto file_row = source_combo->count() - 1;
+  if (!current_palette.has_value()) {
+    // Keep row indices stable; just disable the row when nothing is attached.
+    if (auto* model = qobject_cast<QStandardItemModel*>(source_combo->model()); model != nullptr) {
+      model->item(kSourceCurrent)->setEnabled(false);
+      model->item(kSourceCurrent)->setToolTip(
+          QObject::tr("This document has no palette yet. Set one in the Palette panel, or open an indexed image."));
+    }
+  }
+  form->addRow(QObject::tr("Palette:"), source_combo);
+
+  auto* colors_spin = new QSpinBox(&dialog);
+  colors_spin->setObjectName(QStringLiteral("paletteConvertColorsSpin"));
+  colors_spin->setRange(2, 256);
+  colors_spin->setValue(16);
+  form->addRow(QObject::tr("Colors:"), colors_spin);
+
+  auto* dither_combo = new QComboBox(&dialog);
+  dither_combo->setObjectName(QStringLiteral("paletteConvertDitherCombo"));
+  dither_combo->addItem(QObject::tr("None"), static_cast<int>(PaletteDither::None));
+  dither_combo->addItem(QObject::tr("Floyd-Steinberg"), static_cast<int>(PaletteDither::FloydSteinberg));
+  dither_combo->addItem(QObject::tr("Ordered 4x4"), static_cast<int>(PaletteDither::OrderedBayer4x4));
+  dither_combo->addItem(QObject::tr("Ordered 8x8"), static_cast<int>(PaletteDither::OrderedBayer8x8));
+  form->addRow(QObject::tr("Dither:"), dither_combo);
+
+  auto* alpha_spin = new QSpinBox(&dialog);
+  alpha_spin->setObjectName(QStringLiteral("paletteConvertAlphaSpin"));
+  alpha_spin->setRange(1, 255);
+  alpha_spin->setValue(128);
+  alpha_spin->setToolTip(QObject::tr("Pixels with alpha below this become fully transparent; the rest become opaque"));
+  form->addRow(QObject::tr("Alpha threshold:"), alpha_spin);
+  layout->addLayout(form);
+
+  auto* preview = new ConvertPreviewWidget(&dialog);
+  layout->addWidget(preview, 1);
+
+  auto* info_row = new QHBoxLayout();
+  info_row->setSpacing(4);
+  auto* preview_info = new QLabel(&dialog);
+  preview_info->setObjectName(QStringLiteral("paletteConvertPreviewInfo"));
+  info_row->addWidget(preview_info, 1);
+  // "Zoom: <amount> - + 100% Fit", the row every preview dialog shares (GitHub issue 667).
+  info_row->addSpacing(8);
+  const auto zoom_controls = add_preview_zoom_controls(*info_row, &dialog, QStringLiteral("paletteConvert"));
+  layout->addLayout(info_row);
+
+  auto* buttons = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel, &dialog);
+  QObject::connect(buttons, &QDialogButtonBox::accepted, &dialog, &QDialog::accept);
+  QObject::connect(buttons, &QDialogButtonBox::rejected, &dialog, &QDialog::reject);
+  layout->addWidget(buttons);
+
+  std::optional<Palette> file_palette;
+  QString file_name;
+
+  // Resolves the palette for the current control state; empty palette = invalid.
+  const auto resolve_palette = [&]() -> Palette {
+    const auto row = source_combo->currentIndex();
+    if (row == kSourceOptimized) {
+      return quantize_to_palette(flattened_rgb8, static_cast<std::size_t>(colors_spin->value()), 0);
+    }
+    if (row == kSourceExact) {
+      auto exact = exact_palette_from_pixels(flattened_rgb8, 256, 0);
+      return exact.has_value() ? std::move(*exact) : Palette{};
+    }
+    if (row == kSourceCurrent) {
+      return current_palette.value_or(Palette{});
+    }
+    if (row == file_row) {
+      return file_palette.value_or(Palette{});
+    }
+    const auto preset_index = row - kSourceFirstPreset;
+    if (preset_index >= 0 && preset_index < static_cast<int>(presets.size())) {
+      const auto& preset = presets[static_cast<std::size_t>(preset_index)];
+      return Palette{{preset.colors.begin(), preset.colors.end()}};
+    }
+    return {};
+  };
+
+  const auto full_source = qimage_from_rgb8(flattened_rgb8);
+  const auto fit_source = [&full_source] {
+    // Bounded overview copy so 4k documents re-quantize instantly on every
+    // settings change; the zoom window path shows exact pixels on demand.
+    if (full_source.width() > 640 || full_source.height() > 640) {
+      return full_source.scaled(640, 640, Qt::KeepAspectRatio, Qt::SmoothTransformation);
+    }
+    return full_source;
+  }();
+  preview->set_source(full_source, fit_source);
+
+  // Conversion state shared by the debounced overview refresh and the preview's
+  // on-demand zoom windows; cached here so pan/zoom never mixes a half-updated
+  // combo state with a stale LUT.
+  PaletteLut preview_lut;
+  bool preview_lut_ready = false;
+  auto preview_dither = PaletteDither::None;
+  std::uint8_t preview_alpha = 128;
+  const auto convert_source_image = [&](const QImage& source) {
+    PixelBuffer pixels(source.width(), source.height(), PixelFormat::rgb8());
+    for (std::int32_t y = 0; y < pixels.height(); ++y) {
+      for (std::int32_t x = 0; x < pixels.width(); ++x) {
+        const auto rgb = source.pixel(x, y);
+        auto* px = pixels.pixel(x, y);
+        px[0] = static_cast<std::uint8_t>(qRed(rgb));
+        px[1] = static_cast<std::uint8_t>(qGreen(rgb));
+        px[2] = static_cast<std::uint8_t>(qBlue(rgb));
+      }
+    }
+    (void)apply_palette_to_pixels(pixels, preview_lut, preview_dither, preview_alpha);
+    return qimage_from_rgb8(pixels);
+  };
+  preview->set_window_converter(
+      [&](const QImage& window) { return preview_lut_ready ? convert_source_image(window) : QImage(); });
+  connect_preview_zoom_controls(zoom_controls, preview);
+
+  auto* preview_timer = new QTimer(&dialog);
+  preview_timer->setSingleShot(true);
+  preview_timer->setInterval(180);
+  const auto refresh_preview = [&, preview, preview_info] {
+    const auto palette = resolve_palette();
+    if (palette.colors.empty()) {
+      preview_lut_ready = false;
+      preview->set_fit_converted(QImage());
+      preview_info->setText(source_combo->currentIndex() == kSourceExact
+                                ? QObject::tr("The image has more than 256 colors; choose Optimized instead.")
+                                : QObject::tr("Choose a palette."));
+      return;
+    }
+    preview_lut.build(palette.colors);
+    preview_lut_ready = true;
+    preview_dither = static_cast<PaletteDither>(dither_combo->currentData().toInt());
+    preview_alpha = static_cast<std::uint8_t>(alpha_spin->value());
+    preview->set_fit_converted(convert_source_image(fit_source));
+    preview_info->setText(QObject::tr("%n color(s)", nullptr, static_cast<int>(palette.colors.size())));
+  };
+  QObject::connect(preview_timer, &QTimer::timeout, &dialog, refresh_preview);
+  const auto schedule_preview = [preview_timer] { preview_timer->start(); };
+
+  QObject::connect(source_combo, &QComboBox::activated, &dialog, [&, file_row](int row) {
+    colors_spin->setEnabled(row == kSourceOptimized);
+    if (row == file_row) {
+      const auto path = get_open_file_name(
+          &dialog, QObject::tr("Load Palette"), QString(),
+          QObject::tr("Palette Files (*.pal *.gpl *.hex *.act *.aco *.ase *.bmp);;All Files (*)"),
+          nullptr, QStringLiteral("paletteConvertLoadFileDialog"));
+      if (!path.isEmpty()) {
+        try {
+          auto data = palette_io::read_palette_bytes([&path] {
+            std::vector<std::uint8_t> bytes;
+            QFile file(path);
+            if (file.open(QIODevice::ReadOnly)) {
+              const auto blob = file.readAll();
+              bytes.assign(blob.begin(), blob.end());
+            }
+            return bytes;
+          }());
+          file_palette = Palette{std::move(data.colors), std::move(data.names)};
+          file_name = QFileInfo(path).fileName();
+        } catch (const std::exception& error) {
+          QMessageBox::warning(&dialog, QObject::tr("Load Palette"),
+                               QObject::tr("Could not load the palette file.\n%1")
+                                   .arg(QObject::tr(error.what())));
+          file_palette.reset();
+        }
+      }
+      source_combo->setItemText(file_row, file_palette.has_value()
+                                              ? QObject::tr("From file: %1").arg(file_name)
+                                              : QObject::tr("From file..."));
+    }
+    schedule_preview();
+  });
+  QObject::connect(colors_spin, &QSpinBox::valueChanged, &dialog, [&](int) { schedule_preview(); });
+  QObject::connect(dither_combo, &QComboBox::currentIndexChanged, &dialog, [&](int) { schedule_preview(); });
+  QObject::connect(alpha_spin, &QSpinBox::valueChanged, &dialog, [&](int) { schedule_preview(); });
+
+  colors_spin->setEnabled(true);
+  // Keep readable - / + buttons on the spin boxes (sub-control gotcha: apply the
+  // style after all children exist, with unprefixed selectors; see dialog_utils).
+  append_themed_style(dialog, dialog_spinbox_button_style());
+  refresh_preview();
+
+  if (exec_dialog(dialog) != QDialog::Accepted) {
+    return std::nullopt;
+  }
+  auto palette = resolve_palette();
+  if (palette.colors.empty()) {
+    return std::nullopt;
+  }
+  PaletteConvertSettings settings;
+  settings.palette = std::move(palette);
+  settings.dither = static_cast<PaletteDither>(dither_combo->currentData().toInt());
+  settings.alpha_threshold = alpha_spin->value();
+  return settings;
+}
+
+}  // namespace patchy::ui

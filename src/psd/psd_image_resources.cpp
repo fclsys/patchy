@@ -1,0 +1,1495 @@
+// Image-resources (8BIM) section codec for the PSD reader/writer: resource
+// parse/serialize, alpha-channel names/identifiers/display-info records, the
+// resolution (1005) and grid/guides (1032) resources, and the private Patchy
+// palette resource (4210). Split out of psd_document_io.cpp as a pure move.
+
+#include "psd/psd_document_io.hpp"
+#include "psd/psd_io_internal.hpp"
+
+#include "color/color_management.hpp"
+#include "core/adjustment_layer.hpp"
+#include "core/layer_metadata.hpp"
+#include "core/layer_tree.hpp"
+#include "core/pixel_depth.hpp"
+#include "core/vector_compound.hpp"
+#include "core/pattern_resource.hpp"
+#include "core/smart_object.hpp"
+#include "core/style_contour.hpp"
+#include "core/text_warp.hpp"
+#include "formats/acv_curves_io.hpp"
+#include "psd/psd_binary.hpp"
+#include "psd/psd_descriptor.hpp"
+#include "psd/psd_filter_effects.hpp"
+#include "psd/psd_patterns.hpp"
+#include "psd/psd_smart_objects.hpp"
+#include "render/compositor.hpp"
+#include "support/string_utils.hpp"
+#include "support/translate_noop.hpp"
+
+#include <algorithm>
+#include <array>
+#include <bit>
+#include <cmath>
+#include <cctype>
+#include <climits>
+#include <cstdlib>
+#include <fstream>
+#include <initializer_list>
+#include <future>
+#include <iomanip>
+#include <iterator>
+#include <map>
+#include <memory>
+#include <optional>
+#include <set>
+#include <sstream>
+#include <stdexcept>
+#include <string>
+#include <string_view>
+#include <thread>
+#include <utility>
+#include <vector>
+
+
+namespace patchy::psd {
+
+// Promoted from the anonymous namespace so the vector codec can upsert the
+// saved-path resources (declared in psd_io_internal.hpp).
+void upsert_image_resource(std::vector<ImageResource>& resources, std::uint16_t id,
+                           std::vector<std::uint8_t> payload) {
+  bool replaced = false;
+  for (auto it = resources.begin(); it != resources.end();) {
+    if (it->id != id) {
+      ++it;
+      continue;
+    }
+    if (!replaced) {
+      it->signature = {'8', 'B', 'I', 'M'};
+      it->name.clear();
+      it->payload = std::move(payload);
+      replaced = true;
+      ++it;
+    } else {
+      it = resources.erase(it);
+    }
+  }
+  if (!replaced) {
+    resources.push_back(ImageResource{std::array<char, 4>{'8', 'B', 'I', 'M'}, id, {}, std::move(payload)});
+  }
+}
+
+void remove_image_resource(std::vector<ImageResource>& resources, std::uint16_t id) {
+  resources.erase(std::remove_if(resources.begin(), resources.end(),
+                                 [id](const ImageResource& resource) { return resource.id == id; }),
+                  resources.end());
+}
+
+namespace {
+
+// Halftone screens and transfer functions come in one variant per color-mode family:
+// 1012/1015 for grayscale, multichannel and bitmap documents, 1014/1017/1018 for duotone,
+// 1013/1016 (one entry per color plane) for the color modes. Photoshop's Image > Mode
+// conversion swaps them and never leaves another family's variant in a file. Patchy 1.16
+// kept a grayscale source's 1012/1015 in an RGB save (GitHub issue 341), so a save now drops
+// the variants of other families.
+void remove_other_mode_print_resources(std::vector<ImageResource>& resources, std::uint16_t output_mode) {
+  const bool gray_family = output_mode == kColorModeGrayscale || output_mode == kColorModeMultichannel ||
+                           output_mode == kColorModeBitmap;
+  const bool duotone_family = output_mode == kColorModeDuotone;
+  const auto remove_all = [&resources](std::initializer_list<std::uint16_t> ids) {
+    for (const auto id : ids) {
+      remove_image_resource(resources, id);
+    }
+  };
+  if (!gray_family) {
+    remove_all({1012, 1015});
+  }
+  if (!duotone_family) {
+    remove_all({1014, 1017, 1018});
+  }
+  if (gray_family || duotone_family) {
+    remove_all({1013, 1016});
+  }
+}
+
+}  // namespace
+
+double fixed_16_16_to_double(std::uint32_t value) noexcept {
+  return static_cast<double>(value) / 65536.0;
+}
+
+namespace {
+
+// Some exporters write ISO basic timezone offsets in XMP dates. Adobe's XMP
+// parser accepts the packet but rejects these properties when Photoshop imports
+// File Info, producing a modal data-discard warning. Repair only date properties,
+// keeping all other metadata and the packet's original serialization intact.
+void repair_xmp_date_timezones(std::vector<std::uint8_t>& payload) {
+  const std::string_view xml(reinterpret_cast<const char*>(payload.data()), payload.size());
+  const auto whitespace = [](char c) { return c == ' ' || c == '\t' || c == '\r' || c == '\n'; };
+  using Namespaces = std::map<std::string_view, std::string_view>;
+  struct Element { Namespaces namespaces; std::string_view name; bool date{false}; };
+  std::vector<Element> stack;
+  std::vector<std::size_t> insertions;
+  const auto date_property = [](std::string_view name, const Namespaces& namespaces) {
+    const auto colon = name.find(':');
+    if (colon == std::string_view::npos) return false;
+    const auto found = namespaces.find(name.substr(0, colon));
+    if (found == namespaces.end()) return false;
+    const auto local = name.substr(colon + 1);
+    const auto uri = found->second;
+    return (uri == "http://ns.adobe.com/xap/1.0/" &&
+            (local == "CreateDate" || local == "ModifyDate" || local == "MetadataDate")) ||
+           (uri == "http://ns.adobe.com/photoshop/1.0/" && local == "DateCreated") ||
+           (uri == "http://ns.adobe.com/exif/1.0/" &&
+            (local == "DateTimeOriginal" || local == "DateTimeDigitized" || local == "GPSTimeStamp")) ||
+           (uri == "http://ns.adobe.com/xap/1.0/sType/ResourceEvent#" && local == "when");
+  };
+  const auto inspect_date = [&](std::size_t begin, std::size_t end) {
+    while (begin < end && whitespace(xml[begin])) ++begin;
+    while (end > begin && whitespace(xml[end - 1])) --end;
+    const auto value = xml.substr(begin, end - begin);
+    // YYYY-MM-DDThh:mm:ss[.fraction]+hhmm. Do not guess at damaged dates.
+    if (value.size() < 24 || value[4] != '-' || value[7] != '-' || value[10] != 'T' ||
+        value[13] != ':' || value[16] != ':') return;
+    const auto zone = value.size() - 5;
+    if (value[zone] != '+' && value[zone] != '-') return;
+    for (std::size_t i = 0; i < value.size(); ++i) {
+      if (i == 4 || i == 7 || i == 10 || i == 13 || i == 16 || i == zone) continue;
+      if (i == 19 && zone > 19 && value[i] == '.') continue;
+      if (value[i] < '0' || value[i] > '9') return;
+    }
+    if (zone != 19 && (zone < 21 || value[19] != '.')) return;
+    const auto pair = [&](std::size_t at) { return (value[at] - '0') * 10 + value[at + 1] - '0'; };
+    if (pair(5) < 1 || pair(5) > 12 || pair(8) < 1 || pair(8) > 31 ||
+        pair(11) > 23 || pair(14) > 59 || pair(17) > 59 || pair(zone + 1) > 23 || pair(zone + 3) > 59) return;
+    insertions.push_back(begin + zone + 3);
+  };
+  std::size_t pos = 0;
+  while (pos < xml.size()) {
+    const auto open = xml.find('<', pos);
+    if (open == std::string_view::npos) break;
+    if (!stack.empty() && stack.back().date) inspect_date(pos, open);
+    if (xml.substr(open, 4) == "<!--" || xml.substr(open, 9) == "<![CDATA[" || xml.substr(open, 2) == "<?") {
+      const auto terminator = xml.substr(open, 4) == "<!--" ? "-->" : xml.substr(open, 2) == "<?" ? "?>" : "]]>";
+      const auto end = xml.find(terminator, open + 2);
+      if (end == std::string_view::npos) return;
+      pos = end + std::string_view(terminator).size();
+      continue;
+    }
+    // XMP has no DTD. Leave unsupported packets untouched rather than editing
+    // entity declarations or interpreting an incomplete document.
+    if (xml.substr(open, 2) == "<!") return;
+    auto at = open + 1;
+    const bool closing = at < xml.size() && xml[at] == '/';
+    if (closing) ++at;
+    const auto name_begin = at;
+    while (at < xml.size() && !whitespace(xml[at]) && xml[at] != '/' && xml[at] != '>') ++at;
+    const auto name = xml.substr(name_begin, at - name_begin);
+    if (name.empty()) return;
+    auto namespaces = stack.empty() ? Namespaces{} : stack.back().namespaces;
+    struct Attribute { std::string_view name; std::size_t begin, end; };
+    std::vector<Attribute> attributes;
+    while (at < xml.size()) {
+      while (at < xml.size() && whitespace(xml[at])) ++at;
+      if (at == xml.size() || xml[at] == '>' || xml[at] == '/') break;
+      const auto key_begin = at;
+      while (at < xml.size() && !whitespace(xml[at]) && xml[at] != '=') ++at;
+      const auto key = xml.substr(key_begin, at - key_begin);
+      while (at < xml.size() && whitespace(xml[at])) ++at;
+      if (at == xml.size() || xml[at++] != '=') return;
+      while (at < xml.size() && whitespace(xml[at])) ++at;
+      if (at == xml.size() || (xml[at] != '\'' && xml[at] != '"')) return;
+      const auto quote = xml[at++];
+      const auto end = xml.find(quote, at);
+      if (end == std::string_view::npos) return;
+      attributes.push_back({key, at, end});
+      if (key.starts_with("xmlns:")) namespaces[key.substr(6)] = xml.substr(at, end - at);
+      at = end + 1;
+    }
+    const bool empty = at < xml.size() && xml[at] == '/';
+    if (empty) ++at;
+    if (at == xml.size() || xml[at] != '>') return;
+    if (closing) {
+      if (stack.empty() || stack.back().name != name) return;
+      stack.pop_back();
+    } else {
+      for (const auto& attribute : attributes) {
+        if (date_property(attribute.name, namespaces)) inspect_date(attribute.begin, attribute.end);
+      }
+      if (!empty) {
+        if (stack.size() >= 128) return;
+        const bool date = date_property(name, namespaces);
+        stack.push_back({std::move(namespaces), name, date});
+      }
+    }
+    pos = at + 1;
+  }
+  if (!stack.empty() || insertions.empty()) return;
+  // Build once: repeated vector insertions would be quadratic for large packets.
+  std::vector<std::uint8_t> repaired;
+  repaired.reserve(payload.size() + insertions.size());
+  std::size_t previous = 0;
+  for (const auto insertion : insertions) {
+    repaired.insert(repaired.end(), payload.begin() + previous, payload.begin() + insertion);
+    repaired.push_back(':');
+    previous = insertion;
+  }
+  repaired.insert(repaired.end(), payload.begin() + previous, payload.end());
+  payload = std::move(repaired);
+}
+
+std::optional<std::vector<ImageResource>> read_image_resources(std::span<const std::uint8_t> bytes) {
+  BigEndianReader reader(bytes);
+  std::vector<ImageResource> resources;
+  while (reader.remaining() > 0) {
+    if (reader.remaining() < 12) {
+      return std::nullopt;
+    }
+    ImageResource resource;
+    resource.signature = read_signature(reader);
+    if (resource.signature != std::array<char, 4>{'8', 'B', 'I', 'M'} &&
+        resource.signature != std::array<char, 4>{'8', 'B', '6', '4'}) {
+      return std::nullopt;
+    }
+    resource.id = reader.read_u16();
+    resource.name = read_pascal_string(reader, 2);
+    const auto payload_length = reader.read_u32();
+    if (payload_length > reader.remaining()) {
+      return std::nullopt;
+    }
+    resource.payload = reader.read_bytes(payload_length);
+    if ((payload_length % 2U) != 0) {
+      if (reader.remaining() == 0) {
+        return std::nullopt;
+      }
+      reader.skip(1);
+    }
+    resources.push_back(std::move(resource));
+  }
+  return resources;
+}
+
+void write_image_resource(BigEndianWriter& writer, const ImageResource& resource) {
+  write_signature(writer, resource.signature);
+  writer.write_u16(resource.id);
+  write_pascal_string(writer, resource.name, 2);
+  writer.write_u32(checked_u32(resource.payload.size(), "image resource payload"));
+  writer.write_bytes(resource.payload);
+  if ((resource.payload.size() % 2U) != 0) {
+    writer.write_u8(0);
+  }
+}
+
+std::vector<std::uint8_t> write_image_resources(std::span<const ImageResource> resources) {
+  BigEndianWriter writer;
+  for (const auto& resource : resources) {
+    write_image_resource(writer, resource);
+  }
+  return writer.bytes();
+}
+
+std::vector<std::string> parse_legacy_alpha_channel_names(std::span<const std::uint8_t> payload) {
+  std::vector<std::string> names;
+  std::size_t offset = 0;
+  while (offset < payload.size()) {
+    const auto length = static_cast<std::size_t>(payload[offset++]);
+    if (length > payload.size() - offset) {
+      break;
+    }
+    names.emplace_back(reinterpret_cast<const char*>(payload.data() + offset), length);
+    offset += length;
+  }
+  return names;
+}
+
+std::vector<std::string> parse_unicode_alpha_channel_names(std::span<const std::uint8_t> payload) {
+  BigEndianReader reader(payload);
+  std::vector<std::string> names;
+  while (reader.remaining() >= 4U) {
+    const auto unit_count = reader.read_u32();
+    if (unit_count > reader.remaining() / 2U) {
+      break;
+    }
+    std::string decoded;
+    for (std::uint32_t index = 0; index < unit_count; ++index) {
+      auto codepoint = static_cast<std::uint32_t>(reader.read_u16());
+      if (codepoint == 0) {
+        continue;
+      }
+      if (codepoint >= 0xD800U && codepoint <= 0xDBFFU && index + 1U < unit_count) {
+        const auto low = static_cast<std::uint32_t>(reader.read_u16());
+        ++index;
+        if (low >= 0xDC00U && low <= 0xDFFFU) {
+          codepoint = 0x10000U + ((codepoint - 0xD800U) << 10U) + (low - 0xDC00U);
+        } else {
+          codepoint = '?';
+        }
+      }
+      append_utf8(decoded, codepoint);
+    }
+    names.push_back(std::move(decoded));
+  }
+  return names;
+}
+
+std::vector<std::uint32_t> parse_alpha_identifiers(std::span<const std::uint8_t> payload) {
+  if (payload.size() < 4U) {
+    return {};
+  }
+  BigEndianReader reader(payload);
+  const auto count = reader.read_u32();
+  if (count > reader.remaining() / 4U) {
+    return {};
+  }
+  std::vector<std::uint32_t> identifiers;
+  identifiers.reserve(count);
+  for (std::uint32_t index = 0; index < count; ++index) {
+    identifiers.push_back(reader.read_u32());
+  }
+  return identifiers;
+}
+
+std::vector<std::vector<std::uint8_t>> parse_display_info_records(
+    std::span<const std::uint8_t> payload, bool floating_point_resource) {
+  std::size_t offset = 0;
+  const auto record_size = floating_point_resource ? 13U : 14U;
+  if (floating_point_resource) {
+    if (payload.size() < 4U || BigEndianReader(payload.first(4)).read_u32() != 1U) {
+      return {};
+    }
+    offset = 4U;
+  }
+  if ((payload.size() - offset) % record_size != 0U) {
+    return {};
+  }
+  std::vector<std::vector<std::uint8_t>> records;
+  records.reserve((payload.size() - offset) / record_size);
+  while (offset < payload.size()) {
+    records.emplace_back(payload.begin() + static_cast<std::ptrdiff_t>(offset),
+                         payload.begin() + static_cast<std::ptrdiff_t>(offset + record_size));
+    offset += record_size;
+  }
+  return records;
+}
+
+DocumentChannelDisplayInfo display_info_from_photoshop_record(std::span<const std::uint8_t> record) {
+  DocumentChannelDisplayInfo info;
+  if (record.size() < 13U) {
+    return info;
+  }
+  BigEndianReader reader(record.first(13U));
+  const auto color_space = reader.read_u16();
+  std::array<std::uint16_t, 4> components{};
+  for (auto& component : components) {
+    component = reader.read_u16();
+  }
+  const auto opacity_percent = reader.read_u16();
+  const auto mode = reader.read_u8();
+  if (color_space == 0U) {  // RGB, 16-bit unsigned components.
+    const auto component8 = [](std::uint16_t value) {
+      return static_cast<std::uint8_t>((static_cast<std::uint32_t>(value) + 128U) / 257U);
+    };
+    info.color = RgbColor{component8(components[0]), component8(components[1]), component8(components[2])};
+  }
+  info.opacity = std::clamp(static_cast<float>(opacity_percent) / 100.0F, 0.0F, 1.0F);
+  info.color_indicates = mode == 2U   ? DocumentChannelColorIndicates::SpotColor
+                         : mode == 0U ? DocumentChannelColorIndicates::SelectedAreas
+                                      : DocumentChannelColorIndicates::MaskedAreas;
+  return info;
+}
+
+double sanitized_print_ppi(double value) noexcept {
+  return std::isfinite(value) && value > 0.0 ? value : 300.0;
+}
+
+std::uint32_t double_to_fixed_16_16(double value) noexcept {
+  value = std::clamp(sanitized_print_ppi(value), 1.0, 9999.0);
+  return static_cast<std::uint32_t>(std::lround(value * 65536.0));
+}
+
+std::vector<std::uint8_t> resolution_resource_for_document(const Document& document) {
+  const auto& print_settings = document.print_settings();
+  BigEndianWriter writer;
+  writer.write_u32(double_to_fixed_16_16(print_settings.horizontal_ppi));
+  writer.write_u16(print_settings.horizontal_resolution_display_unit);
+  writer.write_u16(print_settings.width_display_unit);
+  writer.write_u32(double_to_fixed_16_16(print_settings.vertical_ppi));
+  writer.write_u16(print_settings.vertical_resolution_display_unit);
+  writer.write_u16(print_settings.height_display_unit);
+  return writer.bytes();
+}
+
+std::int32_t sanitized_grid_cycle_32(std::int32_t value) noexcept {
+  return value > 0 ? value : kDefaultGridCycle32;
+}
+
+std::vector<std::uint8_t> grid_guides_resource_for_document(const Document& document) {
+  BigEndianWriter writer;
+  writer.write_u32(1);
+  writer.write_u32(static_cast<std::uint32_t>(sanitized_grid_cycle_32(document.grid_settings().horizontal_cycle_32)));
+  writer.write_u32(static_cast<std::uint32_t>(sanitized_grid_cycle_32(document.grid_settings().vertical_cycle_32)));
+  writer.write_u32(checked_u32(document.guides().size(), "guide count"));
+  for (const auto& guide : document.guides()) {
+    // Signed: a guide on the pasteboard is negative or past the canvas (GitHub issue 231).
+    writer.write_u32(static_cast<std::uint32_t>(guide.position_32));
+    writer.write_u8(guide.orientation == GuideOrientation::Horizontal ? 1U : 0U);
+  }
+  return writer.bytes();
+}
+
+[[nodiscard]] std::vector<std::uint8_t> patchy_palette_resource(std::span<const RgbColor> colors, bool mode_active,
+                                                                std::uint8_t alpha_threshold,
+                                                                std::span<const std::string> names) {
+  std::vector<std::uint8_t> payload;
+  payload.reserve(12U + colors.size() * 3U);
+  const auto push_u16 = [&payload](std::uint16_t value) {
+    payload.push_back(static_cast<std::uint8_t>(value >> 8U));
+    payload.push_back(static_cast<std::uint8_t>(value & 0xffU));
+  };
+  payload.push_back(static_cast<std::uint8_t>((kPatchyPaletteMagic >> 24U) & 0xffU));
+  payload.push_back(static_cast<std::uint8_t>((kPatchyPaletteMagic >> 16U) & 0xffU));
+  payload.push_back(static_cast<std::uint8_t>((kPatchyPaletteMagic >> 8U) & 0xffU));
+  payload.push_back(static_cast<std::uint8_t>(kPatchyPaletteMagic & 0xffU));
+  push_u16(1);  // version
+  push_u16(mode_active ? 1U : 0U);
+  payload.push_back(alpha_threshold);
+  payload.push_back(0);  // reserved
+  push_u16(static_cast<std::uint16_t>(colors.size()));
+  for (const auto& color : colors) {
+    payload.push_back(color.red);
+    payload.push_back(color.green);
+    payload.push_back(color.blue);
+  }
+  // Version 1 readers accept trailing bytes. Keep the RGB table compatible and
+  // omit the extension entirely for unnamed palettes (historical bytes unchanged).
+  if (std::any_of(names.begin(), names.end(), [](const auto& name) { return !name.empty(); })) {
+    payload.insert(payload.end(), {'N', 'm', '0', '1'});
+    for (std::size_t i = 0; i < colors.size(); ++i) {
+      const std::string_view name = i < names.size() ? std::string_view(names[i]) : std::string_view{};
+      if (name.size() > kMaxPaletteColorNameBytes) { throw std::runtime_error(PATCHY_TRANSLATE_NOOP("QObject", "Palette color name is too long")); }
+      push_u16(static_cast<std::uint16_t>(name.size()));
+      payload.insert(payload.end(), name.begin(), name.end());
+    }
+  }
+  return payload;
+}
+
+std::vector<std::uint8_t> alpha_channel_names_resource(
+    std::span<const CompositeChannelInfo> channels) {
+  std::vector<std::uint8_t> payload;
+  for (const auto& channel : channels) {
+    // Resource 1006 is a legacy one-byte Pascal string array. Photoshop uses
+    // one '?' per Unicode scalar that is not representable there; the exact
+    // UTF-8 name belongs in resource 1045.
+    std::vector<std::uint8_t> legacy_name;
+    legacy_name.reserve(std::min<std::size_t>(channel.name.size(), 255U));
+    const auto units = utf8_to_utf16(channel.name);
+    for (std::size_t index = 0; index < units.size() && legacy_name.size() < 255U; ++index) {
+      const auto unit = units[index];
+      if (unit >= 0xD800U && unit <= 0xDBFFU && index + 1U < units.size() &&
+          units[index + 1U] >= 0xDC00U && units[index + 1U] <= 0xDFFFU) {
+        ++index;
+      }
+      legacy_name.push_back(unit <= 0x7FU ? static_cast<std::uint8_t>(unit)
+                                         : static_cast<std::uint8_t>('?'));
+    }
+    payload.push_back(static_cast<std::uint8_t>(legacy_name.size()));
+    payload.insert(payload.end(), legacy_name.begin(), legacy_name.end());
+  }
+  return payload;
+}
+
+std::vector<std::uint8_t> unicode_alpha_channel_names_resource(
+    std::span<const CompositeChannelInfo> channels) {
+  BigEndianWriter writer;
+  for (const auto& channel : channels) {
+    const auto units = utf8_to_utf16(channel.name);
+    writer.write_u32(checked_u32(units.size() + 1U, "Unicode alpha channel name length"));
+    for (const auto unit : units) {
+      writer.write_u16(unit);
+    }
+    writer.write_u16(0);  // Photoshop includes the terminator in the unit count.
+  }
+  return writer.bytes();
+}
+
+std::vector<std::uint8_t> alpha_identifiers_resource(
+    std::span<const CompositeChannelInfo> channels) {
+  const auto has_alpha_identifier = [](const CompositeChannelInfo& channel) {
+    return !channel.merged_transparency && channel.alpha_identifier_eligible;
+  };
+  std::vector<std::uint32_t> used;
+  for (const auto& channel : channels) {
+    if (has_alpha_identifier(channel) && channel.photoshop_identifier.has_value()) {
+      used.push_back(*channel.photoshop_identifier);
+    }
+  }
+  std::uint32_t next_identifier = 1U;
+  const auto allocate_identifier = [&used, &next_identifier]() {
+    while (std::find(used.begin(), used.end(), next_identifier) != used.end()) {
+      ++next_identifier;
+      if (next_identifier == 0U) {
+        throw std::runtime_error(PATCHY_TRANSLATE_NOOP("QObject", "PSD alpha channel identifiers are exhausted"));
+      }
+    }
+    const auto result = next_identifier++;
+    used.push_back(result);
+    return result;
+  };
+
+  BigEndianWriter writer;
+  const auto saved_count = static_cast<std::size_t>(std::count_if(
+      channels.begin(), channels.end(), has_alpha_identifier));
+  writer.write_u32(checked_u32(saved_count, "alpha identifier count"));
+  for (const auto& channel : channels) {
+    if (!has_alpha_identifier(channel)) {
+      continue;
+    }
+    writer.write_u32(channel.photoshop_identifier.has_value() ? *channel.photoshop_identifier
+                                                               : allocate_identifier());
+  }
+  return writer.bytes();
+}
+
+std::vector<std::uint8_t> generated_display_info_record(const DocumentChannelDisplayInfo& info) {
+  BigEndianWriter writer;
+  writer.write_u16(0);  // RGB color space.
+  writer.write_u16(static_cast<std::uint16_t>(info.color.red) * 257U);
+  writer.write_u16(static_cast<std::uint16_t>(info.color.green) * 257U);
+  writer.write_u16(static_cast<std::uint16_t>(info.color.blue) * 257U);
+  writer.write_u16(0);
+  writer.write_u16(static_cast<std::uint16_t>(std::lround(std::clamp(info.opacity, 0.0F, 1.0F) * 100.0F)));
+  writer.write_u8(info.color_indicates == DocumentChannelColorIndicates::SpotColor       ? 2U
+                  : info.color_indicates == DocumentChannelColorIndicates::SelectedAreas ? 0U
+                                                                                           : 1U);
+  return writer.bytes();
+}
+
+std::vector<std::uint8_t> display_info_resource(std::span<const CompositeChannelInfo> channels,
+                                                bool floating_point_resource) {
+  BigEndianWriter writer;
+  if (floating_point_resource) {
+    writer.write_u32(1);
+  }
+  for (const auto& channel : channels) {
+    if ((!floating_point_resource && channel.raw_display_info.size() == 14U)) {
+      writer.write_bytes(channel.raw_display_info);
+      continue;
+    }
+    if (channel.raw_display_info.size() >= 13U) {
+      writer.write_bytes(channel.raw_display_info.first(13U));
+    } else {
+      writer.write_bytes(generated_display_info_record(channel.display_info));
+    }
+    if (!floating_point_resource) {
+      writer.write_u8(0);
+    }
+  }
+  return writer.bytes();
+}
+
+}  // namespace
+
+std::optional<std::vector<std::uint8_t>> find_image_resource_payload(std::span<const std::uint8_t> resources,
+                                                                     std::uint16_t id) {
+  auto parsed = read_image_resources(resources);
+  if (!parsed.has_value()) {
+    return std::nullopt;
+  }
+  for (const auto& resource : *parsed) {
+    if (resource.id == id) {
+      return resource.payload;
+    }
+  }
+  return std::nullopt;
+}
+
+ParsedCompositeChannelResources parse_composite_channel_resources(
+    std::span<const std::uint8_t> image_resources) {
+  ParsedCompositeChannelResources result;
+  const auto parsed = read_image_resources(image_resources);
+  if (!parsed.has_value()) {
+    return result;
+  }
+  std::optional<std::span<const std::uint8_t>> legacy_display;
+  std::optional<std::span<const std::uint8_t>> modern_display;
+  for (const auto& resource : *parsed) {
+    switch (resource.id) {
+      case kImageResourceAlphaChannelNames:
+        if (result.legacy_names.empty()) {
+          result.legacy_names = parse_legacy_alpha_channel_names(resource.payload);
+        }
+        break;
+      case kImageResourceUnicodeAlphaChannelNames:
+        if (result.unicode_names.empty()) {
+          result.unicode_names = parse_unicode_alpha_channel_names(resource.payload);
+        }
+        break;
+      case kImageResourceAlphaIdentifiers:
+        if (result.identifiers.empty()) {
+          result.identifiers = parse_alpha_identifiers(resource.payload);
+        }
+        break;
+      case kImageResourceDisplayInfo:
+        if (!legacy_display.has_value()) {
+          legacy_display = resource.payload;
+        }
+        break;
+      case kImageResourceDisplayInfoFloat:
+        if (!modern_display.has_value()) {
+          modern_display = resource.payload;
+        }
+        break;
+      default:
+        break;
+    }
+  }
+  if (modern_display.has_value()) {
+    result.display_records = parse_display_info_records(*modern_display, true);
+  }
+  if (result.display_records.empty() && legacy_display.has_value()) {
+    result.display_records = parse_display_info_records(*legacy_display, false);
+  }
+  return result;
+}
+
+std::uint16_t composite_color_channel_count(std::uint16_t color_mode) noexcept {
+  if (is_cmyk_color_mode(color_mode)) {
+    return 4U;
+  }
+  return is_grayscale_color_mode(color_mode) ? 1U : 3U;
+}
+
+void add_saved_composite_channels(Document& document,
+                                  std::vector<std::vector<std::uint8_t>> channel_planes,
+                                  std::uint16_t first_saved_channel, const Header& header,
+                                  const ParsedCompositeChannelResources& resources) {
+  const auto color_channels = composite_color_channel_count(header.color_mode);
+  if (first_saved_channel < color_channels || first_saved_channel > header.channels) {
+    throw std::runtime_error(PATCHY_TRANSLATE_NOOP("QObject", "Invalid PSD saved channel layout"));
+  }
+  const auto expected_count = static_cast<std::size_t>(header.channels - first_saved_channel);
+  if (channel_planes.size() != expected_count) {
+    throw std::runtime_error(PATCHY_TRANSLATE_NOOP("QObject", "PSD saved channel count does not match the composite data"));
+  }
+  const auto first_resource_index = static_cast<std::size_t>(first_saved_channel - color_channels);
+  const auto pixel_count = static_cast<std::size_t>(document.width()) * static_cast<std::size_t>(document.height());
+  std::size_t alpha_identifier_index = 0;
+  for (std::size_t index = 0; index < channel_planes.size(); ++index) {
+    if (channel_planes[index].size() != pixel_count) {
+      throw std::runtime_error(PATCHY_TRANSLATE_NOOP("QObject", "PSD saved channel dimensions do not match the document"));
+    }
+    const auto aligned_index = [first_resource_index, index, saved_count = channel_planes.size()](
+                                   std::size_t resource_count) {
+      // Modern Photoshop describes merged transparency in the name/display arrays;
+      // some older writers omit that derived entry. Align either shape without using
+      // the literal channel name to decide whether a plane is merged transparency.
+      return first_resource_index != 0U && resource_count == saved_count ? index
+                                                                         : first_resource_index + index;
+    };
+    const auto unicode_index = aligned_index(resources.unicode_names.size());
+    const auto legacy_index = aligned_index(resources.legacy_names.size());
+    const auto display_index = aligned_index(resources.display_records.size());
+    std::string name;
+    if (unicode_index < resources.unicode_names.size() && !resources.unicode_names[unicode_index].empty()) {
+      name = resources.unicode_names[unicode_index];
+    } else if (legacy_index < resources.legacy_names.size() &&
+               !resources.legacy_names[legacy_index].empty()) {
+      name = resources.legacy_names[legacy_index];
+    } else {
+      name = "Alpha " + std::to_string(index + 1U);
+    }
+
+    DocumentChannelDisplayInfo display_info;
+    std::vector<std::uint8_t> raw_display_info;
+    if (display_index < resources.display_records.size()) {
+      raw_display_info = resources.display_records[display_index];
+      display_info = display_info_from_photoshop_record(raw_display_info);
+    }
+    const auto kind = display_info.color_indicates == DocumentChannelColorIndicates::SpotColor
+                          ? DocumentChannelKind::Spot
+                          : DocumentChannelKind::Alpha;
+    PixelBuffer pixels(document.width(), document.height(), PixelFormat::gray8());
+    std::copy(channel_planes[index].begin(), channel_planes[index].end(), pixels.data().begin());
+    DocumentChannel channel(document.allocate_channel_id(), std::move(name), kind, std::move(pixels));
+    // Resource 1053 contains identifiers for saved alpha channels only.
+    // Photoshop omits spot channels, so consume this array independently of
+    // the name/display arrays that describe every extra plane.
+    if (kind == DocumentChannelKind::Alpha &&
+        alpha_identifier_index < resources.identifiers.size()) {
+      channel.set_photoshop_identifier(resources.identifiers[alpha_identifier_index]);
+      ++alpha_identifier_index;
+    }
+    channel.set_display_info(display_info);
+    if (!raw_display_info.empty()) {
+      channel.set_raw_photoshop_display_info(std::move(raw_display_info));
+    }
+    document.add_channel(std::move(channel));
+  }
+}
+
+std::optional<DocumentPrintSettings> print_settings_from_resolution_resource(std::span<const std::uint8_t> payload) {
+  if (payload.size() < 16U) {
+    return std::nullopt;
+  }
+  BigEndianReader reader(payload);
+  const auto horizontal = fixed_16_16_to_double(reader.read_u32());
+  const auto horizontal_unit = reader.read_u16();
+  const auto width_unit = reader.read_u16();
+  const auto vertical = fixed_16_16_to_double(reader.read_u32());
+  const auto vertical_unit = reader.read_u16();
+  const auto height_unit = reader.read_u16();
+
+  DocumentPrintSettings settings;
+  // hRes/vRes are ALWAYS pixels/inch; the unit fields are display-only. Verified
+  // against Photoshop 2026 by byte-patching a 144 PPI file's units to 2 (px/cm):
+  // PS still reports resolution 144. (The previous x2.54 conversion misread real
+  // px/cm-display files as 2.54x their resolution.)
+  settings.horizontal_ppi = sanitized_print_ppi(horizontal);
+  settings.vertical_ppi = sanitized_print_ppi(vertical);
+  settings.horizontal_resolution_display_unit = horizontal_unit;
+  settings.vertical_resolution_display_unit = vertical_unit;
+  settings.width_display_unit = width_unit;
+  settings.height_display_unit = height_unit;
+  return settings;
+}
+
+std::optional<std::pair<DocumentGridSettings, std::vector<DocumentGuide>>>
+grid_guides_from_resource(std::span<const std::uint8_t> payload) {
+  if (payload.size() < 16U) {
+    return std::nullopt;
+  }
+
+  try {
+    BigEndianReader reader(payload);
+    const auto version = reader.read_u32();
+    if (version != 1U) {
+      return std::nullopt;
+    }
+
+    DocumentGridSettings settings;
+    settings.horizontal_cycle_32 = sanitized_grid_cycle_32(read_i32(reader));
+    settings.vertical_cycle_32 = sanitized_grid_cycle_32(read_i32(reader));
+    const auto guide_count = reader.read_u32();
+    if (guide_count > (reader.remaining() / 5U)) {
+      return std::nullopt;
+    }
+
+    std::vector<DocumentGuide> guides;
+    guides.reserve(static_cast<std::size_t>(guide_count));
+    for (std::uint32_t index = 0; index < guide_count; ++index) {
+      DocumentGuide guide;
+      // Photoshop keeps guides on the pasteboard: a negative or past-the-canvas position
+      // is real data, never clamped (GitHub issue 231).
+      guide.position_32 = read_i32(reader);
+      const auto direction = reader.read_u8();
+      guide.orientation = direction == 1U ? GuideOrientation::Horizontal : GuideOrientation::Vertical;
+      guides.push_back(guide);
+    }
+    return std::pair<DocumentGridSettings, std::vector<DocumentGuide>>{settings, std::move(guides)};
+  } catch (const std::exception&) {
+    return std::nullopt;
+  }
+}
+
+// Malformed payloads are ignored: the file still opens as a plain RGB document.
+void apply_patchy_palette_resource(Document& document, std::span<const std::uint8_t> payload) {
+  if (payload.size() < 12U) {
+    return;
+  }
+  const auto magic = (static_cast<std::uint32_t>(payload[0]) << 24U) |
+                     (static_cast<std::uint32_t>(payload[1]) << 16U) |
+                     (static_cast<std::uint32_t>(payload[2]) << 8U) | static_cast<std::uint32_t>(payload[3]);
+  const auto version = static_cast<std::uint16_t>((payload[4] << 8U) | payload[5]);
+  if (magic != kPatchyPaletteMagic || version != 1) {
+    return;
+  }
+  const auto flags = static_cast<std::uint16_t>((payload[6] << 8U) | payload[7]);
+  const auto alpha_threshold = payload[8];
+  const auto count = static_cast<std::uint16_t>((payload[10] << 8U) | payload[11]);
+  if (count == 0 || count > 256 || payload.size() < 12U + static_cast<std::size_t>(count) * 3U) {
+    return;
+  }
+  std::vector<RgbColor> colors;
+  colors.reserve(count);
+  for (std::uint16_t index = 0; index < count; ++index) {
+    const auto offset = 12U + static_cast<std::size_t>(index) * 3U;
+    colors.push_back(RgbColor{payload[offset], payload[offset + 1U], payload[offset + 2U]});
+  }
+  const std::uint16_t depth = count <= 4 ? 2 : (count <= 16 ? 4 : 8);
+  std::vector<std::string> names;
+  auto offset = 12U + static_cast<std::size_t>(count) * 3U;
+  if (payload.size() >= offset + 4U && payload[offset] == 'N' && payload[offset + 1] == 'm' &&
+      payload[offset + 2] == '0' && payload[offset + 3] == '1') {
+    offset += 4;
+    for (std::uint16_t i = 0; i < count; ++i) {
+      if (payload.size() < offset + 2) { names.clear(); break; }
+      const auto size = static_cast<std::size_t>((payload[offset] << 8U) | payload[offset + 1]);
+      offset += 2;
+      if (size > kMaxPaletteColorNameBytes || size > payload.size() - offset) { names.clear(); break; }
+      names.emplace_back(reinterpret_cast<const char*>(payload.data() + offset), size);
+      offset += size;
+    }
+  }
+  document.indexed_palette() = DocumentIndexedPalette{colors, depth, names};
+  if ((flags & 1U) != 0U) {
+    DocumentPaletteEditing editing;
+    editing.palette.colors = std::move(colors);
+    editing.palette.names = std::move(names);
+    editing.alpha_threshold = alpha_threshold;
+    document.palette_editing() = std::move(editing);
+  }
+}
+
+namespace {
+
+bool layer_has_continuous_drop_shadow(const Layer& layer) {
+  const auto& style = std::as_const(layer).layer_style();
+  return std::any_of(style.drop_shadows.begin(), style.drop_shadows.end(),
+                     [](const LayerDropShadow& shadow) { return shadow.continuous; });
+}
+
+}  // namespace
+
+// Besides compound vectors, this also assigns a native 'lyid' to every layer
+// whose long-shadow fields must travel in resource 4212 (the resource keys by
+// that id), so the prepared copy is the one the resource writer sees.
+std::optional<Document> prepare_compound_vector_psd(const Document& document) {
+  std::optional<Document> prepared;
+  if (document_has_compound_vectors(document)) { prepared = expand_compound_vectors(document, true); }
+  if (document_has_open_path_strokes(prepared ? std::as_const(*prepared) : document)) {
+    prepared = expand_open_path_strokes(prepared ? std::as_const(*prepared) : document);
+  }
+  const auto& source = prepared ? std::as_const(*prepared) : document;
+  std::map<std::uint32_t, std::size_t> native_ids;
+  std::vector<LayerId> marked;
+  const auto collect = [&](const auto& self, const std::vector<Layer>& layers) -> void {
+    for (const auto& layer : layers) {
+      if (const auto id = photoshop_layer_id(layer)) { ++native_ids[*id]; }
+      if (compound_vector_group_kind(layer) != CompoundVectorGroupKind::None ||
+          layer_has_continuous_drop_shadow(layer)) {
+        marked.push_back(layer.id());
+      }
+      self(self, layer.children());
+    }
+  };
+  collect(collect, source.layers());
+  std::vector<LayerId> missing;
+  for (const auto id : marked) {
+    const auto native_id = photoshop_layer_id(*source.find_layer(id));
+    if (!native_id || native_ids.at(*native_id) != 1) { missing.push_back(id); }
+  }
+  if (missing.empty()) { return prepared; }
+  if (!prepared) { prepared = document; }
+  std::uint64_t next = 1;
+  for (const auto id : missing) {
+    while (next <= UINT32_MAX && native_ids.contains(static_cast<std::uint32_t>(next))) { ++next; }
+    if (next > UINT32_MAX) { throw std::runtime_error(PATCHY_TRANSLATE_NOOP("QObject", "No available Photoshop layer identifiers")); }
+    const auto native_id = static_cast<std::uint32_t>(next++);
+    native_ids.emplace(native_id, 1);
+    set_photoshop_layer_id(*prepared->find_layer(id), native_id);
+  }
+  return prepared;
+}
+
+void apply_long_shadow_resource(Document& document, std::span<const std::uint8_t> payload) {
+  constexpr std::size_t kEntrySize = 12;
+  if (payload.size() < 12) { return; }
+  BigEndianReader reader(payload);
+  if (reader.read_u32() != kPatchyLongShadowsMagic || reader.read_u16() != 1 || reader.read_u16() != 0) { return; }
+  const auto count = reader.read_u32();
+  if (count > 32767 || reader.remaining() != static_cast<std::size_t>(count) * kEntrySize) { return; }
+  struct Entry {
+    std::uint16_t index;
+    bool continuous;
+    float fade;
+  };
+  std::map<std::uint32_t, std::vector<Entry>> entries;
+  std::set<std::pair<std::uint32_t, std::uint16_t>> seen;
+  for (std::uint32_t i = 0; i < count; ++i) {
+    const auto id = reader.read_u32();
+    const auto index = reader.read_u16();
+    const auto flags = reader.read_u16();
+    const auto fade_fixed = reader.read_u32();
+    if (id == 0 || (flags & ~kPatchyLongShadowFlagContinuous) != 0 || fade_fixed > (100U << 16U) ||
+        !seen.emplace(id, index).second) {
+      return;
+    }
+    entries[id].push_back(Entry{index, (flags & kPatchyLongShadowFlagContinuous) != 0,
+                                static_cast<float>(fade_fixed) / 65536.0F});
+  }
+  std::map<std::uint32_t, std::vector<LayerId>> layers_by_native_id;
+  const auto collect = [&](const auto& self, const std::vector<Layer>& layers) -> void {
+    for (const auto& layer : layers) {
+      if (const auto id = photoshop_layer_id(layer); id && entries.contains(*id)) {
+        layers_by_native_id[*id].push_back(layer.id());
+      }
+      self(self, layer.children());
+    }
+  };
+  collect(collect, std::as_const(document).layers());
+  for (const auto& [id, list] : entries) {
+    const auto found = layers_by_native_id.find(id);
+    if (found == layers_by_native_id.end() || found->second.size() != 1) { continue; }
+    auto* layer = document.find_layer(found->second.front());
+    if (layer == nullptr) { continue; }
+    auto& shadows = layer->layer_style().drop_shadows;
+    for (const auto& entry : list) {
+      if (entry.index < shadows.size()) {
+        shadows[entry.index].continuous = entry.continuous;
+        shadows[entry.index].fade = entry.fade;
+      }
+    }
+  }
+}
+
+void apply_compound_vector_resource(Document& document, std::span<const std::uint8_t> payload) {
+  // Validate the entire bounded record before changing any layer. Duplicate
+  // native ids after foreign edits are ambiguous and must never fold a group.
+  if (payload.size() < 12) { return; }
+  BigEndianReader reader(payload);
+  if (reader.read_u32() != kPatchyCompoundVectorsMagic || reader.read_u16() != 1 || reader.read_u16() != 0) { return; }
+  const auto count = reader.read_u32();
+  if (count > 32767 || reader.remaining() != static_cast<std::size_t>(count) * 8) { return; }
+  std::map<std::uint32_t, CompoundVectorGroupKind> entries;
+  for (std::uint32_t i = 0; i < count; ++i) {
+    const auto id = reader.read_u32();
+    const auto kind = reader.read_u32();
+    if (id == 0 || kind < 1 || kind > 3 || !entries.emplace(id, static_cast<CompoundVectorGroupKind>(kind)).second) { return; }
+  }
+  std::map<std::uint32_t, std::vector<LayerId>> layers_by_native_id;
+  const auto collect = [&](const auto& self, const std::vector<Layer>& layers) -> void {
+    for (const auto& layer : layers) {
+      if (const auto id = photoshop_layer_id(layer); id && entries.contains(*id)) {
+        layers_by_native_id[*id].push_back(layer.id());
+      }
+      self(self, layer.children());
+    }
+  };
+  collect(collect, std::as_const(document).layers());
+  for (const auto& [id, kind] : entries) {
+    const auto found = layers_by_native_id.find(id);
+    if (found == layers_by_native_id.end() || found->second.size() != 1) { continue; }
+    const auto layer_id = found->second.front();
+    const auto* layer = std::as_const(document).find_layer(layer_id);
+    if (layer->kind() == LayerKind::Group && compound_vector_group_kind(*layer) == CompoundVectorGroupKind::None) {
+      set_compound_vector_group_kind(*document.find_layer(layer_id), kind);
+    }
+  }
+}
+
+namespace {
+
+// Metadata-only resources File Info owns (docs/file-info.md). Everything else in the
+// resource section stays in raw_psd_image_resources.
+constexpr std::uint16_t kResourceIptc = 1028;
+constexpr std::uint16_t kResourceCopyrightFlag = 1034;
+constexpr std::uint16_t kResourceCopyrightUrl = 1035;
+constexpr std::uint16_t kResourceExif = 1058;
+constexpr std::uint16_t kResourceXmp = 1060;
+constexpr std::uint16_t kResourceCaptionDigest = 1061;
+constexpr std::uint16_t kResourceThumbnailPhotoshop4 = 1033;  // BGR JFIF
+constexpr std::uint16_t kResourceThumbnail = 1036;            // RGB JFIF
+// Kept verbatim in DocumentFileInfo::psd_resources: thumbnails, workflow URL, version
+// info, EXIF data 3, Mac/Windows print records, auto-save path/format, Lightroom.
+constexpr std::array<std::uint16_t, 10> kOpaqueFileInfoResources{1033, 1036, 1051, 1057, 1059,
+                                                                  1084, 1085, 1086, 1087, 8000};
+
+bool is_file_info_resource(std::uint16_t id) noexcept {
+  return id == kResourceIptc || id == kResourceCopyrightFlag || id == kResourceCopyrightUrl || id == kResourceExif ||
+         id == kResourceXmp || id == kResourceCaptionDigest || id == kImageResourcePatchyFileInfoText ||
+         std::find(kOpaqueFileInfoResources.begin(), kOpaqueFileInfoResources.end(), id) !=
+             kOpaqueFileInfoResources.end();
+}
+
+void write_sized_string(BigEndianWriter& writer, const std::string& text) {
+  writer.write_u32(checked_u32(text.size(), "File Info text length"));
+  writer.write_bytes(std::span(reinterpret_cast<const std::uint8_t*>(text.data()), text.size()));
+}
+
+std::string read_sized_string(BigEndianReader& reader) {
+  const auto length = reader.read_u32();
+  const auto span = reader.read_span(length);
+  return std::string(span.begin(), span.end());
+}
+
+std::vector<std::uint8_t> file_info_text_resource(const std::vector<FileInfoText>& texts) {
+  BigEndianWriter entries;
+  std::uint32_t count = 0;
+  for (const auto& text : texts) {
+    // PDF /Info and SVG title/desc describe the source file only; they are not carried.
+    if (text.kind == FileInfoTextKind::PdfInfo || text.kind == FileInfoTextKind::SvgText) {
+      continue;
+    }
+    entries.write_u8(static_cast<std::uint8_t>(text.kind));
+    write_sized_string(entries, text.key);
+    write_sized_string(entries, text.value);
+    write_sized_string(entries, text.language);
+    ++count;
+  }
+  if (count == 0) {
+    return {};
+  }
+  BigEndianWriter payload;
+  payload.write_u32(kPatchyFileInfoTextMagic);
+  payload.write_u16(1);
+  payload.write_u16(0);
+  payload.write_u32(count);
+  payload.write_bytes(entries.bytes());
+  return payload.bytes();
+}
+
+// A malformed or unknown-version payload yields nothing (and is dropped on save, the
+// same as Photoshop dropping a plug-in resource it cannot read).
+std::vector<FileInfoText> file_info_text_from_resource(std::span<const std::uint8_t> payload) {
+  std::vector<FileInfoText> texts;
+  try {
+    BigEndianReader reader(payload);
+    if (reader.read_u32() != kPatchyFileInfoTextMagic || reader.read_u16() != 1) {
+      return {};
+    }
+    (void)reader.read_u16();
+    const auto count = reader.read_u32();
+    for (std::uint32_t i = 0; i < count; ++i) {
+      FileInfoText text;
+      const auto kind = reader.read_u8();
+      if (kind > static_cast<std::uint8_t>(FileInfoTextKind::Comment)) {
+        return {};
+      }
+      text.kind = static_cast<FileInfoTextKind>(kind);
+      text.key = read_sized_string(reader);
+      text.value = read_sized_string(reader);
+      text.language = read_sized_string(reader);
+      texts.push_back(std::move(text));
+    }
+  } catch (const std::exception&) {
+    return {};
+  }
+  return texts;
+}
+
+}  // namespace
+
+void lift_file_info_resources(Document& document, std::uint16_t source_color_mode, bool large_document) {
+  auto& raw = document.metadata().raw_psd_image_resources;
+  auto parsed = read_image_resources(raw);
+  auto& info = document.file_info();
+  info = DocumentFileInfo{};
+  info.source_format = large_document ? "PSB" : "PSD";
+  if (!parsed.has_value()) {
+    return;
+  }
+  bool lifted_any = false;
+  for (auto& resource : *parsed) {
+    info.structure.push_back(FileInfoSegment{"8BIM " + std::to_string(resource.id), 0, resource.payload.size()});
+    if (resource.id == kImageResourceIccProfile && source_color_mode != kColorModeRgb &&
+        resource.payload.size() >= 128) {
+      info.source_icc = make_metadata_bytes(resource.payload);
+      info.source_icc_note = PATCHY_TRANSLATE_NOOP(
+          "QObject",
+          "Patchy converted this document to RGB, so this profile is shown for reference only and is not written "
+          "to RGB saves.");
+    }
+    if (!is_file_info_resource(resource.id)) {
+      continue;
+    }
+    lifted_any = true;
+    auto& payload = resource.payload;
+    switch (resource.id) {
+      case kResourceIptc:
+        info.iptc = make_metadata_bytes(std::move(payload));
+        break;
+      case kResourceCaptionDigest:
+        if (payload.size() == 16) {
+          std::array<std::uint8_t, 16> digest{};
+          std::copy(payload.begin(), payload.end(), digest.begin());
+          info.iptc_digest = digest;
+        }
+        break;
+      case kResourceCopyrightFlag:
+        if (!payload.empty()) {
+          info.copyright_flag = payload[0] != 0;
+        }
+        break;
+      case kResourceCopyrightUrl: {
+        std::string url(payload.begin(), payload.end());
+        while (!url.empty() && url.back() == '\0') {
+          url.pop_back();
+        }
+        info.copyright_url = std::move(url);
+        break;
+      }
+      case kResourceExif:
+        info.exif = make_metadata_bytes(std::move(payload));
+        break;
+      case kResourceXmp:
+        info.xmp = make_metadata_bytes(std::move(payload));
+        break;
+      case kImageResourcePatchyFileInfoText:
+        info.text = file_info_text_from_resource(payload);
+        break;
+      default:
+        info.psd_resources.emplace_back(resource.id, make_metadata_bytes(std::move(payload)));
+        break;
+    }
+  }
+  if (lifted_any) {
+    std::erase_if(*parsed, [](const ImageResource& resource) { return is_file_info_resource(resource.id); });
+    raw = write_image_resources(*parsed);
+  }
+}
+
+std::vector<std::uint8_t> image_resources_for_document(const Document& document,
+                                                       std::span<const CompositeChannelInfo> channels,
+                                                       std::uint16_t output_mode,
+                                                       const std::vector<std::uint8_t>* output_icc_profile,
+                                                       const std::vector<std::uint8_t>* thumbnail, bool layered) {
+  auto resources = document.metadata().raw_psd_image_resources;
+  auto parsed = read_image_resources(resources);
+  if (!parsed.has_value()) {
+    parsed = std::vector<ImageResource>{};
+  }
+  // File Info owns the metadata resources once the reader lifted them
+  // (lift_file_info_resources). A blob that still carries some was never lifted (a
+  // document assembled by other code): it stays the source of truth, written as before.
+  const bool blob_owns_file_info = std::any_of(parsed->begin(), parsed->end(), [](const ImageResource& resource) {
+    return is_file_info_resource(resource.id);
+  });
+  if (blob_owns_file_info) {
+    for (auto& resource : *parsed) {
+      if (resource.id == kResourceXmp) {
+        repair_xmp_date_timezones(resource.payload);
+      }
+    }
+  }
+  const auto& info = blob_owns_file_info ? DocumentFileInfo{} : document.file_info();
+  if (info.iptc && !info.iptc->empty()) {
+    upsert_image_resource(*parsed, kResourceIptc, *info.iptc);
+    if (info.iptc_digest) {
+      upsert_image_resource(*parsed, kResourceCaptionDigest,
+                            std::vector<std::uint8_t>(info.iptc_digest->begin(), info.iptc_digest->end()));
+    }
+  }
+  if (info.copyright_flag) {
+    upsert_image_resource(*parsed, kResourceCopyrightFlag, {static_cast<std::uint8_t>(*info.copyright_flag ? 1 : 0)});
+  }
+  if (!info.copyright_url.empty()) {
+    upsert_image_resource(*parsed, kResourceCopyrightUrl,
+                          std::vector<std::uint8_t>(info.copyright_url.begin(), info.copyright_url.end()));
+  }
+  if (info.exif && !info.exif->empty()) {
+    upsert_image_resource(*parsed, kResourceExif, *info.exif);
+  }
+  if (info.xmp && !info.xmp->empty()) {
+    auto xmp = *info.xmp;
+    repair_xmp_date_timezones(xmp);
+    upsert_image_resource(*parsed, kResourceXmp, std::move(xmp));
+  }
+  for (const auto& [id, payload] : info.psd_resources) {
+    if (payload && is_file_info_resource(id)) {
+      upsert_image_resource(*parsed, id, *payload);
+    }
+  }
+  if (auto text = file_info_text_resource(info.text); !text.empty()) {
+    upsert_image_resource(*parsed, kImageResourcePatchyFileInfoText, std::move(text));
+  }
+  if (thumbnail != nullptr) {
+    // A thumbnail from an earlier save shows the image as it was then.
+    remove_image_resource(*parsed, kResourceThumbnailPhotoshop4);
+    remove_image_resource(*parsed, kResourceThumbnail);
+    if (!thumbnail->empty()) {
+      upsert_image_resource(*parsed, kResourceThumbnail, *thumbnail);
+    }
+  }
+  if (const auto color_mode = document.metadata().values.find("psd.color_mode");
+      output_mode == kColorModeRgb && color_mode != document.metadata().values.end() && color_mode->second != "RGB") {
+    remove_image_resource(*parsed, kImageResourceIccProfile);
+  }
+  remove_other_mode_print_resources(*parsed, output_mode);
+
+  const auto had_grid_guides_resource = std::any_of(parsed->begin(), parsed->end(), [](const ImageResource& resource) {
+    return resource.id == kImageResourceGridAndGuidesInfo;
+  });
+  const auto has_non_default_grid_guides =
+      !document.guides().empty() ||
+      sanitized_grid_cycle_32(document.grid_settings().horizontal_cycle_32) != kDefaultGridCycle32 ||
+      sanitized_grid_cycle_32(document.grid_settings().vertical_cycle_32) != kDefaultGridCycle32;
+
+  upsert_document_path_resources(*parsed, document);
+  upsert_image_resource(*parsed, kImageResourceResolutionInfo, resolution_resource_for_document(document));
+  if (had_grid_guides_resource || has_non_default_grid_guides) {
+    upsert_image_resource(*parsed, kImageResourceGridAndGuidesInfo, grid_guides_resource_for_document(document));
+  }
+  if (output_icc_profile != nullptr) {
+    if (output_icc_profile->empty()) {
+      remove_image_resource(*parsed, kImageResourceIccProfile);
+    } else {
+      upsert_image_resource(*parsed, kImageResourceIccProfile, *output_icc_profile);
+    }
+  } else if (output_mode == kColorModeRgb && !document.color_state().embedded_icc_profile.empty()) {
+    upsert_image_resource(*parsed, kImageResourceIccProfile, document.color_state().embedded_icc_profile);
+  } else if (output_mode == kColorModeRgb) {
+    // An RGB document's profile is its embedded one: a source profile it no longer has
+    // (converted to sRGB, docs/rgb-profiles.md, or dropped in File Info) is not written.
+    remove_image_resource(*parsed, kImageResourceIccProfile);
+  }
+  if (!channels.empty()) {
+    upsert_image_resource(*parsed, kImageResourceAlphaChannelNames, alpha_channel_names_resource(channels));
+    upsert_image_resource(*parsed, kImageResourceUnicodeAlphaChannelNames,
+                          unicode_alpha_channel_names_resource(channels));
+    upsert_image_resource(*parsed, kImageResourceAlphaIdentifiers, alpha_identifiers_resource(channels));
+    upsert_image_resource(*parsed, kImageResourceDisplayInfo, display_info_resource(channels, false));
+    upsert_image_resource(*parsed, kImageResourceDisplayInfoFloat, display_info_resource(channels, true));
+  } else {
+    remove_image_resource(*parsed, kImageResourceAlphaChannelNames);
+    remove_image_resource(*parsed, kImageResourceUnicodeAlphaChannelNames);
+    remove_image_resource(*parsed, kImageResourceAlphaIdentifiers);
+    remove_image_resource(*parsed, kImageResourceDisplayInfo);
+    remove_image_resource(*parsed, kImageResourceDisplayInfoFloat);
+  }
+  const auto& palette_editing = document.palette_editing();
+  const std::vector<RgbColor>* palette_colors = nullptr;
+  const std::vector<std::string>* palette_names = nullptr;
+  if (palette_editing.has_value() && !palette_editing->palette.colors.empty() &&
+      palette_editing->palette.colors.size() <= 256) {
+    palette_colors = &palette_editing->palette.colors;
+    palette_names = &palette_editing->palette.names;
+  } else if (document.indexed_palette().has_value() && !document.indexed_palette()->colors.empty() &&
+             document.indexed_palette()->colors.size() <= 256) {
+    // A palette attached without the editing mode (imports, RGB round trips)
+    // still travels with the file.
+    palette_colors = &document.indexed_palette()->colors;
+    palette_names = &document.indexed_palette()->names;
+  }
+  if (palette_colors != nullptr) {
+    upsert_image_resource(*parsed, kImageResourcePatchyPalette,
+                          patchy_palette_resource(*palette_colors, palette_editing.has_value(),
+                                                  palette_editing.has_value() ? palette_editing->alpha_threshold
+                                                                              : std::uint8_t{128}, *palette_names));
+  } else {
+    remove_image_resource(*parsed, kImageResourcePatchyPalette);
+  }
+  BigEndianWriter compound_entries;
+  const auto collect_compound = [&](const auto& self, const std::vector<Layer>& layers) -> void {
+    for (const auto& layer : layers) {
+      const auto kind = compound_vector_group_kind(layer);
+      if (const auto id = photoshop_layer_id(layer); id && kind != CompoundVectorGroupKind::None) {
+        compound_entries.write_u32(*id);
+        compound_entries.write_u32(static_cast<std::uint32_t>(kind));
+      }
+      self(self, layer.children());
+    }
+  };
+  collect_compound(collect_compound, document.layers());
+  if (!compound_entries.bytes().empty()) {
+    BigEndianWriter payload;
+    payload.write_u32(kPatchyCompoundVectorsMagic);
+    payload.write_u16(1);
+    payload.write_u16(0);
+    payload.write_u32(checked_u32(compound_entries.bytes().size() / 8, "compound vector group count"));
+    payload.write_bytes(compound_entries.bytes());
+    upsert_image_resource(*parsed, kImageResourcePatchyCompoundVectors, payload.bytes());
+  } else {
+    // Retain opaque future/foreign payloads. Only our understood v1 data can
+    // become stale after its marked shapes were rasterized or removed.
+    std::erase_if(*parsed, [](const auto& resource) {
+      if (resource.id != kImageResourcePatchyCompoundVectors || resource.payload.size() < 8) { return false; }
+      BigEndianReader reader(resource.payload);
+      return reader.read_u32() == kPatchyCompoundVectorsMagic && reader.read_u16() == 1;
+    });
+  }
+  // Long-shadow fields (resource 4212), keyed by the native layer id that
+  // prepare_compound_vector_psd guarantees for every continuous shadow.
+  BigEndianWriter long_shadow_entries;
+  std::uint32_t long_shadow_count = 0;
+  const auto collect_long_shadows = [&](const auto& self, const std::vector<Layer>& layers) -> void {
+    for (const auto& layer : layers) {
+      if (const auto id = photoshop_layer_id(layer); id && layer_has_continuous_drop_shadow(layer)) {
+        const auto& shadows = std::as_const(layer).layer_style().drop_shadows;
+        for (std::size_t index = 0; index < shadows.size() && index < 0xFFFFU; ++index) {
+          if (!shadows[index].continuous) { continue; }
+          long_shadow_entries.write_u32(*id);
+          long_shadow_entries.write_u16(static_cast<std::uint16_t>(index));
+          long_shadow_entries.write_u16(kPatchyLongShadowFlagContinuous);
+          const auto fade = std::clamp(shadows[index].fade, 0.0F, 100.0F);
+          long_shadow_entries.write_u32(static_cast<std::uint32_t>(std::lround(fade * 65536.0F)));
+          ++long_shadow_count;
+        }
+      }
+      self(self, layer.children());
+    }
+  };
+  collect_long_shadows(collect_long_shadows, document.layers());
+  if (long_shadow_count > 0) {
+    BigEndianWriter payload;
+    payload.write_u32(kPatchyLongShadowsMagic);
+    payload.write_u16(1);
+    payload.write_u16(0);
+    payload.write_u32(long_shadow_count);
+    payload.write_bytes(long_shadow_entries.bytes());
+    upsert_image_resource(*parsed, kImageResourcePatchyLongShadows, payload.bytes());
+  } else {
+    std::erase_if(*parsed, [](const auto& resource) {
+      if (resource.id != kImageResourcePatchyLongShadows || resource.payload.size() < 8) { return false; }
+      BigEndianReader reader(resource.payload);
+      return reader.read_u32() == kPatchyLongShadowsMagic && reader.read_u16() == 1;
+    });
+  }
+  const auto had_link_resource = std::any_of(parsed->begin(), parsed->end(), [](const ImageResource& resource) {
+    return resource.id == kImageResourceLayerGroupInfo;
+  });
+  const auto links = layered ? layer_link_groups_in_record_order(document.layers()) : std::vector<std::uint16_t>{};
+  const auto any_link = std::any_of(links.begin(), links.end(), [](std::uint16_t group) { return group != 0U; });
+  if (layered && !links.empty() && (any_link || had_link_resource)) {
+    BigEndianWriter groups;
+    for (const auto group : links) {
+      groups.write_u16(group);
+    }
+    upsert_image_resource(*parsed, kImageResourceLayerGroupInfo, groups.bytes());
+    upsert_image_resource(*parsed, kImageResourceLayerGroupsEnabled, std::vector<std::uint8_t>(links.size(), 1U));
+  } else {
+    // The records the resources described are gone (a flat save, no layers) or carry no link.
+    remove_image_resource(*parsed, kImageResourceLayerGroupInfo);
+    remove_image_resource(*parsed, kImageResourceLayerGroupsEnabled);
+  }
+  return write_image_resources(*parsed);
+}
+
+namespace {
+
+void collect_record_link_groups(const std::vector<Layer>& layers, const std::map<std::uint32_t, std::size_t>& counts,
+                                std::map<std::uint32_t, std::uint16_t>& renumbered,
+                                std::vector<std::uint16_t>& groups) {
+  for (const auto& layer : layers) {
+    if (layer.kind() == LayerKind::Group) {
+      groups.push_back(0U);  // the folder's closing boundary record
+      collect_record_link_groups(layer.children(), counts, renumbered, groups);
+    }
+    std::uint16_t group = 0U;
+    if (const auto found = counts.find(layer.link_group()); layer.link_group() != 0U && found != counts.end() &&
+                                                           found->second > 1U) {
+      const auto next = static_cast<std::uint16_t>(std::min<std::size_t>(renumbered.size() + 1U, 0xFFFFU));
+      group = renumbered.try_emplace(layer.link_group(), next).first->second;
+    }
+    groups.push_back(group);
+  }
+}
+
+void apply_record_link_groups(const std::vector<Layer>& layers, std::span<const std::uint16_t> groups,
+                              std::size_t& index) {
+  for (const auto& layer : layers) {
+    if (layer.kind() == LayerKind::Group) {
+      ++index;
+      apply_record_link_groups(layer.children(), groups, index);
+    }
+    // Link groups never render: set through a const walk so no revision moves.
+    const_cast<Layer&>(layer).set_link_group(groups[index++]);
+  }
+}
+
+}  // namespace
+
+std::vector<std::uint16_t> layer_link_groups_in_record_order(const std::vector<Layer>& layers) {
+  std::vector<std::uint16_t> groups;
+  std::map<std::uint32_t, std::uint16_t> renumbered;
+  collect_record_link_groups(layers, link_group_member_counts(layers), renumbered, groups);
+  return groups;
+}
+
+void apply_layer_link_resource(std::vector<Layer>& layers, std::span<const std::uint8_t> payload) {
+  std::vector<std::uint16_t> groups;
+  groups.reserve(payload.size() / 2U);
+  BigEndianReader reader(payload);
+  while (reader.remaining() >= 2U) {
+    groups.push_back(reader.read_u16());
+  }
+  if (payload.size() % 2U != 0U || groups.size() != layer_link_groups_in_record_order(layers).size()) {
+    return;
+  }
+  std::size_t index = 0;
+  apply_record_link_groups(std::as_const(layers), groups, index);
+  clear_single_member_link_groups(layers);
+}
+
+PixelBuffer thumbnail_pixels(const PixelBuffer& composite, std::span<const std::uint8_t> transparency,
+                             std::int32_t max_side) {
+  const auto width = composite.width();
+  const auto height = composite.height();
+  if (width <= 0 || height <= 0 || max_side <= 0) {
+    return {};
+  }
+  const std::int64_t longest = std::max(width, height);
+  const auto fit = [&](std::int32_t side) {
+    if (longest <= max_side) {
+      return side;
+    }
+    return static_cast<std::int32_t>(std::max<std::int64_t>(1, (side * std::int64_t{max_side} + longest / 2) / longest));
+  };
+  const auto out_width = fit(width);
+  const auto out_height = fit(height);
+  const bool use_transparency =
+      transparency.size() == static_cast<std::size_t>(width) * static_cast<std::size_t>(height);
+  PixelBuffer out(out_width, out_height, PixelFormat::rgb8());
+  auto* out_bytes = out.data().data();
+  // Per output column: the matted sums (value * 255) of R, G and B, and the pixel count.
+  std::vector<std::uint64_t> sums(static_cast<std::size_t>(out_width) * 4U, 0U);
+  std::vector<float> row(static_cast<std::size_t>(width) * 4U);
+  const auto flush = [&](std::int32_t out_y) {
+    auto* dst = out_bytes + static_cast<std::size_t>(out_y) * static_cast<std::size_t>(out_width) * 3U;
+    for (std::int32_t x = 0; x < out_width; ++x) {
+      auto* sum = &sums[static_cast<std::size_t>(x) * 4U];
+      const auto divisor = sum[3] * 255U;
+      for (std::size_t c = 0; c < 3U; ++c) {
+        dst[static_cast<std::size_t>(x) * 3U + c] =
+            divisor == 0 ? std::uint8_t{255} : static_cast<std::uint8_t>((sum[c] + divisor / 2U) / divisor);
+      }
+      std::fill(sum, sum + 4, std::uint64_t{0});
+    }
+  };
+  const auto sample = [](float value) {
+    return static_cast<std::uint64_t>(std::clamp(std::lround(value), 0L, 255L));
+  };
+  std::int32_t current_y = 0;
+  for (std::int32_t y = 0; y < height; ++y) {
+    const auto out_y = static_cast<std::int32_t>(std::int64_t{y} * out_height / height);
+    if (out_y != current_y) {
+      flush(current_y);
+      current_y = out_y;
+    }
+    load_rgba_row(composite, y, 0, width, DeepDomain::Encoded, row);
+    for (std::int32_t x = 0; x < width; ++x) {
+      const auto* pixel = &row[static_cast<std::size_t>(x) * 4U];
+      auto alpha = sample(pixel[3]);
+      if (use_transparency) {
+        alpha = (alpha * transparency[static_cast<std::size_t>(y) * static_cast<std::size_t>(width) +
+                                      static_cast<std::size_t>(x)] + 127U) / 255U;
+      }
+      auto* sum = &sums[static_cast<std::size_t>(std::int64_t{x} * out_width / width) * 4U];
+      for (std::size_t c = 0; c < 3U; ++c) {
+        sum[c] += sample(pixel[c]) * alpha + 255U * (255U - alpha);
+      }
+      ++sum[3];
+    }
+  }
+  flush(current_y);
+  return out;
+}
+
+std::vector<std::uint8_t> thumbnail_resource(std::int32_t width, std::int32_t height,
+                                             std::span<const std::uint8_t> jfif) {
+  const auto row_bytes = (static_cast<std::uint32_t>(width) * 24U + 31U) / 32U * 4U;
+  BigEndianWriter writer;
+  writer.write_u32(1);  // kJpegRGB
+  writer.write_u32(static_cast<std::uint32_t>(width));
+  writer.write_u32(static_cast<std::uint32_t>(height));
+  writer.write_u32(row_bytes);
+  writer.write_u32(row_bytes * static_cast<std::uint32_t>(height));
+  writer.write_u32(checked_u32(jfif.size(), "thumbnail size"));
+  writer.write_u16(24);
+  writer.write_u16(1);
+  writer.write_bytes(jfif);
+  return writer.bytes();
+}
+
+}  // namespace patchy::psd

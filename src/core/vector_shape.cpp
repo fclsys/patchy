@@ -1,0 +1,511 @@
+#include "core/vector_shape.hpp"
+#include "core/vector_compound.hpp"
+
+#include "core/layer_metadata.hpp"
+#include "core/smart_object.hpp"
+
+#include <algorithm>
+#include <array>
+#include <cmath>
+#include <cstdio>
+#include <cstdlib>
+#include <limits>
+
+namespace patchy {
+
+namespace {
+
+std::string format_double(double value) {
+  std::array<char, 32> buffer{};
+  // %.17g round-trips every finite double exactly.
+  std::snprintf(buffer.data(), buffer.size(), "%.17g", value);
+  return std::string(buffer.data());
+}
+
+std::optional<double> parse_double_token(const char*& cursor) {
+  char* end = nullptr;
+  const auto value = std::strtod(cursor, &end);
+  if (end == cursor) {
+    return std::nullopt;
+  }
+  cursor = end;
+  return value;
+}
+
+std::optional<long> parse_long_token(const char*& cursor) {
+  char* end = nullptr;
+  const auto value = std::strtol(cursor, &end, 10);
+  if (end == cursor) {
+    return std::nullopt;
+  }
+  cursor = end;
+  return value;
+}
+
+void skip_spaces(const char*& cursor) {
+  while (*cursor == ' ' || *cursor == '\n' || *cursor == '\r' || *cursor == '\t') {
+    ++cursor;
+  }
+}
+
+bool consume_tag(const char*& cursor, char tag) {
+  skip_spaces(cursor);
+  if (*cursor != tag) {
+    return false;
+  }
+  ++cursor;
+  return true;
+}
+
+void extend_bounds(VectorPathBounds& bounds, bool& any, double x, double y) noexcept {
+  if (!any) {
+    bounds.left = bounds.right = x;
+    bounds.top = bounds.bottom = y;
+    any = true;
+    return;
+  }
+  bounds.left = std::min(bounds.left, x);
+  bounds.right = std::max(bounds.right, x);
+  bounds.top = std::min(bounds.top, y);
+  bounds.bottom = std::max(bounds.bottom, y);
+}
+
+}  // namespace
+
+std::vector<double> dotted_dash_pattern(VectorStrokeCap cap) {
+  return stroke_dash_preset_pattern(StrokeDashPreset::Dotted, cap);
+}
+
+bool is_dotted_dash_pattern(const std::vector<double>& dashes, VectorStrokeCap cap) {
+  return dashes == std::vector<double>{0.0, 2.0} || dashes == dotted_dash_pattern(cap);
+}
+
+namespace {
+
+constexpr std::array<StrokeDashPreset, 8> kStrokeDashPresets{
+    StrokeDashPreset::Solid,       StrokeDashPreset::Dashed,     StrokeDashPreset::Dotted,
+    StrokeDashPreset::LongDashes,  StrokeDashPreset::ShortDashes, StrokeDashPreset::SparseDots,
+    StrokeDashPreset::DashDot,     StrokeDashPreset::DashDotDot};
+
+// Butt-cap forms, in stroke widths.
+std::vector<double> butt_dash_preset(StrokeDashPreset preset) {
+  switch (preset) {
+    case StrokeDashPreset::Solid:
+      return {};
+    case StrokeDashPreset::Dashed:
+      return {2.0, 2.0};
+    case StrokeDashPreset::Dotted:
+      return {1.0, 1.0};
+    case StrokeDashPreset::LongDashes:
+      return {6.0, 2.0};
+    case StrokeDashPreset::ShortDashes:
+      return {1.5, 1.0};
+    case StrokeDashPreset::SparseDots:
+      return {1.0, 3.0};
+    case StrokeDashPreset::DashDot:
+      return {4.0, 2.0, 1.0, 2.0};
+    case StrokeDashPreset::DashDotDot:
+      return {4.0, 2.0, 1.0, 2.0, 1.0, 2.0};
+  }
+  return {};
+}
+
+// The shortest prefix the array repeats, when it repeats a whole number of
+// times with an even-length period.
+std::vector<double> shortest_dash_period(const std::vector<double>& dashes) {
+  const auto size = dashes.size();
+  for (std::size_t period = 2; period < size; period += 2) {
+    if (size % period != 0) continue;
+    bool repeats = true;
+    for (std::size_t i = period; i < size && repeats; ++i) repeats = dashes[i] == dashes[i - period];
+    if (repeats) return {dashes.begin(), dashes.begin() + static_cast<std::ptrdiff_t>(period)};
+  }
+  return dashes;
+}
+
+}  // namespace
+
+std::vector<double> stroke_dash_preset_pattern(StrokeDashPreset preset, VectorStrokeCap cap) {
+  auto dashes = butt_dash_preset(preset);
+  if (cap == VectorStrokeCap::Butt || !stroke_dash_preset_follows_cap(preset)) return dashes;
+  // A round or square cap adds half a width at each end of every dash.
+  for (std::size_t i = 0; i < dashes.size(); ++i) dashes[i] += i % 2 == 0 ? -1.0 : 1.0;
+  return dashes;
+}
+
+bool stroke_dash_preset_follows_cap(StrokeDashPreset preset) {
+  return preset != StrokeDashPreset::Solid && preset != StrokeDashPreset::Dashed;
+}
+
+bool stroke_dash_preset_is_dots(StrokeDashPreset preset) {
+  return preset == StrokeDashPreset::Dotted || preset == StrokeDashPreset::SparseDots;
+}
+
+std::optional<VectorStrokeCap> stroke_dash_preset_cap(StrokeDashPreset preset) {
+  switch (preset) {
+    case StrokeDashPreset::Solid:
+      return std::nullopt;
+    case StrokeDashPreset::Dashed:
+    case StrokeDashPreset::LongDashes:
+    case StrokeDashPreset::ShortDashes:
+      return VectorStrokeCap::Butt;
+    case StrokeDashPreset::Dotted:
+    case StrokeDashPreset::SparseDots:
+    case StrokeDashPreset::DashDot:
+    case StrokeDashPreset::DashDotDot:
+      return VectorStrokeCap::Round;
+  }
+  return std::nullopt;
+}
+
+std::optional<VectorStrokeJoin> stroke_dash_preset_join(StrokeDashPreset preset) {
+  if (stroke_dash_preset_cap(preset) == VectorStrokeCap::Round) return VectorStrokeJoin::Round;
+  return std::nullopt;
+}
+
+void apply_stroke_dash_preset(VectorStroke& stroke, StrokeDashPreset preset) {
+  if (const auto cap = stroke_dash_preset_cap(preset)) stroke.cap = *cap;
+  if (const auto join = stroke_dash_preset_join(preset)) stroke.join = *join;
+  stroke.dashes = stroke_dash_preset_pattern(preset, stroke.cap);
+}
+
+const std::array<StrokeDashPreset, 8>& stroke_dash_presets_in_menu_order() {
+  static constexpr std::array<StrokeDashPreset, 8> kMenuOrder{
+      StrokeDashPreset::Solid,      StrokeDashPreset::Dashed,     StrokeDashPreset::LongDashes,
+      StrokeDashPreset::ShortDashes, StrokeDashPreset::Dotted,    StrokeDashPreset::SparseDots,
+      StrokeDashPreset::DashDot,    StrokeDashPreset::DashDotDot};
+  return kMenuOrder;
+}
+
+const char* stroke_dash_preset_token(StrokeDashPreset preset) {
+  switch (preset) {
+    case StrokeDashPreset::Solid:
+      return "solid";
+    case StrokeDashPreset::Dashed:
+      return "dashed";
+    case StrokeDashPreset::Dotted:
+      return "dotted";
+    case StrokeDashPreset::LongDashes:
+      return "long-dashes";
+    case StrokeDashPreset::ShortDashes:
+      return "short-dashes";
+    case StrokeDashPreset::SparseDots:
+      return "sparse-dots";
+    case StrokeDashPreset::DashDot:
+      return "dash-dot";
+    case StrokeDashPreset::DashDotDot:
+      return "dash-dot-dot";
+  }
+  return "solid";
+}
+
+StrokeDashPreset stroke_dash_preset_from_token(std::string_view token) {
+  for (const auto preset : kStrokeDashPresets) {
+    if (token == stroke_dash_preset_token(preset)) return preset;
+  }
+  return StrokeDashPreset::Solid;
+}
+
+std::optional<StrokeDashPreset> stroke_dash_preset_for(const std::vector<double>& dashes,
+                                                       VectorStrokeCap cap) {
+  if (dashes.empty()) return StrokeDashPreset::Solid;
+  const auto period = shortest_dash_period(dashes);
+  for (const auto preset : kStrokeDashPresets) {
+    if (preset == StrokeDashPreset::Solid) continue;
+    if (period == stroke_dash_preset_pattern(preset, cap)) return preset;
+  }
+  for (const auto preset : kStrokeDashPresets) {
+    if (stroke_dash_preset_is_dots(preset) &&
+        period == stroke_dash_preset_pattern(preset, VectorStrokeCap::Round)) {
+      return preset;
+    }
+  }
+  return std::nullopt;
+}
+
+bool VectorPath::empty() const noexcept {
+  for (const auto& subpath : subpaths) {
+    if (!subpath.anchors.empty()) {
+      return false;
+    }
+  }
+  return true;
+}
+
+std::optional<VectorPathBounds> VectorPath::bounds() const noexcept {
+  VectorPathBounds result{};
+  bool any = false;
+  for (const auto& subpath : subpaths) {
+    for (const auto& anchor : subpath.anchors) {
+      extend_bounds(result, any, anchor.anchor_x, anchor.anchor_y);
+      extend_bounds(result, any, anchor.in_x, anchor.in_y);
+      extend_bounds(result, any, anchor.out_x, anchor.out_y);
+    }
+  }
+  if (!any) {
+    return std::nullopt;
+  }
+  return result;
+}
+
+std::int32_t VectorPath::next_shape_group() const noexcept {
+  std::int32_t next = 0;
+  for (const auto& subpath : subpaths) {
+    next = std::max(next, subpath.shape_group + 1);
+  }
+  return next;
+}
+
+bool layer_has_vector_shape_marker(const Layer& layer) {
+  const auto& metadata = layer.metadata();
+  const auto it = metadata.find(kLayerMetadataVectorShape);
+  return it != metadata.end() && !it->second.empty();
+}
+
+std::string vector_lock_reason(const Layer& layer) {
+  const auto& metadata = layer.metadata();
+  const auto it = metadata.find(kLayerMetadataVectorLock);
+  return it != metadata.end() ? it->second : std::string{};
+}
+
+bool layer_is_vector_shape(const Layer& layer) {
+  return layer_has_vector_shape_marker(layer) && layer.vector_shape() != nullptr;
+}
+
+bool layer_is_fill_layer(const Layer& layer) {
+  if (!layer_is_vector_shape(layer)) {
+    return false;
+  }
+  const auto* shape = layer.vector_shape();
+  return shape->path.empty() && shape->parts.empty() && shape->fill.kind != VectorFillKind::None;
+}
+
+bool layer_pixels_are_procedural(const Layer& layer) {
+  return layer_is_text(layer) || layer_is_smart_object(layer) || layer_is_vector_shape(layer);
+}
+
+bool layer_vector_block_dirty(const Layer& layer) {
+  return layer.metadata().contains(kLayerMetadataVectorBlockDirty);
+}
+
+void drop_live_shape_origination(VectorShapeContent& content, const std::vector<int>& groups) {
+  if (groups.empty()) {
+    return;
+  }
+  content.library_shape_id.clear();
+  std::erase_if(content.origination, [&groups](const LiveShapeParams& params) {
+    return std::find(groups.begin(), groups.end(), params.index) != groups.end();
+  });
+}
+
+void mark_layer_vector_block_dirty(Layer& layer) {
+  // Writer bookkeeping only: the mark must not cold-invalidate content-keyed
+  // caches (every call site follows an edit that already bumped what the edit
+  // changed; a pure translation deliberately bumps render only).
+  layer.metadata_without_content_bump()[kLayerMetadataVectorBlockDirty] = "1";
+}
+
+void strip_layer_vector_data(Layer& layer) {
+  layer.clear_vector_shape();
+  layer.clear_vector_mask();
+  auto& metadata = layer.metadata();
+  for (auto it = metadata.begin(); it != metadata.end();) {
+    if (it->first.rfind("patchy.vector.", 0) == 0 || it->first == kLayerMetadataVectorShape) {
+      it = metadata.erase(it);
+    } else {
+      ++it;
+    }
+  }
+  auto& blocks = layer.unknown_psd_blocks();
+  std::erase_if(blocks, [](const UnknownPsdBlock& block) {
+    return block.key == "vmsk" || block.key == "vsms" || block.key == "vscg" || block.key == "vstk" ||
+           block.key == "vogk" || block.key == "vowv" || block.key == "SoCo" || block.key == "GdFl" ||
+           block.key == "PtFl";
+  });
+}
+
+std::string serialize_vector_path(const VectorPath& path) {
+  std::string out = "v1 ";
+  out += std::to_string(path.fill_rule_value);
+  out += ' ';
+  out += std::to_string(path.initial_fill_value);
+  out += ' ';
+  out += std::to_string(path.subpaths.size());
+  for (const auto& subpath : path.subpaths) {
+    out += "\nS ";
+    out += subpath.closed ? '1' : '0';
+    out += ' ';
+    out += std::to_string(static_cast<int>(subpath.op));
+    out += ' ';
+    out += std::to_string(subpath.shape_group);
+    out += ' ';
+    out += std::to_string(subpath.anchors.size());
+    for (const auto& anchor : subpath.anchors) {
+      out += "\nA ";
+      out += anchor.smooth ? '1' : '0';
+      out += ' ';
+      out += format_double(anchor.anchor_x);
+      out += ' ';
+      out += format_double(anchor.anchor_y);
+      out += ' ';
+      out += format_double(anchor.in_x);
+      out += ' ';
+      out += format_double(anchor.in_y);
+      out += ' ';
+      out += format_double(anchor.out_x);
+      out += ' ';
+      out += format_double(anchor.out_y);
+    }
+  }
+  return out;
+}
+
+std::optional<VectorPath> parse_vector_path(std::string_view text) {
+  const std::string copy(text);
+  const char* cursor = copy.c_str();
+  skip_spaces(cursor);
+  if (*cursor != 'v' || *(cursor + 1) != '1') {
+    return std::nullopt;
+  }
+  cursor += 2;
+  VectorPath path;
+  const auto fill_rule = parse_long_token(cursor);
+  const auto initial_fill = parse_long_token(cursor);
+  const auto subpath_count = parse_long_token(cursor);
+  if (!fill_rule.has_value() || !initial_fill.has_value() || !subpath_count.has_value() ||
+      *subpath_count < 0 || static_cast<std::size_t>(*subpath_count) > text.size() / 10U) {
+    return std::nullopt;
+  }
+  path.fill_rule_value = static_cast<std::uint16_t>(*fill_rule);
+  path.initial_fill_value = static_cast<std::uint16_t>(*initial_fill);
+  path.subpaths.reserve(static_cast<std::size_t>(*subpath_count));
+  for (long subpath_index = 0; subpath_index < *subpath_count; ++subpath_index) {
+    if (!consume_tag(cursor, 'S')) {
+      return std::nullopt;
+    }
+    PathSubpath subpath;
+    const auto closed = parse_long_token(cursor);
+    const auto op = parse_long_token(cursor);
+    const auto group = parse_long_token(cursor);
+    const auto anchor_count = parse_long_token(cursor);
+    if (!closed.has_value() || !op.has_value() || !group.has_value() || !anchor_count.has_value() ||
+        *op < 0 || *op > 3 || *anchor_count < 0 ||
+        static_cast<std::size_t>(*anchor_count) > text.size() / 16U) {
+      return std::nullopt;
+    }
+    subpath.closed = *closed != 0;
+    subpath.op = static_cast<PathCombineOp>(*op);
+    subpath.shape_group = static_cast<std::int32_t>(*group);
+    subpath.anchors.reserve(static_cast<std::size_t>(*anchor_count));
+    for (long anchor_index = 0; anchor_index < *anchor_count; ++anchor_index) {
+      if (!consume_tag(cursor, 'A')) {
+        return std::nullopt;
+      }
+      PathAnchor anchor;
+      const auto smooth = parse_long_token(cursor);
+      const auto ax = parse_double_token(cursor);
+      const auto ay = parse_double_token(cursor);
+      const auto in_x = parse_double_token(cursor);
+      const auto in_y = parse_double_token(cursor);
+      const auto out_x = parse_double_token(cursor);
+      const auto out_y = parse_double_token(cursor);
+      if (!smooth.has_value() || !ax.has_value() || !ay.has_value() || !in_x.has_value() ||
+          !in_y.has_value() || !out_x.has_value() || !out_y.has_value()) {
+        return std::nullopt;
+      }
+      anchor.smooth = *smooth != 0;
+      anchor.anchor_x = *ax;
+      anchor.anchor_y = *ay;
+      anchor.in_x = *in_x;
+      anchor.in_y = *in_y;
+      anchor.out_x = *out_x;
+      anchor.out_y = *out_y;
+      subpath.anchors.push_back(anchor);
+    }
+    path.subpaths.push_back(std::move(subpath));
+  }
+  skip_spaces(cursor);
+  if (*cursor != '\0') {
+    return std::nullopt;
+  }
+  return path;
+}
+
+std::int32_t path_coordinate_to_fixed(double pixels, std::int32_t extent) noexcept {
+  if (extent <= 0) {
+    return 0;
+  }
+  constexpr double kPathFixedScale = 16777216.0;
+  const auto scaled = std::llround((pixels * kPathFixedScale) / static_cast<double>(extent));
+  return static_cast<std::int32_t>(
+      std::clamp(scaled, static_cast<long long>(std::numeric_limits<std::int32_t>::min()),
+                 static_cast<long long>(std::numeric_limits<std::int32_t>::max())));
+}
+
+double path_coordinate_from_fixed(std::int32_t fixed, std::int32_t extent) noexcept {
+  constexpr double kPathFixedScale = 16777216.0;
+  return (static_cast<double>(fixed) / kPathFixedScale) * static_cast<double>(extent);
+}
+
+void transform_vector_path(VectorPath& path, const std::array<double, 6>& matrix) {
+  const auto apply = [&matrix](double& x, double& y) {
+    const double source_x = x;
+    const double source_y = y;
+    x = matrix[0] * source_x + matrix[2] * source_y + matrix[4];
+    y = matrix[1] * source_x + matrix[3] * source_y + matrix[5];
+  };
+  for (auto& subpath : path.subpaths) {
+    for (auto& anchor : subpath.anchors) {
+      apply(anchor.anchor_x, anchor.anchor_y);
+      apply(anchor.in_x, anchor.in_y);
+      apply(anchor.out_x, anchor.out_y);
+    }
+  }
+}
+
+void transform_vector_path_projective(VectorPath& path, const std::array<double, 9>& homography) {
+  const auto apply = [&homography](double& x, double& y) {
+    const double w = homography[6] * x + homography[7] * y + homography[8];
+    if (std::abs(w) < 1e-12) {
+      return;
+    }
+    const double source_x = x;
+    const double source_y = y;
+    x = (homography[0] * source_x + homography[1] * source_y + homography[2]) / w;
+    y = (homography[3] * source_x + homography[4] * source_y + homography[5]) / w;
+  };
+  for (auto& subpath : path.subpaths) {
+    for (auto& anchor : subpath.anchors) {
+      apply(anchor.anchor_x, anchor.anchor_y);
+      apply(anchor.in_x, anchor.in_y);
+      apply(anchor.out_x, anchor.out_y);
+    }
+  }
+}
+
+void translate_vector_path(VectorPath& path, double dx, double dy) {
+  transform_vector_path(path, {1.0, 0.0, 0.0, 1.0, dx, dy});
+}
+
+void translate_vector_shape_content(VectorShapeContent& content, double dx, double dy) {
+  translate_vector_path(content.path, dx, dy);
+  transform_vector_part_appearance(content, {1, 0, 0, 1, dx, dy}, 1.0);
+  for (auto& params : content.origination) {
+    params.left += dx;
+    params.right += dx;
+    params.top += dy;
+    params.bottom += dy;
+    for (std::size_t i = 0; i < params.box_corners.size(); i += 2) {
+      params.box_corners[i] += dx;
+      params.box_corners[i + 1] += dy;
+    }
+    params.line_start_x += dx;
+    params.line_end_x += dx;
+    params.line_start_y += dy;
+    params.line_end_y += dy;
+    params.transform[4] += dx;
+    params.transform[5] += dy;
+  }
+}
+
+}  // namespace patchy

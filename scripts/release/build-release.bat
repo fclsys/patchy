@@ -1,0 +1,640 @@
+@echo off
+setlocal EnableExtensions EnableDelayedExpansion
+
+rem This script lives in scripts\release, two levels below the repo root.
+pushd "%~dp0..\.." || exit /b 1
+set "REPO=%CD%"
+rem Every folder this script deletes is REPO plus a literal build\... suffix, so make
+rem sure REPO really is this repository first (AGENTS.md, destructive deletes).
+if not defined REPO goto fail
+if not exist "%REPO%\CMakeLists.txt" goto fail
+
+rem Architecture (docs/release-process.md): no argument, or "all", packages x64 and then
+rem Windows ARM64, each by a run of this script with that argument; "x64" or "arm64"
+rem packages one. Both are built on this x64 PC: ARM64 is cross-compiled
+rem (windows-arm64-cross-release) and its executables are run by verify-remote.ps1
+rem -Target windows-arm64 on the ARM64 host.
+set "PATCHY_ARCH=%~1"
+if not defined PATCHY_ARCH set "PATCHY_ARCH=all"
+if /i "%PATCHY_ARCH%"=="all" (
+  if exist "%REPO%\build\package\PatchyGeglSources.zip" del /f /q "%REPO%\build\package\PatchyGeglSources.zip"
+  call "%~f0" x64
+  if not "!ERRORLEVEL!"=="0" goto fail
+  rem The x64 half signed with this token and PIN, so the ARM64 half may retry from its first file.
+  set "PATCHY_SIGNING_PROVEN=1"
+  call "%~f0" arm64
+  if not "!ERRORLEVEL!"=="0" goto fail
+  rem The source of the GEGL every package carries, published beside them (docs/gegl-filters.md, "Sources").
+  powershell -NoProfile -ExecutionPolicy Bypass -File "%REPO%\scripts\release\make-gegl-sources.ps1"
+  if not "!ERRORLEVEL!"=="0" goto fail
+  popd
+  exit /b 0
+)
+if /i not "%PATCHY_ARCH%"=="x64" if /i not "%PATCHY_ARCH%"=="arm64" (
+  echo Unknown architecture "%PATCHY_ARCH%" ^(expected x64, arm64, or all^).
+  goto fail
+)
+if /i "%PATCHY_ARCH%"=="arm64" (set "PATCHY_ARCH=arm64") else set "PATCHY_ARCH=x64"
+rem :SignFile retries a failed signature only after one has passed in this run, the x64 half
+rem of the same "all" run included (PATCHY_SIGNING_PROVEN, set above once that half is done).
+set "SIGNED_ONE_FILE="
+if defined PATCHY_SIGNING_PROVEN if not defined PATCHY_ALLOW_UNSIGNED set "SIGNED_ONE_FILE=1"
+
+set "CMAKE_EXE=C:\Program Files\Microsoft Visual Studio\18\Community\Common7\IDE\CommonExtensions\Microsoft\CMake\CMake\bin\cmake.exe"
+if not exist "%CMAKE_EXE%" set "CMAKE_EXE=cmake"
+set "CSC_EXE=%SystemRoot%\Microsoft.NET\Framework64\v4.0.30319\csc.exe"
+if not exist "%CSC_EXE%" set "CSC_EXE=csc.exe"
+
+set "APP_NAME=Patchy"
+set "SIGN_DISPLAY_NAME=Patchy"
+set "SIGN_DOMAIN=rtsoft.com"
+set "SIGNTOOL_EXE=C:\Program Files (x86)\Windows Kits\10\bin\10.0.26100.0\x64\signtool.exe"
+set "IEXPRESS_EXE=%SystemRoot%\System32\iexpress.exe"
+if not exist "%IEXPRESS_EXE%" set "IEXPRESS_EXE=iexpress.exe"
+
+rem QT_HOST_PREFIX is the x64 kit: the whole Qt of an x64 package, and the host tools
+rem (windeployqt, lrelease, moc) of an ARM64 one, whose kit holds only target files.
+set "QT_HOST_PREFIX=%PATCHY_QT_PREFIX%"
+if not defined QT_HOST_PREFIX set "QT_HOST_PREFIX=%REPO%\.deps\Qt\6.8.3\msvc2022_64"
+set "WINDEPLOYQT=%QT_HOST_PREFIX%\bin\windeployqt.exe"
+set "QT_PREFIX=%QT_HOST_PREFIX%"
+set "QTPATHS=%QT_PREFIX%\bin\qtpaths.exe"
+if not exist "%QTPATHS%" set "QTPATHS=%QT_PREFIX%\bin\qtpaths6.exe"
+set "WINDEPLOYQT_TARGET="
+set "PRESET=release"
+set "BUILD_DIR=%REPO%\build\release"
+set "PACKAGE_SUFFIX="
+set "STAGING_NAME=staging"
+set "INSTALLER_WORK_NAME=installer"
+set "VERIFY_WORK_NAME=verify"
+set "QT_SBOM_MODULES=qtbase qtimageformats qtsvg qtpdf"
+set "CONFIGURE_EXTRA="
+rem The ARM64 kit, aqt's win64_msvc2022_arm64_cross_compiled per docs/building.md, has no
+rem qtpdf: PDF import is the stub there and its SPDX notice is not shipped. cmd.exe is
+rem native on every Windows, so PROCESSOR_ARCHITECTURE names the real processor here; an
+rem emulated x64 process would see AMD64, which is why Patchy itself never reads it.
+set "CAN_RUN_PACKAGE=1"
+if /i "%PATCHY_ARCH%"=="arm64" (
+  set "QT_PREFIX=%REPO%\.deps\Qt\6.8.3\msvc2022_arm64"
+  set "QTPATHS=%REPO%\.deps\Qt\6.8.3\msvc2022_arm64\bin\qtpaths.bat"
+  set "WINDEPLOYQT_TARGET=--qtpaths "%REPO%\.deps\Qt\6.8.3\msvc2022_arm64\bin\qtpaths.bat""
+  set "PRESET=windows-arm64-cross-release"
+  set "BUILD_DIR=%REPO%\build\windows-arm64-cross-release"
+  set "PACKAGE_SUFFIX=Arm64"
+  set "STAGING_NAME=staging-arm64"
+  set "INSTALLER_WORK_NAME=installer-arm64"
+  set "VERIFY_WORK_NAME=verify-arm64"
+  set "QT_SBOM_MODULES=qtbase qtimageformats qtsvg"
+  set "CONFIGURE_EXTRA=-DQT_HOST_PATH=%QT_HOST_PREFIX:\=/%"
+  if /i not "%PROCESSOR_ARCHITECTURE%"=="ARM64" set "CAN_RUN_PACKAGE=0"
+)
+
+if not exist "%WINDEPLOYQT%" (
+  echo windeployqt.exe was not found at "%WINDEPLOYQT%".
+  echo Set PATCHY_QT_PREFIX to a Qt 6 MSVC x64 install and run this script again.
+  goto fail
+)
+
+if not exist "%QTPATHS%" (
+  echo qtpaths was not found under "%QT_PREFIX%\bin".
+  if /i "%PATCHY_ARCH%"=="arm64" (
+    echo Install the ARM64 kit as docs/building.md describes ^("Windows ARM64 cross builds"^).
+  ) else (
+    echo Set PATCHY_QT_PREFIX to a complete Qt 6 MSVC x64 install and run this script again.
+  )
+  goto fail
+)
+
+call "%REPO%\scripts\vs-env.bat" -arch=%PATCHY_ARCH% -host_arch=x64 >nul
+if not "!ERRORLEVEL!"=="0" goto fail
+
+if not defined PATCHY_PACKAGE_VERSION (
+  for /f "usebackq delims=" %%V in (`powershell -NoProfile -ExecutionPolicy Bypass -Command "$text = Get-Content -Raw -LiteralPath 'CMakeLists.txt'; $match = [regex]::Match($text, 'project\s*\([\s\S]*?\bVERSION\s+([0-9]+(?:\.[0-9]+){1,3})', [Text.RegularExpressions.RegexOptions]::IgnoreCase); if ($match.Success) { $match.Groups[1].Value } else { '0.0.0' }"`) do set "PATCHY_PACKAGE_VERSION=%%V"
+)
+
+set "PACKAGE_ROOT=%REPO%\build\package"
+set "PACKAGE_NAME=Patchy"
+set "STAGE_DIR=%PACKAGE_ROOT%\%STAGING_NAME%\%PACKAGE_NAME%"
+rem Release asset names (permanent: the update manifest and the download links use them).
+set "ZIP_FILE_NAME=PatchyWindows%PACKAGE_SUFFIX%NoInstaller.zip"
+set "ZIP_PATH=%PACKAGE_ROOT%\%ZIP_FILE_NAME%"
+rem Inside the installer the zip keeps the x64 name: InstallPatchyLauncher.cs looks for it.
+set "PAYLOAD_ZIP_NAME=PatchyWindowsNoInstaller.zip"
+set "LEGACY_ZIP_PATH=%PACKAGE_ROOT%\PatchyWindows.zip"
+set "INSTALLER_PATH=%PACKAGE_ROOT%\PatchyWindows%PACKAGE_SUFFIX%Installer.exe"
+set "INSTALLER_WORK_DIR=%PACKAGE_ROOT%\%INSTALLER_WORK_NAME%"
+set "INSTALLER_PAYLOAD_DIR=%INSTALLER_WORK_DIR%\payload"
+set "INSTALLER_SED_PATH=%INSTALLER_WORK_DIR%\PatchyWindowsInstaller.sed"
+set "WINDOWS_PACKAGING_DIR=%REPO%\packaging\windows"
+set "APP_ICON=%REPO%\src\app\patchy.ico"
+set "APP_EXE=%BUILD_DIR%\patchy.exe"
+
+rem Delete the previous package outputs up front: if any later step fails, nothing
+rem stale is left behind for the upload scripts to pick up by accident.
+if exist "%ZIP_PATH%" del /q "%ZIP_PATH%"
+if exist "%LEGACY_ZIP_PATH%" del /q "%LEGACY_ZIP_PATH%"
+if exist "%INSTALLER_PATH%" del /q "%INSTALLER_PATH%"
+
+rem The packaged executables must come from THIS build. cmake --build reports a
+rem failed link as a NEGATIVE exit code (a locked patchy.exe gave -1 on September 25,
+rem 2026), which "if errorlevel 1" does not catch, so every check in this file compares
+rem against 0 instead. Belt and braces: delete the previous executables first, moving a
+rem running one aside the way the PRE_LINK steps in CMakeLists.txt do (a renamed image
+rem keeps running), so a failed link leaves no executable to package.
+for %%E in (patchy.exe patchy-mcp.exe patchy-8bf-host32.exe patchy-8bf-host64.exe patchy-gegl-host.exe) do (
+  "%CMAKE_EXE%" "-DPATCHY_LOCKED_EXECUTABLE=%BUILD_DIR:\=/%/%%E" -P "%REPO%\cmake\unlock_locked_executable.cmake"
+  if exist "%BUILD_DIR%\%%E" (
+    echo "%BUILD_DIR%\%%E" could not be deleted or moved aside. Close the program using it and rerun.
+    goto fail
+  )
+)
+
+echo Configuring %PATCHY_ARCH% release build ^(preset %PRESET%^)...
+"%CMAKE_EXE%" --preset %PRESET% -DPATCHY_BUILD_APP=ON -DPATCHY_REQUIRE_AI_SELECTION=ON -DPATCHY_REQUIRE_GEGL=ON -DPATCHY_GMIC_THREADS=ON -DCMAKE_PREFIX_PATH="%QT_PREFIX%" %CONFIGURE_EXTRA%
+if not "!ERRORLEVEL!"=="0" goto fail
+
+echo Building %PRESET% preset...
+"%CMAKE_EXE%" --build --preset %PRESET% --target patchy_refresh_build_stamp
+if not "!ERRORLEVEL!"=="0" goto fail
+"%CMAKE_EXE%" --build --preset %PRESET%
+if not "!ERRORLEVEL!"=="0" goto fail
+
+if not exist "%APP_EXE%" (
+  echo Release executable was not created at "%APP_EXE%".
+  goto fail
+)
+if not exist "%BUILD_DIR%\patchy-mcp.exe" (
+  echo The connector was not created at "%BUILD_DIR%\patchy-mcp.exe".
+  goto fail
+)
+
+echo Deploying Qt runtime...
+"%WINDEPLOYQT%" %WINDEPLOYQT_TARGET% --release "%APP_EXE%"
+if not "!ERRORLEVEL!"=="0" goto fail
+
+call :SignReleaseExe
+if not "!ERRORLEVEL!"=="0" goto fail
+
+if not exist "%PACKAGE_ROOT%" mkdir "%PACKAGE_ROOT%"
+set "PATCHY_PACKAGE_ROOT=%PACKAGE_ROOT%"
+set "PATCHY_STAGE_DIR=%STAGE_DIR%"
+powershell -NoProfile -ExecutionPolicy Bypass -Command "$root = [IO.Path]::GetFullPath($env:PATCHY_PACKAGE_ROOT); $target = [IO.Path]::GetFullPath($env:PATCHY_STAGE_DIR); if (-not $target.StartsWith($root + [IO.Path]::DirectorySeparatorChar, [StringComparison]::OrdinalIgnoreCase)) { Write-Error 'Refusing to clear staging directory outside the package root.'; exit 1 }"
+if not "!ERRORLEVEL!"=="0" goto fail
+
+if exist "%STAGE_DIR%" rmdir /s /q "%STAGE_DIR%"
+if exist "%STAGE_DIR%" goto fail
+mkdir "%STAGE_DIR%" || goto fail
+
+echo Staging application and Qt runtime...
+copy /Y "%APP_EXE%" "%STAGE_DIR%\" >nul || goto fail
+copy /Y "%BUILD_DIR%\patchy-mcp.exe" "%STAGE_DIR%\" >nul || goto fail
+rem The legacy 8BF plug-in hosts (docs/plugins.md): both bitnesses ship next to patchy.exe.
+if not exist "%BUILD_DIR%\patchy-8bf-host32.exe" (
+  echo The 32-bit plug-in host was not created at "%BUILD_DIR%\patchy-8bf-host32.exe".
+  goto fail
+)
+if not exist "%BUILD_DIR%\patchy-8bf-host64.exe" (
+  echo The 64-bit plug-in host was not created at "%BUILD_DIR%\patchy-8bf-host64.exe".
+  goto fail
+)
+copy /Y "%BUILD_DIR%\patchy-8bf-host32.exe" "%STAGE_DIR%\" >nul || goto fail
+copy /Y "%BUILD_DIR%\patchy-8bf-host64.exe" "%STAGE_DIR%\" >nul || goto fail
+rem The GEGL helper and Patchy's own GEGL, with its licenses in gegl\licenses (docs/gegl-filters.md).
+if not exist "%BUILD_DIR%\gegl\bin\libgegl-0.4-0.dll" (
+  echo Patchy's own GEGL was not copied into "%BUILD_DIR%\gegl"; build it with scripts\dev\gegl\build-gegl-msys2.sh.
+  goto fail
+)
+xcopy /E /I /Y "%BUILD_DIR%\gegl" "%STAGE_DIR%\gegl" >nul || goto fail
+if not exist "%BUILD_DIR%\patchy-gegl-host.exe" (
+  echo The GEGL helper was not created at "%BUILD_DIR%\patchy-gegl-host.exe".
+  goto fail
+)
+copy /Y "%BUILD_DIR%\patchy-gegl-host.exe" "%STAGE_DIR%\" >nul || goto fail
+rem The plug-ins folder ships with its README so users see where .8bf files go.
+mkdir "%STAGE_DIR%\plugins" || goto fail
+copy /Y "%REPO%\packaging\plugins\README.txt" "%STAGE_DIR%\plugins\README.txt" >nul || goto fail
+xcopy /E /I /Y "%BUILD_DIR%\ai" "%STAGE_DIR%\ai" >nul || goto fail
+xcopy /E /I /Y "%BUILD_DIR%\scripts" "%STAGE_DIR%\scripts" >nul || goto fail
+rem Automatic selection (docs/ai-selection-models.md): ONNX Runtime beside patchy.exe and the
+rem models with their license texts in ai-models\. The configure above requires them.
+for %%F in (onnxruntime.dll onnxruntime_providers_shared.dll) do (
+  if not exist "%BUILD_DIR%\%%F" (
+    echo ONNX Runtime was not staged at "%BUILD_DIR%\%%F"; run scripts\setup-ai-deps.ps1.
+    goto fail
+  )
+  copy /Y "%BUILD_DIR%\%%F" "%STAGE_DIR%\" >nul || goto fail
+)
+if not exist "%BUILD_DIR%\ai-models\mobile_sam_image_encoder_int8.onnx" (
+  echo The automatic selection models were not staged in "%BUILD_DIR%\ai-models"; run scripts\setup-ai-deps.ps1.
+  goto fail
+)
+xcopy /E /I /Y "%BUILD_DIR%\ai-models" "%STAGE_DIR%\ai-models" >nul || goto fail
+"%WINDEPLOYQT%" %WINDEPLOYQT_TARGET% --release ^
+  --dir "%STAGE_DIR%" ^
+  --no-compiler-runtime ^
+  --no-translations ^
+  --no-system-d3d-compiler ^
+  --no-system-dxc-compiler ^
+  --no-opengl-sw ^
+  --exclude-plugins "qtuiotouchplugin,qminimal,qdirect2d,qgif,qico,qicns,qtga,qwbmp" ^
+  "%STAGE_DIR%\patchy.exe"
+if not "!ERRORLEVEL!"=="0" goto fail
+
+for %%F in (
+  "%STAGE_DIR%\imageformats\qgif.dll"
+  "%STAGE_DIR%\imageformats\qicns.dll"
+  "%STAGE_DIR%\imageformats\qico.dll"
+  "%STAGE_DIR%\imageformats\qtga.dll"
+  "%STAGE_DIR%\imageformats\qwbmp.dll"
+) do (
+  if exist "%%~fF" del /q "%%~fF"
+)
+for %%R in ("%STAGE_DIR%\vc_redist.*.exe") do del /q "%%~fR"
+
+call :CopyRequiredImageFormatPlugins
+if not "!ERRORLEVEL!"=="0" goto fail
+
+call :CopyRequiredTlsPlugins
+if not "!ERRORLEVEL!"=="0" goto fail
+
+call :CopyRequiredPlatformPlugins
+if not "!ERRORLEVEL!"=="0" goto fail
+
+call :CopyMsvcRuntimeDlls
+if not "!ERRORLEVEL!"=="0" goto fail
+
+call :CopyTranslations
+if not "!ERRORLEVEL!"=="0" goto fail
+
+call :CopyBundledFonts
+if not "!ERRORLEVEL!"=="0" goto fail
+
+copy /Y "%REPO%\README.md" "%STAGE_DIR%\README.md" >nul
+copy /Y "%REPO%\NOTICE-THIRD-PARTY.md" "%STAGE_DIR%\NOTICE-THIRD-PARTY.md" >nul
+copy /Y "%REPO%\LICENSE" "%STAGE_DIR%\LICENSE" >nul || goto fail
+copy /Y "%APP_ICON%" "%STAGE_DIR%\Patchy.ico" >nul || goto fail
+
+call :CopyQtLicenseSbom
+if not "!ERRORLEVEL!"=="0" goto fail
+
+rem The G'MIC engine is linked into patchy.exe; its license texts ship with it.
+if not exist "%STAGE_DIR%\licenses\gmic" mkdir "%STAGE_DIR%\licenses\gmic" || goto fail
+copy /Y "%REPO%\src\filters\gmic\COPYING" "%STAGE_DIR%\licenses\gmic\gmic-COPYING.txt" >nul || goto fail
+copy /Y "%REPO%\src\filters\gmic\pocketfft\LICENSE.md" "%STAGE_DIR%\licenses\gmic\pocketfft-LICENSE.md" >nul || goto fail
+
+if "%CAN_RUN_PACKAGE%"=="1" (
+  call :HeadlessSmokeCheck
+  if not "!ERRORLEVEL!"=="0" goto fail
+  "%STAGE_DIR%\patchy-mcp.exe" --check
+  if not "!ERRORLEVEL!"=="0" goto fail
+) else (
+  echo Skipping the headless smoke check and patchy-mcp --check: ARM64 executables do not run on this PC.
+  echo scripts\release\verify-remote.ps1 -Target windows-arm64 runs them on the ARM64 host.
+)
+
+echo Writing install manifest...
+set "PATCHY_INSTALL_MANIFEST=%STAGE_DIR%\PatchyInstallManifest.txt"
+powershell -NoProfile -ExecutionPolicy Bypass -Command "$stage = [IO.Path]::GetFullPath($env:PATCHY_STAGE_DIR).TrimEnd('\') + '\'; $manifest = [IO.Path]::GetFullPath($env:PATCHY_INSTALL_MANIFEST); $files = Get-ChildItem -LiteralPath $env:PATCHY_STAGE_DIR -Recurse -File | Where-Object { [IO.Path]::GetFullPath($_.FullName) -ne $manifest } | ForEach-Object { $_.FullName.Substring($stage.Length) } | Sort-Object; $files = @($files) + 'PatchyInstallManifest.txt'; Set-Content -LiteralPath $manifest -Value $files -Encoding ASCII"
+if not "!ERRORLEVEL!"=="0" goto fail
+
+rem The connector check just ran patchy-mcp.exe and antivirus scans freshly copied
+rem executables, so a staged .exe can stay locked for a moment. Wait until each one
+rem opens for reading (up to two minutes) before zipping. A scanner can also take the
+rem lock again between that check and the zip (1.14's first package run), so
+rem make-windows-zip.ps1 retries a few times, starting over from an empty archive each
+rem time. It writes forward-slash entry names; Compress-Archive wrote backslashes that
+rem Linux unzip tools keep in the file names (issue 651).
+echo Creating zip package...
+powershell -NoProfile -ExecutionPolicy Bypass -Command "$deadline = (Get-Date).AddSeconds(120); foreach ($f in Get-ChildItem -LiteralPath $env:PATCHY_STAGE_DIR -Recurse -File -Filter *.exe) { while ($true) { try { $s = [IO.File]::Open($f.FullName, 'Open', 'Read', 'Read'); $s.Close(); break } catch { if ((Get-Date) -gt $deadline) { Write-Host ('Still locked: ' + $f.FullName); exit 1 }; Start-Sleep -Milliseconds 500 } } }"
+if not "!ERRORLEVEL!"=="0" goto fail
+powershell -NoProfile -ExecutionPolicy Bypass -File "%REPO%\scripts\release\make-windows-zip.ps1" -Source "%STAGE_DIR%" -Output "%ZIP_PATH%"
+if not "!ERRORLEVEL!"=="0" goto fail
+if exist "%LEGACY_ZIP_PATH%" del /q "%LEGACY_ZIP_PATH%"
+
+echo Release zip created: "%ZIP_PATH%"
+
+echo Creating Windows installer...
+call :CreateWindowsInstaller
+if not "!ERRORLEVEL!"=="0" goto fail
+
+call :SignInstaller
+if not "!ERRORLEVEL!"=="0" goto fail
+
+rem Unpack the finished installer and zip and exercise them without installing: the
+rem wizard's smoke mode, a self-contained DLL check, and packaging\package-selftest.js
+rem on the unpacked patchy.exe. A package that fails is moved aside so the upload
+rem scripts can never publish it (issue 55 shipped an installer nobody had run).
+echo Verifying the built packages...
+powershell -NoProfile -ExecutionPolicy Bypass -File "%REPO%\scripts\release\verify-windows-package.ps1" -Arch %PATCHY_ARCH% -Installer "%INSTALLER_PATH%" -Zip "%ZIP_PATH%" -Version "%PATCHY_PACKAGE_VERSION%" -WorkDir "%PACKAGE_ROOT%\%VERIFY_WORK_NAME%"
+if not "!ERRORLEVEL!"=="0" goto rejectpackage
+
+echo Release installer created: "%INSTALLER_PATH%"
+popd
+exit /b 0
+
+:SignReleaseExe
+call :SignFile "%APP_EXE%"
+if not "!ERRORLEVEL!"=="0" exit /b !ERRORLEVEL!
+call :SignFile "%BUILD_DIR%\patchy-mcp.exe"
+if not "!ERRORLEVEL!"=="0" exit /b !ERRORLEVEL!
+call :SignFile "%BUILD_DIR%\patchy-8bf-host32.exe"
+if not "!ERRORLEVEL!"=="0" exit /b !ERRORLEVEL!
+call :SignFile "%BUILD_DIR%\patchy-8bf-host64.exe"
+if not "!ERRORLEVEL!"=="0" exit /b !ERRORLEVEL!
+call :SignFile "%BUILD_DIR%\patchy-gegl-host.exe"
+exit /b %ERRORLEVEL%
+
+:SignInstaller
+call :SignFile "%INSTALLER_PATH%"
+exit /b %ERRORLEVEL%
+
+:SignFile
+set "SIGN_TARGET=%~1"
+rem PATCHY_ALLOW_UNSIGNED=1 is the escape hatch for a local packaging run on a machine
+rem without the signing credentials. Without it a missing signer is a hard error: this
+rem script builds what gets published, SmartScreen punishes an unsigned installer, and
+rem "signing skipped" must never scroll past unnoticed in a long release log. The macOS
+rem side had the same silent skip; see PATCHY_REQUIRE_SIGNING in packaging/macos/make-dmg.sh.
+if not defined RT_PROJECTS (
+  if /i "%PATCHY_ALLOW_UNSIGNED%"=="1" (
+    echo RT_PROJECTS is not set; signing skipped for "%SIGN_TARGET%" ^(PATCHY_ALLOW_UNSIGNED=1^).
+    exit /b 0
+  )
+  echo ERROR: RT_PROJECTS is not set, so "%SIGN_TARGET%" cannot be signed.
+  echo Set RT_PROJECTS, or set PATCHY_ALLOW_UNSIGNED=1 for a deliberately unsigned local build.
+  exit /b 1
+)
+
+if not exist "%RT_PROJECTS%\Signing\sign.bat" (
+  if /i "%PATCHY_ALLOW_UNSIGNED%"=="1" (
+    echo Signing script was not found: "%RT_PROJECTS%\Signing\sign.bat"; signing skipped for "%SIGN_TARGET%" ^(PATCHY_ALLOW_UNSIGNED=1^).
+    exit /b 0
+  )
+  echo ERROR: signing script was not found: "%RT_PROJECTS%\Signing\sign.bat".
+  echo "%SIGN_TARGET%" cannot be signed.
+  echo Fix the path, or set PATCHY_ALLOW_UNSIGNED=1 for a deliberately unsigned local build.
+  exit /b 1
+)
+
+if not exist "%SIGNTOOL_EXE%" (
+  echo SignTool was not found: "%SIGNTOOL_EXE%"
+  exit /b 1
+)
+
+rem The key is on a hardware token, which now and then fails one signature with a smart card
+rem error (SignerSign 0x8010001F) that the same call then passes. Retry that file instead of
+rem failing a run whose packages are otherwise done, but only once a file has signed in this
+rem run: sign.bat sends the token's PIN on every call, and retrying a wrong one could lock it.
+set "SIGN_ATTEMPT=0"
+:SignFileAttempt
+set /a SIGN_ATTEMPT+=1
+powershell -NoProfile -ExecutionPolicy Bypass -Command "Start-Sleep -Seconds 2"
+call "%RT_PROJECTS%\Signing\sign.bat" "%SIGN_TARGET%" "%SIGN_DISPLAY_NAME%" "%SIGN_DOMAIN%"
+set "SIGN_CODE=!ERRORLEVEL!"
+if not "!SIGN_CODE!"=="0" (
+  if defined SIGNED_ONE_FILE if !SIGN_ATTEMPT! LSS 3 (
+    echo Signing "%SIGN_TARGET%" failed ^(attempt !SIGN_ATTEMPT! of 3^); retrying in 15 seconds.
+    powershell -NoProfile -ExecutionPolicy Bypass -Command "Start-Sleep -Seconds 15"
+    goto SignFileAttempt
+  )
+  exit /b !SIGN_CODE!
+)
+set "SIGNED_ONE_FILE=1"
+
+"%SIGNTOOL_EXE%" verify /pa /v "%SIGN_TARGET%"
+exit /b %ERRORLEVEL%
+
+:CopyRequiredImageFormatPlugins
+set "PATCHY_STAGE_IMAGEFORMATS=%STAGE_DIR%\imageformats"
+if not exist "%PATCHY_STAGE_IMAGEFORMATS%" mkdir "%PATCHY_STAGE_IMAGEFORMATS%" || exit /b 1
+for %%P in (qgif qjpeg qsvg qtiff qwebp) do (
+  if not exist "%QT_PREFIX%\plugins\imageformats\%%P.dll" (
+    echo Required Qt image format plugin was not found: "%QT_PREFIX%\plugins\imageformats\%%P.dll".
+    echo Install the Qt qtimageformats module and run this script again.
+    exit /b 1
+  )
+  copy /Y "%QT_PREFIX%\plugins\imageformats\%%P.dll" "%PATCHY_STAGE_IMAGEFORMATS%\" >nul || exit /b 1
+)
+exit /b 0
+
+:CopyRequiredTlsPlugins
+set "PATCHY_STAGE_TLS=%STAGE_DIR%\tls"
+if not exist "%PATCHY_STAGE_TLS%" mkdir "%PATCHY_STAGE_TLS%" || exit /b 1
+for %%P in (qschannelbackend) do (
+  if not exist "%QT_PREFIX%\plugins\tls\%%P.dll" (
+    echo Required Qt TLS plugin was not found: "%QT_PREFIX%\plugins\tls\%%P.dll".
+    exit /b 1
+  )
+  copy /Y "%QT_PREFIX%\plugins\tls\%%P.dll" "%PATCHY_STAGE_TLS%\" >nul || exit /b 1
+)
+exit /b 0
+
+:CopyRequiredPlatformPlugins
+rem windeployqt deploys qwindows only; qoffscreen (what --headless loads) is copied
+rem here on purpose so the shipped package can run with no display.
+set "PATCHY_STAGE_PLATFORMS=%STAGE_DIR%\platforms"
+if not exist "%PATCHY_STAGE_PLATFORMS%" mkdir "%PATCHY_STAGE_PLATFORMS%" || exit /b 1
+for %%P in (qwindows qoffscreen) do (
+  if not exist "%QT_PREFIX%\plugins\platforms\%%P.dll" (
+    echo Required Qt platform plugin was not found: "%QT_PREFIX%\plugins\platforms\%%P.dll".
+    exit /b 1
+  )
+  copy /Y "%QT_PREFIX%\plugins\platforms\%%P.dll" "%PATCHY_STAGE_PLATFORMS%\" >nul || exit /b 1
+)
+exit /b 0
+
+:HeadlessSmokeCheck
+rem Proves the STAGED tree runs with no display: Qt DLLs, platforms\qoffscreen.dll, the
+rem MSVC runtime, fonts, and translations all come from %STAGE_DIR%. --headless never
+rem forwards to a running Patchy; PATCHY_SETTINGS_DIR keeps the run out of the real
+rem settings; the temp files live outside staging so the install manifest never sees
+rem them. The bounded wait turns a hang into a failure: Qt's "no platform plugin"
+rem MessageBox has no console to print to.
+setlocal
+set "SMOKE_DIR=%PACKAGE_ROOT%\headless-smoke"
+if exist "%SMOKE_DIR%" rmdir /s /q "%SMOKE_DIR%"
+mkdir "%SMOKE_DIR%\settings" || exit /b 1
+> "%SMOKE_DIR%\smoke.js" echo console.log("headless smoke")
+set "PATCHY_SETTINGS_DIR=%SMOKE_DIR%\settings"
+set "PATCHY_NO_SOUND=1"
+set "QT_COMMAND_LINE_PARSER_NO_GUI_MESSAGE_BOXES=1"
+set "PATCHY_SMOKE_EXE=%STAGE_DIR%\patchy.exe"
+set "PATCHY_SMOKE_SCRIPT=%SMOKE_DIR%\smoke.js"
+set "PATCHY_SMOKE_OUTPUT=%SMOKE_DIR%\smoke-output.txt"
+echo Running the headless smoke check on the staged package...
+powershell -NoProfile -ExecutionPolicy Bypass -Command "$q = [char]34; $a = '--headless --run-script ' + $q + $env:PATCHY_SMOKE_SCRIPT + $q + ' --script-output ' + $q + $env:PATCHY_SMOKE_OUTPUT + $q; $p = Start-Process -FilePath $env:PATCHY_SMOKE_EXE -ArgumentList $a -PassThru; if (-not $p.WaitForExit(180000)) { $p.Kill(); Write-Error 'Headless smoke check timed out after 180 s.'; exit 1 }; if ($p.ExitCode -ne 0) { Write-Error ('Headless smoke check exited with code ' + $p.ExitCode); exit 1 }; if (-not (Test-Path -LiteralPath $env:PATCHY_SMOKE_OUTPUT)) { Write-Error 'Headless smoke check wrote no output file.'; exit 1 }; $last = @(Get-Content -LiteralPath $env:PATCHY_SMOKE_OUTPUT | Where-Object { $_ -ne '' })[-1]; if ($last -ne '[done]') { Write-Error ('Headless smoke check did not end with [done]: ' + $last); exit 1 }"
+set "SMOKE_RESULT=%ERRORLEVEL%"
+if "%SMOKE_RESULT%"=="0" echo Headless smoke check passed.
+endlocal & exit /b %SMOKE_RESULT%
+
+:CopyMsvcRuntimeDlls
+if not defined VCINSTALLDIR (
+  echo VCINSTALLDIR is not set; cannot locate app-local MSVC runtime DLLs.
+  exit /b 1
+)
+
+set "MSVC_REDIST_ROOT=%VCINSTALLDIR%Redist\MSVC"
+if not exist "%MSVC_REDIST_ROOT%" (
+  echo MSVC redistributable root was not found: "%MSVC_REDIST_ROOT%".
+  exit /b 1
+)
+
+set "PATCHY_MSVC_REDIST_ROOT=%MSVC_REDIST_ROOT%"
+set "PATCHY_CRT_ARCH=%PATCHY_ARCH%"
+powershell -NoProfile -ExecutionPolicy Bypass -Command "$root = [IO.Path]::GetFullPath($env:PATCHY_MSVC_REDIST_ROOT); $stage = [IO.Path]::GetFullPath($env:PATCHY_STAGE_DIR); $arch = $env:PATCHY_CRT_ARCH; $crt = Get-ChildItem -LiteralPath $root -Directory | ForEach-Object { Get-ChildItem -Path (Join-Path $_.FullName ($arch + '\Microsoft.VC*.CRT')) -Directory -ErrorAction SilentlyContinue } | Sort-Object FullName -Descending | Select-Object -First 1; if ($null -eq $crt) { Write-Error ('No ' + $arch + ' Microsoft.VC*.CRT directory found under ' + $root); exit 1 }; $files = Get-ChildItem -LiteralPath $crt.FullName -Filter '*.dll' -File | Sort-Object Name; if ($files.Count -eq 0) { Write-Error ('No MSVC runtime DLLs found under ' + $crt.FullName); exit 1 }; foreach ($file in $files) { Copy-Item -LiteralPath $file.FullName -Destination (Join-Path $stage $file.Name) -Force }; $omp = Get-ChildItem -Path (Join-Path $crt.Parent.FullName 'Microsoft.VC*.OpenMP') -Directory -ErrorAction SilentlyContinue | Select-Object -First 1; if ($null -eq $omp) { Write-Error ('No Microsoft.VC*.OpenMP directory found beside ' + $crt.FullName); exit 1 }; $ompFiles = Get-ChildItem -LiteralPath $omp.FullName -Filter '*.dll' -File; if ($ompFiles.Count -eq 0) { Write-Error ('No OpenMP runtime DLL found under ' + $omp.FullName); exit 1 }; foreach ($file in $ompFiles) { Copy-Item -LiteralPath $file.FullName -Destination (Join-Path $stage $file.Name) -Force }"
+exit /b %ERRORLEVEL%
+
+:CopyTranslations
+set "PATCHY_BUILD_TRANSLATIONS=%BUILD_DIR%\translations"
+set "PATCHY_STAGE_TRANSLATIONS=%STAGE_DIR%\translations"
+rem CMake writes languages.txt (one catalog code per line, from PATCHY_TRANSLATED_LANGUAGES)
+rem and stages patchy_<code>.qm plus qtbase_<code>.qm beside it; every shipped language
+rem must be present before packaging. Only those two families are shipped; anything else
+rem in the directory (stale qt_*.qm from older deploy runs) is left behind.
+if not exist "%PATCHY_BUILD_TRANSLATIONS%\languages.txt" (
+  echo Translation language list was not found: "%PATCHY_BUILD_TRANSLATIONS%\languages.txt".
+  exit /b 1
+)
+for /f "usebackq delims=" %%L in ("%PATCHY_BUILD_TRANSLATIONS%\languages.txt") do (
+  if not exist "%PATCHY_BUILD_TRANSLATIONS%\patchy_%%L.qm" (
+    echo Patchy translation was not found: "%PATCHY_BUILD_TRANSLATIONS%\patchy_%%L.qm".
+    exit /b 1
+  )
+  if not exist "%PATCHY_BUILD_TRANSLATIONS%\qtbase_%%L.qm" (
+    echo Qt base translation was not found: "%PATCHY_BUILD_TRANSLATIONS%\qtbase_%%L.qm".
+    exit /b 1
+  )
+)
+if not exist "%PATCHY_STAGE_TRANSLATIONS%" mkdir "%PATCHY_STAGE_TRANSLATIONS%" || exit /b 1
+copy /Y "%PATCHY_BUILD_TRANSLATIONS%\patchy_*.qm" "%PATCHY_STAGE_TRANSLATIONS%\" >nul || exit /b 1
+copy /Y "%PATCHY_BUILD_TRANSLATIONS%\qtbase_*.qm" "%PATCHY_STAGE_TRANSLATIONS%\" >nul || exit /b 1
+exit /b 0
+
+:CopyBundledFonts
+set "PATCHY_BUNDLED_FONTS=%REPO%\third_party\fonts"
+set "PATCHY_STAGE_FONTS=%STAGE_DIR%\fonts"
+if not exist "%PATCHY_BUNDLED_FONTS%" (
+  echo Bundled font directory was not found: "%PATCHY_BUNDLED_FONTS%".
+  exit /b 1
+)
+if not exist "%PATCHY_STAGE_FONTS%" mkdir "%PATCHY_STAGE_FONTS%" || exit /b 1
+powershell -NoProfile -ExecutionPolicy Bypass -Command "Copy-Item -Path (Join-Path $env:PATCHY_BUNDLED_FONTS '*') -Destination $env:PATCHY_STAGE_FONTS -Recurse -Force"
+exit /b %ERRORLEVEL%
+
+:CopyQtLicenseSbom
+for /f "usebackq delims=" %%V in (`"%QTPATHS%" --qt-version`) do set "QT_VERSION=%%V"
+if not defined QT_VERSION (
+  echo Could not determine the Qt version from "%QTPATHS%".
+  exit /b 1
+)
+
+set "QT_SBOM_DIR=%QT_PREFIX%\sbom"
+set "QT_LICENSE_DIR=%STAGE_DIR%\licenses\qt"
+if not exist "%QT_LICENSE_DIR%" mkdir "%QT_LICENSE_DIR%" || exit /b 1
+
+for %%M in (%QT_SBOM_MODULES%) do (
+  set "QT_SBOM_FILE=%QT_SBOM_DIR%\%%M-%QT_VERSION%.spdx"
+  if not exist "!QT_SBOM_FILE!" (
+    echo Required Qt license SBOM was not found: "!QT_SBOM_FILE!".
+    exit /b 1
+  )
+  copy /Y "!QT_SBOM_FILE!" "%QT_LICENSE_DIR%\" >nul || exit /b 1
+)
+exit /b 0
+
+:CreateWindowsInstaller
+if not exist "%IEXPRESS_EXE%" (
+  echo iexpress.exe was not found. It is required to create "%INSTALLER_PATH%".
+  exit /b 1
+)
+
+if not exist "%WINDOWS_PACKAGING_DIR%\InstallPatchyLauncher.cs" (
+  echo Installer launcher source was not found: "%WINDOWS_PACKAGING_DIR%\InstallPatchyLauncher.cs".
+  exit /b 1
+)
+
+if not exist "%WINDOWS_PACKAGING_DIR%\InstallPatchy.ps1" (
+  echo Installer PowerShell template was not found: "%WINDOWS_PACKAGING_DIR%\InstallPatchy.ps1".
+  exit /b 1
+)
+
+if not exist "%WINDOWS_PACKAGING_DIR%\PatchyWindowsInstaller.sed.in" (
+  echo IExpress template was not found: "%WINDOWS_PACKAGING_DIR%\PatchyWindowsInstaller.sed.in".
+  exit /b 1
+)
+
+if not exist "%APP_ICON%" (
+  echo Application icon was not found: "%APP_ICON%".
+  exit /b 1
+)
+
+set "PATCHY_INSTALLER_WORK_DIR=%INSTALLER_WORK_DIR%"
+powershell -NoProfile -ExecutionPolicy Bypass -Command "$root = [IO.Path]::GetFullPath($env:PATCHY_PACKAGE_ROOT); $target = [IO.Path]::GetFullPath($env:PATCHY_INSTALLER_WORK_DIR); if (-not $target.StartsWith($root + [IO.Path]::DirectorySeparatorChar, [StringComparison]::OrdinalIgnoreCase)) { Write-Error 'Refusing to clear installer work directory outside the package root.'; exit 1 }"
+if not "!ERRORLEVEL!"=="0" exit /b !ERRORLEVEL!
+
+if exist "%INSTALLER_WORK_DIR%" rmdir /s /q "%INSTALLER_WORK_DIR%"
+if exist "%INSTALLER_WORK_DIR%" exit /b 1
+mkdir "%INSTALLER_PAYLOAD_DIR%" || exit /b 1
+
+set "PATCHY_INSTALLER_PAYLOAD_DIR=%INSTALLER_PAYLOAD_DIR%\"
+copy /Y "%ZIP_PATH%" "%INSTALLER_PAYLOAD_DIR%\%PAYLOAD_ZIP_NAME%" >nul || exit /b 1
+copy /Y "%WINDOWS_PACKAGING_DIR%\InstallPatchy.ps1" "%INSTALLER_PAYLOAD_DIR%\InstallPatchy.ps1" >nul || exit /b 1
+copy /Y "%APP_ICON%" "%INSTALLER_PAYLOAD_DIR%\Patchy.ico" >nul || exit /b 1
+rem The wizard draws its logo from that icon; a frame the installer's PowerShell cannot
+rem decode used to stop setup at its first window (issue 55).
+powershell -NoProfile -ExecutionPolicy Bypass -File "%INSTALLER_PAYLOAD_DIR%\InstallPatchy.ps1" -PayloadZip "%INSTALLER_PAYLOAD_DIR%\%PAYLOAD_ZIP_NAME%" -CheckLogo
+if not "!ERRORLEVEL!"=="0" exit /b !ERRORLEVEL!
+powershell -NoProfile -ExecutionPolicy Bypass -Command "Set-Content -LiteralPath (Join-Path $env:PATCHY_INSTALLER_PAYLOAD_DIR 'PatchyVersion.txt') -Value $env:PATCHY_PACKAGE_VERSION -Encoding ASCII"
+if not "!ERRORLEVEL!"=="0" exit /b !ERRORLEVEL!
+rem InstallPatchy.ps1 reads this to refuse an ARM64 payload on an x64 or x86 PC.
+powershell -NoProfile -ExecutionPolicy Bypass -Command "Set-Content -LiteralPath (Join-Path $env:PATCHY_INSTALLER_PAYLOAD_DIR 'PatchyArchitecture.txt') -Value $env:PATCHY_ARCH -Encoding ASCII"
+if not "!ERRORLEVEL!"=="0" exit /b !ERRORLEVEL!
+
+"%CSC_EXE%" /nologo /target:winexe /platform:x64 /optimize+ /win32icon:"%APP_ICON%" /reference:System.Windows.Forms.dll /out:"%INSTALLER_PAYLOAD_DIR%\InstallPatchy.exe" "%WINDOWS_PACKAGING_DIR%\InstallPatchyLauncher.cs"
+if not "!ERRORLEVEL!"=="0" exit /b !ERRORLEVEL!
+
+if not exist "%WINDOWS_PACKAGING_DIR%\UninstallPatchy.cs" (
+  echo Installer uninstaller source was not found: "%WINDOWS_PACKAGING_DIR%\UninstallPatchy.cs".
+  exit /b 1
+)
+"%CSC_EXE%" /nologo /target:winexe /platform:x64 /optimize+ /win32icon:"%APP_ICON%" /out:"%INSTALLER_PAYLOAD_DIR%\UninstallPatchy.exe" "%WINDOWS_PACKAGING_DIR%\UninstallPatchy.cs"
+if not "!ERRORLEVEL!"=="0" exit /b !ERRORLEVEL!
+
+call :SignFile "%INSTALLER_PAYLOAD_DIR%\InstallPatchy.exe"
+if not "!ERRORLEVEL!"=="0" exit /b !ERRORLEVEL!
+
+call :SignFile "%INSTALLER_PAYLOAD_DIR%\UninstallPatchy.exe"
+if not "!ERRORLEVEL!"=="0" exit /b !ERRORLEVEL!
+
+set "PATCHY_INSTALLER_SED_TEMPLATE=%WINDOWS_PACKAGING_DIR%\PatchyWindowsInstaller.sed.in"
+set "PATCHY_INSTALLER_SED_PATH=%INSTALLER_SED_PATH%"
+set "PATCHY_INSTALLER_PATH=%INSTALLER_PATH%"
+set "PATCHY_APP_ICON_PATH=%APP_ICON%"
+powershell -NoProfile -ExecutionPolicy Bypass -Command "$sed = Get-Content -Raw -LiteralPath $env:PATCHY_INSTALLER_SED_TEMPLATE; $sed = $sed.Replace('__INSTALLER_PATH__', $env:PATCHY_INSTALLER_PATH).Replace('__PAYLOAD_DIR__', $env:PATCHY_INSTALLER_PAYLOAD_DIR).Replace('__APP_ICON_PATH__', $env:PATCHY_APP_ICON_PATH); Set-Content -LiteralPath $env:PATCHY_INSTALLER_SED_PATH -Value $sed -Encoding ASCII"
+if not "!ERRORLEVEL!"=="0" exit /b !ERRORLEVEL!
+
+if exist "%INSTALLER_PATH%" del /q "%INSTALLER_PATH%"
+set "PATCHY_IEXPRESS_EXE=%IEXPRESS_EXE%"
+set "PATCHY_INSTALLER_SED_RUN_PATH=%INSTALLER_SED_PATH%"
+powershell -NoProfile -ExecutionPolicy Bypass -Command "$process = Start-Process -FilePath $env:PATCHY_IEXPRESS_EXE -ArgumentList @('/N', '/Q', $env:PATCHY_INSTALLER_SED_RUN_PATH) -Wait -PassThru; exit $process.ExitCode"
+set "IEXPRESS_EXIT_CODE=%ERRORLEVEL%"
+
+set "PATCHY_INSTALLER_WAIT_PATH=%INSTALLER_PATH%"
+powershell -NoProfile -ExecutionPolicy Bypass -Command "$path = $env:PATCHY_INSTALLER_WAIT_PATH; $deadline = (Get-Date).AddSeconds(120); $lastSize = -1L; while ((Get-Date) -lt $deadline) { if (Test-Path -LiteralPath $path -PathType Leaf) { $size = (Get-Item -LiteralPath $path).Length; if ($size -gt 0 -and $size -eq $lastSize) { exit 0 }; $lastSize = $size }; Start-Sleep -Milliseconds 500 }; Write-Error ('IExpress completed, but the installer was not created at a stable nonzero size: ' + $path); exit 1"
+if not "!ERRORLEVEL!"=="0" exit /b !ERRORLEVEL!
+if not "%IEXPRESS_EXIT_CODE%"=="0" echo IExpress returned exit code %IEXPRESS_EXIT_CODE% after creating "%INSTALLER_PATH%"; continuing.
+exit /b 0
+
+:rejectpackage
+echo Package verification failed. Moving the packages to "%PACKAGE_ROOT%\rejected".
+if not exist "%PACKAGE_ROOT%\rejected" mkdir "%PACKAGE_ROOT%\rejected"
+if exist "%ZIP_PATH%" move /Y "%ZIP_PATH%" "%PACKAGE_ROOT%\rejected\" >nul
+if exist "%INSTALLER_PATH%" move /Y "%INSTALLER_PATH%" "%PACKAGE_ROOT%\rejected\" >nul
+rem A package that could not be moved must not stay where the upload scripts look.
+if exist "%ZIP_PATH%" del /q "%ZIP_PATH%"
+if exist "%INSTALLER_PATH%" del /q "%INSTALLER_PATH%"
+
+:fail
+echo Release build/package failed.
+popd
+exit /b 1

@@ -1,0 +1,4474 @@
+#include "ui/image_document_io.hpp"
+#include "ui/theme_script_host.hpp"
+#include "ui/export_documents_folder_dialog.hpp"
+#include "ui/animation_preview_window.hpp"
+#include "formats/apng_writer.hpp"
+#include "formats/webp_animation_io.hpp"
+// The JS scripting engine host (docs/scripting.md): per-run QJSEngine lifecycle,
+// the bootstrap prelude (console/timers/include/patchy namespace), the watchdog,
+// undo/refresh integration, and the MainWindow-facing services the API wrappers
+// (script_api.cpp) and script canvas windows call. ScriptEngineHost is a friend
+// of MainWindow; every wrapper reaches MainWindow through here.
+
+#include "ui/main_window_shared.hpp"
+#include "ui/script_engine.hpp"
+#include "ui/text_document.hpp"
+
+#include "filters/gmic/gmic_catalog.hpp"
+#include "filters/gmic/gmic_engine.hpp"
+#include "ui/gmic_library.hpp"
+
+#include "core/layer_metadata.hpp"
+#include "core/text_area.hpp"
+#include "core/layer_render_utils.hpp"
+#include "core/layer_tree.hpp"
+#include "core/palette.hpp"
+#include "core/smart_object.hpp"
+#include "filters/filter_engine.hpp"
+#include "ui/canvas_widget.hpp"
+#include "ui/color_panel.hpp"
+#include "ui/dialog_utils.hpp"
+#include "ui/filter_workflows.hpp"
+#include "ui/font_face_name_index.hpp"
+#include "ui/main_window.hpp"
+#include "ui/mcp_activity.hpp"
+#include "ui/pdf_export.hpp"
+#include "ui/panel_column.hpp"
+#include <QScopedValueRollback>
+#include <QDialog>
+#include "ui/localization.hpp"
+#include "ui/qt_geometry.hpp"
+#include "ui/script_api.hpp"
+#include "ui/script_perspective.hpp"
+#include "ui/hotkey_editor.hpp"
+#include "ui/script_canvas_window.hpp"
+#include "ui/script_folders.hpp"
+#include "ui/smart_object_render.hpp"
+#include "ui/sound_effects.hpp"
+#include "ui/text_layout.hpp"
+#include "ui/theme_qss.hpp"
+#include "ui/theme_palette.hpp"
+
+#include <QApplication>
+#include <QCheckBox>
+#include <QCloseEvent>
+#include <QColor>
+#include <QComboBox>
+#include <QCoreApplication>
+#include <QDialogButtonBox>
+#include <QDoubleSpinBox>
+#include <QElapsedTimer>
+#include <QEventLoop>
+#include <QFile>
+#include <QFileDialog>
+#include <QFileInfo>
+#include <QFormLayout>
+#include <QDir>
+#include <QHBoxLayout>
+#include <QInputDialog>
+#include <QJSEngine>
+#include <QSaveFile>
+#include <QScopeGuard>
+#include <QJsonDocument>
+#include <QJsonArray>
+#include <QJSValueIterator>
+#include <QLabel>
+#include <QLineEdit>
+#include <QPushButton>
+#include <QQmlEngine>
+#include <QSpinBox>
+#include <QStatusBar>
+#include <QTextCharFormat>
+#include <QTextCursor>
+#include <QTextEdit>
+#include <QTextStream>
+#include <QTimer>
+#include <QVBoxLayout>
+
+#include <algorithm>
+#include <array>
+#include <cmath>
+#include <functional>
+#include <memory>
+#include <utility>
+#include <vector>
+
+namespace patchy::ui {
+
+namespace {
+
+// Inactivity window, not a runtime limit: a script may run for hours as long
+// as it keeps making API calls; this is how long one may go completely silent
+// (no pixel write, file operation, or console output) before it is treated as
+// a stuck loop and interrupted.
+constexpr int kDefaultWatchdogTimeoutMs = 120000;
+
+// Defines console/timers/include and the `patchy` namespace on the global
+// object, backed by the hidden host bridge objects. Runs non-strict so the
+// IIFE's `this` is the global object.
+constexpr const char* kBootstrapSource = R"JS(
+(function() {
+  var g = this;
+  var host = g.__patchy_host;
+  function fmt(value) {
+    if (typeof value === 'string') { return value; }
+    if (value === undefined) { return 'undefined'; }
+    if (value === null) { return 'null'; }
+    try {
+      var json = JSON.stringify(value);
+      if (json !== undefined) { return json; }
+    } catch (e) {}
+    return String(value);
+  }
+  function joined(args) { return Array.prototype.map.call(args, fmt).join(' '); }
+  g.console = {
+    log: function() { host.consoleEmit(0, joined(arguments)); },
+    info: function() { host.consoleEmit(0, joined(arguments)); },
+    warn: function() { host.consoleEmit(1, joined(arguments)); },
+    error: function() { host.consoleEmit(2, joined(arguments)); }
+  };
+  g.setTimeout = function(fn, ms) { return host.scriptSetTimer(fn, ms | 0, false); };
+  g.setInterval = function(fn, ms) { return host.scriptSetTimer(fn, ms | 0, true); };
+  g.clearTimeout = function(id) { host.scriptClearTimer(id | 0); };
+  g.clearInterval = function(id) { host.scriptClearTimer(id | 0); };
+  g.requestAnimationFrame = function(fn) { return host.scriptSetTimer(fn, 16, false); };
+  g.include = function(path) { host.includeScript(String(path)); };
+  g.patchy = {
+    app: g.app,
+    io: g.__patchy_io,
+    ui: g.__patchy_ui,
+    recovery: g.__patchy_recovery,
+    plugins: g.__patchy_plugins,
+    gegl: g.__patchy_gegl,
+    gmic: g.__patchy_gmic,
+    perspective: g.__patchy_perspective,
+    scripts: g.__patchy_scripts,
+    apiVersion: g.app.apiVersion,
+    version: g.app.version,
+    args: g.__patchy_args,
+    setResult: function(value) {
+      var json = JSON.stringify([value]);
+      host.scriptSetResult(json);
+    },
+    isMainScript: function() { return !host.scriptIsIncluded(); }
+  };
+  g.patchy.brushes = {};
+  ['listTips','getTip','listPresets','getPreset','getCurrent','resolve','renderPreview',
+   'createTip','importAbr','savePreset','updatePreset','duplicatePreset','removePreset','activate'].forEach(function(name) {
+    g.patchy.brushes[name] = function() { return host.scriptBrushCall(name, Array.prototype.slice.call(arguments)); };
+  });
+})();
+)JS";
+
+}  // namespace
+
+// ---------------------------------------------------------------------------
+// ScriptWatchdog
+
+ScriptWatchdog::ScriptWatchdog(std::function<void()> on_timeout)
+    : on_timeout_(std::move(on_timeout)) {
+#if defined(Q_OS_WASM) && !defined(__EMSCRIPTEN_PTHREADS__)
+  // Single-threaded wasm has no watchdog thread: arm/disarm/feed stay callable
+  // no-ops (flag writes with no waiter) and stuck-loop interruption is lost,
+  // which nothing on this platform could deliver anyway since the engine's
+  // evaluate() cannot be preempted. A pthreads-enabled wasm build spawns the
+  // watchdog like the desktop platforms.
+  return;
+#endif
+  thread_ = std::thread([this] {
+    std::unique_lock<std::mutex> lock(mutex_);
+    for (;;) {
+      cv_.wait(lock, [this] { return quit_ || armed_; });
+      if (quit_) {
+        return;
+      }
+      if (cv_.wait_until(lock, deadline_, [this] { return quit_ || !armed_; })) {
+        if (quit_) {
+          return;
+        }
+        continue;  // disarmed in time
+      }
+      // Deadline passed with the guard still armed. Activity (feed) extends
+      // the window: keep sleeping until a full timeout elapsed with no sign
+      // of life from the script.
+      const auto fed_until =
+          std::chrono::steady_clock::time_point(std::chrono::milliseconds(
+              last_activity_ms_.load(std::memory_order_relaxed))) +
+          timeout_;
+      if (fed_until > deadline_) {
+        deadline_ = fed_until;
+        continue;
+      }
+      armed_ = false;
+      // A genuinely stuck script: interrupt the engine. The callback only
+      // flips an atomic inside QJSEngine, safe from this thread.
+      on_timeout_();
+    }
+  });
+}
+
+ScriptWatchdog::~ScriptWatchdog() {
+  {
+    const std::lock_guard<std::mutex> lock(mutex_);
+    quit_ = true;
+  }
+  cv_.notify_all();
+  if (thread_.joinable()) {
+    thread_.join();
+  }
+}
+
+void ScriptWatchdog::arm(std::chrono::milliseconds timeout) {
+  feed();
+  {
+    const std::lock_guard<std::mutex> lock(mutex_);
+    deadline_ = std::chrono::steady_clock::now() + timeout;
+    timeout_ = timeout;
+    armed_ = true;
+  }
+  cv_.notify_all();
+}
+
+void ScriptWatchdog::disarm() {
+  {
+    const std::lock_guard<std::mutex> lock(mutex_);
+    armed_ = false;
+  }
+  cv_.notify_all();
+}
+
+// ---------------------------------------------------------------------------
+// ScriptEngineHost
+
+ScriptEngineHost::ScriptEngineHost(MainWindow& window) : QObject(&window), window_(window) {}
+
+ScriptEngineHost::~ScriptEngineHost() {
+  // The status bar can be destroyed before this QObject child of MainWindow.
+  // QPointer also handles that parent-owned teardown order.
+  delete script_activity_.data();
+  if (run_ != nullptr) {
+    teardown_run_resources();
+    run_.reset();
+  }
+  { const std::lock_guard lock(interrupt_mutex_); engine_.reset(); }
+}
+
+QString ScriptEngineHost::active_run_name() const {
+  return run_ != nullptr ? run_->name : QString();
+}
+
+std::chrono::milliseconds ScriptEngineHost::watchdog_timeout() const {
+  bool ok = false;
+  const int value = qEnvironmentVariableIntValue("PATCHY_SCRIPT_TIMEOUT_MS", &ok);
+  return std::chrono::milliseconds(ok && value > 0 ? value : kDefaultWatchdogTimeoutMs);
+}
+
+void ScriptEngineHost::emit_message(MessageKind kind, const QString& text) {
+  constexpr int kBacklogLimit = 500;
+  message_backlog_.append(text);
+  if (message_backlog_.size() > kBacklogLimit) {
+    message_backlog_.removeFirst();
+  }
+  emit message_emitted(static_cast<int>(kind), text);
+}
+
+void ScriptEngineHost::report_error(const QJSValue& error) {
+  QString text = error.toString();
+  const auto file = error.property(QStringLiteral("fileName")).toString();
+  const auto line = error.property(QStringLiteral("lineNumber")).toInt();
+  if (!file.isEmpty()) {
+    text += QStringLiteral(" (%1:%2)").arg(QFileInfo(file).fileName()).arg(line);
+  } else if (line > 0) {
+    text += QStringLiteral(" (line %1)").arg(line);
+  }
+  emit_message(MessageKind::Error, text);
+}
+
+bool ScriptEngineHost::run_file(const QString& path, QStringList args, bool unattended) {
+  QFile file(path);
+  if (!file.open(QIODevice::ReadOnly | QIODevice::Text)) {
+    emit_message(MessageKind::Error,
+                 tr("Could not read script file: %1").arg(QDir::toNativeSeparators(path)));
+    return false;
+  }
+  RunOptions options;
+  options.name = QFileInfo(path).fileName();
+  options.path = path;
+  options.args = std::move(args);
+  options.unattended = unattended;
+  return run_source(QString::fromUtf8(file.readAll()), std::move(options));
+}
+
+bool ScriptEngineHost::run_source(const QString& source, RunOptions options) {
+  if (run_ != nullptr) {
+    emit_message(MessageKind::Error, tr("A script is already running: %1").arg(run_->name));
+    return false;
+  }
+  if (watchdog_ == nullptr) {
+    watchdog_ = std::make_unique<ScriptWatchdog>([this] {
+      if (engine_ != nullptr) {
+        engine_->setInterrupted(true);
+      }
+    });
+  }
+  // A pixel shape still pending in a window (GitHub issue 716) is painted before the script
+  // sees any document: its own history entry, ahead of the script's.
+  for (const auto& target_session : window_.sessions_) {
+    if (target_session != nullptr && target_session->canvas != nullptr) {
+      target_session->canvas->commit_pending_pixel_shape();
+    }
+  }
+  run_ = std::make_unique<ScriptRun>();
+  run_->name = options.name.isEmpty() ? tr("Untitled Script") : options.name;
+  run_->unattended = options.unattended;
+  // Parse "key=value" tokens once; install_bindings surfaces them as
+  // patchy.args and show_options_dialog merges them over field defaults.
+  for (const auto& token : options.args) {
+    const auto separator = token.indexOf(QLatin1Char('='));
+    const auto key = separator < 0 ? token : token.left(separator);
+    if (!key.isEmpty()) {
+      run_->args[key] = separator < 0 ? QString() : token.mid(separator + 1);
+    }
+  }
+  if (!options.path.isEmpty()) {
+    run_->include_dir_stack.push_back(QFileInfo(options.path).absolutePath());
+  }
+  last_result_ = QJsonValue(QJsonValue::Null);
+  {
+    const std::lock_guard lock(interrupt_mutex_);
+    engine_ = std::make_unique<QJSEngine>();
+    install_bindings(options);
+    engine_->setInterrupted(external_interrupt_);
+  }
+  emit run_state_changed();
+
+  run_->sync_running = true;
+  run_->burst_clock.start();
+  run_->run_clock.start();
+  if (run_->unattended && !connector_mode_ && window_.isVisible() &&
+      !qEnvironmentVariableIsSet("PATCHY_HEADLESS")) {
+    if (!script_activity_) {
+      script_activity_ = new McpActivity(window_, [this] { stop_active_run(); }, true);
+    }
+    script_activity_->set_connected(tr("Script"));
+    script_activity_->set_operation(run_->name, true);
+  }
+  watchdog_->arm(watchdog_timeout());
+  const auto file_name = options.path.isEmpty() ? run_->name : options.path;
+  const QJSValue result = engine_->evaluate(source, file_name, 1);
+  watchdog_->disarm();
+  run_->sync_running = false;
+  if (manual_edit_pause()) { begin_manual_pause(); emit paused_changed(true); }
+  end_progress_indicator();
+  if (engine_->isInterrupted()) {
+    run_->had_error = true;
+    engine_->setInterrupted(false);
+    emit_message(MessageKind::Error,
+                 run_->stop_requested || external_interrupt_
+                     ? tr("Script stopped.")
+                     : tr("Script stopped: no activity for %1 seconds (a stuck loop?).")
+                           .arg(watchdog_timeout().count() / 1000));
+  } else if (result.isError()) {
+    run_->had_error = true;
+    report_error(result);
+  }
+  schedule_completion_check();
+  return !run_->had_error;
+}
+
+void ScriptEngineHost::install_bindings(const RunOptions& options) {
+  auto& engine = *engine_;
+  auto global = engine.globalObject();
+
+  // patchy.args: the CLI --script-arg key=value tokens (empty object
+  // otherwise; parsed in run_source). Tokens without '=' become keys with an
+  // empty-string value.
+  Q_UNUSED(options);
+  auto args_object = engine.newObject();
+  for (const auto& [key, value] : run_->args) {
+    args_object.setProperty(key, value);
+  }
+  global.setProperty(QStringLiteral("__patchy_args"), args_object);
+
+  // The bridge objects stay C++-owned: `this` is parented to the window, and
+  // the singleton wrappers are parented to the engine, so the JS GC never deletes
+  // them (per-access document/layer wrappers are parentless and JS-owned).
+  const auto host_value = engine.newQObject(this);
+  QQmlEngine::setObjectOwnership(this, QQmlEngine::CppOwnership);
+  global.setProperty(QStringLiteral("__patchy_host"), host_value);
+
+  auto* app_object = new ScriptAppObject(*this);
+  app_object->setParent(&engine);
+  global.setProperty(QStringLiteral("app"), engine.newQObject(app_object));
+
+  auto* io_object = new ScriptIoObject(*this);
+  io_object->setParent(&engine);
+  global.setProperty(QStringLiteral("__patchy_io"), engine.newQObject(io_object));
+
+  auto* ui_object = new ScriptUiObject(*this);
+  ui_object->setParent(&engine);
+  global.setProperty(QStringLiteral("__patchy_ui"), engine.newQObject(ui_object));
+
+  auto* recovery_object = new ScriptRecoveryObject(*this);
+  recovery_object->setParent(&engine);
+  global.setProperty(QStringLiteral("__patchy_recovery"), engine.newQObject(recovery_object));
+
+  auto* plugins_object = new ScriptPluginsObject(*this);
+  plugins_object->setParent(&engine);
+  global.setProperty(QStringLiteral("__patchy_plugins"), engine.newQObject(plugins_object));
+  auto* gegl_object = new ScriptGeglObject(*this);
+  gegl_object->setParent(&engine);
+  global.setProperty(QStringLiteral("__patchy_gegl"), engine.newQObject(gegl_object));
+  auto* gmic_object = new ScriptGmicObject(*this);
+  gmic_object->setParent(&engine);
+  global.setProperty(QStringLiteral("__patchy_gmic"), engine.newQObject(gmic_object));
+  auto* perspective_object = new ScriptPerspectiveObject(*this);
+  perspective_object->setParent(&engine);
+  global.setProperty(QStringLiteral("__patchy_perspective"), engine.newQObject(perspective_object));
+  auto* scripts_object = new ScriptLibraryObject(*this);
+  scripts_object->setParent(&engine);
+  global.setProperty(QStringLiteral("__patchy_scripts"), engine.newQObject(scripts_object));
+
+  const QJSValue bootstrap = engine.evaluate(QString::fromLatin1(kBootstrapSource),
+                                             QStringLiteral("<patchy-bootstrap>"), 1);
+  Q_ASSERT(!bootstrap.isError());
+}
+
+void ScriptEngineHost::stop_active_run() {
+  if (run_ == nullptr) {
+    return;
+  }
+  run_->stop_requested = true;
+  set_paused(false);
+  run_->had_error = run_->had_error || connector_mode_;
+  if (run_->sync_running || run_->in_callback) {
+    // Script code is executing (or a wrapper opened a nested event loop from
+    // it); the engine cannot be destroyed from under it. Interrupt and let the
+    // evaluate/callback caller finish the run.
+    if (engine_ != nullptr) {
+      engine_->setInterrupted(true);
+    }
+    return;
+  }
+  emit_message(MessageKind::Warn, tr("Script stopped."));
+  finish_run();
+}
+
+bool ScriptEngineHost::call_script_callback(QJSValue callback, const QJSValueList& args) {
+  if (run_ == nullptr || run_->finishing || engine_ == nullptr || !callback.isCallable()) {
+    return false;
+  }
+  if (run_->sync_running || run_->in_callback || run_->paused) {
+    // The engine is not reentrant: a timer or input event dispatched from a
+    // mid-script pump must not call back into JS while evaluate() or another
+    // callback is still on the stack (the script-timer handler carries the
+    // same guard). Entering anyway also clobbered the outer burst's watchdog
+    // arm and interrupt flag.
+    return false;
+  }
+  if (document_processing_wait_active()) {
+    // A canvas processing wait is pumping events while a worker composites or
+    // copies the live document; a callback edit now would race that worker
+    // (docs/ai-control.md#processing-waits). Frame callbacks simply run on the
+    // next tick; timers re-arm in their own slot.
+    return false;
+  }
+  run_->in_callback = true;
+  run_->burst_clock.restart();  // busy indicator measures this burst alone
+  watchdog_->arm(watchdog_timeout());
+  const QJSValue result = callback.call(args);
+  watchdog_->disarm();
+  if (run_ == nullptr) {
+    // The callback itself stopped the run.
+    return false;
+  }
+  run_->in_callback = false;
+  if (manual_edit_pause()) { begin_manual_pause(); emit paused_changed(true); }
+  end_progress_indicator();
+  bool failed = false;
+  if (engine_ != nullptr && engine_->isInterrupted()) {
+    run_->had_error = true;
+    engine_->setInterrupted(false);
+    emit_message(MessageKind::Error,
+                 run_->stop_requested || external_interrupt_
+                     ? tr("Script stopped.")
+                     : tr("Script stopped: a callback showed no activity for %1 seconds "
+                          "(a stuck loop?).")
+                           .arg(watchdog_timeout().count() / 1000));
+    failed = true;
+  } else if (result.isError()) {
+    run_->had_error = true;
+    report_error(result);
+    failed = true;
+  }
+  // Callers may be a canvas window's event filter or a timer slot; finishing
+  // tears both down, so it must never run from inside them.
+  schedule_completion_check();
+  return !failed;
+}
+
+void ScriptEngineHost::schedule_completion_check() {
+  if (completion_check_scheduled_) {
+    return;
+  }
+  completion_check_scheduled_ = true;
+  QTimer::singleShot(0, this, [this] {
+    completion_check_scheduled_ = false;
+    check_run_completion();
+  });
+}
+
+void ScriptEngineHost::check_run_completion() {
+  if (run_ == nullptr || run_->sync_running || run_->in_callback || run_->finishing) {
+    return;
+  }
+  if (run_->had_error) {
+    finish_run();
+    return;
+  }
+  const bool windows_open = std::any_of(run_->windows.begin(), run_->windows.end(),
+                                        [](const QPointer<ScriptCanvasWindow>& window) {
+                                          return window != nullptr && window->is_open();
+                                        });
+  if (!run_->timers.empty() || windows_open) {
+    return;
+  }
+  finish_run();
+}
+
+void ScriptEngineHost::finish_run() {
+  if (run_ == nullptr || run_->finishing) {
+    return;
+  }
+  run_->finishing = true;
+  set_paused(false);
+  last_run_had_error_ = run_->had_error;
+  if (stop_confirm_ != nullptr) {
+    stop_confirm_->close();  // the question is moot once the run ends
+  }
+  // The stop-panel confirm's undo option: roll back the run's "Script: name"
+  // snapshot in every session it touched, once the run is fully gone.
+  const auto undo_sessions =
+      run_->undo_after_stop ? run_->undo_steps : std::map<std::int64_t, std::size_t>{};
+  teardown_run_resources();
+  flush_pending_refresh();
+  if (script_activity_) { script_activity_->set_disconnected(); }
+  run_.reset();
+  // The engine must outlive every stored QJSValue; the canvas windows released
+  // theirs in teardown and the run owned the rest.
+  { const std::lock_guard lock(interrupt_mutex_); engine_.reset(); }
+  emit run_state_changed();
+  for (const auto& [session_id, steps] : undo_sessions) {
+    if (const auto* session = window_.session_with_id(session_id)) {
+      const auto available = std::min(steps, session->history.undo_stack().size());
+      activate_session(session_id);
+      for (std::size_t i = 0; i < available; ++i) { window_.undo(); }
+    }
+  }
+}
+
+void ScriptEngineHost::teardown_run_resources() {
+  end_progress_indicator();
+  for (auto& [id, timer] : run_->timers) {
+    timer->stop();
+    delete timer;
+  }
+  run_->timers.clear();
+  for (auto& window : run_->windows) {
+    if (window != nullptr) {
+      window->release_script_state();
+      delete window.data();
+    }
+  }
+  run_->windows.clear();
+}
+
+bool ScriptEngineHost::unattended_run() const {
+  return window_.cli_automation_mode_ || (run_ != nullptr && run_->unattended);
+}
+
+bool MainWindow::unattended_automation() const {
+  // An editable pause belongs to the artist, including normal save prompts.
+  if (script_engine_host_ && script_engine_host_->manual_edit_pause()) return false;
+  return cli_automation_mode_ ||
+         (script_engine_host_ != nullptr && script_engine_host_->unattended_run());
+}
+
+namespace {
+
+// How long a synchronous script burst may block the GUI before the busy
+// overlay appears (Seth's 0.5 s rule); env override for tests.
+int script_busy_delay_ms() noexcept {
+  bool ok = false;
+  const auto value = qEnvironmentVariableIntValue("PATCHY_SCRIPT_BUSY_DELAY_MS", &ok);
+  return ok ? std::max(0, value) : 500;
+}
+
+QString elapsed_text(qint64 elapsed_ms) {
+  const auto seconds = elapsed_ms / 1000;
+  return seconds < 60 ? ScriptEngineHost::tr("%1s").arg(seconds)
+                      : ScriptEngineHost::tr("%1m %2s")
+                            .arg(seconds / 60)
+                            .arg(seconds % 60, 2, 10, QLatin1Char('0'));
+}
+
+// The app-modal "a script owns the UI" panel: script name + elapsed, its most
+// recent console line, and the one control that stays clickable while a long
+// burst blocks everything else - Stop. Esc and the close box are deliberately
+// ignored so a stray keypress cannot kill an hours-long job; only the Stop
+// button (which confirms first) ends the run. Non-Q_OBJECT, cpp-local.
+class ScriptStopPanel : public QDialog {
+public:
+  ScriptStopPanel(QWidget* parent, std::function<void()> on_stop) : QDialog(parent) {
+    setObjectName(QStringLiteral("scriptStopPanel"));
+    setWindowTitle(ScriptEngineHost::tr("Running Script"));
+    setWindowModality(Qt::ApplicationModal);
+    setWindowFlag(Qt::WindowCloseButtonHint, false);
+    setWindowFlag(Qt::WindowContextHelpButtonHint, false);
+    auto* layout = new QHBoxLayout(this);
+    auto* stop = new QPushButton(ScriptEngineHost::tr("Stop..."), this);
+    stop->setObjectName(QStringLiteral("scriptStopPanelButton"));
+    stop->setIcon(script_stop_icon());
+    stop->setIconSize(QSize(18, 18));
+    QObject::connect(stop, &QPushButton::clicked, this, [on_stop = std::move(on_stop)] {
+      on_stop();
+    });
+    auto* text_column = new QVBoxLayout();
+    title_label_ = new QLabel(this);
+    title_label_->setObjectName(QStringLiteral("scriptStopPanelTitle"));
+    detail_label_ = new QLabel(this);
+    detail_label_->setObjectName(QStringLiteral("scriptStopPanelDetail"));
+    set_themed_style(*detail_label_, QStringLiteral("color: @script_detail_text;"));
+    text_column->addWidget(title_label_);
+    text_column->addWidget(detail_label_);
+    layout->addLayout(text_column, 1);
+    layout->addSpacing(12);
+    layout->addWidget(stop);
+    setMinimumWidth(380);
+  }
+
+  void set_status(const QString& title, const QString& detail) {
+    title_label_->setText(title);
+    const auto metrics = detail_label_->fontMetrics();
+    detail_label_->setText(metrics.elidedText(detail, Qt::ElideRight, 340));
+  }
+
+  void reject() override {}  // Esc must not stop an hours-long run
+
+protected:
+  void closeEvent(QCloseEvent* event) override { event->ignore(); }
+
+private:
+  QLabel* title_label_{nullptr};
+  QLabel* detail_label_{nullptr};
+};
+
+}  // namespace
+
+void ScriptEngineHost::pump_progress_indicator() {
+  if (run_ == nullptr) {
+    return;
+  }
+  // Every service call is proof of life for the inactivity watchdog -
+  // unconditionally, CLI runs included.
+  if (watchdog_ != nullptr) {
+    watchdog_->feed();
+  }
+  if (connector_mode_ && connector_progress_callback_) {
+    refresh_script_view();
+    connector_progress_callback_();
+    wait_while_paused();
+    return;
+  }
+  if (script_activity_ && script_activity_->working()) {
+    if (refresh_script_view()) { QApplication::processEvents(QEventLoop::AllEvents, 8); }
+    wait_while_paused();
+    return;
+  }
+  if (unattended_run() || !run_->burst_clock.isValid()) {
+    return;
+  }
+  if (!run_->sync_running && !run_->in_callback) {
+    return;  // between bursts (idle timers/windows keep the run alive)
+  }
+  const qint64 now = run_->burst_clock.elapsed();
+  if (now < script_busy_delay_ms()) {
+    return;
+  }
+  if (run_->busy_active && now - run_->last_pump_ms < 50) {
+    return;  // throttle only once the overlay is up; never delay first show
+  }
+  run_->last_pump_ms = now;
+  if (!run_->busy_active) {
+    run_->busy_active = true;
+    // The canvas overlay when a document is open (a headless-ish run still
+    // gets the stop panel, which is the cancel surface).
+    auto* canvas = session_canvas(active_session_id());
+    if (canvas != nullptr) {
+      run_->busy_canvas = canvas;
+      // Delay 0: this pump already waited out the 0.5 s threshold.
+      canvas->begin_processing_operation(tr("Running script: %1...").arg(run_->name),
+                                         /*delay_ms=*/0);
+      canvas->tick_processing_operation();  // shows the overlay now
+    }
+    // Not while the script owns an interactive window: an application-modal
+    // panel over a game window makes it unplayable everywhere, and on wasm a
+    // window blocked by one never recovers its keyboard (dismiss_busy_indicator).
+    // The window itself, the Script Manager, and the watchdog remain as ways
+    // to end a run that stalls with a window open.
+    if (!has_open_canvas_window()) {
+      if (stop_panel_ == nullptr) {
+        stop_panel_ = new ScriptStopPanel(&window_, [this] { confirm_stop_from_panel(); });
+      }
+      stop_panel_->show();
+    }
+  }
+  if (stop_panel_ != nullptr && stop_panel_->isVisible()) {
+    static_cast<ScriptStopPanel*>(stop_panel_.data())
+        ->set_status(tr("Running script: %1 - %2")
+                         .arg(run_->name, elapsed_text(run_->run_clock.elapsed())),
+                     message_backlog_.isEmpty() ? QString() : message_backlog_.last());
+  }
+  // Pump with input allowed: the app-modal panel swallows everything except
+  // its own Stop button, and the posted-event dispatch runs the coalesced
+  // refresh flush so progressive pixel writes repaint as they land. Not on
+  // wasm: there the browser paints nothing and delivers no input until the
+  // main thread suspends in an idle event loop (docs/wasm.md), so this pump
+  // achieves nothing except dispatching Qt-internal timers into the middle of
+  // the running script, which is how a slow script froze the whole tab.
+#ifndef Q_OS_WASM
+  QApplication::processEvents(QEventLoop::AllEvents, 16);
+#endif
+  wait_while_paused();
+}
+
+void ScriptEngineHost::end_progress_indicator() {
+  if (run_ == nullptr) {
+    return;
+  }
+  if (run_->busy_active && run_->busy_canvas != nullptr) {
+    run_->busy_canvas->end_processing_operation();
+  }
+  if (stop_panel_ != nullptr) {
+    stop_panel_->hide();
+  }
+  run_->busy_active = false;
+  run_->busy_canvas.clear();
+  run_->last_pump_ms = 0;
+}
+
+void ScriptEngineHost::confirm_stop_from_panel() {
+  if (run_ == nullptr || run_->finishing) {
+    return;
+  }
+  if (stop_confirm_ != nullptr) {
+    stop_confirm_->raise();
+    return;
+  }
+  // Deliberately NON-BLOCKING (show, not exec): the job keeps working while
+  // the user decides - an hours-long batch should not sit paused under a
+  // question - and no nested event loop runs inside the panel button's
+  // handler (a timer-driven click could never be answered from its own
+  // nested loop; QEventDispatcherWin32 never re-enters a timer handler).
+  auto* confirm = new QDialog(&window_);
+  confirm->setObjectName(QStringLiteral("scriptStopConfirmDialog"));
+  confirm->setWindowTitle(tr("Stop Script"));
+  confirm->setAttribute(Qt::WA_DeleteOnClose);
+  confirm->setWindowModality(Qt::ApplicationModal);
+  auto* layout = new QVBoxLayout(confirm);
+  auto* question = new QLabel(tr("Stop \"%1\"?").arg(run_->name), confirm);
+  question->setWordWrap(true);
+  layout->addWidget(question);
+  auto* undo_box = new QCheckBox(tr("Undo the changes it made"), confirm);
+  undo_box->setObjectName(QStringLiteral("scriptStopUndoCheckBox"));
+  undo_box->setVisible(run_->undo_enabled && !run_->snapshotted_sessions.empty());
+  layout->addWidget(undo_box);
+  auto* buttons = new QDialogButtonBox(confirm);
+  auto* stop_button = buttons->addButton(tr("Stop Script"), QDialogButtonBox::AcceptRole);
+  stop_button->setObjectName(QStringLiteral("scriptStopConfirmButton"));
+  buttons->addButton(QDialogButtonBox::Cancel);
+  QObject::connect(buttons, &QDialogButtonBox::accepted, confirm, &QDialog::accept);
+  QObject::connect(buttons, &QDialogButtonBox::rejected, confirm, &QDialog::reject);
+  layout->addWidget(buttons);
+  QObject::connect(confirm, &QDialog::accepted, this, [this, undo_box] {
+    if (run_ == nullptr || run_->finishing) {
+      return;  // the run ended while the question was up
+    }
+    // Recomputed at answer time: the run kept working under the confirm.
+    run_->undo_after_stop = undo_box->isChecked() && run_->undo_enabled &&
+                            !run_->snapshotted_sessions.empty();
+    stop_active_run();
+  });
+  stop_confirm_ = confirm;
+  confirm->show();
+}
+
+// ---------------------------------------------------------------------------
+// JS bridge
+
+int ScriptEngineHost::scriptSetTimer(const QJSValue& callback, int interval_ms, bool repeat) {
+  if (run_ == nullptr || run_->finishing) {
+    return 0;
+  }
+  if (!callback.isCallable()) {
+    throw_js_error(tr("setTimeout/setInterval needs a function."));
+    return 0;
+  }
+  const int id = run_->next_timer_id++;
+  auto* timer = new QTimer(this);
+  timer->setInterval(std::max(0, interval_ms));
+  timer->setSingleShot(!repeat);
+  QElapsedTimer elapsed;
+  elapsed.start();
+  connect(timer, &QTimer::timeout, this, [this, id, repeat, callback, elapsed, interval_ms]() mutable {
+    if (run_ == nullptr || run_->finishing) {
+      return;
+    }
+    if (run_->paused) {
+      // Do not execute JS or spin a zero-interval timer while playback is paused.
+      const auto found = run_->timers.find(id);
+      if (found != run_->timers.end()) { found->second->start(std::max(25, interval_ms)); }
+      elapsed.restart();
+      return;
+    }
+    if (const auto found = run_->timers.find(id); found != run_->timers.end() &&
+        found->second->interval() != std::max(0, interval_ms)) {
+      found->second->setInterval(std::max(0, interval_ms));
+    }
+    if (run_->sync_running || run_->in_callback) {
+      // Script code is already executing (the busy-indicator pump processes
+      // events mid-evaluation); the engine is not reentrant. Skip this tick -
+      // repeating timers fire again on schedule, single-shots re-arm to fire
+      // on the next real event-loop turn.
+      if (!repeat) {
+        const auto found = run_->timers.find(id);
+        if (found != run_->timers.end()) {
+          found->second->start(0);
+        }
+      }
+      return;
+    }
+    if (document_processing_wait_active()) {
+      // A canvas processing wait pumps timers while a worker reads the live
+      // document (docs/ai-control.md#processing-waits): hold this tick until the
+      // wait ends. A single-shot re-arms a frame later so it neither runs inside
+      // the wait nor spins the wait's pump; a repeating timer fires again on schedule.
+      if (!repeat) {
+        const auto found = run_->timers.find(id);
+        if (found != run_->timers.end()) {
+          found->second->start(16);
+        }
+      }
+      return;
+    }
+    if (!repeat) {
+      const auto found = run_->timers.find(id);
+      if (found != run_->timers.end()) {
+        found->second->deleteLater();
+        run_->timers.erase(found);
+      }
+    }
+    const double dt_ms = static_cast<double>(elapsed.restart());
+    call_script_callback(callback, QJSValueList{QJSValue(dt_ms)});
+  });
+  run_->timers.emplace(id, timer);
+  timer->start();
+  return id;
+}
+
+void ScriptEngineHost::scriptClearTimer(int timer_id) {
+  if (run_ == nullptr) {
+    return;
+  }
+  const auto found = run_->timers.find(timer_id);
+  if (found == run_->timers.end()) {
+    return;
+  }
+  found->second->stop();
+  found->second->deleteLater();
+  run_->timers.erase(found);
+  schedule_completion_check();
+}
+
+void ScriptEngineHost::consoleEmit(int kind, const QString& text) {
+  pump_progress_indicator();
+  switch (kind) {
+    case 1:
+      emit_message(MessageKind::Warn, text);
+      break;
+    case 2:
+      emit_message(MessageKind::Error, text);
+      break;
+    default:
+      emit_message(MessageKind::Log, text);
+      break;
+  }
+}
+
+namespace {
+
+// A resolved include that lands inside the bundled scripts folder is mapped
+// through the shadow-override store: a user copy at the same relative path
+// wins, matching what the Scripts menu and editor run (script_folders.hpp).
+QString apply_user_script_override(const QString& resolved) {
+  const auto relative =
+      relative_path_under(MainWindow::bundled_scripts_directory(), resolved);
+  if (relative.isEmpty()) {
+    return resolved;  // not a bundled script
+  }
+  const auto candidate = QDir(MainWindow::user_scripts_directory()).absoluteFilePath(relative);
+  return QFileInfo::exists(candidate) ? candidate : resolved;
+}
+
+}  // namespace
+
+QString ScriptEngineHost::resolve_include_path(const QString& path) const {
+  const QFileInfo info(path);
+  if (info.isAbsolute()) {
+    return info.absoluteFilePath();
+  }
+  // Search order: relative to the including script, then the user scripts
+  // root, then the bundled scripts root - so include("Effects/foo.js") works
+  // from any script, and a user copy shadows the bundled one.
+  if (run_ != nullptr && !run_->include_dir_stack.isEmpty()) {
+    const QFileInfo relative(QDir(run_->include_dir_stack.last()).absoluteFilePath(path));
+    if (relative.exists()) {
+      return relative.absoluteFilePath();
+    }
+  }
+  const QFileInfo in_user(QDir(MainWindow::user_scripts_directory()).absoluteFilePath(path));
+  if (in_user.exists()) {
+    return in_user.absoluteFilePath();
+  }
+  const auto bundled_root = MainWindow::bundled_scripts_directory();
+  if (!bundled_root.isEmpty()) {
+    const QFileInfo in_bundled(QDir(bundled_root).absoluteFilePath(path));
+    if (in_bundled.exists()) {
+      return in_bundled.absoluteFilePath();
+    }
+  }
+  // Nothing exists; keep the historical script-relative shape so the error
+  // message names the most likely intended location.
+  if (run_ != nullptr && !run_->include_dir_stack.isEmpty()) {
+    return QDir(run_->include_dir_stack.last()).absoluteFilePath(path);
+  }
+  return info.absoluteFilePath();
+}
+
+void ScriptEngineHost::includeScript(const QString& path) {
+  if (run_ == nullptr || engine_ == nullptr) {
+    return;
+  }
+  const auto resolved = apply_user_script_override(resolve_include_path(path));
+  QFile file(resolved);
+  if (!file.open(QIODevice::ReadOnly | QIODevice::Text)) {
+    throw_js_error(tr("include: could not read %1").arg(QDir::toNativeSeparators(resolved)));
+    return;
+  }
+  run_->include_dir_stack.push_back(QFileInfo(resolved).absolutePath());
+  ++run_->include_depth;
+  // include() evaluates in the shared global scope, and every bundled script
+  // carries a top-level `var OPTIONS = {...}` block - so including a library
+  // would overwrite the including script's OPTIONS with the library's
+  // (Breakout's paddleSpeed/lives went undefined when fancy-background's
+  // OPTIONS replaced them). The included file still sees its own OPTIONS while
+  // its top-level code runs; the includer's binding is restored afterwards.
+  const QJSValue saved_options =
+      engine_->globalObject().property(QStringLiteral("OPTIONS"));
+  const QJSValue result =
+      engine_->evaluate(QString::fromUtf8(file.readAll()), resolved, 1);
+  engine_->globalObject().setProperty(QStringLiteral("OPTIONS"), saved_options);
+  --run_->include_depth;
+  run_->include_dir_stack.pop_back();
+  if (result.isError()) {
+    // Re-throw so the includer's call site fails with the nested error.
+    engine_->throwError(result);
+  }
+}
+
+bool ScriptEngineHost::scriptIsIncluded() const {
+  return run_ != nullptr && run_->include_depth > 0;
+}
+
+void ScriptEngineHost::play_tone(double frequency_hz, int duration_ms, double volume,
+                                 const QString& wave) {
+  pump_progress_indicator();
+  const auto shape = wave.compare(QStringLiteral("square"), Qt::CaseInsensitive) == 0
+                         ? ToneWave::Square
+                         : ToneWave::Sine;
+  play_wav_bytes(build_tone_wav(frequency_hz, duration_ms, volume, shape));
+}
+
+void ScriptEngineHost::play_sound_file(const QString& path) {
+  pump_progress_indicator();
+  // Same search as include(): beside the running script, then the user
+  // scripts folder, then bundled - so playSound("Games/hit.wav") works from
+  // anywhere, with a user copy shadowing a bundled one.
+  const auto resolved = apply_user_script_override(resolve_include_path(path));
+  QFile file(resolved);
+  if (!file.open(QIODevice::ReadOnly)) {
+    throw_js_error(tr("playSound: could not read %1").arg(QDir::toNativeSeparators(resolved)));
+    return;
+  }
+  constexpr qint64 kMaxWavBytes = 10 * 1024 * 1024;
+  if (file.size() > kMaxWavBytes) {
+    throw_js_error(tr("playSound: %1 is larger than 10 MB").arg(QDir::toNativeSeparators(resolved)));
+    return;
+  }
+  auto bytes = file.readAll();
+  if (bytes.size() < 12 || !bytes.startsWith("RIFF") ||
+      bytes.mid(8, 4) != QByteArrayLiteral("WAVE")) {
+    throw_js_error(tr("playSound: %1 is not a .wav file").arg(QDir::toNativeSeparators(resolved)));
+    return;
+  }
+  play_wav_bytes(std::move(bytes));
+}
+
+void ScriptEngineHost::throw_js_error(const QString& message) {
+  if (engine_ != nullptr) {
+    engine_->throwError(QJSValue::GenericError, message);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Session services
+
+std::vector<std::int64_t> ScriptEngineHost::session_ids() const { return window_.sessions_.ids(); }
+
+std::int64_t ScriptEngineHost::active_session_id() const {
+  const auto* session = window_.active_session();
+  return session != nullptr ? session->session_id : 0;
+}
+
+Document* ScriptEngineHost::session_document(std::int64_t session_id) noexcept {
+  auto* session = window_.session_with_id(session_id);
+  return session != nullptr ? &session->document : nullptr;
+}
+
+const Document* ScriptEngineHost::session_document_const(std::int64_t session_id) const noexcept {
+  const auto* session = const_cast<MainWindow&>(window_).session_with_id(session_id);
+  return session != nullptr ? &session->document : nullptr;
+}
+
+QString ScriptEngineHost::session_title(std::int64_t session_id) const {
+  const auto* session = const_cast<MainWindow&>(window_).session_with_id(session_id);
+  return session != nullptr ? session->title : QString();
+}
+
+QString ScriptEngineHost::session_file_path(std::int64_t session_id) const {
+  const auto* session = const_cast<MainWindow&>(window_).session_with_id(session_id);
+  return session != nullptr ? session->path : QString();
+}
+
+QStringList ScriptEngineHost::session_import_notes(std::int64_t session_id) const {
+  const auto* session = const_cast<MainWindow&>(window_).session_with_id(session_id);
+  return session != nullptr ? session->import_notes : QStringList();
+}
+
+bool ScriptEngineHost::session_cmyk_proof(std::int64_t session_id) const {
+  const auto* session = const_cast<MainWindow&>(window_).session_with_id(session_id);
+  return session != nullptr && session->cmyk_proof;
+}
+
+QString ScriptEngineHost::set_session_cmyk_proof(std::int64_t session_id, bool enabled) {
+  auto* session = window_.session_with_id(session_id);
+  if (session == nullptr) {
+    return tr("The document is no longer open.");
+  }
+  return window_.set_session_cmyk_proof(*session, enabled);
+}
+
+std::int64_t ScriptEngineHost::open_document_file(const QString& path) {
+  pump_progress_indicator();
+  std::set<std::int64_t> before;
+  for (const auto id : session_ids()) {
+    before.insert(id);
+  }
+  // app.open returns a new document even when the file is already open (docs/scripting.md).
+  window_.open_document_path(path, MainWindow::OpenExisting::LoadCopy, MainWindow::PdfOpen::Import);
+  for (const auto id : session_ids()) {
+    if (before.count(id) == 0) {
+      return id;
+    }
+  }
+  return 0;
+}
+
+std::int64_t ScriptEngineHost::create_document(int width, int height, const QString& title) {
+  pump_progress_indicator();
+  if (width < 1 || height < 1 || width > 30000 || height > 30000) {
+    return 0;
+  }
+  Document document(width, height, PixelFormat::rgba8());
+  PixelBuffer background(width, height, PixelFormat::rgba8());
+  background.clear(255);
+  auto& layer = document.add_pixel_layer("Background", std::move(background));
+  document.set_active_layer(layer.id());
+  window_.add_document_session(std::move(document), title.isEmpty() ? tr("Untitled") : title);
+  return active_session_id();
+}
+
+bool ScriptEngineHost::save_session_to_path(std::int64_t session_id, const QString& path,
+                                            std::optional<ImageSaveOptions> options, bool export_copy) {
+  pump_progress_indicator();
+  auto* session = window_.session_with_id(session_id);
+  if (session == nullptr) {
+    return false;
+  }
+  window_.activate_document_session(*session);
+  return window_.save_document_to_path(
+      path, std::move(options),
+      MainWindow::SaveToPathPolicy{/*flatten_confirmed=*/true, /*scripted=*/true, export_copy});
+}
+
+ScriptScan ScriptEngineHost::rescan_script_library() {
+  pump_progress_indicator();
+  return window_.rescan_scripts();
+}
+
+QString ScriptEngineHost::script_hotkey(const QString& relative_path) const {
+  const auto* command = window_.hotkey_registry().find_command(script_hotkey_command_id(relative_path));
+  if (command == nullptr || command->action.isNull()) {
+    return {};
+  }
+  return command->action->shortcut().toString(QKeySequence::PortableText);
+}
+
+bool ScriptEngineHost::set_script_hotkey(const QString& relative_path, const QString& sequence_text, QString* error) {
+  const auto id = script_hotkey_command_id(relative_path);
+  if (window_.hotkey_registry().find_command(id) == nullptr) {
+    *error = tr("patchy.scripts: no script at \"%1\" (install it or call rescan() first).").arg(relative_path);
+    return false;
+  }
+  auto overrides = window_.hotkey_registry_.overrides();
+  const auto text = sequence_text.trimmed();
+  if (text.isEmpty()) {
+    overrides.remove(id);
+  } else {
+    const auto sequence = QKeySequence::fromString(text, QKeySequence::PortableText);
+    if (sequence.isEmpty() || sequence.count() != 1 ||
+        is_reserved_binding_key(sequence[0].key(), sequence[0].keyboardModifiers())) {
+      *error = tr("patchy.scripts: \"%1\" is not a shortcut Patchy can bind (use Qt's portable spelling, "
+                  "such as \"Ctrl+Alt+D\").")
+                   .arg(sequence_text);
+      return false;
+    }
+    overrides.insert(id, QList<QKeySequence>{sequence});
+  }
+  // Persists the delta and reapplies every action, exactly as Preferences > Hotkeys OK does.
+  window_.hotkey_registry_.apply_overrides(std::move(overrides));
+  return true;
+}
+
+bool ScriptEngineHost::install_script(const QString& relative_path, const QString& source, QString* error) {
+  pump_progress_indicator();
+  const auto relative = QDir::cleanPath(QDir::fromNativeSeparators(relative_path.trimmed()));
+  const QFileInfo relative_info(relative);
+  // Below the folder only: no absolute path on any platform (a leading "/" or a drive
+  // colon), no ".." segment, and a .js name.
+  if (relative.isEmpty() || relative_info.isAbsolute() || relative.startsWith(QLatin1Char('/')) ||
+      relative.contains(QLatin1Char(':')) || relative.startsWith(QLatin1String("../")) ||
+      relative == QLatin1String("..") || relative.contains(QLatin1String("/../")) ||
+      relative_info.suffix().compare(QLatin1String("js"), Qt::CaseInsensitive) != 0) {
+    *error = tr("patchy.scripts: the script path must be a .js file path inside the user scripts folder "
+                "(\"Mine/export.js\"), not \"%1\".")
+                 .arg(relative_path);
+    return false;
+  }
+  const auto target = QDir(MainWindow::user_scripts_directory()).absoluteFilePath(relative);
+  if (!QDir().mkpath(QFileInfo(target).absolutePath())) {
+    *error = tr("patchy.scripts: could not create the folder for %1.").arg(QDir::toNativeSeparators(target));
+    return false;
+  }
+  QSaveFile file(target);
+  if (!file.open(QIODevice::WriteOnly | QIODevice::Truncate | QIODevice::Text)) {
+    *error = tr("patchy.scripts: could not write %1.").arg(QDir::toNativeSeparators(target));
+    return false;
+  }
+  file.write(source.toUtf8());
+  if (!file.commit()) {
+    *error = tr("patchy.scripts: could not write %1.").arg(QDir::toNativeSeparators(target));
+    return false;
+  }
+  window_.rescan_scripts();
+  return true;
+}
+
+std::optional<ImageSaveOptions> ScriptEngineHost::save_options_for_session(std::int64_t session_id) {
+  auto* session = window_.session_with_id(session_id);
+  if (session == nullptr) {
+    return std::nullopt;
+  }
+  window_.activate_document_session(*session);
+  return window_.image_save_defaults_for_document();
+}
+
+bool ScriptEngineHost::export_session_animated_webp(std::int64_t session_id, const QString& path,
+                                                   const ImageSaveOptions& options, QString* error) {
+  pump_progress_indicator();
+  auto* session = window_.session_with_id(session_id);
+  if (session == nullptr) {
+    *error = tr("One of the documents is no longer open.");
+    return false;
+  }
+  window_.activate_document_session(*session);
+  window_.finish_active_text_editor();
+  if (window_.animation_preview_window_ != nullptr) {
+    window_.animation_preview_window_->stop_playback_for(&session->document);
+  }
+  try {
+    write_animated_webp_file(std::as_const(session->document), path, options);
+  } catch (const std::exception& exception) {
+    *error = translate_data_text(exception.what());
+    return false;
+  }
+  session->document.metadata().values[webp::kLoopCountMetadata] = std::to_string(options.webp_loop_count);
+  window_.add_recent_file(path);
+  offer_browser_download_for_saved_file(path);
+  return true;
+}
+
+bool ScriptEngineHost::export_session_animated_png(std::int64_t session_id, const QString& path,
+                                                  const ImageSaveOptions& options, QString* error) {
+  pump_progress_indicator();
+  auto* session = window_.session_with_id(session_id);
+  if (session == nullptr) {
+    *error = tr("One of the documents is no longer open.");
+    return false;
+  }
+  window_.activate_document_session(*session);
+  window_.finish_active_text_editor();
+  if (window_.animation_preview_window_ != nullptr) {
+    window_.animation_preview_window_->stop_playback_for(&session->document);
+  }
+  try {
+    write_animated_png_file(std::as_const(session->document), path, options);
+  } catch (const std::exception& exception) {
+    *error = translate_data_text(exception.what());
+    return false;
+  }
+  session->document.metadata().values[apng::kLoopCountMetadata] = std::to_string(options.apng_loop_count);
+  window_.add_recent_file(path);
+  offer_browser_download_for_saved_file(path);
+  return true;
+}
+
+bool ScriptEngineHost::export_sessions_to_pdf(const std::vector<std::int64_t>& session_ids, const QString& path,
+                                              const PdfExportOptions& options, QString* error) {
+  pump_progress_indicator();
+  std::vector<const Document*> pages;
+  pages.reserve(session_ids.size());
+  for (const auto session_id : session_ids) {
+    const auto* session = window_.session_with_id(session_id);
+    if (session == nullptr) {
+      if (error != nullptr) {
+        *error = tr("One of the documents is no longer open.");
+      }
+      return false;
+    }
+    pages.push_back(&session->document);
+  }
+  try {
+    (void)write_multipage_pdf_file(pages, path, options, nullptr);
+  } catch (const std::exception& exception) {
+    if (error != nullptr) {
+      *error = QString::fromUtf8(exception.what());
+    }
+    return false;
+  }
+  return true;
+}
+
+std::optional<QStringList> ScriptEngineHost::export_artboards(std::int64_t session_id,
+                                                              const std::vector<LayerId>& artboard_ids,
+                                                              const QString& folder, const QString& extension,
+                                                              const std::optional<QString>& prefix, bool overwrite,
+                                                              QString* error) {
+  pump_progress_indicator();
+  const auto* session = window_.session_with_id(session_id);
+  if (session == nullptr) {
+    *error = tr("The document is no longer open.");
+    return std::nullopt;
+  }
+  if (!window_.export_documents_format_supported(extension)) {
+    *error = tr("exportArtboards cannot write .%1 files.").arg(extension);
+    return std::nullopt;
+  }
+  ImageSequenceNaming naming;
+  naming.use_layer_names = true;
+  if (prefix.has_value()) {
+    naming.prefix = *prefix;
+  } else if (const auto base = QFileInfo(session->title).completeBaseName(); !base.isEmpty()) {
+    naming.prefix = base + QStringLiteral(" - ");
+  }
+  return window_.export_artboards_to_folder(
+      std::as_const(session->document), artboard_ids, folder, extension, naming,
+      overwrite ? ExportDocumentsExistingFiles::Overwrite : ExportDocumentsExistingFiles::AddNumbering, error);
+}
+
+bool ScriptEngineHost::close_session(std::int64_t session_id) {
+  // The busy overlay may sit on the canvas being closed: drop it first.
+  if (run_ != nullptr && run_->busy_active && run_->busy_canvas != nullptr &&
+      run_->busy_canvas == session_canvas(session_id)) {
+    end_progress_indicator();
+  }
+  auto* session = window_.session_with_id(session_id);
+  if (session == nullptr) {
+    return false;
+  }
+  // Scripts close without prompting (the script author decided); mark saved so
+  // the close path cannot raise a modified-document confirmation.
+  window_.set_session_saved(*session);
+  return window_.close_document_session(*session);
+}
+
+void ScriptEngineHost::activate_session(std::int64_t session_id) {
+  auto* session = window_.session_with_id(session_id);
+  if (session != nullptr) {
+    window_.activate_document_session(*session);
+  }
+}
+
+std::vector<LayerId> ScriptEngineHost::duplicate_layers_to_session(std::int64_t source_session_id,
+                                                                    std::vector<LayerId> ids,
+                                                                    std::int64_t target_session_id,
+                                                                    QString* error) {
+  pump_progress_indicator();
+  auto* source = window_.session_with_id(source_session_id);
+  auto* target = window_.session_with_id(target_session_id);
+  if (source == nullptr || target == nullptr || source == target) {
+    if (error != nullptr) {
+      *error = tr("The document is no longer open.");
+    }
+    return {};
+  }
+  MainWindow::CrossDocumentLayerPlacement placement;
+  placement.keep_source_position = true;
+  auto root_ids = window_.copy_layers_between_sessions(
+      *source, std::move(ids), *target, placement,
+      [this, target_session_id] { return prepare_mutation(target_session_id); }, error);
+  if (!root_ids.empty()) {
+    note_structure_changed(target_session_id);
+  }
+  return root_ids;
+}
+
+bool ScriptEngineHost::prepare_mutation(std::int64_t session_id) {
+  pump_progress_indicator();
+  if (engine_ && engine_->isInterrupted()) { return false; }
+  auto* session = window_.session_with_id(session_id);
+  if (session == nullptr) {
+    return false;
+  }
+  if (run_ != nullptr) {
+    // Enabling Slow between edits starts a new history group. Progress inside
+    // a native stroke is not an edit boundary and must never split that stroke.
+    if (slow_mode() && !run_->pending_mutations.count(session_id)) {
+      run_->undo_group_sessions.erase(session_id);
+      run_->slow_mutations.insert(session_id);
+    }
+    run_->pending_mutations.insert(session_id);
+    if (!run_->undo_enabled) {
+      // Undo opted out (app.undoEnabled = false): skip the snapshot, but the
+      // session is still modified work that closing must protect.
+      window_.mark_session_modified(*session);
+      return true;
+    }
+    if (run_->undo_group_sessions.count(session_id) == 0) {
+      const auto label = slow_mode() ? tr("Script: %1 (step %2)").arg(run_->name).arg(run_->undo_steps[session_id] + 1)
+                                    : tr("Script: %1").arg(run_->name);
+      window_.push_undo_snapshot(*session, label);
+      run_->snapshotted_sessions.insert(session_id);
+      run_->undo_group_sessions.insert(session_id);
+      ++run_->undo_steps[session_id];
+    }
+  } else {
+    // Defensive: wrappers should never outlive their run, but a mutation with
+    // no run still deserves an undo entry.
+    window_.push_undo_snapshot(*session, tr("Script"));
+  }
+  return true;
+}
+
+bool ScriptEngineHost::resize_session_image(std::int64_t session_id, int width, int height, ResampleMethod method) {
+  auto* session = window_.session_with_id(session_id);
+  if (!session) { return false; }
+  if (session->document.width() == width && session->document.height() == height) { return true; }
+  if (!prepare_mutation(session_id)) { return false; }
+  const bool resized = window_.resize_document_image(*session, width, height, method, [this] {
+    pump_progress_indicator();
+    return !engine_ || !engine_->isInterrupted();
+  });
+  if (resized) {
+    note_structure_changed(session_id);
+  }
+  return resized;
+}
+
+std::vector<LayerId> ScriptEngineHost::import_files_as_layers(std::int64_t session_id, const QStringList& paths,
+                                                              QString* error) {
+  pump_progress_indicator();
+  auto* session = window_.session_with_id(session_id);
+  if (session == nullptr) {
+    if (error != nullptr) {
+      *error = tr("The document is no longer open.");
+    }
+    return {};
+  }
+  QString failure;
+  auto result = window_.add_files_as_layers(
+      *session, paths, std::nullopt, MainWindow::FailedFilesPolicy::AbortOnAnyFailure,
+      [this](int, int) {
+        pump_progress_indicator();
+        return !engine_ || !engine_->isInterrupted();
+      },
+      [this, session_id](MainWindow::DocumentSession&) { return prepare_mutation(session_id); }, &failure);
+  if (result.added_root_ids_top_to_bottom.empty()) {
+    if (error != nullptr) {
+      *error = failure.isEmpty() ? tr("No layers were added.") : failure;
+    }
+    return {};
+  }
+  note_structure_changed(session_id);
+  return result.added_root_ids_top_to_bottom;
+}
+
+std::optional<LayerId> ScriptEngineHost::add_smart_object(std::int64_t session_id, const QString& path,
+                                                          const SmartObjectParams& params, QString* error) {
+  pump_progress_indicator();
+  auto* session = window_.session_with_id(session_id);
+  if (session == nullptr) {
+    if (error != nullptr) {
+      *error = tr("The document is no longer open.");
+    }
+    return std::nullopt;
+  }
+  MainWindow::SmartObjectPlaceOptions options;
+  options.linked = params.linked;
+  options.x = params.x;
+  options.y = params.y;
+  options.width = params.width;
+  options.height = params.height;
+  options.scale = params.scale;
+  options.name = params.name;
+  const auto placed = window_.place_file_as_smart_object(
+      *session, path, options, [this, session_id] { return prepare_mutation(session_id); }, error);
+  if (placed.has_value()) {
+    note_structure_changed(session_id);
+  }
+  return placed;
+}
+
+int ScriptEngineHost::update_smart_object(std::int64_t session_id, LayerId layer_id, QString* error) {
+  pump_progress_indicator();
+  auto* session = window_.session_with_id(session_id);
+  if (session == nullptr) {
+    if (error != nullptr) {
+      *error = tr("The document is no longer open.");
+    }
+    return 0;
+  }
+  const auto updated = window_.update_linked_smart_object(
+      *session, layer_id, [this, session_id] { return prepare_mutation(session_id); }, error);
+  if (updated > 0) {
+    note_structure_changed(session_id);
+  }
+  return updated;
+}
+
+int ScriptEngineHost::rerender_smart_object(std::int64_t session_id, LayerId layer_id, QString* error) {
+  pump_progress_indicator();
+  auto* session = window_.session_with_id(session_id);
+  if (session == nullptr) {
+    if (error != nullptr) {
+      *error = tr("The document is no longer open.");
+    }
+    return 0;
+  }
+  const auto rendered = window_.rerender_embedded_smart_object(
+      *session, layer_id, [this, session_id] { return prepare_mutation(session_id); }, error);
+  if (rendered > 0) {
+    note_structure_changed(session_id);
+  }
+  return rendered;
+}
+
+std::optional<ScriptEngineHost::SmartObjectInfo> ScriptEngineHost::smart_object_info(std::int64_t session_id,
+                                                                                    LayerId layer_id) const {
+  const auto* session = window_.session_with_id(session_id);
+  const auto* layer = session != nullptr ? std::as_const(session->document).find_layer(layer_id) : nullptr;
+  if (layer == nullptr || !layer_is_smart_object(*layer)) {
+    return std::nullopt;
+  }
+  SmartObjectInfo info;
+  info.source_id = QString::fromStdString(smart_object_source_uuid(*layer));
+  if (const auto placement = smart_object_placement_from_layer(*layer); placement.has_value()) {
+    info.width = placement->width;
+    info.height = placement->height;
+    info.resolution = placement->resolution;
+    info.quad = placement->transform;
+  }
+  const auto* source =
+      std::as_const(session->document).metadata().smart_objects.find(smart_object_source_uuid(*layer));
+  if (source == nullptr) {
+    return info;  // an unparsed placement: the source is unknown
+  }
+  info.file_name = QString::fromStdString(source->filename);
+  if (source->kind != SmartObjectSourceKind::ExternalFile) {
+    return info;
+  }
+  info.linked = true;
+  info.relative_path = QString::fromStdString(source->external_rel_path);
+  const auto document_dir = session->path.isEmpty() ? QString() : QFileInfo(session->path).absolutePath();
+  if (const auto resolved = resolve_smart_object_external_path(*source, document_dir); resolved.has_value()) {
+    info.path = *resolved;
+    info.changed = smart_object_link_changed_on_disk(*source, QFileInfo(*resolved));
+  } else {
+    info.path = QDir::fromNativeSeparators(QString::fromStdString(source->external_original_path));
+    info.missing = true;
+  }
+  return info;
+}
+
+bool ScriptEngineHost::rerender_moved_smart_filters(std::int64_t session_id, LayerId layer_id) {
+  // No pump_progress_indicator here: the caller holds the document across this call.
+  auto* session = window_.session_with_id(session_id);
+  auto* layer = session != nullptr ? session->document.find_layer(layer_id) : nullptr;
+  if (layer == nullptr || session->canvas == nullptr) {
+    return false;
+  }
+  const auto document_dir = session->path.isEmpty() ? QString() : QFileInfo(session->path).absolutePath();
+  return refresh_smart_object_layer_preview(session->document, *layer, session->canvas->transform_interpolation(),
+                                            true, document_dir);
+}
+
+bool ScriptEngineHost::undo_enabled() const noexcept {
+  return run_ == nullptr || run_->undo_enabled;
+}
+
+void ScriptEngineHost::set_undo_enabled(bool enabled) noexcept {
+  if (run_ != nullptr) {
+    run_->undo_enabled = enabled;
+  }
+}
+
+void ScriptEngineHost::note_pixels_changed(std::int64_t session_id, const QRect& dirty_document_rect, bool completed) {
+  auto& pending = pending_refresh_[session_id];
+  if (dirty_document_rect.isEmpty()) {
+    pending.full_canvas = true;
+  } else if (!pending.full_canvas) {
+    pending.dirty += dirty_document_rect;
+  }
+  schedule_refresh_flush();
+  pump_progress_indicator();
+  if (completed) { complete_mutation(session_id); }
+}
+
+void ScriptEngineHost::note_structure_changed(std::int64_t session_id) {
+  auto& pending = pending_refresh_[session_id];
+  pending.structure = true;
+  pending.full_canvas = true;
+  schedule_refresh_flush();
+  pump_progress_indicator();
+  complete_mutation(session_id);
+}
+
+bool ScriptEngineHost::slow_mode_available() const {
+  return window_.isVisible() && !qEnvironmentVariableIsSet("PATCHY_HEADLESS");
+}
+
+bool ScriptEngineHost::slow_mode() const { return slow_mode_ && slow_mode_available(); }
+
+bool ScriptEngineHost::paused() const { return run_ && run_->paused; }
+
+bool ScriptEngineHost::manual_edit_pause() const {
+  return paused() && (waiting_for_resume_ || (!run_->sync_running && !run_->in_callback && api_call_depth_ == 0));
+}
+
+void ScriptEngineHost::begin_api_call() {
+  if (api_call_depth_ == 0) { wait_while_paused(); }
+  ++api_call_depth_;
+}
+
+void ScriptEngineHost::end_api_call() {
+  --api_call_depth_;
+  if (api_call_depth_ == 0) { wait_while_paused(); }
+}
+
+void ScriptEngineHost::pause_at_edit_boundary() {
+  const QScopedValueRollback<int> guard(api_call_depth_, 0);
+  wait_while_paused();
+}
+
+void ScriptEngineHost::keep_alive_for_ui() { if (watchdog_ && run_) { watchdog_->feed(); } }
+
+QJsonArray ScriptEngineHost::pause_history_state() const {
+  QJsonArray state;
+  for (const auto& session : window_.sessions_) {
+    state.append(QJsonObject{{"id", QString::number(session->session_id)},
+      {"revision", QString::number(session->revision)},
+      {"history", QString::number(session->history.current_state_id())}});
+  }
+  return state;
+}
+
+void ScriptEngineHost::begin_manual_pause() {
+  if (run_ && !run_->paused_documents) {
+    refresh_script_view(true);
+    run_->paused_documents = pause_history_state();
+  }
+}
+
+void ScriptEngineHost::finish_manual_pause() {
+  if (!run_ || !run_->paused_documents) return;
+  if (pause_history_state() != *run_->paused_documents) {
+    // Manual history and the next automation edit must have distinct snapshots.
+    run_->undo_group_sessions.clear();
+    run_->pending_mutations.clear();
+    run_->slow_mutations.clear();
+  }
+  run_->paused_documents.reset();
+}
+
+void ScriptEngineHost::set_paused(bool paused) {
+  if (paused && (!run_ || !slow_mode_available() ||
+                 (!connector_mode_ && !(script_activity_ && script_activity_->working())))) {
+    throw_js_error(tr("Pausing requires visible MCP or command-line automation."));
+    return;
+  }
+  if (!run_ || run_->paused == paused) { return; }
+  if (!paused && !run_->stop_requested && manual_edit_pause() && manual_edit_in_progress()) {
+    window_.statusBar()->showMessage(tr("Finish the current manual edit before resuming automation."), 5000);
+    emit paused_changed(true);
+    return;
+  }
+  if (!paused) finish_manual_pause();
+  run_->paused = paused;
+  if (manual_edit_pause()) begin_manual_pause();
+  emit paused_changed(paused);
+}
+
+void ScriptEngineHost::wait_while_paused() {
+  if (!paused() || waiting_for_resume_ || api_call_depth_ != 0 || !engine_ || engine_->isInterrupted()) { return; }
+  const QScopedValueRollback<bool> guard(waiting_for_resume_, true);
+  begin_manual_pause();
+  emit paused_changed(true);
+  while (paused() && !run_->stop_requested && engine_ && !engine_->isInterrupted()) {
+    // Yield the CPU, keep the window/navigation controls alive, and treat a
+    // deliberate pause as activity. Existing sync/callback gates protect JS.
+    if (watchdog_) { watchdog_->feed(); }
+    QEventLoop pause;
+    connect(this, &ScriptEngineHost::paused_changed, &pause, &QEventLoop::quit);
+    QTimer::singleShot(20, &pause, &QEventLoop::quit);
+    pause.exec(QEventLoop::AllEvents);
+  }
+  finish_manual_pause();
+  if (watchdog_) { watchdog_->feed(); }
+}
+
+void ScriptEngineHost::set_slow_mode(bool enabled) {
+  if (enabled && !slow_mode_available()) {
+    throw_js_error(tr("Slow mode requires a visible Patchy workspace."));
+    return;
+  }
+  if (slow_mode_ == enabled) { return; }
+  slow_mode_ = enabled;
+  emit slow_mode_changed(enabled);
+}
+
+void ScriptEngineHost::complete_mutation(std::int64_t session_id) {
+  if (!run_ || !run_->pending_mutations.erase(session_id)) { return; }
+  const bool began_slow = run_->slow_mutations.erase(session_id) != 0;
+  if (!began_slow && !slow_mode()) { return; }
+  run_->undo_group_sessions.erase(session_id);
+  if (slow_mode()) { present_script_view(60, true); }
+}
+
+bool ScriptEngineHost::refresh_script_view(bool force) {
+  if (!run_ || presenting_view_ || !window_.isVisible()) { return false; }
+  const auto now = run_->run_clock.elapsed();
+  if (!force && now - run_->last_preview_ms < 50) { return false; }
+  run_->last_preview_ms = now;
+  const QScopedValueRollback<bool> guard(presenting_view_, true);
+  flush_pending_refresh();
+  QApplication::sendPostedEvents(nullptr, QEvent::LayoutRequest);
+  if (auto* canvas = session_canvas(active_session_id())) { canvas->repaint(); }
+  QApplication::sendPostedEvents(nullptr, QEvent::UpdateRequest);
+  return true;
+}
+
+void ScriptEngineHost::present_script_view(int delay_ms, bool slow_hold) {
+  // A script checkpoint has no history or file side effects. Script timer
+  // callbacks remain deferred by the normal sync_running/in_callback gates.
+  refresh_script_view(true);
+  QElapsedTimer clock;
+  clock.start();
+  do {
+    pump_progress_indicator();
+    const bool input_guarded = connector_mode_ || (script_activity_ && script_activity_->working()) ||
+                               (stop_panel_ && stop_panel_->isVisible());
+    QApplication::processEvents(input_guarded ? QEventLoop::AllEvents : QEventLoop::ExcludeUserInputEvents, 8);
+    if (!run_ || (engine_ && engine_->isInterrupted()) || (slow_hold && !slow_mode()) || clock.elapsed() >= delay_ms) { break; }
+    QEventLoop pause;
+    QTimer::singleShot(static_cast<int>(std::clamp<qint64>(delay_ms - clock.elapsed(), 1, 16)), &pause, &QEventLoop::quit);
+    pause.exec(input_guarded ? QEventLoop::AllEvents : QEventLoop::ExcludeUserInputEvents);
+  } while (true);
+}
+
+void ScriptEngineHost::schedule_refresh_flush() {
+  if (refresh_flush_scheduled_) {
+    return;
+  }
+  refresh_flush_scheduled_ = true;
+  QTimer::singleShot(0, this, [this] {
+    refresh_flush_scheduled_ = false;
+    flush_pending_refresh();
+  });
+}
+
+void ScriptEngineHost::flush_pending_refresh() {
+  if (pending_refresh_.empty()) {
+    return;
+  }
+  auto pending = std::move(pending_refresh_);
+  pending_refresh_.clear();
+  bool active_structure = false;
+  bool active_pixels = false;
+  bool active_paths = false;
+  bool active_palette = false;
+  for (auto& [session_id, refresh] : pending) {
+    auto* session = window_.session_with_id(session_id);
+    if (session == nullptr) {
+      continue;
+    }
+    if (session->canvas != nullptr) {
+      if (refresh.full_canvas) {
+        session->canvas->document_changed();
+      } else if (!refresh.dirty.isEmpty()) {
+        session->canvas->document_changed_effect_bounds(refresh.dirty);
+      }
+    }
+    if (session == window_.active_session()) {
+      active_structure = active_structure || refresh.structure;
+      active_paths = active_paths || refresh.paths;
+      active_palette = active_palette || refresh.palette;
+      active_pixels = true;
+    }
+  }
+  // Panels mirror the active session only.
+  if (active_structure) {
+    window_.refresh_layer_list(true);
+    window_.refresh_layer_controls();
+    window_.update_document_action_state();
+  } else if (active_pixels) {
+    window_.refresh_layer_thumbnails();
+  }
+  if (active_pixels) {
+    window_.refresh_document_info();
+  }
+  if (active_palette) {
+    window_.refresh_palette_panel();
+    window_.schedule_palette_compliance_check();
+  }
+  if (active_paths) {
+    window_.refresh_layer_controls();
+    window_.refresh_paths_panel();
+    if (window_.canvas_) { window_.canvas_->update(); }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Palette-mode write constraint
+
+bool ScriptEngineHost::set_session_palette(std::int64_t session_id, std::vector<RgbColor> colors,
+                                           bool enabled, std::uint8_t alpha_threshold, std::vector<std::string> names) {
+  const auto* before = session_document_const(session_id);
+  if (!before) { return false; }
+  const auto& editing = before->palette_editing();
+  if (enabled && editing && editing->palette.colors == colors && editing->palette.names == names &&
+      editing->alpha_threshold == alpha_threshold) {
+    return true;
+  }
+  if (!enabled && !editing && before->indexed_palette() && before->indexed_palette()->colors == colors &&
+      before->indexed_palette()->names == names) {
+    return true;
+  }
+  if (!prepare_mutation(session_id)) { return false; }
+  auto* document = session_document(session_id);
+  if (!document) { return false; }
+  if (enabled) {
+    DocumentPaletteEditing replacement;
+    replacement.palette.colors = std::move(colors);
+    replacement.palette.names = std::move(names);
+    replacement.alpha_threshold = alpha_threshold;
+    replacement.palette_revision = MainWindow::next_palette_revision();
+    document->palette_editing() = std::move(replacement);
+    sync_document_indexed_palette(*document);
+  } else {
+    const auto count = colors.size();
+    const std::uint16_t depth = count <= 4 ? 2 : (count <= 16 ? 4 : 8);
+    document->indexed_palette() = DocumentIndexedPalette{std::move(colors), depth, std::move(names)};
+    document->palette_editing().reset();
+  }
+  // Metadata only: keep editable layers and derived Smart Object previews intact.
+  // A full refresh invalidates the canvas's cached display quantization in both modes.
+  pending_refresh_[session_id].palette = true;
+  note_structure_changed(session_id);
+  return true;
+}
+
+void ScriptEngineHost::palette_snap_buffer(std::int64_t session_id, PixelBuffer& pixels) {
+  const auto* document = session_document_const(session_id);
+  if (document == nullptr || !document->palette_editing().has_value()) {
+    return;
+  }
+  const auto& editing = *document->palette_editing();
+  PaletteLut lut;
+  lut.build(editing.palette.colors);
+  if (lut.empty()) {
+    return;
+  }
+  (void)apply_palette_to_pixels(pixels, lut, PaletteDither::None, editing.alpha_threshold);
+}
+
+QColor ScriptEngineHost::palette_snap_color(std::int64_t session_id, QColor color) const {
+  const auto* document = session_document_const(session_id);
+  if (document == nullptr || !document->palette_editing().has_value()) {
+    return color;
+  }
+  const auto& editing = *document->palette_editing();
+  PaletteLut lut;
+  lut.build(editing.palette.colors);
+  if (lut.empty()) {
+    return color;
+  }
+  const auto snapped = lut.snap(static_cast<std::uint8_t>(color.red()),
+                                static_cast<std::uint8_t>(color.green()),
+                                static_cast<std::uint8_t>(color.blue()));
+  const int alpha = color.alpha() >= editing.alpha_threshold ? 255 : 0;
+  return QColor(snapped.red, snapped.green, snapped.blue, alpha);
+}
+
+// ---------------------------------------------------------------------------
+// Selection
+
+CanvasWidget* ScriptEngineHost::session_canvas(std::int64_t session_id) const {
+  auto* session = const_cast<MainWindow&>(window_).session_with_id(session_id);
+  return session != nullptr ? session->canvas : nullptr;
+}
+
+void ScriptEngineHost::select_all(std::int64_t session_id) {
+  if (auto* canvas = session_canvas(session_id)) {
+    canvas->select_all();
+  }
+}
+
+void ScriptEngineHost::deselect(std::int64_t session_id) {
+  if (auto* canvas = session_canvas(session_id)) {
+    canvas->clear_selection();
+  }
+}
+
+void ScriptEngineHost::select_region(std::int64_t session_id, const QRegion& region) {
+  auto* canvas = session_canvas(session_id);
+  if (canvas == nullptr) {
+    return;
+  }
+  CanvasWidget::SelectionSnapshot snapshot;
+  const auto* document = session_document_const(session_id);
+  if (document == nullptr) {
+    return;
+  }
+  snapshot.selection = region.intersected(QRect(0, 0, document->width(), document->height()));
+  snapshot.display_region = snapshot.selection;
+  canvas->apply_selection_snapshot(snapshot);
+}
+
+void ScriptEngineHost::smooth_selection(std::int64_t session_id, int radius) {
+  if (auto* canvas = session_canvas(session_id)) {
+    canvas->smooth_selection(radius);
+  }
+}
+
+void ScriptEngineHost::feather_selection(std::int64_t session_id, double radius) {
+  if (auto* canvas = session_canvas(session_id)) {
+    canvas->feather_selection(radius);
+  }
+}
+
+QRegion ScriptEngineHost::selection_region(std::int64_t session_id) const {
+  auto* canvas = session_canvas(session_id);
+  return canvas != nullptr ? canvas->capture_selection_snapshot().selection : QRegion();
+}
+
+bool ScriptEngineHost::has_selection(std::int64_t session_id) const {
+  auto* canvas = session_canvas(session_id);
+  return canvas != nullptr && canvas->has_selection();
+}
+
+PixelBuffer ScriptEngineHost::pixels_limited_to_selection(std::int64_t session_id, const PixelBuffer& pixels,
+                                                          Rect bounds) const {
+  auto* canvas = session_canvas(session_id);
+  if (canvas == nullptr || !canvas->has_selection()) {
+    return pixels;
+  }
+  return patchy::ui::pixels_limited_to_selection(*canvas, pixels, bounds);
+}
+
+bool ScriptEngineHost::selection_has_soft_coverage(std::int64_t session_id) const {
+  auto* canvas = session_canvas(session_id);
+  return canvas != nullptr && canvas->has_selection() && canvas->selection_has_partial_alpha();
+}
+
+void ScriptEngineHost::blend_by_selection_coverage(std::int64_t session_id, PixelBuffer& result,
+                                                   const PixelBuffer& original, Rect bounds) const {
+  auto* canvas = session_canvas(session_id);
+  if (canvas == nullptr || !canvas->has_selection()) {
+    return;
+  }
+  patchy::ui::blend_by_selection_coverage(result, original, bounds, filter_selection(*canvas));
+}
+
+bool ScriptEngineHost::remove_object_in_selection(std::int64_t session_id, LayerId layer_id, bool content_aware,
+                                                  int attempt, int tone_match, int feather, bool* used_content_aware,
+                                                  int* source, int* source_count, std::int64_t* patches,
+                                                  int* attempt_used) {
+  pump_progress_indicator();
+  auto* session = window_.session_with_id(session_id);
+  if (session == nullptr || session->canvas == nullptr) {
+    throw_js_error(tr("The document is no longer open."));
+    return false;
+  }
+  if (session->document.find_layer(layer_id) == nullptr) {
+    throw_js_error(tr("The layer no longer exists."));
+    return false;
+  }
+  const auto active_id = std::as_const(session->document).active_layer_id();
+  if (!active_id.has_value() || *active_id != layer_id) {
+    throw_js_error(tr("removeObject needs the document's active layer (set doc.activeLayer first)."));
+    return false;
+  }
+  auto* canvas = session->canvas;
+  if (!canvas->has_selection()) {
+    throw_js_error(tr("removeObject needs a selection."));
+    return false;
+  }
+  if (!prepare_mutation(session_id)) {
+    return false;
+  }
+  // prepare_mutation may pump input; the selection and layer are re-read by
+  // the canvas itself, so only the session needs re-resolving.
+  session = window_.session_with_id(session_id);
+  if (session == nullptr || session->canvas != canvas) {
+    throw_js_error(tr("The document is no longer open."));
+    return false;
+  }
+  CanvasWidget::RemoveObjectOptions options;
+  options.method =
+      content_aware ? CanvasWidget::RemoveObjectMethod::ContentAware : CanvasWidget::RemoveObjectMethod::NearestEdge;
+  options.attempt = attempt;
+  options.tone_match = tone_match;
+  options.feather = feather;
+  options.record_history = false;
+  // The script's earlier edits wait in pending_refresh_ until the next flush, so the canvas
+  // render cache can look settled while missing them; Remove Object samples that cache
+  // (retouch_source_snapshot, GitHub #597) and would heal from the stale composite.
+  flush_pending_refresh();
+  const auto result = canvas->remove_object_in_selection(options);
+  if (!result.applied) {
+    throw_js_error(result.error);
+    return false;
+  }
+  if (used_content_aware != nullptr) {
+    *used_content_aware = result.method == CanvasWidget::RemoveObjectMethod::ContentAware;
+  }
+  if (source != nullptr) {
+    *source = result.source_index;
+  }
+  if (source_count != nullptr) {
+    *source_count = result.source_count;
+  }
+  if (patches != nullptr) {
+    *patches = result.patches;
+  }
+  if (attempt_used != nullptr) {
+    *attempt_used = result.attempt;
+  }
+  note_pixels_changed(session_id, canvas->selected_document_rect().value_or(QRect()));
+  return true;
+}
+
+bool ScriptEngineHost::red_eye(std::int64_t session_id, LayerId layer_id, QPoint point, std::optional<QRect> box,
+                               int pupil_size, int darken_amount, std::int64_t* pupil_pixels, QRect* changed) {
+  pump_progress_indicator();
+  auto* session = window_.session_with_id(session_id);
+  if (session == nullptr || session->canvas == nullptr) {
+    throw_js_error(tr("The document is no longer open."));
+    return false;
+  }
+  if (session->document.find_layer(layer_id) == nullptr) {
+    throw_js_error(tr("The layer no longer exists."));
+    return false;
+  }
+  const auto active_id = std::as_const(session->document).active_layer_id();
+  if (!active_id.has_value() || *active_id != layer_id) {
+    throw_js_error(tr("redEye needs the document's active layer (set doc.activeLayer first)."));
+    return false;
+  }
+  auto* canvas = session->canvas;
+  if (!prepare_mutation(session_id)) {
+    return false;
+  }
+  session = window_.session_with_id(session_id);
+  if (session == nullptr || session->canvas != canvas) {
+    throw_js_error(tr("The document is no longer open."));
+    return false;
+  }
+  const auto result = canvas->apply_red_eye_at(point, box, pupil_size, darken_amount, /*record_history=*/false);
+  if (result.pupil_pixels <= 0) {
+    throw_js_error(result.error.isEmpty() ? tr("redEye found no red pixels.") : result.error);
+    return false;
+  }
+  if (pupil_pixels != nullptr) {
+    *pupil_pixels = result.pupil_pixels;
+  }
+  if (changed != nullptr) {
+    *changed = result.changed;
+  }
+  note_pixels_changed(session_id, result.changed);
+  return true;
+}
+
+CanvasWidget* ScriptEngineHost::eraser_call_canvas(std::int64_t session_id, LayerId layer_id, const char* function) {
+  auto* session = window_.session_with_id(session_id);
+  if (session == nullptr || session->canvas == nullptr) {
+    throw_js_error(tr("The document is no longer open."));
+    return nullptr;
+  }
+  if (session->document.find_layer(layer_id) == nullptr) {
+    throw_js_error(tr("The layer no longer exists."));
+    return nullptr;
+  }
+  const auto active_id = std::as_const(session->document).active_layer_id();
+  if (!active_id.has_value() || *active_id != layer_id) {
+    throw_js_error(tr("%1 needs the document's active layer (set doc.activeLayer first).").arg(QLatin1String(function)));
+    return nullptr;
+  }
+  return session->canvas;
+}
+
+bool ScriptEngineHost::erase_background(std::int64_t session_id, LayerId layer_id,
+                                        const BackgroundEraserScriptStroke& stroke, QRect* changed) {
+  pump_progress_indicator();
+  auto* canvas = eraser_call_canvas(session_id, layer_id, "eraseBackground");
+  if (canvas == nullptr || !prepare_mutation(session_id)) {
+    return false;
+  }
+  const auto* session = window_.session_with_id(session_id);
+  if (session == nullptr || session->canvas != canvas) {
+    throw_js_error(tr("The document is no longer open."));
+    return false;
+  }
+  const auto result = canvas->apply_background_eraser_stroke(stroke);
+  if (!result.ok) {
+    throw_js_error(result.error.isEmpty()
+                       ? tr("%1 needs an editable pixel layer.").arg(QStringLiteral("eraseBackground"))
+                       : result.error);
+    return false;
+  }
+  if (changed != nullptr) {
+    *changed = result.changed;
+  }
+  if (!result.changed.isEmpty()) {
+    note_pixels_changed(session_id, result.changed);
+  }
+  return true;
+}
+
+bool ScriptEngineHost::magic_erase(std::int64_t session_id, LayerId layer_id, QPoint point,
+                                   const MagicEraserOptions& options, const QColor& background, QRect* changed) {
+  pump_progress_indicator();
+  auto* canvas = eraser_call_canvas(session_id, layer_id, "magicErase");
+  if (canvas == nullptr || !prepare_mutation(session_id)) {
+    return false;
+  }
+  const auto* session = window_.session_with_id(session_id);
+  if (session == nullptr || session->canvas != canvas) {
+    throw_js_error(tr("The document is no longer open."));
+    return false;
+  }
+  const auto result = canvas->apply_magic_eraser(point, options, background);
+  if (!result.ok) {
+    throw_js_error(result.error.isEmpty() ? tr("%1 needs an editable pixel layer.").arg(QStringLiteral("magicErase"))
+                                          : result.error);
+    return false;
+  }
+  if (changed != nullptr) {
+    *changed = result.changed;
+  }
+  if (!result.changed.isEmpty()) {
+    note_pixels_changed(session_id, result.changed);
+  }
+  return true;
+}
+
+bool ScriptEngineHost::color_replace(std::int64_t session_id, LayerId layer_id,
+                                     const ColorReplaceScriptStroke& stroke, QRect* changed) {
+  pump_progress_indicator();
+  auto* session = window_.session_with_id(session_id);
+  if (session == nullptr || session->canvas == nullptr) {
+    throw_js_error(tr("The document is no longer open."));
+    return false;
+  }
+  if (session->document.find_layer(layer_id) == nullptr) {
+    throw_js_error(tr("The layer no longer exists."));
+    return false;
+  }
+  const auto active_id = std::as_const(session->document).active_layer_id();
+  if (!active_id.has_value() || *active_id != layer_id) {
+    throw_js_error(tr("replaceColor needs the document's active layer (set doc.activeLayer first)."));
+    return false;
+  }
+  auto* canvas = session->canvas;
+  if (!prepare_mutation(session_id)) {
+    return false;
+  }
+  session = window_.session_with_id(session_id);
+  if (session == nullptr || session->canvas != canvas) {
+    throw_js_error(tr("The document is no longer open."));
+    return false;
+  }
+  const auto result = canvas->apply_color_replace_stroke(stroke);
+  if (!result.ok) {
+    throw_js_error(result.error.isEmpty() ? tr("replaceColor needs an editable pixel layer.") : result.error);
+    return false;
+  }
+  if (changed != nullptr) {
+    *changed = result.changed;
+  }
+  if (!result.changed.isEmpty()) {
+    note_pixels_changed(session_id, result.changed);
+  }
+  return true;
+}
+
+namespace {
+
+// The Align/Distribute preamble both services share: the session must be
+// open, and every requested root must still exist in its document.
+bool alignment_session_ready(ScriptEngineHost& host, CanvasWidget* canvas, const Document* document,
+                             const std::vector<LayerId>& root_ids, const char* verb) {
+  if (canvas == nullptr || document == nullptr) {
+    host.throw_js_error(ScriptEngineHost::tr("The document is no longer open."));
+    return false;
+  }
+  for (const auto id : root_ids) {
+    if (document->find_layer(id) == nullptr) {
+      host.throw_js_error(ScriptEngineHost::tr("%1 needs layers of this document.").arg(QLatin1String(verb)));
+      return false;
+    }
+  }
+  if (canvas->free_transform_active() || canvas->warp_transform_active() || canvas->path_transform_active()) {
+    host.throw_js_error(
+        ScriptEngineHost::tr("%1: finish the pending transform first.").arg(QLatin1String(verb)));
+    return false;
+  }
+  return true;
+}
+
+}  // namespace
+
+bool ScriptEngineHost::transform_layer(std::int64_t session_id, LayerId layer_id,
+                                       const std::optional<std::array<double, 6>>& matrix,
+                                       const std::optional<std::array<std::array<double, 2>, 4>>& quad,
+                                       std::optional<ResampleMethod> interpolation) {
+  pump_progress_indicator();
+  auto* initial_session = window_.session_with_id(session_id);
+  auto* canvas = initial_session != nullptr ? initial_session->canvas : nullptr;
+  if (canvas == nullptr) {
+    throw_js_error(tr("The document is no longer open."));
+    return false;
+  }
+  if (canvas->free_transform_active() || canvas->warp_transform_active() || canvas->path_transform_active()) {
+    throw_js_error(tr("%1: finish the pending transform first.").arg(QStringLiteral("layer.transform")));
+    return false;
+  }
+  if (!prepare_mutation(session_id)) {
+    return false;
+  }
+  // prepare_mutation may pump input; re-resolve the session before mutating.
+  auto* session = window_.session_with_id(session_id);
+  if (session == nullptr || session->canvas != canvas) {
+    throw_js_error(tr("The document is no longer open."));
+    return false;
+  }
+  std::optional<CanvasWidget::TransformInterpolation> canvas_interpolation;
+  if (interpolation.has_value()) {
+    switch (*interpolation) {
+      case ResampleMethod::Automatic:
+        canvas_interpolation = CanvasWidget::TransformInterpolation::Automatic;
+        break;
+      case ResampleMethod::NearestNeighbor:
+        canvas_interpolation = CanvasWidget::TransformInterpolation::NearestNeighbor;
+        break;
+      case ResampleMethod::Bilinear:
+        canvas_interpolation = CanvasWidget::TransformInterpolation::Bilinear;
+        break;
+      case ResampleMethod::Bicubic:
+        canvas_interpolation = CanvasWidget::TransformInterpolation::Bicubic;
+        break;
+      case ResampleMethod::BicubicSmoother:
+        canvas_interpolation = CanvasWidget::TransformInterpolation::BicubicSmoother;
+        break;
+      case ResampleMethod::BicubicSharper:
+        canvas_interpolation = CanvasWidget::TransformInterpolation::BicubicSharper;
+        break;
+    }
+  }
+  const auto place = [&matrix, &quad](const std::array<QPointF, 4>& box) {
+    std::array<QPointF, 4> corners = box;
+    for (std::size_t i = 0; i < corners.size(); ++i) {
+      if (quad.has_value()) {
+        corners[i] = QPointF((*quad)[i][0], (*quad)[i][1]);
+      } else if (matrix.has_value()) {
+        const auto& m = *matrix;
+        corners[i] = QPointF(m[0] * box[i].x() + m[2] * box[i].y() + m[4], m[1] * box[i].x() + m[3] * box[i].y() + m[5]);
+      }
+    }
+    return corners;
+  };
+  const auto* before_layer = std::as_const(session->document).find_layer(layer_id);
+  QRect dirty = before_layer != nullptr ? to_qrect(layer_render_bounds(*before_layer)) : QRect();
+  const auto error = canvas->apply_scripted_free_transform(layer_id, place, canvas_interpolation);
+  if (!error.isEmpty()) {
+    throw_js_error(error);
+    return false;
+  }
+  if (const auto* after_layer = std::as_const(session->document).find_layer(layer_id); after_layer != nullptr) {
+    dirty = dirty.united(to_qrect(layer_render_bounds(*after_layer)));
+  }
+  note_pixels_changed(session_id, dirty);
+  return true;
+}
+
+int ScriptEngineHost::align_layers(std::int64_t session_id, const std::vector<LayerId>& root_ids, AlignEdge edge,
+                                   bool align_to_canvas) {
+  pump_progress_indicator();
+  auto* initial_session = window_.session_with_id(session_id);
+  auto* canvas = initial_session != nullptr ? initial_session->canvas : nullptr;
+  const Document* document = initial_session != nullptr ? &std::as_const(initial_session->document) : nullptr;
+  if (!alignment_session_ready(*this, canvas, document, root_ids, "alignLayers")) {
+    return -1;
+  }
+  if (canvas->alignment_unit_count(root_ids) == 0) {
+    throw_js_error(tr("alignLayers needs at least one movable layer."));
+    return -1;
+  }
+  if (!prepare_mutation(session_id)) {
+    return -1;
+  }
+  // prepare_mutation may pump input; re-resolve the session before mutating.
+  auto* session = window_.session_with_id(session_id);
+  if (session == nullptr || session->canvas != canvas) {
+    throw_js_error(tr("The document is no longer open."));
+    return -1;
+  }
+  const auto result = canvas->align_layers(edge, align_to_canvas, root_ids, /*record_history=*/false);
+  if (!result.dirty.isEmpty()) {
+    note_pixels_changed(session_id, result.dirty.boundingRect());
+  }
+  return result.moved_layers;
+}
+
+int ScriptEngineHost::distribute_layers(std::int64_t session_id, const std::vector<LayerId>& root_ids,
+                                        DistributeMode mode) {
+  pump_progress_indicator();
+  auto* initial_session = window_.session_with_id(session_id);
+  auto* canvas = initial_session != nullptr ? initial_session->canvas : nullptr;
+  const Document* document = initial_session != nullptr ? &std::as_const(initial_session->document) : nullptr;
+  if (!alignment_session_ready(*this, canvas, document, root_ids, "distributeLayers")) {
+    return -1;
+  }
+  if (canvas->alignment_unit_count(root_ids) < 3) {
+    throw_js_error(tr("distributeLayers needs at least three movable layers."));
+    return -1;
+  }
+  if (!prepare_mutation(session_id)) {
+    return -1;
+  }
+  auto* session = window_.session_with_id(session_id);
+  if (session == nullptr || session->canvas != canvas) {
+    throw_js_error(tr("The document is no longer open."));
+    return -1;
+  }
+  const auto result = canvas->distribute_layers(mode, root_ids, /*record_history=*/false);
+  if (!result.dirty.isEmpty()) {
+    note_pixels_changed(session_id, result.dirty.boundingRect());
+  }
+  return result.moved_layers;
+}
+
+// ---------------------------------------------------------------------------
+// Text layers (the cli_append_text_to_text_layers technique: drive the real
+// inline-editor pipeline so rasters render through the normal commit path)
+
+namespace {
+
+QTextEdit* wait_for_inline_text_editor(CanvasWidget* canvas) {
+  QTextEdit* editor = nullptr;
+  QElapsedTimer wait;
+  wait.start();
+  while (wait.elapsed() < 5000) {
+    editor = canvas->findChild<QTextEdit*>(QStringLiteral("inlineTextEditor"));
+    if (editor != nullptr) {
+      return editor;
+    }
+    QApplication::processEvents(QEventLoop::ExcludeUserInputEvents, 50);
+  }
+  return nullptr;
+}
+
+void collect_layer_ids(const std::vector<Layer>& layers, std::set<LayerId>& out) {
+  for (const auto& layer : layers) {
+    out.insert(layer.id());
+    collect_layer_ids(layer.children(), out);
+  }
+}
+
+}  // namespace
+
+namespace {
+
+std::optional<Qt::LayoutDirection> layout_direction_for_name(const QString& name) {
+  if (name == QLatin1String("ltr")) {
+    return Qt::LeftToRight;
+  }
+  if (name == QLatin1String("rtl")) {
+    return Qt::RightToLeft;
+  }
+  if (name == QLatin1String("auto")) {
+    return Qt::LayoutDirectionAuto;
+  }
+  return std::nullopt;
+}
+
+}  // namespace
+
+QString ScriptEngineHost::text_layer_orientation(std::int64_t session_id, LayerId layer_id) const {
+  const auto* document = session_document_const(session_id);
+  const auto* layer = document != nullptr ? document->find_layer(layer_id) : nullptr;
+  if (layer == nullptr || !layer_is_text(*layer)) {
+    return QString();
+  }
+  const auto found = layer->metadata().find(kLayerMetadataTextOrientation);
+  return found != layer->metadata().end() && found->second == kTextOrientationVertical
+             ? QStringLiteral("vertical")
+             : QStringLiteral("horizontal");
+}
+
+QString ScriptEngineHost::text_layer_font(std::int64_t session_id, LayerId layer_id) const {
+  const auto* document = session_document_const(session_id);
+  const auto* layer = document != nullptr ? document->find_layer(layer_id) : nullptr;
+  if (layer == nullptr || !layer_is_text(*layer)) {
+    return QString();
+  }
+  const auto found = layer->metadata().find(kLayerMetadataTextFont);
+  return found != layer->metadata().end() ? QString::fromStdString(found->second) : QString();
+}
+
+QString ScriptEngineHost::text_layer_direction(std::int64_t session_id, LayerId layer_id) const {
+  const auto* document = session_document_const(session_id);
+  const auto* layer = document != nullptr ? document->find_layer(layer_id) : nullptr;
+  if (layer == nullptr || !layer_is_text(*layer)) {
+    return QString();
+  }
+  const auto found = layer->metadata().find(kLayerMetadataTextParagraphRuns);
+  if (found != layer->metadata().end()) {
+    for (const auto& raw_line : QString::fromStdString(found->second).split(QLatin1Char('\n'))) {
+      const auto fields = raw_line.trimmed().split(QLatin1Char('\t'));
+      if (fields.size() < 10) {
+        continue;
+      }
+      if (fields[9] == QLatin1String("ltr") || fields[9] == QLatin1String("rtl")) {
+        return fields[9];
+      }
+      break;
+    }
+  }
+  return QStringLiteral("auto");
+}
+
+namespace {
+
+// Whether `family` (installed) lacks a glyph for some character of `text` in every face it has.
+// Spaces, marks and controls are drawn by nobody and prove nothing.
+bool text_family_lacks_some_character(const QString& family, const QString& text) {
+  std::vector<QRawFont> faces;
+  for (const auto& style : QFontDatabase::styles(family)) {
+    auto face = QRawFont::fromFont(QFontDatabase::font(family, style, 12));
+    if (face.isValid()) {
+      faces.push_back(std::move(face));
+    }
+  }
+  if (faces.empty()) {
+    return false;  // nothing to interrogate; stay quiet rather than guess
+  }
+  for (int index = 0; index < text.size(); ++index) {
+    char32_t code = text.at(index).unicode();
+    if (text.at(index).isHighSurrogate() && index + 1 < text.size() && text.at(index + 1).isLowSurrogate()) {
+      code = QChar::surrogateToUcs4(text.at(index), text.at(index + 1));
+      ++index;
+    }
+    if (code < 0x20 || QChar::isSpace(code) || QChar::isMark(code) ||
+        QChar::category(code) == QChar::Other_Format) {
+      continue;
+    }
+    const bool drawn = std::any_of(faces.begin(), faces.end(),
+                                   [code](const QRawFont& face) { return face.supportsCharacter(code); });
+    if (!drawn) {
+      return true;
+    }
+  }
+  return false;
+}
+
+bool family_listed(const QStringList& families, const QString& family) {
+  if (families.contains(family.trimmed(), Qt::CaseInsensitive)) {
+    return true;
+  }
+  // The text engine canonicalizes compact spellings such as LiberationSans to
+  // Liberation Sans. That is the requested family, not a fallback substitution.
+  const auto key = compact_text_family_key(family);
+  return !key.isEmpty() && std::any_of(families.begin(), families.end(), [&key](const QString& candidate) {
+    return compact_text_family_key(candidate) == key;
+  });
+}
+
+}  // namespace
+
+// Console warnings (never a dialog) for every font a scripted text edit asked for and did not
+// get. `asked` is what the script requested: the families the layer named before the edit plus
+// any the edit names itself. Three things hide a substitution from a plain "is this layer's
+// font missing" check, and all of them have to be reported:
+//   - the layer still names a family that is not installed, or that has no glyph for its text;
+//   - an edit session moved a missing family onto the face Qt draws it with, so the committed
+//     layer names the substitute and nothing looks missing;
+//   - characters the face cannot draw were moved to the face that draws them, as their own run
+//     (substitute_uncovered_characters_in_editor). Which of the last two a platform does for one
+//     input differs (Linux moves Latin typed into Noto Naskh Arabic to a Latin face, Windows
+//     leaves the run alone), so the check compares what was asked with what the layer ends up
+//     naming instead of trusting either route.
+void ScriptEngineHost::report_text_fonts(const QString& api, std::int64_t session_id, LayerId layer_id,
+                                         const QStringList& asked) {
+  const auto* document = session_document_const(session_id);
+  const auto* layer = document == nullptr ? nullptr : document->find_layer(layer_id);
+  if (layer == nullptr || !layer_is_text(*layer)) {
+    return;
+  }
+  auto problems = text_font_problems_for_layer(*layer);
+  QStringList named;
+  for (const auto& run : text_layer_runs(session_id, layer_id)) {
+    named.push_back(run.family.trimmed());
+  }
+  const bool substitute_present = std::any_of(named.begin(), named.end(), [&asked](const QString& family) {
+    return !family.isEmpty() && !family_listed(asked, family);
+  });
+  if (substitute_present) {
+    const auto text = text_layer_text(session_id, layer_id);
+    const auto installed = font_families_without_foundries(QFontDatabase::families());
+    for (const auto& raw_family : asked) {
+      const auto family = raw_family.trimmed();
+      if (family.isEmpty() || family_listed(problems.not_installed, family) ||
+          family_listed(problems.no_glyphs, family)) {
+        continue;
+      }
+      if (!family_listed(installed, family)) {
+        // A name the database lists under another spelling (family plus face, a full name) is
+        // still in the runs when it resolved; gone from them, it was substituted.
+        if (!family_listed(named, family)) {
+          problems.not_installed.push_back(family);
+        }
+      } else if (!family_listed(named, family) || text_family_lacks_some_character(family, text)) {
+        problems.no_glyphs.push_back(family);
+      }
+    }
+  }
+  if (!problems.not_installed.isEmpty()) {
+    emit_message(MessageKind::Warn, tr("%1: font not available, rendered with a fallback: %2")
+                                        .arg(api, problems.not_installed.join(QStringLiteral(", "))));
+  }
+  if (!problems.no_glyphs.isEmpty()) {
+    emit_message(MessageKind::Warn, tr("%1: font has no glyphs for this text, rendered with a fallback: %2")
+                                        .arg(api, problems.no_glyphs.join(QStringLiteral(", "))));
+  }
+}
+
+// Opens the hidden edit session `text` uses and runs `edit` on it before the commit.
+bool ScriptEngineHost::edit_text_layer_session(std::int64_t session_id, LayerId layer_id, const char* api,
+                                               const std::function<void(QTextEdit&)>& edit,
+                                               const QStringList& requested_fonts) {
+  pump_progress_indicator();
+  auto* session = window_.session_with_id(session_id);
+  if (session == nullptr || session->canvas == nullptr) {
+    return false;
+  }
+  const auto* layer = std::as_const(session->document).find_layer(layer_id);
+  if (layer == nullptr || !layer_is_text(*layer) || text_geometry_is_protected(*layer) ||
+      window_.layer_id_locks_image_pixels(layer_id)) {
+    return false;
+  }
+  // The activation, the session's open and its commit refresh the panels once, at the end,
+  // retiring the old Layers rows: one rebuild each that left its rows for the event loop made
+  // every later call slower (layer.rerenderText across a document, GitHub issue 686).
+  window_.begin_deferred_panel_refreshes();
+  auto refresh_once = qScopeGuard([this] { window_.end_deferred_panel_refreshes(true); });
+  window_.activate_document_session(*session);
+  if (!prepare_mutation(session_id)) {
+    return false;
+  }
+  // Read before the session opens: it substitutes a font the layer cannot be drawn in, and the
+  // committed layer then names the substitute.
+  auto asked = requested_fonts;
+  for (const auto& run : text_layer_runs(session_id, layer_id)) {
+    asked.push_back(run.family);
+  }
+  const auto bounds = layer->bounds();
+  const QPoint anchor(bounds.x + std::max(1, bounds.width) / 2, bounds.y + std::max(1, bounds.height) / 2);
+  session->document.set_active_layer(layer_id);
+  window_.add_text_at(anchor, {}, true, std::nullopt, layer_id);
+  QTextEdit* editor = wait_for_inline_text_editor(session->canvas);
+  if (editor == nullptr) {
+    return false;
+  }
+  if (editor->property("patchy.editingLayerId").toULongLong() != static_cast<qulonglong>(layer_id)) {
+    window_.cancel_active_text_editor();
+    return false;
+  }
+  edit(*editor);
+  QApplication::processEvents(QEventLoop::ExcludeUserInputEvents);
+  window_.finish_active_text_editor();
+  refresh_once.dismiss();
+  window_.end_deferred_panel_refreshes(true);
+  QApplication::processEvents(QEventLoop::ExcludeUserInputEvents);
+  note_structure_changed(session_id);
+
+  report_text_fonts(QString::fromLatin1(api), session_id, layer_id, asked);
+  return true;
+}
+
+bool ScriptEngineHost::set_text_layer_orientation(std::int64_t session_id, LayerId layer_id,
+                                                  const QString& orientation) {
+  if (orientation != QLatin1String("vertical") && orientation != QLatin1String("horizontal")) {
+    return false;
+  }
+  if (text_layer_orientation(session_id, layer_id) == orientation) {
+    return layer_is_text_layer(session_id, layer_id);
+  }
+  return edit_text_layer_session(session_id, layer_id, "layer.textOrientation", [this, orientation](QTextEdit&) {
+    window_.apply_text_orientation(orientation == QLatin1String("vertical"), /*remember_default*/ false);
+  });
+}
+
+bool ScriptEngineHost::rerender_text_layer(std::int64_t session_id, LayerId layer_id) {
+  // An untouched session of a box or PSD-frame layer keeps the source raster on commit
+  // (finish_active_text_editor); marking it changed is what makes the commit render.
+  return edit_text_layer_session(session_id, layer_id, "layer.rerenderText",
+                                 [this](QTextEdit& editor) { window_.mark_text_editor_changed(&editor); });
+}
+
+bool ScriptEngineHost::set_text_layer_direction(std::int64_t session_id, LayerId layer_id,
+                                                const QString& direction) {
+  const auto resolved = layout_direction_for_name(direction);
+  if (!resolved.has_value()) {
+    return false;
+  }
+  return edit_text_layer_session(session_id, layer_id, "layer.textDirection", [this, resolved](QTextEdit& editor) {
+    auto all = editor.textCursor();
+    all.select(QTextCursor::Document);
+    editor.setTextCursor(all);
+    window_.apply_text_direction_to_active_editor(*resolved);
+  });
+}
+
+namespace {
+
+// The format a run is typed with: `base` (the session's typing format, or the first character's
+// on a re-edit) with the run's own family, size, face and color on top. The size lands in editor
+// units beside its exact value, exactly as the options bar's size spin does. A run that names a
+// family or a face drops any recorded style, which would otherwise override the request.
+void apply_text_run_to_format(MainWindow& window, QTextCharFormat& format,
+                              const ScriptEngineHost::TextRunParams& run, double zoom) {
+  if (!run.family.isEmpty()) {
+    window.apply_text_family_to_format(format, run.family);
+  }
+  if (run.size_px > 0.0) {
+    format.setProperty(QTextFormat::FontPixelSize,
+                       std::max(1, static_cast<int>(std::lround(run.size_px * zoom))));
+    format.setProperty(kTextExactSizeFormatProperty, run.size_px * zoom);
+  }
+  if (run.bold.has_value()) {
+    format.setFontWeight(*run.bold ? QFont::Bold : QFont::Normal);
+  }
+  if (run.italic.has_value()) {
+    format.setFontItalic(*run.italic);
+  }
+  if (run.color.isValid()) {
+    format.setForeground(QBrush(run.color));
+  }
+  if (run.caps.has_value()) {
+    format.setProperty(kTextFontCapsFormatProperty, *run.caps);
+  }
+  if (run.script.has_value()) {
+    format.setProperty(kTextFontBaselineFormatProperty, *run.script);
+  }
+  if (run.underline.has_value()) {
+    format.setProperty(kTextUnderlineFormatProperty, *run.underline);
+  }
+  if (run.strikethrough.has_value()) {
+    format.setProperty(kTextStrikethroughFormatProperty, *run.strikethrough);
+  }
+  if (run.ordinals.has_value()) {
+    format.setProperty(kTextOrdinalsFormatProperty, *run.ordinals);
+  }
+  if (run.fractions.has_value()) {
+    format.setProperty(kTextFractionsFormatProperty, *run.fractions);
+  }
+  if (run.ligatures.has_value()) {
+    format.setProperty(kTextLigaturesOffFormatProperty, !*run.ligatures);
+  }
+  if (run.contextual_alternates.has_value()) {
+    format.setProperty(kTextContextualAlternatesFormatProperty, *run.contextual_alternates);
+  }
+  if (run.discretionary_ligatures.has_value()) {
+    format.setProperty(kTextDiscretionaryLigaturesFormatProperty, *run.discretionary_ligatures);
+  }
+  if (run.swash.has_value()) {
+    format.setProperty(kTextSwashFormatProperty, *run.swash);
+  }
+  if (run.stylistic_alternates.has_value()) {
+    format.setProperty(kTextStylisticAlternatesFormatProperty, *run.stylistic_alternates);
+  }
+  if (run.titling_alternates.has_value()) {
+    format.setProperty(kTextTitlingAlternatesFormatProperty, *run.titling_alternates);
+  }
+  if (!run.family.isEmpty() || run.bold.has_value() || run.italic.has_value()) {
+    format.clearProperty(kTextStyleNameFormatProperty);
+  }
+}
+
+// Replaces the editor's selection with the runs, each typed in its own format, and leaves the
+// cursor after the last one.
+void insert_text_runs(MainWindow& window, QTextEdit& editor, const QTextCharFormat& base,
+                      const std::vector<ScriptEngineHost::TextRunParams>& runs, double zoom) {
+  auto cursor = editor.textCursor();
+  cursor.beginEditBlock();
+  for (const auto& run : runs) {
+    QTextCharFormat format = base;
+    apply_text_run_to_format(window, format, run, zoom);
+    cursor.insertText(run.text, format);
+  }
+  cursor.endEditBlock();
+  editor.setTextCursor(cursor);
+}
+
+}  // namespace
+
+std::optional<LayerId> ScriptEngineHost::add_text_layer(std::int64_t session_id,
+                                                        const TextLayerParams& params) {
+  pump_progress_indicator();
+  auto* session = window_.session_with_id(session_id);
+  if (session == nullptr || session->canvas == nullptr) {
+    return std::nullopt;
+  }
+  window_.activate_document_session(*session);
+  if (!prepare_mutation(session_id)) {
+    return std::nullopt;
+  }
+  std::set<LayerId> before;
+  collect_layer_ids(std::as_const(session->document).layers(), before);
+  // add_text_at edits the ACTIVE layer when the point lands inside its bounds;
+  // clearing the active layer guarantees a fresh text layer instead.
+  session->document.clear_active_layer();
+  // A valid box opens the session as paragraph text (the Type tool's drag), wrapping at the
+  // box width; point text otherwise.
+  const QRect box = params.box.isValid() ? QRect(params.position, params.box) : QRect();
+  window_.add_text_at(params.position, box, true, params.area, std::nullopt, params.path);
+  QTextEdit* editor = wait_for_inline_text_editor(session->canvas);
+  if (editor == nullptr) {
+    return std::nullopt;
+  }
+  const double zoom = std::max(0.01, session->canvas->zoom());
+  const auto layer_family =
+      !params.family.isEmpty() ? params.family : (params.runs.empty() ? QString() : params.runs.front().family);
+  if (!layer_family.isEmpty()) {
+    // The options bar's font picker path: besides the char format, the commit reads the family
+    // from the session property and the per-run display family, so a bare QFont family was
+    // dropped and every script-made layer rendered in the bar's current font.
+    window_.apply_text_family_to_editor(*editor, layer_family);
+  }
+  QTextCharFormat format = editor->currentCharFormat();
+  // A new session seeds its face from the options bar's style picker, as Photoshop seeds new
+  // type from its toolbar. A script names the face itself (font, bold, italic), so the picker's
+  // face must not ride along: with the bar parked on a Semibold layer, every scripted layer in
+  // any family offering that face rendered Semibold, whatever the script asked for.
+  format.clearProperty(kTextStyleNameFormatProperty);
+  QFont font = format.font();
+  if (params.size_px > 0.0) {
+    // The inline editor's font lives in editor pixels (document px * zoom, see
+    // the interactive path in main_window.cpp). A point-sized font here would
+    // commit at a size that depends on the current canvas zoom.
+    font.setPixelSize(std::max(1, static_cast<int>(std::lround(params.size_px * zoom))));
+    // The exact size travels alongside the whole-pixel editor font, so the committed size is
+    // the requested one at every zoom rather than round(px / zoom).
+    format.setProperty(kTextExactSizeFormatProperty, params.size_px * zoom);
+  }
+  font.setBold(params.bold);
+  font.setItalic(params.italic);
+  format.setFont(font);
+  if (params.color.isValid()) {
+    format.setForeground(params.color);
+  }
+  editor->setCurrentCharFormat(format);
+  if (params.orientation == QLatin1String("vertical")) {
+    window_.apply_text_orientation(true, /*remember_default*/ false);
+  } else if (params.orientation == QLatin1String("horizontal")) {
+    window_.apply_text_orientation(false, /*remember_default*/ false);
+  }
+  if (params.runs.empty()) {
+    editor->insertPlainText(params.text);
+  } else {
+    insert_text_runs(window_, *editor, format, params.runs, zoom);
+  }
+  if (!params.align.isEmpty()) {
+    // Paragraph-level, like the options bar's alignment buttons on a whole object.
+    auto all = editor->textCursor();
+    all.select(QTextCursor::Document);
+    editor->setTextCursor(all);
+    window_.apply_text_alignment_to_editor(*editor, params.align);
+  }
+  if (const auto direction = layout_direction_for_name(params.direction); direction.has_value()) {
+    auto all = editor->textCursor();
+    all.select(QTextCursor::Document);
+    editor->setTextCursor(all);
+    window_.apply_text_direction_to_active_editor(*direction);
+  }
+  if (!params.paragraph.empty()) {
+    // Paragraph panel metrics on the whole object, like `align`.
+    auto all = editor->textCursor();
+    all.select(QTextCursor::Document);
+    editor->setTextCursor(all);
+    window_.apply_text_paragraph_metrics_to_editor(*editor, params.paragraph);
+  }
+  QApplication::processEvents(QEventLoop::ExcludeUserInputEvents);
+  window_.finish_active_text_editor();
+  QApplication::processEvents(QEventLoop::ExcludeUserInputEvents);
+
+  session = window_.session_with_id(session_id);
+  if (session == nullptr) {
+    return std::nullopt;
+  }
+  std::optional<LayerId> created;
+  std::function<void(const std::vector<Layer>&)> find_new = [&](const std::vector<Layer>& layers) {
+    for (const auto& layer : layers) {
+      if (before.count(layer.id()) == 0 && layer_is_text(layer)) {
+        created = layer.id();
+      }
+      find_new(layer.children());
+    }
+  };
+  find_new(std::as_const(session->document).layers());
+  note_structure_changed(session_id);
+  if (created.has_value()) {
+    // A family that is not installed, or that holds no glyph for the text, renders in a fallback
+    // face; say so, and say which, instead of letting the caller discover it from the pixels.
+    QStringList asked;
+    if (!params.family.trimmed().isEmpty()) {
+      asked.push_back(params.family.trimmed());
+    }
+    for (const auto& run : params.runs) {
+      if (!run.family.trimmed().isEmpty()) {
+        asked.push_back(run.family.trimmed());
+      }
+    }
+    report_text_fonts(QStringLiteral("addTextLayer"), session_id, *created, asked);
+  }
+  return created;
+}
+
+bool ScriptEngineHost::set_text_layer_text(std::int64_t session_id, LayerId layer_id,
+                                           const QString& text) {
+  TextRunParams run;
+  run.text = text;
+  return set_text_layer_runs(session_id, layer_id, {run}, "layer.text");
+}
+
+bool ScriptEngineHost::set_text_layer_runs(std::int64_t session_id, LayerId layer_id,
+                                           const std::vector<TextRunParams>& runs, const char* api) {
+  QStringList requested_fonts;
+  for (const auto& run : runs) {
+    if (!run.family.trimmed().isEmpty()) {
+      requested_fonts.push_back(run.family.trimmed());
+    }
+  }
+  const auto edit = [this, session_id, &runs](QTextEdit& editor) {
+    const auto* session = window_.session_with_id(session_id);
+    const double zoom =
+        session != nullptr && session->canvas != nullptr ? std::max(0.01, session->canvas->zoom()) : 1.0;
+    auto cursor = editor.textCursor();
+    cursor.select(QTextCursor::Document);
+    // Replace the selection in one step, as retyping it in the editor does. Deleting everything
+    // first left an empty block whose char format is only the session's fallback font, so the
+    // inserted text lost the run properties the commit renders from (the exact fractional size,
+    // the Character-panel glyph scales, leading, tracking, faux styles): an imported Photoshop
+    // layer with VerticalScale 0.93 re-rendered 7.5% taller than the same layer applied
+    // interactively. Photoshop gives retyped text the first selected character's attributes;
+    // a run's own font, size, face and color go on top of them.
+    QTextCharFormat base;
+    {
+      auto first = cursor;
+      first.setPosition(0);
+      first.setPosition(std::min(1, first.document()->characterCount() - 1), QTextCursor::KeepAnchor);
+      base = first.charFormat();
+    }
+    editor.setTextCursor(cursor);
+    insert_text_runs(window_, editor, base, runs, zoom);
+  };
+  return edit_text_layer_session(session_id, layer_id, api, edit, requested_fonts);
+}
+
+std::vector<ScriptEngineHost::TextRunInfo> ScriptEngineHost::text_layer_runs(std::int64_t session_id,
+                                                                            LayerId layer_id) const {
+  std::vector<TextRunInfo> runs;
+  const auto* document = session_document_const(session_id);
+  const auto* layer = document != nullptr ? document->find_layer(layer_id) : nullptr;
+  if (layer == nullptr || !layer_is_text(*layer)) {
+    return runs;
+  }
+  const auto& metadata = layer->metadata();
+  const auto value = [&metadata](const char* key) {
+    const auto found = metadata.find(key);
+    return found == metadata.end() ? QString() : QString::fromStdString(found->second);
+  };
+  const auto decode = [](const QString& field) {
+    return QString::fromUtf8(QByteArray::fromPercentEncoding(field.toLatin1()));
+  };
+  const auto text = value(kLayerMetadataText);
+  // The run columns: start, length, size, bold, italic, color, family, then the optional
+  // Photoshop-layout columns, with the recorded face at column 12 (docs/font-resolution.md).
+  for (const auto& raw_line : value(kLayerMetadataTextRuns).split(QLatin1Char('\n'))) {
+    const auto fields = raw_line.trimmed().split(QLatin1Char('\t'));
+    if (fields.size() < 7) {
+      continue;  // the version line
+    }
+    bool start_ok = false;
+    bool length_ok = false;
+    const auto start = fields[0].toInt(&start_ok);
+    const auto length = fields[1].toInt(&length_ok);
+    if (!start_ok || !length_ok || start < 0 || length <= 0 || start >= text.size()) {
+      continue;
+    }
+    TextRunInfo run;
+    run.text = text.mid(start, length);
+    run.size = fields[2].toDouble();
+    run.bold = fields[3].toInt() != 0;
+    run.italic = fields[4].toInt() != 0;
+    run.color = fields[5];
+    run.family = decode(fields[6]);
+    if (fields.size() >= 13) {
+      run.style = decode(fields[12]);
+    }
+    if (fields.size() >= 17) {
+      run.styles = parse_text_character_styles(fields[16]);
+    }
+    runs.push_back(std::move(run));
+  }
+  if (runs.empty()) {
+    TextRunInfo run;
+    run.text = text;
+    run.family = value(kLayerMetadataTextFont);
+    run.size = value(kLayerMetadataTextSize).toDouble();
+    run.bold = value(kLayerMetadataTextBold) == QLatin1String("true");
+    run.italic = value(kLayerMetadataTextItalic) == QLatin1String("true");
+    run.color = value(kLayerMetadataTextColor);
+    runs.push_back(std::move(run));
+  }
+  return runs;
+}
+
+QSize ScriptEngineHost::text_layer_box(std::int64_t session_id, LayerId layer_id) const {
+  const auto* document = session_document_const(session_id);
+  const auto* layer = document != nullptr ? document->find_layer(layer_id) : nullptr;
+  if (layer == nullptr || !layer_is_text(*layer)) {
+    return QSize();
+  }
+  const auto& metadata = layer->metadata();
+  const auto value = [&metadata](const char* key) {
+    const auto found = metadata.find(key);
+    return found == metadata.end() ? QString() : QString::fromStdString(found->second);
+  };
+  // Point text stores its editor box too; only the flow flag says the box is a paragraph box.
+  if (value(kLayerMetadataTextFlow).compare(QLatin1String("box"), Qt::CaseInsensitive) != 0) {
+    return QSize();
+  }
+  const QSize box(value(kLayerMetadataTextBoxWidth).toInt(), value(kLayerMetadataTextBoxHeight).toInt());
+  return box.width() > 0 && box.height() > 0 ? box : QSize();
+}
+
+QString ScriptEngineHost::text_layer_align(std::int64_t session_id, LayerId layer_id) const {
+  const auto* document = session_document_const(session_id);
+  const auto* layer = document != nullptr ? document->find_layer(layer_id) : nullptr;
+  if (layer == nullptr || !layer_is_text(*layer)) {
+    return QString();
+  }
+  const auto found = layer->metadata().find(kLayerMetadataTextParagraphRuns);
+  if (found != layer->metadata().end()) {
+    for (const auto& raw_line : QString::fromStdString(found->second).split(QLatin1Char('\n'))) {
+      const auto fields = raw_line.trimmed().split(QLatin1Char('\t'));
+      if (fields.size() < 3) {
+        continue;
+      }
+      const auto name = canonical_paragraph_alignment_name(fields[2]);
+      return name.isEmpty() ? QStringLiteral("left") : name;
+    }
+  }
+  return QStringLiteral("left");
+}
+
+TextParagraphMetrics ScriptEngineHost::text_layer_paragraph(std::int64_t session_id, LayerId layer_id) const {
+  TextParagraphMetrics metrics;
+  metrics.first_line_indent = 0.0;
+  metrics.start_indent = 0.0;
+  metrics.end_indent = 0.0;
+  metrics.space_before = 0.0;
+  metrics.space_after = 0.0;
+  const auto* document = session_document_const(session_id);
+  const auto* layer = document != nullptr ? document->find_layer(layer_id) : nullptr;
+  if (layer == nullptr || !layer_is_text(*layer)) {
+    return metrics;
+  }
+  const auto found = layer->metadata().find(kLayerMetadataTextParagraphRuns);
+  if (found == layer->metadata().end()) {
+    return metrics;
+  }
+  // The first paragraph's v2+ columns (first line indent, left, right, space before, space after).
+  for (const auto& raw_line : QString::fromStdString(found->second).split(QLatin1Char('\n'))) {
+    const auto fields = raw_line.trimmed().split(QLatin1Char('\t'));
+    if (fields.size() < 3) {
+      continue;
+    }
+    if (fields.size() >= 8) {
+      const auto metric = [&fields](int index) {
+        bool ok = false;
+        const auto value = fields[index].toDouble(&ok);
+        return ok && std::isfinite(value) ? value : 0.0;
+      };
+      metrics.first_line_indent = metric(3);
+      metrics.start_indent = metric(4);
+      metrics.end_indent = metric(5);
+      metrics.space_before = metric(6);
+      metrics.space_after = metric(7);
+    }
+    break;
+  }
+  return metrics;
+}
+
+bool ScriptEngineHost::set_text_layer_paragraph(std::int64_t session_id, LayerId layer_id,
+                                                const TextParagraphMetrics& metrics) {
+  if (metrics.empty()) {
+    return layer_is_text_layer(session_id, layer_id);
+  }
+  return edit_text_layer_session(session_id, layer_id, "layer.textParagraph", [this, metrics](QTextEdit& editor) {
+    auto all = editor.textCursor();
+    all.select(QTextCursor::Document);
+    editor.setTextCursor(all);
+    window_.apply_text_paragraph_metrics_to_editor(editor, metrics);
+  });
+}
+
+bool ScriptEngineHost::set_text_layer_area(std::int64_t session_id, LayerId layer_id,
+                                           const std::optional<VectorPath>& area) {
+  if (area && !valid_text_area(*area)) return false;
+  if (area) {
+    const auto* session = window_.session_with_id(session_id);
+    const auto* layer = session ? session->document.find_layer(layer_id) : nullptr;
+    if (!layer) return false;
+    const auto t = text_area_transform(*layer);
+    const auto determinant = t[0] * t[3] - t[1] * t[2];
+    if (!std::isfinite(determinant) || std::abs(determinant) < 1e-12) return false;
+    auto local = *area;
+    transform_vector_path(local, {t[3]/determinant,-t[1]/determinant,-t[2]/determinant,t[0]/determinant,
+        (t[2]*t[5]-t[3]*t[4])/determinant,(t[1]*t[4]-t[0]*t[5])/determinant});
+    if (!valid_text_area(local)) return false;
+  }
+  return edit_text_layer_session(session_id, layer_id, "layer.textArea", [this, &area](QTextEdit& editor) {
+    window_.set_text_editor_area(editor, area);
+  });
+}
+
+bool ScriptEngineHost::set_text_layer_path(std::int64_t session_id, LayerId layer_id,
+                                           const std::optional<TextPathFrame>& frame) {
+  if (frame && !valid_text_path(frame->path)) return false;
+  if (frame) {
+    const auto* session = window_.session_with_id(session_id);
+    const auto* layer = session ? session->document.find_layer(layer_id) : nullptr;
+    if (!layer) return false;
+    const auto t = text_area_transform(*layer);
+    const auto determinant = t[0] * t[3] - t[1] * t[2];
+    if (!std::isfinite(determinant) || std::abs(determinant) < 1e-12) return false;
+    auto local = frame->path;
+    transform_vector_path(local, {t[3]/determinant,-t[1]/determinant,-t[2]/determinant,t[0]/determinant,
+        (t[2]*t[5]-t[3]*t[4])/determinant,(t[1]*t[4]-t[0]*t[5])/determinant});
+    if (!valid_text_path(local)) return false;
+  }
+  return edit_text_layer_session(session_id, layer_id, "layer.textPath", [this, &frame](QTextEdit& editor) {
+    window_.set_text_editor_path(editor, frame);
+  });
+}
+
+bool ScriptEngineHost::set_text_layer_align(std::int64_t session_id, LayerId layer_id, const QString& align) {
+  const auto alignment = canonical_paragraph_alignment_name(align);
+  return edit_text_layer_session(session_id, layer_id, "layer.textAlign", [this, alignment](QTextEdit& editor) {
+    auto all = editor.textCursor();
+    all.select(QTextCursor::Document);
+    editor.setTextCursor(all);
+    window_.apply_text_alignment_to_editor(editor, alignment);
+  });
+}
+
+QString ScriptEngineHost::text_layer_text(std::int64_t session_id, LayerId layer_id) const {
+  const auto* document = session_document_const(session_id);
+  if (document == nullptr) {
+    return QString();
+  }
+  const auto* layer = document->find_layer(layer_id);
+  if (layer == nullptr) {
+    return QString();
+  }
+  const auto found = layer->metadata().find(kLayerMetadataText);
+  return found == layer->metadata().end() ? QString() : QString::fromStdString(found->second);
+}
+
+bool ScriptEngineHost::layer_is_text_layer(std::int64_t session_id, LayerId layer_id) const {
+  const auto* document = session_document_const(session_id);
+  if (document == nullptr) {
+    return false;
+  }
+  const auto* layer = document->find_layer(layer_id);
+  return layer != nullptr && layer_is_text(*layer);
+}
+
+// ---------------------------------------------------------------------------
+// Filters
+
+std::optional<FilterInvocation> ScriptEngineHost::script_filter_invocation(const FilterRegistry& registry,
+                                                                          const QString& filter_id,
+                                                                          const QJSValue& params) {
+  const auto* definition = registry.find(filter_id.toStdString());
+  if (definition == nullptr) {
+    throw_js_error(tr("Unknown filter id: %1").arg(filter_id));
+    return std::nullopt;
+  }
+  auto invocation = registry.default_invocation(definition->identifier);
+  if (params.isObject()) {
+    QJSValueIterator it(params);
+    while (it.hasNext()) {
+      it.next();
+      const auto key = it.name().toStdString();
+      const auto* parameter = [&]() -> const FilterParameterDefinition* {
+        for (const auto& candidate : definition->catalog.parameters) {
+          if (candidate.key == key) {
+            return &candidate;
+          }
+        }
+        return nullptr;
+      }();
+      if (parameter == nullptr) {
+        throw_js_error(tr("Filter %1 has no parameter named %2")
+                           .arg(filter_id, QString::fromStdString(key)));
+        return std::nullopt;
+      }
+      const auto value = it.value();
+      switch (parameter->kind) {
+        case FilterParameterKind::Integer:
+          invocation.parameters[key] = static_cast<std::int64_t>(value.toInt());
+          break;
+        case FilterParameterKind::Double:
+          invocation.parameters[key] = value.toNumber();
+          break;
+        case FilterParameterKind::Boolean:
+          invocation.parameters[key] = value.toBool();
+          break;
+        case FilterParameterKind::Option:
+          invocation.parameters[key] = value.toString().toStdString();
+          break;
+      }
+    }
+  }
+  auto normalized = registry.normalize(invocation);
+  if (!normalized.has_value()) {
+    throw_js_error(tr("Filter %1 rejected those parameters.").arg(filter_id));
+    return std::nullopt;
+  }
+  return normalized;
+}
+
+bool ScriptEngineHost::apply_filter_to_layer(std::int64_t session_id, LayerId layer_id,
+                                             const QString& filter_id, const QJSValue& params) {
+  pump_progress_indicator();
+  auto* session = window_.session_with_id(session_id);
+  if (session == nullptr) {
+    throw_js_error(tr("The document is no longer open."));
+    return false;
+  }
+  // GEGL filters (docs/gegl-filters.md) come from their own registry, scanned on first use.
+  std::shared_ptr<const FilterRegistry> gegl_registry;
+#ifndef Q_OS_WASM
+  if (filter_id.startsWith(QLatin1String("gegl."))) {
+    window_.ensure_gegl_filters_scanned();
+    gegl_registry = window_.gegl_filter_registry_for(filter_id);
+  }
+#endif
+  const auto& registry = gegl_registry != nullptr ? *gegl_registry : window_.filters_;
+  const auto normalized = script_filter_invocation(registry, filter_id, params);
+  if (!normalized.has_value()) {
+    return false;
+  }
+  auto* layer = session->document.find_layer(layer_id);
+  if (layer == nullptr) {
+    throw_js_error(tr("The layer no longer exists."));
+    return false;
+  }
+  if (layer_is_smart_object(*layer)) {
+    // The Filter menu's rule: a filter with a native mapping becomes a Smart Filter.
+    return add_smart_filter_invocation(session_id, layer_id, registry, *normalized, "applyFilter",
+                                       SmartFilterEntryChanges{}) >= 0;
+  }
+  if (layer->kind() != LayerKind::Pixel && layer->kind() != LayerKind::Text) {
+    throw_js_error(tr("applyFilter needs a pixel layer."));
+    return false;
+  }
+  if (std::as_const(*layer).pixels().empty()) {
+    return true;  // nothing to filter
+  }
+  if (deep_filter_support(normalized->filter_id, std::as_const(*layer).pixels().format().bit_depth) ==
+      DeepFilterSupport::Unsupported) {
+    throw_js_error(tr("This filter is not available in 32-bit documents."));
+    return false;
+  }
+  if (!prepare_mutation(session_id)) {
+    return false;
+  }
+  const auto before_bounds = to_qrect(layer_render_bounds(std::as_const(*layer)));
+  if (auto* canvas = session_canvas(session_id); canvas != nullptr && canvas->has_selection()) {
+    // Like the menu command: limited to the selection, its soft edges blended by coverage.
+    auto filtered = build_filter_preview_pixels(std::as_const(*layer).pixels(), filter_selection(*canvas),
+                                                std::as_const(*layer).bounds(), registry,
+                                                FilterPreviewSettings{true, *normalized});
+    layer->set_pixels(std::move(filtered));
+  } else {
+    registry.apply(*normalized, layer->pixels());
+  }
+  note_pixels_changed(session_id, before_bounds);
+  return true;
+}
+
+bool ScriptEngineHost::apply_camera_raw_filter_to_layer(std::int64_t session_id, LayerId layer_id,
+                                                        const QJSValue& settings) {
+  pump_progress_indicator();
+  auto* session = window_.session_with_id(session_id);
+  if (session == nullptr) {
+    throw_js_error(tr("The document is no longer open."));
+    return false;
+  }
+  PhotoDevelopParams params;
+  if (!settings.isUndefined() && !settings.isNull()) {
+    if (!settings.isObject()) {
+      throw_js_error(tr("applyCameraRawFilter: pass an object of settings."));
+      return false;
+    }
+    // Script names are permanent API identifiers (docs/scripting.md).
+    const std::array<std::pair<QLatin1String, double PhotoDevelopParams::*>, 8> fields = {{
+        {QLatin1String("temperature"), &PhotoDevelopParams::temperature},
+        {QLatin1String("tint"), &PhotoDevelopParams::tint},
+        {QLatin1String("exposure"), &PhotoDevelopParams::exposure_ev},
+        {QLatin1String("contrast"), &PhotoDevelopParams::contrast},
+        {QLatin1String("highlights"), &PhotoDevelopParams::highlights},
+        {QLatin1String("shadows"), &PhotoDevelopParams::shadows},
+        {QLatin1String("saturation"), &PhotoDevelopParams::saturation},
+        {QLatin1String("vibrance"), &PhotoDevelopParams::vibrance},
+    }};
+    QJSValueIterator it(settings);
+    while (it.hasNext()) {
+      it.next();
+      const auto field = std::find_if(fields.begin(), fields.end(),
+                                      [&](const auto& candidate) { return candidate.first == it.name(); });
+      if (field == fields.end()) {
+        throw_js_error(tr("applyCameraRawFilter: unknown setting %1.").arg(it.name()));
+        return false;
+      }
+      const auto value = it.value();
+      if (!value.isNumber() || !std::isfinite(value.toNumber())) {
+        throw_js_error(tr("applyCameraRawFilter: %1 must be a number.").arg(it.name()));
+        return false;
+      }
+      params.*(field->second) = value.toNumber();
+    }
+  }
+  params = normalize_photo_develop_params(params);
+  auto* layer = session->document.find_layer(layer_id);
+  if (layer == nullptr) {
+    throw_js_error(tr("The layer no longer exists."));
+    return false;
+  }
+  if (!editable_rgb_layer_any_depth(layer)) {
+    throw_js_error(tr("applyCameraRawFilter needs an RGB pixel layer."));
+    return false;
+  }
+  if (layer_is_smart_object(*layer)) {
+    throw_js_error(QCoreApplication::translate(
+        "patchy::ui::MainWindow", "Rasterize the Smart Object before applying destructive filters or adjustments"));
+    return false;
+  }
+  if (std::as_const(*layer).pixels().empty() || PhotoDeveloper(params).is_identity()) {
+    return true;  // nothing to change
+  }
+  if (!prepare_mutation(session_id)) {
+    return false;
+  }
+  const auto before_bounds = to_qrect(layer_render_bounds(std::as_const(*layer)));
+  FilterSelection selection;
+  if (auto* canvas = session_canvas(session_id); canvas != nullptr && canvas->has_selection()) {
+    // Like the menu command: limited to the selection, its soft edges blended by coverage.
+    selection = filter_selection(*canvas);
+  }
+  auto pixels = std::as_const(*layer).pixels();
+  apply_camera_raw_filter_to_pixels(pixels, std::as_const(*layer).bounds(), selection, params);
+  layer->set_pixels(std::move(pixels));
+  note_pixels_changed(session_id, before_bounds);
+  return true;
+}
+
+bool ScriptEngineHost::apply_legacy_plugin_to_layer(std::int64_t session_id, LayerId layer_id,
+                                                    const QString& plugin_id, bool show_dialog,
+                                                    const QString& capture_dialog_path) {
+  pump_progress_indicator();
+  auto* session = window_.session_with_id(session_id);
+  if (session == nullptr) {
+    throw_js_error(tr("The document is no longer open."));
+    return false;
+  }
+  const auto* entry = window_.find_legacy_plugin(plugin_id.toStdString());
+  if (entry == nullptr) {
+    throw_js_error(tr("Unknown plug-in id: %1").arg(plugin_id));
+    return false;
+  }
+  if (!entry->probe.supported) {
+    throw_js_error(tr("Plug-in %1 cannot run: %2").arg(plugin_id, translate_data_text(entry->probe.reason)));
+    return false;
+  }
+  auto* layer = session->document.find_layer(layer_id);
+  if (layer == nullptr) {
+    throw_js_error(tr("The layer no longer exists."));
+    return false;
+  }
+  if (layer->kind() != LayerKind::Pixel) {
+    throw_js_error(tr("applyPlugin needs a pixel layer."));
+    return false;
+  }
+  if (std::as_const(*layer).pixels().empty()) {
+    return true;  // nothing to filter
+  }
+  const auto before_bounds = to_qrect(layer_render_bounds(std::as_const(*layer)));
+  QString error;
+  const auto status = window_.apply_legacy_plugin(
+      *session, layer_id, *entry, show_dialog && (!unattended_run() || !capture_dialog_path.isEmpty()),
+      [this, session_id] { (void)prepare_mutation(session_id); }, &error,
+      capture_dialog_path.isEmpty() ? QString() : QDir::toNativeSeparators(capture_dialog_path),
+      // A script that asked for no dialog gets a dialog the plug-in opens
+      // anyway (first run, nothing stored) answered, so it never blocks.
+      /*auto_accept_dialogs=*/unattended_run() || !show_dialog);
+  switch (status) {
+    case MainWindow::LegacyPluginApplyStatus::Applied:
+      note_pixels_changed(session_id, before_bounds);
+      return true;
+    case MainWindow::LegacyPluginApplyStatus::NoChange:
+      return true;
+    case MainWindow::LegacyPluginApplyStatus::Cancelled:
+      throw_js_error(tr("Plug-in %1 was cancelled.").arg(plugin_id));
+      return false;
+    case MainWindow::LegacyPluginApplyStatus::Error:
+      throw_js_error(tr("Plug-in %1 failed: %2").arg(plugin_id, error));
+      return false;
+  }
+  return false;
+}
+
+// ---------------------------------------------------------------------------
+// patchy.gmic and layer.applyGmic (docs/gmic.md)
+
+namespace {
+
+// The tokens scripts use for a filter's input layers. Permanent identifiers.
+struct GmicInputToken {
+  char mode;
+  const char* token;
+};
+constexpr GmicInputToken kGmicInputTokens[] = {
+    {'.', "active"}, {'+', "activeAndBelow"}, {'-', "activeAndAbove"},
+    {'*', "all"},    {'v', "visible"},        {'i', "hidden"},
+};
+
+[[nodiscard]] QString gmic_input_token(char mode) {
+  for (const auto& entry : kGmicInputTokens) {
+    if (entry.mode == mode) {
+      return QString::fromLatin1(entry.token);
+    }
+  }
+  return QStringLiteral("active");
+}
+
+[[nodiscard]] const char* gmic_type_token(gmic::ParameterType type) {
+  switch (type) {
+    case gmic::ParameterType::Bool: return "bool";
+    case gmic::ParameterType::Button: return "button";
+    case gmic::ParameterType::Choice: return "choice";
+    case gmic::ParameterType::Color: return "color";
+    case gmic::ParameterType::Point: return "point";
+    case gmic::ParameterType::File: return "file";
+    case gmic::ParameterType::Float: return "float";
+    case gmic::ParameterType::Folder: return "folder";
+    case gmic::ParameterType::Int: return "int";
+    case gmic::ParameterType::Text: return "text";
+    case gmic::ParameterType::Value: return "value";
+    case gmic::ParameterType::Link:
+    case gmic::ParameterType::Note:
+    case gmic::ParameterType::Separator: break;
+  }
+  return "";
+}
+
+[[nodiscard]] QString gmic_qstring(const std::string& text) {
+  return QString::fromUtf8(text.c_str(), static_cast<qsizetype>(text.size()));
+}
+
+[[nodiscard]] std::string gmic_std_string(const QString& text) {
+  const auto bytes = text.toUtf8();
+  return std::string(bytes.constData(), static_cast<std::size_t>(bytes.size()));
+}
+
+[[nodiscard]] std::string gmic_number(double value) {
+  return gmic_std_string(QString::number(value, 'g', 12));
+}
+
+// A script value as the G'MIC argument a parameter takes; nullopt when it does not fit.
+[[nodiscard]] std::optional<std::string> gmic_argument_from_js(const gmic::Parameter& parameter,
+                                                               const QJSValue& value) {
+  switch (parameter.type) {
+    case gmic::ParameterType::Float:
+      return value.isNumber() ? std::optional(gmic_number(value.toNumber())) : std::nullopt;
+    case gmic::ParameterType::Int:
+      return value.isNumber() ? std::optional(gmic_number(std::round(value.toNumber()))) : std::nullopt;
+    case gmic::ParameterType::Bool:
+    case gmic::ParameterType::Button:
+      return std::string(value.toBool() ? "1" : "0");
+    case gmic::ParameterType::Choice: {
+      if (value.isNumber()) {
+        const double index = value.toNumber();
+        if (index < 0 || index >= static_cast<double>(parameter.choices.size()) || index != std::floor(index)) {
+          return std::nullopt;
+        }
+        return std::to_string(static_cast<int>(index));
+      }
+      const QString wanted = value.toString();
+      for (std::size_t index = 0; index < parameter.choices.size(); ++index) {
+        if (gmic_qstring(parameter.choices[index]).compare(wanted, Qt::CaseInsensitive) == 0) {
+          return std::to_string(index);
+        }
+      }
+      return std::nullopt;
+    }
+    case gmic::ParameterType::Color: {
+      // "#rrggbb" / "#rrggbbaa", or [r, g, b] / [r, g, b, a] with 0..255 channels.
+      std::vector<int> channels;
+      if (value.isString()) {
+        const QString text = value.toString();
+        if (!text.startsWith(QLatin1Char('#')) || (text.size() != 7 && text.size() != 9)) {
+          return std::nullopt;
+        }
+        for (qsizetype at = 1; at + 1 < text.size(); at += 2) {
+          bool ok = false;
+          channels.push_back(text.mid(at, 2).toInt(&ok, 16));
+          if (!ok) {
+            return std::nullopt;
+          }
+        }
+      } else if (value.isArray()) {
+        const auto length = value.property(QStringLiteral("length")).toInt();
+        if (length != 3 && length != 4) {
+          return std::nullopt;
+        }
+        for (int index = 0; index < length; ++index) {
+          channels.push_back(std::clamp(static_cast<int>(std::lround(value.property(static_cast<quint32>(index)).toNumber())), 0, 255));
+        }
+      } else {
+        return std::nullopt;
+      }
+      if (parameter.has_alpha && channels.size() == 3) {
+        channels.push_back(255);
+      }
+      std::string text;
+      for (std::size_t index = 0; index < (parameter.has_alpha ? 4U : 3U); ++index) {
+        if (index > 0) {
+          text += ',';
+        }
+        text += std::to_string(channels[index]);
+      }
+      return text;
+    }
+    case gmic::ParameterType::Point:
+      if (!value.isArray() || value.property(QStringLiteral("length")).toInt() != 2) {
+        return std::nullopt;
+      }
+      return gmic_number(value.property(0).toNumber()) + "," + gmic_number(value.property(1).toNumber());
+    case gmic::ParameterType::File:
+    case gmic::ParameterType::Folder:
+    case gmic::ParameterType::Text:
+      return gmic::quoted_text_value(gmic_std_string(value.toString()));
+    case gmic::ParameterType::Value:
+      return gmic::quoted_text_value(gmic_std_string(value.toString()));
+    case gmic::ParameterType::Link:
+    case gmic::ParameterType::Note:
+    case gmic::ParameterType::Separator:
+      break;
+  }
+  return std::nullopt;
+}
+
+// A parameter's default as a script value of the kind applyGmic accepts back.
+[[nodiscard]] QJSValue gmic_default_to_js(QJSEngine& engine, const gmic::Parameter& parameter) {
+  const QString text = gmic_qstring(parameter.default_value);
+  switch (parameter.type) {
+    case gmic::ParameterType::Float:
+    case gmic::ParameterType::Int:
+    case gmic::ParameterType::Choice:
+      return QJSValue(text.toDouble());
+    case gmic::ParameterType::Bool:
+    case gmic::ParameterType::Button:
+      return QJSValue(text == QLatin1String("1"));
+    case gmic::ParameterType::Color:
+    case gmic::ParameterType::Point: {
+      const auto parts = text.split(QLatin1Char(','));
+      auto array = engine.newArray(static_cast<quint32>(parts.size()));
+      for (qsizetype index = 0; index < parts.size(); ++index) {
+        array.setProperty(static_cast<quint32>(index), parts[index].toDouble());
+      }
+      return array;
+    }
+    case gmic::ParameterType::File:
+    case gmic::ParameterType::Folder:
+    case gmic::ParameterType::Text:
+    case gmic::ParameterType::Value:
+      return QJSValue(gmic_qstring(parameter.text));
+    default:
+      return QJSValue(text);
+  }
+}
+
+}  // namespace
+
+QJSValue ScriptEngineHost::gmic_filter_list() {
+  auto array = engine()->newArray();
+  if (!gmic_filters_available()) {
+    return array;
+  }
+  quint32 index = 0;
+  for (const auto& filter : gmic_library().catalog.filters) {
+    auto value = engine()->newObject();
+    value.setProperty(QStringLiteral("id"), gmic_qstring(filter.id));
+    value.setProperty(QStringLiteral("name"), gmic_qstring(filter.name));
+    QStringList folder;
+    for (const auto& name : filter.folder_path) {
+      folder << gmic_qstring(name);
+    }
+    value.setProperty(QStringLiteral("folder"), folder.join(QStringLiteral(" / ")));
+    value.setProperty(QStringLiteral("inputLayers"), gmic_input_token(filter.input_mode));
+    auto parameters = engine()->newArray();
+    quint32 parameter_index = 0;
+    for (const auto& parameter : filter.parameters) {
+      if (!parameter.carries_value()) {
+        continue;
+      }
+      auto entry = engine()->newObject();
+      entry.setProperty(QStringLiteral("name"), gmic_qstring(parameter.name));
+      entry.setProperty(QStringLiteral("type"), QString::fromLatin1(gmic_type_token(parameter.type)));
+      entry.setProperty(QStringLiteral("default"), gmic_default_to_js(*engine(), parameter));
+      if (parameter.type == gmic::ParameterType::Float || parameter.type == gmic::ParameterType::Int) {
+        entry.setProperty(QStringLiteral("minimum"), std::min(parameter.minimum, parameter.maximum));
+        entry.setProperty(QStringLiteral("maximum"), std::max(parameter.minimum, parameter.maximum));
+      }
+      if (parameter.type == gmic::ParameterType::Choice) {
+        auto choices = engine()->newArray(static_cast<quint32>(parameter.choices.size()));
+        for (std::size_t choice = 0; choice < parameter.choices.size(); ++choice) {
+          choices.setProperty(static_cast<quint32>(choice), gmic_qstring(parameter.choices[choice]));
+        }
+        entry.setProperty(QStringLiteral("choices"), choices);
+      }
+      parameters.setProperty(parameter_index++, entry);
+    }
+    value.setProperty(QStringLiteral("parameters"), parameters);
+    array.setProperty(index++, value);
+  }
+  return array;
+}
+
+QJSValue ScriptEngineHost::apply_gmic_to_layer(std::int64_t session_id, LayerId layer_id, const QString& filter_id,
+                                               const QJSValue& values, const QJSValue& options) {
+  pump_progress_indicator();
+  if (!gmic_filters_available()) {
+    throw_js_error(tr("G'MIC filters are not available in this build."));
+    return QJSValue();
+  }
+  auto* session = window_.session_with_id(session_id);
+  if (session == nullptr) {
+    throw_js_error(tr("The document is no longer open."));
+    return QJSValue();
+  }
+  const auto* filter = gmic_library().catalog.find(gmic_std_string(filter_id));
+  if (filter == nullptr) {
+    throw_js_error(tr("Unknown G'MIC filter: %1").arg(filter_id));
+    return QJSValue();
+  }
+
+  // One argument per value-carrying parameter, defaults first.
+  std::vector<const gmic::Parameter*> parameters;
+  for (const auto& parameter : filter->parameters) {
+    if (parameter.carries_value()) {
+      parameters.push_back(&parameter);
+    }
+  }
+  auto arguments = gmic::default_values(*filter);
+  const auto set_argument = [&](std::size_t index, const QJSValue& value) {
+    if (value.isUndefined() || value.isNull()) {
+      return true;  // keep the default
+    }
+    auto argument = gmic_argument_from_js(*parameters[index], value);
+    if (!argument.has_value()) {
+      throw_js_error(tr("applyGmic: %1 is not a valid value for %2.")
+                         .arg(value.toString(), gmic_qstring(parameters[index]->name)));
+      return false;
+    }
+    arguments[index] = std::move(*argument);
+    return true;
+  };
+  if (values.isArray()) {
+    const auto length = static_cast<std::size_t>(std::max(0, values.property(QStringLiteral("length")).toInt()));
+    if (length > parameters.size()) {
+      throw_js_error(tr("applyGmic: too many values (%1 given, the filter takes %2).")
+                         .arg(static_cast<qulonglong>(length))
+                         .arg(static_cast<qulonglong>(parameters.size())));
+      return QJSValue();
+    }
+    for (std::size_t index = 0; index < length; ++index) {
+      if (!set_argument(index, values.property(static_cast<quint32>(index)))) {
+        return QJSValue();
+      }
+    }
+  } else if (values.isObject()) {
+    QJSValueIterator it(values);
+    while (it.hasNext()) {
+      it.next();
+      const auto name = gmic_std_string(it.name());
+      const auto found = std::find_if(parameters.begin(), parameters.end(),
+                                      [&name](const gmic::Parameter* parameter) { return parameter->name == name; });
+      if (found == parameters.end()) {
+        throw_js_error(tr("applyGmic: unknown parameter %1.").arg(it.name()));
+        return QJSValue();
+      }
+      if (!set_argument(static_cast<std::size_t>(found - parameters.begin()), it.value())) {
+        return QJSValue();
+      }
+    }
+  }
+
+  char input_mode = 0;  // the filter's own
+  if (options.isObject()) {
+    QJSValueIterator it(options);
+    while (it.hasNext()) {
+      it.next();
+      if (it.name() != QLatin1String("inputLayers")) {
+        throw_js_error(tr("applyGmic: unknown option %1.").arg(it.name()));
+        return QJSValue();
+      }
+      const QString token = it.value().toString();
+      for (const auto& entry : kGmicInputTokens) {
+        if (token == QLatin1String(entry.token)) {
+          input_mode = entry.mode;
+        }
+      }
+      if (input_mode == 0) {
+        throw_js_error(tr("applyGmic: unknown inputLayers value %1.").arg(token));
+        return QJSValue();
+      }
+    }
+  }
+
+  QString error;
+  std::size_t added = 0;
+  const auto status = window_.apply_gmic_filter_to_layer(
+      *session, session_canvas(session_id), layer_id, filter->id, arguments, input_mode,
+      /*show_progress=*/!unattended_run(), [this, session_id] { (void)prepare_mutation(session_id); }, &error, &added,
+      // A filter may run for minutes on a large image: it is alive while it runs, and
+      // stopping the script stops it.
+      [this] {
+        keep_alive_for_ui();
+        return run_ != nullptr && !run_->stop_requested && (engine_ == nullptr || !engine_->isInterrupted());
+      });
+  switch (status) {
+    case MainWindow::GmicApplyStatus::Applied:
+      // The layer may have moved or grown, and layers may have been added.
+      note_pixels_changed(session_id, QRect(0, 0, session->document.width(), session->document.height()));
+      if (added > 0) {
+        note_structure_changed(session_id);
+      }
+      return QJSValue(static_cast<double>(added));
+    case MainWindow::GmicApplyStatus::NoChange:
+      return QJSValue(0);
+    case MainWindow::GmicApplyStatus::Cancelled:
+      throw_js_error(tr("G'MIC filter %1 was cancelled.").arg(filter_id));
+      return QJSValue();
+    case MainWindow::GmicApplyStatus::Error:
+      throw_js_error(tr("G'MIC filter %1 failed: %2").arg(filter_id, error));
+      return QJSValue();
+  }
+  return QJSValue();
+}
+
+void ScriptEngineHost::rescan_legacy_plugins() { window_.rescan_legacy_plugin_folders(); }
+
+QJSValue ScriptEngineHost::legacy_plugin_list() {
+  auto array = engine()->newArray();
+  quint32 index = 0;
+  for (const auto& entry : window_.legacy_plugins_) {
+    auto value = engine()->newObject();
+    value.setProperty(QStringLiteral("id"), QString::fromStdString(entry.identifier));
+    value.setProperty(QStringLiteral("name"), QString::fromStdString(entry.probe.display_name));
+    value.setProperty(QStringLiteral("category"), QString::fromStdString(entry.probe.category));
+    value.setProperty(QStringLiteral("path"), QDir::fromNativeSeparators(entry.path));
+    value.setProperty(QStringLiteral("supported"), entry.probe.supported);
+    value.setProperty(QStringLiteral("reason"), translate_data_text(entry.probe.reason));
+    value.setProperty(QStringLiteral("architecture"), QString::fromStdString(entry.probe.architecture));
+    array.setProperty(index++, value);
+  }
+  return array;
+}
+
+// ---------------------------------------------------------------------------
+// Interactive helpers
+
+ScriptEngineHost::ModalWatchdogPause::ModalWatchdogPause(ScriptEngineHost& host) : host_(host) {
+  rearm_ = host_.run_ != nullptr && host_.watchdog_ != nullptr &&
+           (host_.run_->sync_running || host_.run_->in_callback);
+  if (rearm_) {
+    host_.watchdog_->disarm();
+    // The busy overlay/stop panel must not sit over (or behind) the script's
+    // own modal dialog; the burst is parked at it, not busy.
+    host_.end_progress_indicator();
+  }
+}
+
+ScriptEngineHost::ModalWatchdogPause::~ModalWatchdogPause() {
+  if (rearm_ && host_.run_ != nullptr && host_.watchdog_ != nullptr) {
+    // Fresh window (arm feeds) and a fresh busy-indicator threshold: time
+    // spent thinking at the dialog counts as neither inactivity nor busyness.
+    host_.watchdog_->arm(host_.watchdog_timeout());
+    host_.run_->burst_clock.restart();
+  }
+}
+
+void ScriptEngineHost::show_alert(const QString& text) {
+  if (unattended_run()) {
+    emit_message(MessageKind::Log, tr("[alert] %1").arg(text));
+    return;
+  }
+  const ModalWatchdogPause pause(*this);
+  fire_theme_event(ThemeSoundEvent::ScriptAlert);
+  show_information_message(&window_, tr("Script"), text, QStringLiteral("scriptAlertMessageBox"));
+}
+
+QString ScriptEngineHost::show_prompt(const QString& text, const QString& default_value,
+                                      bool* accepted) {
+  if (unattended_run()) {
+    if (accepted != nullptr) {
+      *accepted = true;
+    }
+    return default_value;
+  }
+  const ModalWatchdogPause pause(*this);
+  bool ok = false;
+  const auto result =
+      QInputDialog::getText(&window_, tr("Script"), text, QLineEdit::Normal, default_value, &ok);
+  if (accepted != nullptr) {
+    *accepted = ok;
+  }
+  return ok ? result : QString();
+}
+
+QString ScriptEngineHost::choose_folder(const QString& title) {
+  if (unattended_run()) {
+    return {};
+  }
+  const ModalWatchdogPause pause(*this);
+  return QFileDialog::getExistingDirectory(&window_,
+                                           title.isEmpty() ? tr("Choose Folder") : title);
+}
+
+QString ScriptEngineHost::choose_open_file(const QString& title, const QString& filter) {
+  if (unattended_run()) {
+    return {};
+  }
+  const ModalWatchdogPause pause(*this);
+  return get_open_file_name(&window_, title.isEmpty() ? tr("Choose File") : title, QString(),
+                            filter.isEmpty() ? tr("All files (*)") : filter, nullptr,
+                            QStringLiteral("scriptChooseOpenFileDialog"));
+}
+
+QString ScriptEngineHost::choose_save_file(const QString& title, const QString& filter) {
+  if (unattended_run()) {
+    return {};
+  }
+  const ModalWatchdogPause pause(*this);
+  return get_save_file_name(&window_, title.isEmpty() ? tr("Save File") : title, QString(),
+                            filter.isEmpty() ? tr("All files (*)") : filter, nullptr,
+                            QStringLiteral("scriptChooseSaveFileDialog"));
+}
+
+QJSValue ScriptEngineHost::show_form_dialog(const QJSValue& spec) {
+  return run_form_dialog(spec, /*merge_args=*/false);
+}
+
+QJSValue ScriptEngineHost::show_options_dialog(const QJSValue& spec) {
+  return run_form_dialog(spec, /*merge_args=*/true);
+}
+
+QJSValue ScriptEngineHost::run_form_dialog(const QJSValue& spec, bool merge_args) {
+  if (engine_ == nullptr) {
+    return QJSValue(QJSValue::NullValue);
+  }
+  const auto fields = spec.property(QStringLiteral("fields"));
+  if (!fields.isArray()) {
+    throw_js_error(tr("showDialog: spec.fields must be an array"));
+    return QJSValue(QJSValue::UndefinedValue);
+  }
+  struct FieldSpec {
+    QString key;
+    QString label;
+    QString type;
+    QJSValue value;
+  };
+  std::vector<FieldSpec> parsed;
+  const int count = fields.property(QStringLiteral("length")).toInt();
+  for (int i = 0; i < count; ++i) {
+    const auto field = fields.property(static_cast<quint32>(i));
+    FieldSpec entry;
+    entry.key = field.property(QStringLiteral("key")).toString();
+    entry.type = field.property(QStringLiteral("type")).toString();
+    entry.label = field.property(QStringLiteral("label")).isUndefined()
+                      ? entry.key
+                      : field.property(QStringLiteral("label")).toString();
+    entry.value = field.property(QStringLiteral("value"));
+    if (!field.property(QStringLiteral("key")).isString() || entry.key.isEmpty()) {
+      throw_js_error(tr("showDialog: every field needs a non-empty \"key\""));
+      return QJSValue(QJSValue::UndefinedValue);
+    }
+    static const QStringList kKnownTypes = {
+        QStringLiteral("number"), QStringLiteral("slider"), QStringLiteral("checkbox"),
+        QStringLiteral("choice"), QStringLiteral("text"),   QStringLiteral("color"),
+        QStringLiteral("folder"), QStringLiteral("file")};
+    if (!kKnownTypes.contains(entry.type)) {
+      throw_js_error(tr("showDialog: unknown field type \"%1\" (use number, slider, checkbox, "
+                        "choice, text, color, folder, or file)")
+                         .arg(entry.type));
+      return QJSValue(QJSValue::UndefinedValue);
+    }
+    parsed.push_back(std::move(entry));
+  }
+
+  // showOptions: matching --script-arg values override the field defaults,
+  // coerced by field type (the "defaults unless overridden" contract).
+  if (merge_args && run_ != nullptr) {
+    for (auto& entry : parsed) {
+      const auto found = run_->args.find(entry.key);
+      if (found == run_->args.end()) {
+        continue;
+      }
+      const QString& raw = found->second;
+      if (entry.type == QLatin1String("number") || entry.type == QLatin1String("slider")) {
+        bool ok = false;
+        const double value = raw.toDouble(&ok);
+        if (ok) {
+          entry.value = QJSValue(value);
+        }
+      } else if (entry.type == QLatin1String("checkbox")) {
+        const auto lower = raw.trimmed().toLower();
+        // A bare "--script-arg flag" token (empty value) means "turn it on".
+        entry.value = QJSValue(lower.isEmpty() || lower == QLatin1String("1") ||
+                               lower == QLatin1String("true") || lower == QLatin1String("yes") ||
+                               lower == QLatin1String("on"));
+      } else {
+        entry.value = QJSValue(raw);
+      }
+    }
+  }
+
+  const ModalWatchdogPause pause(*this);
+  QDialog dialog(&window_);
+  dialog.setObjectName(QStringLiteral("scriptFormDialog"));
+  const auto title_value = spec.property(QStringLiteral("title"));
+  const auto title = title_value.isString() ? title_value.toString() : QString();
+  dialog.setWindowTitle(title.isEmpty() ? tr("Script") : title);
+  auto* root = new QVBoxLayout(&dialog);
+  // Optional spec.description: friendly instructions above the form.
+  const auto description_value = spec.property(QStringLiteral("description"));
+  if (description_value.isString() && !description_value.toString().isEmpty()) {
+    auto* blurb = new QLabel(description_value.toString(), &dialog);
+    blurb->setObjectName(QStringLiteral("scriptFormDescription"));
+    blurb->setWordWrap(true);
+    blurb->setMaximumWidth(440);
+    blurb->setTextFormat(Qt::PlainText);
+    root->addWidget(blurb);
+    root->addSpacing(8);
+  }
+  auto* form = new QFormLayout();
+  root->addLayout(form);
+
+  // One getter per field reads its widget back into a JS value on accept.
+  std::vector<std::function<QJSValue()>> getters;
+  const auto fields_array = fields;
+  for (std::size_t i = 0; i < parsed.size(); ++i) {
+    const auto& entry = parsed[i];
+    const auto field = fields_array.property(static_cast<quint32>(i));
+    const auto object_name = QStringLiteral("scriptFormField_") + entry.key;
+    if (entry.type == QLatin1String("number")) {
+      auto* spin = new QDoubleSpinBox(&dialog);
+      spin->setObjectName(object_name);
+      const double minimum = field.property(QStringLiteral("min")).isNumber()
+                                 ? field.property(QStringLiteral("min")).toNumber()
+                                 : -1000000000.0;
+      const double maximum = field.property(QStringLiteral("max")).isNumber()
+                                 ? field.property(QStringLiteral("max")).toNumber()
+                                 : 1000000000.0;
+      const double step = field.property(QStringLiteral("step")).isNumber()
+                              ? field.property(QStringLiteral("step")).toNumber()
+                              : 1.0;
+      const double value = entry.value.isNumber() ? entry.value.toNumber() : 0.0;
+      const bool integral = qFuzzyCompare(minimum, std::floor(minimum)) &&
+                            qFuzzyCompare(maximum, std::floor(maximum)) &&
+                            qFuzzyCompare(step, std::floor(step)) &&
+                            qFuzzyCompare(value, std::floor(value));
+      const int decimals = field.property(QStringLiteral("decimals")).isNumber()
+                               ? field.property(QStringLiteral("decimals")).toInt()
+                               : (integral ? 0 : 2);
+      spin->setDecimals(decimals);
+      spin->setRange(minimum, maximum);
+      spin->setSingleStep(step);
+      spin->setValue(value);
+      configure_dialog_spinbox(spin);
+      form->addRow(entry.label, spin);
+      getters.emplace_back([spin] { return QJSValue(spin->value()); });
+    } else if (entry.type == QLatin1String("slider")) {
+      const int minimum = field.property(QStringLiteral("min")).isNumber()
+                              ? field.property(QStringLiteral("min")).toInt()
+                              : 0;
+      const int maximum = field.property(QStringLiteral("max")).isNumber()
+                              ? field.property(QStringLiteral("max")).toInt()
+                              : 100;
+      const int value = entry.value.isNumber() ? entry.value.toInt() : minimum;
+      auto* spin = add_dialog_slider_spin_row(form, &dialog, entry.label,
+                                              object_name + QStringLiteral("Slider"), object_name,
+                                              minimum, maximum, value);
+      getters.emplace_back([spin] { return QJSValue(spin->value()); });
+    } else if (entry.type == QLatin1String("checkbox")) {
+      auto* box = new QCheckBox(entry.label, &dialog);
+      box->setObjectName(object_name);
+      box->setChecked(entry.value.toBool());
+      form->addRow(QString(), box);
+      getters.emplace_back([box] { return QJSValue(box->isChecked()); });
+    } else if (entry.type == QLatin1String("choice")) {
+      auto* combo = new QComboBox(&dialog);
+      combo->setObjectName(object_name);
+      const auto choices = field.property(QStringLiteral("choices"));
+      const int choice_count =
+          choices.isArray() ? choices.property(QStringLiteral("length")).toInt() : 0;
+      for (int c = 0; c < choice_count; ++c) {
+        combo->addItem(choices.property(static_cast<quint32>(c)).toString());
+      }
+      if (entry.value.isNumber()) {
+        combo->setCurrentIndex(entry.value.toInt());
+      } else if (!entry.value.isUndefined()) {
+        combo->setCurrentText(entry.value.toString());
+      }
+      form->addRow(entry.label, combo);
+      getters.emplace_back([combo] { return QJSValue(combo->currentText()); });
+    } else if (entry.type == QLatin1String("color")) {
+      auto* button = new QPushButton(&dialog);
+      button->setObjectName(object_name);
+      auto color = std::make_shared<QColor>(entry.value.toString());
+      if (!color->isValid()) {
+        *color = QColor(Qt::white);
+      }
+      const auto refresh_swatch = [button, color] {
+        button->setText(color->alpha() < 255 ? color->name(QColor::HexArgb)
+                                             : color->name(QColor::HexRgb));
+        button->setStyleSheet(QStringLiteral("background-color: %1; color: %2;")
+                                  .arg(color->name(QColor::HexRgb),
+                                       color->lightness() < 128 ? QStringLiteral("#e8e8e8")
+                                                                : QStringLiteral("#202020")));
+      };
+      refresh_swatch();
+      QObject::connect(button, &QPushButton::clicked, &dialog, [&dialog, color, refresh_swatch] {
+        // Patchy's own picker (palettes, names, hex) chooses the opaque color; a field that
+        // came in with alpha ("#AARRGGBB") keeps that alpha on the new color. A cancel puts
+        // the previous color back.
+        const auto original = *color;
+        const auto apply = [color, refresh_swatch, original](QColor picked) {
+          picked.setAlpha(original.alpha());
+          *color = picked;
+          refresh_swatch();
+        };
+        const auto picked = request_patchy_color(&dialog, original, tr("Choose Color"), apply);
+        apply(picked.value_or(original));
+      });
+      form->addRow(entry.label, button);
+      getters.emplace_back([color] {
+        return QJSValue(color->alpha() < 255 ? color->name(QColor::HexArgb)
+                                             : color->name(QColor::HexRgb));
+      });
+    } else if (entry.type == QLatin1String("folder") || entry.type == QLatin1String("file")) {
+      auto* row = new QWidget(&dialog);
+      auto* row_layout = new QHBoxLayout(row);
+      row_layout->setContentsMargins(0, 0, 0, 0);
+      auto* line = new QLineEdit(
+          entry.value.isString() ? QDir::toNativeSeparators(entry.value.toString()) : QString(),
+          row);
+      line->setObjectName(object_name);
+      line->setMinimumWidth(220);
+      auto* browse = new QPushButton(tr("Browse..."), row);
+      browse->setObjectName(object_name + QStringLiteral("Browse"));
+      const bool wants_folder = entry.type == QLatin1String("folder");
+      const auto filter_value = field.property(QStringLiteral("filter"));
+      const auto filter = filter_value.isString() ? filter_value.toString() : QString();
+      const auto label = entry.label;
+      QObject::connect(browse, &QPushButton::clicked, &dialog,
+                       [&dialog, line, wants_folder, filter, label] {
+                         const auto start = QDir::fromNativeSeparators(line->text());
+                         const auto picked =
+                             wants_folder
+                                 ? QFileDialog::getExistingDirectory(&dialog, label, start)
+                                 : get_open_file_name(&dialog, label, start,
+                                                      filter.isEmpty() ? tr("All files (*)")
+                                                                       : filter,
+                                                      nullptr,
+                                                      QStringLiteral("scriptFormBrowseDialog"));
+                         if (!picked.isEmpty()) {
+                           line->setText(QDir::toNativeSeparators(picked));
+                         }
+                       });
+      row_layout->addWidget(line, 1);
+      row_layout->addWidget(browse);
+      form->addRow(entry.label, row);
+      // Scripts speak "/" paths (patchy.io, include, open).
+      getters.emplace_back([line] {
+        return QJSValue(QDir::fromNativeSeparators(line->text().trimmed()));
+      });
+    } else {  // "text"
+      auto* line = new QLineEdit(entry.value.isUndefined() ? QString() : entry.value.toString(),
+                                 &dialog);
+      line->setObjectName(object_name);
+      form->addRow(entry.label, line);
+      getters.emplace_back([line] { return QJSValue(line->text()); });
+    }
+  }
+
+  auto* buttons =
+      new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel, &dialog);
+  QObject::connect(buttons, &QDialogButtonBox::accepted, &dialog, &QDialog::accept);
+  QObject::connect(buttons, &QDialogButtonBox::rejected, &dialog, &QDialog::reject);
+  root->addWidget(buttons);
+  // Spin-box button styling must land AFTER all children exist (QSS
+  // sub-control gotcha, dialog_utils.hpp).
+  append_themed_style(dialog, dialog_spinbox_button_style());
+
+  // The fields normalize values identically for interactive and unattended runs.
+  if (!unattended_run() && exec_dialog(dialog) != QDialog::Accepted) {
+    return QJSValue(QJSValue::NullValue);
+  }
+  auto result = engine_->newObject();
+  for (std::size_t i = 0; i < parsed.size(); ++i) {
+    result.setProperty(parsed[i].key, getters[i]());
+  }
+  return result;
+}
+
+// ---------------------------------------------------------------------------
+// App commands
+
+bool ScriptEngineHost::run_app_command(const QString& command_id) {
+  if (command_id == QStringLiteral("edit.undo") ||
+      command_id == QStringLiteral("edit.redo") ||
+      command_id == QStringLiteral("file.quit")) {
+    return false;
+  }
+  // One run at a time: a script cannot start another script (include() is the way to
+  // reuse one), so the per-script hotkey commands are refused here.
+  if (command_id.startsWith(QStringLiteral("script."))) {
+    return false;
+  }
+  if (connector_mode_) {
+    throw_js_error(tr("Menu commands are unavailable in the background connector. Use the scripting API."));
+    return false;
+  }
+  const auto* command = window_.hotkey_registry().find_command(command_id);
+  if (command == nullptr || command->action.isNull()) {
+    return false;
+  }
+  QAction* action = command->action.data();
+  if (!action->isEnabled()) {
+    return false;
+  }
+  // The command may open a modal dialog (and many do); the user's time in it
+  // must not count against the script.
+  const ModalWatchdogPause pause(*this);
+  action->trigger();
+  return true;
+}
+
+QStringList ScriptEngineHost::app_command_ids() const {
+  QStringList ids;
+  for (const auto& command : window_.hotkey_registry().commands()) {
+    ids.append(command.id);
+  }
+  ids.sort();
+  return ids;
+}
+
+// ---------------------------------------------------------------------------
+// UI staging (patchy.ui.setWindowSize / setSidePanelWidth / captureWindow)
+
+void ScriptEngineHost::set_window_size(int width, int height) {
+  pump_progress_indicator();
+  if (window_.isMaximized() || window_.isFullScreen()) {
+    window_.showNormal();
+  }
+  window_.resize(std::clamp(width, 320, 8192), std::clamp(height, 240, 8192));
+}
+
+void ScriptEngineHost::set_side_panel_width(int width) {
+  pump_progress_indicator();
+  window_.set_right_dock_stack_width(std::clamp(width, 120, 2000));
+}
+
+void ScriptEngineHost::set_status_message(const QString& message) {
+  pump_progress_indicator();
+  window_.statusBar()->showMessage(message);
+}
+
+namespace {
+
+// patchy.ui panel names: permanent script identifiers, mapped to the panel ids the
+// saved layout stores (docs/right-docks.md). Append only; never rename one.
+struct ScriptSidePanel {
+  const char* script_name;
+  const char* panel_id;
+};
+constexpr ScriptSidePanel kScriptSidePanels[] = {
+    {"layers", "layersDock"},   {"channels", "channelsDock"},     {"paths", "pathsDock"},
+    {"history", "historyDock"}, {"properties", "propertiesDock"}, {"info", "infoDock"},
+    {"palette", "paletteDock"}, {"color", "colorDock"},
+};
+
+}  // namespace
+
+QString ScriptEngineHost::side_panel_id(const QString& name) {
+  const auto* column = window_.panel_column_;
+  for (const auto& panel : kScriptSidePanels) {
+    const auto id = QString::fromLatin1(panel.panel_id);
+    if (name == QLatin1String(panel.script_name) && column != nullptr && column->has_panel(id)) {
+      return id;
+    }
+  }
+  QStringList names;
+  for (const auto& panel : kScriptSidePanels) {
+    names.append(QLatin1Char('"') + QLatin1String(panel.script_name) + QLatin1Char('"'));
+  }
+  throw_js_error(tr("Unknown panel \"%1\". Panels: %2.").arg(name, names.join(QStringLiteral(", "))));
+  return {};
+}
+
+void ScriptEngineHost::expand_side_panel(const QString& name) {
+  pump_progress_indicator();
+  const auto id = side_panel_id(name);
+  if (!id.isEmpty()) {
+    window_.show_panel(id);
+  }
+}
+
+void ScriptEngineHost::collapse_side_panel(const QString& name) {
+  pump_progress_indicator();
+  const auto id = side_panel_id(name);
+  if (!id.isEmpty()) {
+    window_.panel_column_->set_panel_expanded(id, false);
+  }
+}
+
+void ScriptEngineHost::close_side_panel(const QString& name) {
+  pump_progress_indicator();
+  const auto id = side_panel_id(name);
+  if (!id.isEmpty()) {
+    window_.panel_column_->set_panel_visible(id, false);
+  }
+}
+
+QJSValue ScriptEngineHost::side_panel_state(const QString& name) {
+  const auto id = side_panel_id(name);
+  if (id.isEmpty()) {
+    return QJSValue(QJSValue::UndefinedValue);
+  }
+  const auto* column = window_.panel_column_;
+  auto state = engine()->newObject();
+  state.setProperty(QStringLiteral("open"), column->panel_visible(id));
+  state.setProperty(QStringLiteral("front"), column->panel_in_front(id));
+  state.setProperty(QStringLiteral("expanded"), column->panel_expanded(id));
+  return state;
+}
+
+double ScriptEngineHost::view_zoom_percent() const {
+  const auto* canvas = session_canvas(active_session_id());
+  return canvas != nullptr ? canvas->view_zoom() * 100.0 : 0.0;
+}
+
+double ScriptEngineHost::view_rotation_degrees() const {
+  const auto* canvas = session_canvas(active_session_id());
+  return canvas != nullptr ? canvas->view_rotation() : 0.0;
+}
+
+void ScriptEngineHost::set_view_rotation_degrees(double degrees) {
+  pump_progress_indicator();
+  auto* canvas = session_canvas(active_session_id());
+  if (canvas == nullptr) {
+    throw_js_error(tr("No document is open to rotate the view of."));
+    return;
+  }
+  // Wraps into (-180, 180] and pivots on the view center; the view-changed notification
+  // refreshes the Rotate View options bar.
+  canvas->set_view_rotation(degrees);
+}
+
+bool ScriptEngineHost::view_proof_colors() const { return window_.view_proof_colors_action_->isChecked(); }
+void ScriptEngineHost::set_view_proof_colors(bool enabled) {
+  pump_progress_indicator();
+  window_.view_proof_colors_action_->setChecked(enabled);
+}
+bool ScriptEngineHost::view_pixel_grid() const { return window_.view_pixel_grid_action_->isChecked(); }
+void ScriptEngineHost::set_view_pixel_grid(bool enabled) {
+  pump_progress_indicator();
+  window_.view_pixel_grid_action_->setChecked(enabled);
+}
+// The script names of the two layouts; permanent identifiers.
+constexpr auto kScriptOneColumnLayout = "oneColumn";
+constexpr auto kScriptTwoColumnsLayout = "twoColumns";
+
+QJSValue ScriptEngineHost::tool_palette_state() {
+  const auto& customization = window_.tool_palette_customization();
+  const auto list = [this](const QStringList& ids) {
+    auto array = engine()->newArray(static_cast<uint>(ids.size()));
+    for (qsizetype index = 0; index < ids.size(); ++index) {
+      array.setProperty(static_cast<quint32>(index), ids[index]);
+    }
+    return array;
+  };
+  auto state = engine()->newObject();
+  state.setProperty(QStringLiteral("hiddenTools"), list(customization.hidden_tools));
+  state.setProperty(QStringLiteral("layout"), QString::fromLatin1(customization.two_columns ? kScriptTwoColumnsLayout
+                                                                                           : kScriptOneColumnLayout));
+  state.setProperty(QStringLiteral("wheelScroll"), customization.wheel_scroll);
+  state.setProperty(QStringLiteral("ungroupTools"), customization.ungroup_tools);
+  // The palette's gear was removed; the key stays and always reads false (a permanent identifier).
+  state.setProperty(QStringLiteral("showGearButton"), false);
+  state.setProperty(QStringLiteral("hiddenLayerButtons"), list(customization.hidden_layer_buttons));
+  return state;
+}
+
+void ScriptEngineHost::set_tool_palette_state(const QJSValue& state) {
+  pump_progress_indicator();
+  const auto unknown = [this](const QString& value) {
+    throw_js_error(tr("toolPalette: unknown value \"%1\".").arg(value));
+  };
+  if (!state.isObject()) {
+    unknown(state.toString());
+    return;
+  }
+  QStringList tools;
+  for (const auto& cluster : window_.tool_palette_catalog().clusters) {
+    for (const auto& entry : cluster.entries) {
+      for (const auto& member : entry.members) {
+        tools.push_back(member.id);
+      }
+    }
+  }
+  QStringList layer_buttons;
+  for (const auto* id : kLayerFooterButtonIds) {
+    layer_buttons.push_back(QString::fromLatin1(id));
+  }
+  // An array of ids, each one known; false when one is not (it has thrown).
+  const auto read_ids = [&unknown](const QJSValue& array, const QStringList& known, QStringList& out) {
+    if (!array.isArray()) {
+      unknown(array.toString());
+      return false;
+    }
+    out.clear();
+    const auto length = array.property(QStringLiteral("length")).toUInt();
+    for (quint32 index = 0; index < length; ++index) {
+      const auto id = array.property(index).toString();
+      if (!known.contains(id)) {
+        unknown(id);
+        return false;
+      }
+      out.push_back(id);
+    }
+    return true;
+  };
+  auto customization = window_.tool_palette_customization();
+  if (state.hasProperty(QStringLiteral("hiddenTools")) &&
+      !read_ids(state.property(QStringLiteral("hiddenTools")), tools, customization.hidden_tools)) {
+    return;
+  }
+  if (state.hasProperty(QStringLiteral("hiddenLayerButtons")) &&
+      !read_ids(state.property(QStringLiteral("hiddenLayerButtons")), layer_buttons,
+                customization.hidden_layer_buttons)) {
+    return;
+  }
+  if (state.hasProperty(QStringLiteral("layout"))) {
+    const auto layout = state.property(QStringLiteral("layout")).toString();
+    if (layout != QLatin1String(kScriptOneColumnLayout) && layout != QLatin1String(kScriptTwoColumnsLayout)) {
+      unknown(layout);
+      return;
+    }
+    customization.two_columns = layout == QLatin1String(kScriptTwoColumnsLayout);
+  }
+  if (state.hasProperty(QStringLiteral("wheelScroll"))) {
+    customization.wheel_scroll = state.property(QStringLiteral("wheelScroll")).toBool();
+  }
+  if (state.hasProperty(QStringLiteral("ungroupTools"))) {
+    customization.ungroup_tools = state.property(QStringLiteral("ungroupTools")).toBool();
+  }
+  // showGearButton is accepted and ignored: the palette has no gear any more.
+  window_.apply_tool_palette_customization(customization);
+}
+
+bool ScriptEngineHost::view_gamut_warning() const { return window_.view_gamut_warning_action_->isChecked(); }
+void ScriptEngineHost::set_view_gamut_warning(bool enabled) {
+  pump_progress_indicator();
+  window_.view_gamut_warning_action_->setChecked(enabled);
+}
+
+double ScriptEngineHost::view_preview_exposure() const {
+  const auto* document = session_document_const(active_session_id());
+  if (document == nullptr || document->color_state().bit_depth != BitDepth::Float32) {
+    return 0.0;
+  }
+  return document->color_state().view_exposure_stops;
+}
+
+void ScriptEngineHost::set_view_preview_exposure(double stops) {
+  pump_progress_indicator();
+  const auto* document = session_document_const(active_session_id());
+  if (document == nullptr || document->color_state().bit_depth != BitDepth::Float32 ||
+      window_.hdr_exposure_spin_ == nullptr) {
+    throw_js_error(tr("The preview exposure applies only to an open 32-bit document."));
+    return;
+  }
+  // The spin box clamps to its -20..20 range, stores the value on the document and repaints.
+  window_.hdr_exposure_spin_->setValue(std::clamp(stops, -20.0, 20.0));
+}
+
+void ScriptEngineHost::set_view_zoom_percent(double percent) {
+  pump_progress_indicator();
+  auto* canvas = session_canvas(active_session_id());
+  if (canvas == nullptr) {
+    throw_js_error(tr("No document is open to zoom."));
+    return;
+  }
+  // set_view_zoom_centered clamps to the canvas zoom range and refreshes the
+  // status bar percent through the view-changed notification. Percent is the
+  // view zoom (document pixels per device pixel), what the status box shows.
+  canvas->set_view_zoom_centered(percent / 100.0);
+}
+
+void ScriptEngineHost::fit_view_on_screen() {
+  pump_progress_indicator();
+  auto* canvas = session_canvas(active_session_id());
+  if (canvas == nullptr) {
+    throw_js_error(tr("No document is open to zoom."));
+    return;
+  }
+  // fit_to_view reads the canvas size, so a setWindowSize earlier in this
+  // burst must have been laid out first (same reasoning as captureWindow).
+  QCoreApplication::sendPostedEvents();
+  QCoreApplication::processEvents(QEventLoop::ExcludeUserInputEvents);
+  canvas->fit_to_view();
+}
+
+QJSValue ScriptEngineHost::view_center() {
+  auto* canvas = session_canvas(active_session_id());
+  if (canvas == nullptr) {
+    return QJSValue(QJSValue::NullValue);
+  }
+  // The view area is read from the canvas size: settle a setWindowSize from this burst first.
+  QCoreApplication::sendPostedEvents();
+  QCoreApplication::processEvents(QEventLoop::ExcludeUserInputEvents);
+  const auto point = canvas->view_center_document_point();
+  auto result = engine()->newObject();
+  result.setProperty(QStringLiteral("x"), point.x());
+  result.setProperty(QStringLiteral("y"), point.y());
+  return result;
+}
+
+void ScriptEngineHost::set_view_center(QPointF document_point) {
+  pump_progress_indicator();
+  auto* canvas = session_canvas(active_session_id());
+  if (canvas == nullptr) {
+    throw_js_error(tr("No document is open to zoom."));
+    return;
+  }
+  QCoreApplication::sendPostedEvents();
+  QCoreApplication::processEvents(QEventLoop::ExcludeUserInputEvents);
+  canvas->center_view_on_document_point(document_point);
+}
+
+void ScriptEngineHost::zoom_view_to(QPointF document_point, double percent) {
+  pump_progress_indicator();
+  auto* canvas = session_canvas(active_session_id());
+  if (canvas == nullptr) {
+    throw_js_error(tr("No document is open to zoom."));
+    return;
+  }
+  QCoreApplication::sendPostedEvents();
+  QCoreApplication::processEvents(QEventLoop::ExcludeUserInputEvents);
+  // Percent is view zoom, as for patchy.ui.zoom; the canvas clamps it to its zoom range.
+  canvas->center_view_on_document_point(document_point, percent / 100.0);
+}
+
+void ScriptEngineHost::zoom_view_to_rect(QRectF document_rect, double margin_per_side) {
+  pump_progress_indicator();
+  auto* canvas = session_canvas(active_session_id());
+  if (canvas == nullptr) {
+    throw_js_error(tr("No document is open to zoom."));
+    return;
+  }
+  QCoreApplication::sendPostedEvents();
+  QCoreApplication::processEvents(QEventLoop::ExcludeUserInputEvents);
+  if (!canvas->zoom_to_document_rect(document_rect, margin_per_side)) {
+    throw_js_error(tr("zoomToRect needs a rectangle that overlaps the document."));
+  }
+}
+
+bool ScriptEngineHost::capture_window_to_file(const QString& path) {
+  pump_progress_indicator();
+  // grab() renders synchronously but does not run POSTED layout events, so a
+  // resize earlier in this same burst would capture stale geometry. Settle
+  // them first; user input stays excluded so the capture state cannot shift.
+  QCoreApplication::sendPostedEvents();
+  QCoreApplication::processEvents(QEventLoop::ExcludeUserInputEvents);
+  // The capture shows the workspace, not the capturing script's own status-bar
+  // indicator (Running script, Stop, Pause, Slow): hide it for the grab only.
+  const bool hide_activity = script_activity_ && script_activity_->isVisible();
+  if (hide_activity) {
+    script_activity_->hide();
+    QCoreApplication::sendPostedEvents(nullptr, QEvent::LayoutRequest);
+  }
+  const bool saved = window_.save_debug_screenshot(path);
+  if (hide_activity) {
+    script_activity_->show();
+  }
+  return saved;
+}
+
+void ScriptEngineHost::reveal_layer_row(std::int64_t session_id, LayerId layer_id) {
+  if (session_id == active_session_id()) {
+    window_.reveal_layer_in_layer_list(layer_id);
+    return;
+  }
+  // Non-active session: expand the stored collapsed ancestors so the row is
+  // visible when the session activates (its panel is not on screen to scroll).
+  auto* session = window_.session_with_id(session_id);
+  if (session == nullptr) {
+    return;
+  }
+  std::vector<LayerId> ancestors;
+  if (collect_layer_ancestor_groups(session->document.layers(), layer_id, ancestors)) {
+    for (const auto ancestor_id : ancestors) {
+      session->collapsed_layer_groups.erase(ancestor_id);
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Script canvas windows
+
+void ScriptEngineHost::dismiss_busy_indicator() {
+  if (script_activity_) { script_activity_->set_disconnected(); }
+  if (run_ == nullptr) {
+    return;
+  }
+  // A window created while an application-modal window is visible is born
+  // blocked by it. Qt lifts that block when the modal hides on the desktop
+  // platforms, but the wasm plugin never does, and a blocked window is dropped
+  // by the key-delivery path while still receiving mouse events - the script
+  // canvas window paints and takes clicks but is permanently deaf to the
+  // keyboard (docs/wasm.md). The interactive helpers avoid this through
+  // ModalWatchdogPause; a canvas window is not modal and does not block the
+  // script, so it dismisses the indicator directly instead.
+  end_progress_indicator();
+  // Restart the burst clock so the panel this dismissed does not reappear on
+  // the very next service call (the same reason ModalWatchdogPause does it).
+  run_->burst_clock.restart();
+}
+
+void ScriptEngineHost::adopt_canvas_window(ScriptCanvasWindow* window) {
+  if (run_ == nullptr) {
+    return;
+  }
+  window->setParent(this);
+  QQmlEngine::setObjectOwnership(window, QQmlEngine::CppOwnership);
+  run_->windows.push_back(window);
+}
+
+void ScriptEngineHost::canvas_window_closed(ScriptCanvasWindow* window) {
+  Q_UNUSED(window);
+  schedule_completion_check();
+}
+
+bool ScriptEngineHost::has_open_canvas_window() const {
+  if (run_ == nullptr) {
+    return false;
+  }
+  return std::any_of(run_->windows.begin(), run_->windows.end(),
+                     [](const QPointer<ScriptCanvasWindow>& window) {
+                       return window != nullptr && window->is_open();
+                     });
+}
+
+QImage ScriptEngineHost::active_canvas_window_image() const {
+  if (run_ == nullptr) {
+    return {};
+  }
+  for (auto it = run_->windows.rbegin(); it != run_->windows.rend(); ++it) {
+    if (*it != nullptr && (*it)->is_open()) {
+      return (*it)->surface();
+    }
+  }
+  return {};
+}
+
+}  // namespace patchy::ui

@@ -1,0 +1,116 @@
+#pragma once
+
+// The clone source settings (GitHub issue 424, docs/healing.md "Clone source settings"):
+// four source slots, the active source's point (with Clear, issue 574) and offset, the Clone Stamp's scale,
+// rotation and Flip Horizontal/Vertical with a Reset (hidden on the Healing Brush, issue 596),
+// and the overlay preview with its opacity. It shows what MainWindow hands it through set_state (signals blocked) and
+// reports each edit through its signals; MainWindow applies them to the active canvas.
+// The options bar's gear popup is the only place that shows it.
+
+#include "core/clone_source_transform.hpp"
+
+#include <QPoint>
+#include <QSize>
+#include <QWidget>
+
+#include <array>
+
+class QButtonGroup;
+class QCheckBox;
+class QDoubleSpinBox;
+class QLabel;
+class QPushButton;
+class QSpinBox;
+class QToolButton;
+
+namespace patchy::ui {
+
+class CloneSourcePanel final : public QWidget {
+  Q_OBJECT
+
+public:
+  static constexpr int kSlotCount = 4;
+
+  struct State {
+    bool has_document{false};
+    int slot{0};
+    std::array<bool, kSlotCount> slot_set{};
+    std::array<QPoint, kSlotCount> slot_point{};
+    QPoint offset{};
+    bool offset_set{false};
+    bool aligned{true};
+    patchy::CloneSourceTransform transform{};
+    // False on the Healing Brush, which samples its source untransformed.
+    bool transform_applies{true};
+    bool overlay_shown{true};
+    int overlay_opacity{100};
+  };
+
+  explicit CloneSourcePanel(QWidget* parent = nullptr);
+
+  void set_state(const State& state);
+  [[nodiscard]] QSize sizeHint() const override;
+  [[nodiscard]] const State& state() const noexcept { return state_; }
+
+  [[nodiscard]] QToolButton* slot_button(int slot) const;
+  [[nodiscard]] QLabel* source_label() const noexcept { return source_label_; }
+  [[nodiscard]] QPushButton* clear_source_button() const noexcept { return clear_source_button_; }
+  [[nodiscard]] QSpinBox* offset_x_spin() const noexcept { return offset_x_spin_; }
+  [[nodiscard]] QSpinBox* offset_y_spin() const noexcept { return offset_y_spin_; }
+  // The info mark right of X whose tooltip says why the offset is off or not set yet (issue 574).
+  [[nodiscard]] QToolButton* offset_info_button() const noexcept { return offset_info_button_; }
+  [[nodiscard]] QDoubleSpinBox* scale_spin() const noexcept { return scale_spin_; }
+  [[nodiscard]] QDoubleSpinBox* rotation_spin() const noexcept { return rotation_spin_; }
+  [[nodiscard]] QToolButton* flip_horizontal_button() const noexcept { return flip_horizontal_button_; }
+  [[nodiscard]] QToolButton* flip_vertical_button() const noexcept { return flip_vertical_button_; }
+  [[nodiscard]] QPushButton* reset_button() const noexcept { return reset_button_; }
+  [[nodiscard]] QCheckBox* overlay_check() const noexcept { return overlay_check_; }
+  [[nodiscard]] QSpinBox* overlay_opacity_spin() const noexcept { return overlay_opacity_spin_; }
+
+signals:
+  void slot_picked(int slot);
+  // Clear beside the Point: empty the active slot's source (GitHub issue 574).
+  void clear_source_requested(int slot);
+  void offset_edited(QPoint offset);
+  void transform_edited(patchy::CloneSourceTransform transform);
+  void overlay_edited(bool shown, int opacity);
+
+protected:
+  void changeEvent(QEvent* event) override;
+
+private:
+  void retranslate();
+  void refresh();
+  void emit_transform();
+  void relayout_popup();
+
+  State state_;
+  // The size hint the menu last heard about (relayout_popup).
+  QSize reported_hint_;
+  std::array<QToolButton*, kSlotCount> slot_buttons_{};
+  QButtonGroup* slot_group_{nullptr};
+  QLabel* slots_label_{nullptr};
+  QLabel* source_caption_{nullptr};
+  QLabel* source_label_{nullptr};
+  QPushButton* clear_source_button_{nullptr};
+  QLabel* offset_label_{nullptr};
+  QLabel* offset_x_label_{nullptr};
+  QLabel* offset_y_label_{nullptr};
+  QSpinBox* offset_x_spin_{nullptr};
+  QSpinBox* offset_y_spin_{nullptr};
+  QToolButton* offset_info_button_{nullptr};
+  QLabel* scale_label_{nullptr};
+  QDoubleSpinBox* scale_spin_{nullptr};
+  QLabel* rotation_label_{nullptr};
+  QDoubleSpinBox* rotation_spin_{nullptr};
+  QLabel* flip_label_{nullptr};
+  QToolButton* flip_horizontal_button_{nullptr};
+  QToolButton* flip_vertical_button_{nullptr};
+  QPushButton* reset_button_{nullptr};
+  QWidget* transform_divider_{nullptr};
+  QCheckBox* overlay_check_{nullptr};
+  QLabel* overlay_opacity_label_{nullptr};
+  QSpinBox* overlay_opacity_spin_{nullptr};
+};
+
+}  // namespace patchy::ui

@@ -1,0 +1,805 @@
+#pragma once
+
+#include "core/layer.hpp"
+#include "core/paint_mode.hpp"
+
+#include <QJSValue>
+#include <QObject>
+#include <QString>
+
+#include <cstdint>
+
+class QJSEngine;
+
+namespace patchy {
+class Document;
+}
+
+namespace patchy::ui {
+
+class ScriptEngineHost;
+struct ScriptScan;
+
+// The QObject wrappers the scripting engine exposes to JS (docs/scripting.md).
+// Lifetime rules: the singleton objects (app/io/ui) are parented to the host
+// (C++-owned); document/layer/selection wrappers are created per access with no
+// parent, so the JS garbage collector owns them. Wrappers hold session ids and
+// LayerIds only and re-resolve on every call, throwing a JS error when the
+// target is gone: the layers vector reallocates and sessions close, so a stored
+// pointer is the historical use-after-free pattern. Reads resolve through const
+// documents (mutable layer accessors bump revisions on access).
+
+// Stable script-facing blend mode ids ("normal", "multiply", ...). Append-only,
+// aligned with the BlendMode enum; these are a persistence-adjacent contract
+// (scripts in the wild will hard-code them), so never rename one.
+[[nodiscard]] QString script_blend_mode_id(BlendMode mode);
+[[nodiscard]] bool script_blend_mode_from_id(const QString& id, BlendMode* mode);
+// Brush Mode ids (the drawStrokes "mode" field and the tools/brushMode setting): the
+// blend mode ids above except "pass-through", plus "behind" and "clear". Permanent.
+[[nodiscard]] QString script_paint_mode_id(PaintMode mode);
+[[nodiscard]] bool script_paint_mode_from_id(const QString& id, PaintMode* mode);
+// A {x, y, width, height} object for JS (shared by the script_*.cpp bindings).
+[[nodiscard]] QJSValue rect_to_js(QJSEngine* engine, const Rect& rect);
+
+class ScriptLayerObject : public QObject {
+  Q_OBJECT
+  Q_PROPERTY(QString id READ id)
+  Q_PROPERTY(QString name READ name WRITE set_name)
+  Q_PROPERTY(double opacity READ opacity WRITE set_opacity)
+  Q_PROPERTY(bool visible READ visible WRITE set_visible)
+  Q_PROPERTY(QString blendMode READ blend_mode WRITE set_blend_mode)
+  Q_PROPERTY(bool locked READ locked WRITE set_locked)
+  // The Layers panel color label (GitHub issue 244): "none", "red", ... "gray".
+  Q_PROPERTY(QString colorLabel READ color_label WRITE set_color_label)
+  // Layer > Arrange > Link Layers (GitHub issue 656): layers sharing a nonzero number are linked.
+  Q_PROPERTY(int linkGroup READ link_group WRITE set_link_group)
+  Q_PROPERTY(double x READ x WRITE set_x)
+  Q_PROPERTY(double y READ y WRITE set_y)
+  Q_PROPERTY(QJSValue bounds READ bounds)
+  Q_PROPERTY(bool isGroup READ is_group)
+  Q_PROPERTY(bool isText READ is_text)
+  Q_PROPERTY(bool isShape READ is_shape)
+  Q_PROPERTY(bool isSmartObject READ is_smart_object)
+  // A smart object's Smart Filters (script_smart_filters.cpp, patchy.d.ts).
+  Q_PROPERTY(QJSValue smartFilters READ smart_filters)
+  Q_PROPERTY(bool smartFiltersVisible READ smart_filters_visible WRITE set_smart_filters_visible)
+  // Artboards (docs/artboards.md, script_artboards.cpp).
+  Q_PROPERTY(bool isArtboard READ is_artboard)
+  Q_PROPERTY(QJSValue artboard READ artboard)
+  Q_PROPERTY(QJSValue children READ children)
+  Q_PROPERTY(QString text READ text WRITE set_text)
+  Q_PROPERTY(QString textOrientation READ text_orientation WRITE set_text_orientation)
+  Q_PROPERTY(QString textDirection READ text_direction WRITE set_text_direction)
+  Q_PROPERTY(QString textFont READ text_font)
+  Q_PROPERTY(QJSValue textRuns READ text_runs)
+  Q_PROPERTY(QJSValue textBox READ text_box)
+  Q_PROPERTY(QJSValue textArea READ text_area WRITE set_text_area)
+  Q_PROPERTY(QJSValue textPath READ text_path WRITE set_text_path)
+  Q_PROPERTY(QJSValue textPathRange READ text_path_range WRITE set_text_path_range)
+  Q_PROPERTY(QString textAlign READ text_align WRITE set_text_align)
+  Q_PROPERTY(QJSValue textParagraph READ text_paragraph WRITE set_text_paragraph)
+
+public:
+  ScriptLayerObject(ScriptEngineHost& host, std::int64_t session_id, LayerId layer_id);
+
+  [[nodiscard]] QString name() const;
+  [[nodiscard]] QString id() const;
+  Q_INVOKABLE void drawStrokes(const QJSValue& strokes);
+  Q_INVOKABLE void flipTextPath();
+  [[nodiscard]] bool is_artboard() const;
+  [[nodiscard]] QJSValue artboard() const;
+  // Changes the artboard's rect or background; on a top-level group, makes it one; null
+  // turns an artboard back into a plain group.
+  Q_INVOKABLE void setArtboard(const QJSValue& options);
+  void set_name(const QString& name);
+  [[nodiscard]] double opacity() const;  // 0..100
+  void set_opacity(double opacity);
+  [[nodiscard]] bool visible() const;
+  void set_visible(bool visible);
+  [[nodiscard]] QString blend_mode() const;
+  void set_blend_mode(const QString& mode);
+  [[nodiscard]] bool locked() const;
+  void set_locked(bool locked);
+  [[nodiscard]] QString color_label() const;
+  void set_color_label(const QString& label);
+  [[nodiscard]] int link_group() const;
+  void set_link_group(int group);
+  [[nodiscard]] int x() const;
+  void set_x(double x);
+  [[nodiscard]] int y() const;
+  void set_y(double y);
+  [[nodiscard]] QJSValue bounds() const;
+  [[nodiscard]] bool is_group() const;
+  [[nodiscard]] bool is_text() const;
+  [[nodiscard]] bool is_shape() const;
+  [[nodiscard]] bool is_smart_object() const;
+  // Smart objects: {linked, fileName, path, relativePath, missing, changed,
+  // sourceId, width, height, resolution, quad}; null for other layers.
+  Q_INVOKABLE QJSValue getSmartObject() const;
+  // Update Smart Object Content: re-reads this linked layer's file and re-renders
+  // every layer sharing its source. Returns the number of layers re-rendered;
+  // throws for an embedded smart object, a missing file, or an unreadable one.
+  Q_INVOKABLE int updateSmartObject();
+  Q_INVOKABLE int rerenderSmartObject();
+  // Smart Filters, in execution order (0 runs first: the bottom row in the Layers panel):
+  // [{index, filterId, name, params, visible, opacity, blendMode, modeled}]. Throws for a
+  // layer that is not a smart object.
+  [[nodiscard]] QJSValue smart_filters() const;
+  [[nodiscard]] bool smart_filters_visible() const;
+  void set_smart_filters_visible(bool visible);
+  // Appends a Smart Filter (applyFilter's ids and params; options {visible, opacity,
+  // blendMode}) and returns its index.
+  Q_INVOKABLE int addSmartFilter(const QString& filterId, const QJSValue& params = QJSValue(),
+                                 const QJSValue& options = QJSValue());
+  // Changes {visible, params, opacity, blendMode} of the filter at `index`.
+  Q_INVOKABLE void setSmartFilter(int index, const QJSValue& changes);
+  Q_INVOKABLE void removeSmartFilter(int index);
+  Q_INVOKABLE void moveSmartFilter(int from, int to);
+  Q_INVOKABLE void clearSmartFilters();
+  Q_INVOKABLE QJSValue getShape() const;
+  Q_INVOKABLE void updateShape(const QJSValue& changes);
+  Q_INVOKABLE void transformShape(const QJSValue& matrix, const QJSValue& options = QJSValue());
+  Q_INVOKABLE QJSValue getVectorMask() const;
+  Q_INVOKABLE void setVectorMask(const QJSValue& options);
+  Q_INVOKABLE void removeVectorMask();
+  Q_INVOKABLE void transformVectorMask(const QJSValue& matrix);
+  Q_INVOKABLE void rasterizeVectorMask();
+  Q_INVOKABLE void fillPath(const QJSValue& path, const QJSValue& options = QJSValue());
+  Q_INVOKABLE void strokePath(const QJSValue& path, const QJSValue& options = QJSValue());
+  [[nodiscard]] QJSValue children() const;
+  [[nodiscard]] QString text() const;
+  void set_text(const QString& text);
+  // "horizontal" / "vertical", and "auto" / "ltr" / "rtl"; setting either re-renders the layer.
+  [[nodiscard]] QString text_orientation() const;
+  void set_text_orientation(const QString& orientation);
+  [[nodiscard]] QString text_direction() const;
+  [[nodiscard]] QString text_font() const;
+  void set_text_direction(const QString& direction);
+  // The stored runs ({text, font, style, size, bold, italic, color}), the paragraph box
+  // ({width, height} or null for point text) and the paragraph alignment; setTextRuns replaces
+  // the content with formatted runs through the same session as `text`.
+  [[nodiscard]] QJSValue text_runs() const;
+  [[nodiscard]] QJSValue text_box() const;
+  [[nodiscard]] QJSValue text_area() const;
+  void set_text_area(const QJSValue& area);
+  // Text along a path (docs/path-text.md).
+  [[nodiscard]] QJSValue text_path() const;
+  void set_text_path(const QJSValue& path);
+  [[nodiscard]] QJSValue text_path_range() const;
+  void set_text_path_range(const QJSValue& range);
+  [[nodiscard]] QString text_align() const;
+  void set_text_align(const QString& align);
+  [[nodiscard]] QJSValue text_paragraph() const;
+  void set_text_paragraph(const QJSValue& paragraph);
+  Q_INVOKABLE void setTextRuns(const QJSValue& runs);
+  // Renders the layer again from its stored text, with no change to the text itself.
+  Q_INVOKABLE void rerenderText();
+  // The face the text engine draws each run in: the font it names and the family and style
+  // that really resolve on this machine (a probe for font-resolution differences).
+  Q_INVOKABLE QJSValue resolvedTextFonts() const;
+
+  Q_INVOKABLE void moveTo(double x, double y);
+  // Free Transform with a matrix or a corner quad (GitHub issue 225; patchy.d.ts).
+  Q_INVOKABLE void transform(const QJSValue& options);
+  Q_INVOKABLE QJSValue duplicate(const QJSValue& target = QJSValue());
+  Q_INVOKABLE void remove();
+  // Ungroup this group layer; returns the released layers top to bottom.
+  Q_INVOKABLE QJSValue ungroup();
+  Q_INVOKABLE void fill(const QString& color);
+  Q_INVOKABLE void fillRect(int x, int y, int width, int height, const QString& color);
+  Q_INVOKABLE void applyFilter(const QString& filterId, const QJSValue& params = QJSValue());
+  // Filter > Camera Raw Filter with {temperature, tint, exposure, contrast, highlights,
+  // shadows, saturation, vibrance}; missing ones stay neutral, unknown names throw.
+  Q_INVOKABLE void applyCameraRawFilter(const QJSValue& settings = QJSValue());
+  // Runs a legacy Photoshop plug-in (an id from patchy.plugins.list()) on this
+  // layer, limited to the document selection. Options {dialog, captureDialog}:
+  // dialog false skips the plug-in's own settings dialog and reuses its last
+  // (or default) settings; captureDialog is a PNG path that receives an image
+  // of the dialog while it is up. Unattended runs never show the dialog unless
+  // captureDialog asks for it, and then answer it automatically. Windows only;
+  // throws elsewhere.
+  Q_INVOKABLE void applyPlugin(const QString& pluginId, const QJSValue& options = QJSValue());
+  // A G'MIC library filter (patchy.gmic.list()) on this layer, limited to the
+  // selection, part of the run's undo entry. `values` is an array (one per
+  // parameter, in order) or an object keyed by parameter name; missing ones use
+  // the defaults. Options {inputLayers}. Returns how many layers the filter added.
+  Q_INVOKABLE QJSValue applyGmic(const QString& filterId, const QJSValue& values = QJSValue(),
+                                 const QJSValue& options = QJSValue());
+  // Edit > Remove Object on the document selection; the layer must be the
+  // document's active layer. Options {method, attempt}; returns {method,
+  // patches, source, sourceCount}.
+  Q_INVOKABLE QJSValue removeObject(const QJSValue& options = QJSValue());
+  Q_INVOKABLE QJSValue redEye(const QJSValue& options = QJSValue());
+  // The Color Replacement tool: one stroke through options.points on the active layer
+  // (docs/color-replacement.md). Returns the changed bounds.
+  Q_INVOKABLE QJSValue replaceColor(const QJSValue& options = QJSValue());
+  // The Background Eraser (one stroke through options.points) and the Magic Eraser (one click
+  // at options.x, options.y) on the active layer (docs/eraser-tools.md). Both return the
+  // changed bounds.
+  Q_INVOKABLE QJSValue eraseBackground(const QJSValue& options = QJSValue());
+  Q_INVOKABLE QJSValue magicErase(const QJSValue& options = QJSValue());
+  // Layer > Layer Mask > Remove Background (script_ai_selection.cpp).
+  Q_INVOKABLE void removeBackground(const QJSValue& options = QJSValue());
+  Q_INVOKABLE QJSValue getPixels();
+  Q_INVOKABLE void setPixels(const QJSValue& imageData);
+  // Raster layer masks (script_pixel_io.cpp).
+  Q_INVOKABLE QJSValue getLayerMask() const;
+  Q_INVOKABLE void setLayerMask(const QJSValue& mask);
+  Q_INVOKABLE bool removeLayerMask();
+  // Trace Image to Shapes: returns the new group layer (inserted above this
+  // layer, which is hidden), or null when nothing traced.
+  Q_INVOKABLE QJSValue traceToShapes(const QJSValue& options = QJSValue());
+  // Simplify Path on this shape layer's path (or its vector mask); options
+  // {tolerance, cornerAngle, snapCurvesToLines}; returns {anchorsBefore,
+  // anchorsAfter}. Unknown option names throw.
+  Q_INVOKABLE QJSValue simplifyPath(const QJSValue& options = QJSValue());
+  // Type > Convert to Shape on this text layer, in place (same id); returns this layer.
+  Q_INVOKABLE QJSValue convertToShape();
+  // Type > Create Work Path from this text layer's glyph outlines (the text is kept); returns
+  // the work path.
+  Q_INVOKABLE QJSValue createWorkPath();
+
+  [[nodiscard]] LayerId layer_id() const noexcept { return layer_id_; }
+  [[nodiscard]] std::int64_t session_id() const noexcept { return session_id_; }
+
+private:
+  // Const resolution for reads; nullptr (after a thrown JS error) when gone.
+  [[nodiscard]] const Layer* read_layer() const;
+  // Mutation resolution: undo snapshot bookkeeping + non-const layer, or null.
+  [[nodiscard]] Layer* write_layer();
+
+  ScriptEngineHost& host_;
+  std::int64_t session_id_{0};
+  LayerId layer_id_{0};
+};
+
+class ScriptSelectionObject : public QObject {
+  Q_OBJECT
+  Q_PROPERTY(bool exists READ exists)
+  Q_PROPERTY(QJSValue bounds READ bounds)
+  Q_PROPERTY(bool automaticSelectionAvailable READ automatic_selection_available)
+  Q_PROPERTY(bool subjectSelectionAvailable READ subject_selection_available)
+  Q_PROPERTY(QString objectSelectionModel READ object_selection_model)
+
+public:
+  ScriptSelectionObject(ScriptEngineHost& host, std::int64_t session_id);
+
+  [[nodiscard]] bool exists() const;
+  [[nodiscard]] QJSValue bounds() const;
+  Q_INVOKABLE void selectAll();
+  Q_INVOKABLE void deselect();
+  Q_INVOKABLE void selectRect(int x, int y, int width, int height);
+  Q_INVOKABLE void selectEllipse(int x, int y, int width, int height);
+  // Select > Smooth (radius 1..500) and Select > Feather (0.1..1000); no-ops without a selection.
+  Q_INVOKABLE void smooth(double radius);
+  Q_INVOKABLE void feather(double radius);
+  // Select > Color Range (script_color_range.cpp, docs/color-range.md).
+  Q_INVOKABLE void selectColorRange(const QJSValue& options);
+  Q_INVOKABLE void fromPath(const QJSValue& path, const QJSValue& options = QJSValue());
+  Q_INVOKABLE QJSValue toPath(const QJSValue& options = QJSValue()) const;
+  // The selection as an 8-bit coverage plane, and back (script_pixel_io.cpp).
+  Q_INVOKABLE QJSValue getMask(const QJSValue& rect = QJSValue()) const;
+  Q_INVOKABLE void setMask(const QJSValue& mask, const QJSValue& options = QJSValue());
+  // Automatic selection (script_ai_selection.cpp, docs/ai-selection.md).
+  [[nodiscard]] bool automatic_selection_available() const;
+  // selectSubject, selectBackground and layer.removeBackground (the subject model).
+  [[nodiscard]] bool subject_selection_available() const;
+  // "standard" or "highQuality": the model objectSelect runs (permanent tokens).
+  [[nodiscard]] QString object_selection_model() const;
+  Q_INVOKABLE void selectSubject(const QJSValue& options = QJSValue());
+  Q_INVOKABLE void selectBackground(const QJSValue& options = QJSValue());
+  Q_INVOKABLE void objectSelect(const QJSValue& options);
+
+private:
+  void run_subject_selection(const QJSValue& options, bool background);
+
+  ScriptEngineHost& host_;
+  std::int64_t session_id_{0};
+};
+
+class ScriptDocumentObject : public QObject {
+  Q_OBJECT
+  Q_PROPERTY(QString id READ id)
+  Q_PROPERTY(bool modified READ modified)
+  Q_PROPERTY(bool canUndo READ can_undo)
+  Q_PROPERTY(bool canRedo READ can_redo)
+  Q_PROPERTY(int width READ width)
+  Q_PROPERTY(int height READ height)
+  Q_PROPERTY(QString name READ name)
+  Q_PROPERTY(QString path READ path)
+  Q_PROPERTY(QJSValue importNotes READ import_notes)
+  Q_PROPERTY(double resolution READ resolution)
+  Q_PROPERTY(int bitDepth READ bit_depth)
+  Q_PROPERTY(QString colorProfile READ color_profile)
+  Q_PROPERTY(bool cmykProof READ cmyk_proof WRITE set_cmyk_proof)
+  Q_PROPERTY(QJSValue layers READ layers)
+  Q_PROPERTY(QJSValue activeLayer READ active_layer WRITE set_active_layer)
+  Q_PROPERTY(QJSValue selection READ selection)
+  Q_PROPERTY(QJSValue paths READ paths)
+  Q_PROPERTY(QJSValue workPath READ work_path)
+  Q_PROPERTY(QJSValue clippingPath READ clipping_path WRITE set_clipping_path)
+  Q_PROPERTY(QJSValue fileInfo READ file_info)
+  Q_PROPERTY(QString xmp READ xmp)
+  Q_PROPERTY(QJSValue artboards READ artboards)
+
+public:
+  ScriptDocumentObject(ScriptEngineHost& host, std::int64_t session_id);
+  [[nodiscard]] QString id() const;
+  [[nodiscard]] bool modified() const;
+  [[nodiscard]] bool can_undo() const;
+  [[nodiscard]] bool can_redo() const;
+  Q_INVOKABLE QJSValue getLayer(const QString& id);
+  Q_INVOKABLE QJSValue renderPreview(const QString& path, const QJSValue& options = QJSValue());
+  // The merged visible image as RGBA8 at full resolution (script_pixel_io.cpp).
+  Q_INVOKABLE QJSValue getCompositePixels(const QJSValue& rect = QJSValue()) const;
+  Q_INVOKABLE bool undo();
+  Q_INVOKABLE bool redo();
+  Q_INVOKABLE QJSValue getPalette() const;
+  Q_INVOKABLE void setPalette(const QJSValue& colors, const QJSValue& options = QJSValue());
+  Q_INVOKABLE QJSValue loadPalette(const QString& path, const QJSValue& options = QJSValue());
+  Q_INVOKABLE bool savePalette(const QString& path, const QString& name = QString());
+
+  [[nodiscard]] int width() const;
+  [[nodiscard]] int height() const;
+  [[nodiscard]] QString name() const;
+  [[nodiscard]] QString path() const;
+  [[nodiscard]] QJSValue import_notes() const;
+  [[nodiscard]] double resolution() const;
+  [[nodiscard]] int bit_depth() const;
+  [[nodiscard]] QString color_profile() const;
+  [[nodiscard]] bool cmyk_proof() const;
+  void set_cmyk_proof(bool enabled);
+  [[nodiscard]] QJSValue layers() const;
+  [[nodiscard]] QJSValue active_layer() const;
+  void set_active_layer(const QJSValue& layer);
+  [[nodiscard]] QJSValue selection() const;
+
+  Q_INVOKABLE QJSValue addLayer(const QString& name);
+  Q_INVOKABLE QJSValue addShape(const QString& name, const QJSValue& geometry,
+                               const QJSValue& appearance = QJSValue());
+  Q_INVOKABLE QJSValue addFillLayer(const QString& name, const QJSValue& paint);
+  Q_INVOKABLE QJSValue addGroup(const QString& name);
+  Q_INVOKABLE QJSValue groupLayers(const QJSValue& layers, const QString& name);
+  Q_INVOKABLE void moveLayers(const QJSValue& layers, const QJSValue& destination);
+  Q_INVOKABLE QJSValue listVectorResources() const;
+  [[nodiscard]] QJSValue paths() const;
+  [[nodiscard]] QJSValue work_path() const;
+  [[nodiscard]] QJSValue clipping_path() const;
+  void set_clipping_path(const QJSValue& path);
+  Q_INVOKABLE QJSValue getPath(const QString& id) const;
+  Q_INVOKABLE QJSValue addPath(const QString& name, const QJSValue& data);
+  Q_INVOKABLE QJSValue setWorkPath(const QJSValue& data);
+  // `text` is a string or an array of runs ({text, font?, size?, bold?, italic?, color?}).
+  Q_INVOKABLE QJSValue addTextLayer(const QJSValue& text, const QJSValue& options = QJSValue());
+  // Files as Layers: each path (a string or an array of strings) becomes a
+  // layer above the active layer, bottom to top in argument order; a
+  // multi-layer file becomes a folder named after it. Throws, adding nothing,
+  // when a file cannot be read. Returns the new layers in argument order.
+  Q_INVOKABLE QJSValue importFilesAsLayers(const QJSValue& paths);
+  // Place Embedded / Place Linked: the file becomes a smart-object layer on top.
+  // Options {linked, x, y, width, height, scale, name}; unknown options throw.
+  Q_INVOKABLE QJSValue addSmartObject(const QString& path, const QJSValue& options = QJSValue());
+  Q_INVOKABLE QJSValue findLayer(const QString& name);
+  // Combine Shapes: merges the shape layers (siblings) into the bottom-most
+  // one with op "unite" | "subtract" | "intersect" | "exclude"; returns it.
+  Q_INVOKABLE QJSValue combineShapes(const QJSValue& layers, const QString& op);
+  Q_INVOKABLE QString cssForLayers(const QJSValue& layers);
+  Q_INVOKABLE QJSValue mergeLayers(const QJSValue& layers, const QJSValue& options = QJSValue());
+  // Layer > Arrange > Align / Distribute. `edge` is "left" | "hcenter" |
+  // "right" | "top" | "vcenter" | "bottom" (Distribute adds "hspacing" |
+  // "vspacing"); options {layers?: PatchyLayer[], alignTo?: "selection" |
+  // "canvas"} default to the layer selection and "selection". Both return the
+  // number of layers moved and ride the run's single undo entry.
+  Q_INVOKABLE int alignLayers(const QString& edge, const QJSValue& options = QJSValue());
+  Q_INVOKABLE int distributeLayers(const QString& mode, const QJSValue& options = QJSValue());
+  Q_INVOKABLE void flatten();
+  // File Info (docs/file-info.md): partial update of the Description/IPTC fields
+  // (fileInfo's keys; unknown or read-only keys throw), every metadata row, Strip All
+  // Metadata ({keepColorProfile} defaults to true) and the targeted removals.
+  Q_INVOKABLE void setFileInfo(const QJSValue& fields);
+  Q_INVOKABLE QJSValue metadataEntries() const;
+  Q_INVOKABLE void stripMetadata(const QJSValue& options = QJSValue());
+  Q_INVOKABLE bool removeLocation();
+  Q_INVOKABLE bool removeEditHistory();
+  // File Info's Scan for Watermarks: the composite checked for the known open invisible
+  // watermarks (core/invisible_watermark.hpp). Read-only; never runs on its own.
+  Q_INVOKABLE QJSValue scanForWatermarks() const;
+  // Image > Add Invisible Watermark: a TrustMark payload in the active layer, options
+  // {text?, id?, schema?, strength?} (docs/watermarks.md). One undo step with the run.
+  Q_INVOKABLE QJSValue addInvisibleWatermark(const QJSValue& options = QJSValue());
+  [[nodiscard]] QJSValue file_info() const;
+  [[nodiscard]] QString xmp() const;
+  // `options.method`: a resample id (core/resample.hpp), default "automatic".
+  Q_INVOKABLE void resizeImage(int width, int height, const QJSValue& options = QJSValue());
+  // `options`: `anchor` (a CanvasAnchor id) or `x`/`y` (where the old canvas lands), plus `fill`.
+  Q_INVOKABLE void resizeCanvas(int width, int height, const QJSValue& options = QJSValue());
+  Q_INVOKABLE void convertBitDepth(int bits);
+  Q_INVOKABLE void convertToProfile(const QString& profile, const QJSValue& options = QJSValue());
+  Q_INVOKABLE void crop(int x, int y, int width, int height);
+  // Perspective Crop (GitHub issue 328): `corners` is four [x, y] or {x, y} points in
+  // output order TL, TR, BR, BL; options {width, height, resolution}.
+  Q_INVOKABLE void perspectiveCrop(const QJSValue& corners, const QJSValue& options = QJSValue());
+  // Image > Trim (GitHub issue 297): {basedOn, tolerance, top, bottom, left, right}; returns the kept
+  // rect in the old canvas coordinates, or null when nothing was trimmed.
+  Q_INVOKABLE QJSValue trim(const QJSValue& options = QJSValue());
+  Q_INVOKABLE bool saveAs(const QString& path, const QJSValue& options = QJSValue());
+  Q_INVOKABLE bool exportAs(const QString& path, const QJSValue& options = QJSValue());
+  // File > Export for Web's encoders without a file (docs/web-export.md): format "jpeg",
+  // "webp", "png", "gif", "avif" or "jxl", options as exportAs takes for that format.
+  // Returns {bytes: ArrayBuffer, width, height}.
+  Q_INVOKABLE QJSValue encodeForWeb(const QString& format, const QJSValue& options = QJSValue());
+  Q_INVOKABLE bool exportAnimatedWebp(const QString& path, const QJSValue& options = QJSValue());
+  Q_INVOKABLE bool exportAnimatedPng(const QString& path, const QJSValue& options = QJSValue());
+  Q_INVOKABLE void close();
+  Q_INVOKABLE void activate();
+  // Artboards (script_artboards.cpp).
+  [[nodiscard]] QJSValue artboards() const;
+  Q_INVOKABLE QJSValue addArtboard(const QString& name, const QJSValue& rect, const QJSValue& options = QJSValue());
+  Q_INVOKABLE QJSValue artboardFromLayers(const QJSValue& layers, const QString& name = QString());
+  Q_INVOKABLE QJSValue fitCanvasToArtboards();
+  Q_INVOKABLE QJSValue exportArtboards(const QString& folder, const QJSValue& options = QJSValue());
+
+  [[nodiscard]] std::int64_t session_id() const noexcept { return session_id_; }
+
+private:
+  [[nodiscard]] const Document* read_document() const;
+  [[nodiscard]] Document* write_document();
+  bool save_to_path(const QString& method, const QString& path, const QJSValue& options, bool export_copy);
+
+  ScriptEngineHost& host_;
+  std::int64_t session_id_{0};
+};
+
+class ScriptAppObject : public QObject {
+  Q_OBJECT
+  Q_PROPERTY(QString version READ version CONSTANT)
+  Q_PROPERTY(int apiVersion READ api_version CONSTANT)
+  Q_PROPERTY(QJSValue documents READ documents)
+  Q_PROPERTY(QJSValue activeDocument READ active_document)
+  Q_PROPERTY(bool undoEnabled READ undo_enabled WRITE set_undo_enabled)
+
+public:
+  explicit ScriptAppObject(ScriptEngineHost& host);
+
+  [[nodiscard]] QString version() const;
+  [[nodiscard]] int api_version() const noexcept { return 1; }
+  [[nodiscard]] QJSValue documents() const;
+  [[nodiscard]] QJSValue active_document() const;
+  [[nodiscard]] bool undo_enabled() const;
+  void set_undo_enabled(bool enabled);
+
+  Q_INVOKABLE QJSValue open(const QString& path);
+  Q_INVOKABLE QJSValue getDocument(const QString& id);
+  Q_INVOKABLE QJSValue newDocument(int width, int height, const QJSValue& options = QJSValue());
+  Q_INVOKABLE void alert(const QString& text);
+  Q_INVOKABLE QJSValue prompt(const QString& text, const QString& defaultValue = QString());
+  // Modal folder/file pickers; empty string when cancelled or unattended (CLI).
+  Q_INVOKABLE QString chooseFolder(const QString& title = QString());
+  Q_INVOKABLE QString chooseOpenFile(const QString& title = QString(),
+                                     const QString& filter = QString());
+  Q_INVOKABLE QString chooseSaveFile(const QString& title = QString(),
+                                     const QString& filter = QString());
+  // Registered app commands by stable hotkey command id (docs/scripting.md).
+  Q_INVOKABLE bool runCommand(const QString& commandId);
+  // One PDF with a page per document: exportPdf([docA, docB], "out.pdf", { lossless,
+  // editableLayers, missingFontsAsImages }). A single document is accepted too.
+  Q_INVOKABLE bool exportPdf(const QJSValue& documents, const QString& path, const QJSValue& options = QJSValue());
+  // Writes the PDF of a Scan a Book to PDF project folder (docs/book-scan.md); options
+  // override its saved output settings for this export only. Returns the page count.
+  Q_INVOKABLE int buildBookPdf(const QString& folder, const QString& path, const QJSValue& options = QJSValue());
+  Q_INVOKABLE QStringList commandIds();
+  Q_INVOKABLE QJSValue listFonts();
+  // One entry per screen with its HDR capability (ui/display_hdr_info.hpp).
+  Q_INVOKABLE QJSValue displayInfo();
+  // The working CMYK space (docs/cmyk.md): what it is, and single colors through it.
+  Q_PROPERTY(QJSValue cmykProfile READ cmyk_profile)
+  [[nodiscard]] QJSValue cmyk_profile();
+  Q_INVOKABLE QJSValue colorToCmyk(const QString& color);
+  Q_INVOKABLE QJSValue cmykToColor(double cyan, double magenta, double yellow, double black);
+  // Whether the working CMYK profile can hold the color: the Gamut Warning test.
+  Q_INVOKABLE bool colorInCmykGamut(const QString& color);
+  // Downloads Object Selection's High Quality model when it is missing (desktop only;
+  // script_ai_selection.cpp). True once it is present; throws on failure.
+  Q_INVOKABLE bool downloadObjectSelectionModel();
+  // The TrustMark watermark models (docs/watermarks.md): downloads them when missing
+  // (desktop only, status-bar progress). True once present; throws on failure.
+  Q_INVOKABLE bool downloadWatermarkModels();
+  Q_PROPERTY(bool watermarkModelsAvailable READ watermark_models_available)
+  [[nodiscard]] bool watermark_models_available() const;
+  // Preferences > Watermarks (docs/watermarks.md): {text, addOnSave: "never" | "ask" |
+  // "always", checkOnOpen}; setWatermarkPreferences takes any subset (unknown keys, a bad
+  // token or text TrustMark cannot hold throw).
+  Q_PROPERTY(QJSValue watermarkPreferences READ watermark_preferences)
+  [[nodiscard]] QJSValue watermark_preferences() const;
+  Q_INVOKABLE void setWatermarkPreferences(const QJSValue& preferences);
+  // Preferences > Metadata and Watermarks, "Saved metadata" (docs/file-info-save-stamp.md): {mode:
+  // "none" | "basic" | "personal", name, copyright, email, website, askBeforeAdding};
+  // setSaveMetadataPreferences takes any subset (unknown keys or a bad mode throw).
+  Q_PROPERTY(QJSValue saveMetadataPreferences READ save_metadata_preferences)
+  [[nodiscard]] QJSValue save_metadata_preferences() const;
+  Q_INVOKABLE void setSaveMetadataPreferences(const QJSValue& preferences);
+
+private:
+  ScriptEngineHost& host_;
+};
+
+class ScriptIoObject : public QObject {
+  Q_OBJECT
+
+public:
+  explicit ScriptIoObject(ScriptEngineHost& host);
+
+  Q_INVOKABLE QString readTextFile(const QString& path);
+  Q_INVOKABLE void writeTextFile(const QString& path, const QString& text);
+  // Names of the files in `dir` matching `pattern` ("*.png"; default all
+  // files), sorted case-insensitively. Names only, not full paths.
+  Q_INVOKABLE QStringList listFiles(const QString& dir, const QString& pattern = QString());
+  // File probes so a script can verify its own output (and tests can drive the
+  // real build through --run-script). None of them throw.
+  Q_INVOKABLE bool fileExists(const QString& path);
+  // Size in bytes, or -1 when `path` is not an existing file.
+  Q_INVOKABLE double fileSize(const QString& path);
+  // Creates the folder and any missing parents; true when it exists afterwards.
+  Q_INVOKABLE bool makeDir(const QString& path);
+  // Removes one file (never a folder); true when it was removed.
+  Q_INVOKABLE bool deleteFile(const QString& path);
+  // PNG and the other image formats Qt reads, to and from pixel blocks (script_pixel_io.cpp).
+  Q_INVOKABLE QJSValue readImage(const QString& path, const QJSValue& options = QJSValue());
+  Q_INVOKABLE void writeImage(const QString& path, const QJSValue& imageData);
+
+private:
+  ScriptEngineHost& host_;
+};
+
+// patchy.plugins: the legacy Photoshop plug-ins Patchy found (docs/plugins.md).
+class ScriptPluginsObject : public QObject {
+  Q_OBJECT
+  Q_PROPERTY(QStringList folders READ folders WRITE set_folders)
+  Q_PROPERTY(QString folder READ folder)
+
+public:
+  explicit ScriptPluginsObject(ScriptEngineHost& host);
+
+  // The plug-ins folder next to the application ("/" separators), created
+  // with its README when read; empty on platforms without one.
+  [[nodiscard]] QString folder() const;
+
+  // The user-added plug-in folders (persisted); setting rescans.
+  [[nodiscard]] QStringList folders() const;
+  void set_folders(const QStringList& folders);
+  // Every plug-in file the last scan saw: {id, name, category, path, supported,
+  // reason, architecture}. Unsupported files (formats, automation, other
+  // platforms) carry the reason.
+  Q_INVOKABLE QJSValue list();
+  // Rescans the automatic and user folders; returns list().
+  Q_INVOKABLE QJSValue rescan();
+
+private:
+  ScriptEngineHost& host_;
+};
+
+// patchy.gegl: GEGL filters (docs/gegl-filters.md).
+class ScriptGeglObject : public QObject {
+  Q_OBJECT
+
+public:
+  explicit ScriptGeglObject(ScriptEngineHost& host);
+
+  // Every GEGL filter Patchy offers: {id, name, category, description, parameters};
+  // layer.applyFilter runs one by id. Scans GEGL on first use.
+  Q_INVOKABLE QJSValue filters();
+
+private:
+  ScriptEngineHost& host_;
+};
+
+// patchy.gmic: the G'MIC filter library (docs/gmic.md). Empty in builds without the engine.
+class ScriptGmicObject : public QObject {
+  Q_OBJECT
+  Q_PROPERTY(bool available READ available)
+  Q_PROPERTY(QString version READ version)
+
+public:
+  explicit ScriptGmicObject(ScriptEngineHost& host);
+
+  [[nodiscard]] bool available() const;
+  // The G'MIC version the filters come from ("4.0.5"), "" when unavailable.
+  [[nodiscard]] QString version() const;
+  // Every offered filter: {id, name, folder, inputLayers, parameters: [{name, type,
+  // default, minimum, maximum, choices}]}, parameters in the order applyGmic takes them.
+  Q_INVOKABLE QJSValue list();
+
+private:
+  ScriptEngineHost& host_;
+};
+
+// patchy.scripts: the script library (docs/scripting.md "Script hotkeys"): what the
+// Scripts menu lists, plus installing a script into the user folder and binding its
+// shortcut, so an agent can write a script and put it on a key in one run.
+class ScriptLibraryObject : public QObject {
+  Q_OBJECT
+  Q_PROPERTY(QString userFolder READ user_folder)
+  Q_PROPERTY(QString bundledFolder READ bundled_folder)
+
+public:
+  explicit ScriptLibraryObject(ScriptEngineHost& host);
+
+  [[nodiscard]] QString user_folder() const;
+  [[nodiscard]] QString bundled_folder() const;
+  // Every script of the merged scan: {name, fileName, relativePath, path, bundled,
+  // modified, description, author, hotkey, defaultHotkey, commandId}. Both rescan the
+  // folders and refresh the menu and hotkey commands.
+  Q_INVOKABLE QJSValue list();
+  Q_INVOKABLE QJSValue rescan();
+  // Writes source to <userFolder>/<relativePath>, rescans, binds options.hotkey when
+  // given, and returns the entry. Throws for a bad path, a write failure, or a shortcut
+  // Patchy cannot bind.
+  Q_INVOKABLE QJSValue install(const QString& relativePath, const QString& source,
+                               const QJSValue& options = QJSValue());
+  // The Preferences override for the script ("" clears it, restoring the @hotkey
+  // default); returns the shortcut in effect afterwards.
+  Q_INVOKABLE QString setHotkey(const QString& relativePath, const QString& shortcut);
+  Q_INVOKABLE QString getHotkey(const QString& relativePath);
+
+private:
+  [[nodiscard]] QJSValue entries_value(const ScriptScan& scan);
+  [[nodiscard]] QJSValue entry_value(const QString& relativePath);
+
+  ScriptEngineHost& host_;
+};
+
+// patchy.recovery: the automatic document recovery store (docs/document-recovery.md),
+// exposed so scripts and tests can force a recovery write and inspect or reopen
+// what the store holds. The web build reports enabled === false and holds nothing.
+class ScriptRecoveryObject : public QObject {
+  Q_OBJECT
+  Q_PROPERTY(bool enabled READ enabled WRITE set_enabled)
+  Q_PROPERTY(int intervalMinutes READ interval_minutes WRITE set_interval_minutes)
+  Q_PROPERTY(QString directory READ directory)
+
+public:
+  explicit ScriptRecoveryObject(ScriptEngineHost& host);
+
+  // The persisted preferences; setting either re-arms the timer. The interval
+  // must be one of the Preferences steps (5, 10, 15, 30, 60), else it throws.
+  [[nodiscard]] bool enabled() const;
+  void set_enabled(bool enabled);
+  [[nodiscard]] int interval_minutes() const;
+  void set_interval_minutes(int minutes);
+  // This instance's recovery folder ("/" separators); it exists once something
+  // was written.
+  [[nodiscard]] QString directory() const;
+  // Writes a recovery copy of every modified document whose state changed since
+  // its last copy and waits for the files. Returns the PSB paths written; empty
+  // when nothing changed or the app was busy.
+  Q_INVOKABLE QStringList writeNow();
+  // {file, title, originalPath, savedAt}[] for this instance's copies.
+  Q_INVOKABLE QJSValue listFiles();
+  // {directory, file, title, originalPath, savedAt}[] for copies left by instances
+  // that no longer run.
+  Q_INVOKABLE QJSValue listOrphaned();
+  // Reopens every orphaned copy as a modified "(Recovered)" document; returns them.
+  Q_INVOKABLE QJSValue recoverAll();
+  // Deletes every orphaned folder; returns how many documents were dropped.
+  Q_INVOKABLE int discardOrphaned();
+
+private:
+  ScriptEngineHost& host_;
+};
+
+class ScriptUiObject : public QObject {
+  Q_OBJECT
+
+public:
+  explicit ScriptUiObject(ScriptEngineHost& host);
+
+  // Options object: {width, height, title}. Returns a ScriptCanvasWindow.
+  Q_INVOKABLE QJSValue createCanvas(const QJSValue& options = QJSValue());
+  // Declarative modal form ({title, fields: [{key, label, type, value, ...}]});
+  // returns the values object, or null when cancelled. Unattended CLI runs
+  // return the defaults.
+  Q_INVOKABLE QJSValue showDialog(const QJSValue& spec);
+  // showDialog plus the standard options behavior: --script-arg values
+  // override the field defaults, and unattended runs (CLI) skip the dialog,
+  // returning the effective values. The recommended front door for scripts
+  // with options (docs/scripting.md "Script options").
+  Q_INVOKABLE QJSValue showOptions(const QJSValue& spec);
+  // Fire-and-forget synthesized blip: frequency 20..20000 Hz, duration
+  // 1..4000 ms, volume 0..1, wave "sine" (default) or "square". QJSValue
+  // parameters so omitted JS arguments get these defaults (missing args
+  // arrive as undefined, never as C++ default values).
+  Q_INVOKABLE void playTone(const QJSValue& frequency = QJSValue(),
+                            const QJSValue& durationMs = QJSValue(),
+                            const QJSValue& volume = QJSValue(),
+                            const QJSValue& wave = QJSValue());
+  // Plays a .wav file (up to 10 MB). Relative paths resolve like include():
+  // beside the running script, then the user scripts folder, then bundled.
+  Q_INVOKABLE void playSound(const QString& path);
+  // UI staging for automation (README shots, demos): resize the main window,
+  // set the right panel stack width, save a PNG capture of the main window.
+  Q_INVOKABLE void setWindowSize(int width, int height);
+  Q_INVOKABLE void setSidePanelWidth(int width);
+  Q_INVOKABLE bool captureWindow(const QString& path);
+  // Shows a message in the main window's status bar (progress readouts).
+  Q_INVOKABLE void setStatusMessage(const QString& message);
+  // The right column's panels by permanent name ("layers", "channels", "paths",
+  // "history", "properties", "info", "palette"); unknown names throw.
+  // expandPanel reopens a closed panel, brings its tab to the front and expands
+  // it; panelState returns {open, front, expanded}.
+  Q_INVOKABLE void expandPanel(const QString& name);
+  Q_INVOKABLE void collapsePanel(const QString& name);
+  Q_INVOKABLE void closePanel(const QString& name);
+  Q_INVOKABLE QJSValue panelState(const QString& name);
+  // The active document's view zoom in percent (0 with no document). Setting
+  // clamps like the status bar; throws for NaN/non-positive values or with no
+  // document. Only window captures see the view, never document previews.
+  Q_PROPERTY(double zoom READ zoom WRITE set_zoom)
+  [[nodiscard]] double zoom() const;
+  void set_zoom(double percent);
+  // The active document's view rotation in degrees, clockwise, in (-180, 180] (0 with no
+  // document): docs/view-navigation-rotation.md. Setting wraps any finite angle and turns
+  // the view about its center; throws for NaN or with no document. Pixels never change;
+  // only window captures see it.
+  Q_PROPERTY(double rotation READ rotation WRITE set_rotation)
+  [[nodiscard]] double rotation() const;
+  void set_rotation(double degrees);
+  // View > Fit on Screen for the active document; throws with no document.
+  Q_INVOKABLE void fitOnScreen();
+  // Where the view looks, in document pixels (docs/view-navigation.md, "Scripted view
+  // placement"). viewCenter reads {x, y}, the document point at the view area's center
+  // (null with no document); setting pans there at the current zoom. zoomTo sets the zoom
+  // (percent, clamped like zoom) and centers (x, y). Both keep the point on the document.
+  // zoomToRect fits {x, y, width, height} with an optional margin in view pixels a side
+  // (default 10, Zoom tool marquee). All throw for non-finite numbers or with no document.
+  Q_PROPERTY(QJSValue viewCenter READ view_center WRITE set_view_center)
+  [[nodiscard]] QJSValue view_center() const;
+  void set_view_center(const QJSValue& point);
+  Q_INVOKABLE void zoomTo(const QJSValue& x, const QJSValue& y, const QJSValue& percent);
+  Q_INVOKABLE void zoomToRect(const QJSValue& rect, const QJSValue& margin = QJSValue());
+  // The active 32-bit document's preview exposure in stops (the status bar's Exposure
+  // box): display only, never saved, no history entry. Reads 0 without a 32-bit document;
+  // setting clamps to -20..20 and throws for NaN or without one. Window captures see it.
+  Q_PROPERTY(double previewExposure READ preview_exposure WRITE set_preview_exposure)
+  [[nodiscard]] double preview_exposure() const;
+  void set_preview_exposure(double stops);
+  // View > Proof Colors and View > Gamut Warning (docs/cmyk.md): application-wide canvas
+  // views through the working CMYK profile. Only window captures see them.
+  Q_PROPERTY(bool proofColors READ proof_colors WRITE set_proof_colors)
+  [[nodiscard]] bool proof_colors() const;
+  void set_proof_colors(bool enabled);
+  Q_PROPERTY(bool gamutWarning READ gamut_warning WRITE set_gamut_warning)
+  [[nodiscard]] bool gamut_warning() const;
+  void set_gamut_warning(bool enabled);
+  // View > Pixel Grid: the saved app-wide preference for lines between pixels at 600%
+  // and up. Only window captures see it.
+  Q_PROPERTY(bool pixelGrid READ pixel_grid WRITE set_pixel_grid)
+  [[nodiscard]] bool pixel_grid() const;
+  void set_pixel_grid(bool enabled);
+  // Customize Tool Palette (docs/tool-palette.md): {hiddenTools, layout, wheelScroll,
+  // ungroupTools, showGearButton, hiddenLayerButtons}. Setting takes any subset of those keys, applies
+  // live and saves; an unknown tool id, layer button id or layout throws. showGearButton
+  // (the palette's removed gear) reads false and is ignored when set.
+  Q_PROPERTY(QJSValue toolPalette READ tool_palette WRITE set_tool_palette)
+  [[nodiscard]] QJSValue tool_palette() const;
+  void set_tool_palette(const QJSValue& state);
+  Q_INVOKABLE void present(const QJSValue& delayMs = QJSValue());
+  Q_PROPERTY(bool slowMode READ slow_mode WRITE set_slow_mode)
+  [[nodiscard]] bool slow_mode() const;
+  void set_slow_mode(bool enabled);
+  Q_PROPERTY(bool paused READ paused WRITE set_paused)
+  [[nodiscard]] bool paused() const;
+  void set_paused(bool paused);
+
+private:
+  ScriptEngineHost& host_;
+};
+
+// Shared by the wrapper implementations: a JS document/layer wrapper for the
+// given identity (JS-GC-owned, parentless).
+[[nodiscard]] QJSValue make_document_value(ScriptEngineHost& host, std::int64_t session_id);
+[[nodiscard]] QJSValue make_layer_value(ScriptEngineHost& host, std::int64_t session_id, LayerId layer_id);
+// What `layer.bounds`, `x`, `y` and `moveTo` measure: an artboard's rect, else the layer's
+// stored bounds (script_artboards.cpp).
+[[nodiscard]] Rect script_layer_position_bounds(const Layer& layer);
+
+}  // namespace patchy::ui

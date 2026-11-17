@@ -1,0 +1,3153 @@
+#include "ui/image_document_io.hpp"
+#include "color/rgb_profiles.hpp"
+#include "ui/document_save_coordinator.hpp"
+#include "formats/metadata/metadata_inject.hpp"
+#include "formats/metadata/exif_tags.hpp"
+#include "formats/metadata/tiff_ifd.hpp"
+#include "psd/psd_document_io.hpp"
+#include "psd/psd_tiff.hpp"
+#include "ui/save_progress.hpp"
+#include "ui/memory_info.hpp"
+#include "ui/qt_paths.hpp"
+
+#include "core/blend_math.hpp"
+#include "core/document_depth.hpp"
+#include "core/layer_metadata.hpp"
+#include "core/resample.hpp"
+#include "core/worker_budget.hpp"
+#include "core/smart_object.hpp"
+#include "core/layer_render_utils.hpp"
+#include "core/pixel_depth.hpp"
+#include "core/pixel_tools.hpp"
+#include "formats/bmp_document_io.hpp"
+#include "formats/document_flatten.hpp"
+#include "formats/gif_document_io.hpp"
+#include "formats/animation_frames.hpp"
+#include "formats/animation_timing.hpp"
+#include "formats/apng_writer.hpp"
+#include "formats/webp_animation_io.hpp"
+#include "support/atomic_file_write.hpp"
+#include "support/translate_noop.hpp"
+#include "formats/heif_document_io.hpp"
+#include "formats/ico_document_io.hpp"
+#include "formats/ilbm_document_io.hpp"
+#include "formats/image_density_probe.hpp"
+#include "formats/jxl_document_io.hpp"
+#include "formats/jxr_document_io.hpp"
+#include "formats/pcx_document_io.hpp"
+#include "formats/dds_document_io.hpp"
+#include "formats/exr_document_io.hpp"
+#include "formats/hdr_document_io.hpp"
+#include "formats/jp2_document_io.hpp"
+#include "formats/avif_document_io.hpp"
+#include "formats/rttex_document_io.hpp"
+#include "formats/tga_document_io.hpp"
+#include "core/rect_utils.hpp"
+#include "render/compositor.hpp"
+#include "render/native_cmyk.hpp"
+#include "render/native_duotone.hpp"
+#include "render/layer_compositor.hpp"
+#include "ui/qimage_composite_target.hpp"
+#include "support/string_utils.hpp"
+#include "ui/pdf_export.hpp"
+
+#include <QBuffer>
+#include <QJsonArray>
+#include <QJsonDocument>
+#include <QByteArray>
+#include <QColor>
+#include <QDir>
+#include <QFileInfo>
+#include <QFile>
+#include <QImage>
+#include <QImageWriter>
+#include <QObject>
+#include <QPainter>
+#include <QSaveFile>
+#include <QString>
+#include <QTemporaryDir>
+#include <QtGlobal>
+
+#include <algorithm>
+#include <array>
+#include <atomic>
+#include <chrono>
+#include <cstdint>
+#include <cmath>
+#include <cstring>
+#include <future>
+#include <iostream>
+#include <condition_variable>
+#include <list>
+#include <memory>
+#include <mutex>
+#include <optional>
+#include <span>
+#include <stdexcept>
+#include <set>
+#include <string>
+#include <thread>
+#include <unordered_map>
+#include <unordered_set>
+#include <utility>
+#include <vector>
+
+namespace patchy::ui {
+
+namespace {
+
+bool render_profile_enabled() noexcept;
+double render_profile_min_ms() noexcept;
+std::uint64_t rect_area_u64(Rect rect) noexcept;
+
+}  // namespace
+
+void QImageCompositeTarget::profile_compositor_step(const char* step, const Layer& layer, Rect rect,
+                                                  double elapsed_ms) const {
+  if (!render_profile_enabled() || elapsed_ms < render_profile_min_ms()) {
+    return;
+  }
+  const auto& path = profile_layer_path_.empty() ? layer.name() : profile_layer_path_;
+  std::cerr << "PATCHY_RENDER_PROFILE_STEP ms=" << elapsed_ms
+            << " step=" << (step != nullptr ? step : "unknown")
+            << " area=" << rect_area_u64(rect)
+            << " rect=" << rect.x << "," << rect.y << "," << rect.width << "," << rect.height
+            << " layer=\"" << path << "\"\n";
+}
+
+namespace {
+
+struct RenderTraceStats {
+  int layers{0};
+  int visible_layers{0};
+  int styled_layers{0};
+  std::uint64_t clipped_pixel_area{0};
+};
+
+struct RenderProfileEntry {
+  std::string path;
+  std::string kind;
+  std::string action;
+  Rect draw_rect{};
+  std::uint64_t area{0};
+  double elapsed_ms{0.0};
+};
+
+struct RenderProfile {
+  int visited_layers{0};
+  int skipped_invisible{0};
+  int skipped_zero_opacity{0};
+  int skipped_empty_clip{0};
+  int skipped_unsupported{0};
+  int groups{0};
+  int pixel_layers{0};
+  int adjustment_layers{0};
+  std::uint64_t rendered_area{0};
+  std::vector<RenderProfileEntry> entries;
+};
+
+bool render_trace_enabled() noexcept {
+  static const bool enabled = qEnvironmentVariableIsSet("PATCHY_RENDER_TRACE");
+  return enabled;
+}
+
+bool render_profile_enabled() noexcept {
+  static const bool enabled = qEnvironmentVariableIsSet("PATCHY_RENDER_PROFILE");
+  return enabled;
+}
+
+int render_profile_top_count() noexcept {
+  bool ok = false;
+  const auto value = qEnvironmentVariableIntValue("PATCHY_RENDER_PROFILE_TOP", &ok);
+  return ok ? std::clamp(value, 1, 100) : 16;
+}
+
+double render_profile_min_ms() noexcept {
+  bool ok = false;
+  const auto value = qEnvironmentVariableIntValue("PATCHY_RENDER_PROFILE_MIN_MS", &ok);
+  return ok ? std::max(0, value) : 0;
+}
+
+std::string sanitized_profile_text(std::string text) {
+  for (auto& ch : text) {
+    if (ch == '\n' || ch == '\r' || ch == '\t') {
+      ch = ' ';
+    }
+  }
+  if (text.size() > 140U) {
+    text.resize(140U);
+  }
+  return text;
+}
+
+std::string layer_kind_name(LayerKind kind) {
+  switch (kind) {
+    case LayerKind::Pixel:
+      return "pixel";
+    case LayerKind::Group:
+      return "group";
+    case LayerKind::Adjustment:
+      return "adjustment";
+    case LayerKind::Text:
+      return "text";
+    case LayerKind::Vector:
+      return "vector";
+    case LayerKind::SmartObject:
+      return "smart_object";
+  }
+  return "unknown";
+}
+
+std::string profile_layer_path(std::string_view parent_path, const Layer& layer) {
+  auto name = sanitized_profile_text(layer.name());
+  if (name.empty()) {
+    name = "<unnamed>";
+  }
+  if (parent_path.empty()) {
+    return name;
+  }
+  std::string path(parent_path);
+  path += '/';
+  path += name;
+  return path;
+}
+
+std::uint64_t rect_area_u64(Rect rect) noexcept {
+  if (rect.empty()) {
+    return 0;
+  }
+  return static_cast<std::uint64_t>(rect.width) * static_cast<std::uint64_t>(rect.height);
+}
+
+void collect_render_trace_stats(const Layer& layer, Rect clip,
+                                const std::vector<render_detail::LayerBoundsOverride>* overrides,
+                                RenderTraceStats& stats) {
+  ++stats.layers;
+  if (!render_detail::layer_visible_for_render(layer, overrides) || layer.opacity() <= 0.0F) {
+    return;
+  }
+  ++stats.visible_layers;
+  if (!layer.layer_style().empty()) {
+    ++stats.styled_layers;
+  }
+  if (layer.kind() == LayerKind::Group) {
+    for (const auto& child : layer.children()) {
+      collect_render_trace_stats(child, clip, overrides, stats);
+    }
+    return;
+  }
+  if (layer.kind() == LayerKind::Pixel) {
+    stats.clipped_pixel_area +=
+      rect_area_u64(intersect_rect(clip, render_detail::layer_bounds_for_render(layer, overrides)));
+  } else if (layer.kind() == LayerKind::Adjustment) {
+    auto draw_rect = clip;
+    const auto bounds = render_detail::adjustment_bounds_for_render(layer, overrides);
+    if (!bounds.empty()) {
+      draw_rect = intersect_rect(draw_rect, bounds);
+    }
+    stats.clipped_pixel_area += rect_area_u64(draw_rect);
+  }
+}
+
+bool has_enabled_mask(const Layer& layer) noexcept {
+  return layer.mask().has_value() && !layer.mask()->disabled;
+}
+
+bool has_enabled_backdrop_dependent_style(const LayerStyle& style) noexcept {
+  const auto enabled_drop_shadow = std::any_of(style.drop_shadows.begin(), style.drop_shadows.end(),
+                                               [](const LayerDropShadow& shadow) {
+                                                 return shadow.enabled && shadow.opacity > 0.0F;
+                                               });
+  const auto enabled_inner_shadow = std::any_of(style.inner_shadows.begin(), style.inner_shadows.end(),
+                                                [](const LayerInnerShadow& shadow) {
+                                                  return shadow.enabled && shadow.opacity > 0.0F &&
+                                                         shadow.size > 0.0F;
+                                                });
+  const auto enabled_outer_glow = std::any_of(style.outer_glows.begin(), style.outer_glows.end(),
+                                              [](const LayerOuterGlow& glow) {
+                                                return glow.enabled && glow.opacity > 0.0F && glow.size > 0.0F;
+                                              });
+  const auto enabled_inner_glow = std::any_of(style.inner_glows.begin(), style.inner_glows.end(),
+                                              [](const LayerInnerGlow& glow) {
+                                                return glow.enabled && glow.opacity > 0.0F && glow.size > 0.0F;
+                                              });
+  const auto enabled_gradient = std::any_of(style.gradient_fills.begin(), style.gradient_fills.end(),
+                                            [](const LayerGradientFill& fill) {
+                                              return fill.enabled && fill.opacity > 0.0F;
+                                            });
+  const auto enabled_pattern = std::any_of(style.pattern_overlays.begin(), style.pattern_overlays.end(),
+                                           [](const LayerPatternOverlay& pattern) {
+                                             return pattern.enabled && pattern.opacity > 0.0F;
+                                           });
+  const auto enabled_bevel = std::any_of(style.bevels.begin(), style.bevels.end(), [](const LayerBevelEmboss& bevel) {
+    return bevel.enabled && bevel.size > 0.0F && (bevel.highlight_opacity > 0.0F || bevel.shadow_opacity > 0.0F);
+  });
+  const auto enabled_satin = std::any_of(style.satins.begin(), style.satins.end(), [](const LayerSatin& satin) {
+    return satin.enabled && satin.opacity > 0.0F && satin.size > 0.0F;
+  });
+  return enabled_drop_shadow || enabled_inner_shadow || enabled_outer_glow || enabled_inner_glow || enabled_gradient ||
+         enabled_pattern || enabled_bevel || enabled_satin;
+}
+
+bool layer_style_cache_eligible(const Layer& layer, const PixelBuffer& source) {
+  // A channel restriction must apply against the live backdrop, never inside
+  // the cache's private transparent image (the restored channel would freeze
+  // to transparent black and the blit would paint it).
+  if (layer.kind() != LayerKind::Pixel || layer.blend_mode() != BlendMode::Normal || has_enabled_mask(layer) ||
+      patchy::layer_has_enabled_vector_mask(layer) || render_detail::layer_has_rendered_blend_if(layer) ||
+      render_detail::layer_rendered_channel_restriction(layer) != 0U ||
+      source.empty() || source.format().bit_depth != BitDepth::UInt8 || source.format().channels < 3) {
+    return false;
+  }
+  const auto& style = layer.layer_style();
+  if (!style.effects_visible || style.empty() || has_enabled_backdrop_dependent_style(style)) {
+    return false;
+  }
+
+  bool has_supported_style = false;
+  for (const auto& overlay : style.color_overlays) {
+    if (!overlay.enabled || overlay.opacity <= 0.0F) {
+      continue;
+    }
+    if (overlay.blend_mode != BlendMode::Normal) {
+      return false;
+    }
+    has_supported_style = true;
+  }
+  for (const auto& stroke : style.strokes) {
+    if (!stroke.enabled || stroke.opacity <= 0.0F || stroke.size <= 0.0F) {
+      continue;
+    }
+    if (stroke.blend_mode != BlendMode::Normal || stroke.uses_gradient) {
+      return false;
+    }
+    has_supported_style = true;
+  }
+  return has_supported_style;
+}
+
+bool has_layer_render_override(const Layer& layer, const std::vector<render_detail::LayerBoundsOverride>* overrides) {
+  if (overrides == nullptr) {
+    return false;
+  }
+  return std::any_of(overrides->begin(), overrides->end(), [&layer](const render_detail::LayerBoundsOverride& override) {
+    return override.layer_id == layer.id();
+  });
+}
+
+struct StyleCacheKey {
+  const Layer* layer{nullptr};
+  const std::uint8_t* source_data{nullptr};
+  std::uint64_t revision{0};
+  std::int32_t source_width{0};
+  std::int32_t source_height{0};
+  std::int32_t render_width{0};
+  std::int32_t render_height{0};
+
+  [[nodiscard]] bool operator==(const StyleCacheKey& other) const noexcept {
+    return layer == other.layer && source_data == other.source_data && revision == other.revision &&
+           source_width == other.source_width && source_height == other.source_height && render_width == other.render_width &&
+           render_height == other.render_height;
+  }
+};
+
+struct StyleCacheKeyHash {
+  [[nodiscard]] std::size_t operator()(const StyleCacheKey& key) const noexcept {
+    auto seed = std::hash<const Layer*>{}(key.layer);
+    const auto mix = [&seed](auto value) {
+      seed ^= std::hash<decltype(value)>{}(value) + 0x9e3779b9U + (seed << 6U) + (seed >> 2U);
+    };
+    mix(key.source_data);
+    mix(key.revision);
+    mix(key.source_width);
+    mix(key.source_height);
+    mix(key.render_width);
+    mix(key.render_height);
+    return seed;
+  }
+};
+
+class LayerStyleRenderCache {
+public:
+  [[nodiscard]] std::optional<QImage> find(const StyleCacheKey& key) const {
+    const std::lock_guard lock(mutex_);
+    const auto found = entries_.find(key);
+    if (found == entries_.end()) {
+      return std::nullopt;
+    }
+    return found->second;
+  }
+
+  void put(const StyleCacheKey& key, QImage image) {
+    if (image.isNull()) {
+      return;
+    }
+#ifdef Q_OS_WASM
+    // Wasm linear memory never shrinks, so a desktop-sized cache permanently
+    // ratchets the heap toward Safari's tab limits (see docs/wasm-memory.md).
+    constexpr std::size_t kMaxCacheBytes = 96U * 1024U * 1024U;
+#else
+    constexpr std::size_t kMaxCacheBytes = 768U * 1024U * 1024U;
+#endif
+    const auto image_bytes = static_cast<std::size_t>(image.sizeInBytes());
+    if (image_bytes > kMaxCacheBytes) {
+      return;
+    }
+    const std::lock_guard lock(mutex_);
+    if (total_bytes_ + image_bytes > kMaxCacheBytes) {
+      entries_.clear();
+      total_bytes_ = 0;
+    }
+    total_bytes_ += image_bytes;
+    entries_[key] = std::move(image);
+  }
+
+private:
+  mutable std::mutex mutex_;
+  std::unordered_map<StyleCacheKey, QImage, StyleCacheKeyHash> entries_;
+  std::size_t total_bytes_{0};
+};
+
+LayerStyleRenderCache& layer_style_render_cache() {
+  static LayerStyleRenderCache cache;
+  return cache;
+}
+
+// ---------------------------------------------------------------------------
+// Style MASK cache: the expensive per-effect float masks (distance transforms,
+// spread expansions, interior blurs) keyed by layer content revision. Unlike
+// the baked-image cache above it works for backdrop-dependent effects (Multiply
+// drop shadows, bevels, glows) because the blend math still runs per pixel
+// against the live backdrop - only the mask prep is reused. Masks depend on
+// layer-LOCAL content only, so entries are stored relative to the layer origin
+// and survive moves (content_revision does not bump on set_bounds); an
+// unlinked layer mask shifting relative to the layer changes the key.
+
+struct StyleMaskCacheKey {
+  std::uint64_t content_revision{0};
+  std::uint32_t effect_index{0};
+  render_detail::StyleMaskKind kind{};
+  std::int32_t mask_offset_x{0};
+  std::int32_t mask_offset_y{0};
+
+  [[nodiscard]] bool operator==(const StyleMaskCacheKey& other) const noexcept {
+    return content_revision == other.content_revision && effect_index == other.effect_index &&
+           kind == other.kind && mask_offset_x == other.mask_offset_x && mask_offset_y == other.mask_offset_y;
+  }
+};
+
+struct StyleMaskCacheKeyHash {
+  [[nodiscard]] std::size_t operator()(const StyleMaskCacheKey& key) const noexcept {
+    auto seed = std::hash<std::uint64_t>{}(key.content_revision);
+    const auto mix = [&seed](std::size_t value) {
+      seed ^= value + 0x9e3779b9U + (seed << 6U) + (seed >> 2U);
+    };
+    mix(static_cast<std::size_t>(key.effect_index));
+    mix(static_cast<std::size_t>(key.kind));
+    mix(static_cast<std::size_t>(static_cast<std::uint32_t>(key.mask_offset_x)));
+    mix(static_cast<std::size_t>(static_cast<std::uint32_t>(key.mask_offset_y)));
+    return seed;
+  }
+};
+
+struct StyleMaskCacheValue {
+  // Mask domain relative to the layer bounds origin at compute time.
+  std::int32_t relative_x{0};
+  std::int32_t relative_y{0};
+  std::int32_t width{0};
+  std::int32_t height{0};
+  std::shared_ptr<const render_detail::StyleMaskEntry> entry;
+};
+
+class StyleMaskLruCache {
+public:
+  // A miss marks the key in flight: concurrent strip renders after an edit all
+  // want the same freshly-invalidated masks, and without this latch each strip
+  // computed the identical full-domain mask (up to 16x duplicated EDT/blur
+  // work). Losers block until the winner stores (or abandons on failure); the
+  // caller that receives nullopt MUST pair it with store() or abandon().
+  [[nodiscard]] std::optional<StyleMaskCacheValue> fetch_or_begin(const StyleMaskCacheKey& key) {
+    std::unique_lock lock(mutex_);
+    while (true) {
+      const auto found = index_.find(key);
+      if (found != index_.end()) {
+        entries_.splice(entries_.begin(), entries_, found->second);
+        return found->second->value;
+      }
+      if (in_flight_.insert(key).second) {
+        return std::nullopt;
+      }
+      in_flight_done_.wait(lock);
+    }
+  }
+
+  void abandon(const StyleMaskCacheKey& key) {
+    {
+      const std::lock_guard lock(mutex_);
+      in_flight_.erase(key);
+    }
+    in_flight_done_.notify_all();
+  }
+
+  void store(const StyleMaskCacheKey& key, StyleMaskCacheValue value) {
+    const auto bytes = value_bytes(value);
+    // RAM-scaled on desktop, fixed and small on wasm (see memory_info.hpp): a
+    // styled poster's masks must all fit or every render recomputes them all.
+    const std::size_t kMaxBytes = style_mask_cache_budget_bytes();
+    if (bytes > kMaxBytes || value.entry == nullptr) {
+      abandon(key);
+      return;
+    }
+    const std::lock_guard lock(mutex_);
+    in_flight_.erase(key);
+    if (const auto found = index_.find(key); found != index_.end()) {
+      total_bytes_ -= value_bytes(found->second->value);
+      entries_.erase(found->second);
+      index_.erase(found);
+    }
+    while (total_bytes_ + bytes > kMaxBytes && !entries_.empty()) {
+      total_bytes_ -= value_bytes(entries_.back().value);
+      index_.erase(entries_.back().key);
+      entries_.pop_back();
+    }
+    entries_.push_front(Node{key, std::move(value)});
+    index_[key] = entries_.begin();
+    total_bytes_ += bytes;
+    // Waiters recheck under the lock, so notifying here keeps the in-flight
+    // erase and the publish atomic.
+    in_flight_done_.notify_all();
+  }
+
+private:
+  struct Node {
+    StyleMaskCacheKey key;
+    StyleMaskCacheValue value;
+  };
+
+  [[nodiscard]] static std::size_t value_bytes(const StyleMaskCacheValue& value) noexcept {
+    if (value.entry == nullptr) {
+      return 0;
+    }
+    return (value.entry->primary.size() + value.entry->secondary.size()) * sizeof(float) +
+           (value.entry->group_pixels == nullptr ? 0U : value.entry->group_pixels->data().size());
+  }
+
+  std::mutex mutex_;
+  std::condition_variable in_flight_done_;
+  std::list<Node> entries_;
+  std::unordered_map<StyleMaskCacheKey, std::list<Node>::iterator, StyleMaskCacheKeyHash> index_;
+  std::unordered_set<StyleMaskCacheKey, StyleMaskCacheKeyHash> in_flight_;
+  std::size_t total_bytes_{0};
+};
+
+StyleMaskLruCache& style_mask_lru_cache() {
+  static StyleMaskLruCache cache;
+  return cache;
+}
+
+class DocumentStyleMaskProvider final : public render_detail::StyleMaskProvider {
+public:
+  explicit DocumentStyleMaskProvider(Rect canvas) noexcept : canvas_(canvas) {}
+
+  [[nodiscard]] bool full_domain_allowed(Rect gate) const override {
+    // Byte-stability gate: with the gate rect inside the canvas, the legacy
+    // full-render mask window already equals the full domain, so cached masks
+    // reproduce full-render bytes exactly (see style_mask_for_render).
+    return gate.x >= canvas_.x && gate.y >= canvas_.y && gate.x + gate.width <= canvas_.x + canvas_.width &&
+           gate.y + gate.height <= canvas_.y + canvas_.height;
+  }
+
+  [[nodiscard]] std::shared_ptr<const render_detail::StyleMaskEntry> fetch(
+      const Layer& layer, render_detail::StyleMaskKind kind, std::uint32_t effect_index, Rect domain, Rect bounds,
+      std::optional<Rect> mask_bounds) override {
+    const auto key = cache_key(layer, kind, effect_index, bounds, mask_bounds);
+    const auto cached = style_mask_lru_cache().fetch_or_begin(key);
+    if (!cached.has_value()) {
+      if (render_profile_enabled()) {
+        std::cerr << "PATCHY_STYLE_MASK_COLD kind=" << static_cast<int>(kind) << " rev=" << key.content_revision
+                  << " layer=\"" << layer.name() << "\"\n";
+      }
+      // This thread computes; render code always follows a null fetch with
+      // store(), which clears the in-flight latch.
+      return nullptr;
+    }
+    if (cached->relative_x != domain.x - bounds.x || cached->relative_y != domain.y - bounds.y ||
+        cached->width != domain.width || cached->height != domain.height) {
+      if (render_profile_enabled()) {
+        std::cerr << "PATCHY_STYLE_MASK_MISS kind=" << static_cast<int>(kind) << " rev=" << key.content_revision
+                  << " cached_rel=" << cached->relative_x << "," << cached->relative_y << "," << cached->width
+                  << "," << cached->height << " want_rel=" << domain.x - bounds.x << "," << domain.y - bounds.y
+                  << "," << domain.width << "," << domain.height << " layer=\"" << layer.name() << "\"\n";
+      }
+      // Stored under a different domain; recompute and republish.
+      style_mask_lru_cache().abandon(key);
+      return nullptr;
+    }
+    return cached->entry;
+  }
+
+  void store(const Layer& layer, render_detail::StyleMaskKind kind, std::uint32_t effect_index, Rect domain,
+             Rect bounds, std::optional<Rect> mask_bounds,
+             std::shared_ptr<const render_detail::StyleMaskEntry> entry) override {
+    style_mask_lru_cache().store(
+        cache_key(layer, kind, effect_index, bounds, mask_bounds),
+        StyleMaskCacheValue{domain.x - bounds.x, domain.y - bounds.y, domain.width, domain.height,
+                            std::move(entry)});
+  }
+
+public:
+  [[nodiscard]] static bool enabled() noexcept {
+    // Escape hatch mirroring PATCHY_RENDER_SINGLE_THREADED: byte-stable
+    // comparisons and cache-suspect debugging.
+    static const bool disabled = qEnvironmentVariableIsSet("PATCHY_STYLE_MASK_CACHE_OFF");
+    return !disabled;
+  }
+
+private:
+  [[nodiscard]] static StyleMaskCacheKey cache_key(const Layer& layer, render_detail::StyleMaskKind kind,
+                                                   std::uint32_t effect_index, Rect bounds,
+                                                   std::optional<Rect> mask_bounds) noexcept {
+    StyleMaskCacheKey key;
+    key.content_revision = layer.content_revision();
+    if (layer.kind() == LayerKind::Group) {
+      const auto include_children = [&](auto&& self, const Layer& parent) -> void {
+        for (const auto& child : parent.children()) {
+          key.content_revision ^= child.render_revision() + 0x9e3779b97f4a7c15ULL +
+                                  (key.content_revision << 6U) + (key.content_revision >> 2U);
+          self(self, child);
+        }
+      };
+      include_children(include_children, layer);
+    }
+    key.effect_index = effect_index;
+    key.kind = kind;
+    if (mask_bounds.has_value()) {
+      key.mask_offset_x = mask_bounds->x - bounds.x;
+      key.mask_offset_y = mask_bounds->y - bounds.y;
+    }
+    return key;
+  }
+
+  Rect canvas_;
+};
+
+bool layer_can_affect_clip(const Layer& layer, Rect clip,
+                           const std::vector<render_detail::LayerBoundsOverride>* overrides, Rect* draw_rect) {
+  if (layer.kind() == LayerKind::Pixel) {
+    const auto render_bounds = layer_bounds_with_effects(layer, render_detail::layer_bounds_for_render(layer, overrides));
+    const auto clipped = intersect_rect(clip, render_bounds);
+    if (draw_rect != nullptr) {
+      *draw_rect = clipped;
+    }
+    return !clipped.empty();
+  }
+  if (layer.kind() == LayerKind::Adjustment) {
+    const auto bounds = render_detail::adjustment_bounds_for_render(layer, overrides);
+    if (!bounds.empty()) {
+      const auto clipped = intersect_rect(clip, bounds);
+      if (draw_rect != nullptr) {
+        *draw_rect = clipped;
+      }
+      return !clipped.empty();
+    }
+  }
+  if (draw_rect != nullptr) {
+    *draw_rect = clip;
+  }
+  return true;
+}
+
+bool composite_cached_style_layer(QImageCompositeTarget& destination, const Layer& layer, Rect clip,
+                                  const std::vector<render_detail::LayerBoundsOverride>* overrides) {
+  if (render_detail::raster_view_context != nullptr || has_layer_render_override(layer, overrides)) {
+    return false;
+  }
+
+  const auto& source = render_detail::layer_pixels_for_render(layer, overrides);
+  if (!layer_style_cache_eligible(layer, source)) {
+    return false;
+  }
+
+  const auto bounds = render_detail::layer_bounds_for_render(layer, overrides);
+  const auto render_bounds = layer_bounds_with_effects(layer, bounds);
+  if (render_bounds.empty()) {
+    return true;
+  }
+  const auto draw_rect = intersect_rect(clip, render_bounds);
+  if (draw_rect.empty()) {
+    return true;
+  }
+
+  const StyleCacheKey key{&layer,
+                          source.data().empty() ? nullptr : source.data().data(),
+                          layer.content_revision(),
+                          source.width(),
+                          source.height(),
+                          render_bounds.width,
+                          render_bounds.height};
+  if (const auto cached = layer_style_render_cache().find(key); cached.has_value()) {
+    destination.composite_image(*cached, render_bounds, clip);
+    return true;
+  }
+  if (draw_rect.x != render_bounds.x || draw_rect.y != render_bounds.y ||
+      draw_rect.width != render_bounds.width || draw_rect.height != render_bounds.height) {
+    return false;
+  }
+
+  QImage image(render_bounds.width, render_bounds.height, QImage::Format_RGBA8888);
+  image.fill(Qt::transparent);
+  QImageCompositeTarget target(image, true, render_bounds.x, render_bounds.y);
+  render_detail::composite_pixel_layer(target, layer, render_bounds, overrides, false, nullptr);
+  destination.composite_image(image, render_bounds, clip);
+  layer_style_render_cache().put(key, std::move(image));
+  return true;
+}
+
+void composite_document_layer(QImageCompositeTarget& target, const Layer& layer, Rect clip,
+                              const std::vector<render_detail::LayerBoundsOverride>* overrides,
+                              render_detail::StyleMaskProvider* masks = nullptr, RenderProfile* profile = nullptr,
+                              std::string_view parent_path = {}, const PatternStore* patterns = nullptr) {
+  const auto profiling = profile != nullptr;
+  const auto started = profiling ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+  const auto kind = layer.kind();
+  const auto kind_text = profiling ? layer_kind_name(kind) : std::string();
+  const auto path = profiling ? profile_layer_path(parent_path, layer) : std::string();
+  Rect draw_rect = clip;
+  std::string action;
+  if (profiling) {
+    ++profile->visited_layers;
+  }
+  if (!render_detail::layer_visible_for_render(layer, overrides) || layer.opacity() <= 0.0F) {
+    if (profiling) {
+      if (!render_detail::layer_visible_for_render(layer, overrides)) {
+        ++profile->skipped_invisible;
+        action = "skip_invisible";
+      } else {
+        ++profile->skipped_zero_opacity;
+        action = "skip_zero_opacity";
+      }
+      const auto elapsed = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count();
+      profile->entries.push_back(RenderProfileEntry{path, kind_text, action, draw_rect, 0, elapsed});
+    }
+    return;
+  }
+
+  if (kind != LayerKind::Group && !layer_can_affect_clip(layer, clip, overrides, &draw_rect)) {
+    if (profiling) {
+      ++profile->skipped_empty_clip;
+      const auto elapsed = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count();
+      profile->entries.push_back(RenderProfileEntry{path, kind_text, "skip_empty_clip", draw_rect, 0, elapsed});
+    }
+    return;
+  }
+
+  if (kind == LayerKind::Group) {
+    if (profiling) {
+      ++profile->groups;
+    }
+    if (render_detail::layer_has_rendered_blend_if(layer) ||
+        render_detail::layer_rendered_channel_restriction(layer) != 0U ||
+        layer.blend_mode() != BlendMode::PassThrough || layer.opacity() < 1.0F || layer.fill_opacity() < 1.0F ||
+        (layer.mask().has_value() && !layer.mask()->disabled) || layer_has_enabled_vector_mask(layer) ||
+        group_style_renders(layer) || layer.artboard().has_value()) {
+      // A Blend-If group must be rendered as one isolated source so This Layer
+      // samples the group result and Underlying Layer samples the outer stack.
+      // A masked group routes through composite_layer too, so the group mask
+      // attenuates every child contribution, a non-pass-through group so it
+      // isolates with its blend mode and opacity, a faded pass-through
+      // group so the post-composite opacity fade applies, a STYLED group
+      // so its layer effects render (July 2026; same tradeoff for all: no
+      // per-member style cache or profiling inside), and an artboard, even one
+      // marked Pass Through, so its children clip to its rect over its paper.
+      render_detail::composite_layer(target, layer, clip, overrides, false, masks, nullptr, patterns);
+    } else {
+      // Clip runs inside the children go through render_detail::composite_layer
+      // (no per-member style cache/profiling); unclipped children keep this
+      // path's cached-style fast path via the composite_one callback.
+      render_detail::composite_sibling_layers(
+          target, layer.children(), clip, overrides, false, masks,
+          [&](QImageCompositeTarget& child_target, const Layer& child) {
+            composite_document_layer(child_target, child, clip, overrides, masks, profile, path, patterns);
+          },
+          patterns);
+    }
+    action = "group";
+  } else if (kind == LayerKind::Adjustment) {
+    if (profiling) {
+      ++profile->adjustment_layers;
+      profile->rendered_area += rect_area_u64(draw_rect);
+    }
+    render_detail::composite_adjustment_layer(target, layer, clip, overrides);
+    action = "adjustment";
+  } else if (kind == LayerKind::Pixel) {
+    if (profiling) {
+      ++profile->pixel_layers;
+      profile->rendered_area += rect_area_u64(draw_rect);
+      target.set_profile_layer_path(path);
+    }
+    if (composite_cached_style_layer(target, layer, clip, overrides)) {
+      action = "pixel_cached_or_empty";
+    } else {
+      render_detail::composite_pixel_layer(target, layer, clip, overrides, false, masks, nullptr, patterns);
+      action = layer.layer_style().effects_visible && !layer.layer_style().empty() ? "pixel_style" : "pixel";
+    }
+  } else {
+    if (profiling) {
+      ++profile->skipped_unsupported;
+    }
+    action = "skip_unsupported";
+  }
+  if (profiling) {
+    const auto elapsed = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count();
+    profile->entries.push_back(RenderProfileEntry{path, kind_text, action, draw_rect, rect_area_u64(draw_rect), elapsed});
+  }
+}
+
+void print_render_profile(Rect clip, bool preserve_alpha, const RenderProfile& profile, double elapsed_ms) {
+  auto entries = profile.entries;
+  std::sort(entries.begin(), entries.end(),
+            [](const RenderProfileEntry& lhs, const RenderProfileEntry& rhs) {
+              return lhs.elapsed_ms > rhs.elapsed_ms;
+            });
+  const auto top_count = render_profile_top_count();
+  const auto min_ms = render_profile_min_ms();
+  std::cerr << "PATCHY_RENDER_PROFILE rect=" << clip.x << "," << clip.y << "," << clip.width << "," << clip.height
+            << " preserve_alpha=" << (preserve_alpha ? 1 : 0) << " total_ms=" << elapsed_ms
+            << " visited_layers=" << profile.visited_layers << " groups=" << profile.groups
+            << " pixel_layers=" << profile.pixel_layers << " adjustment_layers=" << profile.adjustment_layers
+            << " skipped_invisible=" << profile.skipped_invisible
+            << " skipped_zero_opacity=" << profile.skipped_zero_opacity
+            << " skipped_empty_clip=" << profile.skipped_empty_clip
+            << " skipped_unsupported=" << profile.skipped_unsupported
+            << " rendered_area=" << profile.rendered_area << '\n';
+  int printed = 0;
+  for (const auto& entry : entries) {
+    if (printed >= top_count) {
+      break;
+    }
+    if (entry.elapsed_ms < min_ms) {
+      continue;
+    }
+    std::cerr << "PATCHY_RENDER_PROFILE_LAYER rank=" << (printed + 1)
+              << " ms=" << entry.elapsed_ms
+              << " action=" << entry.action
+              << " kind=" << entry.kind
+              << " area=" << entry.area
+              << " rect=" << entry.draw_rect.x << "," << entry.draw_rect.y << "," << entry.draw_rect.width << ","
+              << entry.draw_rect.height
+              << " path=\"" << entry.path << "\"\n";
+    ++printed;
+  }
+}
+
+std::string lower_extension(std::string_view extension) {
+  return normalized_extension(extension, false);
+}
+
+bool is_jpeg_extension(std::string_view extension) {
+  const auto lower = lower_extension(extension);
+  return lower == "jpg" || lower == "jpeg";
+}
+
+bool is_bmp_extension(std::string_view extension) {
+  return lower_extension(extension) == "bmp";
+}
+
+double sanitized_ppi(double value) noexcept {
+  return std::isfinite(value) && value > 0.0 ? value : 300.0;
+}
+
+double ppi_from_dots_per_meter(int dots_per_meter) noexcept {
+  return dots_per_meter > 0 ? static_cast<double>(dots_per_meter) * 0.0254 : 300.0;
+}
+
+int dots_per_meter_from_ppi(double ppi) noexcept {
+  return std::clamp(static_cast<int>(std::lround(sanitized_ppi(ppi) / 0.0254)), 1, 1000000);
+}
+
+void apply_document_resolution(QImage& image, const Document& document) {
+  if (image.isNull()) {
+    return;
+  }
+  image.setDotsPerMeterX(dots_per_meter_from_ppi(document.print_settings().horizontal_ppi));
+  image.setDotsPerMeterY(dots_per_meter_from_ppi(document.print_settings().vertical_ppi));
+}
+
+}  // namespace
+
+namespace {
+thread_local bool g_document_depth_render = false;
+}  // namespace
+
+ScopedDocumentDepthRender::ScopedDocumentDepthRender() noexcept : previous_(g_document_depth_render) {
+  g_document_depth_render = true;
+}
+
+ScopedDocumentDepthRender::~ScopedDocumentDepthRender() {
+  g_document_depth_render = previous_;
+}
+
+namespace {
+
+// 16/32-bit documents (docs/high-bit-depth.md): the layers composite at the document's
+// depth, then narrow to the 8-bit image every display and export consumer takes. A
+// Linear (32-bit) value is encoded to sRGB on the way; "over white" mattes in the
+// document's own domain, as an 8-bit render mattes in its.
+QImage deep_target_to_image(const render_detail::DeepCompositeTarget& target, bool preserve_alpha,
+                            bool at_depth = false, float display_scale = 1.0F) {
+  const auto rect = target.rect();
+  const auto linear = target.deep_domain() == DeepDomain::Linear;
+  if (at_depth) {
+    // ScopedDocumentDepthRender: the composite at its own depth and domain. "Over
+    // white" mattes in the document's domain, as the display image below does.
+    QImage deep(rect.width, rect.height,
+                linear ? QImage::Format_RGBA32FPx4 : (preserve_alpha ? QImage::Format_RGBA64 : QImage::Format_RGBX64));
+    for (std::int32_t y = 0; y < rect.height; ++y) {
+      auto* line = deep.scanLine(y);
+      for (std::int32_t x = 0; x < rect.width; ++x) {
+        const auto sample = target.sample_color(rect.x + x, rect.y + y);
+        const auto alpha = clamp_unit(sample.alpha);
+        const std::array<float, 3> color =
+            preserve_alpha ? std::array<float, 3>{sample.color.red, sample.color.green, sample.color.blue}
+                           : std::array<float, 3>{sample.color.red * alpha + 255.0F * (1.0F - alpha),
+                                                  sample.color.green * alpha + 255.0F * (1.0F - alpha),
+                                                  sample.color.blue * alpha + 255.0F * (1.0F - alpha)};
+        const auto out_alpha = preserve_alpha ? alpha : 1.0F;
+        if (linear) {
+          auto* px = reinterpret_cast<float*>(line) + static_cast<std::size_t>(x) * 4U;
+          px[0] = color[0] / 255.0F;
+          px[1] = color[1] / 255.0F;
+          px[2] = color[2] / 255.0F;
+          px[3] = out_alpha;
+        } else {
+          auto* px = reinterpret_cast<std::uint16_t*>(line) + static_cast<std::size_t>(x) * 4U;
+          for (std::size_t c = 0; c < 3U; ++c) {
+            px[c] = static_cast<std::uint16_t>(std::clamp(color[c] * 257.0F + 0.5F, 0.0F, 65535.0F));
+          }
+          px[3] = static_cast<std::uint16_t>(std::clamp(out_alpha * 65535.0F + 0.5F, 0.0F, 65535.0F));
+        }
+      }
+    }
+    return deep;
+  }
+  QImage image(rect.width, rect.height, preserve_alpha ? QImage::Format_RGBA8888 : QImage::Format_RGB888);
+  const auto encode = [linear](float value) {
+    const auto encoded = linear ? static_cast<float>(srgb_encode(value / 255.0) * 255.0) : value;
+    return static_cast<std::uint8_t>(std::clamp(encoded + 0.5F, 0.0F, 255.0F));
+  };
+  for (std::int32_t y = 0; y < rect.height; ++y) {
+    auto* row = image.scanLine(y);
+    for (std::int32_t x = 0; x < rect.width; ++x) {
+      auto sample = target.sample_color(rect.x + x, rect.y + y);
+      // The 32-bit preview exposure (display values only).
+      sample.color.red *= display_scale;
+      sample.color.green *= display_scale;
+      sample.color.blue *= display_scale;
+      const auto alpha = clamp_unit(sample.alpha);
+      if (preserve_alpha) {
+        auto* px = row + static_cast<std::size_t>(x) * 4U;
+        px[0] = encode(sample.color.red);
+        px[1] = encode(sample.color.green);
+        px[2] = encode(sample.color.blue);
+        px[3] = static_cast<std::uint8_t>(std::clamp(alpha * 255.0F + 0.5F, 0.0F, 255.0F));
+      } else {
+        auto* px = row + static_cast<std::size_t>(x) * 3U;
+        px[0] = encode(sample.color.red * alpha + 255.0F * (1.0F - alpha));
+        px[1] = encode(sample.color.green * alpha + 255.0F * (1.0F - alpha));
+        px[2] = encode(sample.color.blue * alpha + 255.0F * (1.0F - alpha));
+      }
+    }
+  }
+  return image;
+}
+
+QImage render_document_rect_deep(const Document& document, Rect clip, bool preserve_alpha,
+                                 const std::vector<render_detail::LayerBoundsOverride>* overrides) {
+  DocumentStyleMaskProvider mask_provider(Rect::from_size(document.width(), document.height()));
+  auto* masks = render_detail::raster_view_context == nullptr && DocumentStyleMaskProvider::enabled()
+                    ? &mask_provider
+                    : nullptr;
+  const auto domain = deep_domain_for(document.color_state().bit_depth);
+  // Read on this thread: the strips below run on others.
+  const auto at_depth = g_document_depth_render;
+  const auto exposure = document.color_state().view_exposure_stops;
+  const auto display_scale = domain == DeepDomain::Linear && std::isfinite(exposure) && exposure != 0.0F
+                                 ? static_cast<float>(std::exp2(static_cast<double>(exposure)))
+                                 : 1.0F;
+  const auto render_strip = [&document, overrides, masks, domain, preserve_alpha, at_depth,
+                             display_scale](Rect strip_clip) {
+    render_detail::DeepCompositeTarget target(strip_clip, false, domain);
+    render_detail::composite_sibling_layers(
+        target, document.layers(), strip_clip, overrides, false, masks,
+        [&](render_detail::DeepCompositeTarget& layer_target, const Layer& layer) {
+          render_detail::composite_layer(layer_target, layer, strip_clip, overrides, false, masks, nullptr,
+                                         &document.metadata().patterns);
+        },
+        &document.metadata().patterns);
+    return deep_target_to_image(target, preserve_alpha, at_depth, display_scale);
+  };
+  // Large renders split into strips composited concurrently, under the 8-bit path's
+  // rules (render_document_rect below): clip rendering equals full rendering, so the
+  // assembled image is the sequential one.
+  const auto clip_area = static_cast<std::int64_t>(clip.width) * static_cast<std::int64_t>(clip.height);
+  const auto strips = max_blocking_fanout_workers(
+      std::clamp(std::min(clip.height / 128, patchy::hardware_worker_threads()), 1, 16));
+  if (render_detail::raster_view_context != nullptr || strips < 2 || clip_area < 4'000'000 ||
+      qEnvironmentVariableIsSet("PATCHY_RENDER_SINGLE_THREADED")) {
+    return render_strip(clip);
+  }
+  struct StripJob {
+    Rect clip{};
+    std::future<QImage> image;
+  };
+  std::vector<StripJob> jobs;
+  const auto rows_per_strip = (clip.height + strips - 1) / strips;
+  for (std::int32_t start = 0; start < clip.height; start += rows_per_strip) {
+    const Rect strip_clip{clip.x, clip.y + start, clip.width, std::min(rows_per_strip, clip.height - start)};
+    jobs.push_back(StripJob{strip_clip, std::async(std::launch::async, render_strip, strip_clip)});
+  }
+  std::vector<QImage> strip_images;
+  strip_images.reserve(jobs.size());
+  for (auto& job : jobs) {
+    strip_images.push_back(job.image.get());
+  }
+  QImage image(clip.width, clip.height, strip_images.front().format());
+  for (std::size_t index = 0; index < jobs.size(); ++index) {
+    const auto& job = jobs[index];
+    const auto& strip = strip_images[index];
+    const auto row_bytes = static_cast<std::size_t>(strip.width()) * static_cast<std::size_t>(strip.depth() / 8);
+    for (std::int32_t row = 0; row < strip.height(); ++row) {
+      std::memcpy(image.scanLine(job.clip.y - clip.y + row), strip.constScanLine(row), row_bytes);
+    }
+  }
+  return image;
+}
+
+bool layer_has_visible_knockout(const Layer& layer,
+                                const std::vector<render_detail::LayerBoundsOverride>* overrides) {
+  if (!render_detail::layer_visible_for_render(layer, overrides) || layer.opacity() <= 0.0F) {
+    return false;
+  }
+  return render_detail::layer_knockout_mode(layer) != 0 ||
+         std::any_of(layer.children().begin(), layer.children().end(), [overrides](const Layer& child) {
+           return layer_has_visible_knockout(child, overrides);
+         });
+}
+
+QImage render_document_rect(const Document& document, QRect document_rect, bool preserve_alpha,
+                            const std::vector<render_detail::LayerBoundsOverride>* overrides) {
+  const auto native_rect = document_rect.normalized();
+  const Rect native_clip{native_rect.x(), native_rect.y(), native_rect.width(), native_rect.height()};
+  auto native = render_native_cmyk8(document, native_clip, overrides);
+  if (!native) native = render_native_duotone8(document, native_clip, overrides);
+  if (native) {
+    if (native->empty()) return {};
+    QImage image(native->width(), native->height(), preserve_alpha ? QImage::Format_RGBA8888 : QImage::Format_RGB888);
+    for (int y = 0; y < native->height(); ++y) {
+      const auto* source = native->row(y).data();
+      auto* destination = image.scanLine(y);
+      for (int x = 0; x < native->width(); ++x) {
+        if (preserve_alpha) std::copy_n(source, 4, destination);
+        else for (int c = 0; c < 3; ++c) destination[c] = static_cast<std::uint8_t>(
+            (static_cast<int>(source[c]) * source[3] + 255 * (255 - source[3]) + 127) / 255);
+        source += 4; destination += preserve_alpha ? 4 : 3;
+      }
+    }
+    return image;
+  }
+  if (document.color_state().bit_depth != BitDepth::UInt8) {
+    const auto normalized = document_rect.normalized();
+    const auto clip = intersect_rect(Rect::from_size(document.width(), document.height()),
+                                     Rect{normalized.x(), normalized.y(), normalized.width(), normalized.height()});
+    if (clip.empty()) {
+      return {};
+    }
+    return render_document_rect_deep(document, clip, preserve_alpha, overrides);
+  }
+  const auto tracing = render_trace_enabled();
+  const auto profiling = render_profile_enabled();
+  RenderTraceStats trace_stats;
+  if (tracing) {
+    const auto normalized = document_rect.normalized();
+    const auto requested = Rect{normalized.x(), normalized.y(), normalized.width(), normalized.height()};
+    const auto clip = intersect_rect(Rect::from_size(document.width(), document.height()), requested);
+    for (const auto& layer : document.layers()) {
+      collect_render_trace_stats(layer, clip, overrides, trace_stats);
+    }
+  }
+  const auto timed_render = tracing || profiling;
+  const auto trace_start = timed_render ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+
+  const auto normalized = document_rect.normalized();
+  const auto requested = Rect{normalized.x(), normalized.y(), normalized.width(), normalized.height()};
+  const auto clip = intersect_rect(Rect::from_size(document.width(), document.height()), requested);
+  if (clip.empty()) {
+    return {};
+  }
+
+  const auto logical_alpha_render =
+      !preserve_alpha && (render_detail::layers_have_rendered_underlying_blend_if(document.layers()) ||
+                         std::any_of(document.layers().begin(), document.layers().end(), [overrides](const Layer& layer) {
+                           return layer_has_visible_knockout(layer, overrides);
+                         }));
+  const auto target_preserves_alpha = preserve_alpha || logical_alpha_render;
+  QImage image(clip.width, clip.height,
+               target_preserves_alpha ? QImage::Format_RGBA8888 : QImage::Format_RGB888);
+  if (target_preserves_alpha) {
+    image.fill(Qt::transparent);
+  } else {
+    image.fill(Qt::white);
+  }
+
+  // Large renders split into horizontal strips composited concurrently. Clip
+  // rendering is exactly equivalent to full rendering (the dirty-rect patch
+  // machinery depends on that invariant), each strip owns a private QImage, and
+  // the document is only read - so the assembled bytes are identical to the
+  // sequential walk. Sequential path kept for: small clips (every pixel test),
+  // tracing/profiling (per-step instrumentation stays meaningful), and the
+  // PATCHY_RENDER_SINGLE_THREADED escape hatch.
+  RenderProfile profile;
+  const auto clip_area = static_cast<std::int64_t>(clip.width) * static_cast<std::int64_t>(clip.height);
+  const auto hardware_threads = patchy::hardware_worker_threads();
+  // max_blocking_fanout_workers: this thread blocks on the strip futures, so
+  // on the wasm main thread the fan-out must fit the idle pthread pool or it
+  // deadlocks the tab (fewer strips render the same bytes, just slower).
+  const auto parallel_strips = max_blocking_fanout_workers(
+      std::clamp(std::min(clip.height / 128, hardware_threads), 1, 16));
+  const bool parallel_render = render_detail::raster_view_context == nullptr && !timed_render && parallel_strips >= 2 && clip_area >= 4'000'000 &&
+                               !qEnvironmentVariableIsSet("PATCHY_RENDER_SINGLE_THREADED");
+  DocumentStyleMaskProvider mask_provider(Rect::from_size(document.width(), document.height()));
+  auto* masks = render_detail::raster_view_context == nullptr && DocumentStyleMaskProvider::enabled() ? &mask_provider : nullptr;
+  if (parallel_render) {
+    struct StripJob {
+      Rect clip{};
+      std::future<QImage> image;
+    };
+    std::vector<StripJob> strips;
+    strips.reserve(static_cast<std::size_t>(parallel_strips));
+    const auto rows_per_strip = (clip.height + parallel_strips - 1) / parallel_strips;
+    for (std::int32_t start = 0; start < clip.height; start += rows_per_strip) {
+      const auto rows = std::min(rows_per_strip, clip.height - start);
+      const Rect strip_clip{clip.x, clip.y + start, clip.width, rows};
+      strips.push_back(StripJob{
+          strip_clip,
+          std::async(std::launch::async, [&document, strip_clip, target_preserves_alpha, overrides, masks] {
+            QImage strip_image(strip_clip.width, strip_clip.height,
+                               target_preserves_alpha ? QImage::Format_RGBA8888 : QImage::Format_RGB888);
+            if (target_preserves_alpha) {
+              strip_image.fill(Qt::transparent);
+            } else {
+              strip_image.fill(Qt::white);
+            }
+            QImageCompositeTarget strip_target(strip_image, target_preserves_alpha, strip_clip.x, strip_clip.y);
+            render_detail::composite_sibling_layers(
+                strip_target, document.layers(), strip_clip, overrides, false, masks,
+                [&](QImageCompositeTarget& target, const Layer& layer) {
+                  composite_document_layer(target, layer, strip_clip, overrides, masks, nullptr, {},
+                                           &document.metadata().patterns);
+                },
+                &document.metadata().patterns);
+            return strip_image;
+          })});
+    }
+    for (auto& strip : strips) {
+      const auto strip_image = strip.image.get();
+      const auto row_bytes =
+          static_cast<std::size_t>(strip_image.width()) * (target_preserves_alpha ? 4U : 3U);
+      for (std::int32_t row = 0; row < strip_image.height(); ++row) {
+        std::memcpy(image.scanLine(strip.clip.y - clip.y + row), strip_image.constScanLine(row), row_bytes);
+      }
+    }
+  } else {
+    QImageCompositeTarget target(image, target_preserves_alpha, clip.x, clip.y);
+    render_detail::composite_sibling_layers(
+        target, document.layers(), clip, overrides, false, masks,
+        [&](QImageCompositeTarget& layer_target, const Layer& layer) {
+          composite_document_layer(layer_target, layer, clip, overrides, masks, profiling ? &profile : nullptr,
+                                   {}, &document.metadata().patterns);
+        },
+        &document.metadata().patterns);
+  }
+  if (logical_alpha_render) {
+    QImage matted(image.width(), image.height(), QImage::Format_RGB888);
+    matted.fill(Qt::white);
+    for (int y = 0; y < image.height(); ++y) {
+      const auto* source = image.constScanLine(y);
+      auto* destination = matted.scanLine(y);
+      for (int x = 0; x < image.width(); ++x) {
+        const auto alpha = static_cast<int>(source[3]);
+        for (int channel = 0; channel < 3; ++channel) {
+          destination[channel] = static_cast<std::uint8_t>(
+              (static_cast<int>(source[channel]) * alpha + 255 * (255 - alpha) + 127) / 255);
+        }
+        source += 4U;
+        destination += 3U;
+      }
+    }
+    image = std::move(matted);
+  }
+  apply_document_resolution(image, document);
+  if (timed_render) {
+    const auto elapsed_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - trace_start);
+    if (tracing) {
+      const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(elapsed_ms);
+      std::cerr << "PATCHY_RENDER_TRACE rect=" << clip.x << "," << clip.y << "," << clip.width << "," << clip.height
+                << " preserve_alpha=" << (preserve_alpha ? 1 : 0) << " layers=" << trace_stats.layers
+                << " visible_layers=" << trace_stats.visible_layers << " styled_layers=" << trace_stats.styled_layers
+                << " pixel_count=" << trace_stats.clipped_pixel_area << " elapsed_ms=" << elapsed.count() << '\n';
+    }
+    if (profiling) {
+      print_render_profile(clip, preserve_alpha, profile, elapsed_ms.count());
+    }
+  }
+  return image;
+}
+
+// Renders each rect as its own render_document_rect call across a small
+// worker pool (result order preserved by index). Each worker's thread-local
+// zero budget stops it from nesting its own blocking fan-out, which the wasm
+// pthread pool cannot stack (native ignores the budget). Thread-local because
+// this runs on worker threads too (a processing wait's patch render): a
+// published BlockingFanoutBudgetScope here raced other threads' scopes.
+std::vector<QImage> render_document_rects_parallel(const Document& document, const std::vector<QRect>& rects,
+                                                   bool preserve_alpha,
+                                                   const std::vector<render_detail::LayerBoundsOverride>* overrides,
+                                                   int worker_budget) {
+  std::vector<QImage> images(rects.size());
+  std::atomic<std::size_t> next_rect{0};
+  const auto worker_count = std::min<std::size_t>(static_cast<std::size_t>(std::max(1, worker_budget)), rects.size());
+  std::vector<std::future<void>> jobs;
+  jobs.reserve(worker_count);
+  for (std::size_t worker = 0; worker < worker_count; ++worker) {
+    jobs.push_back(
+        std::async(std::launch::async, [&document, &rects, &images, &next_rect, preserve_alpha, overrides] {
+          const ThreadFanoutBudgetScope no_nested_fanout(0);
+          while (true) {
+            const auto index = next_rect.fetch_add(1, std::memory_order_relaxed);
+            if (index >= rects.size()) {
+              return;
+            }
+            images[index] = render_document_rect(document, rects[index], preserve_alpha, overrides);
+          }
+        }));
+  }
+  for (auto& job : jobs) {
+    job.get();
+  }
+  return images;
+}
+
+std::vector<RenderedDocumentPatch> render_document_region(
+    const Document& document, const QRegion& document_region, bool preserve_alpha,
+    const std::vector<render_detail::LayerBoundsOverride>* overrides) {
+  std::vector<RenderedDocumentPatch> patches;
+  if (document_region.isEmpty()) {
+    return patches;
+  }
+
+  const QRect canvas_rect(0, 0, document.width(), document.height());
+  std::vector<QRect> rects;
+  std::int64_t total_area = 0;
+  for (const auto& rect : document_region.intersected(canvas_rect)) {
+    if (rect.isEmpty()) {
+      continue;
+    }
+    rects.push_back(rect);
+    total_area += static_cast<std::int64_t>(rect.width()) * static_cast<std::int64_t>(rect.height());
+  }
+
+  // Multi-rect regions (move previews and release patches emit one or two
+  // rects per moved layer) fan the independent per-rect renders out across
+  // workers. Bytes are identical to the sequential loop by construction: each
+  // patch is the same render_document_rect call with the same arguments, and
+  // order is preserved by index. Single-rect regions keep the plain call so a
+  // large rect still strip-splits inside render_document_rect.
+  // Tracing/profiling stay sequential so per-render instrumentation remains
+  // readable.
+  const auto worker_budget = max_blocking_fanout_workers(
+      std::clamp(static_cast<int>(rects.size()), 1,
+                 patchy::hardware_worker_threads()));
+  const bool parallel = rects.size() >= 2U && worker_budget >= 2 && total_area >= 1'000'000 &&
+                        !qEnvironmentVariableIsSet("PATCHY_RENDER_SINGLE_THREADED") && !render_trace_enabled() &&
+                        !render_profile_enabled();
+  if (parallel) {
+    auto images = render_document_rects_parallel(document, rects, preserve_alpha, overrides, worker_budget);
+    patches.reserve(rects.size());
+    for (std::size_t index = 0; index < rects.size(); ++index) {
+      if (!images[index].isNull()) {
+        patches.push_back(RenderedDocumentPatch{rects[index], std::move(images[index])});
+      }
+    }
+    return patches;
+  }
+
+  for (const auto& rect : rects) {
+    auto image = render_document_rect(document, rect, preserve_alpha, overrides);
+    if (image.isNull()) {
+      continue;
+    }
+    patches.push_back(RenderedDocumentPatch{rect, std::move(image)});
+  }
+  return patches;
+}
+
+}  // namespace
+
+PixelBuffer pixels_from_image_native(const QImage& image) {
+  const auto format = image.format();
+  const bool float_image = format == QImage::Format_RGBA32FPx4 || format == QImage::Format_RGBA32FPx4_Premultiplied ||
+                           format == QImage::Format_RGBX32FPx4 || format == QImage::Format_RGBA16FPx4 ||
+                           format == QImage::Format_RGBA16FPx4_Premultiplied || format == QImage::Format_RGBX16FPx4;
+  const bool sixteen_bit = format == QImage::Format_RGBA64 || format == QImage::Format_RGBA64_Premultiplied ||
+                           format == QImage::Format_RGBX64;
+  if (float_image || sixteen_bit) {
+    const auto converted = image.convertToFormat(float_image ? QImage::Format_RGBA32FPx4 : QImage::Format_RGBA64);
+    PixelBuffer pixels(converted.width(), converted.height(),
+                       with_bit_depth(PixelFormat::rgba8(), float_image ? BitDepth::Float32 : BitDepth::UInt16));
+    const auto row_bytes = static_cast<std::size_t>(converted.width()) * (float_image ? 16U : 8U);
+    for (int y = 0; y < converted.height(); ++y) {
+      std::memcpy(pixels.row(y).data(), converted.constScanLine(y), row_bytes);
+    }
+    return pixels;
+  }
+  return pixels_from_image_rgba(image);
+}
+
+PixelBuffer pixels_from_image_rgba(const QImage& image) {
+  const auto converted = image.convertToFormat(QImage::Format_RGBA8888);
+  PixelBuffer pixels(converted.width(), converted.height(), PixelFormat::rgba8());
+  // RGBA8888 stores bytes in R,G,B,A order, matching the buffer's channel
+  // layout, so rows copy wholesale. This runs per mouse-move during transform
+  // drags; the per-pixel QColor loop it replaces dominated that path.
+  const auto row_bytes = static_cast<std::size_t>(converted.width()) * 4U;
+  for (int y = 0; y < converted.height(); ++y) {
+    std::memcpy(pixels.row(y).data(), converted.constScanLine(y), row_bytes);
+  }
+  return pixels;
+}
+
+PixelBuffer pixels_from_image_at_depth(const QImage& image, BitDepth depth) {
+  auto pixels = pixels_from_image_native(image);
+  if (pixels.format().bit_depth == depth) {
+    return pixels;
+  }
+  return convert_pixel_buffer_depth(pixels, depth, SampleKind::Color);
+}
+
+std::optional<std::pair<double, double>> explicit_qimage_density_ppi(const QImage& image) {
+  // Qt's handlers only touch dotsPerMeter when the file records a density; otherwise
+  // the image keeps the constructor default, which is screen-derived. Compare against
+  // a fresh QImage to tell the two apart.
+  static const auto default_dots_per_meter = [] {
+    const QImage reference(1, 1, QImage::Format_ARGB32);
+    return std::pair<int, int>(reference.dotsPerMeterX(), reference.dotsPerMeterY());
+  }();
+  if (image.isNull() || (image.dotsPerMeterX() == default_dots_per_meter.first &&
+                         image.dotsPerMeterY() == default_dots_per_meter.second)) {
+    return std::nullopt;
+  }
+  return std::pair<double, double>(ppi_from_dots_per_meter(image.dotsPerMeterX()),
+                                   ppi_from_dots_per_meter(image.dotsPerMeterY()));
+}
+
+void apply_imported_image_density(Document& document, std::span<const std::uint8_t> file_bytes,
+                                  const QImage& image) {
+  auto& settings = document.print_settings();
+  const auto probe = formats::probe_image_density(file_bytes);
+  if (probe.density.has_value()) {
+    settings.horizontal_ppi = sanitized_ppi(probe.density->horizontal_ppi);
+    settings.vertical_ppi = sanitized_ppi(probe.density->vertical_ppi);
+    return;
+  }
+  if (probe.container == formats::ImageDensityContainer::Unrecognized) {
+    // Containers the probe does not parse (TIFF, WebP, ...): trust only a density the
+    // Qt handler explicitly recorded.
+    if (const auto explicit_density = explicit_qimage_density_ppi(image); explicit_density.has_value()) {
+      settings.horizontal_ppi = sanitized_ppi(explicit_density->first);
+      settings.vertical_ppi = sanitized_ppi(explicit_density->second);
+      return;
+    }
+  }
+  settings.horizontal_ppi = kUntaggedImportPpi;
+  settings.vertical_ppi = kUntaggedImportPpi;
+}
+
+namespace {
+
+// The depth a decoded image keeps while deep editing is on (docs/high-bit-depth-formats.md):
+// 16-bit formats (PNG 16, TIFF 16) open as 16-bit documents, float formats (float TIFF,
+// HDR plug-ins) as 32-bit ones whose values are taken as linear light.
+std::optional<BitDepth> deep_import_depth(const QImage& image) {
+  if (!deep_editing_enabled()) {
+    return std::nullopt;
+  }
+  switch (image.format()) {
+    case QImage::Format_RGBA64:
+    case QImage::Format_RGBA64_Premultiplied:
+    case QImage::Format_RGBX64:
+    case QImage::Format_Grayscale16:
+      return BitDepth::UInt16;
+    case QImage::Format_RGBA16FPx4:
+    case QImage::Format_RGBA16FPx4_Premultiplied:
+    case QImage::Format_RGBX16FPx4:
+    case QImage::Format_RGBA32FPx4:
+    case QImage::Format_RGBA32FPx4_Premultiplied:
+    case QImage::Format_RGBX32FPx4:
+      return BitDepth::Float32;
+    default:
+      return std::nullopt;
+  }
+}
+
+}  // namespace
+
+Document document_from_qimage(const QImage& image, std::string layer_name) {
+  if (image.isNull()) {
+    throw std::invalid_argument("Cannot import a null image");
+  }
+  if (const auto depth = deep_import_depth(image); depth.has_value()) {
+    const auto has_alpha = image.hasAlphaChannel();
+    const auto native = image.convertToFormat(*depth == BitDepth::Float32 ? QImage::Format_RGBA32FPx4
+                                                                          : QImage::Format_RGBA64);
+    auto rgba = pixels_from_image_native(native);
+    auto pixels = rgba;
+    if (!has_alpha) {
+      // An opaque image keeps three channels, as the 8-bit import does.
+      pixels = PixelBuffer(rgba.width(), rgba.height(), with_bit_depth(PixelFormat::rgb8(), *depth));
+      const auto domain = *depth == BitDepth::Float32 ? DeepDomain::Linear : DeepDomain::Encoded;
+      std::vector<float> row(static_cast<std::size_t>(rgba.width()) * 4U);
+      for (int y = 0; y < rgba.height(); ++y) {
+        load_rgba_row(rgba, y, 0, rgba.width(), domain, row);
+        store_rgba_row(pixels, y, 0, rgba.width(), domain, row);
+      }
+    }
+    if (layer_name.empty()) {
+      layer_name = QObject::tr("Imported Image").toStdString();
+    }
+    Document document(native.width(), native.height(), pixels.format());
+    document.color_state().bit_depth = *depth;
+    document.print_settings().horizontal_ppi = ppi_from_dots_per_meter(image.dotsPerMeterX());
+    document.print_settings().vertical_ppi = ppi_from_dots_per_meter(image.dotsPerMeterY());
+    document.add_pixel_layer(std::move(layer_name), std::move(pixels));
+    return document;
+  }
+
+  const auto has_alpha = image.hasAlphaChannel();
+  const auto converted = image.convertToFormat(has_alpha ? QImage::Format_RGBA8888 : QImage::Format_RGB888);
+  auto pixels = has_alpha ? pixels_from_image_rgba(converted)
+                          : PixelBuffer(converted.width(), converted.height(), PixelFormat::rgb8());
+
+  if (!has_alpha) {
+    // RGB888 scanlines can carry 4-byte alignment padding, so copy per row at
+    // the tight 3-bytes-per-pixel width rather than one whole-buffer memcpy.
+    const auto row_bytes = static_cast<std::size_t>(converted.width()) * 3U;
+    for (int y = 0; y < converted.height(); ++y) {
+      std::memcpy(pixels.row(y).data(), converted.constScanLine(y), row_bytes);
+    }
+  }
+
+  if (layer_name.empty()) {
+    layer_name = QObject::tr("Imported Image").toStdString();
+  }
+  Document document(converted.width(), converted.height(), has_alpha ? PixelFormat::rgba8() : PixelFormat::rgb8());
+  document.print_settings().horizontal_ppi = ppi_from_dots_per_meter(image.dotsPerMeterX());
+  document.print_settings().vertical_ppi = ppi_from_dots_per_meter(image.dotsPerMeterY());
+  document.add_pixel_layer(std::move(layer_name), std::move(pixels));
+  // Indexed sources (PNG-8, GIF) carry their palette through to the document so
+  // the Palette panel and the adopt-on-open prompt can offer it, mirroring what
+  // the indexed BMP reader already does.
+  if (image.colorCount() > 0 && image.colorCount() <= 256) {
+    std::vector<RgbColor> palette;
+    palette.reserve(static_cast<std::size_t>(image.colorCount()));
+    for (const auto rgb : image.colorTable()) {
+      palette.push_back(RgbColor{static_cast<std::uint8_t>(qRed(rgb)), static_cast<std::uint8_t>(qGreen(rgb)),
+                                 static_cast<std::uint8_t>(qBlue(rgb))});
+    }
+    const auto count = palette.size();
+    const std::uint16_t depth = count <= 4 ? 2 : (count <= 16 ? 4 : 8);
+    document.indexed_palette() = DocumentIndexedPalette{std::move(palette), depth};
+    // Optional Patchy PNG text metadata. Names are tied to palette order and
+    // never applied to truecolor images or mismatched/malformed tables.
+    const auto text = image.text(QStringLiteral("PatchyPaletteNames"));
+    if (text.size() <= 256 * 6 * static_cast<int>(kMaxPaletteColorNameBytes)) {
+      const auto json = QJsonDocument::fromJson(text.toUtf8());
+      if (json.isArray() && json.array().size() == image.colorCount()) {
+        std::vector<std::string> names;
+        for (const auto& value : json.array()) {
+          const auto utf8 = value.toString().toUtf8();
+          if (!value.isString() || utf8.size() > static_cast<qsizetype>(kMaxPaletteColorNameBytes)) {
+            names.clear(); break;
+          }
+          names.emplace_back(utf8.constData(), static_cast<std::size_t>(utf8.size()));
+        }
+        document.indexed_palette()->names = std::move(names);
+      }
+    }
+  }
+  return document;
+}
+
+bool promote_flat_alpha_to_layer_mask(Document& document) {
+  return prepare_flat_image_alpha(document, /*alpha_as_layer_mask*/ true);
+}
+
+bool prepare_flat_image_alpha(Document& document, bool alpha_as_layer_mask) {
+  // Only flat single-layer imports are eligible. Multi-layer documents (and layers that
+  // already produced a mask) carry their own per-layer transparency/masks and must be
+  // left alone, and so must text layers and smart objects: their raster is a preview of
+  // richer content whose transparency is authored, not a flat image's alpha channel.
+  if (document.layers().size() != 1) {
+    return false;
+  }
+  Layer& layer = document.layers().front();
+  if (layer.kind() != LayerKind::Pixel || !layer.children().empty() || layer.mask().has_value() ||
+      layer_pixels_are_procedural(layer)) {
+    return false;
+  }
+
+  const PixelBuffer& pixels = layer.pixels();
+  const auto format = pixels.format();
+  if (format.channels != 4) {
+    return false;
+  }
+
+  const auto width = pixels.width();
+  const auto height = pixels.height();
+  if (width <= 0 || height <= 0) {
+    return false;
+  }
+  if (format.bit_depth != BitDepth::UInt8) {
+    // 16/32-bit imports (docs/high-bit-depth-formats.md): the same promotion with the mask and
+    // the opaque RGB at the document's depth.
+    const auto domain = format.bit_depth == BitDepth::Float32 ? DeepDomain::Linear : DeepDomain::Encoded;
+    float min_alpha = 1.0F;
+    float max_alpha = 0.0F;
+    for (std::int32_t y = 0; y < height; ++y) {
+      for (std::int32_t x = 0; x < width; ++x) {
+        const auto alpha = pixel_alpha_at(pixels, x, y);
+        min_alpha = std::min(min_alpha, alpha);
+        max_alpha = std::max(max_alpha, alpha);
+      }
+    }
+    if (!alpha_as_layer_mask && max_alpha > 0.0F && min_alpha < 1.0F) {
+      return false;  // meaningful alpha stays the layer's own transparency
+    }
+    PixelBuffer deep_rgb(width, height, with_bit_depth(PixelFormat::rgb8(), format.bit_depth));
+    PixelBuffer deep_mask(width, height, with_bit_depth(PixelFormat::gray8(), format.bit_depth));
+    std::vector<float> row(static_cast<std::size_t>(width) * 4U);
+    std::vector<float> coverage(static_cast<std::size_t>(width));
+    for (std::int32_t y = 0; y < height; ++y) {
+      load_rgba_row(pixels, y, 0, width, domain, row);
+      for (std::int32_t x = 0; x < width; ++x) {
+        coverage[static_cast<std::size_t>(x)] = row[static_cast<std::size_t>(x) * 4U + 3U];
+      }
+      store_rgba_row(deep_rgb, y, 0, width, domain, row);
+      store_coverage_row(deep_mask, y, 0, width, coverage);
+    }
+    layer.set_pixels(std::move(deep_rgb));
+    document.set_format(with_bit_depth(PixelFormat::rgb8(), format.bit_depth));
+    if (max_alpha > 0.0F && min_alpha < 1.0F) {
+      layer.set_mask(LayerMask{Rect::from_size(width, height), std::move(deep_mask), /*default_color*/ 255,
+                               /*disabled*/ false});
+      set_layer_mask_is_document_alpha(layer, true);
+      return true;
+    }
+    return false;
+  }
+
+  // Scan the alpha channel to decide whether it carries a meaningful mask. A uniformly
+  // opaque image has nothing to mask; a uniformly transparent one is treated as opaque
+  // padding so we don't import an image that is entirely masked out.
+  std::uint8_t min_alpha = 255;
+  std::uint8_t max_alpha = 0;
+  for (std::int32_t y = 0; y < height; ++y) {
+    for (std::int32_t x = 0; x < width; ++x) {
+      const std::uint8_t alpha = pixels.pixel(x, y)[3];
+      min_alpha = std::min(min_alpha, alpha);
+      max_alpha = std::max(max_alpha, alpha);
+    }
+  }
+  const bool meaningful = max_alpha > 0 && min_alpha < 255;
+  if (meaningful && !alpha_as_layer_mask) {
+    return false;  // meaningful alpha stays the layer's own transparency
+  }
+
+  std::optional<PixelBuffer> mask_pixels;
+  if (meaningful) {
+    PixelBuffer mask(width, height, PixelFormat::gray8());
+    for (std::int32_t y = 0; y < height; ++y) {
+      for (std::int32_t x = 0; x < width; ++x) {
+        mask.pixel(x, y)[0] = pixels.pixel(x, y)[3];
+      }
+    }
+    mask_pixels = std::move(mask);
+  }
+
+  // Strip the alpha so the layer pixels become opaque RGB and the original colors stay
+  // fully visible (Photoshop shows this as an opaque Background plus an "Alpha 1" channel).
+  PixelBuffer rgb(width, height, PixelFormat::rgb8());
+  for (std::int32_t y = 0; y < height; ++y) {
+    for (std::int32_t x = 0; x < width; ++x) {
+      const std::uint8_t* src = pixels.pixel(x, y);
+      std::uint8_t* dst = rgb.pixel(x, y);
+      dst[0] = src[0];
+      dst[1] = src[1];
+      dst[2] = src[2];
+    }
+  }
+
+  // set_pixels resets the layer bounds to the new pixel size, so apply it before the mask
+  // (set_mask requires the mask bounds to match).
+  layer.set_pixels(std::move(rgb));
+  document.set_format(PixelFormat::rgb8());
+
+  if (mask_pixels.has_value()) {
+    layer.set_mask(LayerMask{Rect::from_size(width, height), std::move(*mask_pixels), /*default_color*/ 255,
+                             /*disabled*/ false});
+    set_layer_mask_is_document_alpha(layer, true);
+    return true;
+  }
+  return false;
+}
+
+QImage qimage_from_document(const Document& document, bool preserve_alpha) {
+  return render_document_rect(document, QRect(0, 0, document.width(), document.height()), preserve_alpha, nullptr);
+}
+
+QImage qimage_from_document_rect(const Document& document, QRect document_rect, bool preserve_alpha) {
+  return render_document_rect(document, document_rect, preserve_alpha, nullptr);
+}
+
+Rect group_visible_alpha_bounds(const Layer& group, Rect bounds, const PatternStore& patterns) {
+  if (bounds.empty()) { return bounds; }
+  const render_detail::RasterViewContext context;
+  const render_detail::ScopedRasterViewContext scope(context);
+  const auto pixels = render_detail::group_silhouette_for_render(group, bounds, nullptr, false, nullptr, &patterns);
+  return layer_visible_alpha_bounds(pixels, bounds).value_or(bounds);
+}
+
+QImage render_layer_isolated(const Document& document, const Layer& layer) {
+  Layer copy = layer;
+  copy.set_visible(true);
+  std::vector<Layer> stack;
+  stack.push_back(std::move(copy));
+  return render_layers_isolated(document, std::move(stack));
+}
+
+QImage render_layers_isolated(const Document& document, std::vector<Layer> stack) {
+  Document scratch(document.width(), document.height(), PixelFormat::rgba8());
+  for (auto& layer : stack) {
+    scratch.add_layer(std::move(layer));
+  }
+  return qimage_from_document(scratch, true);
+}
+
+std::vector<RenderedDocumentPatch> qimage_patches_from_document_region(const Document& document,
+                                                                       const QRegion& document_region,
+                                                                       bool preserve_alpha) {
+  return render_document_region(document, document_region, preserve_alpha, nullptr);
+}
+
+std::vector<RenderedDocumentPatch> qimage_patches_from_document_region_banded(const Document& document,
+                                                                              const QRegion& document_region,
+                                                                              bool preserve_alpha) {
+  const QRect canvas_rect(0, 0, document.width(), document.height());
+  const auto workers = max_blocking_fanout_workers(patchy::hardware_worker_threads());
+  std::vector<QRect> rects;
+  for (const auto& rect : document_region.intersected(canvas_rect)) {
+    if (rect.isEmpty()) {
+      continue;
+    }
+    // Bands of at least 64 rows, about one per worker over the whole region.
+    const int bands = std::clamp(std::min(workers, rect.height() / 64), 1, 16);
+    const int rows = (rect.height() + bands - 1) / bands;
+    for (int top = rect.top(); top <= rect.bottom(); top += rows) {
+      rects.push_back(QRect(rect.left(), top, rect.width(), std::min(rows, rect.bottom() + 1 - top)));
+    }
+  }
+  std::vector<RenderedDocumentPatch> patches;
+  if (rects.empty()) {
+    return patches;
+  }
+  auto images = rects.size() >= 2U && workers >= 2 &&
+                        !qEnvironmentVariableIsSet("PATCHY_RENDER_SINGLE_THREADED")
+                    ? render_document_rects_parallel(document, rects, preserve_alpha, nullptr,
+                                                     std::min<int>(workers, static_cast<int>(rects.size())))
+                    : std::vector<QImage>{};
+  if (images.empty()) {
+    images.reserve(rects.size());
+    for (const auto& rect : rects) {
+      images.push_back(render_document_rect(document, rect, preserve_alpha, nullptr));
+    }
+  }
+  patches.reserve(rects.size());
+  for (std::size_t index = 0; index < rects.size(); ++index) {
+    if (!images[index].isNull()) {
+      patches.push_back(RenderedDocumentPatch{rects[index], std::move(images[index])});
+    }
+  }
+  return patches;
+}
+
+std::optional<Rect> linked_mask_bounds_for_layer_bounds_override(const Document& document, LayerId layer_id,
+                                                                 Rect bounds) {
+  const auto* layer = document.find_layer(layer_id);
+  if (layer == nullptr || !layer->mask().has_value() || !layer_mask_linked(*layer)) {
+    return std::nullopt;
+  }
+  const auto original_bounds = render_detail::layer_bounds_for_render(*layer, nullptr);
+  const auto& mask_bounds = layer->mask()->bounds;
+  return Rect{mask_bounds.x + (bounds.x - original_bounds.x), mask_bounds.y + (bounds.y - original_bounds.y),
+              mask_bounds.width, mask_bounds.height};
+}
+
+QImage qimage_from_document_rect_with_layer_bounds(
+    const Document& document, QRect document_rect, bool preserve_alpha,
+    const std::vector<std::pair<LayerId, Rect>>& layer_bounds) {
+  std::vector<render_detail::LayerBoundsOverride> overrides;
+  overrides.reserve(layer_bounds.size());
+  for (const auto& [layer_id, bounds] : layer_bounds) {
+    overrides.push_back(render_detail::LayerBoundsOverride{
+        layer_id, bounds, nullptr, linked_mask_bounds_for_layer_bounds_override(document, layer_id, bounds)});
+  }
+  return render_document_rect(document, document_rect, preserve_alpha, &overrides);
+}
+
+std::vector<RenderedDocumentPatch> qimage_patches_from_document_region_with_layer_bounds(
+    const Document& document, const QRegion& document_region, bool preserve_alpha,
+    const std::vector<std::pair<LayerId, Rect>>& layer_bounds) {
+  std::vector<render_detail::LayerBoundsOverride> overrides;
+  overrides.reserve(layer_bounds.size());
+  for (const auto& [layer_id, bounds] : layer_bounds) {
+    overrides.push_back(render_detail::LayerBoundsOverride{
+        layer_id, bounds, nullptr, linked_mask_bounds_for_layer_bounds_override(document, layer_id, bounds)});
+  }
+  return render_document_region(document, document_region, preserve_alpha, &overrides);
+}
+
+QImage qimage_from_document_rect_with_layer_bounds(const Document& document, QRect document_rect, bool preserve_alpha,
+                                                   LayerId layer_id, Rect layer_bounds) {
+  const std::vector<std::pair<LayerId, Rect>> layer_bounds_overrides{{layer_id, layer_bounds}};
+  return qimage_from_document_rect_with_layer_bounds(document, document_rect, preserve_alpha, layer_bounds_overrides);
+}
+
+QImage qimage_from_document_rect_with_layer_pixels(const Document& document, QRect document_rect, bool preserve_alpha,
+                                                   LayerId layer_id, const PixelBuffer& layer_pixels,
+                                                   Rect layer_bounds) {
+  const std::vector<render_detail::LayerBoundsOverride> overrides{
+      render_detail::LayerBoundsOverride{layer_id, layer_bounds, &layer_pixels}};
+  return render_document_rect(document, document_rect, preserve_alpha, &overrides);
+}
+
+// Region variant of the pixel-substituting render above; same override
+// semantics (the mask, when present, stays at its document position).
+std::vector<RenderedDocumentPatch> qimage_patches_from_document_region_with_layer_pixels(
+    const Document& document, const QRegion& document_region, bool preserve_alpha, LayerId layer_id,
+    const PixelBuffer& layer_pixels, Rect layer_bounds) {
+  const std::vector<render_detail::LayerBoundsOverride> overrides{
+      render_detail::LayerBoundsOverride{layer_id, layer_bounds, &layer_pixels}};
+  return render_document_region(document, document_region, preserve_alpha, &overrides);
+}
+
+std::vector<RenderedDocumentPatch> qimage_patches_from_document_region_with_layer_pixel_overrides(
+    const Document& document, const QRegion& document_region, bool preserve_alpha,
+    const std::vector<LayerPixelsOverrideSpec>& layer_overrides) {
+  std::vector<render_detail::LayerBoundsOverride> overrides;
+  overrides.reserve(layer_overrides.size());
+  for (const auto& layer_override : layer_overrides) {
+    overrides.push_back(render_detail::LayerBoundsOverride{layer_override.layer_id, layer_override.bounds,
+                                                           layer_override.pixels});
+  }
+  return render_document_region(document, document_region, preserve_alpha, &overrides);
+}
+
+namespace {
+
+std::vector<render_detail::LayerBoundsOverride> hidden_layer_overrides(const Document& document,
+                                                                       const std::vector<LayerId>& hidden_layer_ids) {
+  std::vector<render_detail::LayerBoundsOverride> overrides;
+  overrides.reserve(hidden_layer_ids.size());
+  for (const auto layer_id : hidden_layer_ids) {
+    const auto* layer = document.find_layer(layer_id);
+    if (layer == nullptr) {
+      continue;
+    }
+    const auto bounds = layer->kind() == LayerKind::Adjustment ? layer->bounds() : layer_pixel_bounds(*layer);
+    overrides.push_back(render_detail::LayerBoundsOverride{layer_id, bounds, nullptr, std::nullopt, false});
+  }
+  return overrides;
+}
+
+}  // namespace
+
+QImage qimage_from_document_rect_with_hidden_layers(const Document& document, QRect document_rect,
+                                                    bool preserve_alpha,
+                                                    const std::vector<LayerId>& hidden_layer_ids) {
+  const auto overrides = hidden_layer_overrides(document, hidden_layer_ids);
+  return render_document_rect(document, document_rect, preserve_alpha, &overrides);
+}
+
+namespace {
+
+// Preview-only banding: small-but-expensive rects (a move-proxy snapshot, a
+// base-cache hole over a styled stack, a masked Free Transform drag patch) sit
+// far below render_document_rect's 4 Mpx strip gate and would serialize, so
+// split into horizontal bands rendered across workers. Style-mask float blurs
+// are windowed per band, so the bytes may differ from the unbanded render by
+// the documented ~1-2/255 divergence class near styled layers - never feed the
+// result into a commit or render-cache patch path.
+QImage render_document_rect_banded(const Document& document, QRect clipped, bool preserve_alpha,
+                                   const std::vector<render_detail::LayerBoundsOverride>& overrides) {
+  const auto hardware_threads = patchy::hardware_worker_threads();
+  const auto worker_budget =
+      max_blocking_fanout_workers(std::clamp(clipped.height() / 32, 1, std::min(hardware_threads, 16)));
+  if (worker_budget < 2 || qEnvironmentVariableIsSet("PATCHY_RENDER_SINGLE_THREADED") || render_trace_enabled() ||
+      render_profile_enabled()) {
+    return render_document_rect(document, clipped, preserve_alpha, &overrides);
+  }
+  std::vector<QRect> bands;
+  bands.reserve(static_cast<std::size_t>(worker_budget));
+  const auto rows_per_band = (clipped.height() + worker_budget - 1) / worker_budget;
+  for (int start = 0; start < clipped.height(); start += rows_per_band) {
+    const auto rows = std::min(rows_per_band, clipped.height() - start);
+    bands.push_back(QRect(clipped.x(), clipped.y() + start, clipped.width(), rows));
+  }
+  const auto images = render_document_rects_parallel(document, bands, preserve_alpha, &overrides, worker_budget);
+  for (const auto& image : images) {
+    if (image.isNull()) {
+      return render_document_rect(document, clipped, preserve_alpha, &overrides);
+    }
+  }
+
+  QImage stitched(clipped.width(), clipped.height(),
+                  preserve_alpha ? QImage::Format_RGBA8888 : QImage::Format_RGB888);
+  const auto row_bytes = static_cast<std::size_t>(clipped.width()) * (preserve_alpha ? 4U : 3U);
+  for (std::size_t band = 0; band < bands.size(); ++band) {
+    const auto& image = images[band];
+    for (int row = 0; row < image.height(); ++row) {
+      std::memcpy(stitched.scanLine(bands[band].y() - clipped.y() + row), image.constScanLine(row), row_bytes);
+    }
+  }
+  apply_document_resolution(stitched, document);
+  return stitched;
+}
+
+}  // namespace
+
+QImage qimage_from_document_rect_with_hidden_layers_banded(const Document& document, QRect document_rect,
+                                                           bool preserve_alpha,
+                                                           const std::vector<LayerId>& hidden_layer_ids) {
+  const auto clipped = document_rect.intersected(QRect(0, 0, document.width(), document.height()));
+  if (clipped.isEmpty()) {
+    return {};
+  }
+  return render_document_rect_banded(document, clipped, preserve_alpha,
+                                     hidden_layer_overrides(document, hidden_layer_ids));
+}
+
+QImage qimage_from_document_rect_with_hidden_layers_and_layer_bounds_banded(
+    const Document& document, QRect document_rect, bool preserve_alpha, const std::vector<LayerId>& hidden_layer_ids,
+    const std::vector<std::pair<LayerId, Rect>>& layer_bounds) {
+  const auto clipped = document_rect.intersected(QRect(0, 0, document.width(), document.height()));
+  if (clipped.isEmpty()) {
+    return {};
+  }
+  auto overrides = hidden_layer_overrides(document, hidden_layer_ids);
+  overrides.reserve(overrides.size() + layer_bounds.size());
+  for (const auto& [layer_id, bounds] : layer_bounds) {
+    overrides.push_back(render_detail::LayerBoundsOverride{
+        layer_id, bounds, nullptr, linked_mask_bounds_for_layer_bounds_override(document, layer_id, bounds)});
+  }
+  return render_document_rect_banded(document, clipped, preserve_alpha, overrides);
+}
+
+// Banded (PREVIEW-ONLY, see render_document_rect_banded) form of
+// qimage_patches_from_document_region_with_layer_pixels for one rect: the live
+// Free Transform drag preview of a composited (masked, blended, styled) layer.
+std::vector<RenderedDocumentPatch> qimage_patch_from_document_rect_with_layer_pixels_banded(
+    const Document& document, QRect document_rect, bool preserve_alpha, LayerId layer_id,
+    const PixelBuffer& layer_pixels, Rect layer_bounds) {
+  const auto clipped = document_rect.intersected(QRect(0, 0, document.width(), document.height()));
+  if (clipped.isEmpty()) {
+    return {};
+  }
+  const std::vector<render_detail::LayerBoundsOverride> overrides{
+      render_detail::LayerBoundsOverride{layer_id, layer_bounds, &layer_pixels}};
+  auto image = render_document_rect_banded(document, clipped, preserve_alpha, overrides);
+  if (image.isNull()) {
+    return {};
+  }
+  std::vector<RenderedDocumentPatch> patches;
+  patches.push_back(RenderedDocumentPatch{clipped, std::move(image)});
+  return patches;
+}
+
+bool image_format_preserves_alpha(std::string_view extension) noexcept {
+  const auto lower = lower_extension(extension);
+  return lower == "png" || lower == "tif" || lower == "tiff" || lower == "webp" || lower == "jxr" ||
+         lower == "wdp" || lower == "hdp" || lower == "jxl" || lower == "avif";
+}
+
+namespace {
+
+// Flattens a palette-mode document into an 8-bit indexed image carrying the
+// document palette in file order (plus one transparent slot when the flatten
+// has hidden pixels and the table has room; Qt's PNG writer emits it as tRNS).
+// The GIF and palette PNG quantization the options ask for (docs/web-export.md).
+[[nodiscard]] QuantizeOptions palette_quantize_options(const ImageSaveOptions& options) {
+  return QuantizeOptions{static_cast<std::size_t>(std::clamp(options.palette_colors, 2, 256)),
+                         options.palette_dither, std::clamp(options.palette_dither_amount, 0, 100)};
+}
+
+// A palette PNG of an RGB document: the GIF writer's quantized colors (exact colors when they
+// fit, else median cut, optional error diffusion) plus one fully transparent entry for pixels
+// below 50% alpha, which Qt's PNG writer stores as tRNS.
+[[nodiscard]] QImage quantized_png8_image(const Document& document, const ImageSaveOptions& options) {
+  const auto indexed =
+      indexed_flatten_quantized(document, gif::kQuantizeAlphaThreshold, palette_quantize_options(options));
+  QList<QRgb> table;
+  table.reserve(static_cast<qsizetype>(indexed.palette.size()));
+  for (std::size_t index = 0; index < indexed.palette.size(); ++index) {
+    const auto& color = indexed.palette[index];
+    table.append(static_cast<int>(index) == indexed.transparent_index ? qRgba(0, 0, 0, 0)
+                                                                      : qRgb(color.red, color.green, color.blue));
+  }
+  QImage image(indexed.width, indexed.height, QImage::Format_Indexed8);
+  image.setColorTable(table);
+  for (std::int32_t y = 0; y < indexed.height; ++y) {
+    std::memcpy(image.scanLine(y),
+                indexed.indexes.data() + static_cast<std::size_t>(y) * static_cast<std::size_t>(indexed.width),
+                static_cast<std::size_t>(indexed.width));
+  }
+  return image;
+}
+
+[[nodiscard]] QImage indexed_png8_image(const Document& document) {
+  const auto& editing = *document.palette_editing();
+  const auto& colors = editing.palette.colors;
+  const auto source = qimage_from_document(document, true).convertToFormat(QImage::Format_RGBA8888);
+
+  patchy::PaletteLut lut;
+  lut.build(colors);
+  std::unordered_map<std::uint32_t, int> exact_index;
+  exact_index.reserve(colors.size());
+  QList<QRgb> table;
+  table.reserve(static_cast<qsizetype>(colors.size()) + 1);
+  for (int index = 0; index < static_cast<int>(colors.size()); ++index) {
+    const auto& color = colors[static_cast<std::size_t>(index)];
+    table.append(qRgba(color.red, color.green, color.blue, 255));
+    exact_index.emplace(patchy::palette_color_key(color), index);
+  }
+
+  const auto threshold = editing.alpha_threshold;
+  bool needs_transparent = false;
+  for (int y = 0; y < source.height() && !needs_transparent; ++y) {
+    for (int x = 0; x < source.width(); ++x) {
+      if (qAlpha(source.pixel(x, y)) < threshold) {
+        needs_transparent = true;
+        break;
+      }
+    }
+  }
+  int transparent_index = -1;
+  if (needs_transparent && table.size() < 256) {
+    transparent_index = static_cast<int>(table.size());
+    table.append(qRgba(0, 0, 0, 0));
+  }
+
+  QImage indexed(source.width(), source.height(), QImage::Format_Indexed8);
+  indexed.setColorTable(table);
+  if (std::any_of(editing.palette.names.begin(), editing.palette.names.end(),
+                  [](const auto& name) { return !name.empty(); })) {
+    QJsonArray names;
+    for (qsizetype i = 0; i < table.size(); ++i) {
+      const auto index = static_cast<std::size_t>(i);
+      const auto name = index < editing.palette.names.size() ? QString::fromUtf8(editing.palette.names[index])
+                                                           : QString();
+      names.append(name);
+    }
+    indexed.setText(QStringLiteral("PatchyPaletteNames"),
+                    QString::fromUtf8(QJsonDocument(names).toJson(QJsonDocument::Compact)));
+  }
+  for (int y = 0; y < source.height(); ++y) {
+    for (int x = 0; x < source.width(); ++x) {
+      const auto pixel = source.pixel(x, y);
+      if (transparent_index >= 0 && qAlpha(pixel) < threshold) {
+        indexed.setPixel(x, y, static_cast<uint>(transparent_index));
+        continue;
+      }
+      const auto color = patchy::RgbColor{static_cast<std::uint8_t>(qRed(pixel)),
+                                          static_cast<std::uint8_t>(qGreen(pixel)),
+                                          static_cast<std::uint8_t>(qBlue(pixel))};
+      const auto found = exact_index.find(patchy::palette_color_key(color));
+      const auto index = found != exact_index.end()
+                             ? found->second
+                             : static_cast<int>(lut.index_for(color.red, color.green, color.blue));
+      indexed.setPixel(x, y, static_cast<uint>(index));
+    }
+  }
+  return indexed;
+}
+
+}  // namespace
+
+namespace {
+
+// Pixel replication for the export Scale option. Deliberately not QImage::scaled: manual
+// replication keeps any channel count (RGB, RGBA, gray masks) and indexed outputs
+// byte-stable.
+[[nodiscard]] PixelBuffer upscale_nearest_buffer(const PixelBuffer& source, int scale) {
+  PixelBuffer scaled(source.width() * scale, source.height() * scale, source.format());
+  const auto channels = source.format().channels;
+  for (std::int32_t y = 0; y < source.height(); ++y) {
+    for (std::int32_t x = 0; x < source.width(); ++x) {
+      const auto* src = source.pixel(x, y);
+      for (int dy = 0; dy < scale; ++dy) {
+        for (int dx = 0; dx < scale; ++dx) {
+          auto* dst = scaled.pixel(x * scale + dx, y * scale + dy);
+          for (std::uint16_t channel = 0; channel < channels; ++channel) {
+            dst[channel] = src[channel];
+          }
+        }
+      }
+    }
+  }
+  return scaled;
+}
+
+// Export-only geometry, applied in this order: crop (Trim transparent edges), resize (the Image Size
+// resampler, always Bilinear here), nearest-neighbor pixel-art scale. Channel-agnostic, so
+// rgb8/rgba8 pixels and gray8 mask planes go through identical math.
+struct ExportTransform {
+  std::optional<Rect> crop;                                     // source pixels; nullopt = whole buffer
+  std::optional<std::pair<std::int32_t, std::int32_t>> resize;  // target size AFTER the crop
+  int scale{1};
+};
+
+[[nodiscard]] PixelBuffer crop_buffer(const PixelBuffer& source, Rect rect) {
+  PixelBuffer cropped(rect.width, rect.height, source.format());
+  const auto row_bytes = static_cast<std::size_t>(rect.width) * bytes_per_pixel(source.format());
+  for (std::int32_t y = 0; y < rect.height; ++y) {
+    const auto* src = source.pixel(rect.x, rect.y + y);
+    std::copy(src, src + row_bytes, cropped.pixel(0, y));
+  }
+  return cropped;
+}
+
+[[nodiscard]] PixelBuffer transform_export_buffer(const PixelBuffer& source, const ExportTransform& transform) {
+  PixelBuffer result = source;  // implicitly shared: free until a step replaces it
+  if (transform.crop.has_value()) {
+    result = crop_buffer(result, *transform.crop);
+  }
+  if (transform.resize.has_value() &&
+      (transform.resize->first != result.width() || transform.resize->second != result.height())) {
+    result = resample_pixels(result, transform.resize->first, transform.resize->second, ResampleMethod::Bilinear);
+  }
+  if (transform.scale > 1) {
+    result = upscale_nearest_buffer(result, transform.scale);
+  }
+  return result;
+}
+
+// Straight-alpha source-over onto an opaque background with the render_document_rect matte
+// rounding ((src * a + bg * (255 - a) + 127) / 255). Every alpha becomes 255; the alpha of
+// the background color itself is ignored (a matte is opaque by definition).
+void composite_over_background(PixelBuffer& rgba, QColor background) {
+  const std::array<int, 3> bg{background.red(), background.green(), background.blue()};
+  for (std::int32_t y = 0; y < rgba.height(); ++y) {
+    auto row = rgba.row(y);
+    for (std::int32_t x = 0; x < rgba.width(); ++x) {
+      auto* px = row.data() + static_cast<std::size_t>(x) * 4U;
+      const int alpha = px[3];
+      if (alpha == 255) {
+        continue;
+      }
+      for (std::size_t channel = 0; channel < 3; ++channel) {
+        px[channel] = static_cast<std::uint8_t>((px[channel] * alpha + bg[channel] * (255 - alpha) + 127) / 255);
+      }
+      px[3] = 255;
+    }
+  }
+}
+
+[[nodiscard]] bool export_geometry_requested(const ImageSaveOptions& options) noexcept {
+  return options.export_trim_transparent || options.export_width > 0 || options.export_height > 0;
+}
+
+[[nodiscard]] bool export_transform_requested(const ImageSaveOptions& options) noexcept {
+  return options.export_scale > 1 || export_geometry_requested(options) || options.export_fill_transparent;
+}
+
+// The resize target for a (possibly trimmed) source. export_width/height describe the FULL
+// canvas: an untrimmed source gets them exactly, a trimmed one scales by the same factors
+// so it never distorts. One zero side follows the factor of the other (scripted callers).
+[[nodiscard]] std::optional<std::pair<std::int32_t, std::int32_t>> export_resize_target(
+    const ImageSaveOptions& options, std::int32_t source_width, std::int32_t source_height,
+    std::int32_t canvas_width, std::int32_t canvas_height) {
+  if (options.export_width <= 0 && options.export_height <= 0) {
+    return std::nullopt;
+  }
+  const auto scaled = [](std::int64_t source, std::int64_t numerator, std::int64_t denominator) {
+    return static_cast<std::int32_t>(
+        std::max<std::int64_t>(1, (source * numerator + denominator / 2) / denominator));
+  };
+  const auto width = options.export_width > 0 ? scaled(source_width, options.export_width, canvas_width)
+                                              : scaled(source_width, options.export_height, canvas_height);
+  const auto height = options.export_height > 0 ? scaled(source_height, options.export_height, canvas_height)
+                                                : scaled(source_height, options.export_width, canvas_width);
+  return std::pair{width, height};
+}
+
+[[nodiscard]] std::string trim_kept_full_canvas_notice() {
+  return QObject::tr("Trim transparent edges kept the full canvas: the image has no visible pixels.").toStdString();
+}
+
+[[nodiscard]] Rect union_rects(Rect a, Rect b) noexcept {
+  const auto x0 = std::min(a.x, b.x);
+  const auto y0 = std::min(a.y, b.y);
+  const auto x1 = std::max(a.x + a.width, b.x + b.width);
+  const auto y1 = std::max(a.y + a.height, b.y + b.height);
+  return Rect{x0, y0, x1 - x0, y1 - y0};
+}
+
+// Resolves the export options against an RGBA8 composite whose alpha decides the trim
+// rect. A crop is only recorded when it actually shrinks the canvas.
+[[nodiscard]] ExportTransform resolve_export_transform(const ImageSaveOptions& options,
+                                                       const PixelBuffer& alpha_source,
+                                                       std::vector<std::string>* notices) {
+  ExportTransform transform;
+  const auto canvas_width = alpha_source.width();
+  const auto canvas_height = alpha_source.height();
+  auto width = canvas_width;
+  auto height = canvas_height;
+  if (options.export_trim_transparent) {
+    if (const auto bounds = visible_alpha_local_bounds(alpha_source); bounds.has_value()) {
+      if (bounds->width != width || bounds->height != height) {
+        transform.crop = *bounds;
+      }
+      width = bounds->width;
+      height = bounds->height;
+    } else if (notices != nullptr) {
+      notices->push_back(trim_kept_full_canvas_notice());
+    }
+  }
+  transform.resize = export_resize_target(options, width, height, canvas_width, canvas_height);
+  transform.scale = std::max(1, options.export_scale);
+  return transform;
+}
+
+// A flat stand-in document that every format writer treats exactly like the original. The
+// document-alpha mask structure survives trim, resize, and scale (so alpha-capable formats
+// stay non-destructive: the colors under the mask are kept) and the palette-mode/palette
+// metadata carries over (so indexed exports keep the document palette). A background fill
+// always yields one opaque pixel layer. Scale-only performs exactly the operations the old
+// scale re-entry did, so those bytes are unchanged.
+[[nodiscard]] Document export_stand_in_document(const Document& document, const ImageSaveOptions& options,
+                                                std::vector<std::string>* notices) {
+  const auto finish = [&document](Document& stand_in) {
+    stand_in.print_settings() = document.print_settings();
+    // The writers read metadata and the kept color profile from the document they get
+    // (docs/file-info.md); the export policy filters the metadata later.
+    stand_in.file_info() = document.file_info();
+    stand_in.color_state().embedded_icc_profile = document.color_state().embedded_icc_profile;
+    stand_in.palette_editing() = document.palette_editing();
+    stand_in.indexed_palette() = document.indexed_palette();
+  };
+
+  if (!options.export_fill_transparent && document.layers().size() == 1) {
+    const auto& layer = std::as_const(document).layers().front();
+    if (layer.kind() == LayerKind::Pixel && layer.mask().has_value() && layer_mask_is_document_alpha(layer)) {
+      std::optional<PixelBuffer> pixels;
+      std::optional<PixelBuffer> mask_pixels;
+      std::int32_t stand_in_width = 0;
+      std::int32_t stand_in_height = 0;
+      if (!export_geometry_requested(options)) {
+        // Scale only: replicate the pixels and the mask plane exactly as stored.
+        const auto scale = std::max(1, options.export_scale);
+        const ExportTransform transform{std::nullopt, std::nullopt, scale};
+        pixels = transform_export_buffer(layer.pixels(), transform);
+        mask_pixels = transform_export_buffer(layer.mask()->pixels, transform);
+        stand_in_width = document.width() * scale;
+        stand_in_height = document.height() * scale;
+      } else if (const auto masked = document_alpha_rgba8(document); masked.has_value()) {
+        // The trim rect comes from the combined alpha (the mask resolved to canvas size,
+        // bounds and default color applied); the pixels and that canvas-sized mask plane
+        // then go through one transform, so they stay aligned.
+        const auto transform = resolve_export_transform(options, *masked, notices);
+        PixelBuffer mask_plane(masked->width(), masked->height(), PixelFormat::gray8());
+        for (std::int32_t y = 0; y < masked->height(); ++y) {
+          const auto src_row = masked->row(y);
+          auto dst_row = mask_plane.row(y);
+          for (std::int32_t x = 0; x < masked->width(); ++x) {
+            dst_row[static_cast<std::size_t>(x)] = src_row[static_cast<std::size_t>(x) * 4U + 3U];
+          }
+        }
+        pixels = transform_export_buffer(layer.pixels(), transform);
+        mask_pixels = transform_export_buffer(mask_plane, transform);
+        stand_in_width = pixels->width();
+        stand_in_height = pixels->height();
+      }
+      if (pixels.has_value() && mask_pixels.has_value()) {
+        Document stand_in(stand_in_width, stand_in_height, PixelFormat::rgba8());
+        const auto mask_bounds = Rect::from_size(mask_pixels->width(), mask_pixels->height());
+        Layer copy(stand_in.allocate_layer_id(), layer.name(), std::move(*pixels));
+        copy.set_mask(LayerMask{mask_bounds, std::move(*mask_pixels), layer.mask()->default_color,
+                                layer.mask()->disabled});
+        set_layer_mask_is_document_alpha(copy, true);
+        stand_in.add_layer(std::move(copy));
+        finish(stand_in);
+        return stand_in;
+      }
+      // document_alpha_rgba8 declined (disabled mask, vector mask, other format): flatten below.
+    }
+  }
+
+  auto rgba = flatten_document_rgba8(document);
+  rgba = transform_export_buffer(rgba, resolve_export_transform(options, rgba, notices));
+  if (options.export_fill_transparent) {
+    composite_over_background(rgba, options.export_background_color);
+  }
+  Document stand_in(rgba.width(), rgba.height(), PixelFormat::rgba8());
+  stand_in.add_pixel_layer("Background", std::move(rgba));
+  finish(stand_in);
+  return stand_in;
+}
+
+}  // namespace
+
+void install_ico_png_codec() {
+  ico::set_png_codec(
+      [](std::span<const std::uint8_t> bytes) {
+        ico::RgbaImage out;
+        QImage image;
+        if (!image.loadFromData(bytes.data(), static_cast<int>(bytes.size()), "PNG")) {
+          return out;
+        }
+        const auto converted = image.convertToFormat(QImage::Format_RGBA8888);
+        out.width = converted.width();
+        out.height = converted.height();
+        out.rgba.resize(static_cast<std::size_t>(out.width) * static_cast<std::size_t>(out.height) * 4U);
+        for (int y = 0; y < converted.height(); ++y) {
+          std::memcpy(out.rgba.data() + static_cast<std::size_t>(y) * static_cast<std::size_t>(out.width) * 4U,
+                      converted.constScanLine(y), static_cast<std::size_t>(out.width) * 4U);
+        }
+        return out;
+      },
+      [](const ico::RgbaImage& image) {
+        const QImage qimage(image.rgba.data(), image.width, image.height, image.width * 4,
+                            QImage::Format_RGBA8888);
+        QByteArray encoded;
+        QBuffer buffer(&encoded);
+        buffer.open(QIODevice::WriteOnly);
+        qimage.save(&buffer, "PNG");
+        const auto* data = reinterpret_cast<const std::uint8_t*>(encoded.constData());
+        return std::vector<std::uint8_t>(data, data + encoded.size());
+      });
+}
+
+void install_rttex_jpeg_codec() {
+  rttex::set_jpeg_encoder([](const rttex::RgbImage& image, int quality) {
+    const QImage qimage(image.rgb.data(), image.width, image.height, image.width * 3, QImage::Format_RGB888);
+    QByteArray encoded;
+    QBuffer buffer(&encoded);
+    buffer.open(QIODevice::WriteOnly);
+    QImageWriter writer(&buffer, "JPEG");
+    writer.setQuality(std::clamp(quality, 1, 100));
+    if (!writer.write(qimage)) {
+      return std::vector<std::uint8_t>{};
+    }
+    const auto* data = reinterpret_cast<const std::uint8_t*>(encoded.constData());
+    return std::vector<std::uint8_t>(data, data + encoded.size());
+  });
+}
+
+namespace {
+
+// A 16 or 32-bit document's flatten as a 16-bit image (docs/high-bit-depth-formats.md), for the
+// formats Qt writes at 16 bits (PNG, TIFF): display-encoded, 32-bit values clamped to 0..1
+// and encoded to sRGB (PNG holds no floats). Without alpha it mattes over white in the
+// document's domain, as the 8-bit export does in its.
+QImage deep_export_qimage(const Document& document, bool preserve_alpha) {
+  const auto flat = Compositor{}.flatten_rgba_deep(document);
+  const auto domain = deep_domain_for(document.color_state().bit_depth);
+  QImage image(flat.width(), flat.height(), preserve_alpha ? QImage::Format_RGBA64 : QImage::Format_RGBX64);
+  std::vector<float> row(static_cast<std::size_t>(std::max(0, flat.width())) * 4U);
+  const auto to_u16 = [domain](float deep) {
+    const auto encoded = domain == DeepDomain::Linear ? srgb_encode(deep / 255.0) : std::clamp(deep / 255.0F, 0.0F, 1.0F);
+    return static_cast<std::uint16_t>(std::lround(std::clamp(encoded, 0.0, 1.0) * 65535.0));
+  };
+  for (std::int32_t y = 0; y < flat.height(); ++y) {
+    load_rgba_row(flat, y, 0, flat.width(), domain, row);
+    auto* out = reinterpret_cast<std::uint16_t*>(image.scanLine(y));
+    for (std::int32_t x = 0; x < flat.width(); ++x) {
+      const auto* px = row.data() + static_cast<std::size_t>(x) * 4U;
+      const auto alpha = std::clamp(px[3] / 255.0F, 0.0F, 1.0F);
+      for (int c = 0; c < 3; ++c) {
+        out[x * 4 + c] = to_u16(preserve_alpha ? px[c] : px[c] * alpha + 255.0F * (1.0F - alpha));
+      }
+      out[x * 4 + 3] = preserve_alpha ? static_cast<std::uint16_t>(std::lround(alpha * 65535.0F)) : 65535U;
+    }
+  }
+  return image;
+}
+
+// A 32-bit document's flatten as a float image for TIFF (docs/high-bit-depth-formats.md): the
+// linear values as they are, above 1.0 included (Photoshop's 32-bit TIFF). Without alpha
+// it mattes over white in linear light.
+QImage float_export_qimage(const Document& document, bool preserve_alpha) {
+  const auto flat = Compositor{}.flatten_rgba_deep(document);
+  QImage image(flat.width(), flat.height(), preserve_alpha ? QImage::Format_RGBA32FPx4 : QImage::Format_RGBX32FPx4);
+  std::vector<float> row(static_cast<std::size_t>(std::max(0, flat.width())) * 4U);
+  for (std::int32_t y = 0; y < flat.height(); ++y) {
+    load_rgba_row(flat, y, 0, flat.width(), DeepDomain::Linear, row);
+    auto* out = reinterpret_cast<float*>(image.scanLine(y));
+    for (std::int32_t x = 0; x < flat.width(); ++x) {
+      const auto* px = row.data() + static_cast<std::size_t>(x) * 4U;
+      const auto alpha = std::clamp(px[3] / 255.0F, 0.0F, 1.0F);
+      for (int c = 0; c < 3; ++c) {
+        const auto value = preserve_alpha ? px[c] : px[c] * alpha + 255.0F * (1.0F - alpha);
+        out[x * 4 + c] = std::isfinite(value) ? value / 255.0F : 0.0F;
+      }
+      out[x * 4 + 3] = preserve_alpha ? alpha : 1.0F;
+    }
+  }
+  return image;
+}
+
+}  // namespace
+
+QImage flat_export_qimage(const Document& document, bool preserve_alpha) {
+  // A single masked layer is exported non-destructively to alpha-capable formats: keep the
+  // original colors and write the mask into the alpha channel (compositing would erase the
+  // colors wherever the mask is transparent).
+  if (std::optional<PixelBuffer> masked = preserve_alpha ? document_alpha_rgba8(document) : std::nullopt;
+      masked.has_value()) {
+    QImage image(masked->width(), masked->height(), QImage::Format_RGBA8888);
+    for (std::int32_t y = 0; y < masked->height(); ++y) {
+      const auto src_row = masked->row(y);
+      std::copy(src_row.begin(), src_row.end(), image.scanLine(y));
+    }
+    return image;
+  }
+  return qimage_from_document(document, preserve_alpha);
+}
+
+namespace {
+
+// QImageWriter through a QSaveFile: the encoded bytes land in a sibling temporary
+// file and replace the target only on commit, so a crash, a full disk, or an
+// encoder failure never truncates the user's existing file (the byte-based
+// writers use support/atomic_file_write.hpp for the same reason). The format is
+// the lowercase extension, exactly what QImageWriter(path) derives from a suffix.
+// `quality` < 0 keeps the plugin default.
+void write_bytes_with_save_file(const QString& path, std::span<const std::uint8_t> bytes) {
+  QSaveFile file(path);
+  if (!file.open(QIODevice::WriteOnly)) {
+    throw std::runtime_error(file.errorString().toStdString());
+  }
+  if (file.write(reinterpret_cast<const char*>(bytes.data()), static_cast<qint64>(bytes.size())) !=
+      static_cast<qint64>(bytes.size())) {
+    file.cancelWriting();
+    throw std::runtime_error(file.errorString().toStdString());
+  }
+  if (!file.commit()) {
+    throw std::runtime_error(file.errorString().toStdString());
+  }
+}
+
+}  // namespace
+
+bool save_qimage_atomically(const QImage& image, const QString& path, const char* format) {
+  if (image.isNull() || path.isEmpty()) {
+    return false;
+  }
+  QSaveFile file(path);
+  if (!file.open(QIODevice::WriteOnly)) {
+    return false;
+  }
+  const QByteArray derived = QFileInfo(path).suffix().toLower().toLatin1();
+  if (!image.save(&file, format != nullptr ? format : derived.constData())) {
+    file.cancelWriting();
+    return false;
+  }
+  return file.commit();
+}
+
+std::vector<std::uint8_t> encode_thumbnail_jpeg(const QImage& image) {
+  if (image.isNull()) {
+    return {};
+  }
+  const auto max_side = psd::kThumbnailMaxSide;
+  QImage fitted = image.width() > max_side || image.height() > max_side
+                      ? image.scaled(max_side, max_side, Qt::KeepAspectRatio, Qt::SmoothTransformation)
+                      : image;
+  QImage paper(fitted.size(), QImage::Format_RGB888);
+  paper.fill(Qt::white);
+  {
+    QPainter painter(&paper);
+    painter.drawImage(0, 0, fitted);
+  }
+  QBuffer buffer;
+  buffer.open(QIODevice::WriteOnly);
+  QImageWriter writer(&buffer, QByteArrayLiteral("jpg"));
+  writer.setQuality(75);
+  if (!writer.write(paper)) {
+    return {};
+  }
+  const auto& encoded = buffer.data();
+  return {reinterpret_cast<const std::uint8_t*>(encoded.constData()),
+          reinterpret_cast<const std::uint8_t*>(encoded.constData()) + encoded.size()};
+}
+
+namespace {
+
+// The metadata a flat writer embeds (docs/file-info.md), or nullopt when there is none
+// (the encoder's bytes are then written untouched) or the format has no container for it.
+std::optional<metadata::SaveMetadata> save_metadata_for(const Document& document, const ImageSaveOptions& options,
+                                                        std::string_view format, int width, int height) {
+  static const std::set<std::string_view> kCarriers{"jpg", "jpeg", "jpe", "jfif", "png", "tif", "tiff", "webp", "gif", "jxl", "avif"};
+  if (!kCarriers.contains(format)) {
+    return std::nullopt;
+  }
+  std::optional<metadata::SaveStamp> stamp;
+  metadata::SaveStampDocument file;
+  if (options.metadata_policy == metadata::MetadataPolicy::Basic) {
+    // Basic: the save stamp alone, describing this file (docs/file-info.md, "Writing").
+    stamp = save_stamp_now();
+    const bool jpeg = format == "jpg" || format == "jpeg" || format == "jpe" || format == "jfif";
+    file.format = jpeg               ? "image/jpeg"
+                  : format == "png"  ? "image/png"
+                  : format == "webp" ? "image/webp"
+                  : format == "gif"  ? "image/gif"
+                  : format == "jxl"  ? "image/jxl"
+                  : format == "avif" ? "image/avif"
+                                     : "image/tiff";
+    file.color_mode = jpeg && options.export_cmyk ? 4 : 3;
+    const auto& profile = document.color_state().embedded_icc_profile;
+    file.srgb = file.color_mode == 3 && !profile.empty() && is_srgb_profile(profile);
+  }
+  auto metadata = metadata::prepare_save_metadata(document, options.metadata_policy, width, height,
+                                                  stamp.has_value() ? &*stamp : nullptr, &file);
+  if (metadata.empty()) {
+    return std::nullopt;
+  }
+  return metadata;
+}
+
+// The smallest EXIF that carries a thumbnail, for a JPEG whose metadata choice writes no
+// EXIF but whose thumbnail was asked for (ImageSaveOptions::jpeg_exif_thumbnail_without_metadata):
+// IFD0 with the resolution only (no software, dates or other tags), then IFD1.
+std::vector<std::uint8_t> thumbnail_only_exif(const Document& document) {
+  metadata::TiffStream stream;
+  stream.big_endian = true;
+  const auto ppi = [](double value) {
+    return static_cast<std::uint32_t>(std::clamp(std::lround(value * 100.0), 1L, 100000000L));
+  };
+  stream.set_rational(metadata::IfdKind::Ifd0, metadata::exif_tag::kXResolution,
+                      ppi(document.print_settings().horizontal_ppi), 100);
+  stream.set_rational(metadata::IfdKind::Ifd0, metadata::exif_tag::kYResolution,
+                      ppi(document.print_settings().vertical_ppi), 100);
+  stream.set_short(metadata::IfdKind::Ifd0, metadata::exif_tag::kResolutionUnit, 2);
+  return metadata::write_tiff(stream);
+}
+
+// A JPEG whose EXIF is written gets a thumbnail of the saved image in IFD1, as
+// Photoshop's JPEG saves do (prepare_save_metadata dropped the stale one). Left out when
+// the block would no longer fit one APP1 segment.
+void add_jpeg_exif_thumbnail(metadata::SaveMetadata& metadata, const QImage& image) {
+  auto stream = metadata::parse_tiff(metadata.exif);
+  if (!stream.has_value()) {
+    return;
+  }
+  auto jfif = encode_thumbnail_jpeg(image);
+  if (jfif.empty()) {
+    return;
+  }
+  stream->thumbnail = std::move(jfif);
+  constexpr std::uint16_t kCompressionTag = 259;
+  stream->set_short(metadata::IfdKind::Ifd1, kCompressionTag, 6);  // JPEG (old-style)
+  stream->set_rational(metadata::IfdKind::Ifd1, metadata::exif_tag::kXResolution, 72, 1);
+  stream->set_rational(metadata::IfdKind::Ifd1, metadata::exif_tag::kYResolution, 72, 1);
+  stream->set_short(metadata::IfdKind::Ifd1, metadata::exif_tag::kResolutionUnit, 2);
+  auto bytes = metadata::write_tiff(*stream);
+  constexpr std::size_t kApp1Budget = 65533U - 6U;  // segment length field and "Exif\0\0"
+  if (bytes.size() <= kApp1Budget) {
+    metadata.exif = std::move(bytes);
+  }
+}
+
+// The JPEG coding choices of ImageSaveOptions (progressive scans, optimized Huffman tables,
+// the EXIF thumbnail); the defaults are what Save has always written.
+struct JpegCoding {
+  bool progressive{false};
+  bool optimize{false};
+  bool exif_thumbnail{true};
+  bool thumbnail_without_metadata{false};
+};
+
+[[nodiscard]] JpegCoding jpeg_coding_for(const ImageSaveOptions& options) noexcept {
+  return JpegCoding{options.jpeg_progressive, options.jpeg_optimize, options.jpeg_exif_thumbnail,
+                    options.jpeg_exif_thumbnail && options.jpeg_exif_thumbnail_without_metadata};
+}
+
+void configure_image_writer(QImageWriter& writer, bool jpeg, int quality, const JpegCoding& coding) {
+  if (quality >= 0) {
+    writer.setQuality(quality);
+  }
+  if (jpeg) {
+    // Only set when asked for, so a plain save never depends on the plug-in's handling
+    // of the two options.
+    if (coding.optimize) {
+      writer.setOptimizedWrite(true);
+    }
+    if (coding.progressive) {
+      writer.setProgressiveScanWrite(true);
+    }
+  }
+}
+
+void write_qimage_atomically(const QImage& image, const QString& path, const std::string& format, int quality,
+                             std::optional<metadata::SaveMetadata> metadata = std::nullopt,
+                             const JpegCoding& coding = {}) {
+  const bool jpeg = format == "jpg" || format == "jpeg" || format == "jpe" || format == "jfif";
+  if (metadata.has_value() && !metadata->exif.empty() && jpeg && coding.exif_thumbnail &&
+      image.format() != QImage::Format_CMYK8888) {
+    add_jpeg_exif_thumbnail(*metadata, image);
+  }
+  if (metadata.has_value()) {
+    // Encode in memory, splice the metadata in, then commit the result atomically.
+    QBuffer buffer;
+    buffer.open(QIODevice::WriteOnly);
+    QImageWriter writer(&buffer, QByteArray::fromStdString(format));
+    configure_image_writer(writer, jpeg, quality, coding);
+    if (!writer.write(image)) {
+      throw std::runtime_error(writer.errorString().toStdString());
+    }
+    const auto& encoded = buffer.data();
+    auto bytes = metadata::inject_metadata(
+        std::vector<std::uint8_t>(reinterpret_cast<const std::uint8_t*>(encoded.constData()),
+                                  reinterpret_cast<const std::uint8_t*>(encoded.constData()) + encoded.size()),
+        format, *metadata);
+    write_bytes_with_save_file(path, bytes);
+    return;
+  }
+  QSaveFile file(path);
+  if (!file.open(QIODevice::WriteOnly)) {
+    throw std::runtime_error(file.errorString().toStdString());
+  }
+  QImageWriter writer(&file, QByteArray::fromStdString(format));
+  configure_image_writer(writer, jpeg, quality, coding);
+  if (!writer.write(image)) {
+    file.cancelWriting();
+    throw std::runtime_error(writer.errorString().toStdString());
+  }
+  if (!file.commit()) {
+    throw std::runtime_error(file.errorString().toStdString());
+  }
+}
+
+// The working space a CMYK export separates through; throws when there is no profile to
+// separate with or describe the result by (the user chose the formula).
+std::shared_ptr<const CmykWorkingSpace> cmyk_export_space() {
+  auto space = working_cmyk_space();
+  if (!space->has_profile()) {
+    throw std::runtime_error(
+        PATCHY_TRANSLATE_NOOP("QObject", "CMYK export needs a CMYK profile. Choose one in Preferences."));
+  }
+  return space;
+}
+
+// The composite over white paper, separated to Format_CMYK8888 (255 = full ink).
+QImage cmyk_export_qimage(const Document& document, const CmykWorkingSpace& space, SeparationOptions separation) {
+  const auto composite = flat_export_qimage(document, true).convertToFormat(QImage::Format_ARGB32_Premultiplied);
+  QImage paper(composite.size(), QImage::Format_RGBA8888);
+  paper.fill(Qt::white);
+  {
+    QPainter painter(&paper);
+    painter.drawImage(0, 0, composite);
+  }
+  const auto width = static_cast<std::size_t>(paper.width());
+  std::vector<std::uint8_t> rgba(width * static_cast<std::size_t>(paper.height()) * 4U);
+  for (int y = 0; y < paper.height(); ++y) {
+    std::memcpy(rgba.data() + static_cast<std::size_t>(y) * width * 4U, paper.constScanLine(y), width * 4U);
+  }
+  const auto inks = space.separate_rgba8(rgba, separation);
+  QImage cmyk(paper.size(), QImage::Format_CMYK8888);
+  for (int y = 0; y < cmyk.height(); ++y) {
+    std::memcpy(cmyk.scanLine(y), inks.data() + static_cast<std::size_t>(y) * width * 4U, width * 4U);
+  }
+  return cmyk;
+}
+
+// Encodes `image`, then embeds the document's metadata when the format carries any.
+void write_flat_qimage(const Document& document, const ImageSaveOptions& options, const QImage& image,
+                       const QString& path, const std::string& format, int quality) {
+  auto metadata = save_metadata_for(document, options, format, image.width(), image.height());
+  const auto coding = jpeg_coding_for(options);
+  const bool jpeg = format == "jpg" || format == "jpeg" || format == "jpe" || format == "jfif";
+  if (jpeg && coding.thumbnail_without_metadata && image.format() != QImage::Format_CMYK8888 &&
+      (!metadata.has_value() || metadata->exif.empty())) {
+    // Only the thumbnail: a minimal EXIF, completed with IFD1 here.
+    if (!metadata.has_value()) {
+      metadata.emplace();
+    }
+    metadata->exif = thumbnail_only_exif(document);
+    add_jpeg_exif_thumbnail(*metadata, image);
+    if (const auto stream = metadata::parse_tiff(metadata->exif); !stream.has_value() || stream->thumbnail.empty()) {
+      metadata->exif.clear();  // no thumbnail after all: write no EXIF
+    }
+    if (metadata->empty()) {
+      metadata.reset();
+    }
+    auto added = coding;
+    added.exif_thumbnail = false;  // already in
+    write_qimage_atomically(image, path, format, quality, std::move(metadata), added);
+    return;
+  }
+  write_qimage_atomically(image, path, format, quality, std::move(metadata), coding);
+}
+
+// The native flat writers, the animated GIF/WebP/JPEG XL writers and the export-transform
+// stand-in composite at 8 bits per channel, so a 16/32-bit document reaches them
+// narrowed. PNG, TIFF and still JPEG XL keep deep samples; JPEG, WebP, PDF and the other
+// Qt-encoded formats narrow the deep composite in flat_export_qimage.
+[[nodiscard]] bool flat_writer_needs_8bit_document(const std::string& lower, std::string_view extension,
+                                                   const ImageSaveOptions& options) {
+  return export_transform_requested(options) || options.export_cmyk || lower == "gif" ||
+         (lower == "webp" && options.webp_animate) || (jxl::is_jxl_extension(lower) && options.jxl_animate) ||
+         ((lower == "png" || lower == "apng") && (options.apng_animate || options.png_palette)) || lower == "tga" || lower == "pcx" || lower == "lbm" || lower == "iff" || lower == "bbm" ||
+         lower == "ico" || lower == "cur" || jxr::is_jxr_extension(lower) || rttex::is_rttex_extension(lower) ||
+         dds::is_dds_extension(lower) || is_bmp_extension(extension);
+}
+
+// The JPEG XL writer settings from the dialog's options, with the File Info boxes the save
+// carries (docs/file-info.md).
+jxl::WriteOptions jxl_write_options(const Document& document, const ImageSaveOptions& options, int width,
+                                    int height) {
+  jxl::WriteOptions jxl_options;
+  jxl_options.quality = std::clamp(options.jxl_quality, 1, 100);
+  jxl_options.lossless = options.jxl_lossless;
+  jxl_options.effort = std::clamp(options.jxl_effort, 1, 9);
+  if (const auto metadata = save_metadata_for(document, options, "jxl", width, height)) {
+    jxl_options.exif = metadata->exif;
+    jxl_options.xmp.assign(metadata->xmp.begin(), metadata->xmp.end());
+  }
+  return jxl_options;
+}
+
+void write_jxl_with_metadata(const Document& document, const QString& path, const ImageSaveOptions& options) {
+  jxl::write_jxl_file(document, to_filesystem_path(path),
+                      jxl_write_options(document, options, document.width(), document.height()));
+}
+
+}  // namespace
+
+const Document& document_for_8bit_writer(const Document& document, std::optional<Document>& narrowed) {
+  if (document.color_state().bit_depth == BitDepth::UInt8) {
+    return document;
+  }
+  narrowed.emplace(document);
+  convert_document_depth(*narrowed, BitDepth::UInt8);
+  return *narrowed;
+}
+
+void write_flat_image_file(const Document& document, const QString& path, const QString& extension,
+                           const ImageSaveOptions& options, std::vector<std::string>* notices) {
+  const auto extension_bytes = extension.toStdString();
+  const auto lower = lower_extension(extension_bytes);
+  if (options.export_cmyk && !(is_jpeg_extension(extension_bytes) || lower == "tif" || lower == "tiff" ||
+                               (lower == "pdf" && !options.pdf_editable_layers))) {
+    throw std::runtime_error(PATCHY_TRANSLATE_NOOP(
+        "QObject", "CMYK export is available for JPEG, TIFF and flattened PDF files only."));
+  }
+  if (lower == "pdf" && options.pdf_editable_layers) {
+    // The layered writer needs the real document (export_stand_in_document would flatten
+    // it first); vectors and text scale by the page, so the export transforms do not apply.
+    PdfExportOptions pdf_options{options.pdf_lossless, true, options.pdf_missing_fonts_as_images,
+                                 options.pdf_jpeg_quality};
+    pdf_options.keep_original_image_data = options.pdf_keep_original_images;
+    pdf_options.pages = pdf_page_source_from_token(options.pdf_pages).value_or(PdfPageSource::Artboards);
+    pdf_options.include_ungrouped_layers = options.pdf_include_ungrouped_layers;
+    pdf_options.include_hidden_groups = options.pdf_include_hidden_groups;
+    write_pdf_document_file(document, path, pdf_options, notices);
+    return;
+  }
+  if ((lower == "tif" || lower == "tiff") && options.tiff_layers.value_or(false)) {
+    // Layered TIFF (docs/tiff.md): the composite plus Photoshop's layer data, from the real
+    // document like the editable PDF. Always RGB; the export transforms do not apply.
+    if (options.export_cmyk) {
+      throw std::runtime_error(PATCHY_TRANSLATE_NOOP(
+          "QObject", "A TIFF with layers is saved in RGB. Turn layers off to save a CMYK TIFF."));
+    }
+    psd::LayeredTiffWriteOptions tiff_options;
+    tiff_options.progress = [](int done, int total, const std::string& label) {
+      report_save_progress(done, total, SaveProgress::Kind::Layers, QString::fromStdString(label));
+    };
+    auto bytes = psd::write_layered_tiff(document, tiff_options);
+    if (const auto metadata = save_metadata_for(document, options, lower, document.width(), document.height())) {
+      bytes = metadata::inject_metadata(std::move(bytes), lower, *metadata);
+    }
+    write_bytes_with_save_file(path, bytes);
+    return;
+  }
+  if (document.color_state().bit_depth != BitDepth::UInt8 &&
+      flat_writer_needs_8bit_document(lower, extension_bytes, options)) {
+    std::optional<Document> narrowed;
+    write_flat_image_file(document_for_8bit_writer(document, narrowed), path, extension, options, notices);
+    return;
+  }
+  if (lower == "webp" && options.webp_animate) {
+    write_animated_webp_file(document, path, options, notices);
+    return;
+  }
+  if (jxl::is_jxl_extension(lower) && options.jxl_animate) {
+    write_animated_jxl_file(document, path, options, notices);
+    return;
+  }
+  if ((lower == "png" || lower == "apng") && options.apng_animate) {
+    write_animated_png_file(document, path, options, notices);
+    return;
+  }
+  if (lower == "gif" && options.gif_animate) {
+    // Before the export-transform re-entry: export_stand_in_document flattens the layers
+    // this writer needs, so the animated writer applies the transforms per frame itself.
+    write_animated_gif_file(document, path, options, notices);
+    return;
+  }
+  if (export_transform_requested(options)) {
+    // One level of re-entry: the stand-in has every transform applied, so the resolved
+    // options carry none of them.
+    auto resolved = options;
+    resolved.export_scale = 1;
+    resolved.export_trim_transparent = false;
+    resolved.export_width = 0;
+    resolved.export_height = 0;
+    resolved.export_fill_transparent = false;
+    write_flat_image_file(export_stand_in_document(document, options, notices), path, extension, resolved, notices);
+    return;
+  }
+  // HEIF is decode-only everywhere. Without this guard a hand-typed .heic in Save As
+  // would reach QImageWriter, whose platform plugins (qmacheif on macOS, kimg_heif +
+  // x265 on the Flatpak runtime) can silently HEVC-encode on some platforms but not
+  // others; Patchy never writes HEVC.
+  if (heif::is_heif_extension(lower)) {
+    throw std::runtime_error("HEIC/HEIF images are read-only in Patchy; save as PNG or PSD instead.");
+  }
+  if (avif::is_avif_extension(lower)) {
+    // Every platform, through the vendored libaom (docs/avif.md); the Exif and XMP items ride
+    // inside the container, so no injection step follows.
+    avif::WriteOptions avif_options;
+    avif_options.quality = std::clamp(options.avif_quality, 0, 100);
+    avif_options.lossless = options.avif_lossless;
+    avif_options.speed = std::clamp(options.avif_speed, 0, 10);
+    if (const auto metadata = save_metadata_for(document, options, "avif", document.width(), document.height())) {
+      avif_options.exif = metadata->exif;
+      avif_options.xmp.assign(metadata->xmp.begin(), metadata->xmp.end());
+    }
+    write_bytes_with_save_file(path, avif::write_avif(document, avif_options));
+    return;
+  }
+  if (lower == "tga") {
+    tga::DocumentIo::write_file(document, to_filesystem_path(path));
+    return;
+  }
+  if (jxr::is_jxr_extension(lower)) {
+    // Windows only (the filter row is gated on jxr::is_available(), so this is reachable
+    // elsewhere only through a hand-typed path, where the writer throws a clear message).
+    jxr::write_jxr_file(document, to_filesystem_path(path),
+                        jxr::WriteOptions{std::clamp(options.jxr_quality, 1, 100), options.jxr_lossless});
+    return;
+  }
+  if (jxl::is_jxl_extension(lower)) {
+    // Every platform, at the document's depth (docs/jxl.md).
+    write_jxl_with_metadata(document, path, options);
+    return;
+  }
+  if (rttex::is_rttex_extension(lower)) {
+    install_rttex_jpeg_codec();
+    rttex::WriteOptions rttex_options;
+    rttex_options.encoding = options.rttex_encoding;
+    rttex_options.jpeg_quality = std::clamp(options.rttex_jpeg_quality, 1, 100);
+    rttex_options.power_of_two = options.rttex_power_of_two;
+    rttex_options.force_square = options.rttex_force_square;
+    rttex_options.force_alpha = options.rttex_force_alpha;
+    rttex_options.compress = options.rttex_compress;
+    rttex::write_rttex_file(document, to_filesystem_path(path), rttex_options, notices);
+    return;
+  }
+  if (dds::is_dds_extension(lower)) {
+    dds::WriteOptions dds_options;
+    dds_options.compression = dds::resolve_compression(options.dds_compression, options.dds_source);
+    dds_options.generate_mipmaps = dds::resolve_mipmaps(options.dds_mipmaps, options.dds_source);
+    dds::write_dds_file(document, to_filesystem_path(path), dds_options, notices);
+    return;
+  }
+  // Radiance HDR, OpenEXR and JPEG 2000: the registry's byte writers, through the same
+  // atomic save as the other flat formats (docs/hdr-formats.md).
+  if (hdr::is_hdr_extension(lower)) {
+    write_bytes_with_save_file(path, hdr::write_hdr(document));
+    return;
+  }
+  if (exr::is_exr_extension(lower)) {
+    write_bytes_with_save_file(path, exr::write_exr(document));
+    return;
+  }
+  if (jp2::is_jp2_extension(lower)) {
+    write_bytes_with_save_file(path, jp2::write_jp2(document));
+    return;
+  }
+  if (lower == "gif") {
+    auto bytes = gif::write(document, palette_quantize_options(options));
+    if (const auto metadata = save_metadata_for(document, options, lower, document.width(), document.height())) {
+      bytes = metadata::inject_metadata(std::move(bytes), lower, *metadata);
+    }
+    write_bytes_with_save_file(path, bytes);
+    return;
+  }
+  if (lower == "pcx") {
+    pcx::DocumentIo::write_file(document, to_filesystem_path(path));
+    return;
+  }
+  if (lower == "lbm" || lower == "iff" || lower == "bbm") {
+    ilbm::DocumentIo::write_file(document, to_filesystem_path(path));
+    return;
+  }
+  if (lower == "ico" || lower == "cur") {
+    install_ico_png_codec();
+    ico::WriteOptions ico_options;
+    ico_options.sizes = options.ico_sizes;
+    const bool small_or_palettized =
+        (document.palette_editing().has_value() && !document.palette_editing()->palette.colors.empty()) ||
+        std::max(document.width(), document.height()) <= 64;
+    ico_options.nearest_neighbor = options.ico_resample == IcoResample::Nearest ||
+                                   (options.ico_resample == IcoResample::Auto && small_or_palettized);
+    ico_options.as_cursor = lower == "cur";
+    ico_options.hotspot_x = options.cur_hotspot_x;
+    ico_options.hotspot_y = options.cur_hotspot_y;
+    ico::DocumentIo::write_file(document, to_filesystem_path(path), ico_options);
+    return;
+  }
+  if (lower == "pdf") {
+    PdfExportOptions pdf_options{options.pdf_lossless, false, false, options.pdf_jpeg_quality};
+    pdf_options.keep_original_image_data = options.pdf_keep_original_images;
+    pdf_options.pages = pdf_page_source_from_token(options.pdf_pages).value_or(PdfPageSource::Artboards);
+    pdf_options.include_ungrouped_layers = options.pdf_include_ungrouped_layers;
+    pdf_options.include_hidden_groups = options.pdf_include_hidden_groups;
+    if (options.export_cmyk) {
+      pdf_options.cmyk_space = cmyk_export_space();
+      pdf_options.cmyk_black_ink_only = options.export_black_ink_only;
+    }
+    write_pdf_document_file(document, path, pdf_options, notices);
+    return;
+  }
+  if (options.export_cmyk) {
+    // JPEG or TIFF: Qt writes both in CMYK (Adobe-style inverted JPEG, separated TIFF);
+    // the working profile replaces any RGB profile in the metadata.
+    const auto space = cmyk_export_space();
+    const auto image = cmyk_export_qimage(document, *space, SeparationOptions{options.export_black_ink_only});
+    auto metadata = save_metadata_for(document, options, lower, image.width(), image.height())
+                        .value_or(metadata::SaveMetadata{});
+    metadata.icc = space->profile_bytes();
+    write_qimage_atomically(image, path, lower,
+                            is_jpeg_extension(extension_bytes) ? std::clamp(options.jpeg_quality, 0, 100) : -1,
+                            metadata, jpeg_coding_for(options));
+    return;
+  }
+  if (is_bmp_extension(extension_bytes)) {
+    bmp::DocumentIo::write_file(document, to_filesystem_path(path),
+                                bmp::WriteOptions{options.bmp_encoding, options.bmp_palette_mode, true,
+                                                  to_filesystem_path(options.bmp_palette_path)});
+    return;
+  }
+  // Palette-mode documents export PNG as indexed PNG-8 with the document palette
+  // (converting to RGB mode first restores plain RGBA PNG export).
+  if (extension.compare(QStringLiteral("png"), Qt::CaseInsensitive) == 0 &&
+      document.palette_editing().has_value() && !document.palette_editing()->palette.colors.empty()) {
+    write_flat_qimage(document, options, indexed_png8_image(document), path, lower, -1);
+    return;
+  }
+  // Palette PNG (Export for Web): the GIF quantizer's colors, one transparent entry (tRNS).
+  if (extension.compare(QStringLiteral("png"), Qt::CaseInsensitive) == 0 && options.png_palette) {
+    write_flat_qimage(document, options, quantized_png8_image(document, options), path, lower, -1);
+    return;
+  }
+
+  // 32-bit documents keep their floats in TIFF; 16 and 32-bit documents keep 16 bits in
+  // PNG (and 16-bit TIFF).
+  if ((lower == "tif" || lower == "tiff") && document.color_state().bit_depth == BitDepth::Float32) {
+    write_flat_qimage(document, options, float_export_qimage(document, image_format_preserves_alpha(extension_bytes)),
+                      path, lower, -1);
+    return;
+  }
+  if ((lower == "png" || lower == "tif" || lower == "tiff") && document.color_state().bit_depth != BitDepth::UInt8) {
+    write_flat_qimage(document, options, deep_export_qimage(document, image_format_preserves_alpha(extension_bytes)),
+                      path, lower, -1);
+    return;
+  }
+  int quality = -1;
+  if (is_jpeg_extension(extension_bytes)) {
+    quality = std::clamp(options.jpeg_quality, 0, 100);
+  } else if (lower == "webp") {
+    // Qt's WebP plugin encodes losslessly at quality 100 and lossy below it.
+    quality = options.webp_lossless ? 100 : std::clamp(options.webp_quality, 0, 100);
+  }
+  write_flat_qimage(document, options, flat_export_qimage(document, image_format_preserves_alpha(extension_bytes)),
+                    path, lower, quality);
+}
+
+Document export_transformed_document(const Document& document, const ImageSaveOptions& options,
+                                     std::vector<std::string>* notices) {
+  std::optional<Document> narrowed;
+  return export_stand_in_document(document_for_8bit_writer(document, narrowed), options, notices);
+}
+
+ImageSaveOptions without_export_transforms(ImageSaveOptions options) {
+  options.export_scale = 1;
+  options.export_trim_transparent = false;
+  options.export_width = 0;
+  options.export_height = 0;
+  options.export_fill_transparent = false;
+  return options;
+}
+
+std::vector<std::uint8_t> encode_flat_image_bytes(const Document& document, const QString& extension,
+                                                  const ImageSaveOptions& options,
+                                                  std::vector<std::string>* notices) {
+  // Through write_flat_image_file into a private folder, so the bytes are exactly what an
+  // export of the same options writes, for every format and its animated forms.
+  const QTemporaryDir directory(QDir::temp().filePath(QStringLiteral("patchy-encode-XXXXXX")));
+  if (!directory.isValid()) {
+    throw std::runtime_error(directory.errorString().toStdString());
+  }
+  const auto path = directory.filePath(QStringLiteral("encoded.") + extension);
+  write_flat_image_file(document, path, extension, options, notices);
+  QFile file(path);
+  if (!file.open(QIODevice::ReadOnly)) {
+    throw std::runtime_error(file.errorString().toStdString());
+  }
+  const auto bytes = file.readAll();
+  return {reinterpret_cast<const std::uint8_t*>(bytes.constData()),
+          reinterpret_cast<const std::uint8_t*>(bytes.constData()) + bytes.size()};
+}
+
+void write_encoded_image_file(const QString& path, std::span<const std::uint8_t> bytes) {
+  write_bytes_with_save_file(path, bytes);
+}
+
+std::vector<const Layer*> animation_export_layers(const Document& document) {
+  std::vector<const Layer*> frame_layers;
+  for (const auto& frame : animation::animation_frames(std::as_const(document).layers(), false)) {
+    frame_layers.push_back(frame.layer);
+  }
+  return frame_layers;
+}
+
+bool animation_export_frames_have_transparency(const Document& document) {
+  const auto& top_level = std::as_const(document).layers();
+  for (const auto& ref : animation::animation_frames(top_level, false)) {
+    auto image = render_layers_isolated(document, animation::animation_frame_stack(top_level, ref));
+    if (image.format() != QImage::Format_ARGB32 && image.format() != QImage::Format_ARGB32_Premultiplied) {
+      image = image.convertToFormat(QImage::Format_ARGB32);
+    }
+    for (int y = 0; y < image.height(); ++y) {
+      const auto* row = reinterpret_cast<const QRgb*>(image.constScanLine(y));
+      for (int x = 0; x < image.width(); ++x) {
+        if (qAlpha(row[x]) < 255) {
+          return true;
+        }
+      }
+    }
+  }
+  return false;
+}
+
+void for_each_animation_export_frame(const Document& document, const ImageSaveOptions& options,
+                                     std::vector<std::string>* notices,
+                                     const std::function<void(PixelBuffer rgba, const Layer& layer)>& frame) {
+  const auto& top_level = std::as_const(document).layers();
+  const auto frames = animation::animation_frames(top_level, false);
+  // Each frame draws its own layer plus the shared ("all") layers (docs/animation.md).
+  const auto render_frame = [&](const animation::AnimationFrameRef& ref) {
+    return pixels_from_image_rgba(render_layers_isolated(document, animation::animation_frame_stack(top_level, ref)));
+  };
+  // One transform for every frame. Trim needs every frame up front: it crops to the UNION
+  // of their visible-alpha bounds so the frames keep a single canvas size (the encoder
+  // writes full-canvas frames, no offsets). Without trim the frames render one at a time.
+  ExportTransform transform;
+  const auto canvas_width = document.width();
+  const auto canvas_height = document.height();
+  auto width = canvas_width;
+  auto height = canvas_height;
+  std::vector<PixelBuffer> rendered;
+  if (options.export_trim_transparent) {
+    rendered.reserve(frames.size());
+    std::optional<Rect> union_bounds;
+    for (const auto& ref : frames) {
+      rendered.push_back(render_frame(ref));
+      if (const auto bounds = visible_alpha_local_bounds(rendered.back()); bounds.has_value()) {
+        union_bounds = union_bounds.has_value() ? union_rects(*union_bounds, *bounds) : *bounds;
+      }
+    }
+    if (union_bounds.has_value()) {
+      if (union_bounds->width != width || union_bounds->height != height) {
+        transform.crop = *union_bounds;
+      }
+      width = union_bounds->width;
+      height = union_bounds->height;
+    } else if (notices != nullptr) {
+      notices->push_back(trim_kept_full_canvas_notice());
+    }
+  }
+  transform.resize = export_resize_target(options, width, height, canvas_width, canvas_height);
+  transform.scale = std::max(1, options.export_scale);
+
+  for (std::size_t index = 0; index < frames.size(); ++index) {
+    const Layer& layer = *frames[index].layer;
+    auto rgba = index < rendered.size() ? std::move(rendered[index]) : render_frame(frames[index]);
+    rgba = transform_export_buffer(rgba, transform);
+    if (options.export_fill_transparent) {
+      composite_over_background(rgba, options.export_background_color);
+    }
+    frame(std::move(rgba), layer);
+  }
+}
+
+namespace {
+enum class AnimatedFormat : std::uint8_t { Gif, Webp, Jxl, Png };
+}  // namespace
+
+static void write_animated_layers(const Document& document, const QString& path, const ImageSaveOptions& options,
+                                  std::vector<std::string>* notices, AnimatedFormat format) {
+  const bool as_webp = format == AnimatedFormat::Webp;
+  const bool as_jxl = format == AnimatedFormat::Jxl;
+  const bool as_png = format == AnimatedFormat::Png;
+  const bool palette_mode =
+      document.palette_editing().has_value() && !document.palette_editing()->palette.colors.empty();
+  const auto default_delay_cs =
+      static_cast<std::uint16_t>(std::clamp(options.gif_frame_delay_cs, 0, 0xffff));
+
+  if (animation_export_layers(document).empty()) {
+    throw std::runtime_error(
+        as_webp  ? PATCHY_TRANSLATE_NOOP("QObject", "The document has no visible top-level layers to export as an animated WebP.")
+        : as_jxl ? PATCHY_TRANSLATE_NOOP("QObject", "The document has no visible top-level layers to export as an animated JPEG XL.")
+        : as_png ? PATCHY_TRANSLATE_NOOP("QObject", "The document has no visible top-level layers to export as an animated PNG.")
+                 : "The document has no visible top-level layers to export as an animated GIF.");
+  }
+
+  std::unique_ptr<webp::AnimationEncoder> webp_encoder;
+  std::unique_ptr<jxl::AnimationEncoder> jxl_encoder;
+  std::unique_ptr<apng::AnimationEncoder> png_encoder;
+  std::vector<gif::GifFrame> frames;
+  std::int32_t frame_width = document.width();
+  std::int32_t frame_height = document.height();
+  for_each_animation_export_frame(document, options, notices, [&](PixelBuffer rgba, const Layer& layer) {
+    frame_width = rgba.width();
+    frame_height = rgba.height();
+    if (as_webp) {
+      if (!webp_encoder) {
+        if (options.webp_loop_count < 0 || options.webp_loop_count > 65535 ||
+            options.animation_frame_delay_ms < 0 ||
+            options.animation_frame_delay_ms > static_cast<int>(animation::kMaxFrameDelayMs)) {
+          throw std::runtime_error(PATCHY_TRANSLATE_NOOP("QObject", "Invalid animated WebP frame or duration."));
+        }
+        webp_encoder = std::make_unique<webp::AnimationEncoder>(frame_width, frame_height,
+            static_cast<std::uint16_t>(options.webp_loop_count), options.webp_quality, options.webp_lossless);
+      }
+      webp_encoder->add(rgba, animation::parse_layer_name_delay_ms(layer.name()).value_or(
+          static_cast<std::uint32_t>(options.animation_frame_delay_ms)));
+      return;
+    }
+    if (as_jxl) {
+      if (!jxl_encoder) {
+        if (options.jxl_loop_count < 0 || options.jxl_loop_count > 65535 || options.animation_frame_delay_ms < 0 ||
+            options.animation_frame_delay_ms > static_cast<int>(animation::kMaxFrameDelayMs)) {
+          throw std::runtime_error(PATCHY_TRANSLATE_NOOP("QObject", "Invalid animated JPEG XL frame or duration."));
+        }
+        jxl_encoder = std::make_unique<jxl::AnimationEncoder>(
+            frame_width, frame_height, BitDepth::UInt8, static_cast<std::uint16_t>(options.jxl_loop_count),
+            jxl_write_options(document, options, frame_width, frame_height),
+            document.color_state().embedded_icc_profile);
+      }
+      jxl_encoder->add(rgba, animation::parse_layer_name_delay_ms(layer.name()).value_or(
+          static_cast<std::uint32_t>(options.animation_frame_delay_ms)));
+      return;
+    }
+    if (as_png) {
+      if (!png_encoder) {
+        if (options.apng_loop_count < 0 || options.apng_loop_count > 65535 || options.animation_frame_delay_ms < 0 ||
+            options.animation_frame_delay_ms > static_cast<int>(animation::kMaxFrameDelayMs)) {
+          throw std::runtime_error(PATCHY_TRANSLATE_NOOP("QObject", "Invalid animated PNG frame or duration."));
+        }
+        png_encoder = std::make_unique<apng::AnimationEncoder>(
+            frame_width, frame_height, static_cast<std::uint32_t>(options.apng_loop_count),
+            dots_per_meter_from_ppi(document.print_settings().horizontal_ppi),
+            dots_per_meter_from_ppi(document.print_settings().vertical_ppi));
+      }
+      png_encoder->add(rgba, animation::parse_layer_name_delay_ms(layer.name()).value_or(
+          static_cast<std::uint32_t>(options.animation_frame_delay_ms)));
+      return;
+    }
+    auto indexed = palette_mode
+                       ? indexed_rgba8_with_palette(rgba, document.palette_editing()->palette.colors,
+                                                    document.palette_editing()->alpha_threshold)
+                       : indexed_rgba8_quantized(rgba, gif::kQuantizeAlphaThreshold, palette_quantize_options(options));
+    gif::GifFrame frame;
+    frame.palette = std::move(indexed.palette);
+    frame.transparent_index = indexed.transparent_index;
+    frame.indexes = std::move(indexed.indexes);
+    frame.delay_cs = gif::parse_layer_name_delay_cs(layer.name()).value_or(default_delay_cs);
+    frames.push_back(std::move(frame));
+  });
+  if (as_jxl) {
+    write_file_bytes_atomically(to_filesystem_path(path), jxl_encoder->finish(),
+        PATCHY_TRANSLATE_NOOP("QObject", "Could not open JPEG XL file for writing"),
+        PATCHY_TRANSLATE_NOOP("QObject", "Could not write JPEG XL file"));
+    return;
+  }
+  const auto metadata =
+      save_metadata_for(document, options, as_webp ? "webp" : as_png ? "png" : "gif", frame_width, frame_height);
+  if (as_png) {
+    auto bytes = png_encoder->finish();
+    if (metadata) {
+      bytes = metadata::inject_metadata(std::move(bytes), "png", *metadata);
+    }
+    write_file_bytes_atomically(to_filesystem_path(path), bytes,
+        PATCHY_TRANSLATE_NOOP("QObject", "Could not open PNG file for writing"),
+        PATCHY_TRANSLATE_NOOP("QObject", "Could not write PNG file"));
+  } else if (as_webp) {
+    auto bytes = webp_encoder->finish();
+    if (metadata) {
+      bytes = metadata::inject_metadata(std::move(bytes), "webp", *metadata);
+    }
+    write_file_bytes_atomically(to_filesystem_path(path), bytes,
+        PATCHY_TRANSLATE_NOOP("QObject", "Could not open WebP file for writing"),
+        PATCHY_TRANSLATE_NOOP("QObject", "Could not write WebP file"));
+  } else if (metadata) {
+    write_bytes_with_save_file(
+        path, metadata::inject_metadata(gif::encode_animation(frame_width, frame_height, frames), "gif", *metadata));
+  } else {
+    gif::write_animation_file(frame_width, frame_height, frames, to_filesystem_path(path));
+  }
+}
+
+void write_animated_gif_file(const Document& document, const QString& path, const ImageSaveOptions& options,
+                             std::vector<std::string>* notices) {
+  write_animated_layers(document, path, options, notices, AnimatedFormat::Gif);
+}
+
+void write_animated_webp_file(const Document& document, const QString& path, const ImageSaveOptions& options,
+                              std::vector<std::string>* notices) {
+  write_animated_layers(document, path, options, notices, AnimatedFormat::Webp);
+}
+
+void write_animated_jxl_file(const Document& document, const QString& path, const ImageSaveOptions& options,
+                             std::vector<std::string>* notices) {
+  write_animated_layers(document, path, options, notices, AnimatedFormat::Jxl);
+}
+
+void write_animated_png_file(const Document& document, const QString& path, const ImageSaveOptions& options,
+                             std::vector<std::string>* notices) {
+  write_animated_layers(document, path, options, notices, AnimatedFormat::Png);
+}
+
+}  // namespace patchy::ui

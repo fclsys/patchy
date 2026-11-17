@@ -1,0 +1,1907 @@
+#include <QStatusBar>
+#include "ui/canvas_widget.hpp"
+#include "formats/acv_curves_io.hpp"
+#include "formats/bmp_document_io.hpp"
+#include "formats/aseprite_document_io.hpp"
+#include "formats/ico_document_io.hpp"
+#include "formats/tga_document_io.hpp"
+#include "formats/svg_document_io.hpp"
+#include "ui/image_document_io.hpp"
+#include "ui/main_window.hpp"
+#include "ui/app_settings.hpp"
+#include "psd/psd_document_io.hpp"
+#include "test_harness.hpp"
+#include <QAction>
+#include <QApplication>
+#include <QCheckBox>
+#include <QCoreApplication>
+#include <QImage>
+#include <QProcess>
+#include <QProcessEnvironment>
+#include <QTimer>
+#include <QVariant>
+#include <algorithm>
+#include <atomic>
+#include <chrono>
+#include <array>
+#include <cstdint>
+#include <cmath>
+#include <cstring>
+#include <exception>
+#include <filesystem>
+#include <fstream>
+#include <functional>
+#include <iostream>
+#include <memory>
+#include <optional>
+#include <span>
+#include <stdexcept>
+#include <string>
+#include <string_view>
+#include <vector>
+#include "ui_test_access.hpp"
+#include "ui_test_support.hpp"
+#include "local_psd_fixtures.hpp"
+#include "core/artboard.hpp"
+#include "core/vector_live_shapes.hpp"
+#include "core/vector_raster.hpp"
+#include "core/vector_shape.hpp"
+#include "core/adjustment_layer.hpp"
+#include "ui/background_workers.hpp"
+#include "ui/dialog_utils.hpp"
+#include "ui/script_engine.hpp"
+#include "ui/vector_preview_renderer.hpp"
+#include "ui/canvas_widget_shared.hpp"
+#include <cstdio>
+#include <limits>
+#include <utility>
+
+using namespace patchy;
+using namespace patchy::ui;
+using namespace patchy::test::ui;
+
+namespace {
+
+struct PreviewPreferenceGuard {
+  QVariant before = app_settings().value(QStringLiteral("view/vectorPreview"));
+  PreviewPreferenceGuard() { app_settings().remove(QStringLiteral("view/vectorPreview")); }
+  ~PreviewPreferenceGuard() {
+    if (before.isValid()) { app_settings().setValue(QStringLiteral("view/vectorPreview"), before); }
+    else { app_settings().remove(QStringLiteral("view/vectorPreview")); }
+  }
+};
+
+VectorShapeContent ellipse(double x, double y, double width, double height, RgbColor color) {
+  LiveShapeParams params;
+  params.kind = LiveShapeKind::Ellipse;
+  params.left = x; params.top = y; params.right = x + width; params.bottom = y + height;
+  VectorShapeContent shape;
+  shape.path.subpaths = generate_live_shape_subpaths(params);
+  shape.fill.color = color;
+  return shape;
+}
+
+Layer shape_layer(Document& doc, VectorShapeContent shape) {
+  Layer layer(doc.allocate_layer_id(), "Vector", LayerKind::Pixel);
+  layer.set_vector_shape(std::move(shape));
+  update_vector_shape_raster(layer, Rect::from_size(doc.width(), doc.height()), nullptr);
+  return layer;
+}
+
+Document sample() {
+  Document doc(96, 80, PixelFormat::rgba8());
+  VectorShapeContent paper;
+  paper.fill.color = {244, 241, 233};
+  doc.add_layer(shape_layer(doc, paper));
+  auto shape = ellipse(9.125, 7.5, 71.5, 60.25, {40, 140, 190});
+  shape.stroke.enabled = true;
+  shape.stroke.width = 0.8;
+  shape.stroke.cap = VectorStrokeCap::Round;
+  shape.stroke.join = VectorStrokeJoin::Round;
+  shape.stroke.content.color = {20, 35, 45};
+  auto hole = ellipse(28, 22, 32, 27, {});
+  hole.path.subpaths[0].op = PathCombineOp::Subtract;
+  hole.path.subpaths[0].shape_group = 1;
+  shape.path.subpaths.push_back(hole.path.subpaths[0]);
+  Layer group(doc.allocate_layer_id(), "Group", LayerKind::Group);
+  group.set_blend_mode(BlendMode::PassThrough);
+  group.set_opacity(0.7F);
+  auto first = shape_layer(doc, shape);
+  first.set_fill_opacity(0.8F);
+  group.add_child(std::move(first));
+  auto second = shape_layer(doc, ellipse(40, 17, 42, 40, {220, 70, 30}));
+  second.set_opacity(0.6F);
+  group.add_child(std::move(second));
+  doc.add_layer(std::move(group));
+  return doc;
+}
+
+void settle(CanvasWidget& canvas) {
+  canvas.update();
+  CHECK(process_events_until([&] { return canvas.render_settled(); }, 60000));
+  QApplication::processEvents();
+}
+
+void ui_vector_preview_tiles_match_full_vector_raster() {
+  auto doc = sample();
+  const auto original = psd::DocumentIo::write_layered_rgb8(doc);
+  const auto scene = build_vector_preview_scene(doc);
+  CHECK(scene.fallback == VectorPreviewFallback::None);
+  for (const int scale : {1, 4, 8}) {
+    auto enlarged = doc;
+    resize_image_and_layers(enlarged, doc.width() * scale, doc.height() * scale);
+    const auto expected = qimage_from_document(enlarged, true);
+    const auto result = render_vector_preview(scene, {expected.size(), static_cast<double>(scale), {}});
+    CHECK(result.fallback == VectorPreviewFallback::None);
+    CHECK(result.image == expected);
+    CHECK(result.peak_raster_bytes <= kVectorPreviewRasterBudget);
+  }
+  // Fractional origin and zoom have one phase across all tiles. A viewport
+  // crop at an integer screen offset must equal the corresponding full view.
+  const VectorPreviewView full{{700, 620}, 5.375, {37.25, 24.625}};
+  const auto a = render_vector_preview(scene, full);
+  const auto b = render_vector_preview(scene, {{420, 360}, full.scale, full.offset - QPointF(231, 193)});
+  CHECK(a.fallback == VectorPreviewFallback::None);
+  CHECK(b.image == a.image.copy(231, 193, 420, 360));
+  CHECK(psd::DocumentIo::write_layered_rgb8(doc) == original);
+}
+
+void ui_vector_preview_strokes_complements_and_group_isolation() {
+  for (const auto alignment : {VectorStrokeAlignment::Inside, VectorStrokeAlignment::Center, VectorStrokeAlignment::Outside}) {
+    for (const auto join : {VectorStrokeJoin::Miter, VectorStrokeJoin::Round, VectorStrokeJoin::Bevel}) {
+      Document doc(40, 40, PixelFormat::rgba8());
+      auto shape = ellipse(3.25, 4.5, 31, 27, {170, 130, 60});
+      shape.stroke.enabled = true;
+      shape.stroke.width = 1.25;
+      shape.stroke.alignment = alignment;
+      shape.stroke.join = join;
+      shape.stroke.cap = join == VectorStrokeJoin::Miter ? VectorStrokeCap::Butt :
+          join == VectorStrokeJoin::Round ? VectorStrokeCap::Round : VectorStrokeCap::Square;
+      shape.stroke.dashes = {2, 1};
+      shape.stroke.dash_offset = 0.35;
+      shape.stroke.opacity = 0.7;
+      shape.path_inverted = true;
+      shape.path.subpaths[0].closed = false;
+      Layer group(doc.allocate_layer_id(), "Isolated", LayerKind::Group);
+      group.set_opacity(0.65F);
+      group.add_child(shape_layer(doc, shape));
+      doc.add_layer(std::move(group));
+      const auto scene = build_vector_preview_scene(doc);
+      auto enlarged = doc;
+      resize_image_and_layers(enlarged, 320, 320);
+      const auto result = render_vector_preview(scene, {{320, 320}, 8.0, {}});
+      CHECK(result.fallback == VectorPreviewFallback::None);
+      CHECK(result.image == qimage_from_document(enlarged, true));
+    }
+  }
+}
+
+void ui_vector_preview_eligibility_and_resource_guards() {
+  auto doc = sample();
+  auto& raster = doc.add_layer(Layer(doc.allocate_layer_id(), "Raster", PixelBuffer(1, 1, PixelFormat::rgba8())));
+  CHECK(build_vector_preview_scene(doc).fallback == VectorPreviewFallback::None);
+  raster.set_visible(false);
+  CHECK(build_vector_preview_scene(doc).fallback == VectorPreviewFallback::None);
+  auto& layer = doc.layers().front();
+  layer.set_clipped(true);
+  CHECK(build_vector_preview_scene(doc).fallback == VectorPreviewFallback::None);
+  layer.set_clipped(false);
+  auto changed = *std::as_const(layer).vector_shape();
+  changed.fill.kind = VectorFillKind::Gradient;
+  layer.set_vector_shape(changed);
+  CHECK(build_vector_preview_scene(doc).fallback == VectorPreviewFallback::None);
+  changed.fill.kind = VectorFillKind::Solid;
+  layer.set_vector_shape(changed);
+  layer.set_vector_mask(LayerVectorMask{});
+  CHECK(build_vector_preview_scene(doc).fallback == VectorPreviewFallback::None);
+  layer.clear_vector_mask();
+  LayerDropShadow shadow;
+  shadow.enabled = true;
+  layer.layer_style().drop_shadows.push_back(shadow);
+  CHECK(build_vector_preview_scene(doc).fallback == VectorPreviewFallback::None);
+  layer.layer_style().drop_shadows[0].size = 1e12F;
+  layer.layer_style().drop_shadows[0].enabled = false;
+  CHECK(render_vector_preview(build_vector_preview_scene(doc), {{100, 100}, 4, {}}).fallback == VectorPreviewFallback::None);
+  layer.layer_style().drop_shadows[0].enabled = true;
+  layer.layer_style().effects_visible = false;
+  CHECK(render_vector_preview(build_vector_preview_scene(doc), {{100, 100}, 4, {}}).fallback == VectorPreviewFallback::None);
+  layer.layer_style() = {};
+  const auto scene = build_vector_preview_scene(doc);
+  CHECK(render_vector_preview(scene, {{100000, 100000}, 8, {}}).fallback == VectorPreviewFallback::Memory);
+  CHECK(render_vector_preview(scene, {{100, 100}, 8, {}}, kVectorPreviewRasterBudget).fallback == VectorPreviewFallback::Memory);
+  CHECK(render_vector_preview(scene, {{100, 100}, 8, {}}, std::numeric_limits<std::uint64_t>::max()).fallback == VectorPreviewFallback::Memory);
+  CHECK(render_vector_preview(scene, {{100, 100}, std::numeric_limits<double>::infinity(), {}}).fallback == VectorPreviewFallback::Coordinates);
+  auto huge = sample();
+  auto& shape_layer_ref = huge.layers()[1].children()[0];
+  auto huge_shape = *std::as_const(shape_layer_ref).vector_shape();
+  huge_shape.path.subpaths[0].anchors[0].in_x = 1e12;
+  shape_layer_ref.set_vector_shape(std::move(huge_shape));
+  CHECK(render_vector_preview(build_vector_preview_scene(huge), {{100, 100}, 8, {}}).fallback == VectorPreviewFallback::Coordinates);
+  std::atomic_bool cancelled{true};
+  CHECK(render_vector_preview(scene, {{100, 100}, 8, {}}, 0, &cancelled).image.isNull());
+}
+
+Document mixed_sample() {
+  auto doc = sample();
+  PixelBuffer pixels(40, 35, PixelFormat::rgba8());
+  for (int y = 0; y < pixels.height(); ++y) {
+    for (int x = 0; x < pixels.width(); ++x) {
+      auto* p = pixels.pixel(x, y);
+      p[0] = ((x / 3 + y / 3) % 2) ? 220 : 40;
+      p[1] = 180; p[2] = 120; p[3] = 180;
+    }
+  }
+  Layer raster(doc.allocate_layer_id(), "Bitmap", pixels);
+  raster.set_bounds({24, 23, pixels.width(), pixels.height()});
+  raster.set_blend_mode(BlendMode::Multiply);
+  doc.add_layer(std::move(raster));
+  auto& group = doc.layers()[1];
+  PixelBuffer mask(45, 50, PixelFormat::gray8());
+  mask.clear(200);
+  group.set_mask(LayerMask{{20, 10, 45, 50}, std::move(mask), 30, false});
+  auto& child = group.children()[1];
+  child.set_clipped(true);
+  child.set_blend_mode(BlendMode::Screen);
+  LayerBlendIf blend;
+  blend.channels[0].underlying_layer.white_low = 210;
+  blend.channels[0].underlying_layer.white_high = 250;
+  CHECK(child.set_blend_if(blend));
+  child.set_restricted_channels(kRestrictBlue);
+  Layer adjustment(doc.allocate_layer_id(), "Invert", LayerKind::Adjustment);
+  adjustment.metadata()[kLayerMetadataAdjustmentType] = "invert";
+  adjustment.set_opacity(0.3F);
+  doc.add_layer(std::move(adjustment));
+  return doc;
+}
+
+void ui_vector_preview_mixed_content_matches_compositor() {
+  auto doc = mixed_sample();
+  const auto original = psd::DocumentIo::write_layered_rgb8(doc);
+  const auto scene = build_vector_preview_scene(doc);
+  CHECK(scene.fallback == VectorPreviewFallback::None);
+  CHECK(scene.has_vectors);
+  const auto native = render_vector_preview(scene, {{doc.width(), doc.height()}, 1, {}});
+  CHECK(native.fallback == VectorPreviewFallback::None);
+  CHECK(native.image == qimage_from_document(doc, true));
+  const VectorPreviewView full{{700, 600}, 4.25, {17.375, 20.625}};
+  const auto a = render_vector_preview(scene, full);
+  const auto b = render_vector_preview(scene, {{400, 330}, full.scale, full.offset - QPointF(211, 189)});
+  CHECK(a.fallback == VectorPreviewFallback::None);
+  CHECK(b.fallback == VectorPreviewFallback::None);
+  CHECK(b.image == a.image.copy(211, 189, 400, 330));
+  CHECK(a.image.save(QStringLiteral("test-artifacts/vector-preview-mixed.png")));
+  CHECK(psd::DocumentIo::write_layered_rgb8(doc) == original);
+}
+
+void ui_vector_preview_gradient_pattern_effects_and_vector_masks() {
+  for (int variant = 0; variant < 18; ++variant) {
+    auto doc = sample();
+    auto& group = doc.layers()[1];
+    auto& layer = group.children()[0];
+    auto shape = *std::as_const(layer).vector_shape();
+    LayerStyleGradient gradient;
+    gradient.color_stops = {{0, {240, 40, 20}}, {1, {10, 150, 240}}};
+    gradient.alpha_stops = {{0, 1}, {1, 0.6F}};
+    gradient.angle_degrees = 27;
+    if (variant == 0) { shape.fill.kind = VectorFillKind::Gradient; shape.fill.gradient = gradient; }
+    if (variant == 1) {
+      PixelBuffer pattern(3, 3, PixelFormat::rgba8());
+      pattern.clear(255);
+      pattern.pixel(1, 1)[0] = 0;
+      doc.metadata().patterns.adopt({"preview-pattern", "Pattern", std::move(pattern)});
+      shape.fill.kind = VectorFillKind::Pattern;
+      shape.fill.pattern_id = "preview-pattern";
+      shape.fill.pattern_scale = 2;
+      shape.fill.pattern_phase_x = 1.25;
+      set_layer_effects_reference_point(layer, 11, 7);
+    }
+    if (variant == 2) {
+      LayerVectorMask mask;
+      mask.path = ellipse(20, 10, 60, 58, {}).path;
+      mask.density = 220;
+      group.set_vector_mask(std::move(mask));
+      update_vector_mask_raster(group, {0, 0, doc.width(), doc.height()});
+    }
+    if (variant == 3) {
+      LayerDropShadow shadow;
+      shadow.enabled = true; shadow.size = 2; shadow.distance = 3;
+      layer.layer_style().drop_shadows.push_back(shadow);
+    }
+    if (variant == 4) {
+      LayerGradientFill fill;
+      fill.enabled = true; fill.gradient = gradient;
+      layer.layer_style().gradient_fills.push_back(fill);
+    }
+    if (variant == 5) {
+      LayerStroke stroke;
+      stroke.enabled = true; stroke.size = 2;
+      stroke.uses_gradient = true; stroke.gradient = gradient;
+      layer.layer_style().strokes.push_back(stroke);
+    }
+    if (variant == 6) {
+      LayerBevelEmboss bevel;
+      bevel.enabled = true; bevel.size = 2;
+      layer.layer_style().bevels.push_back(bevel);
+    }
+    if (variant == 7) {
+      LayerDropShadow shadow;
+      shadow.enabled = true; shadow.size = 2; shadow.distance = 3;
+      group.layer_style().drop_shadows.push_back(shadow);
+    }
+    if (variant == 8) {
+      LayerVectorMask mask;
+      mask.path = ellipse(20, 10, 60, 58, {}).path;
+      mask.feather = 1.25;
+      mask.inverted = true;
+      group.set_vector_mask(std::move(mask));
+      update_vector_mask_raster(group, {0, 0, doc.width(), doc.height()});
+    }
+    if (variant == 9) {
+      LayerInnerGlow inner;
+      inner.enabled = true; inner.size = 2;
+      layer.layer_style().inner_glows.push_back(inner);
+      LayerOuterGlow outer;
+      outer.enabled = true; outer.size = 2;
+      layer.layer_style().outer_glows.push_back(outer);
+    }
+    if (variant == 10) {
+      LayerSatin satin;
+      satin.enabled = true; satin.size = 2; satin.distance = 2;
+      layer.layer_style().satins.push_back(satin);
+    }
+    if (variant == 11) {
+      LayerGradientFill fill;
+      fill.enabled = true; fill.gradient = gradient;
+      group.layer_style().gradient_fills.push_back(fill);
+      PixelBuffer mask(30, 25, PixelFormat::gray8());
+      mask.clear(255);
+      layer.set_mask(LayerMask{{30, 30, 30, 25}, std::move(mask), 0, false});
+    }
+    if (variant == 12) {
+      PixelBuffer pattern(3, 3, PixelFormat::rgba8());
+      pattern.clear(255);
+      pattern.pixel(1, 1)[1] = 0;
+      doc.metadata().patterns.adopt({"overlay-pattern", "Overlay", std::move(pattern)});
+      LayerPatternOverlay overlay;
+      overlay.enabled = true; overlay.pattern_id = "overlay-pattern";
+      overlay.scale = 2; overlay.phase_x = 1.25F; overlay.phase_y = -3;
+      layer.layer_style().pattern_overlays.push_back(overlay);
+      set_layer_effects_reference_point(layer, 11, 7);
+    }
+    if (variant == 13) {
+      LayerInnerGlow glow;
+      glow.enabled = true; glow.size = 2;
+      doc.layers()[0].layer_style().inner_glows.push_back(glow);
+    }
+    if (variant == 14 || variant == 15) {
+      LayerStroke stroke;
+      stroke.enabled = true; stroke.size = 2;
+      stroke.uses_gradient = true; stroke.gradient = gradient;
+      stroke.gradient.align_with_layer = false;
+      layer.layer_style().strokes.push_back(stroke);
+      if (variant == 15) {
+        LayerBevelEmboss bevel;
+        bevel.enabled = true; bevel.size = 2; bevel.style = BevelEmbossStyleKind::StrokeEmboss;
+        layer.layer_style().bevels.push_back(bevel);
+      }
+    }
+    if (variant == 16 || variant == 17) {
+      gradient.alpha_stops = {{0, 0}, {0.5F, 0}, {1, 1}};
+      auto& paint = variant == 16 ? shape.fill : shape.stroke.content;
+      paint.kind = VectorFillKind::Gradient;
+      paint.gradient = gradient;
+    }
+    layer.set_vector_shape(std::move(shape));
+    update_vector_shape_raster(layer, {0, 0, doc.width(), doc.height()}, &std::as_const(doc).metadata().patterns);
+    const auto scene = build_vector_preview_scene(doc);
+    const auto native = render_vector_preview(scene, {{doc.width(), doc.height()}, 1, {}});
+    CHECK(native.fallback == VectorPreviewFallback::None);
+    const auto expected = qimage_from_document(doc, true);
+    if (native.image != expected) {
+      (void)native.image.save(QStringLiteral("test-artifacts/vector-preview-variant-%1-actual.png").arg(variant));
+      (void)expected.save(QStringLiteral("test-artifacts/vector-preview-variant-%1-expected.png").arg(variant));
+      throw std::runtime_error("native mixed variant " + std::to_string(variant));
+    }
+    const VectorPreviewView full{{530, 460}, 4, {}};
+    const auto a = render_vector_preview(scene, full);
+    const auto b = render_vector_preview(scene, {{310, 280}, 4, {-197, -173}});
+    CHECK(a.fallback == VectorPreviewFallback::None);
+    CHECK(b.fallback == VectorPreviewFallback::None);
+    if (b.image != a.image.copy(197, 173, 310, 280)) {
+      (void)b.image.save(QStringLiteral("test-artifacts/vector-preview-variant-%1-crop.png").arg(variant));
+      (void)a.image.save(QStringLiteral("test-artifacts/vector-preview-variant-%1-full.png").arg(variant));
+      throw std::runtime_error("tile mixed variant " + std::to_string(variant));
+    }
+  }
+}
+
+void ui_vector_preview_canvas_cache_invalidation_and_lifetime() {
+  auto doc = sample();
+  const auto bytes = psd::DocumentIo::write_layered_rgb8(doc);
+  const auto revision = std::as_const(doc).layers()[0].render_revision();
+  CanvasWidget canvas;
+  canvas.resize(620, 520);
+  canvas.set_document(&doc);
+  canvas.show();
+  canvas.set_zoom_centered(8);
+  canvas.center_document_in_view();
+  canvas.set_tool(CanvasTool::Pan);
+  canvas.set_vector_preview_enabled(true);
+  settle(canvas);
+  CHECK(canvas.vector_preview_status().contains(QStringLiteral("sharp vector view")));
+  const auto first = canvas.grab().toImage();
+  const auto runs = canvas.render_cache_diagnostics().vector_preview_renders;
+  for (int i = 0; i < 4; ++i) { (void)canvas.grab(); }
+  CHECK(canvas.render_cache_diagnostics().vector_preview_renders == runs);
+  CHECK(std::as_const(doc).layers()[0].render_revision() == revision);
+  CHECK(psd::DocumentIo::write_layered_rgb8(doc) == bytes);
+  for (const double zoom : {4.0, 11.0, 6.375, 128.0, 8.0}) {
+    canvas.set_zoom_centered(zoom);
+    (void)canvas.grab();
+  }
+  canvas.center_document_in_view();
+  settle(canvas);
+  CHECK(canvas.grab().toImage() == first);
+  canvas.set_tiling_preview_enabled(true);
+  (void)canvas.grab();
+  CHECK(canvas.vector_preview_status().contains(QStringLiteral("alternate canvas views")));
+  canvas.set_tiling_preview_enabled(false);
+  settle(canvas);
+  canvas.set_layer_edit_target(CanvasWidget::LayerEditTarget::ComponentRed);
+  (void)canvas.grab();
+  CHECK(canvas.vector_preview_status().contains(QStringLiteral("alternate canvas views")));
+  canvas.set_component_channel_preview(CanvasWidget::LayerEditTarget::Content);
+  settle(canvas);
+  CHECK(canvas.vector_preview_status().contains(QStringLiteral("sharp vector view")));
+  doc.set_active_layer(std::as_const(doc).layers()[1].children()[0].id());
+  CHECK(canvas.begin_free_transform());
+  (void)canvas.grab();
+  CHECK(canvas.vector_preview_status().contains(QStringLiteral("alternate canvas views")));
+  canvas.cancel_free_transform();
+  settle(canvas);
+  auto& raster = doc.add_layer(Layer(doc.allocate_layer_id(), "Raster", PixelBuffer(2, 2, PixelFormat::rgba8())));
+  const auto raster_id = raster.id();
+  canvas.document_changed();
+  settle(canvas);
+  CHECK(canvas.vector_preview_status().contains(QStringLiteral("sharp vector view")));
+  doc.find_layer(raster_id)->set_visible(false);
+  canvas.document_changed();
+  settle(canvas);
+  CHECK(canvas.vector_preview_status().contains(QStringLiteral("sharp vector view")));
+  canvas.set_zoom_centered(4);
+  (void)canvas.grab();
+  canvas.set_document(nullptr);
+  QApplication::processEvents();
+  canvas.set_document(&doc);
+  canvas.set_zoom_centered(8);
+  settle(canvas);
+  auto closing = std::make_unique<CanvasWidget>();
+  closing->resize(620, 520);
+  closing->set_document(&doc);
+  closing->show();
+  closing->set_zoom_centered(8);
+  closing->set_vector_preview_enabled(true);
+  (void)closing->grab();
+  closing.reset();
+  wait_for_tracked_background_workers();
+  QApplication::processEvents();
+}
+
+void ui_vector_preview_action_persistence_script_and_history() {
+  PreviewPreferenceGuard guard;
+  MainWindow window;
+  show_window(window);
+  auto* canvas = require_canvas(window);
+  auto& doc = MainWindowTestAccess::document(window);
+  doc = sample();
+  canvas->set_document(&doc);
+  auto* action = window.findChild<QAction*>(QStringLiteral("viewVectorPreviewAction"));
+  CHECK(action && !action->isChecked());
+  CHECK(action->text() == QStringLiteral("Dynamic Vector Preview"));
+  const auto history = MainWindowTestAccess::active_session_undo_depth(window);
+  const auto modified = MainWindowTestAccess::active_session_is_modified(window);
+  const auto bytes = psd::DocumentIo::write_layered_rgb8(doc);
+  window.statusBar()->showMessage(QStringLiteral("Keep this editing message"));
+  ScriptEngineHost::RunOptions options;
+  options.name = QStringLiteral("vector-preview-test");
+  (void)window.script_engine_host().run_source(QStringLiteral(
+      "if (!app.runCommand('view.vector_preview')) throw new Error('command'); patchy.ui.zoom = 800;"
+      "if (!patchy.ui.captureWindow('test-artifacts/ui_vector_preview_capture.png')) throw new Error('capture');"), options);
+  CHECK(process_events_until([&] { return !window.script_engine_host().run_active(); }));
+  settle(*canvas);
+  CHECK(!window.script_engine_host().last_run_had_error());
+  CHECK(!QImage(QStringLiteral("test-artifacts/ui_vector_preview_capture.png")).isNull());
+  CHECK(action->isChecked());
+  CHECK(window.statusBar()->currentMessage() == QStringLiteral("Keep this editing message"));
+  CHECK(app_settings().value(QStringLiteral("view/vectorPreview")).toBool());
+  CHECK(MainWindowTestAccess::active_session_undo_depth(window) == history);
+  CHECK(MainWindowTestAccess::active_session_is_modified(window) == modified);
+  CHECK(psd::DocumentIo::write_layered_rgb8(doc) == bytes);
+  (void)window.script_engine_host().run_source(QStringLiteral(
+      "app.activeDocument.layers[1].children[0].x += 4;"), options);
+  CHECK(process_events_until([&] { return !window.script_engine_host().run_active(); }));
+  settle(*canvas);
+  CHECK(!window.script_engine_host().last_run_had_error());
+  const auto moved = psd::DocumentIo::write_layered_rgb8(MainWindowTestAccess::document(window));
+  CHECK(moved != bytes);
+  MainWindowTestAccess::undo(window);
+  settle(*canvas);
+  CHECK(psd::DocumentIo::write_layered_rgb8(MainWindowTestAccess::document(window)) == bytes);
+  MainWindowTestAccess::redo(window);
+  settle(*canvas);
+  CHECK(psd::DocumentIo::write_layered_rgb8(MainWindowTestAccess::document(window)) == moved);
+  MainWindowTestAccess::create_default_document(window);
+  CHECK(require_canvas(window)->vector_preview_enabled());
+  MainWindowTestAccess::activate_canvas(window, canvas);
+  CHECK(canvas->vector_preview_enabled());
+  MainWindow another;
+  show_window(another);
+  CHECK(require_canvas(another)->vector_preview_enabled());
+  auto* restored_action = require_action(another, "viewVectorPreviewAction");
+  CHECK(restored_action->isChecked());
+  // The first click after loading an enabled preference must turn it off.
+  restored_action->trigger();
+  CHECK(!restored_action->isChecked());
+  CHECK(!require_canvas(another)->vector_preview_enabled());
+  restored_action->trigger();
+  CHECK(require_canvas(another)->vector_preview_enabled());
+
+  bool saw_preferences = false;
+  QTimer::singleShot(0, [&] {
+    try {
+      auto* dialog = find_top_level_dialog(QStringLiteral("patchyPreferencesDialog"));
+      CHECK(dialog != nullptr);
+      auto* check = dialog->findChild<QCheckBox*>(QStringLiteral("preferencesDynamicVectorPreviewCheck"));
+      CHECK(check && check->isChecked());
+      check->setChecked(false);
+      saw_preferences = true;
+      dialog->accept();
+    } catch (...) {
+      (void)unwind_non_modal_dialog_loop(std::current_exception());
+    }
+  });
+  require_action(another, "filePreferencesAction")->trigger();
+  CHECK(saw_preferences);
+  CHECK(!restored_action->isChecked());
+  CHECK(!require_canvas(another)->vector_preview_enabled());
+  CHECK(!app_settings().value(QStringLiteral("view/vectorPreview")).toBool());
+}
+
+void ui_vector_preview_little_everywhere_if_available() {
+  const auto path = patchy::test::local_format_fixture_path("vector-preview", "Little-Everywhere.psd");
+  patchy::test::skip_unless_exists(path);
+  auto doc = psd::DocumentIo::read_file(path);
+  const auto scene = build_vector_preview_scene(doc);
+  CHECK(scene.fallback == VectorPreviewFallback::None);
+  CanvasWidget canvas;
+  canvas.resize(1280, 900);
+  canvas.set_document(&doc);
+  canvas.show();
+  canvas.set_tool(CanvasTool::Pan);
+  // Center the captures on actual bench geometry, including at maximum zoom.
+  const auto find_bench = [&](const auto& self, const std::vector<Layer>& layers) -> const Layer* {
+    for (const auto& layer : layers) {
+      if (layer.name() == "Slatted bench") { return &layer; }
+      if (const auto* found = self(self, layer.children())) { return found; }
+    }
+    return nullptr;
+  };
+  const auto* bench = find_bench(find_bench, std::as_const(doc).layers());
+  CHECK(bench != nullptr);
+  const auto find_anchor = [&](const auto& self, const Layer& layer) -> std::optional<QPointF> {
+    if (const auto* shape = layer.vector_shape()) {
+      for (const auto& subpath : shape->path.subpaths) {
+        if (!subpath.anchors.empty()) {
+          return QPointF(subpath.anchors[0].anchor_x, subpath.anchors[0].anchor_y);
+        }
+      }
+    }
+    for (const auto& child : layer.children()) {
+      if (auto point = self(self, child)) { return point; }
+    }
+    return {};
+  };
+  const auto anchor = find_anchor(find_anchor, *bench);
+  CHECK(anchor.has_value());
+  canvas.zoom_to_document_rect(QRect(static_cast<int>(anchor->x()) - 10, static_cast<int>(anchor->y()) - 10, 20, 20));
+  for (const double zoom : {1.0, 4.0, 8.0, 6.375, 128.0}) {
+    canvas.set_vector_preview_enabled(false);
+    canvas.set_zoom_centered(zoom);
+    settle(canvas);
+    save_widget_artifact("vector-preview-little-" + std::to_string(zoom * 100) + "-pixels", canvas);
+    canvas.set_vector_preview_enabled(true);
+    settle(canvas);
+    save_widget_artifact("vector-preview-little-" + std::to_string(zoom * 100) + "-vectors", canvas);
+    if (zoom * canvas.devicePixelRatioF() > 1) {
+      CHECK(canvas.vector_preview_status().contains(QStringLiteral("sharp vector view")));
+      const auto stats = canvas.render_cache_diagnostics();
+      CHECK(stats.vector_preview_peak_raster_bytes <= kVectorPreviewRasterBudget);
+      std::printf("Vector Preview %.1f%%: %.1f ms, raster reservation %llu bytes\n", zoom * 100,
+                  stats.vector_preview_elapsed_ms, static_cast<unsigned long long>(stats.vector_preview_peak_raster_bytes));
+    }
+  }
+}
+
+void ui_vector_preview_resource_notice_is_once_and_never_covers_other_status() {
+  PreviewPreferenceGuard guard;
+  MainWindow window;
+  show_window(window);
+  auto* canvas = require_canvas(window);
+  auto& doc = MainWindowTestAccess::document(window);
+  doc = sample();
+  auto& layer = doc.layers()[1].children()[0];
+  auto shape = *std::as_const(layer).vector_shape();
+  shape.path.subpaths[0].anchors[0].in_x = 1e12;
+  layer.set_vector_shape(std::move(shape));
+  canvas->set_document(&doc);
+  canvas->set_zoom_centered(8);
+  window.statusBar()->clearMessage();
+  require_action(window, "viewVectorPreviewAction")->trigger();
+  settle(*canvas);
+  CHECK(window.statusBar()->currentMessage().contains(QStringLiteral("preview range")));
+  window.statusBar()->clearMessage();
+  for (const double zoom : {4.0, 8.0, 6.375}) {
+    canvas->set_zoom_centered(zoom);
+    settle(*canvas);
+    CHECK(window.statusBar()->currentMessage().isEmpty());
+  }
+  window.statusBar()->showMessage(QStringLiteral("Another tool's message"));
+  canvas->set_vector_preview_enabled(false);
+  canvas->set_vector_preview_enabled(true);
+  settle(*canvas);
+  CHECK(window.statusBar()->currentMessage() == QStringLiteral("Another tool's message"));
+}
+
+// With Dynamic Vector Preview on, View > Pixel Grid vanished (the preview frame covered
+// the composite's deep-zoom raster, grid included) and only flashed during zooms. The grid
+// must show above the sharp view at every deep zoom, mid-zoom while the old frame is
+// mapped, and across preview toggles; guides, the document grid and selection edges stay
+// above it too (docs/vector-preview.md, "Overlay order").
+struct InteriorGridCheck {
+  int mismatches{0};  // fill or line color where the other was expected
+  int line_pixels{0};
+  int other{0};       // neither color: an overlay drawn over the interior
+};
+
+InteriorGridCheck interior_grid_check(CanvasWidget& canvas, QRgb fill, bool grid) {
+  QApplication::processEvents();
+  const auto image = canvas.grab().toImage().convertToFormat(QImage::Format_ARGB32_Premultiplied);
+  const auto ratio = canvas.devicePixelRatioF();
+  const auto device_x = [&](int x) {
+    return qRound(canvas.widget_position_for_document_point(QPoint(x, 0)).x() * ratio);
+  };
+  const auto device_y = [&](int y) {
+    return qRound(canvas.widget_position_for_document_point(QPoint(0, y)).y() * ratio);
+  };
+  const auto content = canvas_content_rect(canvas);
+  const QRect device_content(qRound(content.left() * ratio), qRound(content.top() * ratio),
+                             qRound(content.width() * ratio), qRound(content.height() * ratio));
+  const auto inside = device_content.intersected(image.rect());
+  const auto line = pixel_grid_line_color(fill);
+  InteriorGridCheck result;
+  // Document cells well inside the 4..20 x 3..15 rectangle, away from its edges.
+  for (int y = 5; y < 13; ++y) {
+    for (int x = 6; x < 18; ++x) {
+      for (int dy = device_y(y); dy < device_y(y + 1); ++dy) {
+        for (int dx = device_x(x); dx < device_x(x + 1); ++dx) {
+          if (!inside.contains(dx, dy)) { continue; }
+          const bool on_line = grid && (dx == device_x(x) || dy == device_y(y));
+          const auto shown = image.pixel(dx, dy) | 0xff000000U;
+          if (on_line) { ++result.line_pixels; }
+          if (shown == (on_line ? line : fill)) { continue; }
+          if (shown == line || shown == fill) { ++result.mismatches; } else { ++result.other; }
+        }
+      }
+    }
+  }
+  return result;
+}
+
+void ui_vector_preview_keeps_pixel_grid_and_overlays_above() {
+  Document doc(24, 18, PixelFormat::rgba8());
+  VectorShapeContent paper;
+  paper.fill.color = {244, 241, 233};
+  doc.add_layer(shape_layer(doc, paper));
+  LiveShapeParams params;
+  params.kind = LiveShapeKind::Rectangle;
+  params.left = 4; params.top = 3; params.right = 20; params.bottom = 15;
+  VectorShapeContent box;
+  box.path.subpaths = generate_live_shape_subpaths(params);
+  box.fill.color = {40, 140, 190};
+  doc.add_layer(shape_layer(doc, box));
+  const auto fill = qRgb(40, 140, 190);
+
+  CanvasWidget canvas;
+  canvas.resize(320, 240);
+  canvas.set_document(&doc);
+  canvas.show();
+  canvas.set_tool(CanvasTool::Pan);
+  canvas.set_pixel_grid_visible(true);
+  canvas.set_vector_preview_enabled(false);
+  canvas.set_view_zoom_centered(8.0);
+  settle(canvas);
+  const auto report = [&](const char* when, const InteriorGridCheck& check) {
+    std::cerr << when << ": " << check.line_pixels << " line pixels, " << check.mismatches << " mismatches, "
+              << check.other << " other\n";
+  };
+  auto check = interior_grid_check(canvas, fill, true);
+  report("preview off", check);
+  CHECK(check.line_pixels > 0 && check.mismatches == 0 && check.other == 0);
+
+  canvas.set_vector_preview_enabled(true);
+  settle(canvas);
+  CHECK(canvas.vector_preview_status().contains(QStringLiteral("sharp vector view")));
+  check = interior_grid_check(canvas, fill, true);
+  report("preview on", check);
+  save_image_artifact("ui_vector_preview_pixel_grid_800", canvas.grab().toImage());
+  CHECK(check.line_pixels > 0 && check.mismatches == 0 && check.other == 0);
+
+  // Mid-zoom (the old frame mapped to the new view, or the new one landed): grid either way.
+  for (const double zoom : {12.0, 6.0, 9.0}) {
+    canvas.set_view_zoom_centered(zoom);
+    check = interior_grid_check(canvas, fill, true);
+    report("zoom step", check);
+    CHECK(check.line_pixels > 0 && check.mismatches == 0 && check.other == 0);
+    settle(canvas);
+    CHECK(canvas.vector_preview_status().contains(QStringLiteral("sharp vector view")));
+    check = interior_grid_check(canvas, fill, true);
+    report("zoom settled", check);
+    CHECK(check.line_pixels > 0 && check.mismatches == 0 && check.other == 0);
+  }
+  // Below 600% the grid stays off with the preview on, as without it.
+  canvas.set_view_zoom_centered(5.0);
+  settle(canvas);
+  check = interior_grid_check(canvas, fill, false);
+  CHECK(check.mismatches == 0 && check.other == 0);
+  canvas.set_view_zoom_centered(8.0);
+  settle(canvas);
+
+  // View > Pixel Grid off removes it under the preview too; toggling the preview keeps it.
+  canvas.set_pixel_grid_visible(false);
+  check = interior_grid_check(canvas, fill, false);
+  CHECK(check.mismatches == 0 && check.other == 0);
+  canvas.set_pixel_grid_visible(true);
+  canvas.set_vector_preview_enabled(false);
+  settle(canvas);
+  CHECK(interior_grid_check(canvas, fill, true).line_pixels > 0);
+  canvas.set_vector_preview_enabled(true);
+  settle(canvas);
+  CHECK(canvas.vector_preview_status().contains(QStringLiteral("sharp vector view")));
+  check = interior_grid_check(canvas, fill, true);
+  report("preview toggled back on", check);
+  CHECK(check.line_pixels > 0 && check.mismatches == 0 && check.other == 0);
+
+  // The other overlays draw above the preview: each adds pixels of its own color.
+  doc.guides().push_back({GuideOrientation::Vertical, 10 * 32});
+  canvas.set_guides_visible(true);
+  check = interior_grid_check(canvas, fill, true);
+  report("guide", check);
+  CHECK(check.other > 0);
+  canvas.set_guides_visible(false);
+  CHECK(interior_grid_check(canvas, fill, true).other == 0);
+
+  doc.grid_settings().horizontal_cycle_32 = 8 * 32;
+  doc.grid_settings().vertical_cycle_32 = 8 * 32;
+  canvas.set_grid_subdivisions(2);
+  canvas.set_grid_visible(true);
+  check = interior_grid_check(canvas, fill, true);
+  report("document grid", check);
+  CHECK(check.other > 0);
+  canvas.set_grid_visible(false);
+  CHECK(interior_grid_check(canvas, fill, true).other == 0);
+
+  QImage alpha(6, 4, QImage::Format_Grayscale8);
+  alpha.fill(255);
+  canvas.apply_automatic_selection_mask(QRect(8, 7, 6, 4), alpha, SelectionMode::Replace, QStringLiteral("Select"));
+  settle(canvas);
+  CHECK(canvas.vector_preview_status().contains(QStringLiteral("sharp vector view")));
+  check = interior_grid_check(canvas, fill, true);
+  report("selection edges", check);
+  CHECK(check.other > 0);
+  canvas.set_selection_edges_visible(false);
+  CHECK(interior_grid_check(canvas, fill, true).other == 0);
+}
+
+// Dynamic Vector Preview in an artboard document: the scene keeps each artboard (its rect
+// mapped to the view), so the compositor clips the children and paints the paper exactly as
+// the document render does at that scale.
+void ui_vector_preview_renders_artboards() {
+  Document doc(60, 50, PixelFormat::rgba8());
+  auto board = make_artboard_group(doc.allocate_layer_id(), "Board", Rect{6, 5, 40, 30}, ArtboardBackground::White);
+  // The ellipse runs past the board's right edge, where the artboard clips it.
+  board.add_child(shape_layer(doc, ellipse(20.25, 9.5, 34.5, 21.75, {200, 40, 40})));
+  doc.layers().push_back(std::move(board));
+  doc.add_layer(shape_layer(doc, ellipse(48.5, 36.25, 10, 12, {40, 90, 200})));  // loose, off the board
+  doc.metadata().artboard_settings.emplace();
+  const auto scene = build_vector_preview_scene(doc);
+  CHECK(scene.fallback == VectorPreviewFallback::None);
+  CHECK(scene.has_vectors);
+  for (const int scale : {1, 4, 8}) {
+    auto enlarged = doc;
+    resize_image_and_layers(enlarged, doc.width() * scale, doc.height() * scale);
+    const auto expected = qimage_from_document(enlarged, true);
+    const auto result = render_vector_preview(scene, {expected.size(), static_cast<double>(scale), {}});
+    CHECK(result.fallback == VectorPreviewFallback::None);
+    CHECK(result.image == expected);
+  }
+}
+
+// Document cells (zoom x zoom widget squares) that hold both the shape's red and the white
+// behind it: a sharp vector edge splits cells, the document-pixel view never does (each
+// cell is one color, apart from overlay lines, which are neither color).
+int split_edge_cells(const QImage& image, const CanvasWidget& canvas, QSize document_size) {
+  int count = 0;
+  for (int y = 0; y < document_size.height(); ++y) {
+    for (int x = 0; x < document_size.width(); ++x) {
+      const auto top_left = canvas.widget_position_for_document_point(QPoint(x, y));
+      const auto bottom_right = canvas.widget_position_for_document_point(QPoint(x + 1, y + 1));
+      bool red = false;
+      bool white = false;
+      for (int py = top_left.y() + 2; py < bottom_right.y() - 2; ++py) {
+        for (int px = top_left.x() + 2; px < bottom_right.x() - 2; ++px) {
+          if (!image.rect().contains(px, py)) {
+            continue;
+          }
+          const auto color = image.pixelColor(px, py);
+          red = red || (std::abs(color.red() - 210) <= 30 && color.green() <= 70 && color.blue() <= 70);
+          white = white || (color.red() >= 235 && color.green() >= 235 && color.blue() >= 235);
+        }
+      }
+      count += red && white ? 1 : 0;
+    }
+  }
+  return count;
+}
+
+// Dynamic Vector Preview through a Free Transform session on a shape layer, in a plain
+// document or inside an artboard: the open session (rotated, under Nearest Neighbor too)
+// shows the transformed path at view resolution instead of the resampled document pixels,
+// and the committed result stays sharp.
+void check_free_transform_stays_sharp(bool on_artboard) {
+  PreviewPreferenceGuard preference_guard;
+  {
+    MainWindow window;
+    show_window(window);
+    Document doc(48, 36, PixelFormat::rgba8());
+    LayerId shape_id{};
+    auto shape = shape_layer(doc, ellipse(6, 8, 30, 16, {210, 30, 30}));
+    shape.metadata()[kLayerMetadataVectorShape] = "1";  // a shape layer, as the shape tools make
+    shape_id = shape.id();
+    if (on_artboard) {
+      auto board = make_artboard_group(doc.allocate_layer_id(), "Board", Rect{0, 0, 48, 36}, ArtboardBackground::White);
+      board.add_child(std::move(shape));
+      doc.layers().push_back(std::move(board));
+      doc.metadata().artboard_settings.emplace();
+    } else {
+      PixelBuffer white(48, 36, PixelFormat::rgba8());
+      white.clear(255);
+      doc.add_layer(Layer(doc.allocate_layer_id(), "Background", std::move(white)));
+      doc.add_layer(std::move(shape));
+    }
+    window.add_document_session(std::move(doc), on_artboard ? QStringLiteral("Board") : QStringLiteral("Plain"));
+    MainWindowTestAccess::select_layers(window, {shape_id}, shape_id);
+    auto* canvas = require_canvas(window);
+    auto* preview_action = require_hotkey_action(window, QStringLiteral("view.vector_preview"));
+    if (!preview_action->isChecked()) {
+      preview_action->trigger();
+    }
+    CHECK(canvas->vector_preview_enabled());
+    canvas->set_zoom(10.0);
+    settle(*canvas);
+    const QSize size(48, 36);
+    const std::string label = on_artboard ? "artboard" : "plain";
+    const auto widget_color = [&](QPoint document_point) {
+      return canvas->grab().toImage().pixelColor(canvas->widget_position_for_document_point(document_point) + QPoint(5, 5));
+    };
+    const auto is_red = [](QColor color) { return color.red() >= 180 && color.green() <= 70; };
+    const auto is_white = [](QColor color) { return color.red() >= 235 && color.green() >= 235 && color.blue() >= 235; };
+    save_widget_artifact("dynamic_vector_static_" + label, *canvas);
+    CHECK(split_edge_cells(canvas->grab().toImage(), *canvas, size) > 20);
+
+    require_hotkey_action(window, QStringLiteral("edit.free_transform"))->trigger();
+    CHECK(canvas->free_transform_active());
+    settle(*canvas);
+    save_widget_artifact("dynamic_vector_free_transform_" + label, *canvas);
+    CHECK(split_edge_cells(canvas->grab().toImage(), *canvas, size) > 20);
+
+    // A quarter turn about the shape's center: the frame shows the turned shape.
+    CHECK(canvas->set_transform_controls_state(QPointF(21, 16), 100.0, 100.0, 90.0));
+    settle(*canvas);
+    save_widget_artifact("dynamic_vector_free_transform_rotated_" + label, *canvas);
+    CHECK(split_edge_cells(canvas->grab().toImage(), *canvas, size) > 20);
+    CHECK(is_red(widget_color(QPoint(21, 3))));     // inside the turned shape only
+    CHECK(is_white(widget_color(QPoint(33, 16))));  // inside the original shape only
+    // The pixel grid over the frame takes its tones from the transformed document: no grid
+    // line still traces the shape where it was.
+    const auto rotated = canvas->grab().toImage();
+    const auto line_x = canvas->widget_position_for_document_point(QPoint(33, 16));
+    for (int dx = -1; dx <= 1; ++dx) {
+      const auto color = rotated.pixelColor(line_x + QPoint(dx, 5));
+      CHECK(color.red() - color.green() < 40);
+    }
+    canvas->set_transform_interpolation(TransformInterpolation::NearestNeighbor);
+    settle(*canvas);
+    CHECK(split_edge_cells(canvas->grab().toImage(), *canvas, size) > 20);
+
+    canvas->finish_free_transform();
+    CHECK(!canvas->free_transform_active());
+    settle(*canvas);
+    CHECK(split_edge_cells(canvas->grab().toImage(), *canvas, size) > 20);
+    CHECK(is_red(widget_color(QPoint(21, 3))));
+    CHECK(is_white(widget_color(QPoint(33, 16))));
+  }
+}
+
+// The hot-air-balloon SVG at a 1920x1080 viewport centered on the canvas. A render's cost
+// must follow the viewport, not the zoomed size of the shapes.
+Document balloon_document() {
+  const auto path = patchy::test::committed_format_fixture_path("svg", "hot_air_balloons_cc0.svg");
+  std::ifstream in(path, std::ios::binary);
+  CHECK(in.good());
+  std::vector<std::uint8_t> bytes((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+  return svg::DocumentIo::read(bytes);
+}
+
+VectorPreviewView balloon_view(const Document& doc, double scale) {
+  const QSize viewport(1920, 1080);
+  return {viewport, scale, QPointF(viewport.width() / 2.0 - doc.width() / 2.0 * scale,
+                                   viewport.height() / 2.0 - doc.height() / 2.0 * scale)};
+}
+
+void collect_shapes(const std::vector<Layer>& layers, std::vector<const VectorShapeContent*>& out) {
+  for (const auto& layer : layers) {
+    if (layer.kind() == LayerKind::Group) { collect_shapes(layer.children(), out); }
+    else if (const auto* shape = layer.vector_shape()) { out.push_back(shape); }
+  }
+}
+
+void ui_vector_preview_cost_follows_viewport_not_zoom() {
+  const auto doc = balloon_document();
+  const auto scene = build_vector_preview_scene(doc);
+  CHECK(scene.fallback == VectorPreviewFallback::None && scene.has_vectors);
+  std::vector<const VectorShapeContent*> shapes;
+  collect_shapes(doc.layers(), shapes);
+  CHECK(shapes.size() > 100U);
+  // The viewport is the same size at every zoom; before the fix 800% cost 35x 100% and
+  // 1600% did not finish in 10 minutes. A loaded or throttling machine (a laptop that moves
+  // the test to slower cores a few seconds in) slows every render alike for a while, so a
+  // zoomed render is compared with the slower of the two 100% renders around it in the same
+  // round, and the better of two rounds counts.
+  const auto timed = [&](double scale) {
+    const auto result = render_vector_preview(scene, balloon_view(doc, scale));
+    CHECK(result.fallback == VectorPreviewFallback::None);
+    CHECK(!result.image.isNull());
+    // Many times the slowest render seen on a throttled laptop (3.4 s); the old code took
+    // 110 s at 400%.
+    CHECK(result.elapsed_ms < 60000.0);
+    std::cout << "  balloons " << scale * 100.0 << "%: " << result.elapsed_ms << " ms\n";
+    return result.elapsed_ms;
+  };
+  double ratio_800 = std::numeric_limits<double>::infinity();
+  double ratio_1600 = ratio_800;
+  for (int round = 0; round < 2; ++round) {
+    const double before = timed(1.0);
+    timed(2.0);
+    timed(4.0);
+    const double at_800 = timed(8.0);
+    const double at_1600 = timed(16.0);
+    const double reference = std::max({before, timed(1.0), 100.0});
+    ratio_800 = std::min(ratio_800, at_800 / reference);
+    ratio_1600 = std::min(ratio_1600, at_1600 / reference);
+  }
+  std::cout << "  balloons 800% / 100%: " << ratio_800 << ", 1600% / 100%: " << ratio_1600 << "\n";
+  CHECK(ratio_800 <= 4.0);
+  CHECK(ratio_1600 <= 5.0);
+
+  // What a tile rasterizes is byte-identical to the reference geometry (every curve
+  // flattened, every segment pair of a combined stroke tested; slow, hence 200%).
+  const auto view = balloon_view(doc, 2.0);
+  const int tile = kVectorPreviewTileSize;
+  int painted_strokes = 0;
+  for (const auto& clip : {Rect{3 * tile, 2 * tile, tile, tile}, Rect{1920 - tile, 0, tile, tile},
+                           Rect{5 * tile, 3 * tile, tile, tile}}) {
+    VectorRasterOptions fast{clip};
+    VectorRasterOptions full{clip};
+    full.reference_geometry = true;
+    for (const auto* source : shapes) {
+      auto shape = *source;
+      transform_vector_path(shape.path, {view.scale, 0, 0, view.scale, view.offset.x(), view.offset.y()});
+      shape.stroke.width *= view.scale;
+      const auto a = rasterize_vector_path(shape.path, fast);
+      const auto b = rasterize_vector_path(shape.path, full);
+      CHECK(a.bounds == b.bounds && a.pixels.data().size() == b.pixels.data().size() &&
+            std::equal(a.pixels.data().begin(), a.pixels.data().end(), b.pixels.data().begin()));
+      if (shape.stroke.enabled) {
+        const auto c = rasterize_vector_stroke(shape.path, shape.stroke, fast);
+        const auto d = rasterize_vector_stroke(shape.path, shape.stroke, full);
+        CHECK(c.bounds == d.bounds && c.pixels.data().size() == d.pixels.data().size() &&
+              std::equal(c.pixels.data().begin(), c.pixels.data().end(), d.pixels.data().begin()));
+        painted_strokes += c.bounds.empty() ? 0 : 1;
+      }
+    }
+  }
+  std::cout << "  balloons 200% tiles: " << painted_strokes << " painted strokes compared\n";
+  CHECK(painted_strokes >= 5);
+}
+
+void ui_vector_preview_stays_sharp_through_free_transform() { check_free_transform_stays_sharp(false); }
+
+void ui_vector_preview_stays_sharp_through_free_transform_on_artboard() { check_free_transform_stays_sharp(true); }
+
+// Gray noise, different in every pixel: nearest-neighbor and bilinear scaling of it disagree
+// nearly everywhere, and every blend of it stays gray.
+int smoothing_noise(int x, int y) {
+  auto z = ((static_cast<std::uint64_t>(static_cast<std::uint32_t>(y)) << 32) | static_cast<std::uint32_t>(x)) +
+           0x9e3779b97f4a7c15ULL;
+  z = (z ^ (z >> 30)) * 0xbf58476d1ce4e5b9ULL;
+  z = (z ^ (z >> 27)) * 0x94d049bb133111ebULL;
+  return 64 + static_cast<int>((z ^ (z >> 31)) % 129U);
+}
+
+// The preview frame follows the display smoothing rule (docs/view-navigation.md, "Display
+// interpolation"): with a shape in the document, a photo looks the same as it does without
+// the preview. At fractional zooms between 100% and 200% the frame's raster content matches
+// the smoothed composite; at whole zooms and from 200% up it is the exact blocks. Runs at
+// device pixel ratio 1 here and 2 in a child run of this test (QT_SCALE_FACTOR=2).
+void ui_vector_preview_raster_content_follows_display_smoothing_rule() {
+  const bool child = qEnvironmentVariableIsSet("PATCHY_VECTOR_PREVIEW_DPR_CHILD");
+  // 2000 px maps to whole device pixels at every zoom below, at ratio 1 and 2, so the
+  // composite's pixel-aligned rect and the frame's exact view share one geometry.
+  constexpr int kSide = 2000;
+  Document doc(kSide, kSide, PixelFormat::rgba8());
+  {
+    PixelBuffer photo(kSide, kSide, PixelFormat::rgba8());
+    for (int y = 0; y < kSide; ++y) {
+      for (int x = 0; x < kSide; ++x) {
+        auto* p = photo.pixel(x, y);
+        p[0] = p[1] = p[2] = static_cast<std::uint8_t>(smoothing_noise(x, y));
+        p[3] = 255;
+      }
+    }
+    Layer layer(doc.allocate_layer_id(), "Photo", std::move(photo));
+    layer.set_bounds({0, 0, kSide, kSide});
+    doc.add_layer(std::move(layer));
+  }
+  const QRect shape_rect(24, 16, 16, 12);
+  {
+    LiveShapeParams params;
+    params.kind = LiveShapeKind::Rectangle;
+    params.left = shape_rect.left(); params.top = shape_rect.top();
+    params.right = shape_rect.left() + shape_rect.width(); params.bottom = shape_rect.top() + shape_rect.height();
+    VectorShapeContent box;
+    box.path.subpaths = generate_live_shape_subpaths(params);
+    box.fill.color = {255, 0, 255};
+    doc.add_layer(shape_layer(doc, box));
+  }
+  const auto fill = qRgb(255, 0, 255);
+
+  CanvasWidget canvas;
+  canvas.resize(300, 220);
+  canvas.set_document(&doc);
+  canvas.show();
+  canvas.set_tool(CanvasTool::Pan);
+  canvas.set_pixel_grid_visible(false);
+  QApplication::processEvents();
+  const double ratio = canvas.devicePixelRatioF();
+  std::cout << "vector preview smoothing device pixel ratio " << ratio << '\n';
+  CHECK(std::abs(ratio - (child ? 2.0 : 1.0)) < 0.001);
+
+  struct View {
+    QImage off;
+    QImage on;
+    QPointF origin;  // the document origin in device pixels
+    double scale{};  // device pixels per document pixel
+    QRect area;      // the canvas content in device pixels
+    QRectF shape;    // the shape in device pixels
+  };
+  const auto capture = [&](double zoom) {
+    View view;
+    canvas.set_vector_preview_enabled(false);
+    // Park the document's corner at a whole widget pixel near the view's corner, so the
+    // document edge is on screen and both paths place the same pixels.
+    canvas.center_view_on_document_point(QPointF(0, 0), zoom);
+    const auto center = canvas.view_transform().map_to_widget(QPointF(0, 0));
+    canvas.center_view_on_document_point(QPointF((center.x() - 10.0) / canvas.zoom(), (center.y() - 8.0) / canvas.zoom()));
+    settle(canvas);
+    view.off = canvas.grab().toImage().convertToFormat(QImage::Format_RGB32);
+    const auto renders = canvas.render_cache_diagnostics().vector_preview_renders;
+    canvas.set_vector_preview_enabled(true);
+    settle(canvas);
+    CHECK(canvas.vector_preview_status().contains(QStringLiteral("sharp vector view")));
+    CHECK(canvas.render_cache_diagnostics().vector_preview_renders > renders);
+    view.on = canvas.grab().toImage().convertToFormat(QImage::Format_RGB32);
+    view.scale = canvas.view_zoom();
+    view.origin = canvas.view_transform().map_to_widget(QPointF(0, 0)) * ratio;
+    CHECK(std::abs(view.scale - zoom) < 1e-9);
+    CHECK(std::abs(view.origin.x() - std::round(view.origin.x())) < 1e-6);
+    CHECK(std::abs(view.origin.y() - std::round(view.origin.y())) < 1e-6);
+    const auto content = canvas_content_rect(canvas);
+    view.area = QRect(QPointF(content.topLeft() * ratio).toPoint(), (QSizeF(content.size()) * ratio).toSize())
+                    .intersected(view.on.rect());
+    view.shape = QRectF(view.origin + QPointF(shape_rect.topLeft()) * view.scale, QSizeF(shape_rect.size()) * view.scale);
+    CHECK(view.on.size() == view.off.size());
+    CHECK(view.area.width() > 200 && view.area.height() > 150);
+    CHECK(QRectF(view.area).contains(view.shape));
+    return view;
+  };
+  const auto name = [&](const char* what, double zoom) {
+    return std::string("ui_vector_preview_smoothing_") + what + "_" + std::to_string(std::lround(zoom * 1000)) +
+           (child ? "_ratio2" : "");
+  };
+
+  // Fractional zooms: the frame's photo is the smoothed composite's, document edge included.
+  constexpr int kTolerance = 6;
+  for (const double zoom : {1.25, 1.5, 1.75}) {
+    const auto view = capture(zoom);
+    // The composite blends the shape's edge half a document pixel each way; the frame keeps it sharp.
+    const auto reach = std::ceil(view.scale * 0.5) + 2.0;
+    const auto skip = view.shape.adjusted(-reach, -reach, reach, reach);
+    int worst = 0;
+    int over = 0;
+    int compared = 0;
+    for (int y = view.area.top(); y <= view.area.bottom(); ++y) {
+      for (int x = view.area.left(); x <= view.area.right(); ++x) {
+        if (skip.contains(QPointF(x + 0.5, y + 0.5))) {
+          continue;
+        }
+        const auto a = view.on.pixel(x, y);
+        const auto b = view.off.pixel(x, y);
+        const int difference = std::max({std::abs(qRed(a) - qRed(b)), std::abs(qGreen(a) - qGreen(b)),
+                                         std::abs(qBlue(a) - qBlue(b))});
+        worst = std::max(worst, difference);
+        over += difference > kTolerance ? 1 : 0;
+        ++compared;
+      }
+    }
+    std::cout << "vector preview smoothing at " << zoom << " ratio " << ratio << ": worst difference " << worst
+              << ", " << over << " of " << compared << " pixels over " << kTolerance << '\n';
+    if (over != 0 || compared < 20000) {
+      save_image_artifact(name("preview_off", zoom), view.off);
+      save_image_artifact(name("preview_on", zoom), view.on);
+      CHECK(false);
+    }
+    // The shape itself stays sharp: one device pixel inside its left edge is pure fill, and
+    // one outside is photo (gray), where the smoothed composite has a blend.
+    const int row = static_cast<int>(std::floor(view.shape.center().y()));
+    const int inside = static_cast<int>(std::ceil(view.shape.left())) + 1;
+    const int outside = static_cast<int>(std::floor(view.shape.left())) - 2;
+    const auto outside_pixel = view.on.pixel(outside, row);
+    const bool sharp = view.on.pixel(inside, row) == fill && qRed(outside_pixel) == qGreen(outside_pixel) &&
+                       qGreen(outside_pixel) == qBlue(outside_pixel);
+    if (!sharp) {
+      save_image_artifact(name("soft_shape_edge", zoom), view.on);
+    }
+    CHECK(sharp);
+  }
+
+  // Whole zooms and 200% and up (GitHub issue 706): exact blocks, each device pixel one
+  // document pixel's value.
+  for (const double zoom : {2.0, 2.5, 3.0, 3.389, 4.0, 5.5}) {
+    const auto view = capture(zoom);
+    const auto skip = view.shape.adjusted(-2, -2, 2, 2);
+    int wrong = 0;
+    int compared = 0;
+    for (int y = view.area.top(); y <= view.area.bottom(); ++y) {
+      for (int x = view.area.left(); x <= view.area.right(); ++x) {
+        if (skip.contains(QPointF(x + 0.5, y + 0.5))) {
+          continue;
+        }
+        const int source_x = static_cast<int>(std::floor((x + 0.5 - view.origin.x()) / view.scale));
+        const int source_y = static_cast<int>(std::floor((y + 0.5 - view.origin.y()) / view.scale));
+        // The pasteboard beside the document, and the document border drawn over its edge.
+        if (x < view.origin.x() + 2 * ratio || y < view.origin.y() + 2 * ratio) {
+          continue;
+        }
+        const int value = smoothing_noise(source_x, source_y);
+        wrong += view.on.pixel(x, y) != qRgb(value, value, value) ? 1 : 0;
+        ++compared;
+      }
+    }
+    std::cout << "vector preview blocks at " << zoom << " ratio " << ratio << ": " << wrong << " of " << compared
+              << " pixels off their document pixel\n";
+    if (wrong != 0 || compared < 20000) {
+      save_image_artifact(name("blocks", zoom), view.on);
+      CHECK(false);
+    }
+  }
+
+  if (child) {
+    return;
+  }
+  QProcess scaled;
+  auto environment = QProcessEnvironment::systemEnvironment();
+  environment.insert(QStringLiteral("QT_SCALE_FACTOR"), QStringLiteral("2"));
+  environment.insert(QStringLiteral("PATCHY_VECTOR_PREVIEW_DPR_CHILD"), QStringLiteral("1"));
+  environment.remove(QStringLiteral("PATCHY_UI_TEST_FILTER"));
+  scaled.setProcessEnvironment(environment);
+  scaled.setProcessChannelMode(QProcess::MergedChannels);
+  scaled.setProgram(QCoreApplication::applicationFilePath());
+  scaled.setArguments({QStringLiteral("ui_vector_preview_raster_content_follows_display_smoothing_rule")});
+  scaled.start();
+  CHECK(scaled.waitForStarted(30000));
+  CHECK(scaled.waitForFinished(180000));
+  const auto output = QString::fromUtf8(scaled.readAll());
+  const bool passed = scaled.exitStatus() == QProcess::NormalExit && scaled.exitCode() == 0 &&
+                      output.contains(QStringLiteral("vector preview smoothing device pixel ratio 2")) &&
+                      output.contains(QStringLiteral("[PASS] ui_vector_preview_raster_content_follows_display_smoothing_rule")) &&
+                      !output.contains(QStringLiteral("[FAIL]"));
+  if (!passed) {
+    std::cerr << "device pixel ratio 2 child run:\n" << output.toStdString() << '\n';
+  }
+  CHECK(passed);
+}
+
+// Color noise for the smooth-sampling documents: every pixel and channel its own value.
+int sampling_noise(int x, int y, int channel) {
+  return (smoothing_noise(x + 977 * channel, y + 131 * channel) - 64) * 255 / 128;
+}
+
+Layer sampling_marker_shape(Document& doc) {
+  LiveShapeParams params;
+  params.kind = LiveShapeKind::Rectangle;
+  params.left = doc.width() - 12; params.top = doc.height() - 10;
+  params.right = doc.width() - 2; params.bottom = doc.height() - 2;
+  VectorShapeContent box;
+  box.path.subpaths = generate_live_shape_subpaths(params);
+  box.fill.color = {255, 0, 255};
+  return shape_layer(doc, box);
+}
+
+// The frame's raster content in a smoothed view (VectorPreviewView::smooth_pixels) is the
+// bilinear reading Qt's smooth blit gives the composite: alpha-weighted, transparent past a
+// layer's bounds, a mask's default past the mask, clamped at the document edge. Without the
+// flag it stays the exact blocks.
+void ui_vector_preview_smooth_pixels_match_bilinear_composite() {
+  constexpr int kWidth = 96;
+  constexpr int kHeight = 80;
+  const auto blank = [] { return Document(kWidth, kHeight, PixelFormat::rgba8()); };
+
+  // A layer inside the canvas with opaque, half-transparent, noisy-alpha and empty parts.
+  auto sprite = blank();
+  {
+    PixelBuffer pixels(60, 48, PixelFormat::rgba8());
+    for (int y = 0; y < pixels.height(); ++y) {
+      for (int x = 0; x < pixels.width(); ++x) {
+        auto* p = pixels.pixel(x, y);
+        for (int channel = 0; channel < 3; ++channel) {
+          p[channel] = static_cast<std::uint8_t>(sampling_noise(x, y, channel));
+        }
+        p[3] = x < 20 ? 255 : x < 40 ? 128 : static_cast<std::uint8_t>(sampling_noise(x, y, 3));
+        if ((x / 7 + y / 5) % 4 == 0) {
+          p[3] = 0;
+        }
+      }
+    }
+    Layer layer(sprite.allocate_layer_id(), "Sprite", std::move(pixels));
+    layer.set_bounds({9, 7, 60, 48});
+    sprite.add_layer(std::move(layer));
+    sprite.add_layer(sampling_marker_shape(sprite));
+  }
+  // An opaque layer over the whole canvas: the photo case, with the document edge.
+  auto photo = blank();
+  {
+    PixelBuffer pixels(kWidth, kHeight, PixelFormat::rgba8());
+    for (int y = 0; y < kHeight; ++y) {
+      for (int x = 0; x < kWidth; ++x) {
+        auto* p = pixels.pixel(x, y);
+        for (int channel = 0; channel < 3; ++channel) {
+          p[channel] = static_cast<std::uint8_t>(sampling_noise(x, y, channel));
+        }
+        p[3] = 255;
+      }
+    }
+    Layer layer(photo.allocate_layer_id(), "Photo", std::move(pixels));
+    layer.set_bounds({0, 0, kWidth, kHeight});
+    photo.add_layer(std::move(layer));
+    photo.add_layer(sampling_marker_shape(photo));
+  }
+  // A flat color under a noisy raster mask that shows everything outside its own rect.
+  auto masked = blank();
+  {
+    PixelBuffer pixels(kWidth, kHeight, PixelFormat::rgba8());
+    for (int y = 0; y < kHeight; ++y) {
+      for (int x = 0; x < kWidth; ++x) {
+        auto* p = pixels.pixel(x, y);
+        p[0] = 200; p[1] = 90; p[2] = 30; p[3] = 255;
+      }
+    }
+    Layer layer(masked.allocate_layer_id(), "Masked", std::move(pixels));
+    layer.set_bounds({0, 0, kWidth, kHeight});
+    PixelBuffer mask(50, 36, PixelFormat::gray8());
+    for (int y = 0; y < mask.height(); ++y) {
+      for (int x = 0; x < mask.width(); ++x) {
+        mask.pixel(x, y)[0] = static_cast<std::uint8_t>(sampling_noise(x, y, 4));
+      }
+    }
+    layer.set_mask(LayerMask{{14, 11, 50, 36}, std::move(mask), 255, false});
+    masked.add_layer(std::move(layer));
+    masked.add_layer(sampling_marker_shape(masked));
+  }
+
+  const QRectF marker(kWidth - 12, kHeight - 10, 10, 8);
+  struct Case {
+    const char* name;
+    const Document* document;
+  };
+  const Case cases[] = {{"sprite", &sprite}, {"photo", &photo}, {"masked", &masked}};
+  for (const auto& item : cases) {
+    const auto& doc = *item.document;
+    const auto scene = build_vector_preview_scene(doc);
+    CHECK(scene.fallback == VectorPreviewFallback::None);
+    CHECK(scene.has_vectors);
+    const auto composite = qimage_from_document(doc, true).convertToFormat(QImage::Format_RGBA8888);
+    CHECK(composite.size() == QSize(kWidth, kHeight));
+    const auto source = [&](int x, int y) { return composite.constScanLine(y) + x * 4; };
+
+    for (const double scale : {1.5, 2.5, 3.389}) {
+      const VectorPreviewView view{{static_cast<int>(std::ceil(kWidth * scale)) + 30,
+                                    static_cast<int>(std::ceil(kHeight * scale)) + 26},
+                                   scale, {11.25, 9.625}, true};
+      const auto result = render_vector_preview(scene, view);
+      CHECK(result.fallback == VectorPreviewFallback::None);
+      const auto frame = result.image.convertToFormat(QImage::Format_RGBA8888);
+      CHECK(frame.size() == view.pixels);
+      const auto skip = QRectF(marker.topLeft() * scale + view.offset, marker.size() * scale)
+                            .adjusted(-scale - 2, -scale - 2, scale + 2, scale + 2);
+      double worst = 0.0;
+      int compared = 0;
+      for (int y = 0; y < frame.height(); ++y) {
+        const double center_y = (y + 0.5 - view.offset.y()) / scale;
+        if (center_y < 0.0 || center_y >= kHeight) {
+          continue;  // off the document: the canvas clips it
+        }
+        const double sy = std::clamp(center_y - 0.5, 0.0, kHeight - 1.0);
+        const int y0 = static_cast<int>(std::floor(sy));
+        const int y1 = std::min(y0 + 1, kHeight - 1);
+        const double fy = sy - y0;
+        for (int x = 0; x < frame.width(); ++x) {
+          const double center_x = (x + 0.5 - view.offset.x()) / scale;
+          if (center_x < 0.0 || center_x >= kWidth || skip.contains(QPointF(x + 0.5, y + 0.5))) {
+            continue;
+          }
+          const double sx = std::clamp(center_x - 0.5, 0.0, kWidth - 1.0);
+          const int x0 = static_cast<int>(std::floor(sx));
+          const int x1 = std::min(x0 + 1, kWidth - 1);
+          const double fx = sx - x0;
+          // Premultiplied, as Qt interpolates the composite.
+          double expected[4] = {0, 0, 0, 0};
+          const auto add = [&](const uchar* p, double weight) {
+            const double alpha = p[3] / 255.0;
+            expected[0] += weight * alpha * p[0];
+            expected[1] += weight * alpha * p[1];
+            expected[2] += weight * alpha * p[2];
+            expected[3] += weight * p[3];
+          };
+          add(source(x0, y0), (1 - fx) * (1 - fy));
+          add(source(x1, y0), fx * (1 - fy));
+          add(source(x0, y1), (1 - fx) * fy);
+          add(source(x1, y1), fx * fy);
+          const auto* actual = frame.constScanLine(y) + x * 4;
+          const double alpha = actual[3] / 255.0;
+          for (int channel = 0; channel < 3; ++channel) {
+            worst = std::max(worst, std::abs(actual[channel] * alpha - expected[channel]));
+          }
+          worst = std::max(worst, std::abs(actual[3] - expected[3]));
+          ++compared;
+        }
+      }
+      std::cout << "smooth frame " << item.name << " at " << scale << ": worst difference " << worst << " over "
+                << compared << " pixels\n";
+      if (worst > 2.5 || compared < 10000) {
+        save_image_artifact(std::string("ui_vector_preview_smooth_") + item.name + "_" +
+                                std::to_string(std::lround(scale * 1000)),
+                            frame);
+        CHECK(false);
+      }
+      // One phase across tiles: a viewport crop at a whole device offset equals the full view.
+      const auto crop = render_vector_preview(
+          scene, {view.pixels - QSize(97, 61), scale, view.offset - QPointF(97, 61), true});
+      CHECK(crop.fallback == VectorPreviewFallback::None);
+      CHECK(crop.image == result.image.copy(97, 61, view.pixels.width() - 97, view.pixels.height() - 61));
+      // The same view without the flag is the exact blocks, so the two differ.
+      CHECK(render_vector_preview(scene, {view.pixels, scale, view.offset}).image != result.image);
+    }
+
+    // Unsmoothed views read exact blocks: each device pixel is one composite pixel.
+    for (const double scale : {2.0, 3.0, 4.0, 5.5}) {
+      const VectorPreviewView view{{static_cast<int>(std::ceil(kWidth * scale)) + 30,
+                                    static_cast<int>(std::ceil(kHeight * scale)) + 26},
+                                   scale, {11, 9}};
+      CHECK(!view.smooth_pixels);
+      const auto result = render_vector_preview(scene, view);
+      CHECK(result.fallback == VectorPreviewFallback::None);
+      const auto frame = result.image.convertToFormat(QImage::Format_RGBA8888);
+      const auto skip = QRectF(marker.topLeft() * scale + view.offset, marker.size() * scale).adjusted(-2, -2, 2, 2);
+      int wrong = 0;
+      int compared = 0;
+      for (int y = 0; y < frame.height(); ++y) {
+        const int source_y = static_cast<int>(std::floor((y + 0.5 - view.offset.y()) / scale));
+        for (int x = 0; x < frame.width(); ++x) {
+          const int source_x = static_cast<int>(std::floor((x + 0.5 - view.offset.x()) / scale));
+          if (source_x < 0 || source_y < 0 || source_x >= kWidth || source_y >= kHeight ||
+              skip.contains(QPointF(x + 0.5, y + 0.5))) {
+            continue;
+          }
+          wrong += std::memcmp(frame.constScanLine(y) + x * 4, source(source_x, source_y), 4) != 0 ? 1 : 0;
+          ++compared;
+        }
+      }
+      if (wrong != 0 || compared < 10000) {
+        std::cerr << "exact frame " << item.name << " at " << scale << ": " << wrong << " of " << compared
+                  << " pixels off their document pixel\n";
+        CHECK(false);
+      }
+    }
+  }
+}
+
+// --- patterns follow the display rule ---
+
+constexpr int kPatternWidth = 96;
+constexpr int kPatternHeight = 80;
+const std::uint8_t kPatternPaper[4] = {232, 236, 240, 255};
+
+void add_paper(Document& doc) {
+  PixelBuffer paper(doc.width(), doc.height(), PixelFormat::rgba8());
+  for (int y = 0; y < doc.height(); ++y) {
+    for (int x = 0; x < doc.width(); ++x) {
+      std::memcpy(paper.pixel(x, y), kPatternPaper, 4);
+    }
+  }
+  Layer layer(doc.allocate_layer_id(), "Paper", std::move(paper));
+  layer.set_bounds({0, 0, doc.width(), doc.height()});
+  doc.add_layer(std::move(layer));
+}
+
+// Small tiles of far-apart colors: enlarged as blocks and enlarged by interpolating between
+// texels, they disagree in almost every view pixel.
+Document pattern_document() {
+  Document doc(kPatternWidth, kPatternHeight, PixelFormat::rgba8());
+  add_paper(doc);
+  PixelBuffer checker(2, 2, PixelFormat::rgba8());
+  const std::uint8_t colors[4][4] = {{250, 246, 236, 255}, {16, 20, 34, 255}, {30, 60, 160, 255}, {240, 200, 60, 255}};
+  for (int index = 0; index < 4; ++index) {
+    std::memcpy(checker.pixel(index % 2, index / 2), colors[index], 4);
+  }
+  doc.metadata().patterns.adopt({"checker", "Checker", std::move(checker)});
+  // An empty texel and a half-transparent one among opaque ones.
+  PixelBuffer holes(3, 3, PixelFormat::rgba8());
+  for (int y = 0; y < 3; ++y) {
+    for (int x = 0; x < 3; ++x) {
+      auto* p = holes.pixel(x, y);
+      p[0] = static_cast<std::uint8_t>(20 + 110 * x);
+      p[1] = static_cast<std::uint8_t>(230 - 100 * y);
+      p[2] = static_cast<std::uint8_t>((x + y) % 2 == 0 ? 30 : 220);
+      p[3] = x == 1 && y == 1 ? 0 : x == 2 && y == 0 ? 128 : 255;
+    }
+  }
+  doc.metadata().patterns.adopt({"holes", "Holes", std::move(holes)});
+  return doc;
+}
+
+VectorShapeContent pattern_box(QRect rect, RgbColor color = {200, 205, 210}) {
+  LiveShapeParams params;
+  params.kind = LiveShapeKind::Rectangle;
+  params.left = rect.left(); params.top = rect.top();
+  params.right = rect.left() + rect.width(); params.bottom = rect.top() + rect.height();
+  VectorShapeContent shape;
+  shape.path.subpaths = generate_live_shape_subpaths(params);
+  shape.fill.color = color;
+  return shape;
+}
+
+VectorFill pattern_paint(const char* id, double scale = 1.0, double angle = 0.0, bool linked = false,
+                         double phase_x = 0.0, double phase_y = 0.0) {
+  VectorFill fill;
+  fill.kind = VectorFillKind::Pattern;
+  fill.pattern_id = id;
+  fill.pattern_scale = scale;
+  fill.pattern_angle_degrees = angle;
+  fill.pattern_linked = linked;
+  fill.pattern_phase_x = phase_x;
+  fill.pattern_phase_y = phase_y;
+  return fill;
+}
+
+LayerPatternOverlay pattern_overlay(const char* id, float scale = 1.0F, float angle = 0.0F, bool linked = false,
+                                    float phase_x = 0.0F, float phase_y = 0.0F) {
+  LayerPatternOverlay overlay;
+  overlay.enabled = true;
+  overlay.pattern_id = id;
+  overlay.scale = scale;
+  overlay.angle_degrees = angle;
+  overlay.link_with_layer = linked;
+  overlay.phase_x = phase_x;
+  overlay.phase_y = phase_y;
+  return overlay;
+}
+
+// A shape layer baked with the document's patterns, its effects reference point at (5, 3).
+Layer pattern_shape_layer(Document& doc, VectorShapeContent shape) {
+  Layer layer(doc.allocate_layer_id(), "Vector", LayerKind::Pixel);
+  set_layer_effects_reference_point(layer, 5, 3);
+  layer.set_vector_shape(std::move(shape));
+  update_vector_shape_raster(layer, Rect::from_size(doc.width(), doc.height()), &std::as_const(doc).metadata().patterns);
+  return layer;
+}
+
+// Inside a shape, Dynamic Vector Preview draws a pattern as the pixel view shows it: the
+// pattern as the document render samples it at document pixels, enlarged by the display
+// rule (exact blocks, or bilinear with VectorPreviewView::smooth_pixels). Before this, the
+// view sampled the tile at view resolution, so a small pattern looked soft above 100%.
+// Covers the shape fill, the shape stroke and Pattern Overlay (on a shape, a pixel layer and
+// a group); linked, phased, scaled, rotated and reduced patterns; transparent texels; tiles.
+void ui_vector_preview_patterns_follow_display_smoothing_rule() {
+  const QRect box(20, 14, 56, 48);
+  const auto inside_box = [box](int x, int y) { return box.adjusted(2, 2, -2, -2).contains(x, y); };
+  struct Case {
+    const char* name;
+    std::function<void(Document&)> build;
+    // Document pixels the pattern paints alone, at full coverage.
+    std::function<bool(int, int)> interior;
+    // Levels allowed past exact (a tile alpha the document render interpolates is kept in 8 bits).
+    int tolerance{0};
+  };
+  const auto fill_case = [&](const char* name, VectorFill paint, int tolerance = 0) {
+    return Case{name, [box, paint](Document& doc) {
+      auto shape = pattern_box(box);
+      shape.fill = paint;
+      doc.add_layer(pattern_shape_layer(doc, std::move(shape)));
+    }, inside_box, tolerance};
+  };
+  const auto overlay_case = [&](const char* name, LayerPatternOverlay overlay, int tolerance = 0) {
+    return Case{name, [box, overlay](Document& doc) {
+      auto layer = pattern_shape_layer(doc, pattern_box(box));
+      layer.layer_style().pattern_overlays.push_back(overlay);
+      doc.add_layer(std::move(layer));
+    }, inside_box, tolerance};
+  };
+  auto faint = pattern_overlay("checker", 1.0F, 0.0F, true, 1.0F, 0.0F);
+  faint.opacity = 0.5F;
+  const std::vector<Case> cases = {
+      fill_case("fill", pattern_paint("checker")),
+      fill_case("fill_linked_phase", pattern_paint("checker", 1.0, 0.0, true, 1.25, -2.5)),
+      fill_case("fill_scaled_rotated", pattern_paint("checker", 3.0, 30.0, true, 0.5, 0.0)),
+      fill_case("fill_transparent_texels", pattern_paint("holes")),
+      fill_case("fill_reduced", pattern_paint("holes", 0.5), 1),
+      Case{"stroke", [box](Document& doc) {
+        auto shape = pattern_box(box);
+        shape.stroke.enabled = true;
+        shape.stroke.width = 12;
+        shape.stroke.alignment = VectorStrokeAlignment::Center;
+        shape.stroke.content = pattern_paint("checker", 1.0, 0.0, true);
+        doc.add_layer(pattern_shape_layer(doc, std::move(shape)));
+      }, [box](int x, int y) {
+        // The straight runs of the 12 px band over the path, two pixels in from its edges.
+        const bool beside = (std::abs(x - box.left()) < 4 || std::abs(x - (box.left() + box.width())) < 4) &&
+                            y >= box.top() + 8 && y < box.top() + box.height() - 8;
+        const bool above = (std::abs(y - box.top()) < 4 || std::abs(y - (box.top() + box.height())) < 4) &&
+                           x >= box.left() + 8 && x < box.left() + box.width() - 8;
+        return beside || above;
+      }},
+      overlay_case("overlay", pattern_overlay("checker", 1.0F, 0.0F, true, 1.0F, 0.0F)),
+      overlay_case("overlay_scaled", pattern_overlay("checker", 2.0F, 0.0F, false, 0.0F, 3.0F)),
+      overlay_case("overlay_rotated", pattern_overlay("checker", 1.0F, -20.0F, true)),
+      overlay_case("overlay_half_opacity", faint, 1),
+      Case{"overlay_on_pixel_layer", [](Document& doc) {
+        PixelBuffer pixels(40, 30, PixelFormat::rgba8());
+        for (int y = 0; y < 30; ++y) {
+          for (int x = 0; x < 40; ++x) {
+            auto* p = pixels.pixel(x, y);
+            p[0] = 90; p[1] = 120; p[2] = 60; p[3] = 255;
+          }
+        }
+        Layer layer(doc.allocate_layer_id(), "Pixels", std::move(pixels));
+        layer.set_bounds({30, 20, 40, 30});
+        layer.layer_style().pattern_overlays.push_back(pattern_overlay("checker", 1.0F, 0.0F, true, 0.0F, 1.0F));
+        doc.add_layer(std::move(layer));
+        doc.add_layer(sampling_marker_shape(doc));
+      }, [](int x, int y) { return QRect(32, 22, 36, 26).contains(x, y); }},
+      Case{"overlay_on_group", [box](Document& doc) {
+        Layer group(doc.allocate_layer_id(), "Group", LayerKind::Group);
+        group.add_child(pattern_shape_layer(doc, pattern_box(box)));
+        group.layer_style().pattern_overlays.push_back(pattern_overlay("checker"));
+        doc.add_layer(std::move(group));
+      }, inside_box},
+  };
+
+  for (const auto& item : cases) {
+    auto doc = pattern_document();
+    item.build(doc);
+    const auto scene = build_vector_preview_scene(doc);
+    CHECK(scene.fallback == VectorPreviewFallback::None);
+    CHECK(scene.has_vectors);
+    const auto composite = qimage_from_document(doc, true).convertToFormat(QImage::Format_RGBA8888);
+    CHECK(composite.size() == QSize(kPatternWidth, kPatternHeight));
+    const auto source = [&](int x, int y) { return composite.constScanLine(y) + x * 4; };
+    const auto artifact = [&](const char* what, double scale) {
+      return std::string("ui_vector_preview_pattern_") + item.name + "_" + what + "_" +
+             std::to_string(std::lround(scale * 1000));
+    };
+    const auto view_size = [](double scale) {
+      return QSize(static_cast<int>(std::ceil(kPatternWidth * scale)) + 30,
+                   static_cast<int>(std::ceil(kPatternHeight * scale)) + 26);
+    };
+    // The pattern must show in the document render, or the comparison below proves nothing.
+    {
+      int colors = 0;
+      std::vector<QRgb> seen;
+      for (int y = 0; y < kPatternHeight; ++y) {
+        for (int x = 0; x < kPatternWidth; ++x) {
+          const auto value = composite.pixel(x, y);
+          if (item.interior(x, y) && std::find(seen.begin(), seen.end(), value) == seen.end()) {
+            seen.push_back(value);
+            ++colors;
+          }
+        }
+      }
+      CHECK(colors >= 4);
+    }
+
+    // Unsmoothed views: each view pixel is its document pixel's value in the render.
+    struct Exact {
+      double scale;
+      QPointF offset;
+    };
+    for (const auto& exact : {Exact{8.0, {11, 9}}, Exact{4.0, {11, 9}}, Exact{5.5, {11, 9}}, Exact{3.389, {11.25, 9.625}}}) {
+      const VectorPreviewView view{view_size(exact.scale), exact.scale, exact.offset};
+      CHECK(!view.smooth_pixels);
+      const auto result = render_vector_preview(scene, view);
+      CHECK(result.fallback == VectorPreviewFallback::None);
+      const auto frame = result.image.convertToFormat(QImage::Format_RGBA8888);
+      CHECK(frame.size() == view.pixels);
+      int wrong = 0;
+      int worst = 0;
+      int compared = 0;
+      for (int y = 0; y < frame.height(); ++y) {
+        const int source_y = static_cast<int>(std::floor((y + 0.5 - view.offset.y()) / view.scale));
+        for (int x = 0; x < frame.width(); ++x) {
+          const int source_x = static_cast<int>(std::floor((x + 0.5 - view.offset.x()) / view.scale));
+          if (source_x < 0 || source_y < 0 || source_x >= kPatternWidth || source_y >= kPatternHeight ||
+              !item.interior(source_x, source_y)) {
+            continue;
+          }
+          const auto* actual = frame.constScanLine(y) + x * 4;
+          const auto* expected = source(source_x, source_y);
+          int difference = 0;
+          for (int channel = 0; channel < 4; ++channel) {
+            difference = std::max(difference, std::abs(actual[channel] - expected[channel]));
+          }
+          worst = std::max(worst, difference);
+          wrong += difference > item.tolerance ? 1 : 0;
+          ++compared;
+        }
+      }
+      std::cout << "pattern blocks " << item.name << " at " << exact.scale << ": " << wrong << " of " << compared
+                << " pixels off their document pixel, worst " << worst << '\n';
+      if (wrong != 0 || compared < 4000) {
+        save_image_artifact(artifact("blocks", exact.scale), frame);
+        save_image_artifact(artifact("document", exact.scale), composite);
+        CHECK(false);
+      }
+      if (exact.scale != 8.0) {
+        continue;
+      }
+      // One phase across tiles, no seam at a tile edge: a crop at a whole offset is the full view.
+      const auto crop = render_vector_preview(scene, {view.pixels - QSize(97, 61), view.scale, view.offset - QPointF(97, 61)});
+      CHECK(crop.fallback == VectorPreviewFallback::None);
+      CHECK(crop.image == result.image.copy(97, 61, view.pixels.width() - 97, view.pixels.height() - 61));
+    }
+
+    // Smoothed views: the bilinear reading the composite's smooth blit gives.
+    for (const double scale : {1.5, 2.5, 3.389}) {
+      const VectorPreviewView view{view_size(scale), scale, {11.25, 9.625}, true};
+      const auto result = render_vector_preview(scene, view);
+      CHECK(result.fallback == VectorPreviewFallback::None);
+      const auto frame = result.image.convertToFormat(QImage::Format_RGBA8888);
+      double worst = 0.0;
+      int compared = 0;
+      for (int y = 0; y < frame.height(); ++y) {
+        const double center_y = (y + 0.5 - view.offset.y()) / scale;
+        if (center_y < 0.0 || center_y >= kPatternHeight) {
+          continue;
+        }
+        const double sy = std::clamp(center_y - 0.5, 0.0, kPatternHeight - 1.0);
+        const int y0 = static_cast<int>(std::floor(sy));
+        const int y1 = std::min(y0 + 1, kPatternHeight - 1);
+        const double fy = sy - y0;
+        for (int x = 0; x < frame.width(); ++x) {
+          const double center_x = (x + 0.5 - view.offset.x()) / scale;
+          if (center_x < 0.0 || center_x >= kPatternWidth) {
+            continue;
+          }
+          const double sx = std::clamp(center_x - 0.5, 0.0, kPatternWidth - 1.0);
+          const int x0 = static_cast<int>(std::floor(sx));
+          const int x1 = std::min(x0 + 1, kPatternWidth - 1);
+          const double fx = sx - x0;
+          if (!item.interior(x0, y0) || !item.interior(x1, y0) || !item.interior(x0, y1) || !item.interior(x1, y1)) {
+            continue;
+          }
+          const auto* actual = frame.constScanLine(y) + x * 4;
+          for (int channel = 0; channel < 4; ++channel) {
+            // The render is opaque here (the paper), so plain weights are Qt's premultiplied ones.
+            const double expected = source(x0, y0)[channel] * (1 - fx) * (1 - fy) + source(x1, y0)[channel] * fx * (1 - fy) +
+                                    source(x0, y1)[channel] * (1 - fx) * fy + source(x1, y1)[channel] * fx * fy;
+            worst = std::max(worst, std::abs(actual[channel] - expected));
+          }
+          ++compared;
+        }
+      }
+      std::cout << "pattern smooth " << item.name << " at " << scale << ": worst difference " << worst << " over "
+                << compared << " pixels\n";
+      if (worst > 2.5 + item.tolerance || compared < 800) {
+        save_image_artifact(artifact("smooth", scale), frame);
+        save_image_artifact(artifact("document", scale), composite);
+        CHECK(false);
+      }
+      if (scale != 2.5) {
+        continue;
+      }
+      const auto crop = render_vector_preview(
+          scene, {view.pixels - QSize(97, 61), scale, view.offset - QPointF(97, 61), true});
+      CHECK(crop.fallback == VectorPreviewFallback::None);
+      CHECK(crop.image == result.image.copy(97, 61, view.pixels.width() - 97, view.pixels.height() - 61));
+      // The same view without the flag is the exact blocks, so the two differ.
+      CHECK(render_vector_preview(scene, {view.pixels, scale, view.offset}).image != result.image);
+    }
+  }
+
+  // The shape's edge stays sharp either way: the view pixel beside it is pure paper, where
+  // the smoothed composite blends the paper into the pattern.
+  {
+    auto doc = pattern_document();
+    cases.front().build(doc);
+    const auto scene = build_vector_preview_scene(doc);
+    const auto composite = qimage_from_document(doc, true).convertToFormat(QImage::Format_RGBA8888);
+    const auto blocks = render_vector_preview(scene, {{800, 660}, 8.0, {11, 9}}).image.convertToFormat(QImage::Format_RGBA8888);
+    const int row = 9 + 30 * 8 + 4;
+    CHECK(std::memcmp(blocks.constScanLine(row) + 170 * 4, kPatternPaper, 4) == 0);
+    CHECK(std::memcmp(blocks.constScanLine(row) + 171 * 4, composite.constScanLine(30) + 20 * 4, 4) == 0);
+    // At 250% with the origin at 11.25 the edge (document x 20) is at view x 61.25.
+    const auto smooth =
+        render_vector_preview(scene, {{270, 230}, 2.5, {11.25, 9.625}, true}).image.convertToFormat(QImage::Format_RGBA8888);
+    CHECK(std::memcmp(smooth.constScanLine(100) + 60 * 4, kPatternPaper, 4) == 0);
+    CHECK(std::memcmp(smooth.constScanLine(100) + 62 * 4, kPatternPaper, 4) != 0);
+  }
+}
+
+// On the canvas: with a pattern-filled shape at 800% (blocks) and 150% (smoothed), turning
+// Dynamic Vector Preview on changes nothing inside the shape. At the fractional block zooms
+// (250%, 450%) both views are exact blocks of the document, but Qt's nearest blit can put a
+// cell edge one device pixel from the frame's center sampling. Saves both views for review.
+void ui_vector_preview_pattern_matches_pixel_view_on_canvas() {
+  // The document is larger than the view at both zooms, so the view can park its corner on
+  // a whole pixel; the shape sits in the corner region that is compared and saved.
+  constexpr int kWidth = 64;
+  constexpr int kHeight = 48;
+  Document doc(400, 300, PixelFormat::rgba8());
+  add_paper(doc);
+  {
+    PixelBuffer checker(2, 2, PixelFormat::rgba8());
+    const std::uint8_t light[4] = {250, 240, 214, 255};
+    const std::uint8_t dark[4] = {24, 38, 84, 255};
+    for (int index = 0; index < 4; ++index) {
+      std::memcpy(checker.pixel(index % 2, index / 2), (index % 2 == index / 2) ? light : dark, 4);
+    }
+    doc.metadata().patterns.adopt({"checker", "Checker", std::move(checker)});
+    auto shape = ellipse(6, 5, 52, 38, {});
+    shape.fill = pattern_paint("checker");
+    doc.add_layer(pattern_shape_layer(doc, std::move(shape)));
+  }
+  // Document pixels well inside the ellipse (center 32, 24; radii 26, 19).
+  const auto interior = [](int x, int y) {
+    const double dx = (x + 0.5 - 32.0) / 22.0;
+    const double dy = (y + 0.5 - 24.0) / 15.0;
+    return dx * dx + dy * dy < 1.0;
+  };
+  const auto composite = qimage_from_document(doc, true).convertToFormat(QImage::Format_RGB32);
+
+  CanvasWidget canvas;
+  canvas.resize(560, 430);
+  canvas.set_document(&doc);
+  canvas.show();
+  canvas.set_tool(CanvasTool::Pan);
+  canvas.set_pixel_grid_visible(false);
+  QApplication::processEvents();
+  CHECK(std::abs(canvas.devicePixelRatioF() - 1.0) < 0.001);
+
+  for (const double zoom : {8.0, 2.5, 4.5, 1.5}) {
+    canvas.set_vector_preview_enabled(false);
+    canvas.center_view_on_document_point(QPointF(0, 0), zoom);
+    const auto center = canvas.view_transform().map_to_widget(QPointF(0, 0));
+    canvas.center_view_on_document_point(QPointF((center.x() - 10.0) / canvas.zoom(), (center.y() - 8.0) / canvas.zoom()));
+    settle(canvas);
+    const auto off = canvas.grab().toImage().convertToFormat(QImage::Format_RGB32);
+    const auto renders = canvas.render_cache_diagnostics().vector_preview_renders;
+    canvas.set_vector_preview_enabled(true);
+    settle(canvas);
+    CHECK(canvas.vector_preview_status().contains(QStringLiteral("sharp vector view")));
+    CHECK(canvas.render_cache_diagnostics().vector_preview_renders > renders);
+    const auto on = canvas.grab().toImage().convertToFormat(QImage::Format_RGB32);
+    const auto origin = canvas.view_transform().map_to_widget(QPointF(0, 0));
+    CHECK(std::abs(canvas.view_zoom() - zoom) < 1e-9);
+    CHECK(std::abs(origin.x() - std::round(origin.x())) < 1e-6 && std::abs(origin.y() - std::round(origin.y())) < 1e-6);
+    const QRect shown = QRectF(origin, QSizeF(kWidth, kHeight) * zoom).toAlignedRect();
+    CHECK(canvas_content_rect(canvas).contains(shown));
+    const auto name = [&](const char* state) {
+      return std::string("ui_vector_preview_pattern_canvas_") + std::to_string(std::lround(zoom * 100)) + "_preview_" + state;
+    };
+    save_image_artifact(name("off"), off.copy(shown.adjusted(-4, -4, 4, 4)));
+    save_image_artifact(name("on"), on.copy(shown.adjusted(-4, -4, 4, 4)));
+
+    const bool blocks = zoom >= 2.0;
+    const bool whole = std::abs(zoom - std::round(zoom)) < 1e-9;
+    int worst = 0;
+    int off_document = 0;
+    int off_phase = 0;
+    int compared = 0;
+    for (int y = shown.top(); y <= shown.bottom(); ++y) {
+      for (int x = shown.left(); x <= shown.right(); ++x) {
+        const int source_x = static_cast<int>(std::floor((x + 0.5 - origin.x()) / zoom));
+        const int source_y = static_cast<int>(std::floor((y + 0.5 - origin.y()) / zoom));
+        // A smoothed pixel reads its neighbors too.
+        bool inside = true;
+        for (int dy = -1; dy <= 1; ++dy) {
+          for (int dx = -1; dx <= 1; ++dx) {
+            inside = inside && interior(source_x + dx, source_y + dy);
+          }
+        }
+        if (!inside) {
+          continue;
+        }
+        const auto a = on.pixel(x, y);
+        const auto b = off.pixel(x, y);
+        if (blocks && !whole) {
+          // The canvas pixel is a neighboring document pixel's value at worst.
+          bool near = false;
+          for (int dy = -1; dy <= 1 && !near; ++dy) {
+            for (int dx = -1; dx <= 1 && !near; ++dx) {
+              near = b == composite.pixel(source_x + dx, source_y + dy);
+            }
+          }
+          off_phase += near ? 0 : 1;
+        } else {
+          worst = std::max({worst, std::abs(qRed(a) - qRed(b)), std::abs(qGreen(a) - qGreen(b)), std::abs(qBlue(a) - qBlue(b))});
+        }
+        off_document += blocks && a != composite.pixel(source_x, source_y) ? 1 : 0;
+        ++compared;
+      }
+    }
+    std::cout << "pattern on the canvas at " << zoom << ": preview on against off, worst difference " << worst << " over "
+              << compared << " pixels, " << off_document << " off their document pixel, " << off_phase
+              << " canvas pixels off a neighboring document pixel\n";
+    // Blocks are exact; the smoothed view allows for Qt's blit against the frame's fixed point.
+    CHECK(compared > static_cast<int>(700.0 * zoom * zoom));
+    CHECK(worst <= (blocks ? 0 : 6));
+    CHECK(off_document == 0);
+    CHECK(off_phase == 0);
+  }
+  canvas.set_vector_preview_enabled(false);
+}
+
+}  // namespace
+
+std::vector<patchy::test::TestCase> vector_preview_tests() {
+  return {
+      {"ui_vector_preview_tiles_match_full_vector_raster", ui_vector_preview_tiles_match_full_vector_raster},
+      {"ui_vector_preview_strokes_complements_and_group_isolation", ui_vector_preview_strokes_complements_and_group_isolation},
+      {"ui_vector_preview_eligibility_and_resource_guards", ui_vector_preview_eligibility_and_resource_guards},
+      {"ui_vector_preview_mixed_content_matches_compositor", ui_vector_preview_mixed_content_matches_compositor},
+      {"ui_vector_preview_gradient_pattern_effects_and_vector_masks", ui_vector_preview_gradient_pattern_effects_and_vector_masks},
+      {"ui_vector_preview_canvas_cache_invalidation_and_lifetime", ui_vector_preview_canvas_cache_invalidation_and_lifetime},
+      {"ui_vector_preview_action_persistence_script_and_history", ui_vector_preview_action_persistence_script_and_history},
+      {"ui_vector_preview_resource_notice_is_once_and_never_covers_other_status", ui_vector_preview_resource_notice_is_once_and_never_covers_other_status},
+      {"ui_vector_preview_little_everywhere_if_available", ui_vector_preview_little_everywhere_if_available},
+      {"ui_vector_preview_keeps_pixel_grid_and_overlays_above", ui_vector_preview_keeps_pixel_grid_and_overlays_above},
+      {"ui_vector_preview_renders_artboards", ui_vector_preview_renders_artboards},
+      {"ui_vector_preview_cost_follows_viewport_not_zoom", ui_vector_preview_cost_follows_viewport_not_zoom},
+      {"ui_vector_preview_stays_sharp_through_free_transform", ui_vector_preview_stays_sharp_through_free_transform},
+      {"ui_vector_preview_stays_sharp_through_free_transform_on_artboard",
+       ui_vector_preview_stays_sharp_through_free_transform_on_artboard},
+      {"ui_vector_preview_raster_content_follows_display_smoothing_rule",
+       ui_vector_preview_raster_content_follows_display_smoothing_rule},
+      {"ui_vector_preview_smooth_pixels_match_bilinear_composite", ui_vector_preview_smooth_pixels_match_bilinear_composite},
+      {"ui_vector_preview_patterns_follow_display_smoothing_rule", ui_vector_preview_patterns_follow_display_smoothing_rule},
+      {"ui_vector_preview_pattern_matches_pixel_view_on_canvas", ui_vector_preview_pattern_matches_pixel_view_on_canvas},
+  };
+}

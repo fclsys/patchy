@@ -1,0 +1,6341 @@
+#include "ui/brush_automation.hpp"
+#include "ui/brush_presets.hpp"
+#include "ui/main_window_shared.hpp"
+#include "ui/curved_slider.hpp"
+#include <QClipboard>
+#include <QMenu>
+#include <map>
+
+#include "ui/canvas_widget.hpp"
+#include "ui/canvas_widget_shared.hpp"
+#include "ui/dialog_utils.hpp"
+#include "ui/qt_paths.hpp"
+#include "ui/tool_cursors.hpp"
+#include "core/layer_metadata.hpp"
+#include "core/palette.hpp"
+#include "ui/pattern_library.hpp"
+#include "ui/brush_tip_library.hpp"
+#include "ui/brush_tip_picker.hpp"
+#include "ui/blend_mode_ui.hpp"
+#include "core/clone_source_transform.hpp"
+#include "core/document_depth.hpp"
+#include "core/pixel_depth.hpp"
+#include "core/pattern_resource.hpp"
+#include "formats/acv_curves_io.hpp"
+#include "formats/bmp_document_io.hpp"
+#include "formats/aseprite_document_io.hpp"
+#include "formats/ico_document_io.hpp"
+#include "formats/tga_document_io.hpp"
+#include "ui/image_document_io.hpp"
+#include "ui/layer_list_widget.hpp"
+#include "ui/main_window.hpp"
+#include "ui/app_settings.hpp"
+#include "psd/psd_document_io.hpp"
+#include "test_harness.hpp"
+#include "local_psd_fixtures.hpp"
+#include <QAction>
+#include <QApplication>
+#include <QCheckBox>
+#include <QComboBox>
+#include <QDialog>
+#include <QElapsedTimer>
+#include <QFrame>
+#include <QImage>
+#include <QKeyEvent>
+#include <QLabel>
+#include <QLineEdit>
+#include <QListWidget>
+#include <QJsonObject>
+#include <QTemporaryDir>
+#include <QPainter>
+#include <QPixmap>
+#include <QAbstractItemView>
+#include <QPushButton>
+#include <QScopeGuard>
+#include <QSpinBox>
+#include <QStringList>
+#include <QSlider>
+#include <QTabWidget>
+#include <QTest>
+#include <QTextEdit>
+#include <QToolButton>
+#include <QWidget>
+#include <algorithm>
+#include <atomic>
+#include <array>
+#include <cstdint>
+#include <cmath>
+#include <cstdio>
+#include <cstring>
+#include <exception>
+#include <filesystem>
+#include <fstream>
+#include <functional>
+#include <iostream>
+#include <limits>
+#include <memory>
+#include <optional>
+#include <span>
+#include <stdexcept>
+#include <string>
+#include <string_view>
+#include <utility>
+#include <vector>
+#include "ui_test_access.hpp"
+#include "ui_test_groups.hpp"
+#include "ui_test_support.hpp"
+
+namespace {
+
+using namespace patchy::test::ui;
+
+void ui_cut_selection_cuts_layer_nested_in_folder() {
+  // Cut used to walk only the root layer list: a selected layer inside a folder was
+  // "not editable", nothing was cut, and the clipboard was wiped.
+  patchy::ui::MainWindow window;
+  show_window(window);
+  auto* canvas = require_canvas(window);
+  auto* layer_list = window.findChild<QListWidget*>(QStringLiteral("layerList"));
+  auto* folder_button = window.findChild<QPushButton*>(QStringLiteral("layerNewFolderButton"));
+  CHECK(layer_list != nullptr);
+  CHECK(folder_button != nullptr);
+
+  require_action(window, "layerNewAction")->trigger();
+  QApplication::processEvents();
+  auto* layer3 = require_layer_item(*layer_list, QStringLiteral("Layer 3"));
+  const std::vector<patchy::LayerId> ids{
+      static_cast<patchy::LayerId>(layer3->data(patchy::ui::kLayerIdRole).toULongLong())};
+  send_layer_button_drop(*folder_button, ids);
+  layer3 = require_layer_item(*layer_list, QStringLiteral("Layer 3"));
+  CHECK(layer3->data(patchy::ui::kLayerDepthRole).toInt() == 1);
+  layer_list->setCurrentItem(layer3);
+  QApplication::processEvents();
+
+  const QColor paint_color(20, 200, 40);
+  require_action_by_text(window, QStringLiteral("Brush"))->trigger();
+  canvas->set_primary_color(paint_color);
+  canvas->set_brush_size(22);
+  drag(*canvas, canvas->widget_position_for_document_point(QPoint(92, 92)),
+       canvas->widget_position_for_document_point(QPoint(130, 110)));
+  CHECK(color_close(canvas_pixel(*canvas, QPoint(100, 100)), paint_color, 55));
+
+  canvas->set_tool(patchy::ui::CanvasTool::Marquee);
+  drag(*canvas, canvas->widget_position_for_document_point(QPoint(70, 70)),
+       canvas->widget_position_for_document_point(QPoint(150, 130)));
+  CHECK(canvas->selected_document_rect().has_value());
+  require_action(window, "editCutAction")->trigger();
+  QApplication::processEvents();
+  CHECK(!color_close(canvas_pixel(*canvas, QPoint(100, 100)), paint_color, 55));
+  CHECK(!QApplication::clipboard()->image().isNull());
+}
+
+void ui_cut_selection_clears_source_and_keeps_clipboard() {
+  patchy::ui::MainWindow window;
+  show_window(window);
+  auto* canvas = require_canvas(window);
+  auto* layer_list = window.findChild<QListWidget*>(QStringLiteral("layerList"));
+  CHECK(layer_list != nullptr);
+
+  const QColor paint_color(255, 80, 20);
+  require_action_by_text(window, QStringLiteral("Brush"))->trigger();
+  canvas->set_primary_color(paint_color);
+  canvas->set_brush_size(22);
+  drag(*canvas, canvas->widget_position_for_document_point(QPoint(92, 92)),
+       canvas->widget_position_for_document_point(QPoint(130, 110)));
+  CHECK(color_close(canvas_pixel(*canvas, QPoint(100, 100)), paint_color, 55));
+
+  canvas->set_tool(patchy::ui::CanvasTool::Marquee);
+  drag(*canvas, canvas->widget_position_for_document_point(QPoint(70, 70)),
+       canvas->widget_position_for_document_point(QPoint(150, 130)));
+  const auto cut_selection_rect = canvas->selected_document_rect();
+  CHECK(cut_selection_rect.has_value());
+  const auto layers_before = layer_list->count();
+  require_action(window, "editCutAction")->trigger();
+  QApplication::processEvents();
+  CHECK(!color_close(canvas_pixel(*canvas, QPoint(100, 100)), paint_color, 55));
+  const auto cut_clipboard_image = QApplication::clipboard()->image();
+  CHECK(!cut_clipboard_image.isNull());
+  QApplication::clipboard()->setImage(cut_clipboard_image);
+  QApplication::processEvents();
+
+  // Re-publishing the same image must retain Patchy's source coordinates.
+  require_action(window, "editPasteInPlaceAction")->trigger();
+  QApplication::processEvents();
+  CHECK(layer_list->count() == layers_before + 1);
+  const auto pasted_rect = canvas->active_layer_document_rect();
+  CHECK(pasted_rect.has_value());
+  CHECK(pasted_rect->topLeft() == cut_selection_rect->topLeft());
+  CHECK(color_close(canvas_pixel(*canvas, QPoint(100, 100)), paint_color, 65));
+  save_widget_artifact("ui_cut_selection", window);
+}
+
+void ui_brush_on_pasted_layer_expands_layer_bounds() {
+  patchy::ui::MainWindow window;
+  show_window(window);
+  auto* canvas = require_canvas(window);
+  auto* layer_list = window.findChild<QListWidget*>(QStringLiteral("layerList"));
+  CHECK(layer_list != nullptr);
+
+  require_action_by_text(window, QStringLiteral("Brush"))->trigger();
+  canvas->set_primary_color(QColor(255, 80, 20));
+  canvas->set_brush_size(18);
+  drag(*canvas, canvas->widget_position_for_document_point(QPoint(60, 60)),
+       canvas->widget_position_for_document_point(QPoint(70, 60)));
+  canvas->set_tool(patchy::ui::CanvasTool::Marquee);
+  drag(*canvas, canvas->widget_position_for_document_point(QPoint(45, 45)),
+       canvas->widget_position_for_document_point(QPoint(85, 85)));
+  const auto layers_before = layer_list->count();
+  require_action(window, "editCopyAction")->trigger();
+  require_action(window, "editPasteAction")->trigger();
+  QApplication::processEvents();
+  CHECK(layer_list->count() == layers_before + 1);
+
+  require_action(window, "editDeselectAction")->trigger();
+  require_action_by_text(window, QStringLiteral("Brush"))->trigger();
+  canvas->set_primary_color(QColor(20, 80, 240));
+  canvas->set_brush_size(24);
+  canvas->set_brush_opacity(100);
+  const QPoint outside_original_paste(260, 190);
+  drag(*canvas, canvas->widget_position_for_document_point(outside_original_paste),
+       canvas->widget_position_for_document_point(outside_original_paste + QPoint(1, 1)));
+  QApplication::processEvents();
+  CHECK(color_close(canvas_pixel(*canvas, outside_original_paste), QColor(20, 80, 240), 45));
+  save_widget_artifact("ui_brush_expands_pasted_layer", window);
+}
+
+void ui_brush_opacity_caps_per_stroke() {
+  patchy::ui::MainWindow window;
+  show_window(window);
+  auto* canvas = require_canvas(window);
+  auto scrub_stroke = [canvas](QPoint document_point) {
+    const auto center = canvas->widget_position_for_document_point(document_point);
+    send_mouse(*canvas, QEvent::MouseButtonPress, center, Qt::LeftButton, Qt::LeftButton);
+    for (const auto offset : {QPoint(0, 0), QPoint(18, 0), QPoint(-18, 0), QPoint(18, 0), QPoint(-18, 0)}) {
+      send_mouse(*canvas, QEvent::MouseMove, center + offset, Qt::NoButton, Qt::LeftButton);
+    }
+    send_mouse(*canvas, QEvent::MouseButtonRelease, center, Qt::LeftButton, Qt::NoButton);
+    QApplication::processEvents();
+  };
+
+  require_action_by_text(window, QStringLiteral("Brush"))->trigger();
+  canvas->set_primary_color(Qt::black);
+  canvas->set_brush_size(32);
+  canvas->set_brush_opacity(20);
+  canvas->set_brush_build_up(false);
+  scrub_stroke(QPoint(175, 120));
+  const auto first_stroke = canvas_pixel(*canvas, QPoint(175, 120));
+  CHECK(first_stroke.red() >= 190);
+  CHECK(first_stroke.red() <= 220);
+  CHECK(std::abs(first_stroke.red() - first_stroke.green()) <= 3);
+  CHECK(std::abs(first_stroke.green() - first_stroke.blue()) <= 3);
+
+  drag(*canvas, canvas->widget_position_for_document_point(QPoint(70, 120)),
+       canvas->widget_position_for_document_point(QPoint(280, 120)));
+  QApplication::processEvents();
+  const auto second_stroke = canvas_pixel(*canvas, QPoint(175, 120));
+  CHECK(second_stroke.red() < first_stroke.red() - 20);
+  CHECK(second_stroke.red() >= 145);
+  CHECK(second_stroke.red() <= 180);
+
+  canvas->set_brush_opacity(100);
+  drag(*canvas, canvas->widget_position_for_document_point(QPoint(175, 180)),
+       canvas->widget_position_for_document_point(QPoint(176, 180)));
+  QApplication::processEvents();
+  CHECK(canvas_pixel(*canvas, QPoint(175, 180)).red() < 20);
+
+  require_action_by_text(window, QStringLiteral("Eraser"))->trigger();
+  canvas->set_brush_size(32);
+  canvas->set_brush_softness(20);
+  canvas->set_brush_opacity(20);
+  canvas->set_brush_build_up(false);
+  scrub_stroke(QPoint(175, 180));
+  const auto first_erase = canvas_pixel(*canvas, QPoint(175, 180));
+  CHECK(first_erase.red() >= 40);
+  CHECK(first_erase.red() <= 70);
+
+  scrub_stroke(QPoint(175, 180));
+  const auto second_erase = canvas_pixel(*canvas, QPoint(175, 180));
+  CHECK(second_erase.red() > first_erase.red() + 20);
+  CHECK(second_erase.red() >= 80);
+  CHECK(second_erase.red() <= 105);
+  save_widget_artifact("ui_brush_opacity_per_stroke", window);
+}
+
+void ui_low_opacity_large_brush_whole_canvas_is_exact_fill_region() {
+  patchy::Document document(48, 32, patchy::PixelFormat::rgba8());
+  document.add_pixel_layer("Paint", solid_pixels(48, 32, patchy::PixelFormat::rgba8(), QColor(0, 0, 0, 0)));
+
+  patchy::ui::MainWindow window;
+  window.add_document_session(std::move(document), QStringLiteral("Uniform Brush"));
+  show_window(window);
+  auto* canvas = require_canvas(window);
+
+  require_action_by_text(window, QStringLiteral("Brush"))->trigger();
+  canvas->set_zoom(1.0);
+  canvas->set_primary_color(Qt::black);
+  canvas->set_brush_size(48);
+  canvas->set_brush_opacity(20);
+  canvas->set_brush_softness(0);
+  canvas->set_brush_build_up(false);
+  QApplication::processEvents();
+
+  const auto send_document_mouse = [canvas](QEvent::Type type, QPoint document_point,
+                                            Qt::MouseButton button, Qt::MouseButtons buttons) {
+    send_mouse(*canvas, type, canvas->widget_position_for_document_point(document_point), button, buttons);
+  };
+
+  send_document_mouse(QEvent::MouseButtonPress, QPoint(0, 0), Qt::LeftButton, Qt::LeftButton);
+  for (int y = 0; y < 32; y += 12) {
+    send_document_mouse(QEvent::MouseMove, QPoint(47, y), Qt::NoButton, Qt::LeftButton);
+    send_document_mouse(QEvent::MouseMove, QPoint(47, std::min(y + 12, 31)), Qt::NoButton, Qt::LeftButton);
+    send_document_mouse(QEvent::MouseMove, QPoint(0, std::min(y + 12, 31)), Qt::NoButton, Qt::LeftButton);
+    if (y + 24 < 32) {
+      send_document_mouse(QEvent::MouseMove, QPoint(0, y + 24), Qt::NoButton, Qt::LeftButton);
+    }
+  }
+  send_document_mouse(QEvent::MouseButtonRelease, QPoint(0, 31), Qt::LeftButton, Qt::NoButton);
+  QApplication::processEvents();
+
+  const auto& painted_layer = patchy::ui::MainWindowTestAccess::document(window).layers().front();
+  const auto& painted_pixels = painted_layer.pixels();
+  CHECK(painted_pixels.format() == patchy::PixelFormat::rgba8());
+  for (std::int32_t y = 0; y < painted_pixels.height(); ++y) {
+    for (std::int32_t x = 0; x < painted_pixels.width(); ++x) {
+      const auto* pixel = painted_pixels.pixel(x, y);
+      CHECK(pixel[0] == 0);
+      CHECK(pixel[1] == 0);
+      CHECK(pixel[2] == 0);
+      CHECK(pixel[3] == 51);
+    }
+  }
+
+  use_solid_fill_settings(canvas);
+  require_action_by_text(window, QStringLiteral("Fill"))->trigger();
+  canvas->set_primary_color(QColor(220, 40, 90));
+  canvas->set_brush_opacity(100);
+  send_document_mouse(QEvent::MouseButtonPress, QPoint(24, 16), Qt::LeftButton, Qt::LeftButton);
+  send_document_mouse(QEvent::MouseButtonRelease, QPoint(24, 16), Qt::LeftButton, Qt::NoButton);
+  QApplication::processEvents();
+
+  const auto& filled_pixels = painted_layer.pixels();
+  for (std::int32_t y = 0; y < filled_pixels.height(); ++y) {
+    for (std::int32_t x = 0; x < filled_pixels.width(); ++x) {
+      const auto* pixel = filled_pixels.pixel(x, y);
+      CHECK(pixel[0] == 220);
+      CHECK(pixel[1] == 40);
+      CHECK(pixel[2] == 90);
+      CHECK(pixel[3] == 255);
+    }
+  }
+}
+
+void ui_soft_brush_click_paints_single_dab() {
+  patchy::ui::MainWindow window;
+  show_window(window);
+  auto* canvas = require_canvas(window);
+
+  require_action_by_text(window, QStringLiteral("Brush"))->trigger();
+  canvas->set_zoom(1.0);
+  canvas->set_primary_color(Qt::black);
+  canvas->set_brush_size(64);
+  canvas->set_brush_opacity(100);
+  canvas->set_brush_softness(100);
+  canvas->set_brush_build_up(false);
+  QApplication::processEvents();
+
+  const QPoint center_doc(150, 120);
+  const auto center = canvas->widget_position_for_document_point(center_doc);
+  send_mouse(*canvas, QEvent::MouseButtonPress, center, Qt::LeftButton, Qt::LeftButton);
+  send_mouse(*canvas, QEvent::MouseButtonRelease, center, Qt::LeftButton, Qt::NoButton);
+  QApplication::processEvents();
+
+  CHECK(canvas_pixel(*canvas, center_doc).red() < 12);
+  const auto feather = canvas_pixel(*canvas, center_doc + QPoint(20, 0));
+  CHECK(feather.red() > 160);
+  CHECK(feather.red() < 225);
+
+  const QPoint drag_start_doc(246, 120);
+  const QPoint drag_end_doc(286, 120);
+  drag(*canvas, canvas->widget_position_for_document_point(drag_start_doc),
+       canvas->widget_position_for_document_point(drag_end_doc));
+  QApplication::processEvents();
+  const auto drag_feather = canvas_pixel(*canvas, QPoint(266, 120) + QPoint(20, 0));
+  CHECK(drag_feather.red() < feather.red() - 12);
+  CHECK(canvas_pixel(*canvas, QPoint(266, 120)).red() < 12);
+  save_widget_artifact("ui_soft_brush_single_click", window);
+}
+
+void ui_brush_can_start_off_canvas_with_visible_soft_edge() {
+  patchy::Document document(96, 80, patchy::PixelFormat::rgba8());
+  document.add_pixel_layer("Paint", solid_pixels(96, 80, patchy::PixelFormat::rgba8(), QColor(Qt::white)));
+
+  patchy::ui::CanvasWidget canvas;
+  canvas.resize(180, 160);
+  canvas.set_document(&document);
+  canvas.set_tool(patchy::ui::CanvasTool::Brush);
+  canvas.set_zoom(1.0);
+  canvas.set_primary_color(Qt::black);
+  canvas.set_brush_size(64);
+  canvas.set_brush_opacity(100);
+  canvas.set_brush_softness(100);
+  canvas.show();
+  QApplication::processEvents();
+
+  const auto off_canvas_center = canvas.widget_position_for_document_point(QPoint(-16, 40));
+  send_mouse(canvas, QEvent::MouseButtonPress, off_canvas_center, Qt::LeftButton, Qt::LeftButton);
+  send_mouse(canvas, QEvent::MouseButtonRelease, off_canvas_center, Qt::LeftButton, Qt::NoButton);
+  QApplication::processEvents();
+
+  const auto entered_edge = canvas_pixel(canvas, QPoint(0, 40));
+  CHECK(entered_edge.red() < 220);
+  CHECK(entered_edge.red() > 40);
+  CHECK(color_close(canvas_pixel(canvas, QPoint(24, 40)), QColor(Qt::white), 2));
+}
+
+void ui_brush_stroke_continues_through_off_canvas_grey_area() {
+  patchy::Document document(120, 80, patchy::PixelFormat::rgba8());
+  document.add_pixel_layer("Paint", solid_pixels(120, 80, patchy::PixelFormat::rgba8(), QColor(Qt::white)));
+
+  patchy::ui::CanvasWidget canvas;
+  canvas.resize(220, 170);
+  canvas.set_document(&document);
+  canvas.set_tool(patchy::ui::CanvasTool::Brush);
+  canvas.set_zoom(1.0);
+  canvas.set_primary_color(Qt::black);
+  canvas.set_brush_size(18);
+  canvas.set_brush_opacity(100);
+  canvas.set_brush_softness(0);
+  canvas.show();
+  QApplication::processEvents();
+
+  const auto widget_point = [&canvas](QPoint document_point) {
+    return canvas.widget_position_for_document_point(document_point);
+  };
+  send_mouse(canvas, QEvent::MouseButtonPress, widget_point(QPoint(-12, 30)), Qt::LeftButton, Qt::LeftButton);
+  send_mouse(canvas, QEvent::MouseMove, widget_point(QPoint(50, 30)), Qt::NoButton, Qt::LeftButton);
+  send_mouse(canvas, QEvent::MouseMove, widget_point(QPoint(132, 30)), Qt::NoButton, Qt::LeftButton);
+  send_mouse(canvas, QEvent::MouseMove, widget_point(QPoint(80, 60)), Qt::NoButton, Qt::LeftButton);
+  send_mouse(canvas, QEvent::MouseButtonRelease, widget_point(QPoint(80, 60)), Qt::LeftButton, Qt::NoButton);
+  QApplication::processEvents();
+
+  CHECK(canvas_pixel(canvas, QPoint(4, 30)).red() < 20);
+  CHECK(canvas_pixel(canvas, QPoint(60, 30)).red() < 20);
+  CHECK(canvas_pixel(canvas, QPoint(116, 30)).red() < 20);
+  CHECK(canvas_pixel(canvas, QPoint(80, 60)).red() < 20);
+}
+
+void ui_large_soft_brush_repaints_after_small_drag() {
+  patchy::Document document(1200, 900, patchy::PixelFormat::rgba8());
+  document.add_pixel_layer("Paint", solid_pixels(1200, 900, patchy::PixelFormat::rgba8(), QColor(Qt::white)));
+
+  patchy::ui::CanvasWidget canvas;
+  canvas.resize(1280, 980);
+  canvas.set_document(&document);
+  canvas.set_tool(patchy::ui::CanvasTool::Brush);
+  canvas.set_zoom(1.0);
+  canvas.set_primary_color(Qt::black);
+  canvas.set_brush_size(patchy::ui::kMaxBrushSize);
+  canvas.set_brush_opacity(100);
+  canvas.set_brush_softness(100);
+  canvas.show();
+  QApplication::processEvents();
+
+  const auto start = canvas.widget_position_for_document_point(QPoint(560, 450));
+  send_mouse(canvas, QEvent::MouseButtonPress, start, Qt::LeftButton, Qt::LeftButton);
+  QApplication::processEvents();
+
+  PaintCounterFilter counter;
+  canvas.installEventFilter(&counter);
+  QApplication::processEvents();
+  counter.paint_events = 0;
+  send_mouse(canvas, QEvent::MouseMove, start + QPoint(20, 0), Qt::NoButton, Qt::LeftButton);
+  CHECK(counter.paint_events > 0);
+  canvas.removeEventFilter(&counter);
+
+  send_mouse(canvas, QEvent::MouseButtonRelease, start + QPoint(20, 0), Qt::LeftButton, Qt::NoButton);
+  QApplication::processEvents();
+}
+
+void ui_large_soft_brush_drag_stays_responsive() {
+  patchy::Document document(900, 640, patchy::PixelFormat::rgba8());
+  document.add_pixel_layer("Paint", solid_pixels(900, 640, patchy::PixelFormat::rgba8(), QColor(Qt::white)));
+
+  patchy::ui::CanvasWidget canvas;
+  canvas.resize(1000, 740);
+  canvas.set_document(&document);
+  canvas.set_tool(patchy::ui::CanvasTool::Brush);
+  canvas.set_zoom(1.0);
+  canvas.set_primary_color(Qt::black);
+  canvas.set_brush_size(patchy::ui::kMaxBrushSize);
+  canvas.set_brush_opacity(100);
+  canvas.set_brush_softness(100);
+  canvas.show();
+  QApplication::processEvents();
+
+  const auto start = canvas.widget_position_for_document_point(QPoint(240, 320));
+  const auto end = canvas.widget_position_for_document_point(QPoint(660, 320));
+  send_mouse(canvas, QEvent::MouseButtonPress, start, Qt::LeftButton, Qt::LeftButton);
+  QApplication::processEvents();
+
+  QElapsedTimer timer;
+  timer.start();
+  constexpr int kSteps = 8;
+  for (int step = 1; step <= kSteps; ++step) {
+    const auto x = start.x() + ((end.x() - start.x()) * step) / kSteps;
+    send_mouse(canvas, QEvent::MouseMove, QPoint(x, start.y()), Qt::NoButton, Qt::LeftButton);
+  }
+  send_mouse(canvas, QEvent::MouseButtonRelease, end, Qt::LeftButton, Qt::NoButton);
+  QApplication::processEvents();
+  const auto elapsed_ms = timer.elapsed();
+
+  std::cout << "[brush_perf] ui_large_soft_brush_drag_stays_responsive elapsed_ms="
+            << elapsed_ms << '\n';
+  CHECK(elapsed_ms < patchy::test::time_budget_ms(5000));
+  save_widget_artifact("ui_large_soft_brush_drag_responsive", canvas);
+}
+
+void ui_soft_brush_shift_click_does_not_overpaint_anchor() {
+  patchy::ui::MainWindow window;
+  show_window(window);
+  auto* canvas = require_canvas(window);
+
+  require_action_by_text(window, QStringLiteral("Brush"))->trigger();
+  canvas->set_zoom(1.0);
+  canvas->set_primary_color(Qt::black);
+  canvas->set_brush_size(64);
+  canvas->set_brush_opacity(100);
+  canvas->set_brush_softness(100);
+  canvas->set_brush_build_up(false);
+  QApplication::processEvents();
+
+  const auto click = [canvas](QPoint document_point, Qt::KeyboardModifiers modifiers) {
+    const auto position = canvas->widget_position_for_document_point(document_point);
+    send_mouse(*canvas, QEvent::MouseButtonPress, position, Qt::LeftButton, Qt::LeftButton, modifiers);
+    send_mouse(*canvas, QEvent::MouseButtonRelease, position, Qt::LeftButton, Qt::NoButton, modifiers);
+    QApplication::processEvents();
+  };
+
+  const QPoint start_doc(90, 160);
+  const QPoint end_doc(280, 80);
+  click(start_doc, Qt::NoModifier);
+  click(end_doc, Qt::ShiftModifier);
+
+  save_widget_artifact("ui_soft_brush_shift_click_anchor", window);
+  CHECK(canvas_pixel(*canvas, QPoint(90, 160)).red() < 12);
+  CHECK(canvas_pixel(*canvas, QPoint(185, 120)).red() < 12);
+  CHECK(canvas_pixel(*canvas, QPoint(280, 80)).red() < 12);
+
+  const auto before_anchor = canvas_pixel(*canvas, QPoint(93, 180));
+  const auto after_anchor = canvas_pixel(*canvas, QPoint(102, 177));
+  const auto body_feather = canvas_pixel(*canvas, QPoint(193, 138));
+  CHECK(before_anchor.red() > 20);
+  CHECK(before_anchor.red() < 220);
+  CHECK(after_anchor.red() > 20);
+  CHECK(after_anchor.red() < 220);
+  CHECK(body_feather.red() > 20);
+  CHECK(body_feather.red() < 220);
+  CHECK(std::abs(before_anchor.red() - after_anchor.red()) <= 48);
+  CHECK(std::abs(after_anchor.red() - body_feather.red()) <= 36);
+}
+
+void ui_soft_brush_line_ignores_mouse_event_density() {
+  patchy::ui::MainWindow window;
+  show_window(window);
+  auto* canvas = require_canvas(window);
+
+  require_action_by_text(window, QStringLiteral("Brush"))->trigger();
+  canvas->set_zoom(1.0);
+  canvas->set_primary_color(Qt::black);
+  canvas->set_brush_size(64);
+  canvas->set_brush_opacity(100);
+  canvas->set_brush_softness(100);
+  canvas->set_brush_build_up(false);
+  QApplication::processEvents();
+
+  const auto drag_line = [canvas](QPoint start, QPoint end, int move_count) {
+    const auto start_position = canvas->widget_position_for_document_point(start);
+    send_mouse(*canvas, QEvent::MouseButtonPress, start_position, Qt::LeftButton, Qt::LeftButton);
+    for (int index = 1; index <= move_count; ++index) {
+      const auto t = static_cast<double>(index) / static_cast<double>(move_count);
+      const QPointF point(static_cast<double>(start.x()) +
+                              (static_cast<double>(end.x()) - static_cast<double>(start.x())) * t,
+                          static_cast<double>(start.y()) +
+                              (static_cast<double>(end.y()) - static_cast<double>(start.y())) * t);
+      const QPoint document_point(static_cast<int>(std::lround(point.x())),
+                                  static_cast<int>(std::lround(point.y())));
+      send_mouse(*canvas, QEvent::MouseMove, canvas->widget_position_for_document_point(document_point),
+                 Qt::NoButton, Qt::LeftButton);
+    }
+    send_mouse(*canvas, QEvent::MouseButtonRelease, canvas->widget_position_for_document_point(end),
+               Qt::LeftButton, Qt::NoButton);
+    QApplication::processEvents();
+  };
+
+  drag_line(QPoint(70, 128), QPoint(300, 128), 3);
+  drag_line(QPoint(70, 216), QPoint(300, 216), 48);
+
+  save_widget_artifact("ui_soft_brush_event_density", window);
+  for (const auto x : {105, 145, 185, 225, 265}) {
+    const auto sparse_body = canvas_pixel(*canvas, QPoint(x, 128));
+    const auto dense_body = canvas_pixel(*canvas, QPoint(x, 216));
+    CHECK(sparse_body.red() < 16);
+    CHECK(dense_body.red() < 16);
+    CHECK(color_close(sparse_body, dense_body, 8));
+
+    const auto sparse_feather = canvas_pixel(*canvas, QPoint(x, 154));
+    const auto dense_feather = canvas_pixel(*canvas, QPoint(x, 242));
+    CHECK(sparse_feather.red() > 18);
+    CHECK(sparse_feather.red() < 245);
+    CHECK(dense_feather.red() > 18);
+    CHECK(dense_feather.red() < 245);
+    CHECK(color_close(sparse_feather, dense_feather, 16));
+  }
+}
+
+void ui_layer_mask_brush_opacity_caps_per_stroke() {
+  patchy::Document document(64, 64, patchy::PixelFormat::rgb8());
+  document.add_pixel_layer("Background",
+                           solid_pixels(64, 64, patchy::PixelFormat::rgb8(), QColor(255, 255, 255)));
+  auto& red = document.add_pixel_layer("Red Fill",
+                                       solid_pixels(64, 64, patchy::PixelFormat::rgb8(), QColor(220, 30, 30)));
+  patchy::PixelBuffer mask_pixels(64, 64, patchy::PixelFormat::gray8());
+  mask_pixels.clear(0);
+  red.set_mask(patchy::LayerMask{patchy::Rect{0, 0, 64, 64}, std::move(mask_pixels), 0, false});
+
+  patchy::ui::MainWindow window;
+  window.add_document_session(std::move(document), QStringLiteral("Mask Brush Opacity"));
+  show_window(window);
+  auto* canvas = require_canvas(window);
+  canvas->set_layer_edit_target(patchy::ui::CanvasWidget::LayerEditTarget::Mask);
+
+  require_action_by_text(window, QStringLiteral("Brush"))->trigger();
+  canvas->set_primary_color(Qt::white);
+  canvas->set_brush_size(24);
+  canvas->set_brush_opacity(20);
+  canvas->set_brush_softness(0);
+  canvas->set_brush_build_up(false);
+
+  auto scrub_stroke = [canvas](QPoint document_point) {
+    const auto center = canvas->widget_position_for_document_point(document_point);
+    send_mouse(*canvas, QEvent::MouseButtonPress, center, Qt::LeftButton, Qt::LeftButton);
+    for (const auto offset : {QPoint(0, 0), QPoint(14, 0), QPoint(-14, 0), QPoint(14, 0), QPoint(-14, 0)}) {
+      send_mouse(*canvas, QEvent::MouseMove, center + offset, Qt::NoButton, Qt::LeftButton);
+    }
+    send_mouse(*canvas, QEvent::MouseButtonRelease, center, Qt::LeftButton, Qt::NoButton);
+    QApplication::processEvents();
+  };
+
+  scrub_stroke(QPoint(32, 32));
+  const auto first_stroke = canvas_pixel(*canvas, QPoint(32, 32));
+  CHECK(first_stroke.red() >= 245);
+  CHECK(first_stroke.green() >= 200);
+  CHECK(first_stroke.green() <= 222);
+  CHECK(std::abs(first_stroke.green() - first_stroke.blue()) <= 4);
+
+  scrub_stroke(QPoint(32, 32));
+  const auto second_stroke = canvas_pixel(*canvas, QPoint(32, 32));
+  CHECK(second_stroke.green() < first_stroke.green() - 20);
+  CHECK(second_stroke.green() >= 165);
+  CHECK(second_stroke.green() <= 190);
+
+  canvas->set_brush_opacity(40);
+  canvas->set_brush_flow(20);
+  canvas->set_brush_build_up(true);
+  const auto airbrush_point = canvas->widget_position_for_document_point(QPoint(16, 16));
+  send_mouse(*canvas, QEvent::MouseButtonPress, airbrush_point, Qt::LeftButton, Qt::LeftButton);
+  QTest::qWait(430);
+  send_mouse(*canvas, QEvent::MouseButtonRelease, airbrush_point, Qt::LeftButton, Qt::NoButton);
+  QApplication::processEvents();
+  const auto airbrush_mask = canvas_pixel(*canvas, QPoint(16, 16));
+  CHECK(airbrush_mask.red() >= 239);
+  CHECK(airbrush_mask.red() <= 243);
+  CHECK(airbrush_mask.green() >= 160);
+  CHECK(airbrush_mask.green() <= 170);
+  CHECK(std::abs(airbrush_mask.green() - airbrush_mask.blue()) <= 4);
+  save_widget_artifact("ui_layer_mask_brush_opacity_per_stroke", window);
+}
+
+void ui_shift_constrains_brush_and_eraser_strokes_to_axis() {
+  patchy::ui::MainWindow window;
+  show_window(window);
+  auto* canvas = require_canvas(window);
+
+  require_action_by_text(window, QStringLiteral("Brush"))->trigger();
+  canvas->set_primary_color(Qt::black);
+  canvas->set_brush_size(5);
+  canvas->set_brush_opacity(100);
+  canvas->set_brush_softness(0);
+  drag(*canvas, canvas->widget_position_for_document_point(QPoint(70, 80)),
+       canvas->widget_position_for_document_point(QPoint(150, 110)), Qt::ShiftModifier);
+  QApplication::processEvents();
+  CHECK(color_close(canvas_pixel(*canvas, QPoint(120, 80)), Qt::black, 12));
+  CHECK(color_close(canvas_pixel(*canvas, QPoint(120, 99)), Qt::white, 12));
+
+  canvas->set_brush_size(45);
+  drag(*canvas, canvas->widget_position_for_document_point(QPoint(60, 180)),
+       canvas->widget_position_for_document_point(QPoint(170, 180)));
+  QApplication::processEvents();
+  CHECK(color_close(canvas_pixel(*canvas, QPoint(120, 199)), Qt::black, 12));
+
+  require_action_by_text(window, QStringLiteral("Eraser"))->trigger();
+  canvas->set_brush_size(5);
+  canvas->set_brush_opacity(100);
+  canvas->set_brush_softness(0);
+  drag(*canvas, canvas->widget_position_for_document_point(QPoint(70, 180)),
+       canvas->widget_position_for_document_point(QPoint(150, 210)), Qt::ShiftModifier);
+  QApplication::processEvents();
+  CHECK(color_close(canvas_pixel(*canvas, QPoint(120, 180)), Qt::white, 12));
+  CHECK(color_close(canvas_pixel(*canvas, QPoint(120, 199)), Qt::black, 12));
+}
+
+void ui_shift_constrains_clone_stamp_strokes_to_axis() {
+  patchy::ui::MainWindow window;
+  show_window(window);
+  auto* canvas = require_canvas(window);
+
+  require_action_by_text(window, QStringLiteral("Brush"))->trigger();
+  canvas->set_primary_color(QColor(230, 40, 30));
+  canvas->set_brush_size(45);
+  canvas->set_brush_opacity(100);
+  canvas->set_brush_softness(0);
+  drag(*canvas, canvas->widget_position_for_document_point(QPoint(70, 90)),
+       canvas->widget_position_for_document_point(QPoint(130, 90)));
+  QApplication::processEvents();
+
+  require_action_by_text(window, QStringLiteral("Clone"))->trigger();
+  canvas->set_brush_size(5);
+  canvas->set_brush_opacity(100);
+  canvas->set_brush_softness(0);
+  const auto source = canvas->widget_position_for_document_point(QPoint(70, 90));
+  send_mouse(*canvas, QEvent::MouseButtonPress, source, Qt::LeftButton, Qt::LeftButton, Qt::AltModifier);
+  send_mouse(*canvas, QEvent::MouseButtonRelease, source, Qt::LeftButton, Qt::NoButton, Qt::AltModifier);
+
+  drag(*canvas, canvas->widget_position_for_document_point(QPoint(170, 100)),
+       canvas->widget_position_for_document_point(QPoint(230, 130)), Qt::ShiftModifier);
+  QApplication::processEvents();
+  CHECK(color_close(canvas_pixel(*canvas, QPoint(210, 100)), QColor(230, 40, 30), 45));
+  CHECK(color_close(canvas_pixel(*canvas, QPoint(210, 120)), Qt::white, 12));
+}
+
+void ui_brush_alt_right_drag_adjusts_size_and_softness() {
+  patchy::Document document(96, 64, patchy::PixelFormat::rgba8());
+  auto& layer = document.add_pixel_layer(
+      "Paint", solid_pixels(96, 64, patchy::PixelFormat::rgba8(), QColor(255, 255, 255)));
+  const auto layer_id = layer.id();
+
+  patchy::ui::CanvasWidget canvas;
+  canvas.resize(420, 300);
+  canvas.set_document(&document);
+  canvas.set_tool(patchy::ui::CanvasTool::Brush);
+  canvas.set_brush_size(20);
+  canvas.set_brush_softness(50);
+  canvas.show();
+  QApplication::processEvents();
+  CHECK(canvas.zoom() == 1.0);
+
+  // Alt+Right-drag right grows the size so the brush edge tracks the pointer
+  // (2 document pixels of diameter per pixel dragged at 100% zoom); dragging
+  // up softens the edge.
+  const QPoint origin(180, 160);
+  send_mouse(canvas, QEvent::MouseButtonPress, origin, Qt::RightButton, Qt::RightButton, Qt::AltModifier);
+  send_mouse(canvas, QEvent::MouseMove, origin + QPoint(30, 0), Qt::NoButton, Qt::RightButton, Qt::AltModifier);
+  CHECK(canvas.brush_size() == 80);
+  CHECK(canvas.brush_softness() == 50);
+  send_mouse(canvas, QEvent::MouseMove, origin + QPoint(30, -50), Qt::NoButton, Qt::RightButton, Qt::AltModifier);
+  CHECK(canvas.brush_size() == 80);
+  CHECK(canvas.brush_softness() == 70);
+  save_widget_artifact("ui_brush_alt_right_drag_hud", canvas);
+  send_mouse(canvas, QEvent::MouseButtonRelease, origin + QPoint(30, -50), Qt::RightButton, Qt::NoButton,
+             Qt::AltModifier);
+  CHECK(canvas.brush_size() == 80);
+  CHECK(canvas.brush_softness() == 70);
+  // The pointer snaps back to the gesture anchor so the brush stays centered
+  // on the spot that was adjusted instead of jumping by the drag distance.
+  CHECK(QCursor::pos() == canvas.mapToGlobal(origin));
+
+  // Escape cancels an in-flight adjustment and restores the committed values.
+  send_mouse(canvas, QEvent::MouseButtonPress, origin, Qt::RightButton, Qt::RightButton, Qt::AltModifier);
+  send_mouse(canvas, QEvent::MouseMove, origin + QPoint(20, 30), Qt::NoButton, Qt::RightButton, Qt::AltModifier);
+  CHECK(canvas.brush_size() == 120);
+  CHECK(canvas.brush_softness() == 58);
+  send_key_press(canvas, Qt::Key_Escape);
+  CHECK(canvas.brush_size() == 80);
+  CHECK(canvas.brush_softness() == 70);
+  CHECK(QCursor::pos() == canvas.mapToGlobal(origin));
+  send_mouse(canvas, QEvent::MouseButtonRelease, origin + QPoint(20, 30), Qt::RightButton, Qt::NoButton,
+             Qt::AltModifier);
+  CHECK(canvas.brush_size() == 80);
+  CHECK(canvas.brush_softness() == 70);
+
+  // Dragging softness all the way to 0% must render the HUD as a solid hard
+  // disc (a duplicate 1.0 gradient stop used to wipe the fill to a fade).
+  send_mouse(canvas, QEvent::MouseButtonPress, origin, Qt::RightButton, Qt::RightButton, Qt::AltModifier);
+  send_mouse(canvas, QEvent::MouseMove, origin + QPoint(0, 200), Qt::NoButton, Qt::RightButton, Qt::AltModifier);
+  CHECK(canvas.brush_size() == 80);
+  CHECK(canvas.brush_softness() == 0);
+  const auto hard_hud = canvas.grab().toImage();
+  const auto hard_edge_sample = hard_hud.pixelColor(origin + QPoint(34, 0));
+  CHECK(hard_edge_sample.red() > hard_edge_sample.green() + 60);
+  save_widget_artifact("ui_brush_alt_right_drag_hud_hard", canvas);
+  send_mouse(canvas, QEvent::MouseButtonRelease, origin + QPoint(0, 200), Qt::RightButton, Qt::NoButton,
+             Qt::AltModifier);
+  CHECK(canvas.brush_softness() == 0);
+
+  // The gesture never paints.
+  const auto& pixels = document.find_layer(layer_id)->pixels();
+  for (int x = 30; x <= 60; ++x) {
+    const auto* pixel = pixels.pixel(x, 40);
+    CHECK(pixel[0] == 255U && pixel[1] == 255U && pixel[2] == 255U);
+  }
+
+  // A move without the right button (lost release) commits and ends the drag
+  // instead of leaving the overlay stuck.
+  send_mouse(canvas, QEvent::MouseButtonPress, origin, Qt::RightButton, Qt::RightButton, Qt::AltModifier);
+  send_mouse(canvas, QEvent::MouseMove, origin + QPoint(10, 0), Qt::NoButton, Qt::RightButton, Qt::AltModifier);
+  CHECK(canvas.brush_size() == 100);
+  send_mouse(canvas, QEvent::MouseMove, origin + QPoint(60, 0), Qt::NoButton, Qt::NoButton);
+  CHECK(canvas.brush_size() == 100);
+  send_mouse(canvas, QEvent::MouseMove, origin + QPoint(90, 0), Qt::NoButton, Qt::NoButton);
+  CHECK(canvas.brush_size() == 100);
+}
+
+void ui_pen_alt_barrel_button_adjusts_brush_size_and_softness() {
+  patchy::Document document(96, 64, patchy::PixelFormat::rgba8());
+  auto& layer = document.add_pixel_layer(
+      "Paint", solid_pixels(96, 64, patchy::PixelFormat::rgba8(), QColor(255, 255, 255)));
+  const auto layer_id = layer.id();
+
+  patchy::ui::CanvasWidget canvas;
+  canvas.resize(420, 300);
+  canvas.set_document(&document);
+  canvas.set_tool(patchy::ui::CanvasTool::Brush);
+  canvas.set_brush_size(20);
+  canvas.set_brush_softness(50);
+  canvas.show();
+  QApplication::processEvents();
+  CHECK(canvas.zoom() == 1.0);
+
+  // Alt + a barrel button mapped to right-click matches the Alt+Right mouse
+  // gesture. The press is hover-only (pressure 0), which is how a Wacom
+  // side-button right-click arrives.
+  const auto before_origin = canvas.widget_position_for_document_point(QPoint(0, 0));
+  const QPoint origin(180, 160);
+  send_tablet(canvas, QEvent::TabletPress, origin, 0.0, Qt::RightButton, Qt::RightButton, Qt::AltModifier);
+  send_tablet(canvas, QEvent::TabletMove, origin + QPoint(30, 0), 0.0, Qt::NoButton, Qt::RightButton,
+              Qt::AltModifier);
+  // Pen gestures use 4 px of diameter per dragged pixel (the disc is centered
+  // on the pen, so the radius must outpace the pen's own travel).
+  CHECK(canvas.brush_size() == 140);
+  CHECK(canvas.brush_softness() == 50);
+  send_tablet(canvas, QEvent::TabletMove, origin + QPoint(30, -50), 0.0, Qt::NoButton, Qt::RightButton,
+              Qt::AltModifier);
+  CHECK(canvas.brush_size() == 140);
+  CHECK(canvas.brush_softness() == 70);
+  send_tablet(canvas, QEvent::TabletRelease, origin + QPoint(30, -50), 0.0, Qt::RightButton, Qt::NoButton,
+              Qt::AltModifier);
+  CHECK(canvas.brush_size() == 140);
+  CHECK(canvas.brush_softness() == 70);
+  // The chord must beat the barrel's configured action (pan by default).
+  CHECK(canvas.widget_position_for_document_point(QPoint(0, 0)) == before_origin);
+
+  // Escape cancels an in-flight pen adjustment; the barrel release that
+  // follows must not leave painting suppressed or re-trigger the pan action.
+  send_tablet(canvas, QEvent::TabletPress, origin, 0.0, Qt::RightButton, Qt::RightButton, Qt::AltModifier);
+  send_tablet(canvas, QEvent::TabletMove, origin + QPoint(20, 0), 0.0, Qt::NoButton, Qt::RightButton,
+              Qt::AltModifier);
+  CHECK(canvas.brush_size() == 220);
+  send_key_press(canvas, Qt::Key_Escape);
+  CHECK(canvas.brush_size() == 140);
+  send_tablet(canvas, QEvent::TabletRelease, origin + QPoint(20, 0), 0.0, Qt::RightButton, Qt::NoButton,
+              Qt::AltModifier);
+  CHECK(canvas.brush_size() == 140);
+  CHECK(canvas.brush_softness() == 70);
+
+  // Without Alt the barrel button keeps its configured pen action.
+  send_tablet(canvas, QEvent::TabletPress, origin, 1.0, Qt::RightButton, Qt::RightButton);
+  send_tablet(canvas, QEvent::TabletMove, origin + QPoint(35, 18), 1.0, Qt::NoButton, Qt::RightButton);
+  send_tablet(canvas, QEvent::TabletRelease, origin + QPoint(35, 18), 0.0, Qt::RightButton, Qt::NoButton);
+  CHECK(canvas.brush_size() == 140);
+  CHECK(canvas.widget_position_for_document_point(QPoint(0, 0)) != before_origin);
+
+  // A lost barrel release (the pen left proximity mid-drag, or the driver
+  // delivered the release as a plain mouse event) must not leave the overlay
+  // stuck: the first hover move without the button commits and ends the drag.
+  send_tablet(canvas, QEvent::TabletPress, origin, 0.0, Qt::RightButton, Qt::RightButton, Qt::AltModifier);
+  send_tablet(canvas, QEvent::TabletMove, origin + QPoint(10, 0), 0.0, Qt::NoButton, Qt::RightButton,
+              Qt::AltModifier);
+  CHECK(canvas.brush_size() == 180);
+  send_tablet(canvas, QEvent::TabletMove, origin + QPoint(60, 0), 0.0, Qt::NoButton, Qt::NoButton);
+  CHECK(canvas.brush_size() == 180);
+  send_tablet(canvas, QEvent::TabletMove, origin + QPoint(90, 0), 0.0, Qt::NoButton, Qt::NoButton);
+  CHECK(canvas.brush_size() == 180);
+
+  // Same when the next event is a quick tip touch instead of a hover move:
+  // the stale drag ends and the press paints immediately.
+  send_tablet(canvas, QEvent::TabletPress, origin, 0.0, Qt::RightButton, Qt::RightButton, Qt::AltModifier);
+  send_tablet(canvas, QEvent::TabletMove, origin + QPoint(10, 0), 0.0, Qt::NoButton, Qt::RightButton,
+              Qt::AltModifier);
+  CHECK(canvas.brush_size() == 220);
+  const auto tip_position = canvas.widget_position_for_document_point(QPoint(20, 20));
+  send_tablet(canvas, QEvent::TabletPress, tip_position, 1.0);
+  send_tablet(canvas, QEvent::TabletMove, tip_position + QPoint(5, 0), 1.0);
+  send_tablet(canvas, QEvent::TabletRelease, tip_position + QPoint(5, 0), 0.0, Qt::LeftButton, Qt::NoButton);
+  CHECK(canvas.brush_size() == 220);
+  {
+    const auto& stroke_pixels = document.find_layer(layer_id)->pixels();
+    const auto* touched = stroke_pixels.pixel(20, 20);
+    CHECK(touched[0] != 255U || touched[1] != 255U || touched[2] != 255U);
+  }
+
+  // The pen tip still paints normally afterwards.
+  const auto paint_position = canvas.widget_position_for_document_point(QPoint(48, 32));
+  send_tablet(canvas, QEvent::TabletPress, paint_position, 1.0);
+  send_tablet(canvas, QEvent::TabletMove, paint_position + QPoint(6, 0), 1.0);
+  send_tablet(canvas, QEvent::TabletRelease, paint_position + QPoint(6, 0), 0.0, Qt::LeftButton, Qt::NoButton);
+  const auto& pixels = document.find_layer(layer_id)->pixels();
+  int painted_pixels = 0;
+  for (std::int32_t y = 0; y < pixels.height(); ++y) {
+    for (std::int32_t x = 0; x < pixels.width(); ++x) {
+      const auto* pixel = pixels.pixel(x, y);
+      if (pixel[0] != 255U || pixel[1] != 255U || pixel[2] != 255U) {
+        ++painted_pixels;
+      }
+    }
+  }
+  CHECK(painted_pixels > 0);
+
+  // Wacom drivers can keep reporting the barrel as held until the pen leaves
+  // proximity. A tip touch with that phantom button state must still end the
+  // gesture and paint immediately — not get swallowed or turned into a pan.
+  send_tablet(canvas, QEvent::TabletPress, origin, 0.0, Qt::RightButton, Qt::RightButton, Qt::AltModifier);
+  send_tablet(canvas, QEvent::TabletMove, origin + QPoint(-10, 0), 0.0, Qt::NoButton, Qt::RightButton,
+              Qt::AltModifier);
+  CHECK(canvas.brush_size() == 180);
+  canvas.set_primary_color(QColor(0, 200, 0));
+  const auto latched_tip = canvas.widget_position_for_document_point(QPoint(70, 40));
+  send_tablet(canvas, QEvent::TabletPress, latched_tip, 1.0, Qt::LeftButton,
+              Qt::LeftButton | Qt::RightButton);
+  send_tablet(canvas, QEvent::TabletMove, latched_tip + QPoint(4, 0), 1.0, Qt::NoButton,
+              Qt::LeftButton | Qt::RightButton);
+  send_tablet(canvas, QEvent::TabletRelease, latched_tip + QPoint(4, 0), 0.0, Qt::LeftButton, Qt::RightButton);
+  CHECK(canvas.brush_size() == 180);
+  {
+    const auto& latched_pixels = document.find_layer(layer_id)->pixels();
+    const auto* touched = latched_pixels.pixel(70, 40);
+    CHECK(touched[1] > 100U);
+    CHECK(touched[0] < 100U);
+  }
+}
+
+void ui_pen_brush_adjust_overlay_centers_on_pen() {
+  patchy::Document document(96, 64, patchy::PixelFormat::rgba8());
+  document.add_pixel_layer("Paint", solid_pixels(96, 64, patchy::PixelFormat::rgba8(), QColor(255, 255, 255)));
+
+  patchy::ui::CanvasWidget canvas;
+  canvas.resize(420, 300);
+  canvas.set_document(&document);
+  canvas.set_tool(patchy::ui::CanvasTool::Brush);
+  canvas.set_brush_size(20);
+  canvas.set_brush_softness(0);
+  canvas.show();
+  QApplication::processEvents();
+  CHECK(canvas.zoom() == 1.0);
+
+  // The pen cannot be warped back to an anchor when the gesture ends, so the
+  // preview disc is centered on the pen the whole time (the gesture finishes
+  // with the brush already under the pen), and the radius outgrows the pen's
+  // travel so both edges keep expanding (a pinned trailing edge reads as
+  // growing out of the top-left corner).
+  const QPoint origin(180, 160);
+  send_tablet(canvas, QEvent::TabletPress, origin, 0.0, Qt::RightButton, Qt::RightButton, Qt::AltModifier);
+  send_tablet(canvas, QEvent::TabletMove, origin + QPoint(20, 0), 0.0, Qt::NoButton, Qt::RightButton,
+              Qt::AltModifier);
+  CHECK(canvas.brush_size() == 100);
+  const auto hud = canvas.grab().toImage();
+  // Size 100 means a 50 px radius around the pen at origin+20. A sample 45 px
+  // ahead of the pen is inside only when the disc is centered on the pen...
+  const auto ahead_of_pen = hud.pixelColor(origin + QPoint(65, 0));
+  CHECK(ahead_of_pen.red() > ahead_of_pen.green() + 60);
+  // ...and a sample behind the press point is inside only when the trailing
+  // edge expanded too instead of staying pinned.
+  const auto behind_anchor = hud.pixelColor(origin - QPoint(25, 0));
+  CHECK(behind_anchor.red() > behind_anchor.green() + 60);
+  const auto outside = hud.pixelColor(origin - QPoint(60, 0));
+  CHECK(outside.red() <= outside.green() + 60);
+  save_widget_artifact("ui_pen_brush_adjust_overlay_centers_on_pen", canvas);
+  send_tablet(canvas, QEvent::TabletRelease, origin + QPoint(20, 0), 0.0, Qt::RightButton, Qt::NoButton,
+              Qt::AltModifier);
+  CHECK(canvas.brush_size() == 100);
+}
+
+void ui_brush_alt_right_drag_syncs_options_bar_spins() {
+  patchy::ui::MainWindow window;
+  show_window(window);
+  auto* canvas = require_canvas(window);
+
+  require_action_by_text(window, QStringLiteral("Brush"))->trigger();
+  canvas->set_zoom(1.0);
+  canvas->set_brush_size(20);
+  canvas->set_brush_softness(50);
+  QApplication::processEvents();
+
+  const auto origin = canvas->widget_position_for_document_point(QPoint(60, 60));
+  send_mouse(*canvas, QEvent::MouseButtonPress, origin, Qt::RightButton, Qt::RightButton, Qt::AltModifier);
+  send_mouse(*canvas, QEvent::MouseMove, origin + QPoint(25, -25), Qt::NoButton, Qt::RightButton, Qt::AltModifier);
+  send_mouse(*canvas, QEvent::MouseButtonRelease, origin + QPoint(25, -25), Qt::RightButton, Qt::NoButton,
+             Qt::AltModifier);
+  QApplication::processEvents();
+
+  CHECK(canvas->brush_size() == 70);
+  CHECK(canvas->brush_softness() == 60);
+  auto* size_spin = window.findChild<QSpinBox*>(QStringLiteral("brushSizeSpin"));
+  auto* softness_spin = window.findChild<QSpinBox*>(QStringLiteral("brushSoftnessSpin"));
+  CHECK(size_spin != nullptr);
+  CHECK(softness_spin != nullptr);
+  CHECK(size_spin->value() == 70);
+  CHECK(softness_spin->value() == 60);
+}
+
+void ui_brush_shift_click_connects_strokes() {
+  patchy::Document document(200, 60, patchy::PixelFormat::rgba8());
+  auto& layer = document.add_pixel_layer(
+      "Paint", solid_pixels(200, 60, patchy::PixelFormat::rgba8(), QColor(0, 0, 0, 0)));
+  const auto layer_id = layer.id();
+
+  patchy::ui::CanvasWidget canvas;
+  canvas.resize(320, 160);
+  canvas.set_document(&document);
+  canvas.set_tool(patchy::ui::CanvasTool::Brush);
+  canvas.set_primary_color(Qt::black);
+  canvas.set_brush_size(8);
+  canvas.set_brush_opacity(100);
+  canvas.set_brush_softness(0);
+  canvas.show();
+  QApplication::processEvents();
+
+  const auto click = [&canvas](QPoint document_point, Qt::KeyboardModifiers modifiers) {
+    const auto position = canvas.widget_position_for_document_point(document_point);
+    send_mouse(canvas, QEvent::MouseButtonPress, position, Qt::LeftButton, Qt::LeftButton, modifiers);
+    send_mouse(canvas, QEvent::MouseButtonRelease, position, Qt::LeftButton, Qt::NoButton, modifiers);
+  };
+  const auto alpha_at = [&document, layer_id](int x, int y) {
+    return document.find_layer(layer_id)->pixels().pixel(x, y)[3];
+  };
+
+  // Plain clicks paint isolated dabs.
+  click(QPoint(30, 10), Qt::NoModifier);
+  click(QPoint(170, 10), Qt::NoModifier);
+  CHECK(alpha_at(30, 10) >= 250U);
+  CHECK(alpha_at(170, 10) >= 250U);
+  CHECK(alpha_at(100, 10) == 0U);
+
+  // Shift+click joins the new dab to the previous stroke end with a line.
+  click(QPoint(30, 30), Qt::NoModifier);
+  click(QPoint(170, 30), Qt::ShiftModifier);
+  CHECK(alpha_at(30, 30) >= 250U);
+  CHECK(alpha_at(100, 30) >= 250U);
+  CHECK(alpha_at(170, 30) >= 250U);
+
+  // The eraser connects the same way.
+  canvas.set_tool(patchy::ui::CanvasTool::Eraser);
+  click(QPoint(30, 30), Qt::ShiftModifier);
+  CHECK(alpha_at(100, 30) == 0U);
+  CHECK(alpha_at(30, 30) == 0U);
+  CHECK(alpha_at(170, 30) == 0U);
+}
+
+// GitHub issue 445: Shift held over the canvas previews the line a Shift+click paints,
+// from the last stroke's end to the pointer; the key alone shows and hides it.
+void ui_paint_shift_line_preview_follows_pointer() {
+  patchy::Document document(200, 80, patchy::PixelFormat::rgba8());
+  auto& layer = document.add_pixel_layer(
+      "Paint", solid_pixels(200, 80, patchy::PixelFormat::rgba8(), QColor(128, 128, 128)));
+  const auto layer_id = layer.id();
+
+  patchy::ui::CanvasWidget canvas;
+  canvas.resize(320, 160);
+  canvas.set_document(&document);
+  canvas.set_zoom(1.0);
+  canvas.set_tool(patchy::ui::CanvasTool::Brush);
+  canvas.set_primary_color(Qt::black);
+  canvas.set_brush_size(8);
+  canvas.set_brush_opacity(100);
+  canvas.set_brush_softness(0);
+  canvas.show();
+  QApplication::processEvents();
+
+  const auto widget_point = [&canvas](QPoint document_point) {
+    return canvas.widget_position_for_document_point(document_point);
+  };
+  // Brightest and darkest widget pixels in a short column across the line's row.
+  const auto column_range = [&canvas, &widget_point](QPoint document_point) {
+    const auto image = canvas.grab().toImage();
+    const auto center = widget_point(document_point);
+    int brightest = 0;
+    int darkest = 255;
+    for (int dy = -3; dy <= 3; ++dy) {
+      const auto color = image.pixelColor(center.x(), center.y() + dy);
+      const auto value = std::min({color.red(), color.green(), color.blue()});
+      brightest = std::max(brightest, std::max({color.red(), color.green(), color.blue()}));
+      darkest = std::min(darkest, value);
+    }
+    return std::pair{brightest, darkest};
+  };
+  const auto shows_line_at = [&column_range](QPoint document_point) {
+    const auto [brightest, darkest] = column_range(document_point);
+    return brightest >= 180 && darkest <= 90;
+  };
+  const auto is_plain_gray_at = [&column_range](QPoint document_point) {
+    const auto [brightest, darkest] = column_range(document_point);
+    return brightest <= 140 && darkest >= 116;
+  };
+
+  // One plain click sets the anchor; no Shift, no line.
+  const auto anchor = widget_point(QPoint(30, 40));
+  send_mouse(canvas, QEvent::MouseButtonPress, anchor, Qt::LeftButton, Qt::LeftButton, Qt::NoModifier);
+  send_mouse(canvas, QEvent::MouseButtonRelease, anchor, Qt::LeftButton, Qt::NoButton, Qt::NoModifier);
+  const auto target = widget_point(QPoint(170, 40));
+  send_mouse(canvas, QEvent::MouseMove, target, Qt::NoButton, Qt::NoButton, Qt::NoModifier);
+  QApplication::processEvents();
+  CHECK(is_plain_gray_at(QPoint(100, 40)));
+
+  // Shift pressed with a stationary pointer shows the line from the anchor to the pointer.
+  send_key_press(canvas, Qt::Key_Shift);
+  QApplication::processEvents();
+  save_image_artifact("issue445_shift_line_preview_canvas", canvas.grab().toImage());
+  CHECK(shows_line_at(QPoint(100, 40)));
+  CHECK(shows_line_at(QPoint(60, 40)));
+  CHECK(is_plain_gray_at(QPoint(100, 15)));
+  CHECK(is_plain_gray_at(QPoint(185, 40)));
+
+  // Moving with Shift held follows the pointer.
+  const auto lower = widget_point(QPoint(170, 70));
+  send_mouse(canvas, QEvent::MouseMove, lower, Qt::NoButton, Qt::NoButton, Qt::ShiftModifier);
+  QApplication::processEvents();
+  CHECK(is_plain_gray_at(QPoint(140, 40)));
+  CHECK(shows_line_at(QPoint(100, 55)));
+
+  // Releasing Shift alone removes it.
+  send_key_release(canvas, Qt::Key_Shift, Qt::ShiftModifier);
+  QApplication::processEvents();
+  CHECK(is_plain_gray_at(QPoint(100, 55)));
+
+  // Shift+Ctrl (the temporary Move) shows no line.
+  send_mouse(canvas, QEvent::MouseMove, target, Qt::NoButton, Qt::NoButton,
+             Qt::ShiftModifier | Qt::ControlModifier);
+  QApplication::processEvents();
+  CHECK(is_plain_gray_at(QPoint(100, 40)));
+
+  // Shift+click paints along the previewed line; the new end is the anchor, so no line remains.
+  send_mouse(canvas, QEvent::MouseMove, target, Qt::NoButton, Qt::NoButton, Qt::ShiftModifier);
+  QApplication::processEvents();
+  CHECK(shows_line_at(QPoint(100, 40)));
+  send_mouse(canvas, QEvent::MouseButtonPress, target, Qt::LeftButton, Qt::LeftButton, Qt::ShiftModifier);
+  send_mouse(canvas, QEvent::MouseButtonRelease, target, Qt::LeftButton, Qt::NoButton, Qt::ShiftModifier);
+  QApplication::processEvents();
+  const auto* painted = document.find_layer(layer_id);
+  CHECK(painted->pixels().pixel(100, 40)[0] <= 10U);
+  CHECK(painted->pixels().pixel(60, 40)[0] <= 10U);
+  CHECK(painted->pixels().pixel(100, 15)[0] >= 120U);
+  CHECK(!shows_line_at(QPoint(100, 40)));
+
+  // The pointer leaving the canvas hides it.
+  const auto lower_left = widget_point(QPoint(30, 70));
+  send_mouse(canvas, QEvent::MouseMove, lower_left, Qt::NoButton, Qt::NoButton, Qt::ShiftModifier);
+  QApplication::processEvents();
+  CHECK(shows_line_at(QPoint(100, 55)));
+  QEvent leave(QEvent::Leave);
+  QApplication::sendEvent(&canvas, &leave);
+  QApplication::processEvents();
+  CHECK(is_plain_gray_at(QPoint(100, 55)));
+
+  // So does a switch to a tool without Shift+click lines.
+  send_mouse(canvas, QEvent::MouseMove, lower_left, Qt::NoButton, Qt::NoButton, Qt::ShiftModifier);
+  QApplication::processEvents();
+  CHECK(shows_line_at(QPoint(100, 55)));
+  canvas.set_tool(patchy::ui::CanvasTool::Marquee);
+  QApplication::processEvents();
+  CHECK(is_plain_gray_at(QPoint(100, 55)));
+
+  // The window capture for the issue: a stroke, then Shift held further along.
+  patchy::ui::MainWindow window;
+  show_window(window);
+  auto* window_canvas = require_canvas(window);
+  require_action_by_text(window, QStringLiteral("Brush"))->trigger();
+  window_canvas->set_primary_color(QColor(40, 90, 200));
+  window_canvas->set_brush_size(24);
+  window_canvas->set_brush_softness(20);
+  QApplication::processEvents();
+  const auto stroke_start = window_canvas->widget_position_for_document_point(QPoint(120, 330));
+  send_mouse(*window_canvas, QEvent::MouseButtonPress, stroke_start, Qt::LeftButton, Qt::LeftButton,
+             Qt::NoModifier);
+  for (int step = 1; step <= 24; ++step) {
+    const auto x = 120 + step * 12;
+    const auto y = 330 - static_cast<int>(std::lround(90.0 * std::sin(step * 0.26)));
+    send_mouse(*window_canvas, QEvent::MouseMove,
+               window_canvas->widget_position_for_document_point(QPoint(x, y)), Qt::NoButton, Qt::LeftButton,
+               Qt::NoModifier);
+  }
+  const auto stroke_end = window_canvas->widget_position_for_document_point(
+      QPoint(120 + 24 * 12, 330 - static_cast<int>(std::lround(90.0 * std::sin(24 * 0.26)))));
+  send_mouse(*window_canvas, QEvent::MouseButtonRelease, stroke_end, Qt::LeftButton, Qt::NoButton, Qt::NoModifier);
+  send_mouse(*window_canvas, QEvent::MouseMove, window_canvas->widget_position_for_document_point(QPoint(640, 140)),
+             Qt::NoButton, Qt::NoButton, Qt::ShiftModifier);
+  QApplication::processEvents();
+  save_widget_artifact("issue445_shift_line_preview", window);
+}
+
+// GitHub issue 505: at a high zoom the Shift+click preview runs between the pixel centers
+// the stroke paints, not from the anchor pixel's top-left corner.
+void ui_paint_shift_line_preview_starts_at_pixel_center() {
+  patchy::Document document(40, 20, patchy::PixelFormat::rgba8());
+  auto& layer = document.add_pixel_layer(
+      "Paint", solid_pixels(40, 20, patchy::PixelFormat::rgba8(), QColor(128, 128, 128)));
+  const auto layer_id = layer.id();
+
+  patchy::ui::CanvasWidget canvas;
+  canvas.resize(400, 240);
+  canvas.set_document(&document);
+  canvas.set_zoom(8.0);
+  canvas.set_tool(patchy::ui::CanvasTool::Brush);
+  canvas.set_primary_color(Qt::black);
+  canvas.set_brush_opacity(100);
+  canvas.set_brush_softness(0);
+  canvas.show();
+  QApplication::processEvents();
+
+  // The widget pixel at a document pixel's center: its corner plus half of 8 px.
+  const auto center_of = [&canvas](QPoint document_point) {
+    return canvas.widget_position_for_document_point(document_point) + QPoint(4, 4);
+  };
+  // Bounds of the preview's light line near a row: the halo is dark, the artwork mid gray. Only the
+  // document area counts (the scroll bars are light too).
+  const auto light_bounds = [&canvas](int row_y) {
+    const auto image = canvas.grab().toImage();
+    const auto left = canvas.widget_position_for_document_point(QPoint(0, 0)).x();
+    const auto right = canvas.widget_position_for_document_point(QPoint(40, 0)).x();
+    QRect bounds;
+    for (int y = row_y - 12; y <= row_y + 12; ++y) {
+      for (int x = left; x < right; ++x) {
+        const auto color = image.pixelColor(x, y);
+        if (std::min({color.red(), color.green(), color.blue()}) >= 200) {
+          bounds = bounds.united(QRect(x, y, 1, 1));
+        }
+      }
+    }
+    return bounds;
+  };
+  const auto near = [](int value, int expected) { return std::abs(value - expected) <= 1; };
+
+  // The capture for the issue: a 1 px dot at 1600%, then Shift held further along.
+  canvas.set_zoom(16.0);
+  canvas.set_brush_size(1);
+  QApplication::processEvents();
+  const auto dot = canvas.widget_position_for_document_point(QPoint(4, 9)) + QPoint(8, 8);
+  send_mouse(canvas, QEvent::MouseButtonPress, dot, Qt::LeftButton, Qt::LeftButton, Qt::NoModifier);
+  send_mouse(canvas, QEvent::MouseButtonRelease, dot, Qt::LeftButton, Qt::NoButton, Qt::NoModifier);
+  send_mouse(canvas, QEvent::MouseMove, canvas.widget_position_for_document_point(QPoint(16, 4)) + QPoint(8, 8),
+             Qt::NoButton, Qt::NoButton, Qt::ShiftModifier);
+  send_key_press(canvas, Qt::Key_Shift);
+  QApplication::processEvents();
+  save_image_artifact("issue505_shift_line_preview_1600", canvas.grab().toImage());
+  send_key_release(canvas, Qt::Key_Shift, Qt::ShiftModifier);
+  canvas.set_zoom(8.0);
+  QApplication::processEvents();
+
+  for (const auto brush_size : {1, 3}) {
+    canvas.set_brush_size(brush_size);
+    QApplication::processEvents();
+    const auto row = brush_size == 1 ? 5 : 12;
+    const auto start = center_of(QPoint(5, row));
+    const auto end = center_of(QPoint(30, row));
+    send_mouse(canvas, QEvent::MouseButtonPress, start, Qt::LeftButton, Qt::LeftButton, Qt::NoModifier);
+    send_mouse(canvas, QEvent::MouseButtonRelease, start, Qt::LeftButton, Qt::NoButton, Qt::NoModifier);
+    send_mouse(canvas, QEvent::MouseMove, end, Qt::NoButton, Qt::NoButton, Qt::ShiftModifier);
+    send_key_press(canvas, Qt::Key_Shift);
+    QApplication::processEvents();
+    save_image_artifact("issue505_shift_line_preview_size" + std::to_string(brush_size), canvas.grab().toImage());
+    const auto line = light_bounds(start.y());
+    CHECK(!line.isEmpty());
+    if (brush_size == 1) {
+      // A 1 px stroke paints from pixel to pixel: the line spans the two pixel centers.
+      CHECK(near(line.left(), start.x()));
+      CHECK(near(line.right(), end.x()));
+      CHECK(near(line.center().y(), start.y()));
+      CHECK(line.height() <= 2);
+    }
+    const auto preview_y = line.center().y();
+
+    // The Shift+click paints the previewed line: its rows sit centered on the preview.
+    send_mouse(canvas, QEvent::MouseButtonPress, end, Qt::LeftButton, Qt::LeftButton, Qt::ShiftModifier);
+    send_mouse(canvas, QEvent::MouseButtonRelease, end, Qt::LeftButton, Qt::NoButton, Qt::ShiftModifier);
+    send_key_release(canvas, Qt::Key_Shift, Qt::ShiftModifier);
+    QApplication::processEvents();
+    const auto* painted = document.find_layer(layer_id);
+    int top = -1;
+    int bottom = -1;
+    for (int y = row - 3; y <= row + 3; ++y) {
+      if (painted->pixels().pixel(18, y)[0] <= 10U) {
+        top = top < 0 ? y : top;
+        bottom = y;
+      }
+    }
+    CHECK(top >= 0);
+    if (brush_size == 1) {
+      CHECK(top == row && bottom == row);
+    }
+    // Painted rows top..bottom cover widget rows from top's corner to bottom + 1's corner.
+    const auto painted_center_y = (canvas.widget_position_for_document_point(QPoint(18, top)).y() +
+                                   canvas.widget_position_for_document_point(QPoint(18, bottom + 1)).y()) /
+                                  2;
+    CHECK(near(preview_y, painted_center_y));
+  }
+}
+
+void ui_brush_opacity_and_flow_digit_keys_set_values() {
+  patchy::Document document(64, 48, patchy::PixelFormat::rgba8());
+  document.add_pixel_layer("Paint", solid_pixels(64, 48, patchy::PixelFormat::rgba8(), QColor(255, 255, 255)));
+
+  patchy::ui::CanvasWidget canvas;
+  canvas.resize(160, 120);
+  canvas.set_document(&document);
+  canvas.set_tool(patchy::ui::CanvasTool::Brush);
+  canvas.set_brush_opacity(100);
+  canvas.set_brush_flow(100);
+  canvas.set_brush_build_up(false);
+  canvas.set_gradient_opacity(80);
+  canvas.show();
+  QApplication::processEvents();
+
+  // Single digits jump to that opacity decade; a quick second digit refines it
+  // (Photoshop-style pairing), and 0 alone means 100%.
+  send_key(canvas, Qt::Key_5);
+  CHECK(canvas.brush_opacity() == 50);
+  send_key(canvas, Qt::Key_2);
+  CHECK(canvas.brush_opacity() == 52);
+  send_key(canvas, Qt::Key_2);
+  CHECK(canvas.brush_opacity() == 20);
+  send_key(canvas, Qt::Key_5);
+  CHECK(canvas.brush_opacity() == 25);
+  send_key(canvas, Qt::Key_0);
+  CHECK(canvas.brush_opacity() == 100);
+  send_key(canvas, Qt::Key_7);
+  CHECK(canvas.brush_opacity() == 7);
+  // The (0,7) pair is consumed, so this 0 starts a fresh entry: 100%.
+  send_key(canvas, Qt::Key_0);
+  CHECK(canvas.brush_opacity() == 100);
+  // ...and a second 0 inside the pair window spells "00": 0%, like a layer's (GitHub issue 562).
+  send_key(canvas, Qt::Key_0);
+  CHECK(canvas.brush_opacity() == 0);
+  // A 0% Brush stroke leaves the pixels alone.
+  const auto paint_bytes = [&document] {
+    const auto bytes = std::as_const(document).layers().back().pixels().data();
+    return std::vector<std::uint8_t>(bytes.begin(), bytes.end());
+  };
+  const auto before = paint_bytes();
+  QTest::mousePress(&canvas, Qt::LeftButton, Qt::NoModifier, QPoint(40, 40));
+  QTest::mouseMove(&canvas, QPoint(110, 70));
+  QTest::mouseRelease(&canvas, Qt::LeftButton, Qt::NoModifier, QPoint(110, 70));
+  QApplication::processEvents();
+  CHECK(paint_bytes() == before);
+  send_key(canvas, Qt::Key_0);  // the pair is consumed: a lone 0 again is 100%
+  CHECK(canvas.brush_opacity() == 100);
+  // The same stroke at 100% paints, so the one above did cross the layer.
+  QTest::mousePress(&canvas, Qt::LeftButton, Qt::NoModifier, QPoint(40, 40));
+  QTest::mouseMove(&canvas, QPoint(110, 70));
+  QTest::mouseRelease(&canvas, Qt::LeftButton, Qt::NoModifier, QPoint(110, 70));
+  QApplication::processEvents();
+  CHECK(paint_bytes() != before);
+
+  // Shift targets Flow while Airbrush is off. With Airbrush on, Photoshop's
+  // shortcut assignment flips: bare digits target Flow and Shift targets
+  // Opacity.
+  send_key(canvas, Qt::Key_4, Qt::ShiftModifier);
+  CHECK(canvas.brush_flow() == 40);
+  send_key(canvas, Qt::Key_5, Qt::ShiftModifier);
+  CHECK(canvas.brush_flow() == 45);
+  canvas.set_brush_build_up(true);
+  send_key(canvas, Qt::Key_6, Qt::ShiftModifier);
+  CHECK(canvas.brush_opacity() == 60);
+  send_key(canvas, Qt::Key_3);
+  CHECK(canvas.brush_flow() == 30);
+  // "00" sets Flow to 0% too.
+  QTest::qWait(900);
+  send_key(canvas, Qt::Key_0);
+  send_key(canvas, Qt::Key_0);
+  CHECK(canvas.brush_flow() == 0);
+  canvas.set_brush_flow(30);
+
+  // The gradient tool routes digits to the gradient opacity instead, "00" included.
+  canvas.set_tool(patchy::ui::CanvasTool::Gradient);
+  QTest::qWait(900);
+  send_key(canvas, Qt::Key_4);
+  CHECK(canvas.gradient_opacity() == 40);
+  CHECK(canvas.brush_opacity() == 60);
+  QTest::qWait(900);
+  send_key(canvas, Qt::Key_0);
+  send_key(canvas, Qt::Key_0);
+  CHECK(canvas.gradient_opacity() == 0);
+  canvas.set_gradient_opacity(40);
+
+  // Non-painting tools ignore the digit keys.
+  canvas.set_tool(patchy::ui::CanvasTool::Move);
+  send_key(canvas, Qt::Key_9);
+  CHECK(canvas.brush_opacity() == 60);
+  CHECK(canvas.gradient_opacity() == 40);
+}
+
+void ui_undo_shortcut_includes_ctrl_alt_z() {
+  patchy::ui::MainWindow window;
+  show_window(window);
+
+  bool found_undo = false;
+  for (auto* action : window.findChildren<QAction*>()) {
+    if (action->shortcuts().contains(QKeySequence(Qt::CTRL | Qt::Key_Z))) {
+      CHECK(action->shortcuts().contains(QKeySequence(Qt::CTRL | Qt::ALT | Qt::Key_Z)));
+      found_undo = true;
+    }
+  }
+  CHECK(found_undo);
+}
+
+void ui_one_pixel_brush_drag_paints_fractional_smoothed_line() {
+  patchy::ui::MainWindow window;
+  show_window(window);
+  auto* canvas = require_canvas(window);
+
+  require_action_by_text(window, QStringLiteral("Brush"))->trigger();
+  canvas->set_zoom(4.0);
+  canvas->set_primary_color(Qt::black);
+  canvas->set_brush_size(1);
+  canvas->set_brush_opacity(100);
+  canvas->set_brush_softness(0);
+  QApplication::processEvents();
+
+  const auto from = canvas->widget_position_for_document_point(QPoint(50, 120)) + QPoint(0, 1);
+  const auto to = canvas->widget_position_for_document_point(QPoint(240, 120)) + QPoint(0, 1);
+  send_mouse(*canvas, QEvent::MouseButtonPress, from, Qt::LeftButton, Qt::LeftButton);
+  for (int step = 1; step <= 12; ++step) {
+    const auto x = from.x() + ((to.x() - from.x()) * step) / 12;
+    send_mouse(*canvas, QEvent::MouseMove, QPoint(x, from.y()), Qt::NoButton, Qt::LeftButton);
+  }
+  send_mouse(*canvas, QEvent::MouseButtonRelease, to, Qt::LeftButton, Qt::NoButton);
+  QApplication::processEvents();
+  save_widget_artifact("ui_one_pixel_brush_fractional_line", *canvas);
+
+  for (const auto x : {80, 100, 120}) {
+    const auto top_left = canvas->widget_position_for_document_point(QPoint(x - 1, 118));
+    const auto bottom_right = canvas->widget_position_for_document_point(QPoint(x + 2, 123));
+    const auto search_rect = QRect(top_left, bottom_right).normalized();
+    CHECK(count_pixels_close(canvas->grab().toImage(), search_rect, Qt::black, 70) > 0);
+  }
+}
+
+void ui_one_pixel_brush_and_eraser_same_cell_drag_touches_one_pixel() {
+  patchy::Document document(64, 64, patchy::PixelFormat::rgb8());
+  document.add_pixel_layer("Background", solid_pixels(64, 64, patchy::PixelFormat::rgb8(), Qt::white));
+  auto& paint_layer = document.add_pixel_layer("Paint",
+                                               solid_pixels(64, 64, patchy::PixelFormat::rgba8(), Qt::transparent));
+  document.set_active_layer(paint_layer.id());
+
+  patchy::ui::CanvasWidget canvas;
+  canvas.resize(240, 240);
+  canvas.set_document(&document);
+  canvas.set_tool(patchy::ui::CanvasTool::Brush);
+  canvas.set_zoom(32.0);
+  canvas.set_primary_color(Qt::black);
+  canvas.set_brush_size(1);
+  canvas.set_brush_opacity(100);
+  canvas.set_brush_softness(100);
+  canvas.show();
+  QApplication::processEvents();
+
+  const QPoint target(34, 28);
+  const auto painted_alpha = [&paint_layer](QPoint point) {
+    const auto bounds = paint_layer.bounds();
+    CHECK(bounds.contains(point.x(), point.y()));
+    return paint_layer.pixels().pixel(point.x() - bounds.x, point.y() - bounds.y)[3];
+  };
+  const auto target_origin = canvas.widget_position_for_document_point(target);
+  send_mouse(canvas, QEvent::MouseButtonPress, target_origin + QPoint(5, 16), Qt::LeftButton, Qt::LeftButton);
+  send_mouse(canvas, QEvent::MouseButtonRelease, target_origin + QPoint(24, 16), Qt::LeftButton, Qt::NoButton);
+  QApplication::processEvents();
+  CHECK(painted_alpha(target) == 255);
+  CHECK(painted_alpha(target + QPoint(1, 0)) == 0);
+  CHECK(painted_alpha(target + QPoint(0, 1)) == 0);
+
+  const QPoint neighbor = target + QPoint(1, 0);
+  const auto neighbor_center = canvas.widget_position_for_document_point(neighbor) + QPoint(16, 16);
+  send_mouse(canvas, QEvent::MouseButtonPress, neighbor_center, Qt::LeftButton, Qt::LeftButton);
+  send_mouse(canvas, QEvent::MouseButtonRelease, neighbor_center, Qt::LeftButton, Qt::NoButton);
+  QApplication::processEvents();
+  CHECK(painted_alpha(neighbor) == 255);
+
+  canvas.set_tool(patchy::ui::CanvasTool::Eraser);
+  canvas.set_brush_size(1);
+  canvas.set_brush_opacity(100);
+  canvas.set_brush_softness(100);
+  send_mouse(canvas, QEvent::MouseButtonPress, target_origin + QPoint(6, 10), Qt::LeftButton, Qt::LeftButton);
+  send_mouse(canvas, QEvent::MouseButtonRelease, target_origin + QPoint(25, 10), Qt::LeftButton, Qt::NoButton);
+  QApplication::processEvents();
+  CHECK(painted_alpha(target) == 0);
+  CHECK(painted_alpha(neighbor) == 255);
+}
+
+void ui_max_zoom_brush_skips_noop_stroke_repaints() {
+  patchy::ui::MainWindow window;
+  show_window(window);
+  auto* canvas = require_canvas(window);
+
+  require_action_by_text(window, QStringLiteral("Brush"))->trigger();
+  canvas->set_zoom(32.0);
+  canvas->set_primary_color(Qt::black);
+  canvas->set_brush_size(2);
+  canvas->set_brush_opacity(100);
+  canvas->set_brush_softness(0);
+  canvas->set_brush_build_up(false);
+  QApplication::processEvents();
+
+  // From the pixel's center, ten 1 px moves stay inside that 32 px pixel.
+  const auto start = canvas->widget_position_for_document_point(QPoint(10, 10)) + QPoint(16, 16);
+  send_mouse(*canvas, QEvent::MouseButtonPress, start, Qt::LeftButton, Qt::LeftButton);
+  QApplication::processEvents();
+
+  PaintCounterFilter counter;
+  canvas->installEventFilter(&counter);
+  QApplication::processEvents();
+  counter.paint_events = 0;
+  for (int offset = 1; offset <= 10; ++offset) {
+    send_mouse(*canvas, QEvent::MouseMove, start + QPoint(offset, 0), Qt::NoButton, Qt::LeftButton);
+  }
+  CHECK(counter.paint_events == 0);
+  canvas->removeEventFilter(&counter);
+  send_mouse(*canvas, QEvent::MouseButtonRelease, start + QPoint(10, 0), Qt::LeftButton, Qt::NoButton);
+  QApplication::processEvents();
+}
+
+void ui_deep_zoom_brush_repaint_stays_responsive() {
+  patchy::Document document(64, 64, patchy::PixelFormat::rgb8());
+  document.add_pixel_layer("Background", solid_pixels(64, 64, patchy::PixelFormat::rgb8(), Qt::white));
+  auto& paint_layer = document.add_pixel_layer("Paint",
+                                               solid_pixels(64, 64, patchy::PixelFormat::rgba8(), Qt::transparent));
+  document.set_active_layer(paint_layer.id());
+  document.grid_settings().horizontal_cycle_32 = 32;
+  document.grid_settings().vertical_cycle_32 = 32;
+
+  patchy::ui::CanvasWidget canvas;
+  canvas.resize(520, 380);
+  canvas.set_document(&document);
+  canvas.set_zoom(128.0);
+  canvas.set_grid_visible(true);
+  canvas.set_grid_subdivisions(1);
+  canvas.set_tool(patchy::ui::CanvasTool::Brush);
+  canvas.set_primary_color(Qt::black);
+  canvas.set_brush_size(4);
+  canvas.set_brush_opacity(100);
+  canvas.set_brush_softness(0);
+  canvas.show();
+  QApplication::processEvents();
+
+  const auto cell_center = [&canvas](QPoint document_point) {
+    const auto a = canvas.widget_position_for_document_point(document_point);
+    const auto b = canvas.widget_position_for_document_point(document_point + QPoint(1, 1));
+    return QPoint((a.x() + b.x()) / 2, (a.y() + b.y()) / 2);
+  };
+  const auto start = cell_center(QPoint(1, 1));
+  send_mouse(canvas, QEvent::MouseButtonPress, start, Qt::LeftButton, Qt::LeftButton);
+  QApplication::processEvents();
+
+  PaintCounterFilter counter;
+  canvas.installEventFilter(&counter);
+  QElapsedTimer timer;
+  timer.start();
+  constexpr int kSteps = 36;
+  for (int step = 1; step <= kSteps; ++step) {
+    send_mouse(canvas, QEvent::MouseMove, start + QPoint(step * 8, (step % 3) - 1), Qt::NoButton, Qt::LeftButton);
+  }
+  const auto elapsed_ms = timer.elapsed();
+  canvas.removeEventFilter(&counter);
+  send_mouse(canvas, QEvent::MouseButtonRelease, start + QPoint(kSteps * 8, 0), Qt::LeftButton, Qt::NoButton);
+  QApplication::processEvents();
+
+  CHECK(counter.paint_events <= kSteps + 4);
+  CHECK(elapsed_ms < patchy::test::time_budget_ms(2500));
+  CHECK(paint_layer.pixels().pixel(1, 1)[3] == 255);
+}
+
+void ui_square_brush_preset_paints_square_tip_and_round_presets_restore_round() {
+  clear_brush_tip_test_state();
+  patchy::ui::MainWindow window;
+  show_window(window);
+  auto* canvas = require_canvas(window);
+  auto* brush_preset = window.findChild<QComboBox*>(QStringLiteral("brushPresetCombo"));
+  auto* picker = window.findChild<patchy::ui::BrushTipPicker*>(QStringLiteral("brushTipPicker"));
+  CHECK(brush_preset != nullptr);
+  CHECK(picker != nullptr);
+  require_action_by_text(window, QStringLiteral("Brush"))->trigger();
+  canvas->set_primary_color(Qt::black);
+
+  // Square sits right under Hard Round and selects the procedural Square tip: no bitmap, no
+  // library entry, the picker face and the canvas footprint both say Square.
+  const auto square_index = brush_preset->findData(QStringLiteral("square"));
+  CHECK(square_index >= 0);
+  CHECK(square_index == brush_preset->findData(QStringLiteral("hard_round")) + 1);
+  brush_preset->setCurrentIndex(square_index);
+  QApplication::processEvents();
+  CHECK(!canvas->has_brush_tip());
+  CHECK(canvas->brush_shape() == patchy::BrushShape::Square);
+  CHECK(picker->current_tip_id() == patchy::ui::builtin_square_brush_tip_id());
+  CHECK(window.brush_tip_library().entries().empty());
+  CHECK(canvas->brush_size() == 25);
+  CHECK(canvas->brush_opacity() == 100);
+  CHECK(canvas->brush_softness() == 0);
+  CHECK(!canvas->brush_build_up());
+  CHECK(canvas->current_script_brush().tip_id == patchy::ui::builtin_square_brush_tip_id());
+
+  canvas->set_zoom(1.0);
+  canvas->set_brush_size(40);  // radius 20: a 41 px square anchored on the pressed pixel
+  const auto center = canvas->widget_position_for_document_point(QPoint(150, 120));
+  send_mouse(*canvas, QEvent::MouseButtonPress, center, Qt::LeftButton, Qt::LeftButton);
+  send_mouse(*canvas, QEvent::MouseButtonRelease, center, Qt::LeftButton, Qt::NoButton);
+  QApplication::processEvents();
+  const auto solid_black = [](QColor color) { return color.red() == 0 && color.green() == 0 && color.blue() == 0; };
+  CHECK(solid_black(canvas_pixel(*canvas, QPoint(150, 120))));
+  CHECK(solid_black(canvas_pixel(*canvas, QPoint(130, 100))));  // corners are fully covered
+  CHECK(solid_black(canvas_pixel(*canvas, QPoint(170, 140))));
+  CHECK(color_close(canvas_pixel(*canvas, QPoint(171, 120)), QColor(Qt::white), 4));  // no fringe
+  CHECK(color_close(canvas_pixel(*canvas, QPoint(129, 120)), QColor(Qt::white), 4));
+  CHECK(color_close(canvas_pixel(*canvas, QPoint(150, 141)), QColor(Qt::white), 4));
+  CHECK(color_close(canvas_pixel(*canvas, QPoint(150, 99)), QColor(Qt::white), 4));
+
+  // The Round family switches back to the procedural Round tip.
+  brush_preset->setCurrentIndex(brush_preset->findData(QStringLiteral("hard_round")));
+  QApplication::processEvents();
+  CHECK(!canvas->has_brush_tip());
+  CHECK(canvas->brush_shape() == patchy::BrushShape::Round);
+  CHECK(picker->current_tip_id() == patchy::ui::builtin_round_brush_tip_id());
+
+  // The picker's Square entry is the same tip.
+  window.set_active_brush_tip(patchy::ui::builtin_square_brush_tip_id(), false);
+  CHECK(canvas->brush_shape() == patchy::BrushShape::Square);
+  window.set_active_brush_tip(patchy::ui::builtin_round_brush_tip_id(), false);
+  CHECK(canvas->brush_shape() == patchy::BrushShape::Round);
+
+  // Scripting sees both procedural tips and the preset's tip id.
+  auto& automation = window.brush_automation_library();
+  automation.refresh();
+  CHECK(automation.preset(QStringLiteral("square"))["settings"].toObject()["tipId"].toString() ==
+        patchy::ui::builtin_square_brush_tip_id());
+  CHECK(!automation.preset(QStringLiteral("round"))["settings"].toObject().contains("tipId"));
+  bool lists_square = false;
+  for (const auto& tip : automation.tips()) {
+    lists_square = lists_square || tip.toObject()["id"].toString() == patchy::ui::builtin_square_brush_tip_id();
+  }
+  CHECK(lists_square);
+  const auto resolved = automation.resolve(QJsonObject{{"presetId", QStringLiteral("square")}});
+  CHECK(resolved.tip == nullptr);
+  CHECK(resolved.tip_id == patchy::ui::builtin_square_brush_tip_id());
+  clear_brush_tip_test_state();
+}
+
+// GitHub issue 482: the soft preset shows as Round and leads the list, Hard Round follows,
+// and the retired "round" id (a 25 px hard round, the startup brush) resolves to Hard Round
+// in the preset table, the settings store and scripting.
+void ui_brush_preset_list_leads_with_round_and_retired_round_id_resolves() {
+  clear_brush_tip_test_state();
+  QStringList table_ids;
+  for (const auto& preset : patchy::ui::builtin_brush_presets()) table_ids.append(preset.id);
+  CHECK(table_ids == (QStringList{"soft_round", "hard_round", "square", "pencil", "ink", "airbrush"}));
+  const auto* soft_round = patchy::ui::find_brush_preset(QStringLiteral("soft_round"));
+  CHECK(soft_round != nullptr);
+  CHECK(patchy::ui::brush_preset_display_name(*soft_round) == QStringLiteral("Round"));
+  CHECK(soft_round->softness == 75);
+  const auto* retired = patchy::ui::find_brush_preset(QStringLiteral("round"));
+  CHECK(retired != nullptr);
+  CHECK(retired->id == QStringLiteral("hard_round"));
+  CHECK(patchy::ui::brush_preset_display_name(*retired) == QStringLiteral("Hard Round"));
+  CHECK(retired->size == 25);
+  CHECK(retired->softness == 0);
+  CHECK(retired->tip_id.isEmpty());
+  CHECK(patchy::ui::default_startup_brush_preset_id() == QStringLiteral("hard_round"));
+
+  SettingsValueRestorer saved_brush_preset(QStringLiteral("tools/brushPreset"));
+  {
+    auto settings = patchy::ui::app_settings();
+    settings.setValue(QStringLiteral("tools/brushPreset"), QStringLiteral("round"));
+    settings.sync();
+  }
+  patchy::ui::MainWindow window;
+  show_window(window);
+  auto* brush_preset = window.findChild<QComboBox*>(QStringLiteral("brushPresetCombo"));
+  CHECK(brush_preset != nullptr);
+  QStringList combo_names;
+  for (int index = 0; index < static_cast<int>(table_ids.size()); ++index) {
+    CHECK(brush_preset->itemData(index).toString() == table_ids[index]);
+    combo_names.append(brush_preset->itemText(index));
+  }
+  CHECK(combo_names == (QStringList{"Round", "Hard Round", "Square", "Pencil", "Ink", "Airbrush"}));
+  CHECK(brush_preset->findData(QStringLiteral("round")) < 0);
+  // A settings store from an older release that names "round" comes back on Hard Round.
+  CHECK(brush_preset->currentData().toString() == QStringLiteral("hard_round"));
+
+  // For review: the options bar around the combo with the open list drawn under it
+  // (test-artifacts/brush-preset-list.png).
+  require_action_by_text(window, QStringLiteral("Brush"))->trigger();
+  QApplication::processEvents();
+  brush_preset->showPopup();
+  QApplication::processEvents();
+  if (auto* popup = brush_preset->view() != nullptr ? brush_preset->view()->window() : nullptr; popup != nullptr) {
+    const auto popup_shot = popup->grab();
+    const auto combo_rect = QRect(brush_preset->mapTo(&window, QPoint(0, 0)), brush_preset->size());
+    const auto bar_rect = QRect(combo_rect.left() - 12, combo_rect.top() - 6,
+                                std::max(combo_rect.width(), popup_shot.width()) + 24, combo_rect.height() + 12)
+                              .intersected(window.rect());
+    QPixmap shot(bar_rect.width(), bar_rect.height() + popup_shot.height() + 6);
+    shot.fill(window.palette().window().color());
+    QPainter painter(&shot);
+    painter.drawPixmap(0, 0, window.grab(bar_rect));
+    painter.drawPixmap(combo_rect.left() - bar_rect.left(), bar_rect.height(), popup_shot);
+    painter.end();
+    ensure_artifact_dir();
+    shot.save(QStringLiteral("test-artifacts/brush-preset-list.png"));
+  }
+  brush_preset->hidePopup();
+  QApplication::processEvents();
+
+  auto& automation = window.brush_automation_library();
+  automation.refresh();
+  bool lists_retired = false;
+  for (const auto& value : automation.presets()) {
+    lists_retired = lists_retired || value.toObject()["id"].toString() == QStringLiteral("round");
+  }
+  CHECK(!lists_retired);
+  const auto by_old_id = automation.preset(QStringLiteral("round"));
+  CHECK(by_old_id["id"].toString() == QStringLiteral("hard_round"));
+  CHECK(by_old_id["name"].toString() == QStringLiteral("Hard Round"));
+  const auto resolved = automation.resolve(QJsonObject{{"presetId", QStringLiteral("round")}});
+  CHECK(resolved.preset_id == QStringLiteral("hard_round"));
+  CHECK(resolved.size == 25);
+  CHECK(automation.preset(QStringLiteral("soft_round"))["name"].toString() == QStringLiteral("Round"));
+  clear_brush_tip_test_state();
+}
+
+void ui_airbrush_preset_builds_while_stationary() {
+  patchy::ui::MainWindow window;
+  show_window(window);
+  auto* canvas = require_canvas(window);
+  auto* brush_preset = window.findChild<QComboBox*>(QStringLiteral("brushPresetCombo"));
+  CHECK(brush_preset != nullptr);
+
+  require_action_by_text(window, QStringLiteral("Brush"))->trigger();
+  canvas->set_primary_color(Qt::black);
+  patchy::BrushDynamics stale_round_dynamics;
+  stale_round_dynamics.scatter = 2.0;
+  stale_round_dynamics.count = 3;
+  patchy::ui::MainWindowTestAccess::set_round_brush_session(window, stale_round_dynamics,
+                                                            42.0, 55.0);
+  QImage sampled_tip(8, 8, QImage::Format_Grayscale8);
+  sampled_tip.fill(255);
+  const auto sampled_tip_id =
+      window.brush_tip_library().add_tip(QStringLiteral("Airbrush preset reset probe"),
+                                         sampled_tip, 0.25);
+  CHECK(!sampled_tip_id.isEmpty());
+  window.set_active_brush_tip(sampled_tip_id, false);
+  CHECK(canvas->has_brush_tip());
+
+  const auto airbrush_index = brush_preset->findData(QStringLiteral("airbrush"));
+  CHECK(airbrush_index >= 0);
+  brush_preset->setCurrentIndex(airbrush_index);
+  QApplication::processEvents();
+  CHECK(!canvas->has_brush_tip());
+  CHECK(!canvas->brush_dynamics().active());
+  CHECK(std::abs(canvas->brush_base_angle_degrees()) < 1e-9);
+  CHECK(canvas->brush_base_roundness() == 100);
+  CHECK(canvas->brush_build_up());
+  CHECK(canvas->brush_opacity() == 100);
+  CHECK(canvas->brush_flow() == 12);
+
+  const auto center = canvas->widget_position_for_document_point(QPoint(150, 120));
+  send_mouse(*canvas, QEvent::MouseButtonPress, center, Qt::LeftButton, Qt::LeftButton);
+  QApplication::processEvents();
+  const auto initial = canvas_pixel(*canvas, QPoint(150, 120));
+  CHECK(initial.red() >= 215);
+  CHECK(initial.red() <= 232);
+
+  QTest::qWait(260);
+  QApplication::processEvents();
+  const auto held = canvas_pixel(*canvas, QPoint(150, 120));
+  CHECK(held.red() < initial.red() - 40);
+  CHECK(held.red() > 70);
+
+  send_mouse(*canvas, QEvent::MouseButtonRelease, center, Qt::LeftButton, Qt::NoButton);
+  QApplication::processEvents();
+  const auto released = canvas_pixel(*canvas, QPoint(150, 120));
+  QTest::qWait(120);
+  QApplication::processEvents();
+  CHECK(color_close(canvas_pixel(*canvas, QPoint(150, 120)), released, 1));
+
+  // A stationary timer tick advances the same Transfer/Fade state as a spatial dab. With a
+  // one-step Flow fade, the press paints normally and every held tick has zero Flow. The old
+  // stateless timer path would ignore the fade and keep darkening this point.
+  patchy::BrushDynamics fade;
+  fade.flow_control = patchy::BrushDynamicControl::Fade;
+  fade.flow_fade_steps = 1;
+  canvas->set_brush_dynamics(fade);
+  const auto faded_center = canvas->widget_position_for_document_point(QPoint(240, 120));
+  send_mouse(*canvas, QEvent::MouseButtonPress, faded_center, Qt::LeftButton, Qt::LeftButton);
+  QApplication::processEvents();
+  const auto faded_initial = canvas_pixel(*canvas, QPoint(240, 120));
+  CHECK(faded_initial.red() >= 215);
+  CHECK(faded_initial.red() <= 232);
+  QTest::qWait(160);
+  QApplication::processEvents();
+  CHECK(color_close(canvas_pixel(*canvas, QPoint(240, 120)), faded_initial, 1));
+  send_mouse(*canvas, QEvent::MouseButtonRelease, faded_center, Qt::LeftButton, Qt::NoButton);
+  QApplication::processEvents();
+  CHECK(window.brush_tip_library().remove_tip(sampled_tip_id));
+  save_widget_artifact("ui_airbrush_stationary_build_up", window);
+}
+
+// Brush Mode on real strokes (core/paint_mode.hpp): the options-bar choice reaches the
+// stroke compositor, which blends against the stroke-start pixels through blend_math.
+// One dab per mode on a mid-gray layer, each one undo entry; Lock Transparent Pixels
+// stops Clear; the Eraser ignores the Brush's Mode.
+namespace brush_mode_test {
+
+struct Fixture {
+  patchy::ui::MainWindow window;
+  patchy::LayerId layer_id{};
+  patchy::ui::CanvasWidget* canvas{nullptr};
+  QComboBox* mode_combo{nullptr};
+
+  explicit Fixture(patchy::Document document) {
+    layer_id = document.layers().front().id();
+    window.add_document_session(std::move(document), QStringLiteral("Brush Mode"));
+    show_window(window);
+    canvas = require_canvas(window);
+    require_action_by_text(window, QStringLiteral("Brush"))->trigger();
+    canvas->set_zoom(1.0);
+    canvas->set_primary_color(QColor(255, 0, 0));
+    canvas->set_brush_size(9);
+    canvas->set_brush_opacity(100);
+    canvas->set_brush_flow(100);
+    canvas->set_brush_softness(0);
+    canvas->set_brush_build_up(false);
+    mode_combo = window.findChild<QComboBox*>(QStringLiteral("brushModeCombo"));
+    CHECK(mode_combo != nullptr);
+    QApplication::processEvents();
+  }
+
+  void select(patchy::PaintMode mode) {
+    mode_combo->setCurrentIndex(mode_combo->findData(patchy::ui::paint_mode_item_data(mode)));
+    QApplication::processEvents();
+    CHECK(canvas->brush_paint_mode() == mode);
+  }
+
+  void dab(QPoint point) {
+    const auto position = canvas->widget_position_for_document_point(point);
+    send_mouse(*canvas, QEvent::MouseButtonPress, position, Qt::LeftButton, Qt::LeftButton);
+    send_mouse(*canvas, QEvent::MouseButtonRelease, position, Qt::LeftButton, Qt::NoButton);
+    QApplication::processEvents();
+  }
+
+  [[nodiscard]] const patchy::Layer& layer() {
+    return *std::as_const(patchy::ui::MainWindowTestAccess::document(window)).find_layer(layer_id);
+  }
+
+  [[nodiscard]] std::array<std::uint8_t, 4> pixel(QPoint point) {
+    const auto* px = layer().pixels().pixel(point.x(), point.y());
+    return {px[0], px[1], px[2], px[3]};
+  }
+
+  void undo() {
+    auto* action = require_action_by_text(window, QStringLiteral("Undo"));
+    CHECK(action->isEnabled());
+    action->trigger();
+    QApplication::processEvents();
+  }
+};
+
+using Rgba = std::array<std::uint8_t, 4>;
+
+}  // namespace brush_mode_test
+
+void ui_brush_mode_strokes_blend_clear_behind_and_undo() {
+  using brush_mode_test::Rgba;
+  using patchy::BlendMode;
+  using patchy::PaintMode;
+  SettingsValueRestorer saved_mode(QStringLiteral("tools/brushMode"));
+  patchy::Document document(64, 64, patchy::PixelFormat::rgba8());
+  document.add_pixel_layer("Paint", solid_pixels(64, 64, patchy::PixelFormat::rgba8(), QColor(128, 128, 128)));
+  brush_mode_test::Fixture f(std::move(document));
+  const Rgba gray{128, 128, 128, 255};
+
+  f.select(PaintMode::of(BlendMode::Multiply));
+  f.dab(QPoint(16, 16));
+  CHECK((f.pixel(QPoint(16, 16)) == Rgba{128, 0, 0, 255}));
+  CHECK((f.pixel(QPoint(30, 30)) == gray));
+  f.undo();
+  CHECK((f.pixel(QPoint(16, 16)) == gray));
+
+  f.select(PaintMode::of(BlendMode::Screen));
+  f.dab(QPoint(16, 16));
+  CHECK((f.pixel(QPoint(16, 16)) == Rgba{255, 128, 128, 255}));
+  f.undo();
+
+  f.select(PaintMode::clear());
+  f.dab(QPoint(44, 16));
+  CHECK(f.pixel(QPoint(44, 16))[3] == 0);
+  // Behind leaves opaque pixels alone and fills the cleared hole.
+  f.select(PaintMode::behind());
+  const auto depth_before_noop = patchy::ui::MainWindowTestAccess::active_session_undo_depth(f.window);
+  f.dab(QPoint(16, 44));
+  CHECK((f.pixel(QPoint(16, 44)) == gray));
+  // A stroke that changed nothing may still be a history entry, like any stroke.
+  while (patchy::ui::MainWindowTestAccess::active_session_undo_depth(f.window) > depth_before_noop) {
+    f.undo();
+  }
+  f.dab(QPoint(44, 16));
+  CHECK((f.pixel(QPoint(44, 16)) == Rgba{255, 0, 0, 255}));
+  f.undo();
+  CHECK(f.pixel(QPoint(44, 16))[3] == 0);
+  f.undo();
+  CHECK((f.pixel(QPoint(44, 16)) == gray));
+
+  // Dissolve at 50% Opacity paints whole pixels or none.
+  f.select(PaintMode::of(BlendMode::Dissolve));
+  f.canvas->set_brush_size(21);
+  f.canvas->set_brush_opacity(50);
+  f.dab(QPoint(40, 44));
+  int painted = 0;
+  int untouched = 0;
+  for (int y = 41; y <= 47; ++y) {
+    for (int x = 37; x <= 43; ++x) {
+      const auto value = f.pixel(QPoint(x, y));
+      CHECK((value == Rgba{255, 0, 0, 255} || value == gray));
+      painted += value == gray ? 0 : 1;
+      untouched += value == gray ? 1 : 0;
+    }
+  }
+  CHECK(painted > 0 && untouched > 0);
+  f.undo();
+  f.canvas->set_brush_size(9);
+  f.canvas->set_brush_opacity(100);
+
+  // Lock Transparent Pixels: Clear cannot remove alpha.
+  patchy::ui::MainWindowTestAccess::document(f.window).find_layer(f.layer_id)->set_lock_flags(
+      patchy::kLayerLockTransparentPixels);
+  f.select(PaintMode::clear());
+  f.dab(QPoint(16, 48));
+  CHECK((f.pixel(QPoint(16, 48)) == gray));
+  patchy::ui::MainWindowTestAccess::document(f.window).find_layer(f.layer_id)->set_lock_flags(patchy::kLayerLockNone);
+
+  // The Mode belongs to the Brush: the Eraser hides it and erases as always.
+  f.select(PaintMode::of(BlendMode::Multiply));
+  require_action_by_text(f.window, QStringLiteral("Eraser"))->trigger();
+  QApplication::processEvents();
+  CHECK(!f.mode_combo->isVisible());
+  f.canvas->set_brush_size(9);
+  f.canvas->set_brush_opacity(100);
+  f.canvas->set_brush_softness(0);
+  f.dab(QPoint(48, 48));
+  CHECK(f.pixel(QPoint(48, 48))[3] == 0);
+  require_action_by_text(f.window, QStringLiteral("Brush"))->trigger();
+  QApplication::processEvents();
+  CHECK(f.mode_combo->isVisible());
+  CHECK(f.canvas->brush_paint_mode() == PaintMode::of(BlendMode::Multiply));
+}
+
+// The same compositor on a 16-bit layer and in palette mode: Multiply lands at depth,
+// and an indexed document snaps the blended color (not the paint color) to its palette.
+void ui_brush_mode_paints_16_bit_and_palette_documents() {
+  using brush_mode_test::Rgba;
+  using patchy::BlendMode;
+  using patchy::PaintMode;
+  SettingsValueRestorer saved_mode(QStringLiteral("tools/brushMode"));
+  patchy::set_deep_editing_override(true);
+  {
+    patchy::Document document(48, 48, patchy::PixelFormat::rgba8());
+    document.add_pixel_layer("Paint", solid_pixels(48, 48, patchy::PixelFormat::rgba8(), QColor(128, 128, 128)));
+    patchy::convert_document_depth(document, patchy::BitDepth::UInt16);
+    brush_mode_test::Fixture f(std::move(document));
+    CHECK(f.layer().pixels().format().bit_depth == patchy::BitDepth::UInt16);
+    f.select(PaintMode::of(BlendMode::Multiply));
+    f.dab(QPoint(20, 20));
+    const auto format = f.layer().pixels().format();
+    const auto deep = patchy::load_pixel(format, f.layer().pixels().pixel(20, 20));
+    CHECK(std::abs(deep[0] - 128.0F) < 0.01F);
+    CHECK(std::abs(deep[1]) < 0.01F);
+    CHECK(std::abs(deep[2]) < 0.01F);
+    CHECK(std::abs(deep[3] - 255.0F) < 0.01F);
+    f.select(PaintMode::clear());
+    f.dab(QPoint(36, 20));
+    CHECK(patchy::load_pixel(format, f.layer().pixels().pixel(36, 20))[3] < 0.01F);
+    f.undo();
+    f.undo();
+    CHECK(std::abs(patchy::load_pixel(format, f.layer().pixels().pixel(20, 20))[1] - 128.0F) < 0.01F);
+  }
+  patchy::set_deep_editing_override(std::nullopt);
+
+  patchy::Document indexed(48, 48, patchy::PixelFormat::rgba8());
+  indexed.add_pixel_layer("Paint", solid_pixels(48, 48, patchy::PixelFormat::rgba8(), QColor(128, 128, 128)));
+  patchy::DocumentPaletteEditing editing;
+  editing.palette.colors = {patchy::RgbColor{128, 128, 128}, patchy::RgbColor{128, 0, 0}, patchy::RgbColor{255, 0, 0},
+                            patchy::RgbColor{255, 255, 255}};
+  indexed.palette_editing() = editing;
+  brush_mode_test::Fixture f(std::move(indexed));
+  f.select(PaintMode::of(BlendMode::Multiply));
+  f.dab(QPoint(20, 20));
+  CHECK((f.pixel(QPoint(20, 20)) == Rgba{128, 0, 0, 255}));
+  f.select(PaintMode{});
+  f.dab(QPoint(36, 36));
+  CHECK((f.pixel(QPoint(36, 36)) == Rgba{255, 0, 0, 255}));
+}
+
+// A visual sample of Brush Mode (artifact ui_brush_mode_stroke_samples.png): one orange
+// stroke per mode across a hue ramp with a transparent band, so Behind shows only in the
+// band and Clear cuts through the ramp. Checks only that each stroke changed its row.
+void ui_brush_mode_stroke_samples_artifact() {
+  using patchy::BlendMode;
+  using patchy::PaintMode;
+  SettingsValueRestorer saved_mode(QStringLiteral("tools/brushMode"));
+  constexpr int kWidth = 420;
+  constexpr int kRow = 40;
+  const std::vector<std::pair<PaintMode, QString>> modes = {
+      {PaintMode{}, QStringLiteral("Normal")},
+      {PaintMode::of(BlendMode::Dissolve), QStringLiteral("Dissolve 60%")},
+      {PaintMode::behind(), QStringLiteral("Behind")},
+      {PaintMode::clear(), QStringLiteral("Clear")},
+      {PaintMode::of(BlendMode::Multiply), QStringLiteral("Multiply")},
+      {PaintMode::of(BlendMode::Screen), QStringLiteral("Screen")},
+      {PaintMode::of(BlendMode::Overlay), QStringLiteral("Overlay")},
+      {PaintMode::of(BlendMode::Difference), QStringLiteral("Difference")},
+      {PaintMode::of(BlendMode::Color), QStringLiteral("Color")},
+  };
+  const int height = kRow * static_cast<int>(modes.size());
+  patchy::PixelBuffer ramp(kWidth, height, patchy::PixelFormat::rgba8());
+  for (int y = 0; y < height; ++y) {
+    for (int x = 0; x < kWidth; ++x) {
+      const auto color = QColor::fromHsvF(static_cast<float>(x) / kWidth * 0.83F, 0.65F, 0.9F);
+      auto* px = ramp.pixel(x, y);
+      px[0] = static_cast<std::uint8_t>(color.red());
+      px[1] = static_cast<std::uint8_t>(color.green());
+      px[2] = static_cast<std::uint8_t>(color.blue());
+      px[3] = x >= 250 && x < 320 ? 0 : 255;
+    }
+  }
+  patchy::Document document(kWidth, height, patchy::PixelFormat::rgba8());
+  document.add_pixel_layer("Ramp", ramp);
+  brush_mode_test::Fixture f(std::move(document));
+  f.canvas->set_primary_color(QColor(255, 140, 0));
+  f.canvas->set_brush_size(22);
+  f.canvas->set_brush_softness(40);
+  const auto before = f.layer().pixels();
+  for (std::size_t i = 0; i < modes.size(); ++i) {
+    f.select(modes[i].first);
+    f.canvas->set_brush_opacity(modes[i].first.blend == BlendMode::Dissolve ? 60 : 100);
+    const int y = static_cast<int>(i) * kRow + kRow / 2;
+    const auto at = [&](int x) { return f.canvas->widget_position_for_document_point(QPoint(x, y)); };
+    send_mouse(*f.canvas, QEvent::MouseButtonPress, at(110), Qt::LeftButton, Qt::LeftButton);
+    for (int x = 120; x <= kWidth - 20; x += 8) {
+      send_mouse(*f.canvas, QEvent::MouseMove, at(x), Qt::NoButton, Qt::LeftButton);
+    }
+    send_mouse(*f.canvas, QEvent::MouseButtonRelease, at(kWidth - 20), Qt::LeftButton, Qt::NoButton);
+    QApplication::processEvents();
+    bool changed = false;
+    for (int x = 120; x < kWidth - 20 && !changed; ++x) {
+      changed = !std::equal(before.pixel(x, y), before.pixel(x, y) + 4, f.layer().pixels().pixel(x, y));
+    }
+    CHECK(changed);
+  }
+  // Composite over a checkerboard (transparency stays visible) and label each row.
+  QImage sample(kWidth, height, QImage::Format_ARGB32);
+  {
+    QPainter painter(&sample);
+    for (int y = 0; y < height; y += 8) {
+      for (int x = 0; x < kWidth; x += 8) {
+        painter.fillRect(x, y, 8, 8, ((x + y) / 8) % 2 == 0 ? QColor(255, 255, 255) : QColor(204, 204, 204));
+      }
+    }
+    const auto& pixels = f.layer().pixels();
+    QImage layer_image(kWidth, height, QImage::Format_RGBA8888);
+    for (int y = 0; y < height; ++y) {
+      std::memcpy(layer_image.scanLine(y), pixels.pixel(0, y), static_cast<std::size_t>(kWidth) * 4U);
+    }
+    painter.drawImage(0, 0, layer_image);
+    painter.setPen(Qt::black);
+    for (std::size_t i = 0; i < modes.size(); ++i) {
+      const QRect label(4, static_cast<int>(i) * kRow + 10, 96, kRow - 20);
+      painter.fillRect(label, QColor(255, 255, 255, 220));
+      painter.drawText(label.adjusted(4, 0, 0, 0), Qt::AlignVCenter | Qt::AlignLeft, modes[i].second);
+    }
+  }
+  ensure_artifact_dir();
+  CHECK(sample.save(QStringLiteral("test-artifacts/ui_brush_mode_stroke_samples.png")));
+}
+
+void ui_brush_flow_builds_only_to_opacity_cap_and_round_trips_psd() {
+  patchy::Document document(96, 96, patchy::PixelFormat::rgba8());
+  const auto layer_id = document.add_pixel_layer(
+      "Paint", solid_pixels(96, 96, patchy::PixelFormat::rgba8(), Qt::white)).id();
+
+  patchy::ui::CanvasWidget canvas;
+  canvas.resize(192, 192);
+  canvas.set_document(&document);
+  canvas.set_tool(patchy::ui::CanvasTool::Brush);
+  canvas.set_zoom(1.0);
+  canvas.set_primary_color(Qt::black);
+  canvas.set_brush_size(32);
+  canvas.set_brush_opacity(40);
+  canvas.set_brush_flow(20);
+  canvas.set_brush_softness(0);
+  canvas.set_brush_build_up(true);
+  canvas.show();
+  QApplication::processEvents();
+
+  const auto point = canvas.widget_position_for_document_point(QPoint(48, 48));
+  send_mouse(canvas, QEvent::MouseButtonPress, point, Qt::LeftButton, Qt::LeftButton);
+  // Timer delivery can be delayed on a busy Windows machine. Wait for the
+  // observable cap rather than assuming a number of dabs fits into 430 ms.
+  // The deadline still fails an airbrush that stops building prematurely.
+  QElapsedTimer cap_wait;
+  cap_wait.start();
+  while (std::as_const(document).find_layer(layer_id)->pixels().pixel(48, 48)[0] > 155U &&
+         cap_wait.elapsed() < 3000) {
+    QTest::qWait(20);
+  }
+  QTest::qWait(80);  // continued delivery must not paint beyond the opacity cap
+  send_mouse(canvas, QEvent::MouseButtonRelease, point, Qt::LeftButton, Qt::NoButton);
+  QApplication::processEvents();
+
+  const auto* layer = std::as_const(document).find_layer(layer_id);
+  CHECK(layer != nullptr);
+  const auto* capped = layer->pixels().pixel(48, 48);
+  CHECK(capped[0] >= 151U && capped[0] <= 155U);
+  CHECK(capped[1] == capped[0]);
+  CHECK(capped[2] == capped[0]);
+  CHECK(capped[3] == 255U);
+
+  ensure_artifact_dir();
+  const auto path = std::filesystem::path("test-artifacts") / "ui_brush_flow_airbrush.psd";
+  patchy::psd::DocumentIo::write_layered_rgb8_file(document, path);
+  const auto reread = patchy::psd::DocumentIo::read_file(path);
+  CHECK(reread.layers().size() == 1U);
+  const auto* reopened = reread.layers().front().pixels().pixel(48, 48);
+  CHECK(std::equal(capped, capped + 4, reopened));
+  save_widget_artifact("ui_brush_flow_opacity_cap", canvas);
+}
+
+void ui_pattern_stamp_alignment_palette_and_psd_round_trip() {
+  patchy::PatternResource pattern;
+  pattern.id = "patchy-test-pattern-stamp";
+  pattern.name = "Pattern Stamp Test";
+  pattern.tile = patchy::PixelBuffer(4, 4, patchy::PixelFormat::rgba8());
+  for (int y = 0; y < pattern.tile.height(); ++y) {
+    for (int x = 0; x < pattern.tile.width(); ++x) {
+      auto* pixel = pattern.tile.pixel(x, y);
+      pixel[0] = static_cast<std::uint8_t>(30 + x * 45);
+      pixel[1] = static_cast<std::uint8_t>(20 + y * 55);
+      pixel[2] = static_cast<std::uint8_t>(10 + x * 8 + y * 6);
+      pixel[3] = static_cast<std::uint8_t>(x == 2 && y == 2 ? 128 : 255);
+    }
+  }
+
+  {
+    patchy::ui::MainWindow window;
+    show_window(window);
+    if (const auto* stale = window.pattern_library().find_entry_by_pattern_id(
+            QString::fromStdString(pattern.id));
+        stale != nullptr) {
+      CHECK(window.pattern_library().remove_pattern(stale->storage_id));
+    }
+    const auto storage_id = window.pattern_library().add_pattern(
+        QString::fromStdString(pattern.name), pattern.tile, QStringLiteral("Tests"),
+        QString::fromStdString(pattern.id));
+    CHECK(!storage_id.isEmpty());
+    require_action_by_text(window, QStringLiteral("Pattern Stamp"))->trigger();
+    QApplication::processEvents();
+    auto* pattern_combo =
+        window.findChild<QComboBox*>(QStringLiteral("patternStampPatternCombo"));
+    auto* aligned = window.findChild<QCheckBox*>(QStringLiteral("patternStampAlignedCheck"));
+    auto* manage = window.findChild<QPushButton*>(QStringLiteral("patternStampManageButton"));
+    auto* size = window.findChild<QSpinBox*>(QStringLiteral("brushSizeSpin"));
+    auto* opacity = window.findChild<QSpinBox*>(QStringLiteral("brushOpacitySpin"));
+    auto* softness = window.findChild<QSpinBox*>(QStringLiteral("brushSoftnessSpin"));
+    CHECK(pattern_combo != nullptr);
+    const auto pattern_index = pattern_combo->findData(QString::fromStdString(pattern.id));
+    CHECK(pattern_index >= 0);
+    pattern_combo->setCurrentIndex(pattern_index);
+    CHECK(pattern_combo->isVisible());
+    CHECK(aligned != nullptr && aligned->isVisible());
+    CHECK(manage != nullptr && manage->isVisible());
+    CHECK(size != nullptr && size->isVisible());
+    CHECK(opacity != nullptr && opacity->isVisible());
+    CHECK(softness != nullptr && softness->isVisible());
+
+    const auto exercise_popup = [&window](const QString& base_name,
+                                          QSpinBox* spin, int value) {
+      auto* action = window.findChild<QAction*>(base_name + QStringLiteral("PopupAction"));
+      CHECK(action != nullptr);
+      CHECK(action->icon().isNull());
+      action->trigger();
+      QApplication::processEvents();
+      auto* popup = window.findChild<QFrame*>(base_name + QStringLiteral("Popup"));
+      auto* slider = window.findChild<QSlider*>(base_name + QStringLiteral("PopupSlider"));
+      CHECK(popup != nullptr && popup->isVisible());
+      CHECK(slider != nullptr);
+      patchy::ui::set_slider_to_value(*slider, value);
+      CHECK(spin->value() == value);
+      popup->close();
+      QApplication::processEvents();
+    };
+    exercise_popup(QStringLiteral("brushSize"), size, 77);
+    exercise_popup(QStringLiteral("brushOpacity"), opacity, 66);
+    exercise_popup(QStringLiteral("brushSoftness"), softness, 44);
+    auto* canvas = require_canvas(window);
+    CHECK(canvas->brush_size() == 77);
+    CHECK(canvas->brush_opacity() == 66);
+    CHECK(canvas->brush_softness() == 44);
+
+    for (const auto* base_name : {
+             "selectionFeather", "selectionCornerRadius",
+             "healingDiffusion", "localAdjustmentStrength",
+             "magneticLassoWidth", "magneticLassoContrast",
+             "magneticLassoFrequency", "wandTolerance",
+             "shapeCornerRadius", "textSize"}) {
+      CHECK(window.findChild<QAction*>(
+                QLatin1String(base_name) + QStringLiteral("PopupAction")) != nullptr);
+    }
+    save_widget_artifact("ui_pattern_stamp_options", window);
+    CHECK(window.pattern_library().remove_pattern(storage_id));
+  }
+
+  patchy::Document document(64, 40, patchy::PixelFormat::rgba8());
+  const auto layer_id = document.add_pixel_layer(
+      "Pattern", solid_pixels(64, 40, patchy::PixelFormat::rgba8(), Qt::transparent)).id();
+  patchy::ui::CanvasWidget canvas;
+  canvas.resize(160, 120);
+  canvas.set_document(&document);
+  canvas.set_tool(patchy::ui::CanvasTool::PatternStamp);
+  canvas.set_pattern_stamp_pattern(pattern);
+  canvas.set_pattern_stamp_aligned(true);
+  canvas.set_brush_size(1);
+  canvas.set_brush_opacity(100);
+  canvas.set_brush_flow(100);
+  canvas.set_brush_softness(0);
+  canvas.show();
+  QApplication::processEvents();
+
+  const auto click = [&canvas](QPoint document_point) {
+    const auto widget_point = canvas.widget_position_for_document_point(document_point);
+    send_mouse(canvas, QEvent::MouseButtonPress, widget_point, Qt::LeftButton, Qt::LeftButton);
+    send_mouse(canvas, QEvent::MouseButtonRelease, widget_point, Qt::LeftButton, Qt::NoButton);
+    QApplication::processEvents();
+  };
+  click(QPoint(20, 20));
+  click(QPoint(25, 20));
+  canvas.set_pattern_stamp_aligned(false);
+  click(QPoint(35, 20));
+
+  const auto* layer = std::as_const(document).find_layer(layer_id);
+  CHECK(layer != nullptr);
+  const auto* centered = layer->pixels().pixel(20, 20);
+  const auto* continued = layer->pixels().pixel(25, 20);
+  const auto* restarted = layer->pixels().pixel(35, 20);
+  CHECK(std::equal(centered, centered + 4, pattern.tile.pixel(2, 2)));
+  CHECK(std::equal(continued, continued + 4, pattern.tile.pixel(3, 2)));
+  CHECK(std::equal(restarted, restarted + 4, pattern.tile.pixel(2, 2)));
+
+  ensure_artifact_dir();
+  const auto path = std::filesystem::path("test-artifacts") / "ui_pattern_stamp.psd";
+  patchy::psd::DocumentIo::write_layered_rgb8_file(document, path);
+  const auto reopened = patchy::psd::DocumentIo::read_file(path);
+  CHECK(reopened.layers().size() == 1U);
+  const auto* reopened_pixel = reopened.layers().front().pixels().pixel(25, 20);
+  CHECK(std::equal(continued, continued + 4, reopened_pixel));
+
+  patchy::Document palette_document(24, 24, patchy::PixelFormat::rgba8());
+  const auto palette_layer_id = palette_document.add_pixel_layer(
+      "Palette Pattern", solid_pixels(24, 24, patchy::PixelFormat::rgba8(), Qt::transparent)).id();
+  patchy::DocumentPaletteEditing editing;
+  editing.palette.colors = {patchy::RgbColor{0, 0, 0}, patchy::RgbColor{255, 255, 255}};
+  editing.palette_revision = 7001;
+  palette_document.palette_editing() = editing;
+  canvas.set_document(&palette_document);
+  canvas.set_pattern_stamp_pattern(pattern);
+  canvas.set_pattern_stamp_aligned(false);
+  click(QPoint(12, 12));
+  const auto* palette_layer = std::as_const(palette_document).find_layer(palette_layer_id);
+  CHECK(palette_layer != nullptr);
+  const auto* snapped = palette_layer->pixels().pixel(12, 12);
+  CHECK((snapped[0] == 0U && snapped[1] == 0U && snapped[2] == 0U) ||
+        (snapped[0] == 255U && snapped[1] == 255U && snapped[2] == 255U));
+  CHECK(snapped[3] == 255U);
+  save_widget_artifact("ui_pattern_stamp_alignment", canvas);
+}
+
+void ui_airbrush_fast_strokes_ignore_mouse_event_density() {
+  patchy::ui::MainWindow window;
+  show_window(window);
+  auto* canvas = require_canvas(window);
+  auto* brush_preset = window.findChild<QComboBox*>(QStringLiteral("brushPresetCombo"));
+  CHECK(brush_preset != nullptr);
+
+  require_action_by_text(window, QStringLiteral("Brush"))->trigger();
+  canvas->set_primary_color(Qt::black);
+  const auto airbrush_index = brush_preset->findData(QStringLiteral("airbrush"));
+  CHECK(airbrush_index >= 0);
+  brush_preset->setCurrentIndex(airbrush_index);
+  QApplication::processEvents();
+
+  auto send_stroke = [canvas](const std::vector<QPoint>& points) {
+    CHECK(points.size() >= 2U);
+    send_mouse(*canvas, QEvent::MouseButtonPress, canvas->widget_position_for_document_point(points.front()),
+               Qt::LeftButton, Qt::LeftButton);
+    for (std::size_t index = 1; index < points.size(); ++index) {
+      send_mouse(*canvas, QEvent::MouseMove, canvas->widget_position_for_document_point(points[index]),
+                 Qt::NoButton, Qt::LeftButton);
+    }
+    send_mouse(*canvas, QEvent::MouseButtonRelease, canvas->widget_position_for_document_point(points.back()),
+               Qt::LeftButton, Qt::NoButton);
+    QApplication::processEvents();
+  };
+
+  send_stroke({QPoint(70, 112), QPoint(280, 112)});
+  send_stroke({QPoint(70, 188), QPoint(76, 188), QPoint(83, 188), QPoint(91, 188), QPoint(102, 188),
+               QPoint(113, 188), QPoint(127, 188), QPoint(139, 188), QPoint(154, 188), QPoint(166, 188),
+               QPoint(181, 188), QPoint(193, 188), QPoint(207, 188), QPoint(219, 188), QPoint(234, 188),
+               QPoint(247, 188), QPoint(261, 188), QPoint(273, 188), QPoint(280, 188)});
+
+  for (const auto x : {110, 145, 180, 215, 250}) {
+    const auto sparse = canvas_pixel(*canvas, QPoint(x, 112));
+    const auto dense = canvas_pixel(*canvas, QPoint(x, 188));
+    CHECK(sparse.red() < 245);
+    CHECK(dense.red() < 245);
+    CHECK(color_close(sparse, dense, 26));
+  }
+  save_widget_artifact("ui_airbrush_event_density", window);
+}
+
+void ui_airbrush_jittered_stroke_uses_smoothed_path() {
+  patchy::ui::MainWindow window;
+  show_window(window);
+  auto* canvas = require_canvas(window);
+  auto* brush_preset = window.findChild<QComboBox*>(QStringLiteral("brushPresetCombo"));
+  CHECK(brush_preset != nullptr);
+
+  require_action_by_text(window, QStringLiteral("Brush"))->trigger();
+  canvas->set_zoom(1.0);
+  canvas->set_primary_color(Qt::black);
+  const auto airbrush_index = brush_preset->findData(QStringLiteral("airbrush"));
+  CHECK(airbrush_index >= 0);
+  brush_preset->setCurrentIndex(airbrush_index);
+  canvas->set_brush_size(18);
+  canvas->set_brush_opacity(64);
+  canvas->set_brush_softness(100);
+  QApplication::processEvents();
+
+  const std::vector<QPoint> points = {
+      QPoint(70, 150),  QPoint(100, 159), QPoint(130, 141), QPoint(160, 159),
+      QPoint(190, 141), QPoint(220, 159), QPoint(250, 141), QPoint(280, 150),
+  };
+  send_mouse(*canvas, QEvent::MouseButtonPress, canvas->widget_position_for_document_point(points.front()),
+             Qt::LeftButton, Qt::LeftButton);
+  for (std::size_t index = 1; index < points.size(); ++index) {
+    send_mouse(*canvas, QEvent::MouseMove, canvas->widget_position_for_document_point(points[index]), Qt::NoButton,
+               Qt::LeftButton);
+  }
+  send_mouse(*canvas, QEvent::MouseButtonRelease, canvas->widget_position_for_document_point(points.back()),
+             Qt::LeftButton, Qt::NoButton);
+  QApplication::processEvents();
+
+  const auto image = canvas->grab().toImage();
+  auto darkness_center_y = [canvas, &image](int x) {
+    double weighted_y = 0.0;
+    double total_darkness = 0.0;
+    for (int y = 128; y <= 172; ++y) {
+      const auto widget_point = canvas->widget_position_for_document_point(QPoint(x, y));
+      const auto color = image.pixelColor(widget_point);
+      const auto darkness = static_cast<double>(255 - color.red());
+      if (darkness <= 4.0) {
+        continue;
+      }
+      weighted_y += static_cast<double>(y) * darkness;
+      total_darkness += darkness;
+    }
+    CHECK(total_darkness > 20.0);
+    return weighted_y / total_darkness;
+  };
+
+  std::vector<double> centerline;
+  for (const auto x : {100, 130, 160, 190, 220, 250}) {
+    centerline.push_back(darkness_center_y(x));
+  }
+  const auto [min_center, max_center] = std::minmax_element(centerline.begin(), centerline.end());
+  CHECK(min_center != centerline.end());
+  CHECK((*max_center - *min_center) <= 12.0);
+  save_widget_artifact("ui_airbrush_smoothed_jitter", window);
+}
+
+void ui_soft_opaque_brush_l_corner_stacks_soft_edges() {
+  patchy::Document document(280, 240, patchy::PixelFormat::rgba8());
+  document.add_pixel_layer("Paint", solid_pixels(280, 240, patchy::PixelFormat::rgba8(), QColor(0, 0, 0, 0)));
+
+  patchy::ui::MainWindow window;
+  window.add_document_session(std::move(document), QStringLiteral("Soft Brush L Corner"));
+  show_window(window);
+  auto* canvas = require_canvas(window);
+
+  require_action_by_text(window, QStringLiteral("Brush"))->trigger();
+  canvas->set_zoom(2.0);
+  canvas->set_primary_color(Qt::black);
+  canvas->set_brush_size(64);
+  canvas->set_brush_opacity(100);
+  canvas->set_brush_softness(100);
+  canvas->set_brush_build_up(false);
+  QApplication::processEvents();
+
+  const auto send_document_mouse = [canvas](QEvent::Type type, QPointF document_point,
+                                            Qt::MouseButton button, Qt::MouseButtons buttons) {
+    send_mouse(*canvas, type, canvas->widget_position_for_document_point(document_point.toPoint()), button,
+               buttons);
+  };
+  const auto drag_segment = [&](QPointF from, QPointF to) {
+    const auto dx = to.x() - from.x();
+    const auto dy = to.y() - from.y();
+    const auto steps = std::max(1, static_cast<int>(std::ceil(std::hypot(dx, dy) / 5.0)));
+    for (int step = 1; step <= steps; ++step) {
+      const auto t = static_cast<double>(step) / static_cast<double>(steps);
+      send_document_mouse(QEvent::MouseMove, QPointF(from.x() + dx * t, from.y() + dy * t), Qt::NoButton,
+                          Qt::LeftButton);
+    }
+  };
+
+  const QPointF start(48, 80);
+  const QPointF corner(184, 80);
+  const QPointF end(184, 204);
+  send_document_mouse(QEvent::MouseButtonPress, start, Qt::LeftButton, Qt::LeftButton);
+  drag_segment(start, corner);
+  drag_segment(corner, end);
+  send_document_mouse(QEvent::MouseButtonRelease, end, Qt::LeftButton, Qt::NoButton);
+  QApplication::processEvents();
+
+  const auto& layer = patchy::ui::MainWindowTestAccess::document(window).layers().front();
+  const auto& pixels = layer.pixels();
+  const auto single_edge_alpha = static_cast<int>(pixels.pixel(152, 64)[3]);
+  const auto inside_corner_alpha = static_cast<int>(pixels.pixel(168, 96)[3]);
+  std::cout << "[soft_artifact] ui_soft_opaque_brush_l_corner single_edge_alpha="
+            << single_edge_alpha << " inside_corner_alpha=" << inside_corner_alpha << '\n';
+  save_widget_artifact("ui_soft_opaque_brush_l_corner", window);
+
+  CHECK(inside_corner_alpha >= single_edge_alpha + 20);
+}
+
+void ui_soft_brush_overlap_artifact_gallery() {
+  const auto distance_to_segment = [](QPointF point, QPointF a, QPointF b) {
+    const auto dx = b.x() - a.x();
+    const auto dy = b.y() - a.y();
+    const auto length_squared = dx * dx + dy * dy;
+    const auto along =
+        length_squared <= std::numeric_limits<double>::epsilon()
+            ? 0.0
+            : std::clamp(((point.x() - a.x()) * dx + (point.y() - a.y()) * dy) / length_squared, 0.0, 1.0);
+    return std::hypot(point.x() - (a.x() + dx * along), point.y() - (a.y() + dy * along));
+  };
+  const auto soft_coverage = [](double distance, double radius, int softness) {
+    if (distance >= radius) {
+      return 0.0;
+    }
+    softness = std::clamp(softness, 0, 100);
+    if (softness <= 0) {
+      return 1.0;
+    }
+    const auto edge_width = std::max(1.0, radius * static_cast<double>(softness) / 100.0);
+    const auto inner_radius = std::max(0.0, radius - edge_width);
+    if (distance <= inner_radius) {
+      return 1.0;
+    }
+    const auto t = std::clamp((distance - inner_radius) / edge_width, 0.0, 1.0);
+    const auto smooth = t * t * t * (t * (t * 6.0 - 15.0) + 10.0);
+    return 1.0 - smooth;
+  };
+  const auto expected_alpha = [&](QPoint point, const std::vector<QPointF>& points, double radius,
+                                  int opacity, int softness) {
+    auto coverage = 0.0;
+    for (std::size_t index = 1; index < points.size(); ++index) {
+      coverage = std::max(coverage,
+                          soft_coverage(distance_to_segment(point, points[index - 1], points[index]), radius,
+                                        softness));
+    }
+    return static_cast<int>(std::lround(coverage * static_cast<double>(opacity) * 2.55));
+  };
+
+  const auto run_case = [&](const char* artifact_name, const std::vector<QPointF>& points,
+                            QSize canvas_size, int brush_size, int opacity, int softness, double event_spacing) {
+    patchy::Document document(canvas_size.width(), canvas_size.height(), patchy::PixelFormat::rgba8());
+    document.add_pixel_layer("Paint", solid_pixels(canvas_size.width(), canvas_size.height(),
+                                                   patchy::PixelFormat::rgba8(), QColor(0, 0, 0, 0)));
+
+    patchy::ui::MainWindow window;
+    window.add_document_session(std::move(document), QString::fromLatin1(artifact_name));
+    show_window(window);
+    auto* canvas = require_canvas(window);
+
+    require_action_by_text(window, QStringLiteral("Brush"))->trigger();
+    canvas->set_zoom(canvas_size.width() > 500 ? 1.0 : 2.0);
+    canvas->set_primary_color(Qt::black);
+    canvas->set_brush_size(brush_size);
+    canvas->set_brush_opacity(opacity);
+    canvas->set_brush_softness(softness);
+    canvas->set_brush_build_up(false);
+    QApplication::processEvents();
+
+    const auto send_document_mouse = [canvas](QEvent::Type type, QPointF document_point,
+                                              Qt::MouseButton button, Qt::MouseButtons buttons) {
+      send_mouse(*canvas, type, canvas->widget_position_for_document_point(document_point.toPoint()), button,
+                 buttons);
+    };
+    const auto drag_segment = [&](QPointF from, QPointF to) {
+      const auto dx = to.x() - from.x();
+      const auto dy = to.y() - from.y();
+      const auto steps = std::max(1, static_cast<int>(std::ceil(std::hypot(dx, dy) / event_spacing)));
+      for (int step = 1; step <= steps; ++step) {
+        const auto t = static_cast<double>(step) / static_cast<double>(steps);
+        send_document_mouse(QEvent::MouseMove, QPointF(from.x() + dx * t, from.y() + dy * t), Qt::NoButton,
+                            Qt::LeftButton);
+      }
+    };
+
+    send_document_mouse(QEvent::MouseButtonPress, points.front(), Qt::LeftButton, Qt::LeftButton);
+    for (std::size_t index = 1; index < points.size(); ++index) {
+      drag_segment(points[index - 1], points[index]);
+    }
+    send_document_mouse(QEvent::MouseButtonRelease, points.back(), Qt::LeftButton, Qt::NoButton);
+    QApplication::processEvents();
+
+    const auto& layer = patchy::ui::MainWindowTestAccess::document(window).layers().front();
+    const auto& pixels = layer.pixels();
+    auto max_underpaint = 0;
+    auto underpaint_pixels = 0;
+    auto max_inner_jump = 0;
+    auto inner_jump_pixels = 0;
+    QPoint max_underpaint_point;
+    QPoint max_jump_point;
+    for (std::int32_t y = 0; y < pixels.height(); ++y) {
+      for (std::int32_t x = 0; x < pixels.width(); ++x) {
+        const QPoint point(x, y);
+        const auto expected = expected_alpha(point, points, static_cast<double>(brush_size) * 0.5,
+                                             opacity, softness);
+        const auto actual = static_cast<int>(pixels.pixel(x, y)[3]);
+        const auto underpaint = expected - actual;
+        if (underpaint > max_underpaint) {
+          max_underpaint = underpaint;
+          max_underpaint_point = point;
+        }
+        if (underpaint > 24) {
+          ++underpaint_pixels;
+        }
+        const auto check_inner_jump = [&](QPoint neighbor) {
+          if (neighbor.x() < 0 || neighbor.y() < 0 || neighbor.x() >= pixels.width() ||
+              neighbor.y() >= pixels.height()) {
+            return;
+          }
+          const auto neighbor_expected = expected_alpha(neighbor, points,
+                                                        static_cast<double>(brush_size) * 0.5,
+                                                        opacity, softness);
+          if (expected < 192 || neighbor_expected < 192) {
+            return;
+          }
+          const auto neighbor_alpha = static_cast<int>(pixels.pixel(neighbor.x(), neighbor.y())[3]);
+          const auto jump = std::abs(actual - neighbor_alpha);
+          if (jump > max_inner_jump) {
+            max_inner_jump = jump;
+            max_jump_point = point;
+          }
+          if (jump > 36) {
+            ++inner_jump_pixels;
+          }
+        };
+        check_inner_jump(point + QPoint(1, 0));
+        check_inner_jump(point + QPoint(0, 1));
+      }
+    }
+    std::cout << "[soft_artifact] " << artifact_name
+              << " max_underpaint=" << max_underpaint
+              << " at " << max_underpaint_point.x() << ',' << max_underpaint_point.y()
+              << " pixels_under_24=" << underpaint_pixels
+              << " max_inner_jump=" << max_inner_jump
+              << " at " << max_jump_point.x() << ',' << max_jump_point.y()
+              << " inner_jump_pixels_36=" << inner_jump_pixels << '\n';
+    CHECK(max_underpaint <= 24);
+    CHECK(underpaint_pixels == 0);
+    CHECK(max_inner_jump <= 36);
+    CHECK(inner_jump_pixels == 0);
+    save_widget_artifact(artifact_name, window);
+  };
+
+  const auto run_default_layer_case = [&](const char* artifact_name, const std::vector<QPointF>& points,
+                                          QSize canvas_size, int brush_size, int opacity, int softness,
+                                          double event_spacing) {
+    patchy::Document document(canvas_size.width(), canvas_size.height(), patchy::PixelFormat::rgb8());
+    document.add_pixel_layer("Background", solid_pixels(canvas_size.width(), canvas_size.height(),
+                                                        patchy::PixelFormat::rgb8(), QColor(255, 255, 255)));
+    document.add_pixel_layer("Paint Layer", solid_pixels(canvas_size.width(), canvas_size.height(),
+                                                         patchy::PixelFormat::rgba8(), QColor(0, 0, 0, 0)));
+
+    patchy::ui::MainWindow window;
+    window.add_document_session(std::move(document), QString::fromLatin1(artifact_name));
+    show_window(window);
+    // This case samples the rendered widget, so the 760px document must stay
+    // fully visible at zoom 1 with headroom: the right dock stack's measured
+    // minimum can grow, and a document edge that slides under the canvas's
+    // overlay scroll bar samples bar pixels instead of the stroke.
+    window.resize(1280, 780);
+    QApplication::processEvents();
+    auto* canvas = require_canvas(window);
+
+    require_action_by_text(window, QStringLiteral("Brush"))->trigger();
+    canvas->set_zoom(canvas_size.width() > 500 ? 1.0 : 2.0);
+    canvas->set_primary_color(Qt::black);
+    canvas->set_brush_size(brush_size);
+    canvas->set_brush_opacity(opacity);
+    canvas->set_brush_softness(softness);
+    canvas->set_brush_build_up(false);
+    QApplication::processEvents();
+
+    const auto send_document_mouse = [canvas](QEvent::Type type, QPointF document_point,
+                                              Qt::MouseButton button, Qt::MouseButtons buttons) {
+      send_mouse(*canvas, type, canvas->widget_position_for_document_point(document_point.toPoint()), button,
+                 buttons);
+    };
+    const auto drag_segment = [&](QPointF from, QPointF to) {
+      const auto dx = to.x() - from.x();
+      const auto dy = to.y() - from.y();
+      const auto steps = std::max(1, static_cast<int>(std::ceil(std::hypot(dx, dy) / event_spacing)));
+      for (int step = 1; step <= steps; ++step) {
+        const auto t = static_cast<double>(step) / static_cast<double>(steps);
+        send_document_mouse(QEvent::MouseMove, QPointF(from.x() + dx * t, from.y() + dy * t), Qt::NoButton,
+                            Qt::LeftButton);
+      }
+    };
+
+    send_document_mouse(QEvent::MouseButtonPress, points.front(), Qt::LeftButton, Qt::LeftButton);
+    for (std::size_t index = 1; index < points.size(); ++index) {
+      drag_segment(points[index - 1], points[index]);
+    }
+    send_document_mouse(QEvent::MouseButtonRelease, points.back(), Qt::LeftButton, Qt::NoButton);
+    QApplication::processEvents();
+
+    QEvent leave_event(QEvent::Leave);
+    QApplication::sendEvent(canvas, &leave_event);
+    QApplication::processEvents();
+
+    const auto image = canvas->grab().toImage();
+    auto max_too_light = 0;
+    auto too_light_pixels = 0;
+    auto max_inner_jump = 0;
+    auto inner_jump_pixels = 0;
+    QPoint max_light_point;
+    QPoint max_jump_point;
+    auto sampled_pixels = 0;
+    for (std::int32_t y = 2; y < canvas_size.height() - 2; ++y) {
+      for (std::int32_t x = 2; x < canvas_size.width() - 2; ++x) {
+        const QPoint point(x, y);
+        const auto top_left = canvas->widget_position_for_document_point(point);
+        const auto bottom_right = canvas->widget_position_for_document_point(point + QPoint(1, 1));
+        const QPoint widget_point((top_left.x() + bottom_right.x()) / 2,
+                                  (top_left.y() + bottom_right.y()) / 2);
+        if (!image.rect().contains(widget_point)) {
+          continue;
+        }
+        ++sampled_pixels;
+        const auto expected_darkness = expected_alpha(point, points, static_cast<double>(brush_size) * 0.5,
+                                                      opacity, softness);
+        const auto actual_darkness = 255 - image.pixelColor(widget_point).red();
+        const auto too_light = expected_darkness - actual_darkness;
+        if (too_light > max_too_light) {
+          max_too_light = too_light;
+          max_light_point = point;
+        }
+        if (too_light > 24) {
+          ++too_light_pixels;
+        }
+
+        const auto check_inner_jump = [&](QPoint neighbor) {
+          const auto neighbor_expected =
+              expected_alpha(neighbor, points, static_cast<double>(brush_size) * 0.5, opacity, softness);
+          if (expected_darkness < 192 || neighbor_expected < 192) {
+            return;
+          }
+          const auto neighbor_top_left = canvas->widget_position_for_document_point(neighbor);
+          const auto neighbor_bottom_right = canvas->widget_position_for_document_point(neighbor + QPoint(1, 1));
+          const QPoint neighbor_widget_point((neighbor_top_left.x() + neighbor_bottom_right.x()) / 2,
+                                             (neighbor_top_left.y() + neighbor_bottom_right.y()) / 2);
+          if (!image.rect().contains(neighbor_widget_point)) {
+            return;
+          }
+          const auto neighbor_darkness = 255 - image.pixelColor(neighbor_widget_point).red();
+          const auto jump = std::abs(actual_darkness - neighbor_darkness);
+          if (jump > max_inner_jump) {
+            max_inner_jump = jump;
+            max_jump_point = point;
+          }
+          if (jump > 36) {
+            ++inner_jump_pixels;
+          }
+        };
+        check_inner_jump(point + QPoint(1, 0));
+        check_inner_jump(point + QPoint(0, 1));
+      }
+    }
+
+    std::cout << "[soft_artifact] " << artifact_name << " sampled=" << sampled_pixels
+              << " max_too_light=" << max_too_light
+              << " at " << max_light_point.x() << ',' << max_light_point.y()
+              << " pixels_too_light_24=" << too_light_pixels
+              << " max_inner_jump=" << max_inner_jump
+              << " at " << max_jump_point.x() << ',' << max_jump_point.y()
+              << " inner_jump_pixels_36=" << inner_jump_pixels << '\n';
+    save_widget_artifact(artifact_name, window);
+    CHECK(sampled_pixels > canvas_size.width() * canvas_size.height() / 2);
+    CHECK(max_inner_jump <= 36);
+    CHECK(inner_jump_pixels == 0);
+  };
+
+  run_case("ui_soft_artifact_acute_zigzag",
+           {QPointF(44, 44), QPointF(330, 78), QPointF(52, 124), QPointF(330, 166), QPointF(46, 214)},
+           QSize(380, 260), 64, 100, 100, 5.0);
+  run_case("ui_soft_artifact_crossing_star",
+           {QPointF(188, 30), QPointF(238, 216), QPointF(42, 96), QPointF(338, 98), QPointF(138, 216),
+            QPointF(188, 30)},
+           QSize(380, 260), 64, 100, 100, 5.0);
+  run_case("ui_soft_artifact_large_sparse_star",
+           {QPointF(376, 60), QPointF(476, 432), QPointF(84, 192), QPointF(676, 196), QPointF(276, 432),
+            QPointF(376, 60)},
+           QSize(760, 560), 160, 100, 100, 10000.0);
+  run_default_layer_case("ui_soft_artifact_large_sparse_star_default_layers",
+                         {QPointF(376, 60), QPointF(476, 432), QPointF(84, 192), QPointF(676, 196), QPointF(276, 432),
+                          QPointF(376, 60)},
+                         QSize(760, 560), 160, 100, 100, 10000.0);
+}
+
+void ui_clone_tool_samples_source_and_paints_offset() {
+  patchy::ui::MainWindow window;
+  show_window(window);
+  auto* canvas = require_canvas(window);
+
+  require_action_by_text(window, QStringLiteral("Brush"))->trigger();
+  canvas->set_primary_color(QColor(230, 40, 30));
+  canvas->set_brush_size(22);
+  canvas->set_brush_opacity(100);
+  drag(*canvas, canvas->widget_position_for_document_point(QPoint(70, 72)),
+       canvas->widget_position_for_document_point(QPoint(72, 72)));
+  canvas->set_primary_color(QColor(30, 80, 230));
+  drag(*canvas, canvas->widget_position_for_document_point(QPoint(110, 72)),
+       canvas->widget_position_for_document_point(QPoint(112, 72)));
+  QApplication::processEvents();
+
+  require_action_by_text(window, QStringLiteral("Clone"))->trigger();
+  QApplication::processEvents();
+  CHECK(canvas->tool() == patchy::ui::CanvasTool::Clone);
+  // No source yet: a press would be refused, and the cursor says so (GitHub issue 380).
+  CHECK(canvas->cursor().shape() == Qt::ForbiddenCursor);
+  // The checks read painted pixels from the widget, where the source overlay (on by default,
+  // GitHub issue 426) would cover the hovered brush.
+  canvas->set_clone_overlay_shown(false);
+  canvas->set_brush_softness(100);
+  auto* clone_aligned = window.findChild<QCheckBox*>(QStringLiteral("cloneAlignedCheck"));
+  CHECK(clone_aligned != nullptr);
+  CHECK(clone_aligned->isChecked());
+  CHECK(canvas->clone_aligned());
+
+  const auto source = canvas->widget_position_for_document_point(QPoint(70, 72));
+  send_mouse(*canvas, QEvent::MouseButtonPress, source, Qt::LeftButton, Qt::LeftButton, Qt::AltModifier);
+  send_mouse(*canvas, QEvent::MouseButtonRelease, source, Qt::LeftButton, Qt::NoButton, Qt::AltModifier);
+  send_mouse(*canvas, QEvent::MouseMove, source, Qt::NoButton, Qt::NoButton);
+  CHECK(canvas->cursor().shape() == Qt::BitmapCursor);
+
+  const auto target = canvas->widget_position_for_document_point(QPoint(170, 102));
+  drag(*canvas, target, target + QPoint(2, 0));
+  QApplication::processEvents();
+  CHECK(color_close(canvas_pixel(*canvas, QPoint(170, 102)), QColor(230, 40, 30), 45));
+  const auto feathered_edge = canvas_pixel(*canvas, QPoint(178, 102));
+  CHECK(feathered_edge.red() > feathered_edge.green());
+  CHECK(feathered_edge.green() > 80);
+  CHECK(feathered_edge.green() < 245);
+  drag(*canvas, canvas->widget_position_for_document_point(QPoint(210, 102)),
+       canvas->widget_position_for_document_point(QPoint(212, 102)));
+  QApplication::processEvents();
+  CHECK(color_close(canvas_pixel(*canvas, QPoint(210, 102)), QColor(30, 80, 230), 45));
+
+  clone_aligned->setChecked(false);
+  QApplication::processEvents();
+  CHECK(!canvas->clone_aligned());
+  send_mouse(*canvas, QEvent::MouseButtonPress, source, Qt::LeftButton, Qt::LeftButton, Qt::AltModifier);
+  send_mouse(*canvas, QEvent::MouseButtonRelease, source, Qt::LeftButton, Qt::NoButton, Qt::AltModifier);
+  drag(*canvas, canvas->widget_position_for_document_point(QPoint(250, 102)),
+       canvas->widget_position_for_document_point(QPoint(252, 102)));
+  QApplication::processEvents();
+  CHECK(color_close(canvas_pixel(*canvas, QPoint(250, 102)), QColor(230, 40, 30), 45));
+  drag(*canvas, canvas->widget_position_for_document_point(QPoint(290, 102)),
+       canvas->widget_position_for_document_point(QPoint(292, 102)));
+  QApplication::processEvents();
+  CHECK(color_close(canvas_pixel(*canvas, QPoint(290, 102)), QColor(230, 40, 30), 45));
+
+  auto* history = window.findChild<QListWidget*>(QStringLiteral("historyList"));
+  CHECK(history != nullptr);
+  CHECK(history->currentItem() != nullptr);
+  CHECK(history->currentItem()->text().contains(QStringLiteral("Clone")));
+  save_widget_artifact("ui_clone_tool_stamp", window);
+}
+
+void ui_clone_tool_feathered_rgba_edges_keep_source_color() {
+  patchy::Document document(64, 64, patchy::PixelFormat::rgba8());
+  auto pixels = solid_pixels(64, 64, patchy::PixelFormat::rgba8(), QColor(0, 0, 0, 0));
+  for (std::int32_t y = 34; y <= 50; ++y) {
+    for (std::int32_t x = 8; x <= 56; ++x) {
+      auto* px = pixels.pixel(x, y);
+      px[0] = 255;
+      px[1] = 220;
+      px[2] = 0;
+      px[3] = 255;
+    }
+  }
+  auto& layer = document.add_pixel_layer("Paint", std::move(pixels));
+
+  patchy::ui::CanvasWidget canvas;
+  canvas.resize(160, 160);
+  canvas.set_document(&document);
+  canvas.set_tool(patchy::ui::CanvasTool::Clone);
+  canvas.set_brush_size(24);
+  canvas.set_brush_opacity(100);
+  canvas.set_brush_softness(100);
+  canvas.show();
+  QApplication::processEvents();
+
+  const auto source = canvas.widget_position_for_document_point(QPoint(32, 42));
+  send_mouse(canvas, QEvent::MouseButtonPress, source, Qt::LeftButton, Qt::LeftButton, Qt::AltModifier);
+  send_mouse(canvas, QEvent::MouseButtonRelease, source, Qt::LeftButton, Qt::NoButton, Qt::AltModifier);
+
+  const auto target = canvas.widget_position_for_document_point(QPoint(32, 16));
+  send_mouse(canvas, QEvent::MouseButtonPress, target, Qt::LeftButton, Qt::LeftButton);
+  send_mouse(canvas, QEvent::MouseButtonRelease, target, Qt::LeftButton, Qt::NoButton);
+  QApplication::processEvents();
+
+  const auto* center = layer.pixels().pixel(32, 16);
+  CHECK(center[0] == 255);
+  CHECK(center[1] == 220);
+  CHECK(center[2] == 0);
+  CHECK(center[3] == 255);
+
+  const auto* feathered = layer.pixels().pixel(40, 16);
+  CHECK(feathered[3] > 20);
+  CHECK(feathered[3] < 240);
+  CHECK(feathered[0] >= 245);
+  CHECK(feathered[1] >= 210);
+  CHECK(feathered[2] <= 5);
+}
+
+void ui_healing_brush_transfers_detail_and_preserves_destination_tone() {
+  patchy::Document document(48, 24, patchy::PixelFormat::rgba8());
+  auto pixels = solid_pixels(48, 24, patchy::PixelFormat::rgba8(), QColor(40, 80, 120, 255));
+  for (std::int32_t y = 11; y <= 13; ++y) {
+    for (std::int32_t x = 9; x <= 11; ++x) {
+      auto* px = pixels.pixel(x, y);
+      px[0] = 100;
+      px[1] = 100;
+      px[2] = 100;
+      px[3] = 255;
+    }
+  }
+  auto* source_center = pixels.pixel(10, 12);
+  source_center[0] = 180;
+  source_center[1] = 160;
+  source_center[2] = 140;
+  auto& layer = document.add_pixel_layer("Healing", std::move(pixels));
+
+  patchy::ui::CanvasWidget canvas;
+  canvas.resize(192, 96);
+  canvas.set_document(&document);
+  canvas.set_tool(patchy::ui::CanvasTool::Healing);
+  canvas.set_brush_size(1);
+  canvas.set_brush_opacity(100);
+  canvas.set_brush_softness(0);
+  // Diffusion 1 heals from the four cells beside the one-pixel footprint, unaveraged, so
+  // the result is the classic transfer: their destination (40,80,120) minus their source
+  // (the 100 ring) carried onto the source center.
+  canvas.set_healing_diffusion(1);
+  canvas.show();
+  QApplication::processEvents();
+
+  const auto source = canvas.widget_position_for_document_point(QPoint(10, 12));
+  send_mouse(canvas, QEvent::MouseButtonPress, source, Qt::LeftButton, Qt::LeftButton, Qt::AltModifier);
+  send_mouse(canvas, QEvent::MouseButtonRelease, source, Qt::LeftButton, Qt::NoButton, Qt::AltModifier);
+  const auto target = canvas.widget_position_for_document_point(QPoint(34, 12));
+  send_mouse(canvas, QEvent::MouseButtonPress, target, Qt::LeftButton, Qt::LeftButton);
+  send_mouse(canvas, QEvent::MouseButtonRelease, target, Qt::LeftButton, Qt::NoButton);
+  QApplication::processEvents();
+
+  const auto* healed = layer.pixels().pixel(34, 12);
+  CHECK(healed[0] == 120);
+  CHECK(healed[1] == 140);
+  CHECK(healed[2] == 160);
+  CHECK(healed[3] == 255);
+  const auto* untouched = layer.pixels().pixel(35, 12);
+  CHECK(untouched[0] == 40 && untouched[1] == 80 && untouched[2] == 120 && untouched[3] == 255);
+
+  QTemporaryDir temp;
+  CHECK(temp.isValid());
+  const auto path = patchy::ui::to_filesystem_path(temp.path()) / "healed.psd";
+  patchy::psd::DocumentIo::write_layered_rgb8_file(document, path);
+  const auto reread = patchy::psd::DocumentIo::read_file(path);
+  CHECK(reread.layers().size() == 1);
+  const auto* round_tripped = reread.layers().front().pixels().pixel(34, 12);
+  CHECK(round_tripped[0] == 120);
+  CHECK(round_tripped[1] == 140);
+  CHECK(round_tripped[2] == 160);
+  CHECK(round_tripped[3] == 255);
+}
+
+void ui_local_adjustment_brushes_use_fixed_math_and_round_trip_psd() {
+  patchy::Document document(25, 5, patchy::PixelFormat::rgba8());
+  auto pixels = solid_pixels(25, 5, patchy::PixelFormat::rgba8(), QColor(100, 100, 100, 255));
+  auto set_pixel = [&pixels](int x, QColor color) {
+    auto* pixel = pixels.pixel(x, 2);
+    pixel[0] = static_cast<std::uint8_t>(color.red());
+    pixel[1] = static_cast<std::uint8_t>(color.green());
+    pixel[2] = static_cast<std::uint8_t>(color.blue());
+    pixel[3] = static_cast<std::uint8_t>(color.alpha());
+  };
+  set_pixel(2, QColor(220, 220, 220, 255));
+  set_pixel(7, QColor(140, 140, 140, 255));
+  set_pixel(12, QColor(64, 64, 64, 255));
+  set_pixel(17, QColor(192, 192, 192, 255));
+  set_pixel(22, QColor(200, 100, 50, 128));
+  auto& layer = document.add_pixel_layer("Local adjustments", std::move(pixels));
+
+  patchy::ui::CanvasWidget canvas;
+  canvas.resize(250, 80);
+  canvas.set_document(&document);
+  canvas.set_brush_size(1);
+  canvas.set_brush_softness(0);
+  canvas.set_local_adjustment_strength(100);
+  canvas.set_local_protect_tones(false);
+  canvas.show();
+  QApplication::processEvents();
+
+  const auto apply = [&canvas](patchy::ui::CanvasTool tool, QPoint point) {
+    canvas.set_tool(tool);
+    const auto widget_point = canvas.widget_position_for_document_point(point);
+    send_mouse(canvas, QEvent::MouseButtonPress, widget_point, Qt::LeftButton, Qt::LeftButton);
+    send_mouse(canvas, QEvent::MouseButtonRelease, widget_point, Qt::LeftButton, Qt::NoButton);
+    QApplication::processEvents();
+  };
+
+  apply(patchy::ui::CanvasTool::BlurBrush, QPoint(2, 2));
+  apply(patchy::ui::CanvasTool::SharpenBrush, QPoint(7, 2));
+  canvas.set_local_tone_range(patchy::ui::CanvasWidget::LocalToneRange::Shadows);
+  apply(patchy::ui::CanvasTool::Dodge, QPoint(12, 2));
+  canvas.set_local_tone_range(patchy::ui::CanvasWidget::LocalToneRange::Highlights);
+  apply(patchy::ui::CanvasTool::Burn, QPoint(17, 2));
+  canvas.set_sponge_mode(patchy::ui::CanvasWidget::SpongeMode::Desaturate);
+  canvas.set_sponge_vibrance(false);
+  apply(patchy::ui::CanvasTool::Sponge, QPoint(22, 2));
+
+  const auto* blurred = layer.pixels().pixel(2, 2);
+  CHECK(blurred[0] == 130 && blurred[1] == 130 && blurred[2] == 130 && blurred[3] == 255);
+  // Sharpen moves the lightness by 0.2 of its difference from a 21-tap binomial blur per dab,
+  // the same on every channel (GitHub issue 660 second follow-up).
+  const auto* sharpened = layer.pixels().pixel(7, 2);
+  CHECK(sharpened[0] == 148 && sharpened[1] == 148 && sharpened[2] == 148 && sharpened[3] == 255);
+  // Dodge and Burn follow the Range curves calibrated against Photoshop (GitHub issue 661;
+  // Protect Tones off here, Strength 100%: Photoshop gives 147 and 109).
+  const auto* dodged = layer.pixels().pixel(12, 2);
+  CHECK(dodged[0] == 145 && dodged[1] == 145 && dodged[2] == 145 && dodged[3] == 255);
+  const auto* burned = layer.pixels().pixel(17, 2);
+  CHECK(burned[0] == 110 && burned[1] == 110 && burned[2] == 110 && burned[3] == 255);
+  const auto* desaturated = layer.pixels().pixel(22, 2);
+  CHECK(desaturated[0] == 117 && desaturated[1] == 117 && desaturated[2] == 117 && desaturated[3] == 128);
+  const auto* untouched = layer.pixels().pixel(23, 2);
+  CHECK(untouched[0] == 100 && untouched[1] == 100 && untouched[2] == 100 && untouched[3] == 255);
+
+  ensure_artifact_dir();
+  const auto path = std::filesystem::path("test-artifacts") / "ui_local_adjustment_brushes.psd";
+  patchy::psd::DocumentIo::write_layered_rgb8_file(document, path);
+  const auto reread = patchy::psd::DocumentIo::read_file(path);
+  CHECK(reread.layers().size() == 1);
+  const auto& round_tripped = reread.layers().front().pixels();
+  CHECK(round_tripped.width() == layer.pixels().width());
+  CHECK(round_tripped.height() == layer.pixels().height());
+  for (std::int32_t y = 0; y < round_tripped.height(); ++y) {
+    for (std::int32_t x = 0; x < round_tripped.width(); ++x) {
+      const auto* actual = round_tripped.pixel(x, y);
+      const auto* expected = layer.pixels().pixel(x, y);
+      CHECK(std::equal(expected, expected + 4, actual));
+    }
+  }
+}
+
+// Blur softens an edge against transparency (desk card local-039: a stroke along the right edge
+// of a shape on a transparent layer changed nothing). Blur spreads alpha with the same 3x3 kernel,
+// grows a layer whose stored edge is the shape's edge, and keeps alpha when transparent pixels are
+// locked.
+void ui_blur_brush_softens_edges_against_transparency() {
+  const auto pixel_at = [](const patchy::Layer& layer, int x, int y) {
+    std::array<int, 4> value{0, 0, 0, 0};
+    const auto bounds = layer.bounds();
+    if (x < bounds.x || y < bounds.y || x >= bounds.x + bounds.width || y >= bounds.y + bounds.height) {
+      return value;
+    }
+    const auto* pixel = layer.pixels().pixel(x - bounds.x, y - bounds.y);
+    for (std::size_t channel = 0; channel < 4U; ++channel) {
+      value[channel] = pixel[channel];
+    }
+    return value;
+  };
+  // Picture for the card, written before the checks so a failing run still writes it: a hard red
+  // disc on a transparent layer over light gray, black paint behind its left edge, one blur pass
+  // down each edge (4x, nearest neighbor).
+  patchy::Document picture_document(96, 72, patchy::PixelFormat::rgba8());
+  auto disc = solid_pixels(96, 72, patchy::PixelFormat::rgba8(), QColor(0, 0, 0, 0));
+  for (std::int32_t y = 0; y < 72; ++y) {
+    for (std::int32_t x = 0; x < 96; ++x) {
+      auto* pixel = disc.pixel(x, y);
+      if ((x - 48) * (x - 48) + (y - 36) * (y - 36) <= 28 * 28) {
+        pixel[0] = 255;
+        pixel[3] = 255;
+      } else if (x >= 10 && x < 30) {
+        pixel[3] = 255;  // black paint behind the disc's left edge, as in the report
+      }
+    }
+  }
+  const auto disc_id = picture_document.add_pixel_layer("Paint Layer", std::move(disc)).id();
+  patchy::ui::CanvasWidget picture_canvas;
+  picture_canvas.resize(480, 360);
+  picture_canvas.set_document(&picture_document);
+  picture_canvas.set_brush_size(12);
+  picture_canvas.set_brush_softness(0);
+  picture_canvas.set_local_adjustment_strength(100);
+  picture_canvas.set_tool(patchy::ui::CanvasTool::BlurBrush);
+  picture_canvas.show();
+  QApplication::processEvents();
+  drag_document_pixel_centers(picture_canvas, {QPoint(70, 18), QPoint(76, 36), QPoint(70, 54)}, 8);
+  drag_document_pixel_centers(picture_canvas, {QPoint(26, 18), QPoint(20, 36), QPoint(26, 54)}, 8);
+  QApplication::processEvents();
+  const auto* blurred_disc = picture_document.find_layer(disc_id);
+  CHECK(blurred_disc != nullptr);
+  QImage picture(96 * 4, 72 * 4, QImage::Format_RGB32);
+  for (int y = 0; y < 72; ++y) {
+    for (int x = 0; x < 96; ++x) {
+      const auto value = pixel_at(*blurred_disc, x, y);
+      const auto mix = [&value](int channel) {
+        return (value[static_cast<std::size_t>(channel)] * value[3] + 224 * (255 - value[3]) + 127) / 255;
+      };
+      const auto color = qRgb(mix(0), mix(1), mix(2));
+      for (int dy = 0; dy < 4; ++dy) {
+        for (int dx = 0; dx < 4; ++dx) {
+          picture.setPixel(x * 4 + dx, y * 4 + dy, color);
+        }
+      }
+    }
+  }
+  save_image_artifact("ui_blur_brush_transparent_edge", picture);
+
+  // An opaque red block on x < 20; the layer is either the whole 40 x 24 canvas (transparent on
+  // the right) or only the block.
+  const auto run = [&pixel_at](bool layer_covers_canvas, bool lock_transparent) {
+    patchy::Document document(40, 24, patchy::PixelFormat::rgba8());
+    auto pixels = solid_pixels(40, 24, patchy::PixelFormat::rgba8(), QColor(0, 0, 0, 0));
+    for (std::int32_t y = 0; y < 24; ++y) {
+      for (std::int32_t x = 0; x < 20; ++x) {
+        auto* pixel = pixels.pixel(x, y);
+        pixel[0] = 255;
+        pixel[1] = 0;
+        pixel[2] = 0;
+        pixel[3] = 255;
+      }
+    }
+    auto& added = document.add_pixel_layer("Paint Layer", std::move(pixels));
+    if (!layer_covers_canvas) {
+      added.set_pixels(solid_pixels(20, 24, patchy::PixelFormat::rgba8(), QColor(255, 0, 0, 255)));
+      CHECK(added.bounds().width == 20);
+    }
+    if (lock_transparent) {
+      patchy::set_layer_locks_transparent_pixels(added, true);
+    }
+    const auto layer_id = added.id();
+
+    patchy::ui::CanvasWidget canvas;
+    canvas.resize(400, 240);
+    canvas.set_document(&document);
+    canvas.set_brush_size(9);
+    canvas.set_brush_softness(0);
+    canvas.set_local_adjustment_strength(100);
+    canvas.set_tool(patchy::ui::CanvasTool::BlurBrush);
+    canvas.show();
+    QApplication::processEvents();
+    drag_document_pixel_centers(canvas, {QPoint(20, 4), QPoint(20, 19)}, 8);
+    QApplication::processEvents();
+    const auto* layer = document.find_layer(layer_id);
+    CHECK(layer != nullptr);
+    return std::make_pair(pixel_at(*layer, 19, 12), pixel_at(*layer, 20, 12));
+  };
+
+  for (const bool covers_canvas : {true, false}) {
+    const auto [inside, outside] = run(covers_canvas, false);
+    // The last opaque column loses some alpha and the first transparent one gains some, both red.
+    CHECK(inside[3] > 0 && inside[3] < 255);
+    CHECK(inside[0] == 255 && inside[1] == 0 && inside[2] == 0);
+    CHECK(outside[3] > 0 && outside[3] < inside[3]);
+    CHECK(outside[0] == 255 && outside[1] == 0 && outside[2] == 0);
+  }
+  // Lock transparent pixels: alpha stays as it was.
+  const auto [locked_inside, locked_outside] = run(true, true);
+  CHECK(locked_inside[3] == 255 && locked_inside[0] == 255);
+  CHECK(locked_outside[3] == 0);
+}
+
+// Tools at an edge that borders transparency (desk card local-039 follow-up). The document is
+// 64 x 24 RGBA; columns 0..25 are opaque, 26..34 an alpha ramp down to 0 (or a hard edge at
+// column 30), the rest transparent, all with the color `paint` (transparent pixels store
+// 0,0,0,0). With `layer_width` below 64 the layer stores only that many columns, so its stored
+// edge is the shape's edge.
+namespace transparent_edge {
+
+constexpr int kWidth = 64;
+constexpr int kHeight = 24;
+
+struct Scene {
+  std::unique_ptr<patchy::Document> document;
+  patchy::LayerId layer_id{0};
+  std::unique_ptr<patchy::ui::CanvasWidget> canvas;
+};
+
+int ramp_alpha(int x, bool ramp) {
+  if (!ramp) {
+    return x < 30 ? 255 : 0;
+  }
+  if (x < 26) {
+    return 255;
+  }
+  if (x > 34) {
+    return 0;
+  }
+  return (34 - x) * 255 / 8;
+}
+
+Scene make_scene(patchy::PixelFormat format, QColor paint, bool ramp, int layer_width, bool lock_transparent) {
+  Scene scene;
+  scene.document = std::make_unique<patchy::Document>(kWidth, kHeight, format);
+  auto& layer = scene.document->add_pixel_layer("Paint Layer", solid_pixels(kWidth, kHeight, format, Qt::transparent));
+  auto pixels = solid_pixels(layer_width, kHeight, format, Qt::transparent);
+  for (std::int32_t y = 0; y < kHeight; ++y) {
+    for (std::int32_t x = 0; x < layer_width; ++x) {
+      const auto alpha = ramp_alpha(x, ramp);
+      if (alpha > 0) {
+        patchy::store_pixel(format, pixels.pixel(x, y),
+                            {static_cast<float>(paint.red()), static_cast<float>(paint.green()),
+                             static_cast<float>(paint.blue()), static_cast<float>(alpha)});
+      }
+    }
+  }
+  layer.set_pixels(std::move(pixels));
+  if (lock_transparent) {
+    patchy::set_layer_locks_transparent_pixels(layer, true);
+  }
+  scene.layer_id = layer.id();
+  scene.canvas = std::make_unique<patchy::ui::CanvasWidget>();
+  scene.canvas->resize(kWidth * 6, kHeight * 6);
+  scene.canvas->set_document(scene.document.get());
+  scene.canvas->set_brush_softness(0);
+  scene.canvas->set_brush_opacity(100);
+  scene.canvas->set_brush_flow(100);
+  scene.canvas->show();
+  QApplication::processEvents();
+  return scene;
+}
+
+// Straight RGBA on the 0..255 scale; outside the stored pixels, transparent.
+std::array<float, 4> pixel(const Scene& scene, int x, int y) {
+  const auto* layer = scene.document->find_layer(scene.layer_id);
+  CHECK(layer != nullptr);
+  const auto bounds = layer->bounds();
+  if (x < bounds.x || y < bounds.y || x >= bounds.x + bounds.width || y >= bounds.y + bounds.height) {
+    return {0.0F, 0.0F, 0.0F, 0.0F};
+  }
+  const auto& pixels = layer->pixels();
+  return patchy::load_pixel(pixels.format(), pixels.pixel(x - bounds.x, y - bounds.y));
+}
+
+void print_row(const char* label, const Scene& scene, int y) {
+  std::printf("[probe] %s:", label);
+  for (int x = 18; x <= 46; x += 2) {
+    const auto value = pixel(scene, x, y);
+    std::printf(" %d=(%.0f,%.0f,%.0f,%.0f)", x, static_cast<double>(value[0]), static_cast<double>(value[1]),
+                static_cast<double>(value[2]), static_cast<double>(value[3]));
+  }
+  const auto bounds = scene.document->find_layer(scene.layer_id)->bounds();
+  std::printf(" bounds=%dx%d\n", bounds.width, bounds.height);
+  std::fflush(stdout);
+}
+
+void stroke(Scene& scene, QPoint from, QPoint to) {
+  drag_document_pixel_centers(*scene.canvas, {from, to}, 12);
+  QApplication::processEvents();
+}
+
+bool near_color(const std::array<float, 4>& value, QColor color, float tolerance) {
+  return std::abs(value[0] - static_cast<float>(color.red())) <= tolerance &&
+         std::abs(value[1] - static_cast<float>(color.green())) <= tolerance &&
+         std::abs(value[2] - static_cast<float>(color.blue())) <= tolerance;
+}
+
+// How many pixels of row `y` are partly transparent; each must keep `color` (no darkening
+// toward the black transparent pixels store) when its alpha is at least `min_alpha`.
+int check_partial_pixels_keep_color(const Scene& scene, int y, QColor color, float tolerance, float min_alpha) {
+  int partial = 0;
+  for (int x = 0; x < kWidth; ++x) {
+    const auto value = pixel(scene, x, y);
+    if (value[3] > 0.0F && value[3] < 255.0F) {
+      ++partial;
+      if (value[3] >= min_alpha && !near_color(value, color, tolerance)) {
+        std::printf("[probe] darkened pixel %d: (%.0f,%.0f,%.0f,%.0f)\n", x, static_cast<double>(value[0]),
+                    static_cast<double>(value[1]), static_cast<double>(value[2]), static_cast<double>(value[3]));
+        CHECK(near_color(value, color, tolerance));
+      }
+    }
+  }
+  return partial;
+}
+
+}  // namespace transparent_edge
+
+// Smudge mixes by alpha (premultiplied): smearing paint into transparency keeps its color
+// instead of darkening toward the transparent pixels' stored black, and smearing transparency
+// into paint thins it without darkening it (with Lock transparent pixels it changes nothing).
+// 8 and 16-bit layers (the core's byte and deep paths).
+void ui_smudge_keeps_color_at_transparent_edges() {
+  using namespace transparent_edge;
+  const QColor paint(220, 40, 30);
+  for (const auto depth : {patchy::BitDepth::UInt8, patchy::BitDepth::UInt16}) {
+    const auto format = patchy::with_bit_depth(patchy::PixelFormat::rgba8(), depth);
+    const auto smudge = [&format, &paint](int layer_width, bool lock, QPoint from, QPoint to) {
+      auto scene = make_scene(format, paint, false, layer_width, lock);
+      scene.canvas->set_tool(patchy::ui::CanvasTool::Smudge);
+      scene.canvas->set_brush_size(12);
+      scene.canvas->set_smudge_strength(90);  // about the per-dab amount 70% Opacity gave before #675
+      stroke(scene, from, to);
+      return scene;
+    };
+    // Paint into transparency, and past the layer's stored edge.
+    for (const auto layer_width : {kWidth, 30}) {
+      const auto scene = smudge(layer_width, false, QPoint(20, 12), QPoint(46, 12));
+      print_row("smudge out", scene, 12);
+      const auto smeared = pixel(scene, 36, 12);
+      CHECK(smeared[3] > 20.0F);
+      CHECK(near_color(smeared, paint, 2.0F));
+      CHECK(check_partial_pixels_keep_color(scene, 12, paint, 2.0F, 1.0F) > 0);
+    }
+    // Transparency into paint.
+    const auto thinned_scene = smudge(kWidth, false, QPoint(44, 12), QPoint(18, 12));
+    print_row("smudge in", thinned_scene, 12);
+    CHECK(pixel(thinned_scene, 26, 12)[3] < 250.0F);
+    CHECK(check_partial_pixels_keep_color(thinned_scene, 12, paint, 2.0F, 1.0F) > 0);
+    // Lock transparent pixels: alpha and color stay.
+    const auto locked = smudge(kWidth, true, QPoint(44, 12), QPoint(18, 12));
+    print_row("smudge in locked", locked, 12);
+    const auto kept = pixel(locked, 26, 12);
+    CHECK(kept[3] == 255.0F);
+    CHECK(near_color(kept, paint, 2.0F));
+    CHECK(pixel(locked, 34, 12)[3] == 0.0F);
+  }
+}
+
+// Sharpen acts on alpha the way it acts on lightness: a soft edge against transparency gets
+// steeper (alpha rises on its inner half and falls on its outer half), the color stays, and
+// Lock transparent pixels keeps alpha.
+void ui_sharpen_steepens_soft_edges_against_transparency() {
+  using namespace transparent_edge;
+  const QColor paint(220, 40, 30);
+  const auto sharpen = [&paint](bool lock) {
+    auto scene = make_scene(patchy::PixelFormat::rgba8(), paint, true, kWidth, lock);
+    scene.canvas->set_tool(patchy::ui::CanvasTool::SharpenBrush);
+    scene.canvas->set_brush_size(15);
+    scene.canvas->set_local_adjustment_strength(100);
+    stroke(scene, QPoint(30, 2), QPoint(30, 21));
+    return scene;
+  };
+  const auto scene = sharpen(false);
+  print_row("sharpen", scene, 12);
+  const auto inner = pixel(scene, 28, 12);
+  const auto outer = pixel(scene, 32, 12);
+  CHECK(inner[3] > static_cast<float>(ramp_alpha(28, true)) + 4.0F);
+  CHECK(outer[3] < static_cast<float>(ramp_alpha(32, true)) - 4.0F);
+  CHECK(near_color(inner, paint, 0.0F));
+  CHECK(pixel(scene, 40, 12)[3] == 0.0F);
+
+  const auto locked = sharpen(true);
+  print_row("sharpen locked", locked, 12);
+  CHECK(pixel(locked, 28, 12)[3] == static_cast<float>(ramp_alpha(28, true)));
+  CHECK(pixel(locked, 32, 12)[3] == static_cast<float>(ramp_alpha(32, true)));
+}
+
+// The other tools at the same edges (desk card local-039 follow-up): each one's row is printed
+// as a [probe] line, and the checks pin what each must do: paint carried into transparency and
+// past the stored edge keeps its color, Lock transparent pixels keeps alpha, the healing tools
+// carry alpha in their membrane (no opaque black from the black transparent pixels store, no
+// hole cut into a soft edge), and the toning tools change the color of semi-transparent pixels
+// without touching alpha.
+void ui_retouch_tools_keep_color_and_alpha_at_transparent_edges() {
+  using namespace transparent_edge;
+  const QColor paint(220, 40, 30);
+  const auto rgba8 = patchy::PixelFormat::rgba8();
+  const auto alt_click = [](Scene& scene, QPoint point) {
+    const auto source = scene.canvas->widget_position_for_document_point(point);
+    send_mouse(*scene.canvas, QEvent::MouseButtonPress, source, Qt::LeftButton, Qt::LeftButton, Qt::AltModifier);
+    send_mouse(*scene.canvas, QEvent::MouseButtonRelease, source, Qt::LeftButton, Qt::NoButton, Qt::AltModifier);
+  };
+  for (const bool lock : {false, true}) {
+    // Clone Stamp: source in the paint, painted into transparency and past the stored edge.
+    for (const auto layer_width : {kWidth, 30}) {
+      auto scene = make_scene(rgba8, paint, false, layer_width, lock);
+      scene.canvas->set_tool(patchy::ui::CanvasTool::Clone);
+      scene.canvas->set_clone_overlay_shown(false);
+      scene.canvas->set_brush_size(9);
+      alt_click(scene, QPoint(8, 12));
+      stroke(scene, QPoint(40, 12), QPoint(46, 12));
+      print_row(lock ? "clone locked" : "clone", scene, 12);
+      const auto cloned = pixel(scene, 42, 12);
+      CHECK(lock ? cloned[3] == 0.0F : (cloned[3] == 255.0F && near_color(cloned, paint, 0.0F)));
+    }
+    // Pattern Stamp into transparency and past the stored edge.
+    for (const auto layer_width : {kWidth, 30}) {
+      auto scene = make_scene(rgba8, paint, false, layer_width, lock);
+      patchy::PatternResource pattern;
+      pattern.id = "local-039-probe";
+      pattern.name = "Probe";
+      pattern.tile = solid_pixels(4, 4, rgba8, QColor(30, 160, 60, 255));
+      scene.canvas->set_tool(patchy::ui::CanvasTool::PatternStamp);
+      scene.canvas->set_pattern_stamp_pattern(pattern);
+      scene.canvas->set_brush_size(9);
+      stroke(scene, QPoint(24, 12), QPoint(46, 12));
+      print_row(lock ? "pattern locked" : "pattern", scene, 12);
+      const auto stamped = pixel(scene, 42, 12);
+      CHECK(lock ? stamped[3] == 0.0F : (stamped[3] == 255.0F && near_color(stamped, QColor(30, 160, 60), 0.0F)));
+    }
+    // Mixer Brush across the edge.
+    {
+      auto scene = make_scene(rgba8, paint, false, kWidth, lock);
+      scene.canvas->set_tool(patchy::ui::CanvasTool::MixerBrush);
+      scene.canvas->set_primary_color(QColor(30, 60, 220));
+      scene.canvas->set_brush_size(9);
+      scene.canvas->set_mixer_wet(50);
+      scene.canvas->set_mixer_load(50);
+      scene.canvas->set_mixer_mix(50);
+      stroke(scene, QPoint(20, 12), QPoint(46, 12));
+      print_row(lock ? "mixer locked" : "mixer", scene, 12);
+      if (lock) {
+        CHECK(pixel(scene, 42, 12)[3] == 0.0F);
+      }
+    }
+    // Healing Brush: source in the paint, painted across the soft edge.
+    {
+      auto scene = make_scene(rgba8, paint, true, kWidth, lock);
+      scene.canvas->set_tool(patchy::ui::CanvasTool::Healing);
+      scene.canvas->set_brush_size(9);
+      alt_click(scene, QPoint(8, 12));
+      stroke(scene, QPoint(24, 12), QPoint(44, 12));
+      print_row(lock ? "healing locked" : "healing", scene, 12);
+      for (int x = 18; x <= 50; ++x) {
+        const auto healed = pixel(scene, x, 12);
+        if (healed[3] >= 64.0F) {  // below that, 8-bit premultiplied rounding moves the color
+          CHECK(near_color(healed, paint, 8.0F));
+        }
+        if (lock) {
+          CHECK(healed[3] == static_cast<float>(ramp_alpha(x, true)));
+        } else if (x >= 38) {
+          // Mostly transparent where the boundary is transparent (the membrane solve leaves
+          // a faint trace on a long thin stroke).
+          CHECK(healed[3] < 96.0F);
+        }
+      }
+    }
+    // Spot Healing on the soft edge.
+    {
+      auto scene = make_scene(rgba8, paint, true, kWidth, lock);
+      scene.canvas->set_tool(patchy::ui::CanvasTool::SpotHealing);
+      scene.canvas->set_brush_size(9);
+      stroke(scene, QPoint(30, 12), QPoint(31, 12));
+      print_row(lock ? "spot locked" : "spot", scene, 12);
+      for (int x = 24; x <= 38; ++x) {
+        const auto healed = pixel(scene, x, 12);
+        if (healed[3] >= 64.0F) {  // below that, 8-bit premultiplied rounding moves the color
+          CHECK(near_color(healed, paint, 8.0F));
+        }
+        if (lock) {
+          CHECK(healed[3] == static_cast<float>(ramp_alpha(x, true)));
+        }
+      }
+      // The soft edge continues through the healed spot instead of a transparent hole.
+      CHECK(pixel(scene, 28, 12)[3] > 128.0F);
+      CHECK(pixel(scene, 32, 12)[3] > 24.0F);
+    }
+  }
+  // Dodge, Burn and Sponge on the soft edge: color moves on semi-transparent pixels, alpha stays.
+  const auto toning = [&rgba8](patchy::ui::CanvasTool tool, const char* label) {
+    auto scene = make_scene(rgba8, QColor(200, 120, 60), true, kWidth, false);
+    scene.canvas->set_tool(tool);
+    scene.canvas->set_brush_size(15);
+    scene.canvas->set_local_adjustment_strength(100);
+    stroke(scene, QPoint(30, 2), QPoint(30, 21));
+    print_row(label, scene, 12);
+    for (int x = 20; x <= 40; ++x) {
+      CHECK(pixel(scene, x, 12)[3] == static_cast<float>(ramp_alpha(x, true)));
+    }
+    CHECK(!near_color(pixel(scene, 31, 12), QColor(200, 120, 60), 0.0F));
+  };
+  toning(patchy::ui::CanvasTool::Dodge, "dodge");
+  toning(patchy::ui::CanvasTool::Burn, "burn");
+  toning(patchy::ui::CanvasTool::Sponge, "sponge");
+}
+
+// GitHub issue 675: Smudge has a Strength of its own (default 50%, settings key
+// tools/smudgeStrength) in the slot where the brush Opacity sits for the painting tools. The
+// brush Opacity no longer reaches Smudge, number keys set the Strength, and it persists.
+void ui_smudge_strength_is_its_own_setting() {
+  SettingsValueRestorer saved_strength(QStringLiteral("tools/smudgeStrength"));
+  SettingsValueRestorer saved_opacity(QStringLiteral("tools/brushOpacity"));
+  SettingsValueRestorer saved_tool(QStringLiteral("tools/activeTool"));
+  {
+    auto settings = patchy::ui::app_settings();
+    settings.remove(QStringLiteral("tools/smudgeStrength"));
+    settings.sync();
+  }
+  {
+    patchy::ui::MainWindow window;
+    show_window(window);
+    window.resize(2400, 900);
+    QApplication::processEvents();
+    auto* canvas = require_canvas(window);
+    auto* strength = window.findChild<QSpinBox*>(QStringLiteral("smudgeStrengthSpin"));
+    auto* opacity = window.findChild<QSpinBox*>(QStringLiteral("brushOpacitySpin"));
+    CHECK(strength != nullptr);
+    CHECK(opacity != nullptr);
+    if (strength == nullptr || opacity == nullptr) {
+      return;
+    }
+    require_action_by_text(window, QStringLiteral("Brush"))->trigger();
+    QApplication::processEvents();
+    CHECK(opacity->isVisible());
+    CHECK(!strength->isVisible());
+    opacity->setValue(100);
+    require_action_by_text(window, QStringLiteral("Smudge"))->trigger();
+    QApplication::processEvents();
+    CHECK(canvas->tool() == patchy::ui::CanvasTool::Smudge);
+    CHECK(strength->isVisible());
+    CHECK(!opacity->isVisible());
+    CHECK(strength->value() == 50);
+    CHECK(canvas->smudge_strength() == 50);
+    CHECK(!strength->toolTip().isEmpty());
+    strength->setValue(30);
+    CHECK(canvas->smudge_strength() == 30);
+    CHECK(canvas->brush_opacity() == 100);
+    // Number keys set Smudge's Strength, not the brush Opacity.
+    canvas->setFocus();
+    send_key(*canvas, Qt::Key_7);
+    QApplication::processEvents();
+    CHECK(canvas->smudge_strength() == 70);
+    CHECK(strength->value() == 70);
+    CHECK(canvas->brush_opacity() == 100);
+    CHECK(patchy::ui::app_settings().value(QStringLiteral("tools/smudgeStrength")).toInt() == 70);
+  }
+  patchy::ui::MainWindow reopened;
+  show_window(reopened);
+  QApplication::processEvents();
+  auto* strength = reopened.findChild<QSpinBox*>(QStringLiteral("smudgeStrengthSpin"));
+  CHECK(strength != nullptr && strength->value() == 70);
+  CHECK(require_canvas(reopened)->smudge_strength() == 70);
+}
+
+// Picture for the desk card (GitHub issue 675): the reporter's portrait at quarter size
+// (local-test-fixtures/sharpen-photo/small.png), one Smudge stroke from the dark fence across
+// the white shirt, Size 110 and Soft 75% (his 443 px brush at quarter size). Left: Strength 100%,
+// the same bytes the old default (Opacity 100%) gave; right: the new default 50%. Writes
+// test-artifacts/ui_smudge_strength_photo.png. 100% must leave the fence's dark far along the
+// stroke, 50% must fade it.
+void ui_smudge_strength_photo_picture_if_available() {
+  const auto path = patchy::test::local_format_fixture_path("sharpen-photo", "small.png");
+  patchy::test::skip_unless_exists(path);
+  QImage source(patchy::ui::to_qstring(path));
+  CHECK(!source.isNull());
+  source = source.convertToFormat(QImage::Format_RGB888);
+  const auto width = source.width();
+  const auto height = source.height();
+  constexpr int kTop = 250;
+  constexpr int kGap = 8;
+  QImage picture(width * 2 + kGap, height - kTop, QImage::Format_RGB32);
+  picture.fill(qRgb(255, 255, 255));
+  std::array<int, 2> lightness_at_end{};
+  for (int panel = 0; panel < 2; ++panel) {
+    auto pixels = solid_pixels(width, height, patchy::PixelFormat::rgb8(), QColor(0, 0, 0));
+    for (int y = 0; y < height; ++y) {
+      const auto* line = source.constScanLine(y);
+      for (int x = 0; x < width; ++x) {
+        auto* px = pixels.pixel(x, y);
+        px[0] = line[x * 3];
+        px[1] = line[x * 3 + 1];
+        px[2] = line[x * 3 + 2];
+      }
+    }
+    patchy::Document document(width, height, patchy::PixelFormat::rgb8());
+    const auto layer_id = document.add_pixel_layer("Photo", std::move(pixels)).id();
+    patchy::ui::CanvasWidget canvas;
+    canvas.resize(width + 140, height + 140);
+    canvas.set_document(&document);
+    canvas.set_zoom(1.0);
+    canvas.show();
+    QApplication::processEvents();
+    canvas.set_tool(patchy::ui::CanvasTool::Smudge);
+    canvas.set_brush_size(110);
+    canvas.set_brush_softness(75);
+    canvas.set_smudge_strength(panel == 0 ? 100 : 50);
+    drag_document_path(canvas, {QPoint(470, 400), QPoint(60, 420)}, 80);
+    QApplication::processEvents();
+    const auto& result = std::as_const(*document.find_layer(layer_id)).pixels();
+    for (int y = kTop; y < height; ++y) {
+      for (int x = 0; x < width; ++x) {
+        const auto* px = result.pixel(x, y);
+        picture.setPixel(panel * (width + kGap) + x, y - kTop, qRgb(px[0], px[1], px[2]));
+      }
+    }
+    const auto* end = result.pixel(120, 418);
+    lightness_at_end[static_cast<std::size_t>(panel)] = (end[0] + end[1] + end[2]) / 3;
+  }
+  std::cout << "smudge photo: lightness near the stroke end at 100% " << lightness_at_end[0] << ", at 50% "
+            << lightness_at_end[1] << "\n";
+  save_image_artifact("ui_smudge_strength_photo", picture);
+  CHECK(lightness_at_end[0] < 150);
+  CHECK(lightness_at_end[1] > 200);
+}
+
+void ui_smudge_tool_drags_painted_pixels() {
+  patchy::ui::MainWindow window;
+  show_window(window);
+  auto* canvas = require_canvas(window);
+
+  require_action_by_text(window, QStringLiteral("Brush"))->trigger();
+  canvas->set_primary_color(QColor(230, 50, 30));
+  canvas->set_brush_size(28);
+  canvas->set_brush_opacity(100);
+  drag(*canvas, canvas->widget_position_for_document_point(QPoint(100, 120)),
+       canvas->widget_position_for_document_point(QPoint(102, 120)));
+  QApplication::processEvents();
+
+  require_action_by_text(window, QStringLiteral("Smudge"))->trigger();
+  QApplication::processEvents();
+  CHECK(canvas->tool() == patchy::ui::CanvasTool::Smudge);
+  canvas->set_brush_size(28);
+  canvas->set_smudge_strength(90);  // about the per-dab amount 70% Opacity gave before #675
+  canvas->set_brush_softness(100);
+  drag(*canvas, canvas->widget_position_for_document_point(QPoint(100, 120)),
+       canvas->widget_position_for_document_point(QPoint(170, 120)));
+  QApplication::processEvents();
+
+  const auto smeared = canvas_pixel(*canvas, QPoint(165, 120));
+  CHECK(smeared.red() > 175);
+  CHECK(smeared.green() < 170);
+  CHECK(smeared.blue() < 160);
+  CHECK(color_close(canvas_pixel(*canvas, QPoint(230, 120)), Qt::white, 10));
+  auto* history = window.findChild<QListWidget*>(QStringLiteral("historyList"));
+  CHECK(history != nullptr);
+  CHECK(history->currentItem() != nullptr);
+  CHECK(history->currentItem()->text().contains(QStringLiteral("Smudge")));
+  save_widget_artifact("ui_smudge_tool", window);
+}
+
+void ui_wet_edges_uses_one_continuous_stroke_boundary() {
+  patchy::ui::MainWindow window;
+  show_window(window);
+  auto* canvas = require_canvas(window);
+  require_action_by_text(window, QStringLiteral("Brush"))->trigger();
+  canvas->set_primary_color(Qt::black);
+  canvas->set_brush_size(40);
+  canvas->set_brush_opacity(100);
+  canvas->set_brush_flow(100);
+  canvas->set_brush_softness(0);
+  patchy::BrushDynamics wet_edges;
+  wet_edges.wet_edges = true;
+  canvas->set_brush_dynamics(wet_edges);
+
+  drag(*canvas, canvas->widget_position_for_document_point(QPoint(160, 200)),
+       canvas->widget_position_for_document_point(QPoint(500, 200)));
+  QApplication::processEvents();
+
+  const auto& document = std::as_const(patchy::ui::MainWindowTestAccess::document(window));
+  CHECK(document.active_layer_id().has_value());
+  const auto* layer = document.find_layer(*document.active_layer_id());
+  CHECK(layer != nullptr);
+  const auto alpha_at = [layer](QPoint point) {
+    if (!layer->bounds().contains(point.x(), point.y())) {
+      return std::uint8_t{0};
+    }
+    return layer->pixels().pixel(point.x() - layer->bounds().x,
+                                 point.y() - layer->bounds().y)[3];
+  };
+
+  std::uint8_t minimum_center = 255;
+  std::uint8_t maximum_center = 0;
+  for (int x = 210; x <= 450; x += 5) {
+    const auto alpha = alpha_at(QPoint(x, 200));
+    minimum_center = std::min(minimum_center, alpha);
+    maximum_center = std::max(maximum_center, alpha);
+  }
+  // The calibrated hard-Round wash keeps the Photoshop 2026 center alpha (about 58.6%).
+  CHECK(minimum_center >= 145);
+  CHECK(maximum_center <= 153);
+  CHECK(maximum_center - minimum_center <= 4);  // no periodic per-dab rings
+  const auto rim_alpha = alpha_at(QPoint(330, 181));
+  CHECK(rim_alpha >= maximum_center + 5);  // one subtle, darker outer stroke rim
+  CHECK(rim_alpha <= maximum_center + 25);
+
+  // Photoshop treats a released-and-restarted mark as a new translucent wash, so ordinary
+  // source-over composition darkens the intersection without introducing internal dab rings.
+  drag(*canvas, canvas->widget_position_for_document_point(QPoint(330, 140)),
+       canvas->widget_position_for_document_point(QPoint(330, 260)));
+  QApplication::processEvents();
+  const auto overlap_alpha = alpha_at(QPoint(330, 200));
+  CHECK(overlap_alpha >= maximum_center + 50);
+  CHECK(overlap_alpha <= 225);
+  save_widget_artifact("ui_wet_edges_continuous_stroke", window);
+}
+
+void ui_mixer_brush_uses_compact_controls_and_round_trips_raster_pixels() {
+  SettingsValueRestorer restore_wet(QStringLiteral("tools/mixerWet"));
+  SettingsValueRestorer restore_load(QStringLiteral("tools/mixerLoad"));
+  SettingsValueRestorer restore_mix(QStringLiteral("tools/mixerMix"));
+  SettingsValueRestorer restore_flow(QStringLiteral("tools/mixerFlow"));
+  patchy::ui::MainWindow window;
+  show_window(window);
+  auto* canvas = require_canvas(window);
+
+  // Put a known color on the active layer. Mixer samples this one pixel once at mouse-down.
+  require_action_by_text(window, QStringLiteral("Brush"))->trigger();
+  canvas->set_primary_color(QColor(0, 30, 240));
+  canvas->set_brush_size(36);
+  canvas->set_brush_opacity(100);
+  canvas->set_brush_flow(100);
+  canvas->set_brush_softness(0);
+  const auto sample_point = canvas->widget_position_for_document_point(QPoint(150, 200));
+  send_mouse(*canvas, QEvent::MouseButtonPress, sample_point, Qt::LeftButton, Qt::LeftButton);
+  send_mouse(*canvas, QEvent::MouseButtonRelease, sample_point, Qt::LeftButton, Qt::NoButton);
+
+  canvas->set_brush_opacity(20);  // hidden Brush opacity must not weaken Mixer strokes
+  require_action_by_text(window, QStringLiteral("Mixer Brush"))->trigger();
+  QApplication::processEvents();
+  CHECK(canvas->tool() == patchy::ui::CanvasTool::MixerBrush);
+  auto* wet = window.findChild<QSpinBox*>(QStringLiteral("mixerWetSpin"));
+  auto* load = window.findChild<QSpinBox*>(QStringLiteral("mixerLoadSpin"));
+  auto* mix = window.findChild<QSpinBox*>(QStringLiteral("mixerMixSpin"));
+  auto* flow = window.findChild<QSpinBox*>(QStringLiteral("mixerFlowSpin"));
+  CHECK(wet != nullptr && wet->isVisible());
+  CHECK(load != nullptr && load->isVisible());
+  CHECK(mix != nullptr && mix->isVisible());
+  CHECK(flow != nullptr && flow->isVisible());
+  CHECK(!window.findChild<QSpinBox*>(QStringLiteral("brushOpacitySpin"))->isVisible());
+  CHECK(window.findChild<QComboBox*>(QStringLiteral("brushPresetCombo"))->isVisible());
+  CHECK(!window.findChild<QToolButton*>(QStringLiteral("brushDynamicsButton"))->isVisible());
+  auto* sample_all = window.findChild<QCheckBox*>(QStringLiteral("mixerSampleAllLayersCheck"));
+  CHECK(sample_all != nullptr && sample_all->isVisible() && !sample_all->isChecked());
+  QTest::mouseClick(wet, Qt::LeftButton, Qt::NoModifier,
+                    QPoint(wet->width() - 7, wet->height() / 2));
+  QApplication::processEvents();
+  QWidget* wet_popup = nullptr;
+  for (auto* widget : QApplication::topLevelWidgets()) {
+    if (widget->objectName() == QStringLiteral("mixerWetPopup") && widget->isVisible()) {
+      wet_popup = widget;
+    }
+  }
+  CHECK(wet_popup != nullptr);
+  CHECK(wet_popup->findChild<QSlider*>(QStringLiteral("mixerWetPopupSlider")) != nullptr);
+  wet_popup->close();
+  // Wet 0 is a dry brush, so Mix greys out (Photoshop parity).
+  wet->setValue(0);
+  QApplication::processEvents();
+  CHECK(!mix->isEnabled());
+  wet->setValue(100);
+  QApplication::processEvents();
+  CHECK(mix->isEnabled());
+  load->setValue(100);
+  mix->setValue(75);
+  flow->setValue(100);
+  CHECK(canvas->mixer_wet() == 100);
+  CHECK(canvas->mixer_load() == 100);
+  CHECK(canvas->mixer_mix() == 75);
+  CHECK(canvas->mixer_flow() == 100);
+
+  canvas->set_primary_color(QColor(240, 20, 0));
+  canvas->set_brush_size(30);
+  drag(*canvas, sample_point,
+       canvas->widget_position_for_document_point(QPoint(500, 200)));
+  QApplication::processEvents();
+
+  const auto& document = std::as_const(patchy::ui::MainWindowTestAccess::document(window));
+  CHECK(document.active_layer_id().has_value());
+  const auto* layer = document.find_layer(*document.active_layer_id());
+  CHECK(layer != nullptr);
+  const auto pixel_at = [layer](QPoint point) {
+    CHECK(layer->bounds().contains(point.x(), point.y()));
+    const auto* pixel = layer->pixels().pixel(point.x() - layer->bounds().x,
+                                               point.y() - layer->bounds().y);
+    return std::array<std::uint8_t, 4>{pixel[0], pixel[1], pixel[2], pixel[3]};
+  };
+  const auto near_color = pixel_at(QPoint(200, 200));
+  const auto far_color = pixel_at(QPoint(450, 200));
+  CHECK(near_color[2] > near_color[0]);
+  CHECK(far_color[0] > far_color[2]);
+  CHECK(far_color[3] < near_color[3]);
+  CHECK(near_color[3] > 150);
+
+  ensure_artifact_dir();
+  const auto path = std::filesystem::path("test-artifacts") / "ui_mixer_brush.psd";
+  patchy::psd::DocumentIo::write_layered_rgb8_file(document, path);
+  const auto reread = patchy::psd::DocumentIo::read_file(path);
+  const auto* reopened = reread.find_layer(*reread.active_layer_id());
+  CHECK(reopened != nullptr);
+  CHECK(reopened->bounds().x == layer->bounds().x);
+  CHECK(reopened->bounds().y == layer->bounds().y);
+  CHECK(reopened->bounds().width == layer->bounds().width);
+  CHECK(reopened->bounds().height == layer->bounds().height);
+  CHECK(reopened->pixels().data().size() == layer->pixels().data().size());
+  CHECK(std::equal(reopened->pixels().data().begin(), reopened->pixels().data().end(),
+                   layer->pixels().data().begin()));
+
+  auto* history = window.findChild<QListWidget*>(QStringLiteral("historyList"));
+  CHECK(history != nullptr && history->currentItem() != nullptr);
+  CHECK(history->currentItem()->text().contains(QStringLiteral("Mixer Brush")));
+  save_widget_artifact("ui_mixer_brush", window);
+}
+
+void ui_mixer_useful_combination_presets_set_wet_load_mix() {
+  SettingsValueRestorer restore_wet(QStringLiteral("tools/mixerWet"));
+  SettingsValueRestorer restore_load(QStringLiteral("tools/mixerLoad"));
+  SettingsValueRestorer restore_mix(QStringLiteral("tools/mixerMix"));
+  SettingsValueRestorer restore_flow(QStringLiteral("tools/mixerFlow"));
+  SettingsValueRestorer restore_sample_all(QStringLiteral("tools/mixerSampleAllLayers"));
+  patchy::ui::MainWindow window;
+  show_window(window);
+  auto* canvas = require_canvas(window);
+  require_action_by_text(window, QStringLiteral("Mixer Brush"))->trigger();
+  QApplication::processEvents();
+
+  auto* combo = window.findChild<QComboBox*>(QStringLiteral("mixerCombinationCombo"));
+  auto* wet = window.findChild<QSpinBox*>(QStringLiteral("mixerWetSpin"));
+  auto* load = window.findChild<QSpinBox*>(QStringLiteral("mixerLoadSpin"));
+  auto* mix = window.findChild<QSpinBox*>(QStringLiteral("mixerMixSpin"));
+  CHECK(combo != nullptr && combo->isVisible());
+  CHECK(wet != nullptr && load != nullptr && mix != nullptr);
+  // The closed combo is compact, so the popup list must carry its own width;
+  // without it every preset renders truncated ("Dry...oad").
+  const auto longest = combo->fontMetrics().horizontalAdvance(QStringLiteral("Very Wet, Heavy Mix"));
+  CHECK(combo->view()->minimumWidth() >= longest);
+
+  combo->setCurrentIndex(combo->findText(QStringLiteral("Wet")));
+  QApplication::processEvents();
+  CHECK(wet->value() == 50 && load->value() == 50 && mix->value() == 50);
+  CHECK(canvas->mixer_wet() == 50 && canvas->mixer_mix() == 50);
+
+  combo->setCurrentIndex(combo->findText(QStringLiteral("Moist, Heavy Mix")));
+  QApplication::processEvents();
+  CHECK(wet->value() == 10 && load->value() == 5 && mix->value() == 100);
+
+  // A manual edit that matches no preset derives back to Custom.
+  wet->setValue(37);
+  QApplication::processEvents();
+  CHECK(combo->currentText() == QStringLiteral("Custom"));
+
+  // Dry rows set Mix to 0 like Photoshop even though the control is disabled
+  // at Wet 0, and the selection still derives back to the preset.
+  combo->setCurrentIndex(combo->findText(QStringLiteral("Dry")));
+  QApplication::processEvents();
+  CHECK(wet->value() == 0 && load->value() == 50 && mix->value() == 0);
+  CHECK(!mix->isEnabled());
+  CHECK(combo->currentText() == QStringLiteral("Dry"));
+}
+
+void ui_mixer_sample_all_layers_switches_stroke_start_sample() {
+  patchy::Document document(64, 24, patchy::PixelFormat::rgba8());
+  document.add_pixel_layer(
+      "Base", solid_pixels(64, 24, patchy::PixelFormat::rgba8(), QColor(20, 40, 230, 255)));
+  auto& edit_layer = document.add_pixel_layer(
+      "Edit", solid_pixels(64, 24, patchy::PixelFormat::rgba8(), QColor(0, 0, 0, 0)));
+  document.set_active_layer(edit_layer.id());
+
+  patchy::ui::CanvasWidget canvas;
+  canvas.resize(256, 96);
+  canvas.set_document(&document);
+  canvas.set_tool(patchy::ui::CanvasTool::MixerBrush);
+  canvas.set_primary_color(QColor(230, 20, 20));
+  canvas.set_brush_size(10);
+  canvas.set_brush_softness(0);
+  canvas.set_mixer_wet(100);
+  canvas.set_mixer_load(50);
+  canvas.set_mixer_mix(100);
+  canvas.set_mixer_flow(100);
+  canvas.show();
+  QApplication::processEvents();
+  // Photoshop-parity default: off.
+  CHECK(!canvas.mixer_sample_all_layers());
+
+  // Off: at Mix 100 the deposit is pure pickup, and the transparent active
+  // layer offers nothing to pick up, so the stroke lays (almost) no paint.
+  drag_document_path(canvas, {QPoint(12, 8), QPoint(52, 8)}, 20);
+  CHECK(edit_layer.pixels().pixel(32, 8)[3] < 30);
+
+  // On: the merged composite (the blue Base layer) feeds the pickup, so the
+  // same stroke paints blue onto the active layer.
+  canvas.set_mixer_sample_all_layers(true);
+  drag_document_path(canvas, {QPoint(12, 16), QPoint(52, 16)}, 20);
+  const auto* painted = edit_layer.pixels().pixel(32, 16);
+  CHECK(painted[3] > 200);
+  CHECK(painted[2] > 150);
+  CHECK(painted[2] > painted[0]);
+}
+
+// Mirrors the Photoshop capture matrix in local-test-fixtures/mixer-calibration:
+// same scene (white 500x260, blue square x 150-330), same three strokes per cell
+// (full crossing y=70, exit-only y=130, straddle start y=190), one row per
+// settings cell. The saved sheet is the Patchy half of the side-by-side
+// comparison against the machine-local Photoshop captures.
+void ui_mixer_calibration_contact_sheet() {
+  struct Cell {
+    const char* label;
+    int wet;
+    int load;
+    int mix;
+    int flow;
+  };
+  const std::array<Cell, 8> cells = {{
+      {"wet 0 load 50 mix 50", 0, 50, 50, 100},
+      {"wet 10 load 50 mix 50", 10, 50, 50, 100},
+      {"wet 25 load 50 mix 50", 25, 50, 50, 100},
+      {"wet 50 load 50 mix 50", 50, 50, 50, 100},
+      {"wet 75 load 50 mix 50", 75, 50, 50, 100},
+      {"wet 100 load 50 mix 50", 100, 50, 50, 100},
+      {"wet 50 load 50 mix 100", 50, 50, 100, 100},
+      {"wet 0 load 1 mix 50", 0, 1, 50, 100},
+  }};
+
+  constexpr int kCellWidth = 500;
+  constexpr int kCellHeight = 260;
+  QImage sheet(kCellWidth, kCellHeight * static_cast<int>(cells.size()), QImage::Format_RGB888);
+  sheet.fill(Qt::white);
+  QPainter painter(&sheet);
+
+  for (std::size_t index = 0; index < cells.size(); ++index) {
+    const auto& cell = cells[index];
+    patchy::Document document(kCellWidth, kCellHeight, patchy::PixelFormat::rgb8());
+    auto& layer = document.add_pixel_layer(
+        "Scene", solid_pixels(kCellWidth, kCellHeight, patchy::PixelFormat::rgb8(), Qt::white));
+    for (int y = 20; y < 240; ++y) {
+      for (int x = 150; x < 330; ++x) {
+        auto* px = layer.pixels().pixel(x, y);
+        px[0] = 0;
+        px[1] = 0;
+        px[2] = 255;
+      }
+    }
+    document.set_active_layer(layer.id());
+
+    patchy::ui::CanvasWidget canvas;
+    canvas.resize(kCellWidth, kCellHeight);
+    canvas.set_document(&document);
+    canvas.set_tool(patchy::ui::CanvasTool::MixerBrush);
+    canvas.set_primary_color(QColor(230, 20, 20));
+    canvas.set_brush_size(30);
+    canvas.set_brush_softness(0);
+    canvas.set_mixer_wet(cell.wet);
+    canvas.set_mixer_load(cell.load);
+    canvas.set_mixer_mix(cell.mix);
+    canvas.set_mixer_flow(cell.flow);
+    canvas.show();
+    QApplication::processEvents();
+
+    drag_document_path(canvas, {QPoint(30, 70), QPoint(470, 70)}, 110);
+    drag_document_path(canvas, {QPoint(240, 130), QPoint(470, 130)}, 58);
+    drag_document_path(canvas, {QPoint(330, 190), QPoint(470, 190)}, 35);
+
+    const auto image = patchy::ui::qimage_from_document(document, false);
+    painter.drawImage(0, static_cast<int>(index) * kCellHeight, image);
+    painter.setPen(Qt::black);
+    painter.drawText(QPoint(8, static_cast<int>(index) * kCellHeight + 14),
+                     QString::fromLatin1(cell.label));
+  }
+  painter.end();
+  save_image_artifact("ui_mixer_calibration_contact_sheet", sheet);
+
+  // Relational floor so the sheet cannot silently go blank: the wet-0 cell's
+  // crossing stroke must paint foreground red near its start.
+  const auto wet0_start = sheet.pixelColor(60, 70);
+  CHECK(wet0_start.red() > 180 && wet0_start.blue() < 100);
+}
+
+void ui_copy_ignores_hidden_active_layer() {
+  patchy::ui::MainWindow window;
+  show_window(window);
+  auto* canvas = require_canvas(window);
+  auto* layer_list = window.findChild<QListWidget*>(QStringLiteral("layerList"));
+  CHECK(layer_list != nullptr);
+  QApplication::clipboard()->clear();
+
+  require_action_by_text(window, QStringLiteral("Brush"))->trigger();
+  canvas->set_primary_color(QColor(0, 0, 0));
+  drag(*canvas, QPoint(80, 80), QPoint(150, 110));
+  require_action(window, "editSelectAllAction")->trigger();
+  require_action(window, "editCopyAction")->trigger();
+  QApplication::processEvents();
+
+  require_layer_item(*layer_list, QStringLiteral("Paint Layer"))->setCheckState(Qt::Unchecked);
+  QApplication::processEvents();
+
+  const auto layers_before = layer_list->count();
+  require_action(window, "editCopyAction")->trigger();
+  require_action(window, "editPasteAction")->trigger();
+  QApplication::processEvents();
+
+  CHECK(layer_list->count() == layers_before);
+  save_widget_artifact("ui_hidden_layer_copy_ignored", window);
+}
+
+void ui_copy_selected_layers_copies_composited_selection() {
+  patchy::ui::MainWindow window;
+  show_window(window);
+  auto* canvas = require_canvas(window);
+  auto* layer_list = window.findChild<QListWidget*>(QStringLiteral("layerList"));
+  CHECK(layer_list != nullptr);
+
+  require_action_by_text(window, QStringLiteral("Brush"))->trigger();
+  canvas->set_brush_size(22);
+  canvas->set_primary_color(QColor(230, 20, 30));
+  drag(*canvas, canvas->widget_position_for_document_point(QPoint(40, 42)),
+       canvas->widget_position_for_document_point(QPoint(42, 42)));
+
+  require_action(window, "layerNewAction")->trigger();
+  QApplication::processEvents();
+  canvas->set_primary_color(QColor(20, 70, 240));
+  drag(*canvas, canvas->widget_position_for_document_point(QPoint(82, 42)),
+       canvas->widget_position_for_document_point(QPoint(84, 42)));
+
+  layer_list->clearSelection();
+  require_layer_item(*layer_list, QStringLiteral("Layer 3"))->setSelected(true);
+  require_layer_item(*layer_list, QStringLiteral("Paint Layer"))->setSelected(true);
+  canvas->set_tool(patchy::ui::CanvasTool::Marquee);
+  drag(*canvas, canvas->widget_position_for_document_point(QPoint(20, 20)),
+       canvas->widget_position_for_document_point(QPoint(120, 80)));
+
+  const auto copied_rect = canvas->selected_document_rect();
+  CHECK(copied_rect.has_value());
+  const auto layers_before = layer_list->count();
+  require_action(window, "editCopyAction")->trigger();
+  require_action(window, "editPasteAction")->trigger();
+  QApplication::processEvents();
+  CHECK(layer_list->count() == layers_before + 1);
+  const auto pasted_rect = canvas->active_layer_document_rect();
+  CHECK(pasted_rect.has_value());
+  const auto offset = pasted_rect->topLeft() - copied_rect->topLeft();
+  CHECK(color_close(canvas_pixel(*canvas, QPoint(40, 42) + offset), QColor(230, 20, 30), 45));
+  CHECK(color_close(canvas_pixel(*canvas, QPoint(82, 42) + offset), QColor(20, 70, 240), 45));
+  save_widget_artifact("ui_copy_selected_layers", window);
+}
+
+void ui_eraser_on_background_paints_background_color_and_size_cursor() {
+  // A new document's opaque Background locks transparency and position (Photoshop), so the
+  // Eraser paints the background color there instead of punching through (GitHub issue 97).
+  patchy::ui::MainWindow window;
+  show_window(window);
+  auto* canvas = require_canvas(window);
+  auto* layer_list = window.findChild<QListWidget*>(QStringLiteral("layerList"));
+  CHECK(layer_list != nullptr);
+
+  require_action_by_text(window, QStringLiteral("Brush"))->trigger();
+  canvas->set_brush_size(38);
+  CHECK(canvas->cursor().shape() == Qt::BitmapCursor);
+
+  require_action_by_text(window, QStringLiteral("Eraser"))->trigger();
+  canvas->set_brush_size(38);
+  canvas->set_brush_opacity(100);
+  canvas->set_brush_softness(0);
+  canvas->set_secondary_color(QColor(30, 140, 220));
+  CHECK(canvas->cursor().shape() == Qt::BitmapCursor);
+  auto* background = require_layer_item(*layer_list, QStringLiteral("Background"));
+  layer_list->clearSelection();
+  layer_list->setCurrentItem(background);
+  background->setSelected(true);
+  QApplication::processEvents();
+
+  auto* background_row = layer_list->itemWidget(background);
+  CHECK(background_row != nullptr);
+  // One padlock names the Background (GitHub issue 274); its locks are still both set.
+  const auto badges = background_row->findChildren<QLabel*>(QStringLiteral("layerLockBadge"));
+  CHECK(badges.size() == 1);
+  CHECK(badges.size() == 1 && badges.front()->property("layerBackgroundBadge").toBool());
+  const auto background_id = static_cast<patchy::LayerId>(background->data(Qt::UserRole).toULongLong());
+  const auto* background_model =
+      std::as_const(patchy::ui::MainWindowTestAccess::document(window)).find_layer(background_id);
+  CHECK(background_model != nullptr &&
+        (patchy::layer_lock_flags(*background_model) & patchy::kLayerLockTransparentPixels) != 0U &&
+        (patchy::layer_lock_flags(*background_model) & patchy::kLayerLockPosition) != 0U);
+
+  const auto erase_point = canvas->widget_position_for_document_point(QPoint(90, 90));
+  drag(*canvas, erase_point, erase_point + QPoint(1, 1));
+  QApplication::processEvents();
+  CHECK(color_close(canvas_pixel(*canvas, QPoint(90, 90)), QColor(30, 140, 220), 3));
+  const auto& background_layer = patchy::ui::MainWindowTestAccess::document(window).layers().front();
+  CHECK(background_layer.name() == "Background" && background_layer.pixels().format().channels == 3);
+  save_widget_artifact("ui_background_eraser_background_color", window);
+}
+
+void ui_brush_and_eraser_remember_separate_settings() {
+  SettingsValueRestorer restore_brush_size(QStringLiteral("tools/brushSize"));
+  SettingsValueRestorer restore_brush_opacity(QStringLiteral("tools/brushOpacity"));
+  SettingsValueRestorer restore_brush_softness(QStringLiteral("tools/brushSoftness"));
+  SettingsValueRestorer restore_eraser_size(QStringLiteral("tools/eraserSize"));
+  SettingsValueRestorer restore_eraser_opacity(QStringLiteral("tools/eraserOpacity"));
+  SettingsValueRestorer restore_eraser_softness(QStringLiteral("tools/eraserSoftness"));
+
+  {
+    patchy::ui::MainWindow window;
+    show_window(window);
+    auto* canvas = require_canvas(window);
+    auto* size_spin = window.findChild<QSpinBox*>(QStringLiteral("brushSizeSpin"));
+    auto* opacity_spin = window.findChild<QSpinBox*>(QStringLiteral("brushOpacitySpin"));
+    auto* flow_spin = window.findChild<QSpinBox*>(QStringLiteral("brushFlowSpin"));
+    auto* airbrush_check = window.findChild<QCheckBox*>(QStringLiteral("brushAirbrushCheck"));
+    auto* softness_spin = window.findChild<QSpinBox*>(QStringLiteral("brushSoftnessSpin"));
+    CHECK(size_spin != nullptr);
+    CHECK(opacity_spin != nullptr);
+    CHECK(flow_spin != nullptr);
+    CHECK(airbrush_check != nullptr);
+    CHECK(softness_spin != nullptr);
+
+    require_action_by_text(window, QStringLiteral("Brush"))->trigger();
+    size_spin->setValue(31);
+    opacity_spin->setValue(81);
+    flow_spin->setValue(35);
+    airbrush_check->setChecked(true);
+    softness_spin->setValue(11);
+
+    require_action_by_text(window, QStringLiteral("Eraser"))->trigger();
+    size_spin->setValue(62);
+    opacity_spin->setValue(52);
+    flow_spin->setValue(65);
+    airbrush_check->setChecked(false);
+    softness_spin->setValue(92);
+    CHECK(canvas->brush_size() == 62);
+    CHECK(canvas->brush_opacity() == 52);
+    CHECK(canvas->brush_flow() == 65);
+    CHECK(!canvas->brush_build_up());
+    CHECK(canvas->brush_softness() == 92);
+
+    require_action_by_text(window, QStringLiteral("Brush"))->trigger();
+    CHECK(size_spin->value() == 31);
+    CHECK(opacity_spin->value() == 81);
+    CHECK(flow_spin->value() == 35);
+    CHECK(airbrush_check->isChecked());
+    CHECK(softness_spin->value() == 11);
+    CHECK(canvas->brush_size() == 31);
+    CHECK(canvas->brush_opacity() == 81);
+    CHECK(canvas->brush_flow() == 35);
+    CHECK(canvas->brush_build_up());
+    CHECK(canvas->brush_softness() == 11);
+
+    require_action_by_text(window, QStringLiteral("Clone"))->trigger();
+    CHECK(size_spin->value() == 31);
+    CHECK(canvas->brush_size() == 31);
+
+    require_action_by_text(window, QStringLiteral("Eraser"))->trigger();
+    CHECK(size_spin->value() == 62);
+    CHECK(opacity_spin->value() == 52);
+    CHECK(flow_spin->value() == 65);
+    CHECK(!airbrush_check->isChecked());
+    CHECK(softness_spin->value() == 92);
+    CHECK(canvas->brush_size() == 62);
+
+    patchy::Document second(64, 64, patchy::PixelFormat::rgb8());
+    second.add_pixel_layer("Background", solid_pixels(64, 64, patchy::PixelFormat::rgb8(), Qt::white));
+    window.add_document_session(std::move(second), QStringLiteral("Second"));
+    auto* second_canvas = require_canvas(window);
+    CHECK(second_canvas != canvas);
+    CHECK(second_canvas->brush_size() == 62);
+    CHECK(second_canvas->brush_flow() == 65);
+    CHECK(!second_canvas->brush_build_up());
+    size_spin->setValue(48);
+    auto* tabs = window.findChild<QTabWidget*>(QStringLiteral("documentTabs"));
+    CHECK(tabs != nullptr);
+    tabs->setCurrentIndex(0);
+    CHECK(require_canvas(window) == canvas);
+    CHECK(canvas->brush_size() == 48);
+    CHECK(size_spin->value() == 48);
+
+    require_action_by_text(window, QStringLiteral("Brush"))->trigger();
+    CHECK(canvas->brush_size() == 31);
+    CHECK(canvas->brush_flow() == 35);
+    CHECK(canvas->brush_build_up());
+  }
+
+  patchy::ui::MainWindow window;
+  show_window(window);
+  auto* canvas = require_canvas(window);
+  auto* size_spin = window.findChild<QSpinBox*>(QStringLiteral("brushSizeSpin"));
+  CHECK(size_spin != nullptr);
+  // A restart brings both sets back (GitHub issue 254): the last tool switch above
+  // saved the Brush values live and the Eraser's from its stash. The Eraser has no
+  // Flow or Airbrush of its own, so those come from the startup preset.
+  CHECK(canvas->tool() == patchy::ui::CanvasTool::Brush);
+  CHECK(canvas->brush_size() == 31);
+  CHECK(canvas->brush_opacity() == 81);
+  CHECK(canvas->brush_flow() == 35);
+  CHECK(canvas->brush_softness() == 11);
+  CHECK(canvas->brush_build_up());
+  require_action_by_text(window, QStringLiteral("Eraser"))->trigger();
+  CHECK(canvas->brush_size() == 48);
+  CHECK(canvas->brush_opacity() == 52);
+  CHECK(canvas->brush_flow() == 100);
+  CHECK(canvas->brush_softness() == 92);
+  CHECK(!canvas->brush_build_up());
+  CHECK(size_spin->value() == 48);
+}
+
+void ui_magic_wand_cursor_marks_click_hotspot() {
+  patchy::ui::MainWindow window;
+  show_window(window);
+  auto* canvas = require_canvas(window);
+
+  canvas->set_tool(patchy::ui::CanvasTool::MagicWand);
+  canvas->setFocus(Qt::OtherFocusReason);
+  QApplication::processEvents();
+  CHECK(canvas->tool() == patchy::ui::CanvasTool::MagicWand);
+  CHECK(canvas->cursor().shape() == Qt::BitmapCursor);
+  CHECK(canvas->cursor().hotSpot() == QPoint(6, 6));
+
+  send_key_press(*canvas, Qt::Key_Space);
+  CHECK(canvas->cursor().shape() == Qt::OpenHandCursor);
+  send_key_release(*canvas, Qt::Key_Space);
+  CHECK(canvas->cursor().shape() == Qt::BitmapCursor);
+  CHECK(canvas->cursor().hotSpot() == QPoint(6, 6));
+}
+
+void ui_spacebar_pan_works_from_layer_panel_but_not_text_entry() {
+  patchy::ui::MainWindow window;
+  show_window(window);
+  auto* canvas = require_canvas(window);
+  auto* layer_list = window.findChild<QListWidget*>(QStringLiteral("layerList"));
+  CHECK(layer_list != nullptr);
+  CHECK(layer_list->viewport() != nullptr);
+
+  layer_list->setFocus(Qt::OtherFocusReason);
+  QApplication::processEvents();
+  const auto origin_before_panel_drag = canvas->widget_position_for_document_point(QPoint(0, 0));
+
+  send_key_press(*layer_list, Qt::Key_Space);
+  CHECK(canvas->cursor().shape() == Qt::OpenHandCursor);
+  CHECK(QApplication::overrideCursor() != nullptr);
+  CHECK(QApplication::overrideCursor()->shape() == Qt::OpenHandCursor);
+
+  const auto panel_drag_start = layer_list->viewport()->rect().center();
+  const auto panel_drag_end = panel_drag_start + QPoint(42, 27);
+  send_mouse(*layer_list->viewport(), QEvent::MouseButtonPress, panel_drag_start, Qt::LeftButton, Qt::LeftButton);
+  CHECK(QApplication::overrideCursor() != nullptr);
+  CHECK(QApplication::overrideCursor()->shape() == Qt::ClosedHandCursor);
+  send_mouse(*layer_list->viewport(), QEvent::MouseMove, panel_drag_end, Qt::NoButton, Qt::LeftButton);
+  send_mouse(*layer_list->viewport(), QEvent::MouseButtonRelease, panel_drag_end, Qt::LeftButton, Qt::NoButton);
+
+  const auto origin_after_panel_drag = canvas->widget_position_for_document_point(QPoint(0, 0));
+  CHECK(origin_after_panel_drag.x() - origin_before_panel_drag.x() >= 30);
+  CHECK(origin_after_panel_drag.y() - origin_before_panel_drag.y() >= 18);
+  CHECK(QApplication::overrideCursor() != nullptr);
+  CHECK(QApplication::overrideCursor()->shape() == Qt::OpenHandCursor);
+  send_key_release(*layer_list, Qt::Key_Space);
+  CHECK(QApplication::overrideCursor() == nullptr);
+
+  require_action_by_text(window, QStringLiteral("Type"))->trigger();
+  const auto text_position = canvas->widget_position_for_document_point(QPoint(120, 120));
+  send_mouse(*canvas, QEvent::MouseButtonPress, text_position, Qt::LeftButton, Qt::LeftButton);
+  send_mouse(*canvas, QEvent::MouseButtonRelease, text_position, Qt::LeftButton, Qt::NoButton);
+  QApplication::processEvents();
+
+  auto* editor = canvas->findChild<QTextEdit*>(QStringLiteral("inlineTextEditor"));
+  CHECK(editor != nullptr);
+  editor->clear();
+  editor->setFocus(Qt::OtherFocusReason);
+  QApplication::processEvents();
+
+  const auto origin_before_text_space = canvas->widget_position_for_document_point(QPoint(0, 0));
+  QKeyEvent text_space_press(QEvent::KeyPress, Qt::Key_Space, Qt::NoModifier, QStringLiteral(" "));
+  QApplication::sendEvent(editor, &text_space_press);
+  QKeyEvent text_space_release(QEvent::KeyRelease, Qt::Key_Space, Qt::NoModifier, QStringLiteral(" "));
+  QApplication::sendEvent(editor, &text_space_release);
+  QApplication::processEvents();
+  CHECK(editor->toPlainText() == QStringLiteral(" "));
+  CHECK(canvas->widget_position_for_document_point(QPoint(0, 0)) == origin_before_text_space);
+  CHECK(QApplication::overrideCursor() == nullptr);
+
+  send_key(*editor, Qt::Key_Escape);
+}
+
+void ui_move_tool_after_text_edit_keeps_spacebar_pan_active() {
+  patchy::ui::MainWindow window;
+  show_window(window);
+  auto* canvas = require_canvas(window);
+
+  require_action_by_text(window, QStringLiteral("Type"))->trigger();
+  const auto text_position = canvas->widget_position_for_document_point(QPoint(120, 120));
+  send_mouse(*canvas, QEvent::MouseButtonPress, text_position, Qt::LeftButton, Qt::LeftButton);
+  send_mouse(*canvas, QEvent::MouseButtonRelease, text_position, Qt::LeftButton, Qt::NoButton);
+  QApplication::processEvents();
+
+  auto* editor = canvas->findChild<QTextEdit*>(QStringLiteral("inlineTextEditor"));
+  CHECK(editor != nullptr);
+  editor->setPlainText(QStringLiteral("Pan Focus"));
+  editor->setFocus(Qt::OtherFocusReason);
+  QApplication::processEvents();
+
+  // Transform-box hit zones (GitHub issue 176) would give a resize or rotate cursor when
+  // the pointer lands near the new text's box edge, which depends on font metrics and
+  // so differs between runs; this test is about focus and Space-pan, not those zones.
+  canvas->set_show_transform_controls(false);
+  require_action_by_text(window, QStringLiteral("Move"))->trigger();
+  QApplication::processEvents();
+  CHECK(canvas->findChild<QTextEdit*>(QStringLiteral("inlineTextEditor")) == nullptr);
+  CHECK(QApplication::focusWidget() == canvas);
+  // A Move-tool cursor, not the text I-beam. Which one depends on whether the
+  // pointer rests on the committed text's pixels (GitHub issue 170): the
+  // four-way cursor there, the arrow with a move badge elsewhere.
+  const auto move_cursor_image = [&] { return canvas->cursor().pixmap().toImage(); };
+  const auto move_shape = canvas->cursor().shape();
+  CHECK(move_shape == Qt::SizeAllCursor ||
+        (move_shape == Qt::BitmapCursor &&
+         move_cursor_image() == patchy::ui::move_pointer_cursor().pixmap().toImage()));
+  const auto move_image = move_cursor_image();
+
+  auto* focused = QApplication::focusWidget();
+  CHECK(focused == canvas);
+  send_key_press(*focused, Qt::Key_Space);
+  CHECK(canvas->cursor().shape() == Qt::OpenHandCursor);
+  send_key_release(*focused, Qt::Key_Space);
+  // Releasing Space brings back exactly the Move cursor shown before it.
+  CHECK(canvas->cursor().shape() == move_shape);
+  CHECK(move_cursor_image() == move_image);
+}
+
+void ui_spacebar_pan_works_while_child_dialog_focused() {
+  patchy::ui::MainWindow window;
+  show_window(window);
+  auto* canvas = require_canvas(window);
+
+  // A non-modal child dialog (layer style / adjustment / filter) is a separate
+  // top-level window. Holding Space while it holds focus should still pan the
+  // canvas behind it, without the user first having to click the canvas.
+  QDialog dialog(&window);
+  dialog.setObjectName(QStringLiteral("spacebarPanChildDialog"));
+  dialog.resize(240, 120);
+  auto* button = new QPushButton(QStringLiteral("Apply"), &dialog);
+  button->setGeometry(20, 12, 160, 32);
+  auto* text_field = new QLineEdit(&dialog);
+  text_field->setObjectName(QStringLiteral("spacebarPanChildDialogEdit"));
+  text_field->setGeometry(20, 60, 160, 32);
+  dialog.show();
+  dialog.raise();
+  QApplication::processEvents();
+
+  button->setFocus(Qt::OtherFocusReason);
+  QApplication::processEvents();
+  // The intra-app guard in the fix depends on the application staying active
+  // while focus moves between the dialog and the main window.
+  CHECK(QGuiApplication::applicationState() == Qt::ApplicationActive);
+
+  // Arm panning from the focused dialog button.
+  send_key_press(*button, Qt::Key_Space);
+  CHECK(QApplication::overrideCursor() != nullptr);
+  CHECK(QApplication::overrideCursor()->shape() == Qt::OpenHandCursor);
+
+  // Clicking the canvas deactivates the dialog window and activates the main
+  // window. That intra-app WindowDeactivate must NOT disarm the pan, otherwise
+  // the drag below never grabs the canvas.
+  QEvent dialog_deactivate(QEvent::WindowDeactivate);
+  QApplication::sendEvent(&dialog, &dialog_deactivate);
+  QApplication::processEvents();
+  CHECK(QApplication::overrideCursor() != nullptr);
+  CHECK(QApplication::overrideCursor()->shape() == Qt::OpenHandCursor);
+
+  // A single press-drag-release on the canvas pans it, with no re-arming.
+  const auto origin_before_drag = canvas->widget_position_for_document_point(QPoint(0, 0));
+  const auto canvas_drag_start = canvas->widget_position_for_document_point(QPoint(40, 40));
+  const auto canvas_drag_end = canvas_drag_start + QPoint(50, 34);
+  send_mouse(*canvas, QEvent::MouseButtonPress, canvas_drag_start, Qt::LeftButton, Qt::LeftButton);
+  CHECK(QApplication::overrideCursor() != nullptr);
+  CHECK(QApplication::overrideCursor()->shape() == Qt::ClosedHandCursor);
+  send_mouse(*canvas, QEvent::MouseMove, canvas_drag_end, Qt::NoButton, Qt::LeftButton);
+  send_mouse(*canvas, QEvent::MouseButtonRelease, canvas_drag_end, Qt::LeftButton, Qt::NoButton);
+
+  const auto origin_after_drag = canvas->widget_position_for_document_point(QPoint(0, 0));
+  CHECK(origin_after_drag.x() - origin_before_drag.x() >= 40);
+  CHECK(origin_after_drag.y() - origin_before_drag.y() >= 25);
+  CHECK(QApplication::overrideCursor() != nullptr);
+  CHECK(QApplication::overrideCursor()->shape() == Qt::OpenHandCursor);
+  send_key_release(*button, Qt::Key_Space);
+  CHECK(QApplication::overrideCursor() == nullptr);
+
+  // Space typed into a text field inside the same dialog must still type a
+  // space and never engage panning.
+  text_field->clear();
+  text_field->setFocus(Qt::OtherFocusReason);
+  QApplication::processEvents();
+  const auto origin_before_text_space = canvas->widget_position_for_document_point(QPoint(0, 0));
+  QKeyEvent text_space_press(QEvent::KeyPress, Qt::Key_Space, Qt::NoModifier, QStringLiteral(" "));
+  QApplication::sendEvent(text_field, &text_space_press);
+  QKeyEvent text_space_release(QEvent::KeyRelease, Qt::Key_Space, Qt::NoModifier, QStringLiteral(" "));
+  QApplication::sendEvent(text_field, &text_space_release);
+  QApplication::processEvents();
+  CHECK(text_field->text() == QStringLiteral(" "));
+  CHECK(canvas->widget_position_for_document_point(QPoint(0, 0)) == origin_before_text_space);
+  CHECK(QApplication::overrideCursor() == nullptr);
+}
+
+void ui_brush_smoothing_options_bar_round_trips_settings() {
+  SettingsValueRestorer restore_smoothing(QStringLiteral("tools/brushSmoothing"));
+  SettingsValueRestorer restore_pulled(QStringLiteral("tools/brushSmoothingPulledString"));
+  SettingsValueRestorer restore_catch_up(QStringLiteral("tools/brushSmoothingCatchUp"));
+  SettingsValueRestorer restore_catch_up_end(QStringLiteral("tools/brushSmoothingCatchUpEnd"));
+  SettingsValueRestorer restore_zoom_adjust(QStringLiteral("tools/brushSmoothingZoomAdjust"));
+  {
+    auto settings = patchy::ui::app_settings();
+    for (const auto* key :
+         {"tools/brushSmoothing", "tools/brushSmoothingPulledString", "tools/brushSmoothingCatchUp",
+          "tools/brushSmoothingCatchUpEnd", "tools/brushSmoothingZoomAdjust"}) {
+      settings.remove(QString::fromLatin1(key));
+    }
+    settings.sync();
+  }
+
+  patchy::ui::MainWindow window;
+  show_window(window);
+  auto* canvas = require_canvas(window);
+
+  require_action_by_text(window, QStringLiteral("Brush"))->trigger();
+  QApplication::processEvents();
+  auto* smoothing_spin = window.findChild<QSpinBox*>(QStringLiteral("brushSmoothingSpin"));
+  auto* gear = window.findChild<QToolButton*>(QStringLiteral("brushSmoothingOptionsButton"));
+  CHECK(smoothing_spin != nullptr);
+  CHECK(gear != nullptr);
+  if (smoothing_spin == nullptr || gear == nullptr) {
+    return;
+  }
+  CHECK(smoothing_spin->isVisible());
+  CHECK(gear->isVisible());
+  CHECK(smoothing_spin->value() == 0);
+  CHECK(canvas->brush_smoothing() == 0);
+
+  smoothing_spin->setValue(40);
+  QApplication::processEvents();
+  CHECK(canvas->brush_smoothing() == 40);
+
+  CHECK(gear->menu() != nullptr);
+  QAction* pulled_string = nullptr;
+  QAction* catch_up = nullptr;
+  QAction* catch_up_end = nullptr;
+  QAction* zoom_adjust = nullptr;
+  for (auto* action : gear->menu()->actions()) {
+    if (action->text() == QStringLiteral("Pulled String Mode")) {
+      pulled_string = action;
+    } else if (action->text() == QStringLiteral("Stroke Catch-up")) {
+      catch_up = action;
+    } else if (action->text() == QStringLiteral("Catch-up on Stroke End")) {
+      catch_up_end = action;
+    } else if (action->text() == QStringLiteral("Adjust for Zoom")) {
+      zoom_adjust = action;
+    }
+  }
+  CHECK(pulled_string != nullptr);
+  CHECK(catch_up != nullptr);
+  CHECK(catch_up_end != nullptr);
+  CHECK(zoom_adjust != nullptr);
+  if (pulled_string == nullptr || catch_up == nullptr || catch_up_end == nullptr ||
+      zoom_adjust == nullptr) {
+    return;
+  }
+  // Photoshop-parity defaults: pulled string off, both catch-ups on, zoom adjust on.
+  CHECK(!pulled_string->isChecked());
+  CHECK(catch_up->isChecked());
+  CHECK(catch_up_end->isChecked());
+  CHECK(zoom_adjust->isChecked());
+  CHECK(!canvas->brush_smoothing_pulled_string());
+  CHECK(canvas->brush_smoothing_catch_up());
+  CHECK(canvas->brush_smoothing_catch_up_end());
+  CHECK(canvas->brush_smoothing_zoom_adjust());
+
+  pulled_string->setChecked(true);
+  QApplication::processEvents();
+  CHECK(canvas->brush_smoothing_pulled_string());
+
+  // The controls follow the Mixer Brush and Eraser tools too, and hide for Smudge.
+  require_action_by_text(window, QStringLiteral("Mixer Brush"))->trigger();
+  QApplication::processEvents();
+  CHECK(smoothing_spin->isVisible());
+  CHECK(gear->isVisible());
+  require_action_by_text(window, QStringLiteral("Eraser"))->trigger();
+  QApplication::processEvents();
+  CHECK(smoothing_spin->isVisible());
+  CHECK(gear->isVisible());
+  require_action_by_text(window, QStringLiteral("Smudge"))->trigger();
+  QApplication::processEvents();
+  CHECK(!smoothing_spin->isVisible());
+  CHECK(!gear->isVisible());
+}
+
+// The Brush overlay (GitHub issue 517) lives in the Brush tool's gear: Show Outline (on) above
+// Show Overlay and its opacity (off at 100%) with no saved setting, reaching the canvas and
+// persisting. Overlay Opacity scrubs from its label and its field like every numeric option.
+// The Mixer Brush and the Eraser share the gear but not these, so their menu hides the entries.
+void ui_brush_overlay_gear_defaults_off_and_persists() {
+  SettingsValueRestorer restore_overlay(QStringLiteral("tools/brushOverlay"));
+  SettingsValueRestorer restore_opacity(QStringLiteral("tools/brushOverlayOpacity"));
+  SettingsValueRestorer restore_outline(QStringLiteral("tools/brushOutline"));
+  {
+    auto settings = patchy::ui::app_settings();
+    settings.remove(QStringLiteral("tools/brushOverlay"));
+    settings.remove(QStringLiteral("tools/brushOverlayOpacity"));
+    settings.remove(QStringLiteral("tools/brushOutline"));
+    settings.sync();
+  }
+  patchy::ui::MainWindow window;
+  show_window(window);
+  auto* canvas = require_canvas(window);
+  require_action_by_text(window, QStringLiteral("Brush"))->trigger();
+  QApplication::processEvents();
+  auto* gear = window.findChild<QToolButton*>(QStringLiteral("brushSmoothingOptionsButton"));
+  auto* outline = window.findChild<QAction*>(QStringLiteral("brushOutlineAction"));
+  auto* overlay = window.findChild<QAction*>(QStringLiteral("brushOverlayAction"));
+  auto* opacity_action = window.findChild<QAction*>(QStringLiteral("brushOverlayOpacityAction"));
+  auto* opacity = window.findChild<QSpinBox*>(QStringLiteral("brushOverlayOpacitySpin"));
+  CHECK(gear != nullptr && gear->menu() != nullptr && outline != nullptr && overlay != nullptr &&
+        opacity_action != nullptr && opacity != nullptr);
+  if (gear == nullptr || gear->menu() == nullptr || outline == nullptr || overlay == nullptr ||
+      opacity_action == nullptr || opacity == nullptr) {
+    return;
+  }
+  auto* menu = gear->menu();
+  const auto actions = menu->actions();
+  CHECK(actions.contains(outline) && actions.contains(overlay) && actions.contains(opacity_action));
+  CHECK(actions.indexOf(outline) + 1 == actions.indexOf(overlay));  // Show Outline sits above Show Overlay
+  CHECK(canvas->brush_outline_shown());
+  CHECK(!canvas->brush_overlay_shown());
+  CHECK(canvas->brush_overlay_opacity() == 100);
+  menu->popup(gear->mapToGlobal(QPoint(0, gear->height())));
+  QApplication::processEvents();
+  CHECK(outline->isVisible() && overlay->isVisible() && opacity_action->isVisible());
+  CHECK(outline->isCheckable() && outline->isChecked());
+  CHECK(overlay->isCheckable() && !overlay->isChecked());
+  CHECK(opacity->value() == 100);
+  CHECK(!opacity->isEnabled());  // nothing to fade while the overlay is off
+
+  overlay->setChecked(true);
+  QApplication::processEvents();
+  CHECK(canvas->brush_overlay_shown());
+  CHECK(opacity->isEnabled());
+  opacity->setValue(40);
+  CHECK(canvas->brush_overlay_opacity() == 40);
+
+  // Overlay Opacity scrubs: a drag on its label, then on its field.
+  CHECK(opacity->property(patchy::ui::kScrubHandleInstalledProperty).toBool());
+  QLabel* opacity_label = nullptr;
+  for (auto* label : menu->findChildren<QLabel*>()) {
+    if (label->buddy() == opacity) {
+      opacity_label = label;
+    }
+  }
+  CHECK(opacity_label != nullptr);
+  const int drag_start = QApplication::startDragDistance();
+  const auto scrub = [&](QWidget& handle, int dx) {
+    const auto origin = handle.rect().center();
+    send_mouse(handle, QEvent::MouseButtonPress, origin, Qt::LeftButton, Qt::LeftButton);
+    send_mouse(handle, QEvent::MouseMove, origin + QPoint(dx, 0), Qt::NoButton, Qt::LeftButton);
+    send_mouse(handle, QEvent::MouseButtonRelease, origin + QPoint(dx, 0), Qt::LeftButton, Qt::NoButton);
+    QApplication::processEvents();
+  };
+  if (opacity_label != nullptr) {
+    CHECK(opacity_label->cursor().shape() == Qt::SizeHorCursor);
+    scrub(*opacity_label, drag_start + 10);
+    CHECK(opacity->value() == 40 + drag_start + 10);
+    CHECK(canvas->brush_overlay_opacity() == opacity->value());
+  }
+  if (auto* editor = opacity->findChild<QLineEdit*>(); editor != nullptr) {
+    opacity->setValue(40);
+    scrub(*editor, -(drag_start + 10));
+    CHECK(opacity->value() == 40 - drag_start - 10);
+    CHECK(canvas->brush_overlay_opacity() == opacity->value());
+  } else {
+    CHECK(false);
+  }
+  opacity->setValue(40);
+  CHECK(canvas->brush_overlay_opacity() == 40);
+
+  outline->setChecked(false);
+  QApplication::processEvents();
+  CHECK(!canvas->brush_outline_shown());
+  menu->popup(gear->mapToGlobal(QPoint(0, gear->height())));
+  QApplication::processEvents();
+  save_window_popup_artifact("issue517_brush_overlay_gear", window, *gear, *menu);
+  menu->close();
+  QApplication::processEvents();
+  patchy::ui::MainWindowTestAccess::save_tool_settings(window);
+  {
+    auto settings = patchy::ui::app_settings();
+    CHECK(settings.value(QStringLiteral("tools/brushOverlay")).toBool());
+    CHECK(settings.value(QStringLiteral("tools/brushOverlayOpacity")).toInt() == 40);
+    CHECK(!settings.value(QStringLiteral("tools/brushOutline"), true).toBool());
+  }
+
+  for (const auto* tool_name : {"Mixer Brush", "Eraser"}) {
+    require_action_by_text(window, QString::fromLatin1(tool_name))->trigger();
+    QApplication::processEvents();
+    menu->popup(gear->mapToGlobal(QPoint(0, gear->height())));
+    QApplication::processEvents();
+    CHECK(!outline->isVisible() && !overlay->isVisible() && !opacity_action->isVisible());
+    menu->close();
+    QApplication::processEvents();
+  }
+
+  // A new window reads the saved choice back.
+  patchy::ui::MainWindow reopened;
+  show_window(reopened);
+  auto* reopened_canvas = require_canvas(reopened);
+  CHECK(reopened_canvas->brush_overlay_shown());
+  CHECK(reopened_canvas->brush_overlay_opacity() == 40);
+  CHECK(!reopened_canvas->brush_outline_shown());
+}
+
+// Show Outline off (GitHub issue 517 follow-up): the Brush tool's pointer is the small center
+// cross at every size (GitHub issue 533 follow-up) instead of the outline cursor, and a brush
+// too large for an OS cursor draws no canvas outline. The Eraser keeps its outline; turning the
+// option back on restores both.
+void ui_brush_overlay_show_outline_off_removes_outline() {
+  patchy::Document document(400, 300, patchy::PixelFormat::rgba8());
+  document.add_pixel_layer("Paper", solid_pixels(400, 300, patchy::PixelFormat::rgba8(), QColor(Qt::white)));
+  patchy::ui::CanvasWidget canvas;
+  canvas.resize(600, 420);
+  canvas.set_document(&document);
+  canvas.set_tool(patchy::ui::CanvasTool::Brush);
+  canvas.set_zoom(1.0);
+  canvas.set_brush_softness(0);
+  canvas.set_brush_size(20);
+  canvas.show();
+  QApplication::processEvents();
+  const auto hover = canvas.widget_position_for_document_point(QPoint(200, 150));
+  send_mouse(canvas, QEvent::MouseMove, hover, Qt::NoButton, Qt::NoButton);
+  QApplication::processEvents();
+  CHECK(canvas.brush_outline_shown());
+  CHECK(canvas.cursor().shape() == Qt::BitmapCursor);  // the outline cursor
+
+  canvas.set_brush_outline_shown(false);
+  CHECK(patchy::ui::brush_center_cross_cursor_shown(canvas.cursor()));
+  canvas.set_tool(patchy::ui::CanvasTool::Eraser);
+  CHECK(canvas.cursor().shape() == Qt::BitmapCursor);  // only the Brush follows the option
+  canvas.set_tool(patchy::ui::CanvasTool::Brush);
+  CHECK(patchy::ui::brush_center_cross_cursor_shown(canvas.cursor()));
+
+  // A 200 px brush outgrows the OS cursor: its outline is drawn on the canvas.
+  canvas.set_brush_size(200);
+  const auto darkest_on_rim = [&canvas, hover] {
+    send_mouse(canvas, QEvent::MouseMove, hover, Qt::NoButton, Qt::NoButton);
+    QApplication::processEvents();
+    const auto image = canvas.grab().toImage();
+    int darkest = 255;
+    for (int dx = 95; dx <= 105; ++dx) {
+      darkest = std::min(darkest, image.pixelColor(hover + QPoint(dx, 0)).red());
+    }
+    return darkest;
+  };
+  CHECK(patchy::ui::brush_center_cross_cursor_shown(canvas.cursor()));
+  CHECK(darkest_on_rim() > 240);
+  canvas.set_brush_outline_shown(true);
+  CHECK(patchy::ui::brush_center_cross_cursor_shown(canvas.cursor()));  // outline on the canvas
+  CHECK(darkest_on_rim() < 200);
+}
+
+// The gear's Overlay Opacity label starts at the same x as the menu's item text (GitHub issue
+// 517 follow-up), in both schemes: the first ink of "Overlay Opacity:" and of the unchecked
+// "Show Overlay" item, each less its first glyph's left bearing, agree within a pixel.
+void ui_brush_overlay_opacity_label_aligns_with_item_text() {
+  for (const auto scheme : {patchy::ui::ColorSchemePreference::Dark, patchy::ui::ColorSchemePreference::Light}) {
+    ColorSchemeRestorer restore_scheme(scheme);
+    SettingsValueRestorer restore_overlay(QStringLiteral("tools/brushOverlay"));
+    patchy::ui::MainWindow window;
+    show_window(window);
+    require_action_by_text(window, QStringLiteral("Brush"))->trigger();
+    QApplication::processEvents();
+    auto* gear = window.findChild<QToolButton*>(QStringLiteral("brushSmoothingOptionsButton"));
+    auto* overlay = window.findChild<QAction*>(QStringLiteral("brushOverlayAction"));
+    auto* opacity = window.findChild<QSpinBox*>(QStringLiteral("brushOverlayOpacitySpin"));
+    CHECK(gear != nullptr && gear->menu() != nullptr && overlay != nullptr && opacity != nullptr);
+    if (gear == nullptr || gear->menu() == nullptr || overlay == nullptr || opacity == nullptr) {
+      return;
+    }
+    overlay->setChecked(false);  // no check mark left of the reference text
+    auto* menu = gear->menu();
+    QLabel* label = nullptr;
+    for (auto* candidate : menu->findChildren<QLabel*>()) {
+      if (candidate->buddy() == opacity) {
+        label = candidate;
+      }
+    }
+    CHECK(label != nullptr);
+    if (label == nullptr) {
+      return;
+    }
+    menu->popup(gear->mapToGlobal(QPoint(0, gear->height())));
+    QApplication::processEvents();
+    const auto image = menu->grab().toImage();
+    // The first column, from just inside the menu border, whose pixels in [top, bottom) differ
+    // from the row's own background (sampled at the menu's right end).
+    const auto first_ink = [&image, menu](int top, int bottom, int right) {
+      const auto background = image.pixelColor(menu->width() - 4, (top + bottom) / 2);
+      for (int x = 2; x < right; ++x) {
+        for (int y = top; y < bottom; ++y) {
+          const auto color = image.pixelColor(x, y);
+          if (std::abs(color.red() - background.red()) + std::abs(color.green() - background.green()) +
+                  std::abs(color.blue() - background.blue()) >
+              24) {
+            return x;
+          }
+        }
+      }
+      return -1;
+    };
+    const auto item = menu->actionGeometry(overlay);
+    const auto label_rect = QRect(label->mapTo(menu, QPoint(0, 0)), label->size());
+    const auto item_ink = first_ink(item.top() + 1, item.bottom(), item.center().x());
+    const auto label_ink = first_ink(label_rect.top(), label_rect.bottom() + 1, label_rect.right());
+    CHECK(item_ink > 0 && label_ink > 0);
+    const auto item_pen = item_ink - menu->fontMetrics().leftBearing(overlay->text().front());
+    const auto label_pen = label_ink - label->fontMetrics().leftBearing(label->text().front());
+    CHECK(std::abs(item_pen - label_pen) <= 1);
+    if (scheme == patchy::ui::ColorSchemePreference::Dark) {
+      save_window_popup_artifact("issue517_brush_gear_aligned", window, *gear, *menu);
+    }
+    menu->close();
+    QApplication::processEvents();
+  }
+}
+
+// The gear's Overlay Opacity row sits on the menu's own background in both schemes (GitHub
+// issue 517 follow-up: the row painted the darker window background).
+void ui_brush_overlay_opacity_row_matches_menu_background() {
+  for (const auto scheme : {patchy::ui::ColorSchemePreference::Dark, patchy::ui::ColorSchemePreference::Light}) {
+    ColorSchemeRestorer restore_scheme(scheme);
+    patchy::ui::MainWindow window;
+    show_window(window);
+    require_action_by_text(window, QStringLiteral("Brush"))->trigger();
+    QApplication::processEvents();
+    auto* gear = window.findChild<QToolButton*>(QStringLiteral("brushSmoothingOptionsButton"));
+    auto* row = window.findChild<QWidget*>(QStringLiteral("brushOverlayOpacityRow"));
+    auto* outline = window.findChild<QAction*>(QStringLiteral("brushOutlineAction"));
+    CHECK(gear != nullptr && gear->menu() != nullptr && row != nullptr && outline != nullptr);
+    if (gear == nullptr || gear->menu() == nullptr || row == nullptr || outline == nullptr) {
+      return;
+    }
+    auto* menu = gear->menu();
+    menu->popup(gear->mapToGlobal(QPoint(0, gear->height())));
+    QApplication::processEvents();
+    const auto image = menu->grab().toImage();
+    // The empty right end of the row and of the Show Outline item (its check mark is at the left).
+    const auto row_point = QPoint(menu->width() - 8, row->mapTo(menu, QPoint(0, row->height() / 2)).y());
+    const auto item_point = QPoint(row_point.x(), menu->actionGeometry(outline).center().y());
+    CHECK(image.pixelColor(row_point) == image.pixelColor(item_point));
+    menu->close();
+    QApplication::processEvents();
+  }
+}
+
+// With the overlay on, the canvas shows one dab of the current tip under the hovered Brush in
+// the foreground color at the overlay opacity: the footprint's shape (Round, Square, a sampled
+// tip) and nothing outside it. Off, on another tool, or in the document, nothing changes.
+void ui_brush_overlay_draws_dab_in_foreground_color() {
+  patchy::Document document(120, 80, patchy::PixelFormat::rgba8());
+  auto& layer =
+      document.add_pixel_layer("Paper", solid_pixels(120, 80, patchy::PixelFormat::rgba8(), QColor(Qt::white)));
+  const auto original_bytes = std::as_const(layer).pixels().data();
+  const std::vector<std::uint8_t> original(original_bytes.begin(), original_bytes.end());
+  patchy::ui::CanvasWidget canvas;
+  canvas.resize(400, 260);
+  canvas.set_document(&document);
+  canvas.set_tool(patchy::ui::CanvasTool::Brush);
+  canvas.set_zoom(2.0);
+  canvas.set_primary_color(QColor(220, 30, 40));
+  canvas.set_brush_size(20);
+  canvas.set_brush_softness(0);
+  canvas.show();
+  QApplication::processEvents();
+  const QPoint hover_doc(60, 40);
+  const auto hover = canvas.widget_position_for_document_point(hover_doc) + QPoint(1, 1);
+  const auto pixel = [&canvas, hover](QPoint document_point) {
+    send_mouse(canvas, QEvent::MouseMove, hover, Qt::NoButton, Qt::NoButton);
+    QApplication::processEvents();
+    return canvas.grab().toImage().pixelColor(canvas.widget_position_for_document_point(document_point) +
+                                              QPoint(1, 1));
+  };
+  const QColor red(220, 30, 40);
+  const QColor white(Qt::white);
+  CHECK(!canvas.brush_overlay_shown());
+  CHECK(color_close(pixel(hover_doc), white, 6));
+
+  canvas.set_brush_overlay_shown(true);
+  CHECK(color_close(pixel(hover_doc), red, 6));
+  CHECK(color_close(pixel(hover_doc + QPoint(8, 0)), red, 6));
+  CHECK(color_close(pixel(hover_doc + QPoint(13, 0)), white, 6));
+  CHECK(color_close(pixel(hover_doc + QPoint(8, 8)), white, 6));  // past the round edge
+
+  canvas.set_brush_shape(patchy::BrushShape::Square);
+  CHECK(color_close(pixel(hover_doc + QPoint(8, 8)), red, 6));  // the square's corner
+  canvas.set_brush_shape(patchy::BrushShape::Round);
+
+  canvas.set_brush_overlay_opacity(50);
+  const auto half = pixel(hover_doc);
+  CHECK(half.red() > 225 && half.green() > 115 && half.green() < 170 && half.blue() > 120 && half.blue() < 175);
+  canvas.set_brush_overlay_opacity(100);
+
+  // The foreground color follows at once.
+  canvas.set_primary_color(QColor(20, 60, 200));
+  CHECK(color_close(pixel(hover_doc), QColor(20, 60, 200), 6));
+
+  // A sampled tip: its left half paints, its right half does not.
+  auto tip = std::make_shared<patchy::BrushTip>();
+  tip->width = 20;
+  tip->height = 20;
+  tip->mask.assign(400, std::uint8_t{0});
+  for (int y = 0; y < 20; ++y) {
+    for (int x = 0; x < 10; ++x) {
+      tip->mask[static_cast<std::size_t>(y) * 20 + x] = 255;
+    }
+  }
+  canvas.set_brush_tip(tip, QStringLiteral("test.half"));
+  CHECK(color_close(pixel(hover_doc + QPoint(-5, 0)), QColor(20, 60, 200), 10));
+  CHECK(color_close(pixel(hover_doc + QPoint(5, 0)), white, 10));
+  canvas.set_brush_tip(nullptr, QString());
+
+  canvas.set_tool(patchy::ui::CanvasTool::Eraser);
+  CHECK(color_close(pixel(hover_doc), white, 6));
+  canvas.set_tool(patchy::ui::CanvasTool::Brush);
+  CHECK(color_close(pixel(hover_doc), QColor(20, 60, 200), 6));
+  // The preview never paints.
+  CHECK(std::ranges::equal(std::as_const(layer).pixels().data(), original));
+
+  // The issue shot: a soft orange brush over a striped sheet at 200%.
+  patchy::Document sheet(200, 120, patchy::PixelFormat::rgba8());
+  auto stripes = solid_pixels(200, 120, patchy::PixelFormat::rgba8(), QColor(236, 236, 230));
+  for (int x = 0; x < 200; x += 40) {
+    fill_pixel_rect(stripes, QRect(x, 0, 20, 120), QColor(70, 110, 160));
+  }
+  sheet.add_pixel_layer("Stripes", std::move(stripes));
+  patchy::ui::CanvasWidget shot;
+  shot.resize(420, 260);
+  shot.set_document(&sheet);
+  shot.set_tool(patchy::ui::CanvasTool::Brush);
+  shot.set_zoom(2.0);
+  shot.set_primary_color(QColor(245, 140, 30));
+  shot.set_brush_size(70);
+  shot.set_brush_softness(60);
+  shot.set_brush_overlay_shown(true);
+  shot.show();
+  QApplication::processEvents();
+  send_mouse(shot, QEvent::MouseMove, shot.widget_position_for_document_point(QPoint(100, 60)), Qt::NoButton,
+             Qt::NoButton);
+  QApplication::processEvents();
+  save_widget_artifact("issue517_brush_overlay", shot);
+}
+
+// The overlay shows exactly the pixels a click paints, down to a 1 px brush: sizes 1 to 4, Round
+// and Square, Soft, a flat rotated footprint and a small sampled tip, at 800% and 3200%. A 1 px
+// Square once filled its whole 7 x 7 reach (the radius-0 square has coverage 1 at any offset,
+// since paint_brush_dab trims that dab to one pixel itself). Below 100% the overlay stays within
+// the dab's few screen pixels and still shows.
+void ui_brush_overlay_small_dabs_match_painted_footprint() {
+  struct Case {
+    int size;
+    patchy::BrushShape shape;
+    int softness;
+    int roundness;
+    double angle;
+    bool tip;
+  };
+  const auto round = patchy::BrushShape::Round;
+  const auto square = patchy::BrushShape::Square;
+  const std::vector<Case> cases = {
+      {1, square, 0, 100, 0.0, false}, {1, round, 0, 100, 0.0, false},  {1, square, 50, 100, 0.0, false},
+      {1, round, 50, 100, 0.0, false}, {2, square, 0, 100, 0.0, false}, {2, round, 0, 100, 0.0, false},
+      {3, square, 0, 100, 0.0, false}, {3, round, 0, 100, 0.0, false},  {3, round, 60, 100, 0.0, false},
+      {4, square, 0, 50, 30.0, false}, {4, round, 0, 40, 45.0, false},  {4, square, 40, 100, 0.0, false},
+      {1, round, 0, 100, 0.0, true},   {3, round, 0, 100, 0.0, true},
+  };
+  auto tip = std::make_shared<patchy::BrushTip>();
+  tip->width = 3;
+  tip->height = 3;
+  tip->mask = {255, 255, 255, 255, 0, 0, 255, 0, 0};  // an L
+  const auto configure = [&tip](patchy::ui::CanvasWidget& canvas, const Case& c) {
+    canvas.set_tool(patchy::ui::CanvasTool::Brush);
+    canvas.set_primary_color(Qt::black);
+    canvas.set_brush_opacity(100);
+    canvas.set_brush_outline_shown(false);
+    canvas.set_brush_size(c.size);
+    canvas.set_brush_softness(c.softness);
+    canvas.set_brush_shape(c.shape);
+    canvas.set_brush_base_shape(c.angle, c.roundness);
+    if (c.tip) {
+      canvas.set_brush_tip(tip, QStringLiteral("test.tiny"));
+    }
+    canvas.set_brush_overlay_shown(true);
+    canvas.set_brush_overlay_opacity(100);
+  };
+  for (const auto zoom : {8, 32}) {
+    for (const auto& c : cases) {
+      patchy::Document document(15, 15, patchy::PixelFormat::rgba8());
+      const auto layer_id =
+          document.add_pixel_layer("Paper", solid_pixels(15, 15, patchy::PixelFormat::rgba8(), QColor(Qt::white)))
+              .id();
+      patchy::ui::CanvasWidget canvas;
+      canvas.resize(640, 640);
+      canvas.set_document(&document);
+      canvas.set_zoom(static_cast<double>(zoom));
+      configure(canvas, c);
+      canvas.show();
+      QApplication::processEvents();
+      const QPoint hover_doc(7, 7);
+      const auto center_of = [&canvas, zoom](QPoint document_point) {
+        return canvas.widget_position_for_document_point(document_point) + QPoint(zoom / 2, zoom / 2);
+      };
+      const auto hover = center_of(hover_doc);
+      send_mouse(canvas, QEvent::MouseMove, hover, Qt::NoButton, Qt::NoButton);
+      QApplication::processEvents();
+      const auto overlay = canvas.grab().toImage();
+      if (zoom == 8 && c.size == 1 && c.shape == square && c.softness == 0) {
+        const auto corner = canvas.widget_position_for_document_point(hover_doc - QPoint(5, 5));
+        save_image_artifact("brush_overlay_1px_square_800", overlay.copy(QRect(corner, QSize(11 * zoom, 11 * zoom))));
+      }
+      send_mouse(canvas, QEvent::MouseButtonPress, hover, Qt::LeftButton, Qt::LeftButton);
+      send_mouse(canvas, QEvent::MouseButtonRelease, hover, Qt::LeftButton, Qt::NoButton);
+      QApplication::processEvents();
+      const auto& pixels = std::as_const(*document.find_layer(layer_id)).pixels();
+      int worst = 0;
+      int painted = 0;
+      int shown = 0;
+      for (int y = 2; y <= 12; ++y) {
+        for (int x = 2; x <= 12; ++x) {
+          const auto overlay_red = overlay.pixelColor(center_of(QPoint(x, y))).red();
+          const auto painted_red = static_cast<int>(pixels.pixel(x, y)[0]);
+          worst = std::max(worst, std::abs(overlay_red - painted_red));
+          painted += painted_red < 250 ? 1 : 0;
+          shown += overlay_red < 250 ? 1 : 0;
+        }
+      }
+      if (worst > 6) {
+        std::cerr << "overlay footprint differs: zoom " << zoom << " size " << c.size << " shape "
+                  << static_cast<int>(c.shape) << " soft " << c.softness << " roundness " << c.roundness
+                  << " tip " << c.tip << ": worst " << worst << ", painted " << painted << ", shown " << shown
+                  << '\n';
+      }
+      CHECK(painted > 0);
+      CHECK(worst <= 6);
+    }
+  }
+
+  // Below 100% the overlay is drawn at screen resolution: a few screen pixels at most, never none.
+  for (const auto& c : cases) {
+    patchy::Document document(64, 64, patchy::PixelFormat::rgba8());
+    document.add_pixel_layer("Paper", solid_pixels(64, 64, patchy::PixelFormat::rgba8(), QColor(Qt::white)));
+    patchy::ui::CanvasWidget canvas;
+    canvas.resize(200, 200);
+    canvas.set_document(&document);
+    canvas.set_zoom(0.5);
+    configure(canvas, c);
+    canvas.show();
+    QApplication::processEvents();
+    const auto hover = canvas.widget_position_for_document_point(QPoint(32, 32));
+    send_mouse(canvas, QEvent::MouseMove, hover, Qt::NoButton, Qt::NoButton);
+    QApplication::processEvents();
+    const auto image = canvas.grab().toImage();
+    int shown = 0;
+    for (int y = hover.y() - 8; y <= hover.y() + 8; ++y) {
+      for (int x = hover.x() - 8; x <= hover.x() + 8; ++x) {
+        shown += image.pixelColor(x, y).red() < 250 ? 1 : 0;
+      }
+    }
+    const auto reach = (c.size + 1) / 2 + 1;
+    if (shown < 1 || shown > reach * reach) {
+      std::cerr << "overlay at 50%: size " << c.size << " shape " << static_cast<int>(c.shape) << " soft "
+                << c.softness << " tip " << c.tip << ": " << shown << " screen pixels\n";
+    }
+    CHECK(shown >= 1);
+    CHECK(shown <= reach * reach);
+  }
+}
+
+// A drag stroke lands where the click dab does: centered on the pointer (the press paints the
+// pixel under it, centered on that pixel). Drag points once kept the pointer's document position
+// while the core brushes measure coverage from pixel indices, so every drag dab sat half a pixel
+// down-right of the click dab. Brush (hard Round sizes 2 to 4, Square, Soft) and Eraser.
+void ui_brush_drag_dabs_center_on_pointer() {
+  struct Case {
+    patchy::ui::CanvasTool tool;
+    int size;
+    patchy::BrushShape shape;
+    int softness;
+  };
+  const std::vector<Case> cases = {
+      {patchy::ui::CanvasTool::Brush, 3, patchy::BrushShape::Round, 0},
+      {patchy::ui::CanvasTool::Brush, 2, patchy::BrushShape::Round, 0},
+      {patchy::ui::CanvasTool::Brush, 4, patchy::BrushShape::Round, 0},
+      {patchy::ui::CanvasTool::Brush, 3, patchy::BrushShape::Square, 0},
+      {patchy::ui::CanvasTool::Brush, 7, patchy::BrushShape::Round, 50},
+      {patchy::ui::CanvasTool::Eraser, 3, patchy::BrushShape::Round, 0},
+  };
+  for (const auto& c : cases) {
+    const auto erase = c.tool == patchy::ui::CanvasTool::Eraser;
+    patchy::Document document(48, 24, patchy::PixelFormat::rgba8());
+    const auto layer_id = document
+                              .add_pixel_layer("Paper", solid_pixels(48, 24, patchy::PixelFormat::rgba8(),
+                                                                     erase ? QColor(Qt::black) : QColor(Qt::white)))
+                              .id();
+    patchy::ui::CanvasWidget canvas;
+    canvas.resize(460, 260);
+    canvas.set_document(&document);
+    canvas.set_zoom(8.0);
+    canvas.set_tool(c.tool);
+    canvas.set_primary_color(Qt::black);
+    canvas.set_brush_opacity(100);
+    canvas.set_brush_size(c.size);
+    canvas.set_brush_softness(c.softness);
+    canvas.set_brush_shape(c.shape);
+    canvas.show();
+    QApplication::processEvents();
+    const auto center_of = [&canvas](QPoint document_point) {
+      return canvas.widget_position_for_document_point(document_point) + QPoint(4, 4);
+    };
+    constexpr int kRow = 12;
+    send_mouse(canvas, QEvent::MouseButtonPress, center_of(QPoint(8, kRow)), Qt::LeftButton, Qt::LeftButton);
+    for (int x = 9; x <= 40; ++x) {
+      send_mouse(canvas, QEvent::MouseMove, center_of(QPoint(x, kRow)), Qt::NoButton, Qt::LeftButton);
+    }
+    send_mouse(canvas, QEvent::MouseButtonRelease, center_of(QPoint(40, kRow)), Qt::LeftButton, Qt::NoButton);
+    QApplication::processEvents();
+    if (c.tool == patchy::ui::CanvasTool::Brush && c.size == 3 && c.shape == patchy::BrushShape::Round) {
+      // The press dab at the left end, the dragged band to its right.
+      const auto corner = canvas.widget_position_for_document_point(QPoint(4, kRow - 4));
+      save_image_artifact("brush_drag_size3_800", canvas.grab().toImage().copy(QRect(corner, QSize(14 * 8, 9 * 8))));
+    }
+    const auto& pixels = std::as_const(*document.find_layer(layer_id)).pixels();
+    const auto change = [&pixels, erase](int y) {
+      const auto* px = pixels.pixel(24, y);
+      return erase ? 255 - static_cast<int>(px[3]) : 255 - static_cast<int>(px[0]);
+    };
+    int solid_rows = 0;
+    int worst = 0;
+    for (int k = 1; k <= 6; ++k) {
+      worst = std::max(worst, std::abs(change(kRow - k) - change(kRow + k)));
+    }
+    for (int y = kRow - 6; y <= kRow + 6; ++y) {
+      solid_rows += change(y) > 128 ? 1 : 0;
+    }
+    if (worst > 12) {
+      std::cerr << "drag band off center: tool " << static_cast<int>(c.tool) << " size " << c.size << " shape "
+                << static_cast<int>(c.shape) << " soft " << c.softness << ": worst " << worst << '\n';
+    }
+    CHECK(change(kRow) > 200);
+    CHECK(worst <= 12);
+    if (c.softness == 0) {
+      CHECK(solid_rows == 2 * (c.size / 2) + 1);
+    }
+  }
+}
+
+void ui_brush_smoothing_pulled_string_short_drag_paints_only_press_dab() {
+  patchy::Document document(200, 120, patchy::PixelFormat::rgba8());
+  document.add_pixel_layer("Paint",
+                           solid_pixels(200, 120, patchy::PixelFormat::rgba8(), QColor(Qt::white)));
+
+  patchy::ui::CanvasWidget canvas;
+  canvas.resize(400, 260);
+  canvas.set_document(&document);
+  canvas.set_tool(patchy::ui::CanvasTool::Brush);
+  canvas.set_zoom(1.0);
+  canvas.set_primary_color(Qt::black);
+  canvas.set_brush_size(8);
+  canvas.set_brush_opacity(100);
+  canvas.set_brush_softness(0);
+  canvas.set_brush_smoothing(60);
+  canvas.set_brush_smoothing_pulled_string(true);
+  canvas.set_brush_smoothing_catch_up_end(false);
+  canvas.show();
+  QApplication::processEvents();
+
+  const QPoint press_doc(60, 60);
+  const QPoint release_doc(90, 60);  // 30 px of drag, well inside the 60 px leash
+  drag_document_path(canvas, {press_doc, release_doc}, 6);
+  QApplication::processEvents();
+
+  // The press dab lands at the press point; the slack drag never paints and
+  // without Catch-up on Stroke End the release point stays untouched.
+  CHECK(canvas_pixel(canvas, press_doc).red() < 40);
+  CHECK(color_close(canvas_pixel(canvas, release_doc), QColor(Qt::white), 8));
+  CHECK(color_close(canvas_pixel(canvas, QPoint(75, 60)), QColor(Qt::white), 8));
+}
+
+void ui_brush_smoothing_catch_up_on_end_completes_stroke() {
+  patchy::Document document(200, 120, patchy::PixelFormat::rgba8());
+  document.add_pixel_layer("Paint",
+                           solid_pixels(200, 120, patchy::PixelFormat::rgba8(), QColor(Qt::white)));
+
+  patchy::ui::CanvasWidget canvas;
+  canvas.resize(400, 260);
+  canvas.set_document(&document);
+  canvas.set_tool(patchy::ui::CanvasTool::Brush);
+  canvas.set_zoom(1.0);
+  canvas.set_primary_color(Qt::black);
+  canvas.set_brush_size(8);
+  canvas.set_brush_opacity(100);
+  canvas.set_brush_softness(0);
+  canvas.set_brush_smoothing(60);
+  canvas.set_brush_smoothing_pulled_string(true);
+  canvas.set_brush_smoothing_catch_up_end(true);
+  canvas.show();
+  QApplication::processEvents();
+
+  const QPoint press_doc(60, 60);
+  const QPoint release_doc(90, 60);
+  drag_document_path(canvas, {press_doc, release_doc}, 6);
+  QApplication::processEvents();
+
+  // Catch-up on Stroke End releases at the raw pointer: the closing segment
+  // carries the paint from the press point all the way to the release point.
+  CHECK(canvas_pixel(canvas, press_doc).red() < 40);
+  CHECK(canvas_pixel(canvas, QPoint(75, 60)).red() < 40);
+  CHECK(canvas_pixel(canvas, release_doc).red() < 40);
+}
+
+
+// local-040: a 1 px Brush drag paints a continuous line on a new transparent layer and on an
+// opaque one, at Flow under 100 too. The dab-spaced path (Flow, Airbrush) puts slanted dabs
+// between pixel indices, and a 1 px dab used to paint only when it landed exactly on one, so
+// the line stopped after a few pixels while 2 px strokes were fine.
+void ui_brush_one_pixel_slanted_drag_stays_continuous() {
+  struct Case {
+    int flow;
+    bool new_layer;
+    double zoom;
+    QSize document_size;
+    QPoint from;
+    QPoint to;
+    const char* artifact;
+  };
+  const std::vector<Case> cases{
+      {90, true, 8.0, QSize(48, 24), QPoint(3, 3), QPoint(44, 20), "local040_one_pixel_flow90_stroke_800"},
+      {90, true, 1.0, QSize(160, 80), QPoint(20, 20), QPoint(140, 62), nullptr},
+      {90, true, 1.0, QSize(160, 80), QPoint(140, 15), QPoint(25, 70), nullptr},
+      {90, false, 1.0, QSize(160, 80), QPoint(20, 20), QPoint(140, 62), nullptr},
+      {100, true, 1.0, QSize(160, 80), QPoint(20, 20), QPoint(140, 62), nullptr},
+  };
+  for (const auto& c : cases) {
+    patchy::Document document(c.document_size.width(), c.document_size.height(), patchy::PixelFormat::rgba8());
+    document.add_pixel_layer("Background", solid_pixels(c.document_size.width(), c.document_size.height(),
+                                                        patchy::PixelFormat::rgba8(), QColor(Qt::white)));
+    patchy::ui::MainWindow window;
+    window.add_document_session(std::move(document), QStringLiteral("One Pixel"));
+    show_window(window);
+    auto* canvas = require_canvas(window);
+    if (c.new_layer) {
+      require_action(window, "layerNewAction")->trigger();
+      QApplication::processEvents();
+    }
+    require_action_by_text(window, QStringLiteral("Brush"))->trigger();
+    canvas->set_zoom_centered(c.zoom);
+    canvas->set_primary_color(Qt::black);
+    canvas->set_brush_size(1);
+    canvas->set_brush_opacity(100);
+    canvas->set_brush_flow(c.flow);
+    canvas->set_brush_softness(0);
+    canvas->set_brush_build_up(false);
+    canvas->set_brush_smoothing(0);
+    QApplication::processEvents();
+
+    // The pointer moves one screen pixel at a time along the line, as a hand-drawn drag does.
+    const auto center_of = [canvas](QPoint document_point) {
+      return widget_center_of_document_pixel(*canvas, document_point);
+    };
+    const auto start = center_of(c.from);
+    const auto end = center_of(c.to);
+    const auto steps = std::max(std::abs(end.x() - start.x()), std::abs(end.y() - start.y()));
+    send_mouse(*canvas, QEvent::MouseButtonPress, start, Qt::LeftButton, Qt::LeftButton);
+    for (int i = 1; i <= steps; ++i) {
+      const auto t = static_cast<double>(i) / steps;
+      const QPoint point(start.x() + static_cast<int>(std::lround((end.x() - start.x()) * t)),
+                         start.y() + static_cast<int>(std::lround((end.y() - start.y()) * t)));
+      send_mouse(*canvas, QEvent::MouseMove, point, Qt::NoButton, Qt::LeftButton);
+    }
+    send_mouse(*canvas, QEvent::MouseButtonRelease, end, Qt::LeftButton, Qt::NoButton);
+    QApplication::processEvents();
+
+    if (c.artifact != nullptr) {
+      process_events_for(300);  // the stroke's display refresh settles
+      const QRect frame(canvas->widget_position_for_document_point(QPoint(0, 0)),
+                        canvas->widget_position_for_document_point(
+                            QPoint(c.document_size.width(), c.document_size.height())));
+      save_image_artifact(c.artifact, canvas->grab().toImage().copy(frame));
+    }
+
+    const auto& doc = patchy::ui::MainWindowTestAccess::document(window);
+    const auto& layer = std::as_const(*doc.find_layer(*doc.active_layer_id()));
+    const auto& pixels = layer.pixels();
+    const auto bounds = layer.bounds();
+    const auto painted_at = [&](int x, int y) {
+      const auto lx = x - bounds.x;
+      const auto ly = y - bounds.y;
+      if (lx < 0 || ly < 0 || lx >= pixels.width() || ly >= pixels.height()) {
+        return false;
+      }
+      const auto* px = pixels.pixel(lx, ly);
+      return px[3] > 128 && px[0] < 128;
+    };
+    // Every column along the line holds paint within a pixel of it, to the very end.
+    const auto dx = c.to.x() - c.from.x();
+    const auto dy = c.to.y() - c.from.y();
+    int missing = 0;
+    int first_missing = -1;
+    for (int i = 0; i <= std::abs(dx); ++i) {
+      const auto x = c.from.x() + (dx < 0 ? -i : i);
+      const auto ideal_y = static_cast<double>(c.from.y()) + static_cast<double>(dy) * i / std::abs(dx);
+      const auto y = static_cast<int>(std::lround(ideal_y));
+      if (!painted_at(x, y - 1) && !painted_at(x, y) && !painted_at(x, y + 1)) {
+        ++missing;
+        if (first_missing < 0) {
+          first_missing = x;
+        }
+      }
+    }
+    if (missing > 0) {
+      std::cerr << "local-040 flow " << c.flow << (c.new_layer ? " new layer" : " background") << " zoom " << c.zoom
+                << ": " << missing << " columns without paint, first at x " << first_missing << '\n';
+    }
+    CHECK(missing == 0);
+    CHECK(painted_at(c.from.x(), c.from.y()));
+    CHECK(painted_at(c.to.x(), c.to.y()));
+  }
+}
+
+// GitHub issue 165: a busy GUI thread gets one mouse move per frame, and the
+// platform folds the skipped positions into it (Windows mouse history, X11
+// compression). Every folded position must reach the stroke as its own
+// sample, or a fast curve paints as straight chords between frames.
+void ui_brush_stroke_paints_every_coalesced_mouse_sample() {
+  for (const int brush_size : {1, 9}) {
+    for (const bool burst : {false, true}) {
+      patchy::Document document(240, 160, patchy::PixelFormat::rgba8());
+      document.add_pixel_layer("Paint",
+                               solid_pixels(240, 160, patchy::PixelFormat::rgba8(), QColor(Qt::white)));
+
+      patchy::ui::CanvasWidget canvas;
+      canvas.resize(320, 220);
+      canvas.set_document(&document);
+      canvas.set_tool(patchy::ui::CanvasTool::Brush);
+      canvas.set_zoom(1.0);
+      canvas.set_primary_color(Qt::black);
+      canvas.set_brush_size(brush_size);
+      canvas.set_brush_opacity(100);
+      canvas.set_brush_softness(0);
+      canvas.set_brush_smoothing(0);
+      canvas.show();
+      QApplication::processEvents();
+
+      // A half circle from the press to the one delivered move; the burst is
+      // every position in between, all folded into that single event.
+      const QPointF center(120.0, 120.0);
+      constexpr double kRadius = 80.0;
+      constexpr int kSamples = 40;
+      std::vector<QPoint> arc;
+      for (int i = 0; i <= kSamples; ++i) {
+        const auto angle = std::acos(-1.0) * (1.0 + static_cast<double>(i) / kSamples);
+        arc.emplace_back(static_cast<int>(std::lround(center.x() + kRadius * std::cos(angle))),
+                         static_cast<int>(std::lround(center.y() + kRadius * std::sin(angle))));
+      }
+      const auto widget_point = [&canvas](QPoint document_point) {
+        return canvas.widget_position_for_document_point(document_point);
+      };
+      int provider_calls = 0;
+      if (burst) {
+        canvas.set_coalesced_mouse_positions_provider([&](const QMouseEvent& event) -> std::vector<QPointF> {
+          ++provider_calls;
+          if (event.position().toPoint() != widget_point(arc.back())) {
+            return {};
+          }
+          std::vector<QPointF> folded;
+          for (std::size_t i = 1; i + 1 < arc.size(); ++i) {
+            folded.emplace_back(widget_point(arc[i]));
+          }
+          return folded;
+        });
+      }
+      send_mouse(canvas, QEvent::MouseButtonPress, widget_point(arc.front()), Qt::LeftButton, Qt::LeftButton);
+      send_mouse(canvas, QEvent::MouseMove, widget_point(arc.back()), Qt::NoButton, Qt::LeftButton);
+      send_mouse(canvas, QEvent::MouseButtonRelease, widget_point(arc.back()), Qt::LeftButton, Qt::NoButton);
+      QApplication::processEvents();
+
+      const auto image = canvas.grab().toImage();
+      const auto red_at = [&](QPoint document_point) {
+        return image.pixelColor(widget_point(document_point)).red();
+      };
+      // The chord the stroke used to paint runs straight across the middle.
+      const QPoint chord_middle(120, 120);
+      const QPoint arc_top(120, 40);
+      if (burst) {
+        CHECK(provider_calls >= 1);
+        int painted = 0;
+        for (const auto& point : arc) {
+          painted += red_at(point) < 80 ? 1 : 0;
+        }
+        CHECK(painted == static_cast<int>(arc.size()));
+        CHECK(red_at(chord_middle) > 200);
+      } else {
+        CHECK(red_at(chord_middle) < 80);
+        CHECK(red_at(arc_top) > 200);
+      }
+      save_widget_artifact("ui_brush_coalesced_" + std::string(burst ? "burst" : "single") + "_size" +
+                               std::to_string(brush_size),
+                           canvas);
+    }
+  }
+}
+
+// A 731 px hard round stroke in short moves, the case GitHub issue 135 lagged on. Each segment
+// skips the disk the previous one painted; the bytes must match the stroke painted without the
+// skip, for the Brush at 60% opacity and for the Eraser.
+void ui_hard_round_stroke_skip_keeps_bytes() {
+  for (const auto tool : {patchy::ui::CanvasTool::Brush, patchy::ui::CanvasTool::Eraser}) {
+    const auto paint = [tool](bool skip) {
+      patchy::Document document(900, 700, patchy::PixelFormat::rgba8());
+      const auto layer_id =
+          document.add_pixel_layer("Paint", solid_pixels(900, 700, patchy::PixelFormat::rgba8(), QColor(200, 220, 240)))
+              .id();
+      patchy::ui::CanvasWidget canvas;
+      canvas.resize(500, 400);
+      canvas.set_document(&document);
+      canvas.set_tool(tool);
+      canvas.set_zoom(0.5);
+      canvas.set_hard_round_skip_enabled_for_testing(skip);
+      canvas.set_primary_color(QColor(20, 40, 160));
+      canvas.set_brush_size(731);
+      canvas.set_brush_opacity(tool == patchy::ui::CanvasTool::Brush ? 60 : 100);
+      canvas.set_brush_softness(0);
+      canvas.show();
+      QApplication::processEvents();
+      const auto widget_point = [&canvas](double x, double y) {
+        return canvas.widget_position_for_document_point(QPoint(static_cast<int>(x), static_cast<int>(y)));
+      };
+      send_mouse(canvas, QEvent::MouseButtonPress, widget_point(200.0, 330.0), Qt::LeftButton, Qt::LeftButton);
+      for (int index = 1; index <= 120; ++index) {
+        send_mouse(canvas, QEvent::MouseMove, widget_point(200.0 + 4.0 * index, 330.0 + 30.0 * std::sin(index * 0.08)),
+                   Qt::NoButton, Qt::LeftButton);
+      }
+      send_mouse(canvas, QEvent::MouseButtonRelease, widget_point(680.0, 330.0 + 30.0 * std::sin(9.6)),
+                 Qt::LeftButton, Qt::NoButton);
+      QApplication::processEvents();
+      return document.find_layer(layer_id)->pixels();
+    };
+    const auto skipped = paint(true);
+    const auto full = paint(false);
+    bool identical = skipped.width() == full.width() && skipped.height() == full.height();
+    for (std::int32_t y = 0; identical && y < full.height(); ++y) {
+      const auto left = skipped.row(y);
+      const auto right = full.row(y);
+      identical = std::equal(left.begin(), left.end(), right.begin(), right.end());
+    }
+    CHECK(identical);
+    // The stroke painted (or erased) the middle of the layer.
+    CHECK(std::as_const(skipped).pixel(450, 330)[0] != 200 || std::as_const(skipped).pixel(450, 330)[3] != 255);
+  }
+}
+
+// GitHub issue 677: a big soft Brush at reduced Flow (philipzae's Airbrush: 179 px, Soft 13,
+// Flow 12) paints its spaced dabs through draw_banded_brush_dab, an inlined walk whose big dabs
+// fan out over 64-row bands. The bytes must match core paint_brush_dab through the stroke
+// compositor's callbacks, on one thread and on several, for the Airbrush, a soft partial-opacity
+// stroke, the soft Eraser, Multiply, a rotated Square, an oval, a feathered selection, 16-bit
+// and the Dissolve paint mode, with folded mouse samples and repeated points. A stroke sent one
+// pixel per move still places one dab per spacing step. The follow-up (the Airbrush preset at
+// Soft 10% and 100%) paints each move's dabs in one batch (flush_brush_dab_batch); batched and
+// dab-by-dab bytes match core too.
+void ui_brush_banded_dabs_keep_bytes() {
+  struct Case {
+    const char* name;
+    patchy::ui::CanvasTool tool;
+    int size;
+    int softness;
+    int opacity;
+    int flow;
+    bool build_up;
+    int roundness;
+    patchy::BrushShape shape;
+    std::optional<patchy::BlendMode> mode;
+    bool feathered_selection;
+    bool deep;
+  };
+  const auto round = patchy::BrushShape::Round;
+  const std::vector<Case> cases{
+      {"airbrush_flow12", patchy::ui::CanvasTool::Brush, 179, 13, 100, 12, true, 100, round, std::nullopt, false, false},
+      {"soft_60", patchy::ui::CanvasTool::Brush, 241, 50, 60, 100, false, 100, round, std::nullopt, false, false},
+      {"eraser_soft", patchy::ui::CanvasTool::Eraser, 201, 40, 80, 100, false, 100, round, std::nullopt, false, false},
+      {"multiply", patchy::ui::CanvasTool::Brush, 181, 30, 100, 40, true, 100, round, patchy::BlendMode::Multiply,
+       false, false},
+      {"dissolve", patchy::ui::CanvasTool::Brush, 161, 60, 70, 30, false, 100, round, patchy::BlendMode::Dissolve,
+       false, false},
+      {"square", patchy::ui::CanvasTool::Brush, 151, 20, 100, 30, true, 100, patchy::BrushShape::Square, std::nullopt,
+       false, false},
+      {"oval", patchy::ui::CanvasTool::Brush, 221, 35, 90, 25, false, 55, round, std::nullopt, false, false},
+      {"feathered", patchy::ui::CanvasTool::Brush, 201, 25, 100, 25, true, 100, round, std::nullopt, true, false},
+      {"deep_16", patchy::ui::CanvasTool::Brush, 179, 13, 100, 12, true, 100, round, std::nullopt, false, true},
+      {"airbrush_soft10", patchy::ui::CanvasTool::Brush, 179, 10, 100, 100, true, 100, round, std::nullopt, false,
+       false},
+      {"airbrush_soft100", patchy::ui::CanvasTool::Brush, 179, 100, 100, 100, true, 100, round, std::nullopt, false,
+       false},
+      {"eraser_soft100", patchy::ui::CanvasTool::Eraser, 179, 100, 100, 100, false, 100, round, std::nullopt, false,
+       false},
+      {"deep_16_soft100", patchy::ui::CanvasTool::Brush, 179, 100, 100, 100, true, 100, round, std::nullopt, false,
+       true},
+  };
+  patchy::set_deep_editing_override(true);
+  for (const auto& test_case : cases) {
+    struct Result {
+      std::vector<std::uint8_t> bytes;
+      int dabs{0};
+    };
+    const auto paint = [&test_case](bool banded, bool single_threaded, bool batched) {
+      if (single_threaded) {
+        qputenv("PATCHY_RENDER_SINGLE_THREADED", "1");
+      }
+      const auto restore_threads = qScopeGuard([single_threaded] {
+        if (single_threaded) {
+          qunsetenv("PATCHY_RENDER_SINGLE_THREADED");
+        }
+      });
+      constexpr int kWidth = 700;
+      constexpr int kHeight = 520;
+      auto pixels = solid_pixels(kWidth, kHeight, patchy::PixelFormat::rgba8(), QColor(0, 0, 0, 255));
+      for (int y = 0; y < kHeight; ++y) {
+        for (int x = 0; x < kWidth; ++x) {
+          auto* px = pixels.pixel(x, y);
+          px[0] = static_cast<std::uint8_t>((x * 7 + y * 3) % 256);
+          px[1] = static_cast<std::uint8_t>((y * 5) % 256);
+          px[2] = static_cast<std::uint8_t>(((x ^ y) * 11) % 256);
+          px[3] = static_cast<std::uint8_t>(x < 60 ? 128 : 255);
+        }
+      }
+      patchy::Document document(kWidth, kHeight, patchy::PixelFormat::rgba8());
+      const auto layer_id = document.add_pixel_layer("Photo", std::move(pixels)).id();
+      if (test_case.deep) {
+        patchy::convert_document_depth(document, patchy::BitDepth::UInt16);
+      }
+      patchy::ui::CanvasWidget canvas;
+      canvas.resize(520, 420);
+      canvas.set_document(&document);
+      canvas.set_zoom(0.5);
+      canvas.set_banded_brush_dabs_enabled_for_testing(banded);
+      canvas.set_brush_dab_batching_enabled_for_testing(batched);
+      canvas.show();
+      QApplication::processEvents();
+      const auto widget_point = [&canvas](QPoint document_point) {
+        return canvas.widget_position_for_document_point(document_point);
+      };
+      if (test_case.feathered_selection) {
+        canvas.set_tool(patchy::ui::CanvasTool::EllipticalMarquee);
+        canvas.set_selection_feather_radius(25);
+        drag(canvas, widget_point(QPoint(200, 90)), widget_point(QPoint(640, 470)));
+        QApplication::processEvents();
+      }
+      canvas.set_tool(test_case.tool);
+      canvas.set_primary_color(QColor(30, 90, 200));
+      canvas.set_secondary_color(QColor(240, 200, 40));
+      canvas.set_brush_size(test_case.size);
+      canvas.set_brush_softness(test_case.softness);
+      canvas.set_brush_opacity(test_case.opacity);
+      canvas.set_brush_flow(test_case.flow);
+      canvas.set_brush_build_up(test_case.build_up);
+      canvas.set_brush_shape(test_case.shape);
+      canvas.set_brush_base_shape(30.0, test_case.roundness);
+      if (test_case.mode.has_value()) {
+        canvas.set_brush_paint_mode(patchy::PaintMode::of(*test_case.mode));
+      }
+      // Every fourth move folds three extra samples into it (GitHub issue 165), every
+      // seventh repeats the previous point, and the path turns back on itself.
+      std::vector<QPoint> path;
+      for (int index = 0; index <= 90; ++index) {
+        const auto t = static_cast<double>(index);
+        path.emplace_back(static_cast<int>(std::lround(400.0 + 160.0 * std::sin(t * 0.05))),
+                          static_cast<int>(std::lround(260.0 + 120.0 * std::sin(t * 0.11) + (index % 5) * 2)));
+        if (index % 7 == 3) {
+          path.push_back(path.back());
+        }
+      }
+      std::vector<QPointF> folded;
+      canvas.set_coalesced_mouse_positions_provider(
+          [&folded](const QMouseEvent&) -> std::vector<QPointF> { return folded; });
+      const auto layer_bytes = [&document, layer_id] {
+        const auto bytes = std::as_const(*document.find_layer(layer_id)).pixels().data();
+        return std::vector<std::uint8_t>(bytes.begin(), bytes.end());
+      };
+      const auto before = layer_bytes();
+      const auto dabs_before = canvas.render_cache_diagnostics().brush_dabs;
+      // Sent events only: no event-loop pass runs between press and release, so no Airbrush
+      // timer tick lands and both runs paint the same dabs.
+      send_mouse(canvas, QEvent::MouseButtonPress, widget_point(path.front()), Qt::LeftButton, Qt::LeftButton);
+      for (std::size_t index = 1; index < path.size();) {
+        const auto extra = index % 4 == 0 ? std::min<std::size_t>(3, path.size() - 1 - index) : 0;
+        folded.clear();
+        for (std::size_t sample = 0; sample < extra; ++sample) {
+          folded.emplace_back(widget_point(path[index + sample]));
+        }
+        const auto event_point = widget_point(path[index + extra]);
+        QMouseEvent event(QEvent::MouseMove, event_point, canvas.mapToGlobal(event_point), Qt::NoButton,
+                          Qt::LeftButton, Qt::NoModifier);
+        QApplication::sendEvent(&canvas, &event);
+        index += extra + 1;
+      }
+      folded.clear();
+      send_mouse(canvas, QEvent::MouseButtonRelease, widget_point(path.back()), Qt::LeftButton, Qt::NoButton);
+      QApplication::processEvents();
+      Result result;
+      result.bytes = layer_bytes();
+      result.dabs = canvas.render_cache_diagnostics().brush_dabs - dabs_before;
+      CHECK(result.bytes != before);
+      return result;
+    };
+    // Core paint_brush_dab through the compositor's callbacks is the dab as it was before.
+    const auto core = paint(false, true, false);
+    const auto single = paint(true, true, false);
+    const auto parallel = paint(true, false, false);
+    const auto batched_single = paint(true, true, true);
+    const auto batched = paint(true, false, true);
+    if (single.bytes != core.bytes || parallel.bytes != core.bytes || batched_single.bytes != core.bytes ||
+        batched.bytes != core.bytes) {
+      std::printf("[INFO] banded dab case %s: one thread %s, bands %s, batched one thread %s, batched %s\n",
+                  test_case.name, single.bytes == core.bytes ? "same" : "changed",
+                  parallel.bytes == core.bytes ? "same" : "changed",
+                  batched_single.bytes == core.bytes ? "same" : "changed",
+                  batched.bytes == core.bytes ? "same" : "changed");
+    }
+    CHECK(core.dabs > 0);
+    CHECK(single.dabs == core.dabs);
+    CHECK(parallel.dabs == core.dabs);
+    CHECK(batched_single.dabs == core.dabs);
+    CHECK(batched.dabs == core.dabs);
+    CHECK(single.bytes == core.bytes);
+    CHECK(parallel.bytes == core.bytes);
+    CHECK(batched_single.bytes == core.bytes);
+    CHECK(batched.bytes == core.bytes);
+  }
+  patchy::set_deep_editing_override(std::nullopt);
+
+  // Work per move: 600 one-pixel moves of the 179 px Airbrush place one dab per spacing step
+  // (179 / 8 = 22.4 px), not one per move.
+  patchy::Document document(800, 300, patchy::PixelFormat::rgba8());
+  document.add_pixel_layer("Paint", solid_pixels(800, 300, patchy::PixelFormat::rgba8(), QColor(255, 255, 255)));
+  patchy::ui::CanvasWidget canvas;
+  canvas.resize(820, 320);
+  canvas.set_document(&document);
+  canvas.set_zoom(1.0);
+  canvas.show();
+  QApplication::processEvents();
+  canvas.set_tool(patchy::ui::CanvasTool::Brush);
+  canvas.set_brush_size(179);
+  canvas.set_brush_softness(13);
+  canvas.set_brush_opacity(100);
+  canvas.set_brush_flow(12);
+  canvas.set_brush_build_up(true);
+  const auto dabs_before = canvas.render_cache_diagnostics().brush_dabs;
+  send_mouse(canvas, QEvent::MouseButtonPress, canvas.widget_position_for_document_point(QPoint(100, 150)),
+             Qt::LeftButton, Qt::LeftButton);
+  for (int x = 101; x <= 700; ++x) {
+    send_mouse(canvas, QEvent::MouseMove, canvas.widget_position_for_document_point(QPoint(x, 150)), Qt::NoButton,
+               Qt::LeftButton);
+  }
+  send_mouse(canvas, QEvent::MouseButtonRelease, canvas.widget_position_for_document_point(QPoint(700, 150)),
+             Qt::LeftButton, Qt::NoButton);
+  QApplication::processEvents();
+  const auto dabs = canvas.render_cache_diagnostics().brush_dabs - dabs_before;
+  std::printf("[INFO] 600 one-pixel moves at 179 px: %d dabs\n", dabs);
+  CHECK(dabs >= 26);
+  CHECK(dabs <= 30);
+}
+
+// GitHub issue 677 follow-up: a Brush or Eraser stroke's queued moves coalesce per event-loop
+// pass like a Clone stroke's, keeping every position, so a fast pointer's backlog paints its
+// spaced dabs in one batch. Queued and sent strokes give the same bytes (Soft 100%, Flow 100,
+// Airbrush off so no timer tick lands; the soft Eraser too).
+void ui_brush_stroke_coalesces_queued_moves_and_keeps_bytes() {
+  for (const auto tool : {patchy::ui::CanvasTool::Brush, patchy::ui::CanvasTool::Eraser}) {
+    struct Result {
+      std::vector<std::uint8_t> bytes;
+      int coalesced{0};
+      int dabs{0};
+    };
+    const auto paint = [tool](bool queued) {
+      constexpr int kWidth = 900;
+      constexpr int kHeight = 600;
+      auto pixels = solid_pixels(kWidth, kHeight, patchy::PixelFormat::rgba8(), QColor(0, 0, 0, 255));
+      for (int y = 0; y < kHeight; ++y) {
+        for (int x = 0; x < kWidth; ++x) {
+          auto* px = pixels.pixel(x, y);
+          px[0] = static_cast<std::uint8_t>((x * 7 + y * 3) % 256);
+          px[1] = static_cast<std::uint8_t>((y * 5) % 256);
+          px[2] = static_cast<std::uint8_t>(((x ^ y) * 11) % 256);
+        }
+      }
+      patchy::Document document(kWidth, kHeight, patchy::PixelFormat::rgba8());
+      const auto layer_id = document.add_pixel_layer("Photo", std::move(pixels)).id();
+      patchy::ui::CanvasWidget canvas;
+      canvas.resize(520, 400);
+      canvas.set_document(&document);
+      canvas.set_zoom(0.25);
+      canvas.set_drag_move_coalescing_for_testing(queued ? patchy::ui::CanvasWidget::DragMoveCoalescing::AllMoves
+                                                         : patchy::ui::CanvasWidget::DragMoveCoalescing::Off);
+      canvas.show();
+      QApplication::processEvents();
+      canvas.set_tool(tool);
+      canvas.set_primary_color(QColor(30, 90, 200));
+      canvas.set_brush_size(179);
+      canvas.set_brush_softness(100);
+      canvas.set_brush_opacity(100);
+      canvas.set_brush_flow(100);
+      canvas.set_brush_build_up(false);
+      const auto widget_point = [&canvas](QPointF document_point) {
+        return QPointF(canvas.widget_position_for_document_point(document_point.toPoint()));
+      };
+      // A zigzag, about 30 image pixels a move.
+      std::vector<QPointF> path;
+      for (int index = 0; index <= 120; ++index) {
+        const auto t = static_cast<double>(index);
+        const auto travel = std::fmod(30.0 * t, 1200.0);
+        path.emplace_back(150.0 + (travel < 600.0 ? travel : 1200.0 - travel), 150.0 + 2.5 * t);
+      }
+      for (int wait = 0; wait < 200 && !canvas.render_settled(); ++wait) {
+        canvas.repaint();
+        QApplication::processEvents();
+      }
+      const auto before = canvas.render_cache_diagnostics();
+      send_mouse(canvas, QEvent::MouseButtonPress, widget_point(path.front()).toPoint(), Qt::LeftButton,
+                 Qt::LeftButton);
+      if (queued) {
+        // Queued as a window system queues them, in bursts of nine per event-loop pass.
+        for (std::size_t index = 1; index < path.size(); ++index) {
+          const auto position = widget_point(path[index]);
+          QApplication::postEvent(&canvas, new QMouseEvent(QEvent::MouseMove, position, canvas.mapToGlobal(position),
+                                                           Qt::NoButton, Qt::LeftButton, Qt::NoModifier));
+          if (index % 9 == 0) {
+            QApplication::processEvents();
+          }
+        }
+        QApplication::processEvents();
+        QApplication::processEvents();
+      } else {
+        for (std::size_t index = 1; index < path.size(); ++index) {
+          const auto position = widget_point(path[index]);
+          QMouseEvent event(QEvent::MouseMove, position, canvas.mapToGlobal(position), Qt::NoButton, Qt::LeftButton,
+                            Qt::NoModifier);
+          QApplication::sendEvent(&canvas, &event);
+        }
+      }
+      send_mouse(canvas, QEvent::MouseButtonRelease, widget_point(path.back()).toPoint(), Qt::LeftButton,
+                 Qt::NoButton);
+      QApplication::processEvents();
+      const auto after = canvas.render_cache_diagnostics();
+      Result result;
+      const auto bytes = std::as_const(*document.find_layer(layer_id)).pixels().data();
+      result.bytes.assign(bytes.begin(), bytes.end());
+      result.coalesced = after.drag_moves_coalesced - before.drag_moves_coalesced;
+      result.dabs = after.brush_dabs - before.brush_dabs;
+      return result;
+    };
+    const auto sent = paint(false);
+    const auto queued = paint(true);
+    std::printf("[INFO] %s stroke: %d dabs sent, %d queued, %d moves coalesced\n",
+                tool == patchy::ui::CanvasTool::Brush ? "Brush" : "Eraser", sent.dabs, queued.dabs, queued.coalesced);
+    CHECK(sent.dabs > 100);
+    CHECK(queued.dabs == sent.dabs);
+    CHECK(queued.coalesced > 0);
+    CHECK(queued.bytes == sent.bytes);
+  }
+}
+
+// GitHub issue 597: a big Clone Stamp segment visits only its capsule's row spans, one
+// continuing the previous segment skips the half-plane behind its start and the fully covered
+// disk there, and big segments fan out over 64-row bands. The bytes must match the full
+// bounding-box walk on one thread for hard, soft, partial-opacity,
+// oval, feathered-selection, transformed-source, 16-bit and Healing Brush strokes, with folded
+// mouse samples, repeated points and reversals.
+void ui_clone_stamp_large_brush_skip_keeps_bytes() {
+  struct Case {
+    const char* name;
+    patchy::ui::CanvasTool tool;
+    int size;
+    int softness;
+    int opacity;
+    int roundness;
+    bool feathered_selection;
+    bool transformed;
+    bool deep;
+  };
+  const std::vector<Case> cases{
+      {"hard", patchy::ui::CanvasTool::Clone, 301, 0, 100, 100, false, false, false},
+      {"soft_60", patchy::ui::CanvasTool::Clone, 301, 100, 60, 100, false, false, false},
+      {"medium_oval", patchy::ui::CanvasTool::Clone, 251, 40, 100, 55, false, false, false},
+      {"feathered", patchy::ui::CanvasTool::Clone, 201, 30, 80, 100, true, false, false},
+      {"transformed", patchy::ui::CanvasTool::Clone, 221, 50, 100, 100, false, true, false},
+      {"deep_16", patchy::ui::CanvasTool::Clone, 181, 70, 75, 100, false, false, true},
+      {"healing", patchy::ui::CanvasTool::Healing, 161, 20, 100, 100, false, false, false},
+  };
+  patchy::set_deep_editing_override(true);
+  for (const auto& test_case : cases) {
+    const auto paint = [&test_case](bool skip, bool single_threaded) {
+      if (single_threaded) {
+        qputenv("PATCHY_RENDER_SINGLE_THREADED", "1");
+      }
+      const auto restore_threads = qScopeGuard([single_threaded] {
+        if (single_threaded) {
+          qunsetenv("PATCHY_RENDER_SINGLE_THREADED");
+        }
+      });
+      constexpr int kWidth = 700;
+      constexpr int kHeight = 520;
+      auto pixels = solid_pixels(kWidth, kHeight, patchy::PixelFormat::rgba8(), QColor(0, 0, 0, 255));
+      for (int y = 0; y < kHeight; ++y) {
+        for (int x = 0; x < kWidth; ++x) {
+          auto* px = pixels.pixel(x, y);
+          px[0] = static_cast<std::uint8_t>((x * 7 + y * 3) % 256);
+          px[1] = static_cast<std::uint8_t>((y * 5) % 256);
+          px[2] = static_cast<std::uint8_t>(((x ^ y) * 11) % 256);
+          px[3] = static_cast<std::uint8_t>(x < 60 ? 128 : 255);
+        }
+      }
+      patchy::Document document(kWidth, kHeight, patchy::PixelFormat::rgba8());
+      const auto layer_id = document.add_pixel_layer("Photo", std::move(pixels)).id();
+      if (test_case.deep) {
+        patchy::convert_document_depth(document, patchy::BitDepth::UInt16);
+      }
+      patchy::ui::CanvasWidget canvas;
+      canvas.resize(520, 420);
+      canvas.set_document(&document);
+      canvas.set_zoom(0.5);
+      canvas.set_clone_stamp_skip_enabled_for_testing(skip);
+      canvas.show();
+      QApplication::processEvents();
+      const auto widget_point = [&canvas](QPoint document_point) {
+        return canvas.widget_position_for_document_point(document_point);
+      };
+      if (test_case.feathered_selection) {
+        canvas.set_tool(patchy::ui::CanvasTool::EllipticalMarquee);
+        canvas.set_selection_feather_radius(25);
+        drag(canvas, widget_point(QPoint(200, 90)), widget_point(QPoint(640, 470)));
+        QApplication::processEvents();
+      }
+      canvas.set_tool(test_case.tool);
+      canvas.set_brush_size(test_case.size);
+      canvas.set_brush_softness(test_case.softness);
+      canvas.set_brush_opacity(test_case.opacity);
+      canvas.set_brush_base_shape(30.0, test_case.roundness);
+      if (test_case.transformed) {
+        canvas.set_clone_source_transform(patchy::CloneSourceTransform{125.0, 15.0});
+      }
+      send_mouse(canvas, QEvent::MouseButtonPress, widget_point(QPoint(150, 260)), Qt::LeftButton, Qt::LeftButton,
+                 Qt::AltModifier);
+      send_mouse(canvas, QEvent::MouseButtonRelease, widget_point(QPoint(150, 260)), Qt::LeftButton, Qt::NoButton,
+                 Qt::AltModifier);
+      // Every fourth move folds three extra samples into it (GitHub issue 165), every
+      // seventh repeats the previous point, and the path turns back on itself.
+      std::vector<QPoint> path;
+      for (int index = 0; index <= 90; ++index) {
+        const auto t = static_cast<double>(index);
+        path.emplace_back(static_cast<int>(std::lround(400.0 + 160.0 * std::sin(t * 0.05))),
+                          static_cast<int>(std::lround(260.0 + 120.0 * std::sin(t * 0.11) + (index % 5) * 2)));
+        if (index % 7 == 3) {
+          path.push_back(path.back());
+        }
+      }
+      std::vector<QPointF> folded;
+      canvas.set_coalesced_mouse_positions_provider(
+          [&folded](const QMouseEvent&) -> std::vector<QPointF> { return folded; });
+      const auto layer_bytes = [&document, layer_id] {
+        const auto bytes = std::as_const(*document.find_layer(layer_id)).pixels().data();
+        return std::vector<std::uint8_t>(bytes.begin(), bytes.end());
+      };
+      const auto before = layer_bytes();
+      send_mouse(canvas, QEvent::MouseButtonPress, widget_point(path.front()), Qt::LeftButton, Qt::LeftButton);
+      for (std::size_t index = 1; index < path.size();) {
+        const auto extra = index % 4 == 0 ? std::min<std::size_t>(3, path.size() - 1 - index) : 0;
+        folded.clear();
+        for (std::size_t sample = 0; sample < extra; ++sample) {
+          folded.emplace_back(widget_point(path[index + sample]));
+        }
+        const auto event_point = widget_point(path[index + extra]);
+        QMouseEvent event(QEvent::MouseMove, event_point, canvas.mapToGlobal(event_point), Qt::NoButton,
+                          Qt::LeftButton, Qt::NoModifier);
+        QApplication::sendEvent(&canvas, &event);
+        index += extra + 1;
+      }
+      folded.clear();
+      send_mouse(canvas, QEvent::MouseButtonRelease, widget_point(path.back()), Qt::LeftButton, Qt::NoButton);
+      QApplication::processEvents();
+      const auto after = layer_bytes();
+      CHECK(after != before);
+      return after;
+    };
+    // The full walk on one thread is the stamp as it was before the issue.
+    const auto full = paint(false, true);
+    const auto skipped = paint(true, true);
+    const auto parallel = paint(true, false);
+    if (skipped != full || parallel != full) {
+      std::printf("[INFO] clone stamp case %s: skip %s, strips %s\n", test_case.name,
+                  skipped == full ? "same" : "changed", parallel == full ? "same" : "changed");
+    }
+    CHECK(skipped == full);
+    CHECK(parallel == full);
+  }
+  patchy::set_deep_editing_override(std::nullopt);
+}
+
+// GitHub issue 597 follow-up: Wayland delivers every pointer motion, and a Clone or Healing
+// stroke that handled each as its own event left the canvas unpainted while a fast mouse
+// kept the queue full. Queued moves now coalesce per event-loop pass with every position
+// kept (the earlier moves and their folded samples ride on the replayed one), and a press
+// shares the settled render cache as its All Layers snapshot instead of rendering the
+// document again. Two strokes painted that way must leave the same bytes as the same
+// moves sent one by one from fresh renders.
+void ui_clone_stroke_coalesces_queued_moves_and_keeps_bytes() {
+  for (const auto tool : {patchy::ui::CanvasTool::Clone, patchy::ui::CanvasTool::Healing}) {
+    struct Result {
+      std::vector<std::uint8_t> bytes;
+      int coalesced{0};
+      int reuses{0};
+    };
+    const auto paint = [tool](bool coalesce_and_reuse) {
+      constexpr int kWidth = 420;
+      constexpr int kHeight = 300;
+      auto pixels = solid_pixels(kWidth, kHeight, patchy::PixelFormat::rgba8(), QColor(0, 0, 0, 255));
+      for (int y = 0; y < kHeight; ++y) {
+        for (int x = 0; x < kWidth; ++x) {
+          auto* px = pixels.pixel(x, y);
+          px[0] = static_cast<std::uint8_t>((x * 7 + y * 3) % 256);
+          px[1] = static_cast<std::uint8_t>((y * 5) % 256);
+          px[2] = static_cast<std::uint8_t>(((x ^ y) * 11) % 256);
+        }
+      }
+      patchy::Document document(kWidth, kHeight, patchy::PixelFormat::rgba8());
+      const auto layer_id = document.add_pixel_layer("Photo", std::move(pixels)).id();
+      // A Multiply layer above, so the All Layers sample is a real composite.
+      auto& tint = document.add_pixel_layer(
+          "Tint", solid_pixels(kWidth, kHeight, patchy::PixelFormat::rgba8(), QColor(250, 180, 120, 150)));
+      tint.set_blend_mode(patchy::BlendMode::Multiply);
+      document.set_active_layer(layer_id);
+      patchy::ui::CanvasWidget canvas;
+      canvas.resize(520, 400);
+      canvas.set_document(&document);
+      canvas.set_zoom(1.0);
+      canvas.set_retouch_snapshot_cache_reuse_enabled_for_testing(coalesce_and_reuse);
+      canvas.set_drag_move_coalescing_for_testing(coalesce_and_reuse
+                                                      ? patchy::ui::CanvasWidget::DragMoveCoalescing::AllMoves
+                                                      : patchy::ui::CanvasWidget::DragMoveCoalescing::Off);
+      canvas.show();
+      QApplication::processEvents();
+      canvas.set_tool(tool);
+      canvas.set_brush_size(61);
+      canvas.set_brush_softness(60);
+      const auto widget_point = [&canvas](QPoint document_point) {
+        return canvas.widget_position_for_document_point(document_point);
+      };
+      send_mouse(canvas, QEvent::MouseButtonPress, widget_point(QPoint(90, 150)), Qt::LeftButton, Qt::LeftButton,
+                 Qt::AltModifier);
+      send_mouse(canvas, QEvent::MouseButtonRelease, widget_point(QPoint(90, 150)), Qt::LeftButton, Qt::NoButton,
+                 Qt::AltModifier);
+      // Every third move carries two samples the platform folded into it.
+      std::map<std::pair<int, int>, std::vector<QPointF>> folded_by_event;
+      canvas.set_coalesced_mouse_positions_provider([&folded_by_event](const QMouseEvent& event) {
+        const auto found = folded_by_event.find({event.position().toPoint().x(), event.position().toPoint().y()});
+        return found == folded_by_event.end() ? std::vector<QPointF>{} : found->second;
+      });
+      for (const int stroke : {0, 1}) {
+        std::vector<QPoint> path;
+        for (int index = 0; index <= 60; ++index) {
+          const auto t = static_cast<double>(index);
+          path.emplace_back(static_cast<int>(std::lround(220.0 + 3.0 * t)),
+                            static_cast<int>(std::lround(90.0 + stroke * 90.0 + 30.0 * std::sin(t * 0.2))));
+        }
+        folded_by_event.clear();
+        std::vector<QPoint> event_points;
+        for (std::size_t index = 1; index < path.size();) {
+          if (index % 3 == 0 && index + 2 < path.size()) {
+            const auto event_point = widget_point(path[index + 2]);
+            folded_by_event[{event_point.x(), event_point.y()}] = {QPointF(widget_point(path[index])),
+                                                                   QPointF(widget_point(path[index + 1]))};
+            event_points.push_back(event_point);
+            index += 3;
+          } else {
+            event_points.push_back(widget_point(path[index]));
+            index += 1;
+          }
+        }
+        for (int wait = 0; wait < 200 && !canvas.render_settled(); ++wait) {
+          canvas.repaint();
+          QApplication::processEvents();
+        }
+        send_mouse(canvas, QEvent::MouseButtonPress, widget_point(path.front()), Qt::LeftButton, Qt::LeftButton);
+        if (coalesce_and_reuse) {
+          // Queued as a window system queues them, in bursts of seven per event-loop pass.
+          constexpr std::size_t kBurst = 7;
+          const auto queued = event_points.size() - event_points.size() % kBurst - kBurst;
+          for (std::size_t index = 0; index < queued; ++index) {
+            const auto position = QPointF(event_points[index]);
+            QApplication::postEvent(&canvas, new QMouseEvent(QEvent::MouseMove, position, canvas.mapToGlobal(position),
+                                                             Qt::NoButton, Qt::LeftButton, Qt::NoModifier));
+            if (index % kBurst == kBurst - 1) {
+              QApplication::processEvents();
+            }
+          }
+          // The last moves arrive without the event loop running: the first applies, the
+          // rest are still recorded when the release lands, which applies them first.
+          for (std::size_t index = queued; index < event_points.size(); ++index) {
+            send_mouse(canvas, QEvent::MouseMove, event_points[index], Qt::NoButton, Qt::LeftButton);
+          }
+        } else {
+          for (const auto& position : event_points) {
+            send_mouse(canvas, QEvent::MouseMove, position, Qt::NoButton, Qt::LeftButton);
+          }
+        }
+        send_mouse(canvas, QEvent::MouseButtonRelease, event_points.back(), Qt::LeftButton, Qt::NoButton);
+        QApplication::processEvents();
+      }
+      Result result;
+      const auto bytes = std::as_const(*document.find_layer(layer_id)).pixels().data();
+      result.bytes.assign(bytes.begin(), bytes.end());
+      result.coalesced = canvas.render_cache_diagnostics().drag_moves_coalesced;
+      result.reuses = canvas.render_cache_diagnostics().retouch_snapshot_cache_reuses;
+      return result;
+    };
+    const auto one_by_one = paint(false);
+    const auto coalesced = paint(true);
+    CHECK(one_by_one.coalesced == 0 && one_by_one.reuses == 0);
+    CHECK(coalesced.coalesced > 20);
+    CHECK(coalesced.reuses == 2);
+    CHECK(coalesced.bytes == one_by_one.bytes);
+  }
+}
+
+// GitHub issue 597 follow-up 3: a Clone or Healing press no longer copies a whole image. The
+// source fills tile by tile from the render cache it shares (All Layers) or from the active
+// layer as it was (Current Layer), and a render-cache patch takes its tiles first instead of
+// copying the cache. A stroke whose source overlaps what it paints, with a frame after
+// every move, must leave the bytes the whole-image source left, and undo must restore the
+// photo exactly.
+void ui_clone_lazy_source_keeps_bytes_and_undo_restores() {
+  // Each window saves its Sample choice on close; a later retouch test expects the default.
+  SettingsValueRestorer saved_sample(QStringLiteral("tools/retouchSampleLayers"));
+  SettingsValueRestorer saved_legacy_sample(QStringLiteral("tools/retouchSampleAllLayers"));
+  struct Case {
+    const char* name;
+    patchy::ui::CanvasTool tool;
+    patchy::SampleLayers sample;
+    bool transformed;
+  };
+  const Case cases[] = {
+      {"clone_all_layers", patchy::ui::CanvasTool::Clone, patchy::SampleLayers::AllLayers, false},
+      {"clone_current_layer", patchy::ui::CanvasTool::Clone, patchy::SampleLayers::CurrentLayer, false},
+      {"clone_all_layers_transformed", patchy::ui::CanvasTool::Clone, patchy::SampleLayers::AllLayers, true},
+      {"healing_all_layers", patchy::ui::CanvasTool::Healing, patchy::SampleLayers::AllLayers, false},
+      {"healing_current_layer", patchy::ui::CanvasTool::Healing, patchy::SampleLayers::CurrentLayer, false},
+  };
+  constexpr int kWidth = 1800;
+  constexpr int kHeight = 1300;
+  for (const auto& test_case : cases) {
+    struct Result {
+      std::vector<std::uint8_t> bytes;
+      bool undo_restored{false};
+      int tiles_filled{0};
+      int cache_detaches{0};
+    };
+    const auto paint = [&test_case](bool lazy) {
+      auto pixels = solid_pixels(kWidth, kHeight, patchy::PixelFormat::rgba8(), QColor(0, 0, 0, 255));
+      for (int y = 0; y < kHeight; ++y) {
+        for (int x = 0; x < kWidth; ++x) {
+          auto* px = pixels.pixel(x, y);
+          px[0] = static_cast<std::uint8_t>((x * 7 + y * 3) % 256);
+          px[1] = static_cast<std::uint8_t>((y * 5) % 256);
+          px[2] = static_cast<std::uint8_t>(((x ^ y) * 11) % 256);
+        }
+      }
+      patchy::Document document(kWidth, kHeight, patchy::PixelFormat::rgba8());
+      const auto layer_id = document.add_pixel_layer("Photo", std::move(pixels)).id();
+      // A Multiply layer above, so All Layers samples a real composite.
+      auto& tint = document.add_pixel_layer(
+          "Tint", solid_pixels(kWidth, kHeight, patchy::PixelFormat::rgba8(), QColor(250, 180, 120, 150)));
+      tint.set_blend_mode(patchy::BlendMode::Multiply);
+      document.set_active_layer(layer_id);
+      patchy::ui::MainWindow window;
+      window.add_document_session(std::move(document), QStringLiteral("Lazy source"));
+      show_window(window);
+      auto* canvas = require_canvas(window);
+      canvas->set_zoom(0.25);
+      canvas->set_lazy_clone_source_enabled_for_testing(lazy);
+      canvas->set_tool(test_case.tool);
+      canvas->set_retouch_sample_layers(test_case.sample);
+      canvas->set_brush_size(301);
+      canvas->set_brush_softness(50);
+      canvas->set_brush_opacity(100);
+      if (test_case.transformed) {
+        canvas->set_clone_source_transform(patchy::CloneSourceTransform{125.0, 15.0});
+      }
+      QApplication::processEvents();
+      const auto layer_bytes = [&window, layer_id] {
+        const auto* layer = std::as_const(patchy::ui::MainWindowTestAccess::document(window)).find_layer(layer_id);
+        const auto bytes = layer->pixels().data();
+        return std::vector<std::uint8_t>(bytes.begin(), bytes.end());
+      };
+      const auto settle = [canvas] {
+        for (int wait = 0; wait < 400 && !canvas->render_settled(); ++wait) {
+          canvas->repaint();
+          QApplication::processEvents();
+        }
+      };
+      const auto widget_point = [canvas](QPoint document_point) {
+        return canvas->widget_position_for_document_point(document_point);
+      };
+      send_mouse(*canvas, QEvent::MouseButtonPress, widget_point(QPoint(700, 650)), Qt::LeftButton, Qt::LeftButton,
+                 Qt::AltModifier);
+      send_mouse(*canvas, QEvent::MouseButtonRelease, widget_point(QPoint(700, 650)), Qt::LeftButton, Qt::NoButton,
+                 Qt::AltModifier);
+      settle();
+      const auto before = layer_bytes();
+      const auto diagnostics_before = canvas->render_cache_diagnostics();
+      // From 120 px right of the source rightwards: the stroke soon samples what it painted
+      // (the source keeps the press's pixels there), with a frame after every move.
+      const QPoint from(820, 600);
+      const QPoint to(1400, 780);
+      send_mouse(*canvas, QEvent::MouseButtonPress, widget_point(from), Qt::LeftButton, Qt::LeftButton);
+      canvas->repaint();
+      QApplication::processEvents();
+      constexpr int kSteps = 30;
+      for (int step = 1; step <= kSteps; ++step) {
+        const QPoint point(from.x() + (to.x() - from.x()) * step / kSteps,
+                           from.y() + (to.y() - from.y()) * step / kSteps);
+        send_mouse(*canvas, QEvent::MouseMove, widget_point(point), Qt::NoButton, Qt::LeftButton);
+        canvas->repaint();
+        QApplication::processEvents();
+      }
+      send_mouse(*canvas, QEvent::MouseButtonRelease, widget_point(to), Qt::LeftButton, Qt::NoButton);
+      QApplication::processEvents();
+      settle();
+      Result result;
+      result.bytes = layer_bytes();
+      CHECK(result.bytes != before);
+      const auto diagnostics = canvas->render_cache_diagnostics();
+      result.tiles_filled = diagnostics.retouch_source_tiles_filled - diagnostics_before.retouch_source_tiles_filled;
+      result.cache_detaches =
+          diagnostics.render_cache_patch_detaches - diagnostics_before.render_cache_patch_detaches;
+      patchy::ui::MainWindowTestAccess::undo(window);
+      settle();
+      result.undo_restored = layer_bytes() == before;
+      return result;
+    };
+    const auto whole = paint(false);
+    const auto lazy = paint(true);
+    constexpr int kTiles = ((kWidth + 63) / 64) * ((kHeight + 63) / 64);
+    if (lazy.bytes != whole.bytes || !lazy.undo_restored || lazy.cache_detaches != 0) {
+      std::printf("[INFO] lazy clone source case %s: bytes %s, undo %s, tiles %d of %d, cache copies %d\n",
+                  test_case.name, lazy.bytes == whole.bytes ? "same" : "changed",
+                  lazy.undo_restored ? "restores" : "differs", lazy.tiles_filled, kTiles, lazy.cache_detaches);
+    }
+    CHECK(lazy.bytes == whole.bytes);
+    CHECK(whole.undo_restored);
+    CHECK(lazy.undo_restored);
+    CHECK(whole.tiles_filled == 0);
+    if (test_case.sample == patchy::SampleLayers::AllLayers) {
+      // The whole-image source shared the cache, so the frames did patch it mid-stroke.
+      CHECK(whole.cache_detaches > 0);
+    }
+    // Only the tiles around the stroke and its source, and the cache is patched in place.
+    CHECK(lazy.tiles_filled > 0);
+    CHECK(lazy.tiles_filled < kTiles / 2);
+    CHECK(lazy.cache_detaches == 0);
+  }
+}
+
+void ui_coalesced_pointer_history_keeps_points_after_previous_sample() {
+  using patchy::ui::PointerHistoryPoint;
+  const std::vector<PointerHistoryPoint> history{
+      {10, 10, 100}, {9, 9, 99}, {9, 9, 98}, {7, 6, 97}, {4, 4, 95}, {2, 2, 93}};
+  // Newest first in, oldest first out; a repeated position keeps its newest
+  // entry, and the walk stops at the previous sample.
+  const auto recovered = patchy::ui::pointer_history_since(history, PointerHistoryPoint{4, 4, 95});
+  CHECK(recovered.size() == 2U);
+  CHECK(recovered.size() == 2U && recovered[0] == (PointerHistoryPoint{7, 6, 97}));
+  CHECK(recovered.size() == 2U && recovered[1] == (PointerHistoryPoint{9, 9, 99}));
+  // A previous sample the buffer no longer holds: everything newer than it.
+  CHECK(patchy::ui::pointer_history_since(history, PointerHistoryPoint{3, 3, 96}).size() == 2U);
+  // No anchor, or nothing but the current point: nothing to join.
+  CHECK(patchy::ui::pointer_history_since(history, std::nullopt).empty());
+  CHECK(patchy::ui::pointer_history_since(std::span(history).first(1), PointerHistoryPoint{4, 4, 95}).empty());
+  // The system tick wraps: 2 comes after 0xFFFFFFFE.
+  const std::vector<PointerHistoryPoint> wrapped{{5, 5, 4}, {4, 4, 2}, {3, 3, 0xFFFFFFFFU}, {2, 2, 0xFFFFFFFEU}};
+  const auto across = patchy::ui::pointer_history_since(wrapped, PointerHistoryPoint{2, 2, 0xFFFFFFFEU});
+  CHECK(across.size() == 2U);
+  CHECK(across.size() == 2U && across[0].x == 3 && across[1].x == 4);
+}
+
+// GitHub issue 165: zoomed out, every brush frame used to throw the display
+// mip chain away, so the next paint rebuilt it from the whole composite. The
+// chain is now patched under the stroke and must match a full rebuild.
+void ui_zoomed_out_brush_stroke_patches_display_mips_in_place() {
+  // Odd sizes and partly transparent pixels reach the odd-edge blocks and
+  // the alpha-weighted average.
+  constexpr int kWidth = 333;
+  constexpr int kHeight = 221;
+  patchy::PixelBuffer pixels(kWidth, kHeight, patchy::PixelFormat::rgba8());
+  for (int y = 0; y < kHeight; ++y) {
+    for (int x = 0; x < kWidth; ++x) {
+      auto* pixel = pixels.pixel(x, y);
+      pixel[0] = static_cast<std::uint8_t>((x * 7) % 256);
+      pixel[1] = static_cast<std::uint8_t>((y * 5) % 256);
+      pixel[2] = static_cast<std::uint8_t>(((x + y) * 3) % 256);
+      pixel[3] = static_cast<std::uint8_t>(40 + (x * 215) / kWidth);
+    }
+  }
+  patchy::Document document(kWidth, kHeight, patchy::PixelFormat::rgba8());
+  document.add_pixel_layer("Paint", std::move(pixels));
+
+  patchy::ui::CanvasWidget canvas;
+  canvas.resize(220, 180);
+  canvas.set_document(&document);
+  canvas.set_tool(patchy::ui::CanvasTool::Brush);
+  canvas.set_zoom(0.25);
+  canvas.set_primary_color(QColor(20, 200, 90));
+  canvas.set_brush_size(23);
+  canvas.set_brush_opacity(60);
+  canvas.set_brush_softness(50);
+  canvas.show();
+  QApplication::processEvents();
+  (void)canvas.grab();
+  const auto before = canvas.render_cache_diagnostics();
+  CHECK(before.display_mip_rebuilds >= 1);
+
+  drag_document_path(canvas, {QPoint(31, 17), QPoint(170, 140), QPoint(300, 40), QPoint(332, 220)}, 9);
+  QApplication::processEvents();
+  const auto patched = canvas.grab().toImage();
+  const auto after = canvas.render_cache_diagnostics();
+  CHECK(after.partial_patches > before.partial_patches);
+  CHECK(after.display_mip_rebuilds == before.display_mip_rebuilds);
+  save_image_artifact("ui_zoomed_out_brush_patched_mips", patched);
+
+  canvas.force_refresh();
+  QApplication::processEvents();
+  const auto rebuilt = canvas.grab().toImage();
+  CHECK(canvas.render_cache_diagnostics().display_mip_rebuilds > after.display_mip_rebuilds);
+  CHECK(patched.size() == rebuilt.size());
+  CHECK(patched == rebuilt);
+}
+
+// Issue 253: Opacity and Flow share the 0..100 range of Soft and Smooth, so every options-bar
+// percentage has one minimum (Photoshop stops Opacity and Flow at 1%). The popup slider, the
+// arrow keys, the typed field and a label scrub all reach 0, in Dark and Light, and a stroke at
+// 0% Opacity or 0% Flow (Airbrush on or off; the Line tool and the Eraser too) leaves the layer
+// byte for byte untouched: no paint, no NaN, no assert. The last case proves the strokes paint.
+void ui_brush_opacity_and_flow_accept_zero_and_paint_nothing() {
+  ColorSchemeRestorer restore_scheme;
+  for (const auto scheme :
+       {patchy::ui::ColorSchemePreference::Dark, patchy::ui::ColorSchemePreference::Light}) {
+    ColorSchemeRestorer::apply(scheme);
+    const std::string scheme_name = scheme == patchy::ui::ColorSchemePreference::Dark ? "dark" : "light";
+    {
+      patchy::ui::MainWindow window;
+      show_window(window);
+      require_action_by_text(window, QStringLiteral("Brush"))->trigger();
+      QApplication::processEvents();
+      auto* canvas = require_canvas(window);
+      auto* softness = window.findChild<QSpinBox*>(QStringLiteral("brushSoftnessSpin"));
+      CHECK(softness != nullptr);
+      CHECK(softness->minimum() == 0);
+
+      const auto find_label = [&window](const QString& text) {
+        QLabel* found = nullptr;
+        for (auto* label : window.findChildren<QLabel*>()) {
+          if (label->isVisible() && label->text() == text && label->property("optionLabel").toBool()) {
+            found = label;
+          }
+        }
+        CHECK(found != nullptr);
+        return found;
+      };
+      const auto exercise = [&](const QString& base_name, const QString& label_text,
+                                const std::function<int()>& canvas_value) {
+        auto* spin = window.findChild<QSpinBox*>(base_name + QStringLiteral("Spin"));
+        CHECK(spin != nullptr);
+        spin->setValue(50);
+        CHECK(canvas_value() == 50);
+
+        // The popup slider reaches 0.
+        auto* action = window.findChild<QAction*>(base_name + QStringLiteral("PopupAction"));
+        CHECK(action != nullptr);
+        action->trigger();
+        QApplication::processEvents();
+        auto* popup = window.findChild<QFrame*>(base_name + QStringLiteral("Popup"));
+        auto* slider = window.findChild<QSlider*>(base_name + QStringLiteral("PopupSlider"));
+        CHECK(popup != nullptr && popup->isVisible());
+        CHECK(slider != nullptr);
+        patchy::ui::set_slider_to_value(*slider, slider->minimum());
+        QApplication::processEvents();
+        if (base_name == QStringLiteral("brushOpacity")) {
+          save_window_popup_artifact("issue_253_opacity_popup_minimum_" + scheme_name, window, *spin, *popup);
+        }
+        CHECK(slider->minimum() == 0);
+        CHECK(spin->value() == 0);
+        CHECK(canvas_value() == 0);
+        popup->close();
+        QApplication::processEvents();
+
+        // Range, step and arrow keys match Soft.
+        CHECK(spin->minimum() == softness->minimum());
+        CHECK(spin->maximum() == softness->maximum());
+        CHECK(spin->singleStep() == softness->singleStep());
+        spin->setValue(1);
+        send_key(*spin, Qt::Key_Down);
+        CHECK(spin->value() == 0);
+        send_key(*spin, Qt::Key_Down);
+        CHECK(spin->value() == 0);
+        CHECK(canvas_value() == 0);
+
+        // Typing 0 is accepted.
+        spin->setValue(50);
+        spin->setFocus(Qt::TabFocusReason);
+        QApplication::processEvents();
+        spin->selectAll();
+        QKeyEvent zero(QEvent::KeyPress, Qt::Key_0, Qt::NoModifier, QStringLiteral("0"));
+        QApplication::sendEvent(spin, &zero);
+        send_key(*spin, Qt::Key_Return);
+        CHECK(spin->value() == 0);
+        CHECK(canvas_value() == 0);
+
+        // A label scrub stops at 0, like Soft's.
+        spin->setValue(30);
+        auto* label = find_label(label_text);
+        const auto origin = label->rect().center();
+        const auto far_left = origin - QPoint(5000, 0);
+        send_mouse(*label, QEvent::MouseButtonPress, origin, Qt::LeftButton, Qt::LeftButton);
+        send_mouse(*label, QEvent::MouseMove, far_left, Qt::NoButton, Qt::LeftButton);
+        send_mouse(*label, QEvent::MouseButtonRelease, far_left, Qt::LeftButton, Qt::NoButton);
+        QApplication::processEvents();
+        CHECK(spin->value() == 0);
+        CHECK(canvas_value() == 0);
+        spin->setValue(100);
+      };
+      exercise(QStringLiteral("brushOpacity"), QStringLiteral("Opacity"),
+               [canvas] { return canvas->brush_opacity(); });
+      exercise(QStringLiteral("brushFlow"), QStringLiteral("Flow"), [canvas] { return canvas->brush_flow(); });
+    }
+
+    patchy::Document document(96, 96, patchy::PixelFormat::rgba8());
+    const auto layer_id = document.add_pixel_layer(
+        "Paint", solid_pixels(96, 96, patchy::PixelFormat::rgba8(), Qt::white)).id();
+    patchy::ui::CanvasWidget canvas;
+    canvas.resize(192, 192);
+    canvas.set_document(&document);
+    canvas.set_zoom(1.0);
+    canvas.set_primary_color(Qt::black);
+    canvas.set_brush_size(24);
+    canvas.set_brush_softness(50);  // a soft edge reaches the accumulating coverage paths
+    canvas.show();
+    QApplication::processEvents();
+
+    struct StrokeCase {
+      patchy::ui::CanvasTool tool;
+      int opacity;
+      int flow;
+      bool airbrush;
+      bool paints;
+    };
+    const StrokeCase cases[] = {
+        {patchy::ui::CanvasTool::Brush, 0, 100, false, false},
+        {patchy::ui::CanvasTool::Brush, 0, 100, true, false},
+        {patchy::ui::CanvasTool::Brush, 100, 0, false, false},
+        {patchy::ui::CanvasTool::Brush, 100, 0, true, false},
+        {patchy::ui::CanvasTool::Brush, 0, 0, true, false},
+        {patchy::ui::CanvasTool::Eraser, 0, 100, false, false},
+        {patchy::ui::CanvasTool::Line, 0, 100, false, false},
+        {patchy::ui::CanvasTool::Brush, 100, 100, false, true},
+    };
+    for (const auto& stroke : cases) {
+      canvas.set_tool(stroke.tool);
+      canvas.set_brush_opacity(stroke.opacity);
+      canvas.set_brush_flow(stroke.flow);
+      canvas.set_brush_build_up(stroke.airbrush);
+      CHECK(canvas.brush_opacity() == stroke.opacity);
+      CHECK(canvas.brush_flow() == stroke.flow);
+      const auto before_bytes = std::as_const(document).find_layer(layer_id)->pixels().data();
+      const std::vector<std::uint8_t> before(before_bytes.begin(), before_bytes.end());
+      const auto from = canvas.widget_position_for_document_point(QPoint(24, 48));
+      const auto to = canvas.widget_position_for_document_point(QPoint(72, 48));
+      send_mouse(canvas, QEvent::MouseButtonPress, from, Qt::LeftButton, Qt::LeftButton);
+      for (int step = 1; step <= 6; ++step) {
+        const QPoint at(from.x() + (to.x() - from.x()) * step / 6, from.y());
+        send_mouse(canvas, QEvent::MouseMove, at, Qt::NoButton, Qt::LeftButton);
+      }
+      QTest::qWait(stroke.airbrush ? 180 : 10);  // a held Airbrush adds timer dabs
+      send_mouse(canvas, QEvent::MouseButtonRelease, to, Qt::LeftButton, Qt::NoButton);
+      QApplication::processEvents();
+      const auto after = std::as_const(document).find_layer(layer_id)->pixels().data();
+      const bool untouched = after.size() == before.size() && std::equal(after.begin(), after.end(), before.begin());
+      CHECK(untouched == !stroke.paints);
+    }
+  }
+}
+
+}  // namespace
+
+std::vector<patchy::test::TestCase> brush_engine_stroke_tests_part1() {
+  return {
+      {"ui_cut_selection_clears_source_and_keeps_clipboard", ui_cut_selection_clears_source_and_keeps_clipboard},
+      {"ui_cut_selection_cuts_layer_nested_in_folder", ui_cut_selection_cuts_layer_nested_in_folder},
+      {"ui_brush_on_pasted_layer_expands_layer_bounds", ui_brush_on_pasted_layer_expands_layer_bounds},
+      {"ui_brush_opacity_caps_per_stroke", ui_brush_opacity_caps_per_stroke},
+      {"ui_low_opacity_large_brush_whole_canvas_is_exact_fill_region",
+       ui_low_opacity_large_brush_whole_canvas_is_exact_fill_region},
+      {"ui_soft_brush_click_paints_single_dab", ui_soft_brush_click_paints_single_dab},
+      {"ui_brush_can_start_off_canvas_with_visible_soft_edge",
+       ui_brush_can_start_off_canvas_with_visible_soft_edge},
+      {"ui_brush_stroke_continues_through_off_canvas_grey_area",
+       ui_brush_stroke_continues_through_off_canvas_grey_area},
+      {"ui_large_soft_brush_repaints_after_small_drag",
+       ui_large_soft_brush_repaints_after_small_drag},
+      {"ui_large_soft_brush_drag_stays_responsive",
+       ui_large_soft_brush_drag_stays_responsive},
+      {"ui_soft_brush_shift_click_does_not_overpaint_anchor",
+       ui_soft_brush_shift_click_does_not_overpaint_anchor},
+      {"ui_soft_brush_line_ignores_mouse_event_density", ui_soft_brush_line_ignores_mouse_event_density},
+      {"ui_layer_mask_brush_opacity_caps_per_stroke",
+       ui_layer_mask_brush_opacity_caps_per_stroke},
+      {"ui_shift_constrains_brush_and_eraser_strokes_to_axis",
+       ui_shift_constrains_brush_and_eraser_strokes_to_axis},
+      {"ui_shift_constrains_clone_stamp_strokes_to_axis",
+       ui_shift_constrains_clone_stamp_strokes_to_axis},
+      {"ui_brush_alt_right_drag_adjusts_size_and_softness",
+       ui_brush_alt_right_drag_adjusts_size_and_softness},
+      {"ui_pen_alt_barrel_button_adjusts_brush_size_and_softness",
+       ui_pen_alt_barrel_button_adjusts_brush_size_and_softness},
+      {"ui_pen_brush_adjust_overlay_centers_on_pen", ui_pen_brush_adjust_overlay_centers_on_pen},
+      {"ui_brush_alt_right_drag_syncs_options_bar_spins",
+       ui_brush_alt_right_drag_syncs_options_bar_spins},
+      {"ui_brush_shift_click_connects_strokes", ui_brush_shift_click_connects_strokes},
+      {"ui_paint_shift_line_preview_follows_pointer", ui_paint_shift_line_preview_follows_pointer},
+      {"ui_paint_shift_line_preview_starts_at_pixel_center",
+       ui_paint_shift_line_preview_starts_at_pixel_center},
+      {"ui_brush_opacity_and_flow_digit_keys_set_values",
+       ui_brush_opacity_and_flow_digit_keys_set_values},
+      {"ui_undo_shortcut_includes_ctrl_alt_z", ui_undo_shortcut_includes_ctrl_alt_z},
+      {"ui_one_pixel_brush_drag_paints_fractional_smoothed_line",
+       ui_one_pixel_brush_drag_paints_fractional_smoothed_line},
+      {"ui_one_pixel_brush_and_eraser_same_cell_drag_touches_one_pixel",
+       ui_one_pixel_brush_and_eraser_same_cell_drag_touches_one_pixel},
+      {"ui_max_zoom_brush_skips_noop_stroke_repaints",
+       ui_max_zoom_brush_skips_noop_stroke_repaints},
+      {"ui_deep_zoom_brush_repaint_stays_responsive",
+       ui_deep_zoom_brush_repaint_stays_responsive},
+      {"ui_square_brush_preset_paints_square_tip_and_round_presets_restore_round",
+       ui_square_brush_preset_paints_square_tip_and_round_presets_restore_round},
+      {"ui_brush_preset_list_leads_with_round_and_retired_round_id_resolves",
+       ui_brush_preset_list_leads_with_round_and_retired_round_id_resolves},
+      {"ui_airbrush_preset_builds_while_stationary",
+       ui_airbrush_preset_builds_while_stationary},
+      {"ui_brush_mode_strokes_blend_clear_behind_and_undo", ui_brush_mode_strokes_blend_clear_behind_and_undo},
+      {"ui_brush_mode_paints_16_bit_and_palette_documents", ui_brush_mode_paints_16_bit_and_palette_documents},
+      {"ui_brush_mode_stroke_samples_artifact", ui_brush_mode_stroke_samples_artifact},
+      {"ui_brush_flow_builds_only_to_opacity_cap_and_round_trips_psd",
+       ui_brush_flow_builds_only_to_opacity_cap_and_round_trips_psd},
+      {"ui_brush_opacity_and_flow_accept_zero_and_paint_nothing",
+       ui_brush_opacity_and_flow_accept_zero_and_paint_nothing},
+      {"ui_pattern_stamp_alignment_palette_and_psd_round_trip",
+       ui_pattern_stamp_alignment_palette_and_psd_round_trip},
+      {"ui_airbrush_fast_strokes_ignore_mouse_event_density",
+       ui_airbrush_fast_strokes_ignore_mouse_event_density},
+      {"ui_airbrush_jittered_stroke_uses_smoothed_path", ui_airbrush_jittered_stroke_uses_smoothed_path},
+      {"ui_soft_opaque_brush_l_corner_stacks_soft_edges",
+       ui_soft_opaque_brush_l_corner_stacks_soft_edges},
+      {"ui_soft_brush_overlap_artifact_gallery", ui_soft_brush_overlap_artifact_gallery},
+      {"ui_clone_tool_samples_source_and_paints_offset", ui_clone_tool_samples_source_and_paints_offset},
+      {"ui_clone_tool_feathered_rgba_edges_keep_source_color",
+       ui_clone_tool_feathered_rgba_edges_keep_source_color},
+      {"ui_healing_brush_transfers_detail_and_preserves_destination_tone",
+       ui_healing_brush_transfers_detail_and_preserves_destination_tone},
+      {"ui_local_adjustment_brushes_use_fixed_math_and_round_trip_psd",
+       ui_local_adjustment_brushes_use_fixed_math_and_round_trip_psd},
+      {"ui_blur_brush_softens_edges_against_transparency", ui_blur_brush_softens_edges_against_transparency},
+      {"ui_smudge_keeps_color_at_transparent_edges", ui_smudge_keeps_color_at_transparent_edges},
+      {"ui_sharpen_steepens_soft_edges_against_transparency",
+       ui_sharpen_steepens_soft_edges_against_transparency},
+      {"ui_retouch_tools_keep_color_and_alpha_at_transparent_edges",
+       ui_retouch_tools_keep_color_and_alpha_at_transparent_edges},
+      {"ui_smudge_tool_drags_painted_pixels", ui_smudge_tool_drags_painted_pixels},
+      {"ui_smudge_strength_is_its_own_setting", ui_smudge_strength_is_its_own_setting},
+      {"ui_smudge_strength_photo_picture_if_available", ui_smudge_strength_photo_picture_if_available},
+      {"ui_wet_edges_uses_one_continuous_stroke_boundary",
+       ui_wet_edges_uses_one_continuous_stroke_boundary},
+      {"ui_mixer_brush_uses_compact_controls_and_round_trips_raster_pixels",
+       ui_mixer_brush_uses_compact_controls_and_round_trips_raster_pixels},
+      {"ui_mixer_sample_all_layers_switches_stroke_start_sample",
+       ui_mixer_sample_all_layers_switches_stroke_start_sample},
+      {"ui_mixer_useful_combination_presets_set_wet_load_mix",
+       ui_mixer_useful_combination_presets_set_wet_load_mix},
+      {"ui_mixer_calibration_contact_sheet", ui_mixer_calibration_contact_sheet},
+      {"ui_brush_smoothing_options_bar_round_trips_settings",
+       ui_brush_smoothing_options_bar_round_trips_settings},
+      {"ui_brush_overlay_gear_defaults_off_and_persists", ui_brush_overlay_gear_defaults_off_and_persists},
+      {"ui_brush_overlay_draws_dab_in_foreground_color", ui_brush_overlay_draws_dab_in_foreground_color},
+      {"ui_brush_overlay_small_dabs_match_painted_footprint",
+       ui_brush_overlay_small_dabs_match_painted_footprint},
+      {"ui_brush_drag_dabs_center_on_pointer", ui_brush_drag_dabs_center_on_pointer},
+      {"ui_brush_overlay_show_outline_off_removes_outline", ui_brush_overlay_show_outline_off_removes_outline},
+      {"ui_brush_overlay_opacity_row_matches_menu_background",
+       ui_brush_overlay_opacity_row_matches_menu_background},
+      {"ui_brush_overlay_opacity_label_aligns_with_item_text",
+       ui_brush_overlay_opacity_label_aligns_with_item_text},
+      {"ui_brush_smoothing_pulled_string_short_drag_paints_only_press_dab",
+       ui_brush_smoothing_pulled_string_short_drag_paints_only_press_dab},
+      {"ui_brush_one_pixel_slanted_drag_stays_continuous", ui_brush_one_pixel_slanted_drag_stays_continuous},
+      {"ui_brush_smoothing_catch_up_on_end_completes_stroke",
+       ui_brush_smoothing_catch_up_on_end_completes_stroke},
+      {"ui_brush_stroke_paints_every_coalesced_mouse_sample",
+       ui_brush_stroke_paints_every_coalesced_mouse_sample},
+      {"ui_hard_round_stroke_skip_keeps_bytes", ui_hard_round_stroke_skip_keeps_bytes},
+      {"ui_brush_banded_dabs_keep_bytes", ui_brush_banded_dabs_keep_bytes},
+      {"ui_brush_stroke_coalesces_queued_moves_and_keeps_bytes", ui_brush_stroke_coalesces_queued_moves_and_keeps_bytes},
+      {"ui_clone_stamp_large_brush_skip_keeps_bytes", ui_clone_stamp_large_brush_skip_keeps_bytes},
+      {"ui_clone_stroke_coalesces_queued_moves_and_keeps_bytes",
+       ui_clone_stroke_coalesces_queued_moves_and_keeps_bytes},
+      {"ui_clone_lazy_source_keeps_bytes_and_undo_restores", ui_clone_lazy_source_keeps_bytes_and_undo_restores},
+      {"ui_coalesced_pointer_history_keeps_points_after_previous_sample",
+       ui_coalesced_pointer_history_keeps_points_after_previous_sample},
+      {"ui_zoomed_out_brush_stroke_patches_display_mips_in_place",
+       ui_zoomed_out_brush_stroke_patches_display_mips_in_place},
+      {"ui_copy_ignores_hidden_active_layer", ui_copy_ignores_hidden_active_layer},
+      {"ui_copy_selected_layers_copies_composited_selection", ui_copy_selected_layers_copies_composited_selection},
+      {"ui_eraser_on_background_paints_background_color_and_size_cursor",
+       ui_eraser_on_background_paints_background_color_and_size_cursor},
+      {"ui_brush_and_eraser_remember_separate_settings", ui_brush_and_eraser_remember_separate_settings},
+      {"ui_magic_wand_cursor_marks_click_hotspot", ui_magic_wand_cursor_marks_click_hotspot},
+      {"ui_spacebar_pan_works_from_layer_panel_but_not_text_entry",
+       ui_spacebar_pan_works_from_layer_panel_but_not_text_entry},
+      {"ui_move_tool_after_text_edit_keeps_spacebar_pan_active",
+       ui_move_tool_after_text_edit_keeps_spacebar_pan_active},
+      {"ui_spacebar_pan_works_while_child_dialog_focused",
+       ui_spacebar_pan_works_while_child_dialog_focused},
+  };
+}

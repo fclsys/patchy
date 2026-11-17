@@ -1,0 +1,208 @@
+#pragma once
+
+#include "core/vector_shape.hpp"
+#include "ui/unit_spin_box.hpp"
+#include "ui/appearance_edits.hpp"
+
+#include <QSize>
+#include <QString>
+
+#include <functional>
+#include <memory>
+#include <optional>
+#include <string>
+#include <vector>
+
+class QDialog;
+class QScreen;
+class QWidget;
+
+namespace patchy {
+struct PatternStore;
+}
+
+namespace patchy::ui {
+
+class CustomShapeLibrary;
+class GradientLibrary;
+class PatternLibrary;
+
+// A shape picked in Geometry's Shape picker (GitHub #644): its library id and unit-box path.
+struct PickedCustomShape {
+  std::string id;
+  VectorPath path;
+};
+
+// Geometry's box for a shape layer drawn as a plain path (a custom shape, a Pen outline;
+// GitHub #642): the path's bounds (VectorPath::bounds) in document pixels.
+struct ShapePathBox {
+  double left{0.0};
+  double top{0.0};
+  double right{0.0};
+  double bottom{0.0};
+
+  friend bool operator==(const ShapePathBox&, const ShapePathBox&) = default;
+};
+
+// The editable appearance of a shape/fill layer. `geometry` carries the
+// layer's single live-shape origination when the caller allows editing it
+// (rect/rounded-rect bounds and radii, ellipse and polygon bounds, polygon sides
+// and star inset, line endpoints and weight); the dialog edits the params in place
+// and the caller regenerates the subpaths. Dialog-based geometry editing is the
+// reviewed patent route; on-canvas live-shape gizmos stay excluded (docs/vector-tools.md).
+struct ShapeAppearanceSettings {
+  VectorFill fill{};
+  VectorStroke stroke{};
+  std::optional<LiveShapeParams> geometry;
+  // A layer whose path has no live shape to regenerate (a custom shape, a Pen outline;
+  // GitHub #642): its bounds. A changed box moves and scales the path.
+  std::optional<ShapePathBox> path_box{};
+  // A custom shape picked in Geometry (GitHub #644): a unit-box library path that
+  // replaces the layer's outline, fitted to `path_box`. Only set by that pick.
+  std::shared_ptr<const PickedCustomShape> path_shape{};
+  // The library shape the layer was stamped from (VectorShapeContent::library_shape_id)
+  // and its current outline, so the picker can show that shape when the outline still is
+  // it (GitHub #644 follow-up). Read when the dialog opens; never compared, edited or applied.
+  std::string library_shape_id{};
+  std::shared_ptr<const VectorPath> library_shape_outline{};
+  // Layer transparency (the Layers panel values) and the shape's vector-mask
+  // Feather / Density (VectorShapeContent::feather/density), all PSD-native.
+  float layer_opacity{1.0F};
+  float fill_opacity{1.0F};
+  double feather{0.0};
+  std::uint8_t density{255};
+  std::shared_ptr<const AppearanceEdits<ShapeAppearanceSettings>> edits{};
+  bool preview_enabled{true};
+  // A Color, Gradient or Pattern fill layer without a vector path: the dialog shows
+  // only its Fill section (GitHub #582). Not an appearance value: never compared,
+  // edited or applied.
+  bool fill_layer_only{false};
+};
+
+// The Dashes > Custom "Dash pattern" field's text: lengths in stroke widths, space
+// separated in the UI locale. Parsing returns nullopt for text that is not a
+// usable pattern; an odd count repeats once (SVG's reading).
+[[nodiscard]] QString dash_pattern_text(const std::vector<double>& dashes);
+[[nodiscard]] std::optional<std::vector<double>> parse_dash_pattern_text(const QString& text);
+// A dash preset's name, as the Dashes combo and the options bar's dash combo show it.
+[[nodiscard]] QString stroke_dash_preset_label(StrokeDashPreset preset);
+
+// A stroke style the user saved in Shape Appearance (GitHub #557): the line
+// settings without width or paint. Saved in the app settings under
+// kStrokeStylePresetsKey as a JSON array (stroke_style_presets_json).
+struct StrokeStylePreset {
+  QString name;
+  VectorStrokeAlignment alignment{VectorStrokeAlignment::Inside};
+  VectorStrokeCap cap{VectorStrokeCap::Butt};
+  VectorStrokeJoin join{VectorStrokeJoin::Miter};
+  std::vector<double> dashes;  // stroke widths; empty is solid
+  double dash_offset{0.0};     // stroke widths
+};
+inline constexpr const char* kStrokeStylePresetsKey = "shapeAppearance/strokeStylePresets";
+[[nodiscard]] StrokeStylePreset stroke_style_preset_from(const VectorStroke& stroke, QString name);
+void apply_stroke_style_preset(VectorStroke& stroke, const StrokeStylePreset& preset);
+[[nodiscard]] bool stroke_matches_style_preset(const VectorStroke& stroke, const StrokeStylePreset& preset);
+[[nodiscard]] QString stroke_style_presets_json(const std::vector<StrokeStylePreset>& presets);
+// Skips entries it cannot read (no name, unusable dashes).
+[[nodiscard]] std::vector<StrokeStylePreset> parse_stroke_style_presets_json(const QString& json);
+[[nodiscard]] std::vector<StrokeStylePreset> load_stroke_style_presets();
+void save_stroke_style_presets(const std::vector<StrokeStylePreset>& presets);
+
+// One stroke list (GitHub #557 follow-up): Shape Appearance's Dashes combo and the
+// options bar's dash combo list the built-in dash presets, then the saved presets with
+// item data kSavedStrokePresetRow + index, then Custom. The Stroke Presets manager lists
+// the built-ins first too, locked.
+inline constexpr int kSavedStrokePresetRow = 1000;
+// A saved preset may not take a built-in's name (compared case-insensitively, in the UI language).
+[[nodiscard]] bool stroke_preset_name_is_builtin(const QString& name);
+// A built-in dash preset as the manager shows it: its name, its caps and corners (Butt and
+// Miter where it sets none), its pattern for those caps, Inside and no offset.
+[[nodiscard]] StrokeStylePreset builtin_stroke_style_preset(StrokeDashPreset preset);
+// The index of the first saved preset `stroke` matches on every field, or -1.
+[[nodiscard]] int matching_stroke_style_preset(const VectorStroke& stroke,
+                                               const std::vector<StrokeStylePreset>& presets);
+
+// Live-preview dialog for a shape layer's fill and stroke (the
+// request_levels_settings convention): every control change fires
+// preview_changed with the full settings; returns nullopt on cancel. Pattern
+// choices may reference library-only pattern ids - the caller adopts them
+// into the document PatternStore when applying. foreground/background resolve
+// gradient presets that defer stops to the current tool colors.
+// `reset_defaults` is what the Reset button restores (fill, stroke, opacity,
+// edge; the geometry in `initial` is kept). `units` presents the geometry,
+// line weight and stroke width fields in the ruler unit through the document
+// PPI (docs/resolution-units.md); every value stays document pixels.
+// The custom shape library behind Geometry's Shape picker (GitHub #644): `library` returns it
+// with the bundled pack loaded, `manage` opens the Shapes Manager over `parent`. Without a
+// library the picker is left out.
+struct ShapeAppearanceShapeSource {
+  std::function<const CustomShapeLibrary*()> library;
+  std::function<void(QWidget* parent)> manage;
+};
+
+// The dialog's rows, built into `host` (docs/vector-tools-appearance.md). The modal dialog
+// below builds them into itself; the stay-open Shape Appearance window (shape_appearance_panel)
+// builds a new page for each target it follows, with `window` the top-level window around it.
+enum class ShapeAppearanceBodyMode {
+  Modal,  // Preview, Reset, OK, Cancel: changes are previews until OK
+  Live,   // Reset, Close: every change is applied at once
+};
+
+struct ShapeAppearanceBodyOptions {
+  // Fired with the full settings on every control change.
+  std::function<void(const ShapeAppearanceSettings&)> changed;
+  ShapeAppearanceSettings initial;
+  ShapeAppearanceSettings reset_defaults;
+  GradientLibrary* gradient_library{nullptr};
+  PatternLibrary* pattern_library{nullptr};
+  const PatternStore* document_patterns{nullptr};  // read while building only
+  RgbColor foreground{};
+  RgbColor background{};
+  DocumentFieldUnits units{};
+  const AppearanceDialogContext<ShapeAppearanceSettings>* batch{nullptr};  // copied
+  ShapeAppearanceShapeSource custom_shapes{};
+  ShapeAppearanceBodyMode mode{ShapeAppearanceBodyMode::Modal};
+  // Runs a dialog a row opens (color picker, Gradient Manager, Shapes Manager); `body`
+  // returns false when it was cancelled. Unset: `body` is called directly.
+  std::function<void(const std::function<bool()>& body)> run_child_dialog;
+  // Live only: a "Show handles" box under the fill's Gradient rows and one under the
+  // stroke's (GitHub issue 694, docs/gradients-fill-handles.md); `gradient_handles_toggled`
+  // set adds them. Only one gradient has handles at a time: `show_gradient_handles` says
+  // whether any does, `gradient_handles_on_stroke` which one when the fill and the stroke
+  // are both gradients (with one gradient, that one). Ticking a box unticks the other.
+  bool show_gradient_handles{false};
+  bool gradient_handles_on_stroke{false};
+  std::function<void(bool show, bool on_stroke)> gradient_handles_toggled;
+};
+
+struct ShapeAppearanceBody {
+  bool fill_layer_only{false};
+  // The size of `host` that shows every visible row, capped to the screen. `chrome_height`
+  // is what a window around the host adds to its height (0 when the host is the window).
+  std::function<QSize(const QScreen*, int chrome_height)> fitted_size;
+  std::function<ShapeAppearanceSettings()> settings;
+  // The modal dialog's accepted result (turns Preview back on first).
+  std::function<ShapeAppearanceSettings()> finish;
+  // Live: the edits captured so far are applied. `current` is each target's appearance now;
+  // later changes are captured against it.
+  std::function<void(std::vector<ShapeAppearanceSettings> current)> rebase;
+};
+
+// A dynamic property of the stay-open window: the size it was last given by the window's own
+// code (the fit at opening, a page that needed more room). A size that differs from it is the
+// user's, which is only ever grown.
+inline constexpr char kShapeAppearanceAutoSizeProperty[] = "shapeAppearanceAutoSize";
+
+[[nodiscard]] ShapeAppearanceBody build_shape_appearance_body(QWidget& host, QDialog& window,
+                                                             ShapeAppearanceBodyOptions options);
+
+[[nodiscard]] std::optional<ShapeAppearanceSettings> request_shape_appearance_settings(
+    QWidget* parent, std::function<void(const ShapeAppearanceSettings&)> preview_changed,
+    ShapeAppearanceSettings initial, ShapeAppearanceSettings reset_defaults,
+    GradientLibrary* gradient_library,
+    PatternLibrary* pattern_library, const PatternStore* document_patterns, RgbColor foreground,
+    RgbColor background, const DocumentFieldUnits& units = {},
+    const AppearanceDialogContext<ShapeAppearanceSettings>* batch = nullptr,
+    const ShapeAppearanceShapeSource& custom_shapes = {});
+
+}  // namespace patchy::ui

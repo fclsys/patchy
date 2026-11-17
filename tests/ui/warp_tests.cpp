@@ -1,0 +1,3274 @@
+#include <QStatusBar>
+#include <QTextBlock>
+#include "ui/canvas_widget.hpp"
+#include "core/layer_metadata.hpp"
+#include "core/smart_object.hpp"
+#include "core/text_warp.hpp"
+#include "core/warp_mesh.hpp"
+#include "ui/smart_object_render.hpp"
+#include "ui/pattern_library.hpp"
+#include "ui/brush_tip_library.hpp"
+#include "ui/dialog_utils.hpp"
+#include "formats/acv_curves_io.hpp"
+#include "formats/bmp_document_io.hpp"
+#include "formats/aseprite_document_io.hpp"
+#include "formats/ico_document_io.hpp"
+#include "formats/tga_document_io.hpp"
+#include "ui/main_window.hpp"
+#include "ui/text_layout.hpp"
+#include "psd/psd_document_io.hpp"
+#include "test_fonts.hpp"
+#include "test_harness.hpp"
+#include "local_psd_fixtures.hpp"
+#include <QApplication>
+#include <QCheckBox>
+#include <QComboBox>
+#include <QDialog>
+#include <QDialogButtonBox>
+#include <QDoubleSpinBox>
+#include <QFont>
+#include <QFontComboBox>
+#include <QFontDatabase>
+#include <QImage>
+#include <QItemSelectionModel>
+#include <QLabel>
+#include <QListWidget>
+#include <QMouseEvent>
+#include <QPainter>
+#include <QPushButton>
+#include <QRectF>
+#include <QRadioButton>
+#include <QSpinBox>
+#include <QStringList>
+#include <QTabWidget>
+#include <QTextCursor>
+#include <QTextEdit>
+#include <QTimer>
+#include <QToolBar>
+#include <algorithm>
+#include <atomic>
+#include <array>
+#include <chrono>
+#include <cstdio>
+#include <cstdint>
+#include <cmath>
+#include <cstring>
+#include <exception>
+#include <filesystem>
+#include <fstream>
+#include <functional>
+#include <iostream>
+#include <limits>
+#include <memory>
+#include <optional>
+#include <span>
+#include <stdexcept>
+#include <string>
+#include <string_view>
+#include <utility>
+#include <vector>
+#include "ui_test_access.hpp"
+#include "ui_test_groups.hpp"
+#include "ui_test_support.hpp"
+
+namespace {
+
+using namespace patchy::test::ui;
+
+void ui_warp_render_matches_photoshop_preview_if_available() {
+  const auto path = patchy::test::local_psd_fixture_path("ps2026_e6_warp_before.psd");
+  patchy::test::skip_unless_exists(path);
+  // The fixture's stored pixels ARE Photoshop's warped render; re-rendering through
+  // Patchy's warp pipeline must stay close to them.
+  auto document = patchy::psd::DocumentIo::read_file(path);
+  patchy::Layer* layer = nullptr;
+  for (auto& candidate : document.layers()) {
+    if (candidate.name() == "e5_a_40x30") {
+      layer = &candidate;
+    }
+  }
+  CHECK(layer != nullptr);
+  const auto photoshop_pixels = layer->pixels();
+  const auto photoshop_bounds = layer->bounds();
+  CHECK(patchy::smart_object_warp_from_layer(*layer).has_value());
+  CHECK(patchy::ui::refresh_smart_object_layer_preview(document, *layer,
+                                                       patchy::ui::CanvasWidget::TransformInterpolation::Bicubic));
+  const auto& rendered_pixels = layer->pixels();
+  const auto rendered_bounds = layer->bounds();
+  std::cout << "  warp bounds: PS " << photoshop_bounds.x << "," << photoshop_bounds.y << " "
+            << photoshop_bounds.width << "x" << photoshop_bounds.height << "  Patchy " << rendered_bounds.x
+            << "," << rendered_bounds.y << " " << rendered_bounds.width << "x" << rendered_bounds.height
+            << '\n';
+  CHECK(std::abs(rendered_bounds.x - photoshop_bounds.x) <= 4);
+  CHECK(std::abs(rendered_bounds.y - photoshop_bounds.y) <= 4);
+
+  double total_delta = 0.0;
+  int compared = 0;
+  for (int y = 0; y < photoshop_bounds.height; ++y) {
+    for (int x = 0; x < photoshop_bounds.width; ++x) {
+      const auto* ps = photoshop_pixels.pixel(x, y);
+      const int rx = photoshop_bounds.x + x - rendered_bounds.x;
+      const int ry = photoshop_bounds.y + y - rendered_bounds.y;
+      if (ps == nullptr || rx < 0 || ry < 0 || rx >= rendered_pixels.width() || ry >= rendered_pixels.height()) {
+        continue;
+      }
+      const auto* ours = rendered_pixels.pixel(rx, ry);
+      if (ours == nullptr || ps[3] < 200 || ours[3] < 200) {
+        continue;  // compare solid interior pixels (edge AA differs slightly)
+      }
+      total_delta += std::abs(int(ps[0]) - int(ours[0])) + std::abs(int(ps[1]) - int(ours[1])) +
+                     std::abs(int(ps[2]) - int(ours[2]));
+      ++compared;
+    }
+  }
+  CHECK(compared > 200);
+  const double mean_delta = total_delta / (compared * 3.0);
+  if (mean_delta >= 12.0) {
+    std::cout << "  warp render mean channel delta " << mean_delta << " over " << compared << " px\n";
+  }
+  CHECK(mean_delta < 12.0);
+}
+
+void ui_warped_smart_object_free_transform_rerenders() {
+  const auto path = patchy::test::local_psd_fixture_path("ps2026_e6_warp_before.psd");
+  patchy::test::skip_unless_exists(path);
+  patchy::ui::MainWindow window;
+  show_window(window);
+  patchy::ui::MainWindowTestAccess::open_document_path(window, QString::fromStdWString(path.wstring()));
+  QApplication::processEvents();
+  auto& document = patchy::ui::MainWindowTestAccess::document(window);
+  const patchy::Layer* warped = nullptr;
+  for (const auto& layer : std::as_const(document).layers()) {
+    if (layer.name() == "e5_a_40x30") {
+      warped = &layer;
+    }
+  }
+  CHECK(warped != nullptr);
+  const auto layer_id = warped->id();
+  // A supported warp imports UNLOCKED: no badge, no import notice, transforms allowed.
+  CHECK(patchy::smart_object_lock_reason(*warped).empty());
+  CHECK(patchy::smart_object_warp_from_layer(*warped).has_value());
+
+  // Select through the LIST so the canvas selection follows.
+  auto* layer_list = window.findChild<QListWidget*>(QStringLiteral("layerList"));
+  CHECK(layer_list != nullptr);
+  auto* item = require_layer_item(*layer_list, QStringLiteral("e5_a_40x30"));
+  layer_list->clearSelection();
+  layer_list->setCurrentItem(item);
+  item->setSelected(true);
+  QApplication::processEvents();
+  CHECK(document.active_layer_id() == layer_id);
+
+  auto* canvas = patchy::ui::MainWindowTestAccess::canvas(window);
+  CHECK(canvas != nullptr);
+  const auto before_placement = patchy::smart_object_placement_from_layer(*document.find_layer(layer_id));
+  CHECK(before_placement.has_value());
+  CHECK(canvas->begin_free_transform());
+  const auto controls = canvas->transform_controls_state();
+  CHECK(controls.has_value());
+  CHECK(canvas->set_transform_controls_state(controls->reference_position, 200.0, 200.0, 0.0));
+  QApplication::processEvents();
+  canvas->finish_free_transform();
+  QApplication::processEvents();
+
+  const auto* transformed = document.find_layer(layer_id);
+  CHECK(transformed != nullptr);
+  // The hull quad doubled and the warp survived (mesh is content-space, untouched).
+  const auto warp_after = patchy::smart_object_warp_from_layer(*transformed);
+  CHECK(warp_after.has_value());
+  const auto after_placement = patchy::smart_object_placement_from_layer(*transformed);
+  CHECK(after_placement.has_value());
+  const auto before_width = before_placement->transform[2] - before_placement->transform[0];
+  const auto after_width = after_placement->transform[2] - after_placement->transform[0];
+  CHECK(std::abs(after_width - before_width * 2.0) < 0.6);
+  CHECK(patchy::layer_smart_object_block_dirty(*transformed));
+  const auto raster_status =
+      std::as_const(*transformed).metadata().find(patchy::kLayerMetadataSmartObjectRasterStatus);
+  CHECK(raster_status != std::as_const(*transformed).metadata().end() &&
+        raster_status->second == patchy::kSmartObjectRasterStatusPatchy);
+  // Re-rendered through the warp: pixels track the doubled hull quad, not the content rect.
+  CHECK(std::abs(static_cast<double>(transformed->bounds().width) - after_width) < 4.0);
+
+  // The regenerated SoLd resaves and re-parses with the mesh byte-exact and the
+  // transformed quad intact.
+  const auto reread = patchy::psd::DocumentIo::read(patchy::psd::DocumentIo::write_layered_rgb8(document));
+  const patchy::Layer* reread_layer = nullptr;
+  for (const auto& layer : reread.layers()) {
+    if (layer.name() == "e5_a_40x30") {
+      reread_layer = &layer;
+    }
+  }
+  CHECK(reread_layer != nullptr);
+  CHECK(patchy::smart_object_lock_reason(*reread_layer).empty());
+  const auto reread_warp = patchy::smart_object_warp_from_layer(*reread_layer);
+  CHECK(reread_warp.has_value());
+  CHECK(reread_warp->mesh_xs == warp_after->mesh_xs);
+  CHECK(reread_warp->mesh_ys == warp_after->mesh_ys);
+  const auto reread_placement = patchy::smart_object_placement_from_layer(*reread_layer);
+  CHECK(reread_placement.has_value());
+  CHECK(std::abs(reread_placement->transform[0] - after_placement->transform[0]) < 1e-6);
+  CHECK(std::abs(reread_placement->transform[4] - after_placement->transform[4]) < 1e-6);
+  // E11 acceptance artifact: a Photoshop-authored mesh transformed through Patchy,
+  // for the PS open-and-resave gate.
+  ensure_artifact_dir();
+  patchy::psd::DocumentIo::write_layered_rgb8_file(
+      document, std::filesystem::path("test-artifacts/ui_warped_smart_object_transformed.psd"));
+}
+
+void ui_warped_smart_object_edit_commit_keeps_warp() {
+  const auto path = patchy::test::local_psd_fixture_path("ps2026_e6_warp_before.psd");
+  patchy::test::skip_unless_exists(path);
+  patchy::ui::MainWindow window;
+  show_window(window);
+  patchy::ui::MainWindowTestAccess::open_document_path(window, QString::fromStdWString(path.wstring()));
+  QApplication::processEvents();
+  auto* tabs = window.findChild<QTabWidget*>(QStringLiteral("documentTabs"));
+  CHECK(tabs != nullptr);
+  const auto parent_tab_index = tabs->currentIndex();
+  const auto tab_count_before = tabs->count();
+  auto& parent_document = patchy::ui::MainWindowTestAccess::document(window);
+  const patchy::Layer* warped = nullptr;
+  for (const auto& layer : std::as_const(parent_document).layers()) {
+    if (layer.name() == "e5_a_40x30") {
+      warped = &layer;
+    }
+  }
+  CHECK(warped != nullptr);
+  const auto layer_id = warped->id();
+  parent_document.set_active_layer(layer_id);
+  QApplication::processEvents();
+
+  // Edit Contents opens the embedded png child; a same-size edit commits back.
+  patchy::ui::MainWindowTestAccess::open_smart_object_contents(window);
+  QApplication::processEvents();
+  CHECK(tabs->count() == tab_count_before + 1);
+  CHECK(patchy::ui::MainWindowTestAccess::active_session_is_smart_object_child(window));
+  auto& child_document = patchy::ui::MainWindowTestAccess::document(window);
+  const auto child_width = child_document.width();
+  const auto child_height = child_document.height();
+  CHECK(child_width == 40 && child_height == 30);
+  CHECK(!child_document.layers().empty());
+  auto& child_layer = child_document.layers().front();
+  // Magenta: a color the fixture's artwork cannot plausibly contain.
+  child_layer.set_pixels(
+      solid_pixels(child_width, child_height, patchy::PixelFormat::rgba8(), QColor(220, 20, 200, 255)));
+  child_layer.set_bounds(patchy::Rect{0, 0, child_width, child_height});
+  patchy::ui::MainWindowTestAccess::canvas(window)->document_changed();
+  CHECK(patchy::ui::MainWindowTestAccess::save_document(window));
+  QApplication::processEvents();
+
+  tabs->setCurrentIndex(parent_tab_index);
+  QApplication::processEvents();
+  auto& parent_after = patchy::ui::MainWindowTestAccess::document(window);
+  const auto* committed = parent_after.find_layer(layer_id);
+  CHECK(committed != nullptr);
+  // Same-size commit re-renders through the WARP: bounds stay hull-quad sized
+  // (PS bakes 66,80 67x35), never the flat 40x30 content rect.
+  const auto bounds = committed->bounds();
+  CHECK(std::abs(bounds.x - 66) <= 4 && std::abs(bounds.y - 80) <= 4);
+  CHECK(std::abs(bounds.width - 67) <= 6 && std::abs(bounds.height - 35) <= 6);
+  const auto& pixels = committed->pixels();
+  int magenta = 0;
+  for (int y = 0; y < pixels.height(); ++y) {
+    for (int x = 0; x < pixels.width(); ++x) {
+      const auto* px = pixels.pixel(x, y);
+      if (px != nullptr && px[3] > 200 && px[0] > 150 && px[1] < 90 && px[2] > 150) {
+        ++magenta;
+      }
+    }
+  }
+  CHECK(magenta > 800);
+  // Warp metadata and the hull placement survive the commit untouched.
+  CHECK(patchy::smart_object_warp_from_layer(*committed).has_value());
+  const auto placement = patchy::smart_object_placement_from_layer(*committed);
+  CHECK(placement.has_value());
+  CHECK(std::abs(placement->transform[0] - 66.0) < 1e-6);
+  CHECK(std::abs(placement->transform[1] - 78.0) < 1e-6);
+}
+
+void ui_warp_transform_bends_pixel_layer_and_undoes() {
+  patchy::ui::MainWindow window;
+  show_window(window);
+  patchy::Document built(120, 90, patchy::PixelFormat::rgba8());
+  patchy::PixelBuffer pixels(48, 36, patchy::PixelFormat::rgba8());
+  for (std::int32_t y = 0; y < 36; ++y) {
+    for (std::int32_t x = 0; x < 48; ++x) {
+      auto* px = pixels.pixel(x, y);
+      px[0] = static_cast<std::uint8_t>(40 + x * 4);
+      px[1] = static_cast<std::uint8_t>(200 - y * 4);
+      px[2] = 90;
+      px[3] = 255;
+    }
+  }
+  patchy::Layer layer(built.allocate_layer_id(), "warp me", std::move(pixels));
+  layer.set_bounds(patchy::Rect{30, 25, 48, 36});
+  built.add_layer(std::move(layer));
+  const auto layer_id = built.layers().back().id();
+  built.set_active_layer(layer_id);
+  window.add_document_session(std::move(built), QStringLiteral("Warp"));
+  QApplication::processEvents();
+  auto& document = patchy::ui::MainWindowTestAccess::document(window);
+  auto* canvas = patchy::ui::MainWindowTestAccess::canvas(window);
+  CHECK(canvas != nullptr);
+  const auto original_bounds = document.find_layer(layer_id)->bounds();
+  const auto undo_depth_before = patchy::ui::MainWindowTestAccess::active_session_undo_depth(window);
+
+  // The Edit menu action starts the cage; the options-bar warp widgets appear.
+  require_action(window, "editWarpTransformAction")->trigger();
+  QApplication::processEvents();
+  CHECK(canvas->warp_transform_active());
+  CHECK(canvas->warp_handle_count() == 16);
+  auto* style_combo = window.findChild<QComboBox*>(QStringLiteral("warpStyleCombo"));
+  CHECK(style_combo != nullptr && style_combo->isVisible());
+
+  // Drag the top-left corner up-left: the bake must expand beyond the old bounds.
+  const auto corner = canvas->warp_handle_document_position(0);
+  CHECK(std::abs(corner.x() - original_bounds.x) < 0.5);
+  CHECK(std::abs(corner.y() - original_bounds.y) < 0.5);
+  canvas->set_warp_handle_document_position(0, corner + QPointF(-12.0, -9.0));
+  CHECK(canvas->warp_style_preset() == QStringLiteral("warpCustom"));
+  canvas->finish_warp_transform();
+  QApplication::processEvents();
+  CHECK(!canvas->warp_transform_active());
+
+  const auto* warped = document.find_layer(layer_id);
+  CHECK(warped != nullptr);
+  const auto warped_bounds = warped->bounds();
+  CHECK(warped_bounds.x < original_bounds.x - 6);
+  CHECK(warped_bounds.y < original_bounds.y - 4);
+  CHECK(warped_bounds.width > original_bounds.width);
+  CHECK(patchy::ui::MainWindowTestAccess::active_session_undo_depth(window) == undo_depth_before + 1);
+
+  // One undo restores the un-warped pixels and bounds.
+  require_action_by_text(window, QStringLiteral("Undo"))->trigger();
+  QApplication::processEvents();
+  auto& after_undo = patchy::ui::MainWindowTestAccess::document(window);
+  const auto* restored = after_undo.find_layer(layer_id);
+  CHECK(restored != nullptr);
+  CHECK(restored->bounds().x == original_bounds.x);
+  CHECK(restored->bounds().y == original_bounds.y);
+  CHECK(restored->bounds().width == original_bounds.width);
+  CHECK(restored->bounds().height == original_bounds.height);
+}
+
+void ui_warp_transform_on_smart_object_writes_mesh_and_survives_resave() {
+  patchy::ui::MainWindow window;
+  show_window(window);
+  const auto layer_id = open_smart_object_fixture(window);
+  auto& document = patchy::ui::MainWindowTestAccess::document(window);
+  auto* canvas = patchy::ui::MainWindowTestAccess::canvas(window);
+  CHECK(canvas != nullptr);
+  const auto placement_before = patchy::smart_object_placement_from_layer(*document.find_layer(layer_id));
+  CHECK(placement_before.has_value());
+
+  CHECK(canvas->begin_warp_transform());
+  CHECK(canvas->warp_transform_active());
+  // Style presets bake through the same generators the parser uses.
+  canvas->apply_warp_style_preset(QStringLiteral("warpArc"), 50.0);
+  CHECK(canvas->warp_style_preset() == QStringLiteral("warpArc"));
+  canvas->finish_warp_transform();
+  QApplication::processEvents();
+  CHECK(!canvas->warp_transform_active());
+
+  const auto* warped = document.find_layer(layer_id);
+  CHECK(warped != nullptr);
+  const auto warp = patchy::smart_object_warp_from_layer(*warped);
+  CHECK(warp.has_value());
+  CHECK(warp->style == "warpCustom");  // commits bake PS-style: custom mesh, value 0
+  CHECK(warp->u_order == 4 && warp->v_order == 4);
+  CHECK(warp->mesh_xs.size() == 16U);
+  CHECK(!warp->mesh_generated);
+  CHECK(patchy::layer_smart_object_block_dirty(*warped));
+  CHECK(patchy::smart_object_lock_reason(*warped).empty());
+  const auto placement_after = patchy::smart_object_placement_from_layer(*warped);
+  CHECK(placement_after.has_value());
+  // Arc 50 swings the top corners outward: the stored quad is the new mesh hull in
+  // document space, so it must extend past the original placement.
+  CHECK(placement_after->transform[0] < placement_before->transform[0] - 1.0);
+  CHECK(placement_after->transform[2] > placement_before->transform[2] + 1.0);
+  // The re-rendered preview tracks the hull quad.
+  const auto bounds = warped->bounds();
+  CHECK(std::abs(bounds.x - placement_after->transform[0]) <= 3.0);
+  CHECK(static_cast<double>(bounds.width) >=
+        placement_after->transform[2] - placement_after->transform[0] - 3.0);
+
+  // The regenerated SoLd survives a resave: same mesh, same quad, still unlocked.
+  const auto reread = patchy::psd::DocumentIo::read(patchy::psd::DocumentIo::write_layered_rgb8(document));
+  const patchy::Layer* reread_layer = nullptr;
+  for (const auto& layer : reread.layers()) {
+    if (layer.id() == layer_id || layer.name() == "small") {
+      reread_layer = &layer;
+    }
+  }
+  CHECK(reread_layer != nullptr);
+  CHECK(patchy::smart_object_lock_reason(*reread_layer).empty());
+  const auto reread_warp = patchy::smart_object_warp_from_layer(*reread_layer);
+  CHECK(reread_warp.has_value());
+  CHECK(reread_warp->mesh_xs == warp->mesh_xs);
+  CHECK(reread_warp->mesh_ys == warp->mesh_ys);
+  const auto reread_placement = patchy::smart_object_placement_from_layer(*reread_layer);
+  CHECK(reread_placement.has_value());
+  CHECK(std::abs(reread_placement->transform[0] - placement_after->transform[0]) < 1e-6);
+  // E11 acceptance artifact: Photoshop must open a Patchy-authored warp cleanly.
+  ensure_artifact_dir();
+  patchy::psd::DocumentIo::write_layered_rgb8_file(
+      document, std::filesystem::path("test-artifacts/ui_warp_tool_smart_object.psd"));
+}
+
+// GitHub issue 719: Cylinder, the last entry of the warp style list, is Patchy's own
+// style: one patch that wraps the whole layer like a label, shaped by the Bend field
+// and editable through the regular cage.
+void ui_warp_cylinder_style_wraps_pixel_layer() {
+  patchy::ui::MainWindow window;
+  show_window(window);
+  patchy::Document built(160, 120, patchy::PixelFormat::rgba8());
+  patchy::PixelBuffer pixels(48, 36, patchy::PixelFormat::rgba8());
+  for (std::int32_t y = 0; y < 36; ++y) {
+    for (std::int32_t x = 0; x < 48; ++x) {
+      auto* px = pixels.pixel(x, y);
+      // A different colour per sixth of the width, so the wrap's slow sides show.
+      px[0] = static_cast<std::uint8_t>(40 * (x / 8));
+      px[1] = static_cast<std::uint8_t>(200 - y * 4);
+      px[2] = 90;
+      px[3] = 255;
+    }
+  }
+  patchy::Layer layer(built.allocate_layer_id(), "label", std::move(pixels));
+  layer.set_bounds(patchy::Rect{50, 30, 48, 36});
+  built.add_layer(std::move(layer));
+  const auto layer_id = built.layers().back().id();
+  built.set_active_layer(layer_id);
+  window.add_document_session(std::move(built), QStringLiteral("Cylinder"));
+  QApplication::processEvents();
+  auto& document = patchy::ui::MainWindowTestAccess::document(window);
+  auto* canvas = patchy::ui::MainWindowTestAccess::canvas(window);
+  CHECK(canvas != nullptr);
+  const auto original_bounds = document.find_layer(layer_id)->bounds();
+  const auto undo_depth_before = patchy::ui::MainWindowTestAccess::active_session_undo_depth(window);
+  const QString cylinder_style = QStringLiteral("patchyCylinderWrap");
+  CHECK(cylinder_style.toStdString() == patchy::kCylinderWrapWarpStyle);
+
+  require_action(window, "editWarpTransformAction")->trigger();
+  QApplication::processEvents();
+  CHECK(canvas->warp_transform_active());
+  auto* style_combo = window.findChild<QComboBox*>(QStringLiteral("warpStyleCombo"));
+  auto* bend_spin = window.findChild<QDoubleSpinBox*>(QStringLiteral("warpBendSpin"));
+  CHECK(style_combo != nullptr && style_combo->isVisible());
+  CHECK(bend_spin != nullptr);
+  // Custom, the fifteen bends, then Cylinder last.
+  CHECK(style_combo->count() == 17);
+  CHECK(style_combo->itemData(16).toString() == cylinder_style);
+  CHECK(style_combo->itemText(16) == QStringLiteral("Cylinder"));
+
+  bend_spin->setValue(50.0);
+  style_combo->setCurrentIndex(16);
+  QApplication::processEvents();
+  CHECK(canvas->warp_style_preset() == cylinder_style);
+  CHECK(canvas->warp_style_preset_value() == 50.0);
+  // The regular cage: sixteen handles, the corners on the layer's corners.
+  CHECK(canvas->warp_handle_count() == 16);
+  const auto near_point = [](QPointF a, QPointF b) {
+    return std::abs(a.x() - b.x()) < 1e-6 && std::abs(a.y() - b.y()) < 1e-6;
+  };
+  CHECK(near_point(canvas->warp_handle_document_position(0), QPointF(50.0, 30.0)));
+  CHECK(near_point(canvas->warp_handle_document_position(3), QPointF(98.0, 30.0)));
+  CHECK(near_point(canvas->warp_handle_document_position(12), QPointF(50.0, 66.0)));
+  CHECK(near_point(canvas->warp_handle_document_position(15), QPointF(98.0, 66.0)));
+  // The inner columns sit on the sides, a third above the depth below their rows.
+  CHECK(near_point(canvas->warp_handle_document_position(1), QPointF(50.0, 38.0)));
+  CHECK(near_point(canvas->warp_handle_document_position(2), QPointF(98.0, 38.0)));
+  save_widget_artifact("ui_warp_cylinder_cage", *canvas);
+
+  // The Bend field reshapes it and the style stays Cylinder.
+  bend_spin->setValue(-40.0);
+  QApplication::processEvents();
+  CHECK(canvas->warp_style_preset() == cylinder_style);
+  CHECK(near_point(canvas->warp_handle_document_position(1), QPointF(50.0, 30.0 - 6.4)));
+  bend_spin->setValue(50.0);
+  QApplication::processEvents();
+  CHECK(style_combo->currentData().toString() == cylinder_style);
+
+  canvas->finish_warp_transform();
+  QApplication::processEvents();
+  CHECK(!canvas->warp_transform_active());
+  CHECK(patchy::ui::MainWindowTestAccess::active_session_undo_depth(window) == undo_depth_before + 1);
+  const auto* warped = document.find_layer(layer_id);
+  CHECK(warped != nullptr);
+  const auto warped_bounds = warped->bounds();
+  // The sides stay where they were; both edges hang 6 px (50% of a quarter of the
+  // width) at the centre, so the layer grows downward by that much.
+  CHECK(std::abs(warped_bounds.x - 50) <= 1);
+  CHECK(std::abs(warped_bounds.x + warped_bounds.width - 98) <= 1);
+  CHECK(std::abs(warped_bounds.y - 30) <= 1);
+  CHECK(warped_bounds.y + warped_bounds.height >= 71 && warped_bounds.y + warped_bounds.height <= 73);
+  const auto pixel_at = [&warped, &warped_bounds](int document_x, int document_y) {
+    return std::as_const(*warped).pixels().pixel(document_x - warped_bounds.x, document_y - warped_bounds.y);
+  };
+  const auto alpha_at = [&pixel_at](int document_x, int document_y) {
+    const auto* px = pixel_at(document_x, document_y);
+    return px == nullptr ? 0 : static_cast<int>(px[3]);
+  };
+  // The top edge dips at the centre and the bottom edge hangs below the corners.
+  CHECK(alpha_at(74, 32) == 0);
+  CHECK(alpha_at(74, 50) == 255);
+  CHECK(alpha_at(52, 36) == 255);
+  CHECK(alpha_at(74, 70) == 255);
+  CHECK(alpha_at(52, 70) == 0);
+  // All of the content is still there, squeezed toward the sides: the first sixth of
+  // the layer (red 0) and the last (red 200) each end well inside their old 8 px.
+  const auto* left_strip = pixel_at(51, 45);
+  const auto* past_left_strip = pixel_at(55, 45);
+  const auto* right_strip = pixel_at(96, 45);
+  CHECK(left_strip != nullptr && left_strip[3] == 255 && left_strip[0] < 20);
+  CHECK(past_left_strip != nullptr && past_left_strip[0] >= 30);
+  CHECK(right_strip != nullptr && right_strip[3] == 255 && right_strip[0] > 180);
+  save_widget_artifact("ui_warp_cylinder_committed", *canvas);
+
+  require_action_by_text(window, QStringLiteral("Undo"))->trigger();
+  QApplication::processEvents();
+  auto& after_undo = patchy::ui::MainWindowTestAccess::document(window);
+  const auto* restored = after_undo.find_layer(layer_id);
+  CHECK(restored != nullptr);
+  CHECK(restored->bounds().x == original_bounds.x && restored->bounds().y == original_bounds.y);
+  CHECK(restored->bounds().width == original_bounds.width && restored->bounds().height == original_bounds.height);
+
+  // Dragging a cage handle turns the style into Custom, as with every preset.
+  require_action(window, "editWarpTransformAction")->trigger();
+  QApplication::processEvents();
+  canvas->apply_warp_style_preset(cylinder_style, 30.0);
+  CHECK(canvas->warp_style_preset() == cylinder_style);
+  canvas->set_warp_handle_document_position(5, canvas->warp_handle_document_position(5) + QPointF(3.0, 2.0));
+  CHECK(canvas->warp_style_preset() == QStringLiteral("warpCustom"));
+  QApplication::processEvents();
+  CHECK(style_combo->currentData().toString() == QStringLiteral("warpCustom"));
+  canvas->cancel_warp_transform();
+}
+
+// On a smart object the Cylinder style commits like every preset: a custom 4x4 mesh
+// that Photoshop reads, never a cylinder record.
+void ui_warp_cylinder_style_on_smart_object_writes_custom_mesh() {
+  patchy::ui::MainWindow window;
+  show_window(window);
+  const auto layer_id = open_smart_object_fixture(window);
+  auto& document = patchy::ui::MainWindowTestAccess::document(window);
+  auto* canvas = patchy::ui::MainWindowTestAccess::canvas(window);
+  CHECK(canvas != nullptr);
+  const auto placement_before = patchy::smart_object_placement_from_layer(*document.find_layer(layer_id));
+  CHECK(placement_before.has_value());
+
+  CHECK(canvas->begin_warp_transform());
+  canvas->apply_warp_style_preset(QStringLiteral("patchyCylinderWrap"), 60.0);
+  CHECK(canvas->warp_style_preset() == QStringLiteral("patchyCylinderWrap"));
+  canvas->finish_warp_transform();
+  QApplication::processEvents();
+  CHECK(!canvas->warp_transform_active());
+
+  const auto* warped = document.find_layer(layer_id);
+  CHECK(warped != nullptr);
+  const auto warp = patchy::smart_object_warp_from_layer(*warped);
+  CHECK(warp.has_value());
+  CHECK(warp->style == "warpCustom" && warp->value == 0.0 && !warp->mesh_generated);
+  CHECK(warp->u_order == 4 && warp->v_order == 4 && warp->mesh_xs.size() == 16U);
+  const auto expected = patchy::generate_cylinder_wrap_warp_mesh(
+      60.0, warp->bounds_right - warp->bounds_left, warp->bounds_bottom - warp->bounds_top);
+  CHECK(expected.has_value());
+  for (std::size_t i = 0; i < 16U; ++i) {
+    CHECK(std::abs(warp->mesh_xs[i] - expected->xs[i]) < 1e-9);
+    CHECK(std::abs(warp->mesh_ys[i] - expected->ys[i]) < 1e-9);
+  }
+  CHECK(patchy::layer_smart_object_block_dirty(*warped));
+  CHECK(patchy::smart_object_lock_reason(*warped).empty());
+  const auto placement_after = patchy::smart_object_placement_from_layer(*warped);
+  CHECK(placement_after.has_value());
+  // The quad frames the control hull: the sides stay, the bottom reaches lower.
+  CHECK(std::abs(placement_after->transform[0] - placement_before->transform[0]) < 1e-6);
+  CHECK(std::abs(placement_after->transform[2] - placement_before->transform[2]) < 1e-6);
+  CHECK(placement_after->transform[5] > placement_before->transform[5] + 1.0);
+
+  const auto reread = patchy::psd::DocumentIo::read(patchy::psd::DocumentIo::write_layered_rgb8(document));
+  const patchy::Layer* reread_layer = nullptr;
+  for (const auto& layer : reread.layers()) {
+    if (layer.name() == "small") {
+      reread_layer = &layer;
+    }
+  }
+  CHECK(reread_layer != nullptr);
+  CHECK(patchy::smart_object_lock_reason(*reread_layer).empty());
+  const auto reread_warp = patchy::smart_object_warp_from_layer(*reread_layer);
+  CHECK(reread_warp.has_value());
+  CHECK(reread_warp->style == "warpCustom");
+  CHECK(reread_warp->mesh_xs == warp->mesh_xs && reread_warp->mesh_ys == warp->mesh_ys);
+  // Acceptance artifact: Photoshop must open the Cylinder style's mesh cleanly.
+  ensure_artifact_dir();
+  patchy::psd::DocumentIo::write_layered_rgb8_file(
+      document, std::filesystem::path("test-artifacts/ui_warp_cylinder_smart_object.psd"));
+}
+
+// The Cylinder style at a label's size, picked from the open style list. Saves the
+// review captures: the list with Cylinder last, the cage, and the wrapped label.
+void ui_warp_cylinder_style_list_and_label_wrap() {
+  patchy::ui::MainWindow window;
+  show_window(window);
+  window.resize(1200, 760);
+  patchy::Document built(400, 300, patchy::PixelFormat::rgba8());
+  built.add_pixel_layer("Background", solid_pixels(400, 300, patchy::PixelFormat::rgba8(), QColor(255, 255, 255)));
+  // The 8 x 6 checker of the Photoshop capture in local-test-fixtures/psd/ps2026_cylinder,
+  // so the two programs' cylinders can be put side by side.
+  patchy::PixelBuffer pixels(240, 150, patchy::PixelFormat::rgba8());
+  for (std::int32_t y = 0; y < 150; ++y) {
+    for (std::int32_t x = 0; x < 240; ++x) {
+      const int column = x / 30;
+      const int row = y / 25;
+      const bool odd = ((column + row) % 2) != 0;
+      auto* px = pixels.pixel(x, y);
+      px[0] = static_cast<std::uint8_t>(odd ? 30 + 28 * column : 235);
+      px[1] = static_cast<std::uint8_t>(odd ? 60 : 235 - 30 * row);
+      px[2] = static_cast<std::uint8_t>(odd ? 255 - 36 * row : 120 + 16 * column);
+      px[3] = 255;
+    }
+  }
+  patchy::Layer layer(built.allocate_layer_id(), "Label", std::move(pixels));
+  layer.set_bounds(patchy::Rect{80, 75, 240, 150});
+  built.add_layer(std::move(layer));
+  const auto layer_id = built.layers().back().id();
+  built.set_active_layer(layer_id);
+  window.add_document_session(std::move(built), QStringLiteral("Label"));
+  QApplication::processEvents();
+  process_events_for(60);
+  auto& document = patchy::ui::MainWindowTestAccess::document(window);
+  auto* canvas = patchy::ui::MainWindowTestAccess::canvas(window);
+  CHECK(canvas != nullptr);
+
+  require_action(window, "editWarpTransformAction")->trigger();
+  QApplication::processEvents();
+  CHECK(canvas->warp_transform_active());
+  auto* style_combo = window.findChild<QComboBox*>(QStringLiteral("warpStyleCombo"));
+  auto* bend_spin = window.findChild<QDoubleSpinBox*>(QStringLiteral("warpBendSpin"));
+  CHECK(style_combo != nullptr && bend_spin != nullptr);
+  bend_spin->setValue(60.0);
+  const int cylinder_index = style_combo->findData(QStringLiteral("patchyCylinderWrap"));
+  CHECK(cylinder_index == style_combo->count() - 1);
+  style_combo->setCurrentIndex(cylinder_index);
+  QApplication::processEvents();
+  process_events_for(60);
+  CHECK(canvas->warp_style_preset() == QStringLiteral("patchyCylinderWrap"));
+  CHECK(canvas->warp_style_preset_value() == 60.0);
+  save_widget_artifact("ui_warp_cylinder_window", window);
+  style_combo->showPopup();
+  QApplication::processEvents();
+  if (auto* popup = style_combo->view()->window(); popup != nullptr && popup->isVisible()) {
+    save_window_popup_artifact("ui_warp_cylinder_style_list", window, *style_combo, *popup);
+  }
+  style_combo->hidePopup();
+  QApplication::processEvents();
+
+  canvas->finish_warp_transform();
+  QApplication::processEvents();
+  process_events_for(60);
+  const auto* warped = document.find_layer(layer_id);
+  CHECK(warped != nullptr);
+  const auto bounds = warped->bounds();
+  // Sides in place; both edges hang 36 px (60% of a quarter of 240) at the centre.
+  // The baked layer keeps a pixel or two of clear margin round the warped pixels.
+  CHECK(std::abs(bounds.x - 80) <= 2 && std::abs(bounds.x + bounds.width - 320) <= 2);
+  CHECK(std::abs(bounds.y - 75) <= 2);
+  CHECK(std::abs(bounds.y + bounds.height - (225 + 36)) <= 2);
+  const auto wrapped = flattened_on_white(std::as_const(*warped).pixels());
+  // The top edge at the centre sits 36 px down; the checker's first column (30 px
+  // wide before) is squeezed to under half of that at the left side.
+  CHECK(wrapped.pixelColor(120, 30) == QColor(255, 255, 255));
+  CHECK(wrapped.pixelColor(120, 40) != QColor(255, 255, 255));
+  const auto first_column = wrapped.pixelColor(4, 80);
+  const auto second_column = wrapped.pixelColor(14, 80);
+  CHECK(first_column != second_column);
+  save_image_artifact("ui_warp_cylinder_label_wrapped", wrapped);
+  save_widget_artifact("ui_warp_cylinder_window_committed", window);
+}
+
+void ui_warp_transform_refuses_text_layer() {
+  patchy::ui::MainWindow window;
+  show_window(window);
+  patchy::Document built(96, 64, patchy::PixelFormat::rgba8());
+  patchy::Layer text_layer(built.allocate_layer_id(), "headline",
+                           solid_pixels(40, 16, patchy::PixelFormat::rgba8(), QColor(20, 20, 20, 255)));
+  text_layer.set_bounds(patchy::Rect{8, 8, 40, 16});
+  text_layer.metadata()[patchy::kLayerMetadataText] = "Sample";
+  built.add_layer(std::move(text_layer));
+  const auto text_id = built.layers().back().id();
+  built.set_active_layer(text_id);
+  window.add_document_session(std::move(built), QStringLiteral("WarpText"));
+  QApplication::processEvents();
+  auto* canvas = patchy::ui::MainWindowTestAccess::canvas(window);
+  CHECK(canvas != nullptr);
+  CHECK(!canvas->begin_warp_transform());
+  CHECK(!canvas->warp_transform_active());
+  CHECK(window.statusBar()->currentMessage().contains(QStringLiteral("rasterize"), Qt::CaseInsensitive));
+}
+
+void ui_warp_text_dialog_applies_and_undoes() {
+  // Photoshop's Warp Text: the options-bar dialog applies a style warp to the
+  // active text layer as ONE undo step; Cancel restores the pre-dialog state.
+  patchy::Document built(420, 260, patchy::PixelFormat::rgba8());
+  built.add_pixel_layer("Background",
+                        solid_pixels(420, 260, patchy::PixelFormat::rgba8(), QColor(Qt::white)));
+  patchy::Layer text_layer(built.allocate_layer_id(), "Warp Me",
+                           solid_pixels(1, 1, patchy::PixelFormat::rgba8(), QColor(0, 0, 0, 0)));
+  const auto text_id = text_layer.id();
+  text_layer.set_bounds(patchy::Rect{90, 110, 1, 1});
+  text_layer.metadata()[patchy::kLayerMetadataText] = "Warplify";
+  text_layer.metadata()[patchy::kLayerMetadataTextSize] = "36";
+  text_layer.metadata()[patchy::kLayerMetadataTextColor] = "#101010";
+  built.add_layer(std::move(text_layer));
+  built.set_active_layer(text_id);
+
+  patchy::ui::MainWindow window;
+  window.add_document_session(std::move(built), QStringLiteral("WarpTextDialog"));
+  show_window(window);
+  auto& document = patchy::ui::MainWindowTestAccess::document(window);
+  auto* layer = document.find_layer(text_id);
+  CHECK(layer != nullptr);
+  // Give the layer its real unwarped render first (what a committed layer holds).
+  CHECK(patchy::ui::MainWindowTestAccess::apply_text_warp(window, *layer, patchy::TextWarp{}));
+  const auto unwarped_bounds = layer->bounds();
+  const auto unwarped_pixels = layer->pixels();
+  const auto same_rect = [](const patchy::Rect& a, const patchy::Rect& b) {
+    return a.x == b.x && a.y == b.y && a.width == b.width && a.height == b.height;
+  };
+  const auto same_pixels = [](const patchy::PixelBuffer& a, const patchy::PixelBuffer& b) {
+    return a.width() == b.width() && a.height() == b.height() &&
+           std::equal(a.data().begin(), a.data().end(), b.data().begin(), b.data().end());
+  };
+  CHECK(unwarped_bounds.width > 4 && unwarped_bounds.height > 4);
+  CHECK(!patchy::text_warp_from_layer(*layer).has_value());
+
+  // Cancel restores the original state even after live previews.
+  bool drove_dialog = false;
+  QTimer::singleShot(0, guarded([&] {
+    auto* dialog = find_top_level_dialog(QStringLiteral("warpTextDialog"));
+    CHECK(dialog != nullptr);
+    auto* style_combo = dialog->findChild<QComboBox*>(QStringLiteral("warpTextStyleCombo"));
+    auto* bend_spin = dialog->findChild<QSpinBox*>(QStringLiteral("warpTextBendSpin"));
+    CHECK(style_combo != nullptr && bend_spin != nullptr);
+    style_combo->setCurrentIndex(style_combo->findData(QStringLiteral("warpArc")));
+    bend_spin->setValue(50);
+    QApplication::processEvents();
+    // The live preview should already show warped pixels on the layer.
+    auto* preview_layer = patchy::ui::MainWindowTestAccess::document(window).find_layer(text_id);
+    CHECK(preview_layer != nullptr);
+    CHECK(preview_layer->bounds().height > unwarped_bounds.height + 4);
+    drove_dialog = true;
+    dialog->reject();
+  }));
+  patchy::ui::MainWindowTestAccess::request_warp_text_dialog(window);
+  CHECK(drove_dialog);
+  layer = document.find_layer(text_id);
+  CHECK(layer != nullptr);
+  CHECK(same_rect(layer->bounds(), unwarped_bounds));
+  CHECK(same_pixels(layer->pixels(), unwarped_pixels));
+  CHECK(!patchy::text_warp_from_layer(*layer).has_value());
+
+  // OK applies the warp: metadata + taller bounds (arc bows the text upward).
+  drove_dialog = false;
+  QTimer::singleShot(0, guarded([&] {
+    auto* dialog = find_top_level_dialog(QStringLiteral("warpTextDialog"));
+    CHECK(dialog != nullptr);
+    auto* style_combo = dialog->findChild<QComboBox*>(QStringLiteral("warpTextStyleCombo"));
+    auto* bend_spin = dialog->findChild<QSpinBox*>(QStringLiteral("warpTextBendSpin"));
+    auto* vertical_radio = dialog->findChild<QRadioButton*>(QStringLiteral("warpTextVerticalRadio"));
+    CHECK(style_combo != nullptr && bend_spin != nullptr && vertical_radio != nullptr);
+    CHECK(!vertical_radio->isChecked());  // defaults to horizontal
+    style_combo->setCurrentIndex(style_combo->findData(QStringLiteral("warpArc")));
+    bend_spin->setValue(50);
+    QApplication::processEvents();
+    save_widget_artifact("ui_warp_text_dialog", *dialog);
+    drove_dialog = true;
+    if (auto* buttons = dialog->findChild<QDialogButtonBox*>(); buttons != nullptr) {
+      buttons->button(QDialogButtonBox::Ok)->click();
+    }
+  }));
+  patchy::ui::MainWindowTestAccess::request_warp_text_dialog(window);
+  CHECK(drove_dialog);
+  layer = document.find_layer(text_id);
+  CHECK(layer != nullptr);
+  const auto warped_bounds = layer->bounds();
+  const auto warp = patchy::text_warp_from_layer(*layer);
+  CHECK(warp.has_value());
+  CHECK(warp->style == "warpArc");
+  CHECK(warp->value == 50.0);
+  CHECK(warp->bounds_right - warp->bounds_left > 4.0);
+  CHECK(warped_bounds.height > unwarped_bounds.height + 4);
+
+  // One undo step restores the unwarped layer; redo re-applies.
+  require_action_by_text(window, QStringLiteral("Undo"))->trigger();
+  QApplication::processEvents();
+  layer = document.find_layer(text_id);
+  CHECK(layer != nullptr);
+  CHECK(same_rect(layer->bounds(), unwarped_bounds));
+  CHECK(!patchy::text_warp_from_layer(*layer).has_value());
+  require_action_by_text(window, QStringLiteral("Redo"))->trigger();
+  QApplication::processEvents();
+  layer = document.find_layer(text_id);
+  CHECK(layer != nullptr);
+  CHECK(same_rect(layer->bounds(), warped_bounds));
+  CHECK(patchy::text_warp_from_layer(*layer).has_value());
+
+  // Re-opening with style None removes the warp (back to the plain render).
+  drove_dialog = false;
+  QTimer::singleShot(0, guarded([&] {
+    auto* dialog = find_top_level_dialog(QStringLiteral("warpTextDialog"));
+    CHECK(dialog != nullptr);
+    auto* style_combo = dialog->findChild<QComboBox*>(QStringLiteral("warpTextStyleCombo"));
+    CHECK(style_combo != nullptr);
+    CHECK(style_combo->currentData().toString() == QStringLiteral("warpArc"));  // remembers
+    auto* bend_spin = dialog->findChild<QSpinBox*>(QStringLiteral("warpTextBendSpin"));
+    CHECK(bend_spin != nullptr && bend_spin->value() == 50);
+    style_combo->setCurrentIndex(style_combo->findData(QStringLiteral("warpNone")));
+    QApplication::processEvents();
+    drove_dialog = true;
+    if (auto* buttons = dialog->findChild<QDialogButtonBox*>(); buttons != nullptr) {
+      buttons->button(QDialogButtonBox::Ok)->click();
+    }
+  }));
+  patchy::ui::MainWindowTestAccess::request_warp_text_dialog(window);
+  CHECK(drove_dialog);
+  layer = document.find_layer(text_id);
+  CHECK(layer != nullptr);
+  CHECK(!patchy::text_warp_from_layer(*layer).has_value());
+  CHECK(std::abs(layer->bounds().height - unwarped_bounds.height) <= 2);
+}
+
+void ui_warp_text_render_matches_photoshop_if_available() {
+  // COM captures (July 2026): Photoshop-rendered warped text next to the same text
+  // unwarped. Re-rendering the warp through Patchy's pipeline must land on the
+  // same geometry (IoU + bounds tolerances absorb the Qt-vs-PS anti-aliasing and
+  // font-metric differences).
+  skip_without_arial_for_psd_text_preview();
+  struct WarpRenderCase {
+    const char* name;
+    double min_iou;
+    int max_bounds_delta;
+  };
+  // Floors sit well under the observed IoUs (~0.68-0.72 for point text): a
+  // geometry bug drops to ~0.0-0.1, so these separate real breaks from
+  // anti-aliasing and font-metric noise. Box text observes ~0.30 with a ~6-9 px
+  // vertical offset: Photoshop hangs the first line's ascent above the frame top
+  // while Qt lays it inside - a pre-existing box-text divergence the warp merely
+  // inherits (the unwarped render shows the same offset), so its floors only pin
+  // gross warp geometry.
+  const WarpRenderCase cases[] = {
+      {"wt_arc_p50", 0.62, 4},
+      {"wt_rise_p50", 0.62, 4},
+      {"wt_fisheye_p50", 0.62, 4},
+      {"wt_squeeze_p100", 0.60, 4},
+      {"wt_twist_p60_h30", 0.60, 4},
+      {"wt_arch_p50_para", 0.22, 12},
+      // Box-text frame semantics (a short line riding the frame warp's shoulder):
+      // the corner geometry is dramatic, so even loose floors pin it hard; the
+      // first-line layout offset amplifies along the surface gradient, hence the
+      // wider bounds tolerance.
+      {"wt_bulge_p50_para_smalltext", 0.30, 18},
+      {"wt_arc_p50_para_smalltext", 0.20, 20},
+      {"wt_bulge_p50_para_2lines", 0.30, 18},
+  };
+  // The floors above are Windows numbers: the reference PNGs are Photoshop renders of Windows
+  // Arial through DirectWrite, and Patchy matches them there at IoU 0.68-0.85. macOS meets the
+  // same floors (0.67-0.89, ink within 2 px) since it fills glyph outlines rather than CoreText's
+  // smoothed glyph images (draw_document_glyph_run; those cost ~0.06 of IoU and up to 4 px of ink
+  // extent). A FreeType rasterizer keeps the old ~0.06 and 2 px allowance, unmeasured here: Linux
+  // has no Arial and skips the whole test above. A real geometry break drops IoU to ~0.0-0.1.
+#if defined(Q_OS_WIN) || defined(Q_OS_MACOS)
+  constexpr double iou_floor_scale = 1.0;
+  constexpr int extra_bounds_delta = 0;
+#else
+  constexpr double iou_floor_scale = 0.90;
+  constexpr int extra_bounds_delta = 2;
+#endif
+  patchy::ui::MainWindow window;
+  show_window(window);
+  int verified = 0;
+  int missed = 0;
+  for (const auto& render_case : cases) {
+    const auto psd_path =
+        patchy::test::local_psd_fixture_path(std::string("ps2026_warptext/") + render_case.name + ".psd");
+    const auto png_path =
+        patchy::test::local_psd_fixture_path(std::string("ps2026_warptext/") + render_case.name + ".png");
+    if (!std::filesystem::exists(psd_path) || !std::filesystem::exists(png_path)) {
+      continue;
+    }
+    auto document = patchy::psd::DocumentIo::read_file(psd_path);
+    CHECK(!document.layers().empty());
+    auto& layer = document.layers().front();
+    const auto warp = patchy::text_warp_from_layer(layer);
+    CHECK(warp.has_value());
+    // Re-render Photoshop's warp through Patchy's own pipeline.
+    CHECK(patchy::ui::MainWindowTestAccess::apply_text_warp(window, layer, *warp));
+    const QImage reference(QString::fromStdString(png_path.string()));
+    CHECK(!reference.isNull());
+    const auto reference_alpha = reference.convertToFormat(QImage::Format_RGBA8888);
+    QImage rendered(reference.width(), reference.height(), QImage::Format_RGBA8888);
+    rendered.fill(Qt::transparent);
+    {
+      QPainter painter(&rendered);
+      painter.drawImage(QPoint(layer.bounds().x, layer.bounds().y),
+                        image_from_pixels_for_visuals(layer.pixels()));
+    }
+    std::int64_t intersection = 0;
+    std::int64_t union_count = 0;
+    int min_x = reference.width();
+    int max_x = -1;
+    int min_y = reference.height();
+    int max_y = -1;
+    int ref_min_x = reference.width();
+    int ref_max_x = -1;
+    int ref_min_y = reference.height();
+    int ref_max_y = -1;
+    for (int y = 0; y < reference.height(); ++y) {
+      const auto* ref_line = reference_alpha.constScanLine(y);
+      const auto* out_line = rendered.constScanLine(y);
+      for (int x = 0; x < reference.width(); ++x) {
+        const bool ref_on = ref_line[x * 4 + 3] > 96;
+        const bool out_on = out_line[x * 4 + 3] > 96;
+        intersection += (ref_on && out_on) ? 1 : 0;
+        union_count += (ref_on || out_on) ? 1 : 0;
+        if (out_on) {
+          min_x = std::min(min_x, x);
+          max_x = std::max(max_x, x);
+          min_y = std::min(min_y, y);
+          max_y = std::max(max_y, y);
+        }
+        if (ref_on) {
+          ref_min_x = std::min(ref_min_x, x);
+          ref_max_x = std::max(ref_max_x, x);
+          ref_min_y = std::min(ref_min_y, y);
+          ref_max_y = std::max(ref_max_y, y);
+        }
+      }
+    }
+    CHECK(union_count > 0);
+    const double iou = static_cast<double>(intersection) / static_cast<double>(union_count);
+    const auto worst_delta = std::max({std::abs(min_x - ref_min_x), std::abs(min_y - ref_min_y),
+                                       std::abs(max_x - ref_max_x), std::abs(max_y - ref_max_y)});
+    std::cout << "  " << render_case.name << ": IoU " << iou << ", bounds delta ("
+              << std::abs(min_x - ref_min_x) << "," << std::abs(min_y - ref_min_y) << ","
+              << std::abs(max_x - ref_max_x) << "," << std::abs(max_y - ref_max_y) << ")\n";
+    if (iou < render_case.min_iou * iou_floor_scale) {
+      std::cout << "    [MISS] IoU below " << render_case.min_iou * iou_floor_scale << "\n";
+      ++missed;
+    }
+    if (worst_delta > render_case.max_bounds_delta + extra_bounds_delta) {
+      std::cout << "    [MISS] bounds delta above " << render_case.max_bounds_delta + extra_bounds_delta
+                << "\n";
+      ++missed;
+    }
+    ++verified;
+  }
+  if (verified == 0) {
+    patchy::test::skip("no optional fixture present (ps2026_warptext captures)");
+  }
+  // Every case reports before anything fails: one run then shows the whole picture, which is
+  // what a cross-platform rasterizer difference needs (a first-case throw hid the other eight).
+  CHECK(missed == 0);
+}
+
+void ui_warp_text_box_text_warps_over_frame() {
+  // Editor-created point text warps about its own layout; BOX text warps over the
+  // dragged FRAME like Photoshop (wt_*_para_smalltext captures: a short line in a
+  // big box rides the warp surface's shoulder in Photoshop too, so a "nicer"
+  // text-extent box here would diverge from PS).
+  patchy::ui::MainWindow window;
+  show_window(window);
+  auto* canvas = require_canvas(window);
+  require_action_by_text(window, QStringLiteral("Type"))->trigger();
+  const auto hit_point = canvas->widget_position_for_document_point(QPoint(100, 140));
+  send_mouse(*canvas, QEvent::MouseButtonPress, hit_point, Qt::LeftButton, Qt::LeftButton);
+  send_mouse(*canvas, QEvent::MouseButtonRelease, hit_point, Qt::LeftButton, Qt::NoButton);
+  QApplication::processEvents();
+  auto* editor = canvas->findChild<QTextEdit*>(QStringLiteral("inlineTextEditor"));
+  CHECK(editor != nullptr);
+  editor->insertPlainText(QStringLiteral("Hey man!"));
+  QApplication::processEvents();
+  require_action_by_text(window, QStringLiteral("Move"))->trigger();
+  QApplication::processEvents();
+  auto& document = patchy::ui::MainWindowTestAccess::document(window);
+  const auto active_id = document.active_layer_id();
+  CHECK(active_id.has_value());
+  auto* layer = document.find_layer(*active_id);
+  CHECK(layer != nullptr && patchy::layer_is_text(*layer));
+  auto unwarped = image_from_pixels_for_visuals(layer->pixels());
+  // Drive the REAL dialog like a user: pick Bulge, bend 50, OK.
+  QTimer::singleShot(0, guarded([&] {
+    auto* dialog = find_top_level_dialog(QStringLiteral("warpTextDialog"));
+    CHECK(dialog != nullptr);
+    auto* style_combo = dialog->findChild<QComboBox*>(QStringLiteral("warpTextStyleCombo"));
+    auto* bend_spin = dialog->findChild<QSpinBox*>(QStringLiteral("warpTextBendSpin"));
+    CHECK(style_combo != nullptr && bend_spin != nullptr);
+    style_combo->setCurrentIndex(style_combo->findData(QStringLiteral("warpBulge")));
+    bend_spin->setValue(50);
+    QApplication::processEvents();
+    if (auto* buttons = dialog->findChild<QDialogButtonBox*>(); buttons != nullptr) {
+      buttons->button(QDialogButtonBox::Ok)->click();
+    }
+  }));
+  patchy::ui::MainWindowTestAccess::request_warp_text_dialog(window);
+  layer = document.find_layer(*active_id);
+  CHECK(layer != nullptr);
+  const auto stored = patchy::text_warp_from_layer(*layer);
+  CHECK(stored.has_value());
+  CHECK(stored->style == "warpBulge");
+  CHECK(stored->value == 50.0);
+  auto warped = image_from_pixels_for_visuals(layer->pixels());
+  QImage sheet(std::max(unwarped.width(), warped.width()),
+               unwarped.height() + warped.height() + 8, QImage::Format_RGBA8888);
+  sheet.fill(Qt::white);
+  {
+    QPainter painter(&sheet);
+    painter.drawImage(0, 0, unwarped);
+    painter.drawImage(0, unwarped.height() + 8, warped);
+  }
+  ensure_artifact_dir();
+  CHECK(sheet.save(QStringLiteral("test-artifacts/ui_warp_text_point_bulge.png")));
+  std::cout << "  unwarped " << unwarped.width() << "x" << unwarped.height() << " warped "
+            << warped.width() << "x" << warped.height() << " at " << layer->bounds().x << ","
+            << layer->bounds().y << "\n";
+
+  // Second scenario: BOX text with a short line in a big frame (the dragged-box flow).
+  patchy::Layer box_layer(document.allocate_layer_id(), "BoxText",
+                          solid_pixels(1, 1, patchy::PixelFormat::rgba8(), QColor(0, 0, 0, 0)));
+  const auto box_id = box_layer.id();
+  box_layer.set_bounds(patchy::Rect{80, 40, 1, 1});
+  box_layer.metadata()[patchy::kLayerMetadataText] = "Hi!";
+  box_layer.metadata()[patchy::kLayerMetadataTextSize] = "48";
+  box_layer.metadata()[patchy::kLayerMetadataTextColor] = "#101010";
+  box_layer.metadata()[patchy::kLayerMetadataTextFlow] = "box";
+  box_layer.metadata()[patchy::kLayerMetadataTextBoxWidth] = "300";
+  box_layer.metadata()[patchy::kLayerMetadataTextBoxHeight] = "140";
+  document.add_layer(std::move(box_layer));
+  auto* boxed = document.find_layer(box_id);
+  CHECK(boxed != nullptr);
+  CHECK(patchy::ui::MainWindowTestAccess::apply_text_warp(window, *boxed, patchy::TextWarp{}));
+  auto box_unwarped = image_from_pixels_for_visuals(boxed->pixels());
+  const auto ink_height = [](const QImage& image) {
+    int min_y = image.height();
+    int max_y = -1;
+    for (int y = 0; y < image.height(); ++y) {
+      const auto* line = image.constScanLine(y);
+      for (int x = 0; x < image.width(); ++x) {
+        if (line[x * 4 + 3] > 96) {
+          min_y = std::min(min_y, y);
+          max_y = std::max(max_y, y);
+          break;
+        }
+      }
+    }
+    return max_y >= min_y ? (max_y - min_y + 1) : 0;
+  };
+  const auto unwarped_ink_height = ink_height(box_unwarped.convertToFormat(QImage::Format_RGBA8888));
+  CHECK(unwarped_ink_height > 20);
+  patchy::TextWarp box_bulge;
+  box_bulge.style = "warpBulge";
+  box_bulge.value = 50.0;
+  CHECK(patchy::ui::MainWindowTestAccess::apply_text_warp(window, *boxed, box_bulge));
+  auto box_warped = image_from_pixels_for_visuals(boxed->pixels());
+  // Frame semantics: the corner-sitting line shears up the frame bulge's shoulder,
+  // growing its ink height far past what a text-extent bulge would (PS: 36 -> 68).
+  const auto warped_ink_height = ink_height(box_warped.convertToFormat(QImage::Format_RGBA8888));
+  CHECK(warped_ink_height >= unwarped_ink_height + 20);
+  QImage box_sheet(std::max(box_unwarped.width(), box_warped.width()),
+                   box_unwarped.height() + box_warped.height() + 8, QImage::Format_RGBA8888);
+  box_sheet.fill(Qt::white);
+  {
+    QPainter painter(&box_sheet);
+    painter.drawImage(0, 0, box_unwarped);
+    painter.drawImage(0, box_unwarped.height() + 8, box_warped);
+  }
+  CHECK(box_sheet.save(QStringLiteral("test-artifacts/ui_warp_text_box_frame_bulge.png")));
+  std::cout << "  box ink height " << unwarped_ink_height << " -> " << warped_ink_height << "\n";
+}
+
+void ui_warp_text_psd_writes_baseline_anchored_geometry() {
+  // Photoshop anchors a point-text transform at the first-line BASELINE; a warped
+  // Patchy save must do the same (box top = -ascent-ish, negative) or Photoshop's
+  // type re-render drops the text by one descent (the buldge_test jump).
+  patchy::Document built(420, 260, patchy::PixelFormat::rgba8());
+  built.add_pixel_layer("Background",
+                        solid_pixels(420, 260, patchy::PixelFormat::rgba8(), QColor(Qt::white)));
+  patchy::Layer text_layer(built.allocate_layer_id(), "Anchored",
+                           solid_pixels(1, 1, patchy::PixelFormat::rgba8(), QColor(0, 0, 0, 0)));
+  const auto text_id = text_layer.id();
+  text_layer.set_bounds(patchy::Rect{90, 120, 1, 1});
+  text_layer.metadata()[patchy::kLayerMetadataText] = "Jumpy";
+  text_layer.metadata()[patchy::kLayerMetadataTextSize] = "48";
+  text_layer.metadata()[patchy::kLayerMetadataTextColor] = "#101010";
+  built.add_layer(std::move(text_layer));
+  built.set_active_layer(text_id);
+
+  patchy::ui::MainWindow window;
+  window.add_document_session(std::move(built), QStringLiteral("WarpBaseline"));
+  show_window(window);
+  auto& document = patchy::ui::MainWindowTestAccess::document(window);
+  auto* layer = document.find_layer(text_id);
+  CHECK(layer != nullptr);
+  patchy::TextWarp warp;
+  warp.style = "warpBulge";
+  warp.value = 60.0;
+  CHECK(patchy::ui::MainWindowTestAccess::apply_text_warp(window, *layer, warp));
+  const auto stored = patchy::text_warp_from_layer(*layer);
+  CHECK(stored.has_value());
+  const auto box_height = stored->bounds_bottom - stored->bounds_top;
+  CHECK(box_height > 10.0);
+  // The metadata baseline sits in the box's lower half (ascent of the first line).
+  CHECK(stored->baseline - stored->bounds_top > box_height * 0.5);
+  CHECK(stored->baseline - stored->bounds_top < box_height);
+
+  const auto bytes = patchy::psd::DocumentIo::write_layered_rgb8(document);
+  ensure_artifact_dir();
+  {
+    // Kept as an artifact so the Photoshop re-render jump can be re-measured by COM.
+    std::ofstream out("test-artifacts/warp_baseline_check.psd", std::ios::binary);
+    out.write(reinterpret_cast<const char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
+  }
+  const auto reopened = patchy::psd::DocumentIo::read(bytes);
+  const patchy::Layer* reopened_layer = nullptr;
+  for (const auto& candidate : reopened.layers()) {
+    if (candidate.name() == "Anchored") {
+      reopened_layer = &candidate;
+      break;
+    }
+  }
+  CHECK(reopened_layer != nullptr);
+  const auto reopened_warp = patchy::text_warp_from_layer(*reopened_layer);
+  CHECK(reopened_warp.has_value());
+  CHECK(reopened_warp->style == "warpBulge");
+  // Baseline-relative box in the file: ascent above the origin, descent below.
+  CHECK(reopened_warp->bounds_top < -0.5);
+  CHECK(std::abs(reopened_warp->bounds_top - (stored->bounds_top - stored->baseline)) < 1.0);
+  CHECK(std::abs(reopened_warp->bounds_bottom - (stored->bounds_bottom - stored->baseline)) < 1.0);
+}
+
+void ui_warp_text_box_matches_photoshop_layout() {
+  // Photoshop recomputes a warped layer's box (the TySh's four-float tail) from its own layout on
+  // open and asks "Some text layers might need to be updated" when the stored box is more than
+  // about a pixel off (Photoshop 2025 and 2026, October 2026: +1 px opened clean, +2 px prompted).
+  // A box Patchy derives must therefore be Photoshop's: kerned advances, top = baseline -
+  // (em + cap height) / 2, bottom = last baseline + head yMin; box text raises only the frame top.
+  // The expected values are Photoshop 2026's own files (local ps2026_warptext captures).
+  skip_without_arial_for_psd_text_preview();
+  struct BoxCase {
+    const char* name;
+    const char* text;
+    bool boxed;
+    double left, top, right, bottom;
+  };
+  const BoxCase cases[] = {
+      {"Point", "Warplify", false, 0.0, -41.191, 171.562, 15.586},
+      {"TwoLines", "Warplify\nTwo Lines", false, 0.0, -41.191, 216.117, 73.186},
+      {"Frame", "Hi!", true, 0.0, -6.824, 300.0, 140.0},
+  };
+  patchy::Document built(640, 400, patchy::PixelFormat::rgba8());
+  built.add_pixel_layer("Background",
+                        solid_pixels(640, 400, patchy::PixelFormat::rgba8(), QColor(Qt::white)));
+  std::vector<patchy::LayerId> ids;
+  for (const auto& box_case : cases) {
+    patchy::Layer text_layer(built.allocate_layer_id(), box_case.name,
+                             solid_pixels(1, 1, patchy::PixelFormat::rgba8(), QColor(0, 0, 0, 0)));
+    ids.push_back(text_layer.id());
+    text_layer.set_bounds(patchy::Rect{90, 60, 1, 1});
+    text_layer.metadata()[patchy::kLayerMetadataText] = box_case.text;
+    text_layer.metadata()[patchy::kLayerMetadataTextFont] = "Arial";
+    text_layer.metadata()[patchy::kLayerMetadataTextSize] = "48";
+    text_layer.metadata()[patchy::kLayerMetadataTextColor] = "#101010";
+    if (box_case.boxed) {
+      text_layer.metadata()[patchy::kLayerMetadataTextFlow] = "box";
+      text_layer.metadata()[patchy::kLayerMetadataTextBoxWidth] = "300";
+      text_layer.metadata()[patchy::kLayerMetadataTextBoxHeight] = "140";
+    }
+    built.add_layer(std::move(text_layer));
+  }
+  patchy::ui::MainWindow window;
+  window.add_document_session(std::move(built), QStringLiteral("WarpBoxPhotoshop"));
+  show_window(window);
+  auto& document = patchy::ui::MainWindowTestAccess::document(window);
+  patchy::TextWarp warp;
+  warp.style = "warpArc";
+  warp.value = 50.0;
+  for (const auto id : ids) {
+    auto* layer = document.find_layer(id);
+    CHECK(layer != nullptr);
+    CHECK(patchy::ui::MainWindowTestAccess::apply_text_warp(window, *layer, warp));
+  }
+  const auto reopened = patchy::psd::DocumentIo::read(patchy::psd::DocumentIo::write_layered_rgb8(document));
+  for (const auto& box_case : cases) {
+    const patchy::Layer* layer = nullptr;
+    for (const auto& candidate : reopened.layers()) {
+      if (candidate.name() == box_case.name) {
+        layer = &candidate;
+      }
+    }
+    CHECK(layer != nullptr);
+    const auto stored = patchy::text_warp_from_layer(*layer);
+    CHECK(stored.has_value());
+    std::cout << "  " << box_case.name << ": box [" << stored->bounds_left << ", " << stored->bounds_top << ", "
+              << stored->bounds_right << ", " << stored->bounds_bottom << "]\n";
+    // Photoshop opened a box within 1 px of its own clean and prompted at 2 px.
+    CHECK(std::abs(stored->bounds_left - box_case.left) < 0.75);
+    CHECK(std::abs(stored->bounds_top - box_case.top) < 0.75);
+    CHECK(std::abs(stored->bounds_right - box_case.right) < 0.75);
+    CHECK(std::abs(stored->bounds_bottom - box_case.bottom) < 0.75);
+  }
+}
+
+void ui_warp_text_survives_editor_commit() {
+  // Editing warped text re-renders through the warp with a box freshly derived
+  // from the new layout (Photoshop recomputes its warp box on every change).
+  patchy::Document built(480, 280, patchy::PixelFormat::rgba8());
+  built.add_pixel_layer("Background",
+                        solid_pixels(480, 280, patchy::PixelFormat::rgba8(), QColor(Qt::white)));
+  patchy::Layer text_layer(built.allocate_layer_id(), "Warped",
+                           solid_pixels(1, 1, patchy::PixelFormat::rgba8(), QColor(0, 0, 0, 0)));
+  const auto text_id = text_layer.id();
+  text_layer.set_bounds(patchy::Rect{110, 130, 1, 1});
+  text_layer.metadata()[patchy::kLayerMetadataText] = "Bend";
+  text_layer.metadata()[patchy::kLayerMetadataTextSize] = "36";
+  text_layer.metadata()[patchy::kLayerMetadataTextColor] = "#101010";
+  built.add_layer(std::move(text_layer));
+  built.set_active_layer(text_id);
+
+  patchy::ui::MainWindow window;
+  window.add_document_session(std::move(built), QStringLiteral("WarpCommit"));
+  show_window(window);
+  auto* canvas = require_canvas(window);
+  auto& document = patchy::ui::MainWindowTestAccess::document(window);
+  auto* layer = document.find_layer(text_id);
+  CHECK(layer != nullptr);
+  patchy::TextWarp warp;
+  warp.style = "warpArc";
+  warp.value = 60.0;
+  CHECK(patchy::ui::MainWindowTestAccess::apply_text_warp(window, *layer, warp));
+  const auto warped_bounds = layer->bounds();
+  const auto warp_before = patchy::text_warp_from_layer(*layer);
+  CHECK(warp_before.has_value());
+  const auto box_width_before = warp_before->bounds_right - warp_before->bounds_left;
+
+  // Edit the text through the inline editor: click into the warped INK (the middle
+  // of the warped bounds can be empty air under an arc), append, commit.
+  QPoint ink_document_point(warped_bounds.x, warped_bounds.y);
+  {
+    const auto& pixels = layer->pixels();
+    const auto data = pixels.data();
+    bool found_ink = false;
+    for (int y = 0; y < pixels.height() && !found_ink; ++y) {
+      for (int x = 0; x < pixels.width() && !found_ink; ++x) {
+        if (data[(static_cast<std::size_t>(y) * pixels.width() + x) * 4U + 3U] > 200) {
+          ink_document_point = QPoint(warped_bounds.x + x + 1, warped_bounds.y + y + 1);
+          found_ink = true;
+        }
+      }
+    }
+    CHECK(found_ink);
+  }
+  require_action_by_text(window, QStringLiteral("Type"))->trigger();
+  const auto hit_point = canvas->widget_position_for_document_point(ink_document_point);
+  send_mouse(*canvas, QEvent::MouseButtonPress, hit_point, Qt::LeftButton, Qt::LeftButton);
+  send_mouse(*canvas, QEvent::MouseButtonRelease, hit_point, Qt::LeftButton, Qt::NoButton);
+  QApplication::processEvents();
+  auto* editor = canvas->findChild<QTextEdit*>(QStringLiteral("inlineTextEditor"));
+  CHECK(editor != nullptr);
+  CHECK(editor->toPlainText() == QStringLiteral("Bend"));
+  QTextCursor cursor(editor->document());
+  cursor.movePosition(QTextCursor::End);
+  editor->setTextCursor(cursor);
+  editor->insertPlainText(QStringLiteral("ier"));
+  QApplication::processEvents();
+  // Switching tools commits the edit (the established commit path in these tests).
+  require_action_by_text(window, QStringLiteral("Move"))->trigger();
+  QApplication::processEvents();
+  CHECK(canvas->findChild<QTextEdit*>(QStringLiteral("inlineTextEditor")) == nullptr);
+
+  layer = document.find_layer(text_id);
+  CHECK(layer != nullptr);
+  const auto found = layer->metadata().find(patchy::kLayerMetadataText);
+  CHECK(found != layer->metadata().end() && found->second == "Bendier");
+  const auto warp_after = patchy::text_warp_from_layer(*layer);
+  CHECK(warp_after.has_value());
+  CHECK(warp_after->style == "warpArc");
+  CHECK(warp_after->value == 60.0);
+  // Longer text = wider layout box; the warp box must follow it.
+  CHECK(warp_after->bounds_right - warp_after->bounds_left > box_width_before + 4.0);
+  CHECK(layer->bounds().width > warped_bounds.width + 4);
+  // Still warped: the arc lifts the ends well above a flat line of this size.
+  CHECK(layer->bounds().height > warped_bounds.height - 4);
+}
+
+// A point-text layer at a known origin over a white background, ready for Warp Text.
+// The font is pinned to the suite font so metadata renders and session renders agree.
+patchy::LayerId build_warped_text_session_document(patchy::ui::MainWindow& window, const char* session_name,
+                                                   QPoint origin, const char* text,
+                                                   const QString& family = QString()) {
+  patchy::Document built(520, 320, patchy::PixelFormat::rgba8());
+  built.add_pixel_layer("Background",
+                        solid_pixels(520, 320, patchy::PixelFormat::rgba8(), QColor(Qt::white)));
+  patchy::Layer text_layer(built.allocate_layer_id(), "Warped",
+                           solid_pixels(1, 1, patchy::PixelFormat::rgba8(), QColor(0, 0, 0, 0)));
+  const auto text_id = text_layer.id();
+  text_layer.set_bounds(patchy::Rect{origin.x(), origin.y(), 1, 1});
+  text_layer.metadata()[patchy::kLayerMetadataText] = text;
+  text_layer.metadata()[patchy::kLayerMetadataTextSize] = "36";
+  text_layer.metadata()[patchy::kLayerMetadataTextColor] = "#101010";
+  text_layer.metadata()[patchy::kLayerMetadataTextFont] =
+      (family.isEmpty() ? QApplication::font().family() : family).toStdString();
+  built.add_layer(std::move(text_layer));
+  built.set_active_layer(text_id);
+  window.add_document_session(std::move(built), QString::fromLatin1(session_name));
+  return text_id;
+}
+
+// The warped raster's first (top-left-most) and right-most inked document points; the
+// middle of warped bounds can be empty air under an arc, so entry clicks use real ink.
+QPoint first_ink_document_point(const patchy::Layer& layer) {
+  const auto& pixels = layer.pixels();
+  const auto data = pixels.data();
+  for (int y = 0; y < pixels.height(); ++y) {
+    for (int x = 0; x < pixels.width(); ++x) {
+      if (data[(static_cast<std::size_t>(y) * pixels.width() + x) * 4U + 3U] > 200) {
+        return QPoint(layer.bounds().x + x + 1, layer.bounds().y + y + 1);
+      }
+    }
+  }
+  return QPoint(layer.bounds().x, layer.bounds().y);
+}
+
+QPoint right_most_ink_document_point(const patchy::Layer& layer) {
+  const auto& pixels = layer.pixels();
+  const auto data = pixels.data();
+  for (int x = pixels.width() - 1; x >= 0; --x) {
+    for (int y = 0; y < pixels.height(); ++y) {
+      if (data[(static_cast<std::size_t>(y) * pixels.width() + x) * 4U + 3U] > 200) {
+        return QPoint(layer.bounds().x + x, layer.bounds().y + y);
+      }
+    }
+  }
+  return QPoint(layer.bounds().x, layer.bounds().y);
+}
+
+// Column 11 of a v4+ patchy.text.runs line is the faux bold flag (the writer only emits
+// the column when some run carries faux/style data; earlier versions cannot carry it).
+bool runs_metadata_uses_faux_bold(const std::string& value) {
+  const auto lines = QString::fromStdString(value).split(QLatin1Char('\n'));
+  for (const auto& raw_line : lines) {
+    const auto line = raw_line.trimmed();
+    if (line.isEmpty() || line.startsWith(QLatin1Char('v'))) {
+      continue;
+    }
+    const auto fields = line.split(QLatin1Char('\t'));
+    if (fields.size() >= 12 && fields[11].toInt() != 0) {
+      return true;
+    }
+  }
+  return false;
+}
+
+bool editor_document_has_faux_bold(const QTextEdit& editor) {
+  for (auto block = editor.document()->begin(); block.isValid(); block = block.next()) {
+    for (auto it = block.begin(); !it.atEnd(); ++it) {
+      const auto fragment = it.fragment();
+      if (fragment.isValid() && fragment.length() > 0 &&
+          fragment.charFormat().property(patchy::ui::kTextFauxBoldFormatProperty).toBool()) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+void ui_warp_text_edit_caret_matches_unwarped_preview() {
+  // Editing a warped layer works on the UNWARPED text: the session places the editor,
+  // the preview glyphs, the caret, and mouse hit-testing at the unwarped transform
+  // origin (the caret used to sit in blank air while the glyphs anchored to the warped
+  // ink), and keeps tracking the layer after a Move-style bounds translation.
+  patchy::ui::MainWindow window;
+  const auto text_id =
+      build_warped_text_session_document(window, "WarpCaret", QPoint(110, 130), "HHHHHH");
+  show_window(window);
+  auto* canvas = require_canvas(window);
+  canvas->set_zoom(1.0);
+  QApplication::processEvents();
+  auto& document = patchy::ui::MainWindowTestAccess::document(window);
+  auto* layer = document.find_layer(text_id);
+  CHECK(layer != nullptr);
+  patchy::TextWarp warp;
+  warp.style = "warpArc";
+  warp.value = 60.0;
+  CHECK(patchy::ui::MainWindowTestAccess::apply_text_warp(window, *layer, warp));
+  canvas->document_changed();
+  QApplication::processEvents();
+
+  require_action_by_text(window, QStringLiteral("Type"))->trigger();
+  patchy::ui::MainWindowTestAccess::add_text_at(window, first_ink_document_point(*layer));
+  QApplication::processEvents();
+  process_events_for(300);
+  auto* editor = canvas->findChild<QTextEdit*>(QStringLiteral("inlineTextEditor"));
+  CHECK(editor != nullptr);
+  if (editor == nullptr) {
+    return;
+  }
+  // The session transform is the stored unwarped origin, not the warped ink corner.
+  CHECK(editor->property("patchy.documentTextX").toInt() == 110);
+  CHECK(editor->property("patchy.documentTextY").toInt() == 130);
+  // The unwarped preview glyphs land at that same origin.
+  CHECK(editor->property("patchy.textPreviewLayerId").isValid());
+  const auto preview_id =
+      static_cast<patchy::LayerId>(editor->property("patchy.textPreviewLayerId").toULongLong());
+  const auto* preview = document.find_layer(preview_id);
+  CHECK(preview != nullptr);
+  if (preview == nullptr) {
+    require_action_by_text(window, QStringLiteral("Move"))->trigger();
+    return;
+  }
+  CHECK(std::abs(preview->bounds().x - 110) <= 1);
+  CHECK(std::abs(preview->bounds().y - 130) <= 1);
+
+  // Click the middle of the rendered ink: the caret must land inside the text (the
+  // probe is derived from the preview render, per docs/text-tool-layout.md -- clicking the
+  // caret alone proves nothing when caret and click share a wrong layout).
+  const auto preview_bounds = preview->bounds();
+  const QPoint ink_center_doc(preview_bounds.x + preview_bounds.width / 2,
+                              preview_bounds.y + preview_bounds.height / 2);
+  const auto ink_probe = canvas->widget_position_for_document_point(ink_center_doc) - editor->pos();
+  send_mouse(*editor->viewport(), QEvent::MouseButtonPress, ink_probe, Qt::LeftButton, Qt::LeftButton);
+  send_mouse(*editor->viewport(), QEvent::MouseButtonRelease, ink_probe, Qt::LeftButton, Qt::NoButton);
+  QApplication::processEvents();
+  const auto mid_position = editor->textCursor().position();
+  CHECK(mid_position >= 2 && mid_position <= 5);
+
+  // Caret round trip: click exactly where the caret is drawn and the position returns.
+  QTextCursor cursor(editor->document());
+  cursor.setPosition(3);
+  editor->setTextCursor(cursor);
+  QApplication::processEvents();
+  const auto caret = editor->property("patchy.previewCaretRect").toRect();
+  CHECK(!caret.isEmpty());
+  if (!caret.isEmpty()) {
+    const QPoint caret_probe(caret.left(), (caret.top() + caret.bottom()) / 2);
+    send_mouse(*editor->viewport(), QEvent::MouseButtonPress, caret_probe, Qt::LeftButton, Qt::LeftButton);
+    send_mouse(*editor->viewport(), QEvent::MouseButtonRelease, caret_probe, Qt::LeftButton, Qt::NoButton);
+    QApplication::processEvents();
+    CHECK(editor->textCursor().position() == 3);
+  }
+
+  // Commit unchanged, translate the layer bounds (what a Move drag does; the stored
+  // text transform is untouched), re-enter: the session must follow the moved raster.
+  require_action_by_text(window, QStringLiteral("Move"))->trigger();
+  QApplication::processEvents();
+  process_events_for(150);
+  layer = document.find_layer(text_id);
+  CHECK(layer != nullptr);
+  if (layer == nullptr) {
+    return;
+  }
+  auto moved_bounds = layer->bounds();
+  moved_bounds.x += 40;
+  moved_bounds.y += 25;
+  layer->set_bounds(moved_bounds);
+  canvas->document_changed();
+  QApplication::processEvents();
+
+  require_action_by_text(window, QStringLiteral("Type"))->trigger();
+  patchy::ui::MainWindowTestAccess::add_text_at(window, first_ink_document_point(*layer));
+  QApplication::processEvents();
+  process_events_for(300);
+  editor = canvas->findChild<QTextEdit*>(QStringLiteral("inlineTextEditor"));
+  CHECK(editor != nullptr);
+  if (editor != nullptr) {
+    CHECK(editor->property("patchy.documentTextX").toInt() == 150);
+    CHECK(editor->property("patchy.documentTextY").toInt() == 155);
+    require_action_by_text(window, QStringLiteral("Move"))->trigger();
+    QApplication::processEvents();
+  }
+}
+
+void ui_warp_text_recommit_keeps_origin() {
+  // A no-change edit commit of a warped layer reproduces the layer exactly: same
+  // bounds, same warp box, same stored transform. The commit used to re-anchor the
+  // text at the WARPED ink corner, drifting the layer on every commit. Two rounds
+  // catch cumulative drift.
+  patchy::ui::MainWindow window;
+  const auto text_id =
+      build_warped_text_session_document(window, "WarpRecommit", QPoint(110, 130), "Bend");
+  show_window(window);
+  auto* canvas = require_canvas(window);
+  canvas->set_zoom(1.0);
+  QApplication::processEvents();
+  auto& document = patchy::ui::MainWindowTestAccess::document(window);
+  auto* layer = document.find_layer(text_id);
+  CHECK(layer != nullptr);
+  patchy::TextWarp warp;
+  warp.style = "warpArc";
+  warp.value = 60.0;
+  CHECK(patchy::ui::MainWindowTestAccess::apply_text_warp(window, *layer, warp));
+  canvas->document_changed();
+  QApplication::processEvents();
+
+  const auto recommit = [&window, &document, &canvas, text_id] {
+    auto* current = document.find_layer(text_id);
+    CHECK(current != nullptr);
+    if (current == nullptr) {
+      return;
+    }
+    require_action_by_text(window, QStringLiteral("Type"))->trigger();
+    patchy::ui::MainWindowTestAccess::add_text_at(window, first_ink_document_point(*current));
+    QApplication::processEvents();
+    process_events_for(300);
+    CHECK(canvas->findChild<QTextEdit*>(QStringLiteral("inlineTextEditor")) != nullptr);
+    require_action_by_text(window, QStringLiteral("Move"))->trigger();
+    QApplication::processEvents();
+    process_events_for(150);
+  };
+  // Session 0 normalizes the hand-built metadata into a committed state; the stability
+  // assertions run against that, so fixture-vs-editor normalization cannot hide drift.
+  recommit();
+  layer = document.find_layer(text_id);
+  CHECK(layer != nullptr);
+  if (layer == nullptr) {
+    return;
+  }
+  const auto baseline_bounds = layer->bounds();
+  const auto baseline_warp = patchy::text_warp_from_layer(*layer);
+  CHECK(baseline_warp.has_value());
+  const auto transform_found = layer->metadata().find(patchy::kLayerMetadataTextTransform);
+  CHECK(transform_found != layer->metadata().end());
+  const auto baseline_transform = transform_found != layer->metadata().end()
+                                      ? transform_found->second
+                                      : std::string();
+
+  for (int round = 0; round < 2; ++round) {
+    recommit();
+    layer = document.find_layer(text_id);
+    CHECK(layer != nullptr);
+    if (layer == nullptr) {
+      return;
+    }
+    CHECK(layer->bounds().x == baseline_bounds.x);
+    CHECK(layer->bounds().y == baseline_bounds.y);
+    CHECK(layer->bounds().width == baseline_bounds.width);
+    CHECK(layer->bounds().height == baseline_bounds.height);
+    const auto warp_now = patchy::text_warp_from_layer(*layer);
+    CHECK(warp_now.has_value());
+    if (warp_now.has_value() && baseline_warp.has_value()) {
+      CHECK(warp_now->style == baseline_warp->style);
+      CHECK(warp_now->value == baseline_warp->value);
+      CHECK(std::abs(warp_now->bounds_left - baseline_warp->bounds_left) < 1e-6);
+      CHECK(std::abs(warp_now->bounds_top - baseline_warp->bounds_top) < 1e-6);
+      CHECK(std::abs(warp_now->bounds_right - baseline_warp->bounds_right) < 1e-6);
+      CHECK(std::abs(warp_now->bounds_bottom - baseline_warp->bounds_bottom) < 1e-6);
+    }
+    const auto transform_now = layer->metadata().find(patchy::kLayerMetadataTextTransform);
+    CHECK(transform_now != layer->metadata().end() && transform_now->second == baseline_transform);
+  }
+}
+
+void ui_warp_text_commit_leaves_no_stale_canvas() {
+  // Ending a warped-text session repaints everything it touched: the old warped render
+  // (its bounds rarely match the new ones), the unwarped preview, and the committed
+  // result. Stale regions used to keep the old pixels in the render cache until a
+  // manual Redraw All (F5). force_refresh() rebuilds the composite from scratch, so
+  // grab-vs-force_refresh equality is the oracle.
+  patchy::ui::MainWindow window;
+  const auto text_id =
+      build_warped_text_session_document(window, "WarpStale", QPoint(110, 130), "Bendy");
+  show_window(window);
+  auto* canvas = require_canvas(window);
+  canvas->set_zoom(1.0);
+  QApplication::processEvents();
+  auto& document = patchy::ui::MainWindowTestAccess::document(window);
+  auto* layer = document.find_layer(text_id);
+  CHECK(layer != nullptr);
+  patchy::TextWarp warp;
+  warp.style = "warpArc";
+  warp.value = 60.0;
+  CHECK(patchy::ui::MainWindowTestAccess::apply_text_warp(window, *layer, warp));
+  canvas->force_refresh();
+  QApplication::processEvents();
+  const auto entry_point = first_ink_document_point(*layer);
+  const auto right_ink = right_most_ink_document_point(*layer);
+
+  // Delete ALL text before the first preview lands: the source layer is hidden from a
+  // visible state on the empty-text path, whose vacated region used to be discarded
+  // (the warped ghost stayed baked in the cache).
+  require_action_by_text(window, QStringLiteral("Type"))->trigger();
+  patchy::ui::MainWindowTestAccess::add_text_at(window, entry_point);
+  auto* editor = canvas->findChild<QTextEdit*>(QStringLiteral("inlineTextEditor"));
+  CHECK(editor != nullptr);
+  if (editor == nullptr) {
+    return;
+  }
+  {
+    QTextCursor cursor(editor->document());
+    cursor.select(QTextCursor::Document);
+    cursor.removeSelectedText();
+  }
+  process_events_for(300);
+  auto mid_session = canvas->grab().toImage();
+  canvas->force_refresh();
+  auto mid_forced = canvas->grab().toImage();
+  // Mask the caret: with no preview the editor paints its own (blinking) cursor, the
+  // one region legitimately absent from the recomposited cache.
+  const auto viewport_origin = editor->viewport()->mapTo(canvas, QPoint(0, 0));
+  for (const auto caret_rect :
+       {editor->cursorRect().translated(viewport_origin),
+        editor->property("patchy.previewCaretRect").toRect().translated(viewport_origin)}) {
+    if (caret_rect.isEmpty()) {
+      continue;
+    }
+    const auto masked = caret_rect.adjusted(-6, -6, 6, 6);
+    QPainter mask_session(&mid_session);
+    mask_session.fillRect(masked, Qt::white);
+    QPainter mask_forced(&mid_forced);
+    mask_forced.fillRect(masked, Qt::white);
+  }
+  CHECK(images_equal_rgba(mid_session, mid_forced));
+
+  // Replace with far smaller ink and commit: the old warped extremity must repaint.
+  editor->insertPlainText(QStringLiteral("I"));
+  process_events_for(300);
+  require_action_by_text(window, QStringLiteral("Move"))->trigger();
+  QApplication::processEvents();
+  process_events_for(150);
+  CHECK(canvas->findChild<QTextEdit*>(QStringLiteral("inlineTextEditor")) == nullptr);
+  const auto committed = canvas->grab().toImage();
+  canvas->force_refresh();
+  QApplication::processEvents();
+  const auto committed_forced = canvas->grab().toImage();
+  CHECK(images_equal_rgba(committed, committed_forced));
+  // Direct, diagnosable probe: the old right-edge ink is background again.
+  CHECK(color_close(canvas_pixel(*canvas, right_ink), QColor(Qt::white), 12));
+}
+
+void ui_warp_text_dialog_refuses_faux_bold() {
+  // Photoshop refuses to warp type that uses Faux Bold anywhere in the layer; the Warp
+  // Text dialog must not open, whether the faux bold sits in committed metadata
+  // (imports) or was toggled in the live session the request commits first.
+  patchy::ui::MainWindow window;
+  patchy::Document built(420, 260, patchy::PixelFormat::rgba8());
+  built.add_pixel_layer("Background",
+                        solid_pixels(420, 260, patchy::PixelFormat::rgba8(), QColor(Qt::white)));
+  patchy::Layer text_layer(built.allocate_layer_id(), "Faux",
+                           solid_pixels(40, 16, patchy::PixelFormat::rgba8(), QColor(20, 20, 20, 255)));
+  const auto text_id = text_layer.id();
+  text_layer.set_bounds(patchy::Rect{60, 90, 40, 16});
+  text_layer.metadata()[patchy::kLayerMetadataText] = "FauxWarp";
+  text_layer.metadata()[patchy::kLayerMetadataTextSize] = "36";
+  text_layer.metadata()[patchy::kLayerMetadataTextColor] = "#101010";
+  const auto family_encoded =
+      QString::fromLatin1(QApplication::font().family().toUtf8().toPercentEncoding());
+  text_layer.metadata()[patchy::kLayerMetadataTextRuns] =
+      QStringLiteral("v4\n0\t8\t36\t0\t0\t#101010\t%1\tauto\t0\t1\t1\t1")
+          .arg(family_encoded)
+          .toStdString();
+  built.add_layer(std::move(text_layer));
+  built.set_active_layer(text_id);
+  window.add_document_session(std::move(built), QStringLiteral("FauxWarpGuard"));
+  show_window(window);
+  auto& document = patchy::ui::MainWindowTestAccess::document(window);
+
+  bool dialog_appeared = false;
+  QTimer::singleShot(0, [&dialog_appeared] {
+    if (auto* dialog = find_top_level_dialog(QStringLiteral("warpTextDialog")); dialog != nullptr) {
+      dialog_appeared = true;
+      dialog->reject();
+    }
+  });
+  patchy::ui::MainWindowTestAccess::request_warp_text_dialog(window);
+  QApplication::processEvents();
+  CHECK(!dialog_appeared);
+  CHECK(window.statusBar()->currentMessage().contains(QStringLiteral("Faux bold")));
+  auto* layer = document.find_layer(text_id);
+  CHECK(layer != nullptr && !patchy::text_warp_from_layer(*layer).has_value());
+
+  // Live-session ordering: request_warp_text_dialog commits the open session first, so
+  // faux bold toggled moments earlier is already in the metadata the guard reads.
+  patchy::Layer plain(document.allocate_layer_id(), "Plain",
+                      solid_pixels(1, 1, patchy::PixelFormat::rgba8(), QColor(0, 0, 0, 0)));
+  const auto plain_id = plain.id();
+  plain.set_bounds(patchy::Rect{60, 170, 1, 1});
+  plain.metadata()[patchy::kLayerMetadataText] = "Fresh";
+  plain.metadata()[patchy::kLayerMetadataTextSize] = "36";
+  plain.metadata()[patchy::kLayerMetadataTextColor] = "#101010";
+  plain.metadata()[patchy::kLayerMetadataTextFont] = QApplication::font().family().toStdString();
+  document.add_layer(std::move(plain));
+  auto* plain_layer = document.find_layer(plain_id);
+  CHECK(plain_layer != nullptr);
+  if (plain_layer == nullptr) {
+    return;
+  }
+  CHECK(patchy::ui::MainWindowTestAccess::apply_text_warp(window, *plain_layer, patchy::TextWarp{}));
+  document.set_active_layer(plain_id);
+  require_action_by_text(window, QStringLiteral("Type"))->trigger();
+  patchy::ui::MainWindowTestAccess::add_text_at(
+      window, QPoint(plain_layer->bounds().x + 2, plain_layer->bounds().y + 2));
+  QApplication::processEvents();
+  auto* canvas = require_canvas(window);
+  auto* editor = canvas->findChild<QTextEdit*>(QStringLiteral("inlineTextEditor"));
+  CHECK(editor != nullptr);
+  if (editor == nullptr) {
+    return;
+  }
+  {
+    QTextCursor cursor(editor->document());
+    cursor.select(QTextCursor::Document);
+    QTextCharFormat format;
+    format.setProperty(patchy::ui::kTextFauxBoldFormatProperty, true);
+    cursor.mergeCharFormat(format);
+  }
+  QApplication::processEvents();
+  dialog_appeared = false;
+  QTimer::singleShot(0, [&dialog_appeared] {
+    if (auto* dialog = find_top_level_dialog(QStringLiteral("warpTextDialog")); dialog != nullptr) {
+      dialog_appeared = true;
+      dialog->reject();
+    }
+  });
+  patchy::ui::MainWindowTestAccess::request_warp_text_dialog(window);
+  QApplication::processEvents();
+  CHECK(!dialog_appeared);
+  CHECK(canvas->findChild<QTextEdit*>(QStringLiteral("inlineTextEditor")) == nullptr);
+  auto* committed = document.find_layer(plain_id);
+  CHECK(committed != nullptr);
+  if (committed != nullptr) {
+    CHECK(!patchy::text_warp_from_layer(*committed).has_value());
+    const auto runs = committed->metadata().find(patchy::kLayerMetadataTextRuns);
+    CHECK(runs != committed->metadata().end() && runs_metadata_uses_faux_bold(runs->second));
+  }
+}
+
+void ui_warped_text_refuses_faux_bold_toggle() {
+  // The reverse direction: enabling faux bold on a warped layer is refused from both
+  // entrances (the Character panel checkbox reverts; Ctrl+B never applies the faux
+  // fallback), so the faux+warp state Photoshop refuses to author cannot be created.
+  patchy::ui::MainWindow window;
+  const auto text_id =
+      build_warped_text_session_document(window, "WarpFauxToggle", QPoint(110, 130), "Bend");
+  show_window(window);
+  auto* canvas = require_canvas(window);
+  canvas->set_zoom(1.0);
+  QApplication::processEvents();
+  auto& document = patchy::ui::MainWindowTestAccess::document(window);
+  auto* layer = document.find_layer(text_id);
+  CHECK(layer != nullptr);
+  patchy::TextWarp warp;
+  warp.style = "warpArc";
+  warp.value = 60.0;
+  CHECK(patchy::ui::MainWindowTestAccess::apply_text_warp(window, *layer, warp));
+  canvas->document_changed();
+  QApplication::processEvents();
+
+  require_action_by_text(window, QStringLiteral("Type"))->trigger();
+  patchy::ui::MainWindowTestAccess::add_text_at(window, first_ink_document_point(*layer));
+  QApplication::processEvents();
+  process_events_for(250);
+  auto* editor = canvas->findChild<QTextEdit*>(QStringLiteral("inlineTextEditor"));
+  CHECK(editor != nullptr);
+  if (editor == nullptr) {
+    return;
+  }
+
+  // Character panel: the checkbox refuses and reverts.
+  auto* character_button = window.findChild<QPushButton*>(QStringLiteral("textCharacterButton"));
+  CHECK(character_button != nullptr);
+  if (character_button == nullptr) {
+    require_action_by_text(window, QStringLiteral("Move"))->trigger();
+    return;
+  }
+  bool drove_panel = false;
+  QTimer::singleShot(0, guarded([&window, &drove_panel] {
+    auto* dialog = window.findChild<QDialog*>(QStringLiteral("textCharacterDialog"));
+    CHECK(dialog != nullptr);
+    if (dialog == nullptr) {
+      return;
+    }
+    auto* faux_bold = dialog->findChild<QAbstractButton*>(QStringLiteral("textCharacterFauxBold"));
+    CHECK(faux_bold != nullptr && faux_bold->isEnabled() && !faux_bold->isChecked());
+    if (faux_bold != nullptr) {
+      faux_bold->click();
+      QApplication::processEvents();
+      CHECK(!faux_bold->isChecked());
+      drove_panel = true;
+    }
+    dialog->reject();
+  }));
+  character_button->click();
+  QApplication::processEvents();
+  CHECK(drove_panel);
+  CHECK(window.statusBar()->currentMessage().contains(QStringLiteral("Faux bold")));
+  CHECK(!editor_document_has_faux_bold(*editor));
+
+  // Ctrl+B: whatever the family offers, the faux flag must never appear on a warped
+  // session (a real Bold face is allowed; the synthetic fallback is refused).
+  patchy::ui::MainWindowTestAccess::toggle_text_bold_face(window);
+  QApplication::processEvents();
+  CHECK(!editor_document_has_faux_bold(*editor));
+
+  // Commit: the layer comes out warped and without faux bold in its runs.
+  require_action_by_text(window, QStringLiteral("Move"))->trigger();
+  QApplication::processEvents();
+  process_events_for(150);
+  layer = document.find_layer(text_id);
+  CHECK(layer != nullptr);
+  if (layer != nullptr) {
+    if (const auto runs = layer->metadata().find(patchy::kLayerMetadataTextRuns);
+        runs != layer->metadata().end()) {
+      CHECK(!runs_metadata_uses_faux_bold(runs->second));
+    }
+    CHECK(patchy::text_warp_from_layer(*layer).has_value());
+  }
+}
+
+void ui_text_character_panel_edits_selected_layer_without_session() {
+  patchy::test::register_test_fonts(patchy::test::TestFontRole::UiDefault);
+  for (const bool warped : {false, true}) {
+    patchy::ui::MainWindow window;
+    const auto id = build_warped_text_session_document(window, "CharacterLayer", QPoint(110, 130), "BendMore");
+    show_window(window);
+    auto* canvas = require_canvas(window);
+    canvas->set_zoom(0.75);
+    auto& document = patchy::ui::MainWindowTestAccess::document(window);
+    auto* layer = document.find_layer(id);
+    const auto family = QString::fromStdString(std::as_const(*layer).metadata().at(patchy::kLayerMetadataTextFont));
+    layer->metadata()[patchy::kLayerMetadataTextRuns] =
+        QStringLiteral("v3\n0\t4\t36\t0\t0\t#101010\t%1\tauto\t0\t1\t1\n"
+                       "4\t4\t24\t0\t0\t#202080\t%1\tauto\t0\t1\t1\n")
+            .arg(QString::fromLatin1(family.toUtf8().toPercentEncoding())).toStdString();
+    patchy::TextWarp warp;
+    if (warped) {
+      warp.style = "warpArc";
+      warp.value = 60.0;
+    }
+    CHECK(patchy::ui::MainWindowTestAccess::apply_text_warp(window, *layer, warp));
+    // A moved warp must keep the Move-corrected origin when character metrics change.
+    auto moved = layer->bounds();
+    moved.x += 25;
+    moved.y += 15;
+    layer->set_bounds(moved);
+    canvas->document_changed();
+    patchy::ui::MainWindowTestAccess::refresh_layer_ui(window);
+    require_action_by_text(window, QStringLiteral("Type"))->trigger();
+    const auto before = *std::as_const(document).find_layer(id);
+    const auto depth = patchy::ui::MainWindowTestAccess::active_session_undo_depth(window);
+    const auto points_per_pixel = 72.0 / document.print_settings().horizontal_ppi;
+    bool drove = false;
+    QTimer::singleShot(0, [&] {
+      try {
+        auto* dialog = window.findChild<QDialog*>(QStringLiteral("textCharacterDialog"));
+        CHECK(dialog != nullptr);
+        auto* tracking = dialog->findChild<QSpinBox*>(QStringLiteral("textCharacterTrackingSpin"));
+        auto* horizontal = dialog->findChild<QSpinBox*>(QStringLiteral("textCharacterHScaleSpin"));
+        auto* vertical = dialog->findChild<QSpinBox*>(QStringLiteral("textCharacterVScaleSpin"));
+        auto* automatic = dialog->findChild<QCheckBox*>(QStringLiteral("textCharacterAutoLeading"));
+        auto* leading = dialog->findChild<QDoubleSpinBox*>(QStringLiteral("textCharacterLeadingSpin"));
+        auto* faux_bold = dialog->findChild<QAbstractButton*>(QStringLiteral("textCharacterFauxBold"));
+        auto* faux_italic = dialog->findChild<QAbstractButton*>(QStringLiteral("textCharacterFauxItalic"));
+        CHECK(tracking && horizontal && vertical && automatic && leading && faux_bold && faux_italic);
+        CHECK(tracking->isEnabled() && tracking->value() == 0);
+        CHECK(automatic->isChecked());
+        CHECK(std::abs(leading->value() - 43.2 * points_per_pixel) < 0.05);
+        CHECK(canvas->findChild<QTextEdit*>(QStringLiteral("inlineTextEditor")) == nullptr);
+        CHECK(std::ranges::equal(std::as_const(document).find_layer(id)->pixels().data(), before.pixels().data()));
+        CHECK(patchy::ui::MainWindowTestAccess::active_session_undo_depth(window) == depth);
+        if (warped) {
+          faux_bold->click();
+          CHECK(!faux_bold->isChecked());
+          CHECK(window.statusBar()->currentMessage().contains(QStringLiteral("Faux bold")));
+          CHECK(patchy::ui::MainWindowTestAccess::active_session_undo_depth(window) == depth);
+        }
+        dialog->activateWindow();
+        tracking->setFocus();
+        QApplication::processEvents();
+        CHECK(tracking->hasFocus());
+        tracking->setValue(100);
+        const bool focus_preserved = tracking->hasFocus();
+        CHECK(canvas->tool() == patchy::ui::CanvasTool::Text);
+        CHECK(canvas->findChild<QTextEdit*>(QStringLiteral("inlineTextEditor")) == nullptr);
+        CHECK(patchy::ui::MainWindowTestAccess::active_session_undo_depth(window) == depth + 1);
+        const auto* changed = std::as_const(document).find_layer(id);
+        CHECK(changed->visible());
+        CHECK(!std::ranges::equal(changed->pixels().data(), before.pixels().data()));
+        CHECK(patchy::text_warp_from_layer(*changed).has_value() == warped);
+        // One undo restores the original raster, placement and metadata exactly.
+        require_action_by_text(window, QStringLiteral("Undo"))->trigger();
+        const auto* restored = std::as_const(document).find_layer(id);
+        CHECK(std::ranges::equal(restored->pixels().data(), before.pixels().data()));
+        CHECK(restored->bounds().x == before.bounds().x && restored->bounds().y == before.bounds().y);
+        CHECK(restored->bounds().width == before.bounds().width && restored->bounds().height == before.bounds().height);
+        CHECK(restored->metadata() == before.metadata());
+        CHECK(tracking->value() == 0);
+        require_action_by_text(window, QStringLiteral("Redo"))->trigger();
+        CHECK(tracking->value() == 100);
+        horizontal->setValue(120);
+        vertical->setValue(110);
+        automatic->setChecked(false);
+        leading->setValue(60.0 * points_per_pixel);
+        faux_italic->setChecked(true);
+        if (!warped) {
+          faux_bold->setChecked(true);
+        }
+        CHECK(canvas->findChild<QTextEdit*>(QStringLiteral("inlineTextEditor")) == nullptr);
+        const auto* final_layer = std::as_const(document).find_layer(id);
+        const auto runs = QString::fromStdString(final_layer->metadata().at(patchy::kLayerMetadataTextRuns));
+        bool saw_large = false;
+        bool saw_small = false;
+        for (const auto& line : runs.split(QLatin1Char('\n')).mid(1)) {
+          const auto fields = line.split(QLatin1Char('\t'));
+          if (fields.size() < 14) { continue; }
+          saw_large |= std::abs(fields[2].toDouble() - 36.0) < 0.01;
+          saw_small |= std::abs(fields[2].toDouble() - 24.0) < 0.01;
+          CHECK(std::abs(fields[7].toDouble() - 60.0) < 0.01);
+          CHECK(fields[8].toInt() == 100);
+          CHECK(std::abs(fields[9].toDouble() - 1.2) < 0.001);
+          CHECK(std::abs(fields[10].toDouble() - 1.1) < 0.001);
+          CHECK(fields[11].toInt() == (warped ? 0 : 1));
+          CHECK(fields[13].toInt() == 1);
+        }
+        CHECK(saw_large && saw_small);
+        if (warped) {
+          const auto final_warp = patchy::text_warp_from_layer(*final_layer);
+          CHECK(final_warp.has_value() && final_warp->style == warp.style && final_warp->value == warp.value);
+          save_widget_artifact("ui_text_character_selected_warped_layer", window);
+          save_widget_artifact("ui_text_character_selected_warped_panel", *dialog);
+        }
+        CHECK(focus_preserved);
+        drove = true;
+        dialog->reject();
+      } catch (...) {
+        patchy::ui::unwind_non_modal_dialog_loop(std::current_exception());
+      }
+    });
+    window.findChild<QPushButton*>(QStringLiteral("textCharacterButton"))->click();
+    CHECK(drove);
+  }
+}
+
+// Three rendered, unwarped text layers for the no-session tests (GitHub issue 31): a Text
+// options-bar or Character-panel change with no inline session must reach every SELECTED
+// text layer, not only the active one, as one undo step.
+struct NoSessionTextLayers {
+  patchy::LayerId alpha{0};
+  patchy::LayerId beta{0};
+  patchy::LayerId gamma{0};
+};
+
+NoSessionTextLayers build_no_session_text_layers(patchy::ui::MainWindow& window, const char* session_name) {
+  patchy::Document built(520, 360, patchy::PixelFormat::rgba8());
+  built.add_pixel_layer("Background", solid_pixels(520, 360, patchy::PixelFormat::rgba8(), QColor(Qt::white)));
+  const auto family = QApplication::font().family().toStdString();
+  const auto add = [&](const char* name, QPoint origin, const char* size) {
+    patchy::Layer layer(built.allocate_layer_id(), name,
+                        solid_pixels(1, 1, patchy::PixelFormat::rgba8(), QColor(0, 0, 0, 0)));
+    const auto id = layer.id();
+    layer.set_bounds(patchy::Rect{origin.x(), origin.y(), 1, 1});
+    layer.metadata()[patchy::kLayerMetadataText] = name;
+    layer.metadata()[patchy::kLayerMetadataTextSize] = size;
+    layer.metadata()[patchy::kLayerMetadataTextColor] = "#101010";
+    layer.metadata()[patchy::kLayerMetadataTextFont] = family;
+    built.add_layer(std::move(layer));
+    return id;
+  };
+  NoSessionTextLayers ids;
+  ids.alpha = add("Alpha", QPoint(40, 40), "36");
+  ids.beta = add("Beta", QPoint(40, 150), "24");
+  ids.gamma = add("Gamma", QPoint(40, 260), "30");
+  built.set_active_layer(ids.alpha);
+  window.add_document_session(std::move(built), QString::fromLatin1(session_name));
+  auto& document = patchy::ui::MainWindowTestAccess::document(window);
+  for (const auto id : {ids.alpha, ids.beta, ids.gamma}) {
+    // An identity warp is a plain render: real bounds and pixels for the hidden sessions.
+    CHECK(patchy::ui::MainWindowTestAccess::apply_text_warp(window, *document.find_layer(id), patchy::TextWarp{}));
+  }
+  patchy::ui::MainWindowTestAccess::refresh_layer_ui(window);
+  return ids;
+}
+
+// Selects exactly `names` in the Layers panel; the last one is the current (active) row.
+void select_layer_rows(patchy::ui::MainWindow& window, const QStringList& names) {
+  auto* list = window.findChild<QListWidget*>(QStringLiteral("layerList"));
+  CHECK(list != nullptr);
+  if (list == nullptr || names.isEmpty()) {
+    return;
+  }
+  list->setCurrentItem(require_layer_item(*list, names.back()), QItemSelectionModel::ClearAndSelect);
+  for (const auto& name : names) {
+    require_layer_item(*list, name)->setSelected(true);
+  }
+  QApplication::processEvents();
+}
+
+QStringList selected_layer_row_names(patchy::ui::MainWindow& window) {
+  QStringList names;
+  auto* list = window.findChild<QListWidget*>(QStringLiteral("layerList"));
+  if (list == nullptr) {
+    return names;
+  }
+  for (int row = 0; row < list->count(); ++row) {
+    if (list->item(row)->isSelected()) {
+      names << list->item(row)->text();
+    }
+  }
+  names.sort();
+  return names;
+}
+
+std::string text_layer_metadata(const patchy::Document& document, patchy::LayerId id, const char* key) {
+  const auto* layer = document.find_layer(id);
+  if (layer == nullptr) {
+    return {};
+  }
+  const auto found = layer->metadata().find(key);
+  return found == layer->metadata().end() ? std::string() : found->second;
+}
+
+// One column of the first patchy.text.runs line (3 = bold, 8 = tracking), 0 when the layer
+// records no runs or the column is absent.
+int first_run_column(const patchy::Document& document, patchy::LayerId id, int column) {
+  const auto runs = QString::fromStdString(text_layer_metadata(document, id, patchy::kLayerMetadataTextRuns));
+  for (const auto& raw_line : runs.split(QLatin1Char('\n'))) {
+    const auto line = raw_line.trimmed();
+    if (line.isEmpty() || line.startsWith(QLatin1Char('v'))) {
+      continue;
+    }
+    const auto fields = line.split(QLatin1Char('\t'));
+    return fields.size() > column ? fields[column].toInt() : 0;
+  }
+  return 0;
+}
+
+int first_run_tracking(const patchy::Document& document, patchy::LayerId id) {
+  return first_run_column(document, id, 8);
+}
+
+bool first_run_bold(const patchy::Document& document, patchy::LayerId id) {
+  return first_run_column(document, id, 3) != 0;
+}
+
+bool layer_matches(const patchy::Document& document, patchy::LayerId id, const patchy::Layer& expected) {
+  const auto* layer = document.find_layer(id);
+  return layer != nullptr && std::ranges::equal(layer->pixels().data(), expected.pixels().data()) &&
+         layer->metadata() == expected.metadata() && layer->bounds().x == expected.bounds().x &&
+         layer->bounds().y == expected.bounds().y && layer->bounds().width == expected.bounds().width &&
+         layer->bounds().height == expected.bounds().height;
+}
+
+void ui_text_options_bar_size_applies_to_selected_layers_without_session() {
+  patchy::test::register_test_fonts(patchy::test::TestFontRole::UiDefault);
+  patchy::ui::MainWindow window;
+  const auto ids = build_no_session_text_layers(window, "OptionsBarSize");
+  show_window(window);
+  auto* canvas = require_canvas(window);
+  canvas->set_zoom(0.75);
+  auto& document = patchy::ui::MainWindowTestAccess::document(window);
+  require_action_by_text(window, QStringLiteral("Type"))->trigger();
+  select_layer_rows(window, {QStringLiteral("Alpha"), QStringLiteral("Beta")});
+  auto* size_spin = window.findChild<QDoubleSpinBox*>(QStringLiteral("textSizeSpin"));
+  CHECK(size_spin != nullptr);
+  if (size_spin == nullptr) {
+    return;
+  }
+  const auto points_per_pixel = 72.0 / document.print_settings().horizontal_ppi;
+  const auto before_alpha = *std::as_const(document).find_layer(ids.alpha);
+  const auto before_beta = *std::as_const(document).find_layer(ids.beta);
+  const auto before_gamma = *std::as_const(document).find_layer(ids.gamma);
+  const auto depth = patchy::ui::MainWindowTestAccess::active_session_undo_depth(window);
+  CHECK(canvas->findChild<QTextEdit*>(QStringLiteral("inlineTextEditor")) == nullptr);
+
+  size_spin->setValue(60.0 * points_per_pixel);
+  QApplication::processEvents();
+  CHECK(canvas->findChild<QTextEdit*>(QStringLiteral("inlineTextEditor")) == nullptr);
+  CHECK(canvas->tool() == patchy::ui::CanvasTool::Text);
+  // Both selected layers, one undo step; the unselected layer is untouched.
+  CHECK(patchy::ui::MainWindowTestAccess::active_session_undo_depth(window) == depth + 1);
+  CHECK(text_layer_metadata(document, ids.alpha, patchy::kLayerMetadataTextSize) == "60");
+  CHECK(text_layer_metadata(document, ids.beta, patchy::kLayerMetadataTextSize) == "60");
+  CHECK(!std::ranges::equal(std::as_const(document).find_layer(ids.alpha)->pixels().data(),
+                            before_alpha.pixels().data()));
+  CHECK(!std::ranges::equal(std::as_const(document).find_layer(ids.beta)->pixels().data(),
+                            before_beta.pixels().data()));
+  CHECK(layer_matches(document, ids.gamma, before_gamma));
+  // The commits rebuild the panel rows; the selection is put back and the bar shows the size.
+  CHECK(selected_layer_row_names(window) == (QStringList{QStringLiteral("Alpha"), QStringLiteral("Beta")}));
+  CHECK(std::abs(size_spin->value() - 60.0 * points_per_pixel) < 0.01);
+
+  require_action_by_text(window, QStringLiteral("Undo"))->trigger();
+  CHECK(patchy::ui::MainWindowTestAccess::active_session_undo_depth(window) == depth);
+  CHECK(layer_matches(document, ids.alpha, before_alpha));
+  CHECK(layer_matches(document, ids.beta, before_beta));
+  CHECK(layer_matches(document, ids.gamma, before_gamma));
+  require_action_by_text(window, QStringLiteral("Redo"))->trigger();
+  CHECK(text_layer_metadata(document, ids.alpha, patchy::kLayerMetadataTextSize) == "60");
+  CHECK(text_layer_metadata(document, ids.beta, patchy::kLayerMetadataTextSize) == "60");
+  CHECK(text_layer_metadata(document, ids.gamma, patchy::kLayerMetadataTextSize) == "30");
+}
+
+void ui_text_options_bar_family_and_style_apply_to_selected_layers_without_session() {
+  patchy::test::register_test_fonts(patchy::test::TestFontRole::UiDefault);
+  patchy::ui::MainWindow window;
+  const auto ids = build_no_session_text_layers(window, "OptionsBarFamily");
+  show_window(window);
+  auto* canvas = require_canvas(window);
+  canvas->set_zoom(1.0);
+  auto& document = patchy::ui::MainWindowTestAccess::document(window);
+  require_action_by_text(window, QStringLiteral("Type"))->trigger();
+  select_layer_rows(window, {QStringLiteral("Alpha"), QStringLiteral("Beta")});
+  auto* font_combo = window.findChild<QFontComboBox*>(QStringLiteral("textFontCombo"));
+  auto* style_combo = window.findChild<QComboBox*>(QStringLiteral("textStyleCombo"));
+  CHECK(font_combo != nullptr && style_combo != nullptr);
+  if (font_combo == nullptr || style_combo == nullptr) {
+    return;
+  }
+  const auto primary = QApplication::font().family();
+  QString second;
+  // The Linux UiDefault role registers Liberation Sans and DejaVu Sans, not the others.
+  for (const auto* candidate : {"Calibri", "Segoe UI", "Verdana", "Arial", "Liberation Sans", "DejaVu Sans"}) {
+    const auto family = QString::fromLatin1(candidate);
+    if (family != primary && QFontDatabase::hasFamily(family)) {
+      second = family;
+      break;
+    }
+  }
+  CHECK(!second.isEmpty());
+  if (second.isEmpty()) {
+    return;
+  }
+  // With no session the bar mirrors the active layer, so the pick below is a real change.
+  CHECK(font_combo->currentFont().family() == primary);
+  const auto depth = patchy::ui::MainWindowTestAccess::active_session_undo_depth(window);
+
+  font_combo->setCurrentFont(QFont(second));
+  QApplication::processEvents();
+  CHECK(canvas->findChild<QTextEdit*>(QStringLiteral("inlineTextEditor")) == nullptr);
+  CHECK(patchy::ui::MainWindowTestAccess::active_session_undo_depth(window) == depth + 1);
+  CHECK(text_layer_metadata(document, ids.alpha, patchy::kLayerMetadataTextFont) == second.toStdString());
+  CHECK(text_layer_metadata(document, ids.beta, patchy::kLayerMetadataTextFont) == second.toStdString());
+  CHECK(text_layer_metadata(document, ids.gamma, patchy::kLayerMetadataTextFont) == primary.toStdString());
+  CHECK(selected_layer_row_names(window) == (QStringList{QStringLiteral("Alpha"), QStringLiteral("Beta")}));
+
+  // The face picker resolves against each layer's own family; Bold is flag-expressible, so
+  // it lands in the runs' bold column rather than a recorded style.
+  const auto bold_index = style_combo->findData(QStringLiteral("Bold"));
+  CHECK(bold_index >= 0);
+  if (bold_index >= 0) {
+    CHECK(!first_run_bold(document, ids.alpha));
+    style_combo->setCurrentIndex(bold_index);
+    QApplication::processEvents();
+    CHECK(canvas->findChild<QTextEdit*>(QStringLiteral("inlineTextEditor")) == nullptr);
+    CHECK(patchy::ui::MainWindowTestAccess::active_session_undo_depth(window) == depth + 2);
+    CHECK(first_run_bold(document, ids.alpha));
+    CHECK(first_run_bold(document, ids.beta));
+    CHECK(!first_run_bold(document, ids.gamma));
+    CHECK(style_combo->currentData().toString() == QStringLiteral("Bold"));
+    require_action_by_text(window, QStringLiteral("Undo"))->trigger();
+    CHECK(!first_run_bold(document, ids.alpha));
+  }
+  require_action_by_text(window, QStringLiteral("Undo"))->trigger();
+  CHECK(patchy::ui::MainWindowTestAccess::active_session_undo_depth(window) == depth);
+  CHECK(text_layer_metadata(document, ids.alpha, patchy::kLayerMetadataTextFont) == primary.toStdString());
+  CHECK(text_layer_metadata(document, ids.beta, patchy::kLayerMetadataTextFont) == primary.toStdString());
+}
+
+void ui_text_options_bar_follows_active_text_layer() {
+  patchy::test::register_test_fonts(patchy::test::TestFontRole::UiDefault);
+  patchy::ui::MainWindow window;
+  const auto ids = build_no_session_text_layers(window, "OptionsBarMirror");
+  show_window(window);
+  auto* canvas = require_canvas(window);
+  canvas->set_zoom(1.0);
+  auto& document = patchy::ui::MainWindowTestAccess::document(window);
+  require_action_by_text(window, QStringLiteral("Type"))->trigger();
+  auto* font_combo = window.findChild<QFontComboBox*>(QStringLiteral("textFontCombo"));
+  auto* size_spin = window.findChild<QDoubleSpinBox*>(QStringLiteral("textSizeSpin"));
+  auto* align_left = window.findChild<QPushButton*>(QStringLiteral("textAlignLeftButton"));
+  CHECK(font_combo != nullptr && size_spin != nullptr);
+  if (font_combo == nullptr || size_spin == nullptr) {
+    return;
+  }
+  const auto points_per_pixel = 72.0 / document.print_settings().horizontal_ppi;
+  const auto depth = patchy::ui::MainWindowTestAccess::active_session_undo_depth(window);
+  const auto before_beta = *std::as_const(document).find_layer(ids.beta);
+
+  // Selecting a text layer with no session shows ITS family and size, and mutates nothing.
+  select_layer_rows(window, {QStringLiteral("Beta")});
+  // 24 px is 5.76 pt at 300 ppi; the bar shows the plainest points naming 24 px (5.8,
+  // text_pixels_to_points), so check the size it names.
+  CHECK(std::abs(size_spin->value() - 24.0 * points_per_pixel) < 0.05);
+  CHECK(std::lround(size_spin->value() / points_per_pixel) == 24);
+  CHECK(font_combo->currentFont().family() == QApplication::font().family());
+  select_layer_rows(window, {QStringLiteral("Gamma")});
+  CHECK(std::abs(size_spin->value() - 30.0 * points_per_pixel) < 0.01);
+  if (align_left != nullptr) {
+    CHECK(align_left->isChecked());
+  }
+  CHECK(canvas->findChild<QTextEdit*>(QStringLiteral("inlineTextEditor")) == nullptr);
+  CHECK(patchy::ui::MainWindowTestAccess::active_session_undo_depth(window) == depth);
+  CHECK(layer_matches(document, ids.beta, before_beta));
+  // A pixel layer leaves the bar alone (it seeds the next new layer).
+  select_layer_rows(window, {QStringLiteral("Background")});
+  CHECK(std::abs(size_spin->value() - 30.0 * points_per_pixel) < 0.01);
+}
+
+void ui_text_character_panel_edits_all_selected_layers_without_session() {
+  patchy::test::register_test_fonts(patchy::test::TestFontRole::UiDefault);
+  patchy::ui::MainWindow window;
+  const auto ids = build_no_session_text_layers(window, "CharacterMulti");
+  show_window(window);
+  auto* canvas = require_canvas(window);
+  canvas->set_zoom(1.0);
+  auto& document = patchy::ui::MainWindowTestAccess::document(window);
+  // Alpha warped, Beta plain: faux bold is refused on the warped layer and still applied to
+  // the other one, with the refusal left on the status bar.
+  patchy::TextWarp warp;
+  warp.style = "warpArc";
+  warp.value = 60.0;
+  CHECK(patchy::ui::MainWindowTestAccess::apply_text_warp(window, *document.find_layer(ids.alpha), warp));
+  canvas->document_changed();
+  patchy::ui::MainWindowTestAccess::refresh_layer_ui(window);
+  require_action_by_text(window, QStringLiteral("Type"))->trigger();
+  select_layer_rows(window, {QStringLiteral("Beta"), QStringLiteral("Alpha")});
+  const auto before_gamma = *std::as_const(document).find_layer(ids.gamma);
+  const auto depth = patchy::ui::MainWindowTestAccess::active_session_undo_depth(window);
+  bool drove = false;
+  QTimer::singleShot(0, [&] {
+    try {
+      auto* dialog = window.findChild<QDialog*>(QStringLiteral("textCharacterDialog"));
+      CHECK(dialog != nullptr);
+      auto* tracking = dialog->findChild<QSpinBox*>(QStringLiteral("textCharacterTrackingSpin"));
+      auto* faux_bold = dialog->findChild<QAbstractButton*>(QStringLiteral("textCharacterFauxBold"));
+      CHECK(tracking != nullptr && faux_bold != nullptr);
+      tracking->setValue(100);
+      QApplication::processEvents();
+      CHECK(canvas->findChild<QTextEdit*>(QStringLiteral("inlineTextEditor")) == nullptr);
+      CHECK(patchy::ui::MainWindowTestAccess::active_session_undo_depth(window) == depth + 1);
+      CHECK(first_run_tracking(document, ids.alpha) == 100);
+      CHECK(first_run_tracking(document, ids.beta) == 100);
+      CHECK(layer_matches(document, ids.gamma, before_gamma));
+      CHECK(patchy::text_warp_from_layer(*std::as_const(document).find_layer(ids.alpha)).has_value());
+      CHECK(selected_layer_row_names(window) == (QStringList{QStringLiteral("Alpha"), QStringLiteral("Beta")}));
+
+      faux_bold->click();
+      QApplication::processEvents();
+      CHECK(window.statusBar()->currentMessage().contains(QStringLiteral("Faux bold")));
+      CHECK(patchy::ui::MainWindowTestAccess::active_session_undo_depth(window) == depth + 2);
+      CHECK(runs_metadata_uses_faux_bold(text_layer_metadata(document, ids.beta, patchy::kLayerMetadataTextRuns)));
+      CHECK(!runs_metadata_uses_faux_bold(text_layer_metadata(document, ids.alpha, patchy::kLayerMetadataTextRuns)));
+
+      require_action_by_text(window, QStringLiteral("Undo"))->trigger();
+      require_action_by_text(window, QStringLiteral("Undo"))->trigger();
+      CHECK(patchy::ui::MainWindowTestAccess::active_session_undo_depth(window) == depth);
+      CHECK(first_run_tracking(document, ids.alpha) == 0);
+      CHECK(first_run_tracking(document, ids.beta) == 0);
+      CHECK(!runs_metadata_uses_faux_bold(text_layer_metadata(document, ids.beta, patchy::kLayerMetadataTextRuns)));
+      drove = true;
+      dialog->reject();
+    } catch (...) {
+      patchy::ui::unwind_non_modal_dialog_loop(std::current_exception());
+    }
+  });
+  window.findChild<QPushButton*>(QStringLiteral("textCharacterButton"))->click();
+  CHECK(drove);
+}
+
+void ui_text_thumbnail_double_click_selects_all_without_zoom() {
+  patchy::test::register_test_fonts(patchy::test::TestFontRole::UiDefault);
+  for (const bool warped : {false, true}) {
+    patchy::ui::MainWindow window;
+    const auto id = build_warped_text_session_document(window, "TextThumbnail", QPoint(110, 130), "BendMore");
+    show_window(window);
+    auto* canvas = require_canvas(window);
+    canvas->set_zoom(0.75);
+    auto& document = patchy::ui::MainWindowTestAccess::document(window);
+    auto* layer = document.find_layer(id);
+    patchy::TextWarp warp;
+    if (warped) { warp.style = "warpArc"; warp.value = 60.0; }
+    CHECK(patchy::ui::MainWindowTestAccess::apply_text_warp(window, *layer, warp));
+    const auto name = QString::fromStdString(layer->name());
+    canvas->document_changed();
+    patchy::ui::MainWindowTestAccess::refresh_layer_ui(window);
+    require_action_by_text(window, QStringLiteral("Move"))->trigger();
+    auto* list = window.findChild<QListWidget*>(QStringLiteral("layerList"));
+    CHECK(list != nullptr);
+    click_layer_row_thumbnail(*list, QStringLiteral("Background"), QStringLiteral("layerContentThumbnail"));
+    const auto zoom = canvas->zoom();
+    const auto origin = canvas->widget_position_for_document_point(QPoint(0, 0));
+    click_layer_row_thumbnail(*list, name, QStringLiteral("layerContentThumbnail"));
+    auto* row = list->itemWidget(require_layer_item(*list, name));
+    auto* thumbnail = row->findChild<QLabel*>(QStringLiteral("layerContentThumbnail"));
+    CHECK(thumbnail != nullptr);
+    send_double_click(*thumbnail, thumbnail->rect().center());
+    QApplication::processEvents();
+    auto* editor = canvas->findChild<QTextEdit*>(QStringLiteral("inlineTextEditor"));
+    const bool selected_all = editor != nullptr && editor->textCursor().selectedText() == QStringLiteral("BendMore");
+    const bool correct_layer = editor != nullptr && editor->property("patchy.editingLayerId").toULongLong() == id;
+    const bool type_active = canvas->tool() == patchy::ui::CanvasTool::Text;
+    const bool focused = editor != nullptr && editor->hasFocus();
+    const bool view_unchanged = canvas->zoom() == zoom &&
+        canvas->widget_position_for_document_point(QPoint(0, 0)) == origin;
+    if (editor != nullptr) {
+      editor->insertPlainText(QStringLiteral("Replacement"));
+      require_action_by_text(window, QStringLiteral("Move"))->trigger();
+      QApplication::processEvents();
+    }
+    CHECK(selected_all && correct_layer && type_active && focused && view_unchanged);
+    const auto* committed = std::as_const(document).find_layer(id);
+    CHECK(committed->metadata().at(patchy::kLayerMetadataText) == "Replacement");
+    CHECK(patchy::text_warp_from_layer(*committed).has_value() == warped);
+  }
+}
+
+void ui_warped_text_allows_real_bold_face() {
+  // Photoshop's restriction covers FAUX bold only: a family that ships a real Bold
+  // face keeps toggling bold on warped text with no refusal.
+  skip_without_arial_for_psd_text_preview();
+  patchy::ui::MainWindow window;
+  const auto text_id = build_warped_text_session_document(window, "WarpRealBold", QPoint(110, 130),
+                                                          "Bend", QStringLiteral("Arial"));
+  show_window(window);
+  auto* canvas = require_canvas(window);
+  canvas->set_zoom(1.0);
+  QApplication::processEvents();
+  auto& document = patchy::ui::MainWindowTestAccess::document(window);
+  auto* layer = document.find_layer(text_id);
+  CHECK(layer != nullptr);
+  patchy::TextWarp warp;
+  warp.style = "warpArc";
+  warp.value = 60.0;
+  CHECK(patchy::ui::MainWindowTestAccess::apply_text_warp(window, *layer, warp));
+  canvas->document_changed();
+  QApplication::processEvents();
+
+  require_action_by_text(window, QStringLiteral("Type"))->trigger();
+  patchy::ui::MainWindowTestAccess::add_text_at(window, first_ink_document_point(*layer));
+  QApplication::processEvents();
+  process_events_for(250);
+  auto* editor = canvas->findChild<QTextEdit*>(QStringLiteral("inlineTextEditor"));
+  CHECK(editor != nullptr);
+  if (editor == nullptr) {
+    return;
+  }
+  patchy::ui::MainWindowTestAccess::toggle_text_bold_face(window);
+  QApplication::processEvents();
+  CHECK(!editor_document_has_faux_bold(*editor));
+  bool any_real_bold = false;
+  for (auto block = editor->document()->begin(); block.isValid(); block = block.next()) {
+    for (auto it = block.begin(); !it.atEnd(); ++it) {
+      const auto fragment = it.fragment();
+      if (fragment.isValid() && fragment.length() > 0 &&
+          fragment.charFormat().font().weight() >= QFont::Bold) {
+        any_real_bold = true;
+      }
+    }
+  }
+  CHECK(any_real_bold);
+  CHECK(!window.statusBar()->currentMessage().contains(QStringLiteral("Faux bold")));
+  require_action_by_text(window, QStringLiteral("Move"))->trigger();
+  QApplication::processEvents();
+  process_events_for(150);
+  layer = document.find_layer(text_id);
+  CHECK(layer != nullptr && patchy::text_warp_from_layer(*layer).has_value());
+}
+
+void ui_imported_faux_bold_warp_layer_still_renders() {
+  // Rendering stays permissive: a layer carrying BOTH faux bold and a warp (imported,
+  // or authored before the guards existed) still renders through the warp pipeline;
+  // only the authoring entrances refuse.
+  patchy::ui::MainWindow window;
+  patchy::Document built(420, 260, patchy::PixelFormat::rgba8());
+  built.add_pixel_layer("Background",
+                        solid_pixels(420, 260, patchy::PixelFormat::rgba8(), QColor(Qt::white)));
+  patchy::Layer text_layer(built.allocate_layer_id(), "FauxWarped",
+                           solid_pixels(1, 1, patchy::PixelFormat::rgba8(), QColor(0, 0, 0, 0)));
+  const auto text_id = text_layer.id();
+  text_layer.set_bounds(patchy::Rect{60, 90, 1, 1});
+  text_layer.metadata()[patchy::kLayerMetadataText] = "FauxWarp";
+  text_layer.metadata()[patchy::kLayerMetadataTextSize] = "36";
+  text_layer.metadata()[patchy::kLayerMetadataTextColor] = "#101010";
+  const auto family_encoded =
+      QString::fromLatin1(QApplication::font().family().toUtf8().toPercentEncoding());
+  text_layer.metadata()[patchy::kLayerMetadataTextRuns] =
+      QStringLiteral("v4\n0\t8\t36\t0\t0\t#101010\t%1\tauto\t0\t1\t1\t1")
+          .arg(family_encoded)
+          .toStdString();
+  built.add_layer(std::move(text_layer));
+  built.set_active_layer(text_id);
+  window.add_document_session(std::move(built), QStringLiteral("FauxWarpRenders"));
+  show_window(window);
+  auto& document = patchy::ui::MainWindowTestAccess::document(window);
+  auto* layer = document.find_layer(text_id);
+  CHECK(layer != nullptr);
+  if (layer == nullptr) {
+    return;
+  }
+  patchy::TextWarp warp;
+  warp.style = "warpArc";
+  warp.value = 60.0;
+  CHECK(patchy::ui::MainWindowTestAccess::apply_text_warp(window, *layer, warp));
+  CHECK(patchy::text_warp_from_layer(*layer).has_value());
+  CHECK(layer->bounds().width > 4 && layer->bounds().height > 4);
+
+  // The authoring funnel still refuses the combination.
+  bool dialog_appeared = false;
+  QTimer::singleShot(0, [&dialog_appeared] {
+    if (auto* dialog = find_top_level_dialog(QStringLiteral("warpTextDialog")); dialog != nullptr) {
+      dialog_appeared = true;
+      dialog->reject();
+    }
+  });
+  patchy::ui::MainWindowTestAccess::request_warp_text_dialog(window);
+  QApplication::processEvents();
+  CHECK(!dialog_appeared);
+  CHECK(window.statusBar()->currentMessage().contains(QStringLiteral("Faux bold")));
+}
+
+void ui_options_bar_transform_session_replaces_tool_controls() {
+  patchy::ui::MainWindow window;
+  show_window(window);
+  auto* canvas = require_canvas(window);
+  window.resize(1500, 800);
+  QApplication::processEvents();
+  process_events_for(60);
+  // The default document starts transparent; Ctrl+T needs opaque pixels.
+  use_solid_fill_settings(canvas);
+  canvas->set_primary_color(QColor(40, 130, 230));
+  require_action(window, "layerFillForegroundAction")->trigger();
+  QApplication::processEvents();
+
+  auto* options_bar = window.findChild<QToolBar*>(QStringLiteral("Options"));
+  auto* brush_size = window.findChild<QSpinBox*>(QStringLiteral("brushSizeSpin"));
+  auto* x_spin = window.findChild<QDoubleSpinBox*>(QStringLiteral("freeTransformXSpin"));
+  auto* style_combo = window.findChild<QComboBox*>(QStringLiteral("warpStyleCombo"));
+  auto* toggle = window.findChild<QPushButton*>(QStringLiteral("transformWarpModeButton"));
+  auto* apply = window.findChild<QPushButton*>(QStringLiteral("freeTransformApplyButton"));
+  CHECK(options_bar != nullptr);
+  CHECK(brush_size != nullptr);
+  CHECK(x_spin != nullptr);
+  CHECK(style_combo != nullptr);
+  CHECK(toggle != nullptr);
+  CHECK(apply != nullptr);
+
+  // Brush is the active tool: its controls show, no session widgets.
+  CHECK(brush_size->isVisible());
+  CHECK(!x_spin->isVisible());
+  CHECK(!toggle->isVisible());
+  const int single_row_height = options_bar->height();
+
+  // Ctrl+T: the session OWNS the bar (Photoshop) - the brush row swaps out for
+  // the transform controls and the bar keeps its single-row height, so the
+  // canvas never shifts down.
+  require_action(window, "editFreeTransformAction")->trigger();
+  QApplication::processEvents();
+  process_events_for(60);
+  CHECK(canvas->free_transform_active());
+  CHECK(!brush_size->isVisible());
+  CHECK(x_spin->isVisible());
+  CHECK(!style_combo->isVisible());
+  CHECK(toggle->isVisible());
+  CHECK(!toggle->isChecked());
+  CHECK(apply->isVisible());
+  CHECK(options_bar->height() == single_row_height);
+  save_widget_artifact("ui_options_bar_transform_mode", window);
+
+  // The warp-mode toggle swaps to the warp controls, same single row.
+  toggle->click();
+  QApplication::processEvents();
+  process_events_for(60);
+  CHECK(canvas->warp_transform_active());
+  CHECK(!canvas->free_transform_active());
+  CHECK(!brush_size->isVisible());
+  CHECK(!x_spin->isVisible());
+  CHECK(style_combo->isVisible());
+  CHECK(toggle->isVisible());
+  CHECK(toggle->isChecked());
+  CHECK(apply->isVisible());
+  CHECK(options_bar->height() == single_row_height);
+  save_widget_artifact("ui_options_bar_warp_mode", window);
+
+  // Esc restores the tool's own controls.
+  send_key(*canvas, Qt::Key_Escape);
+  QApplication::processEvents();
+  process_events_for(60);
+  CHECK(!canvas->warp_transform_active());
+  CHECK(brush_size->isVisible());
+  CHECK(!x_spin->isVisible());
+  CHECK(!toggle->isVisible());
+  CHECK(options_bar->height() == single_row_height);
+}
+
+void ui_free_transform_warp_toggle_composes_single_commit() {
+  patchy::ui::MainWindow window;
+  show_window(window);
+  patchy::Document built(200, 150, patchy::PixelFormat::rgba8());
+  built.add_pixel_layer("Background", solid_pixels(200, 150, patchy::PixelFormat::rgba8(), QColor(Qt::white)));
+  patchy::Layer layer(built.allocate_layer_id(), "warp me",
+                      solid_pixels(48, 36, patchy::PixelFormat::rgba8(), QColor(200, 40, 160, 255)));
+  layer.set_bounds(patchy::Rect{76, 57, 48, 36});
+  built.add_layer(std::move(layer));
+  const auto layer_id = built.layers().back().id();
+  built.set_active_layer(layer_id);
+  window.add_document_session(std::move(built), QStringLiteral("ComposeWarp"));
+  QApplication::processEvents();
+  auto& document = patchy::ui::MainWindowTestAccess::document(window);
+  auto* canvas = patchy::ui::MainWindowTestAccess::canvas(window);
+  CHECK(canvas != nullptr);
+  const auto undo_depth_before = patchy::ui::MainWindowTestAccess::active_session_undo_depth(window);
+
+  // Free transform first: scale to 200% about the center (box (52,39) 96x72).
+  require_action(window, "editFreeTransformAction")->trigger();
+  QApplication::processEvents();
+  CHECK(canvas->free_transform_active());
+  auto* scale_x = window.findChild<QDoubleSpinBox*>(QStringLiteral("freeTransformScaleXSpin"));
+  CHECK(scale_x != nullptr && scale_x->isVisible());
+  scale_x->setValue(200.0);  // the link button mirrors it into the vertical scale
+  QApplication::processEvents();
+
+  // The warp toggle carries the pending scale into the cage instead of dropping
+  // it: the corner handle sits on the SCALED box, not the stored layer bounds.
+  auto* toggle = window.findChild<QPushButton*>(QStringLiteral("transformWarpModeButton"));
+  CHECK(toggle != nullptr && toggle->isVisible());
+  toggle->click();
+  QApplication::processEvents();
+  CHECK(canvas->warp_transform_active());
+  CHECK(!canvas->free_transform_active());
+  CHECK(canvas->warp_handle_count() == 16);
+  const auto corner = canvas->warp_handle_document_position(0);
+  CHECK(std::abs(corner.x() - 52.0) < 1.5);
+  CHECK(std::abs(corner.y() - 39.0) < 1.5);
+
+  // Warp the corner outward, then commit through the shared Apply button: ONE
+  // undo step bakes scale + warp together.
+  canvas->set_warp_handle_document_position(0, corner + QPointF(-10.0, -8.0));
+  auto* apply = window.findChild<QPushButton*>(QStringLiteral("freeTransformApplyButton"));
+  CHECK(apply != nullptr && apply->isVisible());
+  apply->click();
+  QApplication::processEvents();
+  CHECK(!canvas->warp_transform_active());
+  CHECK(!canvas->free_transform_active());
+  CHECK(patchy::ui::MainWindowTestAccess::active_session_undo_depth(window) == undo_depth_before + 1);
+
+  const auto* committed = document.find_layer(layer_id);
+  CHECK(committed != nullptr);
+  const auto bounds = committed->bounds();
+  CHECK(bounds.x <= 44);       // the scaled left edge (52) pulled further left
+  CHECK(bounds.width >= 100);  // 2x scale (96) plus the warp bulge
+  CHECK(bounds.height >= 74);
+
+  // One undo restores the original layer exactly.
+  require_action_by_text(window, QStringLiteral("Undo"))->trigger();
+  QApplication::processEvents();
+  auto& after_undo = patchy::ui::MainWindowTestAccess::document(window);
+  const auto* restored = after_undo.find_layer(layer_id);
+  CHECK(restored != nullptr);
+  CHECK(restored->bounds().x == 76 && restored->bounds().y == 57);
+  CHECK(restored->bounds().width == 48 && restored->bounds().height == 36);
+}
+
+void ui_warp_toggle_back_to_free_transform_keeps_pending_warp() {
+  patchy::ui::MainWindow window;
+  show_window(window);
+  patchy::Document built(220, 160, patchy::PixelFormat::rgba8());
+  built.add_pixel_layer("Background", solid_pixels(220, 160, patchy::PixelFormat::rgba8(), QColor(Qt::white)));
+  patchy::Layer layer(built.allocate_layer_id(), "flag",
+                      solid_pixels(60, 40, patchy::PixelFormat::rgba8(), QColor(30, 120, 220, 255)));
+  layer.set_bounds(patchy::Rect{80, 60, 60, 40});
+  built.add_layer(std::move(layer));
+  const auto layer_id = built.layers().back().id();
+  built.set_active_layer(layer_id);
+  window.add_document_session(std::move(built), QStringLiteral("WarpThenMove"));
+  QApplication::processEvents();
+  auto& document = patchy::ui::MainWindowTestAccess::document(window);
+  auto* canvas = patchy::ui::MainWindowTestAccess::canvas(window);
+  CHECK(canvas != nullptr);
+  const auto undo_depth_before = patchy::ui::MainWindowTestAccess::active_session_undo_depth(window);
+
+  require_action(window, "editWarpTransformAction")->trigger();
+  QApplication::processEvents();
+  CHECK(canvas->warp_transform_active());
+  canvas->apply_warp_style_preset(QStringLiteral("warpArc"), 50.0);
+  QApplication::processEvents();
+
+  // Toggle back to free transform: the warp rides along uncommitted and the
+  // affine stage edits the warped hull box.
+  auto* toggle = window.findChild<QPushButton*>(QStringLiteral("transformWarpModeButton"));
+  CHECK(toggle != nullptr && toggle->isChecked());
+  toggle->click();
+  QApplication::processEvents();
+  CHECK(canvas->free_transform_active());
+  CHECK(!canvas->warp_transform_active());
+  CHECK(!toggle->isChecked());
+  const auto state = canvas->transform_controls_state();
+  CHECK(state.has_value());
+  CHECK(state->active);
+
+  // Move the pending result 30 px right via the reference X spin, then commit:
+  // one undo step containing warp + move, baked in a single resample.
+  auto* x_spin = window.findChild<QDoubleSpinBox*>(QStringLiteral("freeTransformXSpin"));
+  CHECK(x_spin != nullptr && x_spin->isVisible());
+  x_spin->setValue(x_spin->value() + 30.0);
+  QApplication::processEvents();
+  auto* apply = window.findChild<QPushButton*>(QStringLiteral("freeTransformApplyButton"));
+  CHECK(apply != nullptr);
+  apply->click();
+  QApplication::processEvents();
+  CHECK(!canvas->free_transform_active());
+  CHECK(patchy::ui::MainWindowTestAccess::active_session_undo_depth(window) == undo_depth_before + 1);
+
+  const auto* committed = document.find_layer(layer_id);
+  CHECK(committed != nullptr);
+  const auto bounds = committed->bounds();
+  CHECK(bounds.width > 66);  // arc 50 swings the corners outward past the 60 px content
+  // The symmetric arc keeps the hull centered on the content, so the committed
+  // center sits at the original center (110) + the 30 px nudge.
+  const auto center_x = bounds.x + bounds.width / 2.0;
+  CHECK(std::abs(center_x - 140.0) <= 4.0);
+
+  require_action_by_text(window, QStringLiteral("Undo"))->trigger();
+  QApplication::processEvents();
+  auto& after_undo = patchy::ui::MainWindowTestAccess::document(window);
+  const auto* restored = after_undo.find_layer(layer_id);
+  CHECK(restored != nullptr);
+  CHECK(restored->bounds().x == 80 && restored->bounds().y == 60);
+  CHECK(restored->bounds().width == 60 && restored->bounds().height == 40);
+}
+
+void ui_smart_object_transform_then_warp_commits_composed_placement() {
+  patchy::ui::MainWindow window;
+  show_window(window);
+  const auto layer_id = open_smart_object_fixture(window);
+  auto& document = patchy::ui::MainWindowTestAccess::document(window);
+  auto* canvas = patchy::ui::MainWindowTestAccess::canvas(window);
+  CHECK(canvas != nullptr);
+  const auto placement_before = patchy::smart_object_placement_from_layer(*document.find_layer(layer_id));
+  CHECK(placement_before.has_value());
+  const auto width_before = placement_before->transform[2] - placement_before->transform[0];
+  const auto undo_depth_before = patchy::ui::MainWindowTestAccess::active_session_undo_depth(window);
+
+  require_action(window, "editFreeTransformAction")->trigger();
+  QApplication::processEvents();
+  CHECK(canvas->free_transform_active());
+  auto* scale_x = window.findChild<QDoubleSpinBox*>(QStringLiteral("freeTransformScaleXSpin"));
+  CHECK(scale_x != nullptr);
+  scale_x->setValue(150.0);
+  QApplication::processEvents();
+
+  auto* toggle = window.findChild<QPushButton*>(QStringLiteral("transformWarpModeButton"));
+  CHECK(toggle != nullptr);
+  toggle->click();
+  QApplication::processEvents();
+  CHECK(canvas->warp_transform_active());
+  canvas->apply_warp_style_preset(QStringLiteral("warpArc"), 30.0);
+  canvas->finish_warp_transform();
+  QApplication::processEvents();
+  CHECK(!canvas->warp_transform_active());
+  CHECK(patchy::ui::MainWindowTestAccess::active_session_undo_depth(window) == undo_depth_before + 1);
+
+  const auto* warped = document.find_layer(layer_id);
+  CHECK(warped != nullptr);
+  const auto warp = patchy::smart_object_warp_from_layer(*warped);
+  CHECK(warp.has_value());
+  CHECK(warp->u_order == 4 && warp->v_order == 4);
+  CHECK(patchy::smart_object_lock_reason(*warped).empty());
+  CHECK(patchy::layer_smart_object_block_dirty(*warped));
+  const auto placement_after = patchy::smart_object_placement_from_layer(*warped);
+  CHECK(placement_after.has_value());
+  // 150% scale composed with the arc hull growth: the stored quad ends up
+  // clearly wider than the original placement.
+  const auto width_after = placement_after->transform[2] - placement_after->transform[0];
+  CHECK(width_after > width_before * 1.4);
+}
+
+void ui_warp_toggle_refuses_text_layer_and_keeps_transform() {
+  patchy::ui::MainWindow window;
+  show_window(window);
+  patchy::Document built(96, 64, patchy::PixelFormat::rgba8());
+  patchy::Layer text_layer(built.allocate_layer_id(), "headline",
+                           solid_pixels(40, 16, patchy::PixelFormat::rgba8(), QColor(20, 20, 20, 255)));
+  text_layer.set_bounds(patchy::Rect{8, 8, 40, 16});
+  text_layer.metadata()[patchy::kLayerMetadataText] = "Sample";
+  built.add_layer(std::move(text_layer));
+  const auto text_id = built.layers().back().id();
+  built.set_active_layer(text_id);
+  window.add_document_session(std::move(built), QStringLiteral("WarpToggleText"));
+  QApplication::processEvents();
+  auto* canvas = patchy::ui::MainWindowTestAccess::canvas(window);
+  CHECK(canvas != nullptr);
+
+  require_action(window, "editFreeTransformAction")->trigger();
+  QApplication::processEvents();
+  CHECK(canvas->free_transform_active());
+
+  // The toggle refuses text layers (warp would too) but must keep the pending
+  // free-transform session alive instead of discarding it.
+  auto* toggle = window.findChild<QPushButton*>(QStringLiteral("transformWarpModeButton"));
+  CHECK(toggle != nullptr && toggle->isVisible());
+  toggle->click();
+  QApplication::processEvents();
+  CHECK(!canvas->warp_transform_active());
+  CHECK(canvas->free_transform_active());
+  CHECK(!toggle->isChecked());
+  CHECK(window.statusBar()->currentMessage().contains(QStringLiteral("rasterize"), Qt::CaseInsensitive));
+
+  send_key(*canvas, Qt::Key_Escape);
+  QApplication::processEvents();
+  CHECK(!canvas->free_transform_active());
+}
+
+// GitHub #200: the warp resampler splits output rows across workers and can clip to
+// a rect; both must reproduce the sequential, unclipped bytes (the commit and the
+// preview share it).
+void ui_warp_resample_parallel_and_clipped_match_sequential() {
+  QImage source(420, 300, QImage::Format_RGBA8888);
+  std::uint64_t seed = 0x2545F4914F6CDD1DULL;
+  for (int y = 0; y < source.height(); ++y) {
+    auto* row = source.scanLine(y);
+    for (int x = 0; x < source.width() * 4; ++x) {
+      seed ^= seed << 13U;
+      seed ^= seed >> 7U;
+      seed ^= seed << 17U;
+      row[x] = static_cast<std::uint8_t>(seed);
+    }
+  }
+  // A bent cage with a fold, so first-writer-wins ordering matters.
+  auto mesh = patchy::identity_warp_mesh(0.0, 0.0, 420.0, 300.0, 4, 4);
+  mesh.xs[5] += 260.0;
+  mesh.ys[5] += 120.0;
+  mesh.xs[3] += 90.0;
+  mesh.ys[3] -= 60.0;
+  const std::array<double, 8> quad{10.0, 20.0, 530.0, 20.0, 530.0, 380.0, 10.0, 380.0};
+  const auto grid = patchy::build_warp_surface_grid(mesh, quad, 420.0, 300.0, 4.0, 128);
+  CHECK(grid.has_value());
+  const auto interpolation = patchy::ui::CanvasWidget::TransformInterpolation::Bicubic;
+  qputenv("PATCHY_RENDER_SINGLE_THREADED", "1");
+  const auto sequential = patchy::ui::resample_warped_rgba8(source, *grid, interpolation);
+  qunsetenv("PATCHY_RENDER_SINGLE_THREADED");
+  const auto parallel = patchy::ui::resample_warped_rgba8(source, *grid, interpolation);
+  CHECK(!sequential.image.isNull());
+  CHECK(sequential.bounds.x == parallel.bounds.x && sequential.bounds.y == parallel.bounds.y);
+  CHECK(sequential.image == parallel.image);
+
+  const patchy::Rect clip{140, 90, 230, 170};
+  const auto clipped = patchy::ui::resample_warped_rgba8(source, *grid, interpolation, clip);
+  CHECK(clipped.bounds.x == clip.x && clipped.bounds.y == clip.y);
+  CHECK(clipped.bounds.width == clip.width && clipped.bounds.height == clip.height);
+  CHECK(clipped.image == sequential.image.copy(clip.x - sequential.bounds.x, clip.y - sequential.bounds.y,
+                                               clip.width, clip.height));
+  const auto outside =
+      patchy::ui::resample_warped_rgba8(source, *grid, interpolation, patchy::Rect{2000, 2000, 50, 50});
+  CHECK(outside.image.isNull());
+}
+
+// GitHub #200: a warp handle drag renders at view resolution. Zoomed out, frames
+// composite from the preview-scaled document; at 100% they cover only the view; the
+// release renders the resting preview, which matches the committed result on screen.
+void ui_warp_drag_preview_renders_at_view_resolution() {
+  patchy::ui::MainWindow window;
+  show_window(window);
+  constexpr int kWidth = 2400;
+  constexpr int kHeight = 1600;
+  patchy::Document built(kWidth, kHeight, patchy::PixelFormat::rgba8());
+  patchy::PixelBuffer backdrop(kWidth, kHeight, patchy::PixelFormat::rgba8());
+  backdrop.clear(255);
+  built.add_layer(patchy::Layer(built.allocate_layer_id(), "Backdrop", std::move(backdrop)));
+  patchy::PixelBuffer art(kWidth, kHeight, patchy::PixelFormat::rgba8());
+  for (std::int32_t y = 0; y < kHeight; ++y) {
+    for (std::int32_t x = 0; x < kWidth; ++x) {
+      auto* px = art.pixel(x, y);
+      // Bands plus per-pixel noise (a one-pixel misplacement shows), and blue kept
+      // low so the blue cage overlay can be told apart from the art below.
+      auto noise = static_cast<std::uint64_t>(y) * 0x9E3779B97F4A7C15ULL + static_cast<std::uint64_t>(x);
+      noise = (noise ^ (noise >> 30U)) * 0xBF58476D1CE4E5B9ULL;
+      noise = (noise ^ (noise >> 27U)) * 0x94D049BB133111EBULL;
+      noise ^= noise >> 31U;
+      const bool band = ((x / 160) + (y / 160)) % 2 == 0;
+      px[0] = static_cast<std::uint8_t>((band ? 200 : 40) + (noise & 39U));
+      px[1] = static_cast<std::uint8_t>((band ? 90 : 150) + ((noise >> 8U) & 39U));
+      px[2] = static_cast<std::uint8_t>(40 + ((noise >> 16U) & 63U));
+      px[3] = 255;
+    }
+  }
+  patchy::Layer layer(built.allocate_layer_id(), "Warp me", std::move(art));
+  const auto layer_id = layer.id();
+  built.add_layer(std::move(layer));
+  built.set_active_layer(layer_id);
+  window.add_document_session(std::move(built), QStringLiteral("Warp view"));
+  QApplication::processEvents();
+  auto* canvas = patchy::ui::MainWindowTestAccess::canvas(window);
+  CHECK(canvas != nullptr);
+  canvas->set_zoom_centered(0.25);
+  QApplication::processEvents();
+
+  require_action(window, "editWarpTransformAction")->trigger();
+  QApplication::processEvents();
+  CHECK(canvas->warp_transform_active());
+  const auto drag = [canvas](int handle, QPoint step) {
+    const auto start = canvas->widget_position_f(canvas->warp_handle_document_position(handle)).toPoint();
+    send_mouse(*canvas, QEvent::MouseButtonPress, start, Qt::LeftButton, Qt::LeftButton);
+    for (int frame = 1; frame <= 4; ++frame) {
+      send_mouse(*canvas, QEvent::MouseMove, start + step * frame, Qt::NoButton, Qt::LeftButton);
+      canvas->repaint();
+    }
+    return start + step * 4;
+  };
+
+  // Zoomed out (25%: composite level 2): frames come from the scaled document.
+  const auto before_zoomed_out = canvas->render_cache_diagnostics();
+  const auto end_zoomed_out = drag(5, QPoint(6, 4));
+  const auto during_zoomed_out = canvas->render_cache_diagnostics();
+  CHECK(during_zoomed_out.warp_scaled_previews >= before_zoomed_out.warp_scaled_previews + 4);
+  CHECK(during_zoomed_out.warp_preview_last_pixels <=
+        static_cast<std::uint64_t>(kWidth / 4 + 64) * static_cast<std::uint64_t>(kHeight / 4 + 64));
+  send_mouse(*canvas, QEvent::MouseButtonRelease, end_zoomed_out, Qt::LeftButton, Qt::NoButton);
+  QApplication::processEvents();
+
+  // 100%: a frame renders the view, not the 3.8 Mpx layer. Arriving through a
+  // zoom-to-rect leaves a fractional pan, where a patch must still land on whole
+  // pixels like the image around it.
+  canvas->zoom_to_document_rect(QRect(613, 411, 1001, 667));
+  canvas->set_zoom_centered(1.0);
+  QApplication::processEvents();
+  const auto view_pixels =
+      static_cast<std::uint64_t>(canvas->width() + 16) * static_cast<std::uint64_t>(canvas->height() + 16);
+  const auto end_full = drag(5, QPoint(-5, 3));
+  const auto during_full = canvas->render_cache_diagnostics();
+  CHECK(during_full.warp_preview_last_pixels <= view_pixels);
+  CHECK(during_full.warp_preview_last_pixels < static_cast<std::uint64_t>(kWidth) * kHeight / 2);
+  send_mouse(*canvas, QEvent::MouseButtonRelease, end_full, Qt::LeftButton, Qt::NoButton);
+  QApplication::processEvents();
+
+  // Zooming back out re-renders the resting preview at the new level.
+  const auto before_zoom = canvas->render_cache_diagnostics();
+  canvas->set_zoom_centered(0.25);
+  QApplication::processEvents();
+  CHECK(canvas->render_cache_diagnostics().warp_scaled_previews > before_zoom.warp_scaled_previews);
+  // Back to the same fractional-pan 100% view (the view refresh renders it), so the
+  // commit below is captured from exactly this view.
+  canvas->zoom_to_document_rect(QRect(613, 411, 1001, 667));
+  canvas->set_zoom_centered(1.0);
+  QApplication::processEvents();
+  canvas->repaint();
+  const auto resting = canvas->grab().toImage();
+  save_widget_artifact("warp_view_resolution_resting", *canvas);
+
+  // The resting preview is the commit's own render on screen (the cage overlay aside).
+  canvas->finish_warp_transform();
+  const auto settle_started = std::chrono::steady_clock::now();
+  while (!canvas->render_settled() &&
+         std::chrono::steady_clock::now() - settle_started < std::chrono::seconds(30)) {
+    canvas->repaint();
+    QApplication::processEvents();
+  }
+  CHECK(!canvas->warp_transform_active());
+  canvas->repaint();
+  const auto committed = canvas->grab().toImage();
+  save_widget_artifact("warp_view_resolution_committed", *canvas);
+  CHECK(resting.size() == committed.size());
+  const auto resting_rgb = resting.convertToFormat(QImage::Format_RGB32);
+  const auto committed_rgb = committed.convertToFormat(QImage::Format_RGB32);
+  std::int64_t differing = 0;
+  for (int y = 0; y < resting_rgb.height(); ++y) {
+    const auto* a = reinterpret_cast<const QRgb*>(resting_rgb.constScanLine(y));
+    const auto* b = reinterpret_cast<const QRgb*>(committed_rgb.constScanLine(y));
+    for (int x = 0; x < resting_rgb.width(); ++x) {
+      const auto delta = std::max({std::abs(qRed(a[x]) - qRed(b[x])), std::abs(qGreen(a[x]) - qGreen(b[x])),
+                                   std::abs(qBlue(a[x]) - qBlue(b[x]))});
+      // The cage lines and handles draw in light blue and white, which raise blue
+      // over the low-blue art; everything else must match the commit.
+      const bool overlay = qBlue(a[x]) > qBlue(b[x]) + 8;
+      if (delta > 8 && !overlay) {
+        ++differing;
+      }
+    }
+  }
+  CHECK(differing < static_cast<std::int64_t>(resting_rgb.width()) * resting_rgb.height() / 500);
+}
+
+// GitHub #298: a warp drag on a 2560x1440 photo lagged seconds behind the pointer.
+// Every mouse move rendered a preview (and refreshed the options bar), so moves that
+// arrived faster than a render queued up. A drag now renders once per painted frame
+// from the latest handle position, and between 50% and 100% device zoom its frames
+// render at half resolution instead of the whole on-screen layer at full resolution.
+void ui_warp_drag_renders_once_per_frame() {
+  patchy::ui::MainWindow window;
+  show_window(window);
+  constexpr int kWidth = 1600;
+  constexpr int kHeight = 1000;
+  patchy::Document built(kWidth, kHeight, patchy::PixelFormat::rgba8());
+  patchy::PixelBuffer art(kWidth, kHeight, patchy::PixelFormat::rgba8());
+  for (std::int32_t y = 0; y < kHeight; ++y) {
+    for (std::int32_t x = 0; x < kWidth; ++x) {
+      auto* px = art.pixel(x, y);
+      const bool band = ((x / 100) + (y / 100)) % 2 == 0;
+      px[0] = static_cast<std::uint8_t>(band ? 210 : 40);
+      px[1] = static_cast<std::uint8_t>(band ? 90 : 160);
+      px[2] = 50;
+      px[3] = 255;
+    }
+  }
+  patchy::Layer layer(built.allocate_layer_id(), "Photo", std::move(art));
+  const auto layer_id = layer.id();
+  built.add_layer(std::move(layer));
+  built.set_active_layer(layer_id);
+  window.add_document_session(std::move(built), QStringLiteral("Warp burst"));
+  QApplication::processEvents();
+  auto* canvas = patchy::ui::MainWindowTestAccess::canvas(window);
+  CHECK(canvas != nullptr);
+  canvas->set_view_zoom_centered(0.25);
+  QApplication::processEvents();
+  require_action(window, "editWarpTransformAction")->trigger();
+  QApplication::processEvents();
+  CHECK(canvas->warp_transform_active());
+
+  // Moves queued faster than a frame (posted together, as a backed-up input queue
+  // delivers them) render once, at the latest handle position.
+  constexpr int kHandle = 0;
+  const auto start = canvas->widget_position_f(canvas->warp_handle_document_position(kHandle)).toPoint();
+  send_mouse(*canvas, QEvent::MouseButtonPress, start, Qt::LeftButton, Qt::LeftButton);
+  const auto renders_before = canvas->render_cache_diagnostics().warp_preview_renders;
+  QPoint end = start;
+  for (int move = 1; move <= 12; ++move) {
+    end = start + QPoint(9, 5) * move;
+    QApplication::postEvent(canvas, new QMouseEvent(QEvent::MouseMove, QPointF(end), QPointF(canvas->mapToGlobal(end)),
+                                                    Qt::NoButton, Qt::LeftButton, Qt::NoModifier));
+  }
+  QApplication::processEvents();
+  canvas->repaint();
+  CHECK(canvas->render_cache_diagnostics().warp_preview_renders == renders_before + 1);
+  const auto handle_widget = canvas->widget_position_f(canvas->warp_handle_document_position(kHandle));
+  CHECK(std::abs(handle_widget.x() - end.x()) <= 1.0 && std::abs(handle_widget.y() - end.y()) <= 1.0);
+  canvas->repaint();  // nothing moved: no second render
+  CHECK(canvas->render_cache_diagnostics().warp_preview_renders == renders_before + 1);
+  // The release renders the resting frame at once, without waiting for a paint.
+  send_mouse(*canvas, QEvent::MouseButtonRelease, end, Qt::LeftButton, Qt::NoButton);
+  CHECK(canvas->render_cache_diagnostics().warp_preview_renders == renders_before + 2);
+  QApplication::processEvents();
+
+  // 70% device zoom: the whole layer is on screen at the full-resolution display
+  // level. Drag frames render at half resolution; the resting frame at full.
+  canvas->set_view_zoom_centered(0.7);
+  QApplication::processEvents();
+  canvas->repaint();
+  const auto scaled_before = canvas->render_cache_diagnostics().warp_scaled_previews;
+  const auto start_70 = canvas->widget_position_f(canvas->warp_handle_document_position(kHandle)).toPoint();
+  send_mouse(*canvas, QEvent::MouseButtonPress, start_70, Qt::LeftButton, Qt::LeftButton);
+  const auto end_70 = start_70 + QPoint(-20, -12);
+  send_mouse(*canvas, QEvent::MouseMove, end_70, Qt::NoButton, Qt::LeftButton);
+  canvas->repaint();
+  const auto during = canvas->render_cache_diagnostics();
+  CHECK(during.warp_scaled_previews == scaled_before + 1);
+  CHECK(during.warp_preview_last_pixels <=
+        static_cast<std::uint64_t>(kWidth / 2 + 64) * static_cast<std::uint64_t>(kHeight / 2 + 64));
+  save_widget_artifact("warp_drag_half_resolution_70", *canvas);
+  send_mouse(*canvas, QEvent::MouseButtonRelease, end_70, Qt::LeftButton, Qt::NoButton);
+  const auto resting = canvas->render_cache_diagnostics();
+  CHECK(resting.warp_scaled_previews == during.warp_scaled_previews);
+  CHECK(resting.warp_preview_last_pixels > during.warp_preview_last_pixels * 2);
+  canvas->cancel_warp_transform();
+}
+
+// A warp handle dragged far past its neighbours stretches the surface's cells into
+// long slivers and folds it over itself. The resample walks each cell's own span per
+// row, so its work stays a small multiple of the output however far the handle goes;
+// walking each cell's bounding box tested every sliver against most of the output
+// (GitHub issue 299: a middle point dragged a few inches at a zoomed-out view made
+// every frame crawl).
+void ui_warp_far_dragged_interior_point_resamples_in_bounded_work() {
+  constexpr int kWidth = 600;
+  constexpr int kHeight = 400;
+  QImage source(kWidth, kHeight, QImage::Format_RGBA8888);
+  for (int y = 0; y < kHeight; ++y) {
+    auto* row = source.scanLine(y);
+    for (int x = 0; x < kWidth; ++x) {
+      const bool band = ((x / 40) + (y / 40)) % 2 == 0;
+      row[x * 4 + 0] = static_cast<std::uint8_t>(band ? 220 : 30);
+      row[x * 4 + 1] = static_cast<std::uint8_t>((x * 255) / kWidth);
+      row[x * 4 + 2] = static_cast<std::uint8_t>((y * 255) / kHeight);
+      row[x * 4 + 3] = 255;
+    }
+  }
+  for (const double reach : {0.0, 1500.0, 6000.0}) {
+    auto mesh = patchy::identity_warp_mesh(0.0, 0.0, kWidth, kHeight, 4, 4);
+    mesh.xs[5] += reach;  // row 1, column 1: an interior point, dragged right
+    mesh.ys[5] += reach / 6.0;
+    const auto [min_x, max_x] = std::minmax_element(mesh.xs.begin(), mesh.xs.end());
+    const auto [min_y, max_y] = std::minmax_element(mesh.ys.begin(), mesh.ys.end());
+    const std::array<double, 8> quad{*min_x, *min_y, *max_x, *min_y, *max_x, *max_y, *min_x, *max_y};
+    for (const auto& [cell, cells] : std::vector<std::pair<double, int>>{{4.0, 128}, {16.0, 64}}) {
+      const auto grid = patchy::build_warp_surface_grid(mesh, quad, kWidth, kHeight, cell, cells);
+      CHECK(grid.has_value());
+      if (!grid.has_value()) {
+        continue;
+      }
+      // What walking every cell's bounding box costs.
+      std::uint64_t box_tests = 0;
+      for (int r = 0; r + 1 < grid->rows; ++r) {
+        for (int c = 0; c + 1 < grid->columns; ++c) {
+          const auto i = static_cast<std::size_t>(r * grid->columns + c);
+          const std::array<std::size_t, 4> corner{i, i + 1, i + static_cast<std::size_t>(grid->columns),
+                                                  i + static_cast<std::size_t>(grid->columns) + 1};
+          double x0 = 1e300;
+          double x1 = -1e300;
+          double y0 = 1e300;
+          double y1 = -1e300;
+          for (const auto k : corner) {
+            x0 = std::min(x0, grid->doc_xs[k]);
+            x1 = std::max(x1, grid->doc_xs[k]);
+            y0 = std::min(y0, grid->doc_ys[k]);
+            y1 = std::max(y1, grid->doc_ys[k]);
+          }
+          box_tests += static_cast<std::uint64_t>(std::ceil(x1) + 1 - std::floor(x0)) *
+                       static_cast<std::uint64_t>(std::ceil(y1) + 1 - std::floor(y0));
+        }
+      }
+      const auto started = std::chrono::steady_clock::now();
+      const auto warped =
+          patchy::ui::resample_warped_rgba8(source, *grid, patchy::ui::CanvasWidget::TransformInterpolation::Bilinear);
+      const auto elapsed_ms =
+          std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count();
+      const auto pixels = static_cast<std::uint64_t>(warped.image.width()) * warped.image.height();
+      std::printf("[INFO] issue299 warp reach %.0f cell %.0f: output %dx%d, span tests %llu (%.2f per pixel), "
+                  "box tests %llu, %.1f ms\n",
+                  reach, cell, warped.image.width(), warped.image.height(),
+                  static_cast<unsigned long long>(warped.cell_pixel_tests),
+                  pixels > 0 ? static_cast<double>(warped.cell_pixel_tests) / static_cast<double>(pixels) : 0.0,
+                  static_cast<unsigned long long>(box_tests), elapsed_ms);
+      CHECK(!warped.image.isNull());
+      // The surface stays inside the control points' hull (a Bezier surface does).
+      CHECK(warped.bounds.x >= static_cast<int>(std::floor(*min_x)) - 2 &&
+            warped.bounds.x + warped.bounds.width <= static_cast<int>(std::ceil(*max_x)) + 2);
+      CHECK(warped.cell_pixel_tests <= 4 * pixels + static_cast<std::uint64_t>(grid->rows * grid->columns) * 64);
+      if (reach > 0.0) {
+        save_image_artifact("issue299_warp_far_reach_" + std::to_string(static_cast<int>(reach)) + "_cell" +
+                                std::to_string(static_cast<int>(cell)),
+                            warped.image);
+      }
+    }
+  }
+}
+
+// The same drag through the canvas at a zoomed-out view, the way it was reported:
+// every drag frame and the resting frame keep their resample work bounded by the
+// pixels they render.
+void ui_warp_far_drag_preview_work_stays_bounded() {
+  patchy::ui::MainWindow window;
+  show_window(window);
+  constexpr int kWidth = 3300;
+  constexpr int kHeight = 2550;
+  patchy::Document built(kWidth, kHeight, patchy::PixelFormat::rgba8());
+  patchy::PixelBuffer backdrop(kWidth, kHeight, patchy::PixelFormat::rgba8());
+  backdrop.clear(255);
+  built.add_layer(patchy::Layer(built.allocate_layer_id(), "Backdrop", std::move(backdrop)));
+  constexpr int kArtWidth = 1400;
+  constexpr int kArtHeight = 600;
+  patchy::PixelBuffer art(kArtWidth, kArtHeight, patchy::PixelFormat::rgba8());
+  for (std::int32_t y = 0; y < kArtHeight; ++y) {
+    for (std::int32_t x = 0; x < kArtWidth; ++x) {
+      auto* px = art.pixel(x, y);
+      const bool band = ((x / 100) + (y / 100)) % 2 == 0;
+      px[0] = static_cast<std::uint8_t>(band ? 30 : 60);
+      px[1] = static_cast<std::uint8_t>(band ? 90 : 140);
+      px[2] = static_cast<std::uint8_t>(band ? 200 : 240);
+      px[3] = 255;
+    }
+  }
+  patchy::Layer layer(built.allocate_layer_id(), "Ribbon", std::move(art));
+  layer.set_bounds(patchy::Rect{500, 700, kArtWidth, kArtHeight});
+  const auto layer_id = layer.id();
+  built.add_layer(std::move(layer));
+  built.set_active_layer(layer_id);
+  window.add_document_session(std::move(built), QStringLiteral("Far warp"));
+  QApplication::processEvents();
+  auto* canvas = patchy::ui::MainWindowTestAccess::canvas(window);
+  CHECK(canvas != nullptr);
+  if (canvas == nullptr) {
+    return;
+  }
+  canvas->set_zoom_centered(0.25);
+  QApplication::processEvents();
+  require_action(window, "editWarpTransformAction")->trigger();
+  QApplication::processEvents();
+  CHECK(canvas->warp_transform_active());
+
+  // Handle 5 (row 1, column 1) dragged about 5 inches on screen to the right.
+  const auto start = canvas->widget_position_f(canvas->warp_handle_document_position(5)).toPoint();
+  send_mouse(*canvas, QEvent::MouseButtonPress, start, Qt::LeftButton, Qt::LeftButton);
+  const auto bounded = [](const patchy::ui::CanvasRenderCacheDiagnostics& diagnostics) {
+    return diagnostics.warp_preview_last_cell_tests <= 4 * diagnostics.warp_preview_last_pixels + 64 * 65 * 65 * 4;
+  };
+  QPoint end = start;
+  for (int frame = 1; frame <= 6; ++frame) {
+    end = start + QPoint(frame * 90, frame * 10);
+    send_mouse(*canvas, QEvent::MouseMove, end, Qt::NoButton, Qt::LeftButton);
+    const auto started = std::chrono::steady_clock::now();
+    canvas->repaint();
+    const auto elapsed_ms =
+        std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count();
+    const auto diagnostics = canvas->render_cache_diagnostics();
+    std::printf("[INFO] issue299 drag frame %d: %llu px, %llu tests, %.1f ms\n", frame,
+                static_cast<unsigned long long>(diagnostics.warp_preview_last_pixels),
+                static_cast<unsigned long long>(diagnostics.warp_preview_last_cell_tests), elapsed_ms);
+    CHECK(bounded(diagnostics));
+  }
+  save_image_artifact("issue299_warp_far_drag_frame", canvas->grab().toImage());
+  send_mouse(*canvas, QEvent::MouseButtonRelease, end, Qt::LeftButton, Qt::NoButton);
+  QApplication::processEvents();
+  const auto resting = canvas->render_cache_diagnostics();
+  std::printf("[INFO] issue299 resting frame: %llu px, %llu tests\n",
+              static_cast<unsigned long long>(resting.warp_preview_last_pixels),
+              static_cast<unsigned long long>(resting.warp_preview_last_cell_tests));
+  CHECK(bounded(resting));
+  save_image_artifact("issue299_warp_far_drag_resting", canvas->grab().toImage());
+  canvas->finish_warp_transform();
+  QApplication::processEvents();
+  CHECK(!canvas->warp_transform_active());
+  const auto bounds = canvas->active_layer_document_rect();
+  CHECK(bounds.has_value());
+  if (bounds.has_value()) {
+    std::printf("[INFO] issue299 committed bounds %d,%d %dx%d\n", bounds->x(), bounds->y(), bounds->width(),
+                bounds->height());
+  }
+}
+
+// Warp after a Perspective stage (the #299 type buttons make that a two-click path):
+// the cage maps to the document through the stage's homography, which has a horizon.
+// A middle point dragged past it used to put the surface on both sides, its lattice
+// ran off to infinity, and the frame filled with streaks while every repaint crawled.
+// The handle now stops at its last good position and the surface stays finite.
+void ui_warp_after_perspective_handle_stops_at_the_horizon() {
+  patchy::ui::MainWindow window;
+  show_window(window);
+  constexpr int kWidth = 1600;
+  constexpr int kHeight = 1000;
+  patchy::Document built(kWidth, kHeight, patchy::PixelFormat::rgba8());
+  patchy::PixelBuffer backdrop(kWidth, kHeight, patchy::PixelFormat::rgba8());
+  backdrop.clear(255);
+  built.add_layer(patchy::Layer(built.allocate_layer_id(), "Backdrop", std::move(backdrop)));
+  patchy::PixelBuffer art(400, 300, patchy::PixelFormat::rgba8());
+  for (std::int32_t y = 0; y < 300; ++y) {
+    for (std::int32_t x = 0; x < 400; ++x) {
+      auto* px = art.pixel(x, y);
+      const bool band = ((x / 50) + (y / 50)) % 2 == 0;
+      px[0] = static_cast<std::uint8_t>(band ? 30 : 200);
+      px[1] = static_cast<std::uint8_t>(band ? 80 : 60);
+      px[2] = static_cast<std::uint8_t>(band ? 210 : 40);
+      px[3] = 255;
+    }
+  }
+  patchy::Layer layer(built.allocate_layer_id(), "Art", std::move(art));
+  layer.set_bounds(patchy::Rect{100, 100, 400, 300});
+  const auto layer_id = layer.id();
+  built.add_layer(std::move(layer));
+  built.set_active_layer(layer_id);
+  window.add_document_session(std::move(built), QStringLiteral("Perspective warp"));
+  QApplication::processEvents();
+  auto* canvas = patchy::ui::MainWindowTestAccess::canvas(window);
+  CHECK(canvas != nullptr);
+  if (canvas == nullptr) {
+    return;
+  }
+  canvas->set_zoom_centered(0.5);
+  QApplication::processEvents();
+  require_action(window, "editTransformPerspectiveAction")->trigger();
+  QApplication::processEvents();
+  CHECK(canvas->free_transform_active());
+  // The right side shrinks to a sliver: the sides meet a little right of x = 560.
+  CHECK(canvas->set_free_transform_quad(
+      {QPointF(100, 100), QPointF(500, 230), QPointF(500, 270), QPointF(100, 400)}));
+  require_action(window, "editWarpTransformAction")->trigger();
+  QApplication::processEvents();
+  CHECK(canvas->warp_transform_active());
+  if (!canvas->warp_transform_active()) {
+    return;
+  }
+  const double margin = std::max(4096.0, 2.0 * std::max(kWidth, kHeight));
+  const QRectF sane(-margin, -margin, kWidth + 2 * margin, kHeight + 2 * margin);
+  const auto start = canvas->warp_handle_document_position(5);
+  for (const double reach :
+       {100.0, 130.0, 140.0, 145.0, 150.0, 153.0, 155.0, 157.0, 158.0, 159.0, 160.0, 300.0, 1200.0, 5000.0}) {
+    canvas->set_warp_handle_document_position(5, start + QPointF(reach, 20.0));
+    QApplication::processEvents();
+    const auto diagnostics = canvas->render_cache_diagnostics();
+    std::printf("[INFO] issue299 perspective reach %.0f: handle %.1f,%.1f, %llu px, %llu tests\n", reach,
+                canvas->warp_handle_document_position(5).x(), canvas->warp_handle_document_position(5).y(),
+                static_cast<unsigned long long>(diagnostics.warp_preview_last_pixels),
+                static_cast<unsigned long long>(diagnostics.warp_preview_last_cell_tests));
+    for (int handle = 0; handle < canvas->warp_handle_count(); ++handle) {
+      const auto position = canvas->warp_handle_document_position(handle);
+      CHECK(std::isfinite(position.x()) && std::isfinite(position.y()) && sane.contains(position));
+    }
+    CHECK(diagnostics.warp_preview_last_cell_tests <=
+          4 * diagnostics.warp_preview_last_pixels + 129ULL * 129ULL * 64ULL);
+  }
+  // The handle stops short of the horizon (the sides meet near x = 562), where the
+  // old code drew screen-wide streaks from about 150 px of reach on.
+  CHECK(canvas->warp_handle_document_position(5).x() < 562.0);
+  CHECK(canvas->warp_handle_document_position(5).x() > 540.0);
+  save_image_artifact("issue299_warp_perspective_far", canvas->grab().toImage());
+  canvas->finish_warp_transform();
+  QApplication::processEvents();
+  const auto bounds = canvas->active_layer_document_rect();
+  CHECK(bounds.has_value() && sane.contains(QRectF(*bounds)));
+}
+
+}  // namespace
+
+std::vector<patchy::test::TestCase> warp_tests() {
+  return {
+      {"ui_warp_resample_parallel_and_clipped_match_sequential",
+       ui_warp_resample_parallel_and_clipped_match_sequential},
+      {"ui_warp_drag_preview_renders_at_view_resolution", ui_warp_drag_preview_renders_at_view_resolution},
+      {"ui_warp_far_dragged_interior_point_resamples_in_bounded_work",
+       ui_warp_far_dragged_interior_point_resamples_in_bounded_work},
+      {"ui_warp_far_drag_preview_work_stays_bounded", ui_warp_far_drag_preview_work_stays_bounded},
+      {"ui_warp_after_perspective_handle_stops_at_the_horizon",
+       ui_warp_after_perspective_handle_stops_at_the_horizon},
+      {"ui_warp_drag_renders_once_per_frame", ui_warp_drag_renders_once_per_frame},
+      {"ui_warp_render_matches_photoshop_preview_if_available",
+       ui_warp_render_matches_photoshop_preview_if_available},
+      {"ui_warped_smart_object_free_transform_rerenders", ui_warped_smart_object_free_transform_rerenders},
+      {"ui_warped_smart_object_edit_commit_keeps_warp", ui_warped_smart_object_edit_commit_keeps_warp},
+      {"ui_warp_transform_bends_pixel_layer_and_undoes", ui_warp_transform_bends_pixel_layer_and_undoes},
+      {"ui_warp_transform_on_smart_object_writes_mesh_and_survives_resave",
+       ui_warp_transform_on_smart_object_writes_mesh_and_survives_resave},
+      {"ui_warp_cylinder_style_wraps_pixel_layer", ui_warp_cylinder_style_wraps_pixel_layer},
+      {"ui_warp_cylinder_style_on_smart_object_writes_custom_mesh",
+       ui_warp_cylinder_style_on_smart_object_writes_custom_mesh},
+      {"ui_warp_cylinder_style_list_and_label_wrap", ui_warp_cylinder_style_list_and_label_wrap},
+      {"ui_warp_transform_refuses_text_layer", ui_warp_transform_refuses_text_layer},
+      {"ui_warp_text_dialog_applies_and_undoes", ui_warp_text_dialog_applies_and_undoes},
+      {"ui_warp_text_box_text_warps_over_frame", ui_warp_text_box_text_warps_over_frame},
+      {"ui_warp_text_psd_writes_baseline_anchored_geometry",
+       ui_warp_text_psd_writes_baseline_anchored_geometry},
+      {"ui_warp_text_box_matches_photoshop_layout", ui_warp_text_box_matches_photoshop_layout},
+      {"ui_warp_text_render_matches_photoshop_if_available",
+       ui_warp_text_render_matches_photoshop_if_available},
+      {"ui_warp_text_survives_editor_commit", ui_warp_text_survives_editor_commit},
+      {"ui_warp_text_edit_caret_matches_unwarped_preview", ui_warp_text_edit_caret_matches_unwarped_preview},
+      {"ui_warp_text_recommit_keeps_origin", ui_warp_text_recommit_keeps_origin},
+      {"ui_warp_text_commit_leaves_no_stale_canvas", ui_warp_text_commit_leaves_no_stale_canvas},
+      {"ui_warp_text_dialog_refuses_faux_bold", ui_warp_text_dialog_refuses_faux_bold},
+      {"ui_warped_text_refuses_faux_bold_toggle", ui_warped_text_refuses_faux_bold_toggle},
+      {"ui_text_character_panel_edits_selected_layer_without_session",
+       ui_text_character_panel_edits_selected_layer_without_session},
+      {"ui_text_options_bar_size_applies_to_selected_layers_without_session",
+       ui_text_options_bar_size_applies_to_selected_layers_without_session},
+      {"ui_text_options_bar_family_and_style_apply_to_selected_layers_without_session",
+       ui_text_options_bar_family_and_style_apply_to_selected_layers_without_session},
+      {"ui_text_options_bar_follows_active_text_layer", ui_text_options_bar_follows_active_text_layer},
+      {"ui_text_character_panel_edits_all_selected_layers_without_session",
+       ui_text_character_panel_edits_all_selected_layers_without_session},
+      {"ui_text_thumbnail_double_click_selects_all_without_zoom",
+       ui_text_thumbnail_double_click_selects_all_without_zoom},
+      {"ui_warped_text_allows_real_bold_face", ui_warped_text_allows_real_bold_face},
+      {"ui_imported_faux_bold_warp_layer_still_renders", ui_imported_faux_bold_warp_layer_still_renders},
+      {"ui_options_bar_transform_session_replaces_tool_controls",
+       ui_options_bar_transform_session_replaces_tool_controls},
+      {"ui_free_transform_warp_toggle_composes_single_commit", ui_free_transform_warp_toggle_composes_single_commit},
+      {"ui_warp_toggle_back_to_free_transform_keeps_pending_warp",
+       ui_warp_toggle_back_to_free_transform_keeps_pending_warp},
+      {"ui_smart_object_transform_then_warp_commits_composed_placement",
+       ui_smart_object_transform_then_warp_commits_composed_placement},
+      {"ui_warp_toggle_refuses_text_layer_and_keeps_transform", ui_warp_toggle_refuses_text_layer_and_keeps_transform},
+  };
+}

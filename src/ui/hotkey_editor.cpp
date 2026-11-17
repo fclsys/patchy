@@ -1,0 +1,1537 @@
+#include "ui/hotkey_editor.hpp"
+#include "ui/command_search.hpp"
+#include "ui/dialog_utils.hpp"
+#include "ui/hotkey_sets.hpp"
+#include "ui/tool_modifier_style.hpp"
+#include "ui/theme_qss.hpp"
+
+#include <QAction>
+#include <QComboBox>
+#include <QDir>
+#include <QFileInfo>
+#include <QFrame>
+#include <QGridLayout>
+#include <QHBoxLayout>
+#include <QHash>
+#include <QInputDialog>
+#include <QKeyEvent>
+#include <QKeySequence>
+#include <QLabel>
+#include <QLineEdit>
+#include <QMenu>
+#include <QMenuBar>
+#include <QPushButton>
+#include <QRegularExpression>
+#include <QScrollArea>
+#include <QScrollBar>
+#include <QSet>
+#include <QSignalBlocker>
+#include <QStyle>
+#include <QStyleOptionComboBox>
+#include <QTimer>
+#include <QToolButton>
+#include <QVBoxLayout>
+#include <algorithm>
+#include <array>
+#include <functional>
+#include <utility>
+
+namespace patchy::ui {
+
+namespace {
+
+// Only the long command names wrap (GitHub issue 451: they set the Preferences dialog's
+// minimum width): a wrapping label measures its height for every width, and the panel has
+// ~150 rows, so the short ones stay single-line.
+constexpr int kHotkeyLabelWrapWidth = 200;
+void wrap_if_long(QLabel& label, const QString& plain_text) {
+  label.setWordWrap(label.fontMetrics().horizontalAdvance(plain_text) > kHotkeyLabelWrapWidth);
+}
+
+bool is_modifier_only_key(int key) {
+  return key == Qt::Key_Control || key == Qt::Key_Shift || key == Qt::Key_Alt || key == Qt::Key_Meta ||
+         key == Qt::Key_AltGr || key == Qt::Key_CapsLock || key == Qt::Key_NumLock || key == Qt::Key_ScrollLock;
+}
+
+// GitHub issue 676 follow-up: with Show set to Commands with shortcuts the search reads only
+// the keys. A chord's tokens are each modifier's names (as the chips show them, plus the usual
+// other spellings) and the key's native and portable names, in lower case.
+QStringList modifier_tokens(Qt::KeyboardModifiers modifiers) {
+  QStringList tokens;
+#ifdef Q_OS_MACOS
+  if (modifiers.testFlag(Qt::ControlModifier)) {
+    tokens << QStringLiteral("cmd") << QStringLiteral("command") << QString(QChar(0x2318));
+  }
+  if (modifiers.testFlag(Qt::MetaModifier)) {
+    tokens << QStringLiteral("ctrl") << QStringLiteral("control") << QString(QChar(0x2303));
+  }
+  if (modifiers.testFlag(Qt::AltModifier)) {
+    tokens << QStringLiteral("option") << QStringLiteral("opt") << QStringLiteral("alt") << QString(QChar(0x2325));
+  }
+  if (modifiers.testFlag(Qt::ShiftModifier)) {
+    tokens << QStringLiteral("shift") << QString(QChar(0x21E7));
+  }
+#else
+  if (modifiers.testFlag(Qt::ControlModifier)) {
+    tokens << QStringLiteral("ctrl") << QStringLiteral("control");
+  }
+  if (modifiers.testFlag(Qt::MetaModifier)) {
+    tokens << QStringLiteral("meta") << QStringLiteral("win") << QStringLiteral("super");
+  }
+  if (modifiers.testFlag(Qt::AltModifier)) {
+    tokens << QStringLiteral("alt");
+  }
+  if (modifiers.testFlag(Qt::ShiftModifier)) {
+    tokens << QStringLiteral("shift");
+  }
+#endif
+  return tokens;
+}
+
+void append_key_chords(const QKeySequence& sequence, QList<QStringList>& chords) {
+  for (int index = 0; index < sequence.count(); ++index) {
+    const auto combination = sequence[index];
+    auto tokens = modifier_tokens(combination.keyboardModifiers());
+    const QKeySequence key(combination.key());
+    for (const auto format : {QKeySequence::NativeText, QKeySequence::PortableText}) {
+      const auto name = key.toString(format).toLower();
+      if (!name.isEmpty() && !tokens.contains(name)) {
+        tokens << name;
+      }
+    }
+    chords << tokens;
+  }
+}
+
+// The built-in rows show their keys as text ("O / Shift+O / H", "0-9", "Arrows / Shift+Arrows").
+QList<QStringList> built_in_key_chords(const QString& keys) {
+  QList<QStringList> chords;
+  for (const auto& alternative : keys.split(QStringLiteral(" / "), Qt::SkipEmptyParts)) {
+    QStringList tokens;
+    for (const auto& part : alternative.split(QLatin1Char('+'), Qt::SkipEmptyParts)) {
+      const auto token = part.trimmed().toLower();
+      tokens << token;
+      if (token.size() == 3 && token.at(1) == QLatin1Char('-')) {  // a range such as 0-9
+        for (char16_t c = token.at(0).unicode(); c <= token.at(2).unicode(); ++c) {
+          tokens << QString(QChar(c));
+        }
+      } else if (token == QStringLiteral("arrows")) {
+        tokens << QStringLiteral("left") << QStringLiteral("right") << QStringLiteral("up") << QStringLiteral("down");
+      }
+    }
+    chords << tokens;
+  }
+  return chords;
+}
+
+// "ctrl+u", "Ctrl U" and "ctrl + u" give ctrl and u; a plus with no key before it ("+",
+// "ctrl++") is the plus key itself.
+QStringList shortcut_query_tokens(const QString& query) {
+  QStringList tokens;
+  QString current;
+  bool after_separator = true;
+  for (const QChar c : query.toLower()) {
+    if (c.isSpace()) {
+      if (!current.isEmpty()) {
+        tokens << current;
+        current.clear();
+        after_separator = false;
+      }
+    } else if (c == QLatin1Char('+') && current.isEmpty() && after_separator) {
+      tokens << QString(c);
+      after_separator = false;
+    } else if (c == QLatin1Char('+')) {
+      if (!current.isEmpty()) {
+        tokens << current;
+        current.clear();
+      }
+      after_separator = true;
+    } else {
+      current += c;
+    }
+  }
+  if (!current.isEmpty()) {
+    tokens << current;
+  }
+  return tokens;
+}
+
+// One letter, or anything with a digit, must name the key exactly: "u" finds U (not Up), "f1"
+// finds F1 (not F10 to F12). Two or more letters may also start a longer name ("ctr", "shi",
+// "pg"), so a partly typed word still finds its chords.
+bool shortcut_token_matches(const QString& query_token, const QString& key_token) {
+  if (key_token == query_token) {
+    return true;
+  }
+  if (query_token.size() < 2 ||
+      !std::all_of(query_token.begin(), query_token.end(), [](QChar c) { return c.isLetter(); })) {
+    return false;
+  }
+  return key_token.startsWith(query_token);
+}
+
+// Every query token must match a token of the same chord.
+bool key_chords_match(const QList<QStringList>& chords, const QStringList& query_tokens) {
+  return std::any_of(chords.begin(), chords.end(), [&](const QStringList& chord) {
+    return std::all_of(query_tokens.begin(), query_tokens.end(), [&](const QString& query_token) {
+      return std::any_of(chord.begin(), chord.end(),
+                         [&](const QString& key_token) { return shortcut_token_matches(query_token, key_token); });
+    });
+  });
+}
+
+}  // namespace
+
+bool is_reserved_binding_key(int key, Qt::KeyboardModifiers modifiers) {
+  if ((modifiers & (Qt::ControlModifier | Qt::AltModifier | Qt::MetaModifier)) != 0) {
+    return key == Qt::Key_Escape;
+  }
+  switch (key) {
+    case Qt::Key_Return:
+    case Qt::Key_Enter:
+    case Qt::Key_Space:
+    case Qt::Key_Tab:
+    case Qt::Key_Backtab:
+    case Qt::Key_Left:
+    case Qt::Key_Right:
+    case Qt::Key_Up:
+    case Qt::Key_Down:
+    case Qt::Key_Escape:
+    case Qt::Key_Backspace:
+      return true;
+    default:
+      break;
+  }
+  if ((modifiers & Qt::ShiftModifier) == 0 && key >= Qt::Key_0 && key <= Qt::Key_9) {
+    return true;
+  }
+  return false;
+}
+
+// Records exactly one chord. Esc cancels, plain Backspace clears the binding,
+// reserved keys show a transient refusal instead of committing.
+class HotkeyCaptureEdit final : public QLineEdit {
+public:
+  HotkeyCaptureEdit(QString reserved_message, QWidget* parent) : QLineEdit(parent),
+                                                                 reserved_message_(std::move(reserved_message)) {
+    setObjectName(QStringLiteral("hotkeyCaptureEdit"));
+    setReadOnly(true);
+    setFocusPolicy(Qt::StrongFocus);
+    setContextMenuPolicy(Qt::NoContextMenu);
+    setAttribute(Qt::WA_InputMethodEnabled, false);
+    setMinimumWidth(190);
+    setFixedHeight(24);
+  }
+
+  std::function<void(QKeySequence)> on_commit;
+  std::function<void()> on_cancel;
+  std::function<void()> on_clear;
+
+protected:
+  bool event(QEvent* event) override {
+    // Keep every chord out of the shortcut system while recording.
+    if (event->type() == QEvent::ShortcutOverride) {
+      event->accept();
+      return true;
+    }
+    return QLineEdit::event(event);
+  }
+
+  void keyPressEvent(QKeyEvent* event) override {
+    event->accept();
+    if (finished_) {
+      return;
+    }
+    const int key = event->key();
+    if (key == Qt::Key_unknown || is_modifier_only_key(key)) {
+      return;
+    }
+    const auto modifiers = event->modifiers() & ~Qt::KeypadModifier;
+    if (key == Qt::Key_Escape && modifiers == Qt::NoModifier) {
+      finish(on_cancel);
+      return;
+    }
+    if (key == Qt::Key_Backspace && modifiers == Qt::NoModifier) {
+      finish(on_clear);
+      return;
+    }
+    if (is_reserved_binding_key(key, modifiers)) {
+      setText(reserved_message_);
+      QTimer::singleShot(1200, this, [this] {
+        if (!finished_) {
+          setText(QString());
+        }
+      });
+      return;
+    }
+    const QKeySequence sequence(QKeyCombination(modifiers, static_cast<Qt::Key>(key)));
+    if (sequence.isEmpty()) {
+      return;
+    }
+    if (on_commit) {
+      finished_ = true;
+      on_commit(sequence);
+    }
+  }
+
+  void keyReleaseEvent(QKeyEvent* event) override { event->accept(); }
+
+  void focusOutEvent(QFocusEvent* event) override {
+    QLineEdit::focusOutEvent(event);
+    finish(on_cancel);
+  }
+
+private:
+  void finish(const std::function<void()>& callback) {
+    if (finished_) {
+      return;
+    }
+    finished_ = true;
+    if (callback) {
+      callback();
+    }
+  }
+
+  QString reserved_message_;
+  bool finished_{false};
+};
+
+HotkeyEditorPanel::HotkeyEditorPanel(HotkeyRegistry& registry, QMenuBar* menu_bar, QWidget* parent)
+    : QWidget(parent), registry_(registry), staged_(registry.overrides()) {
+  setObjectName(QStringLiteral("hotkeyEditorPanel"));
+  load_shortcut_sets();
+
+  // The search row and hint stay put above the command list, which scrolls on its own
+  // (GitHub issue 561). Preferences hosts the panel with no right inset, so the list's
+  // scroll bar sits at the page edge; the 12 px right margins keep the rows and the
+  // search row off it, and the header widens its margin by the bar while it shows.
+  auto* layout = new QVBoxLayout(this);
+  layout->setContentsMargins(0, 0, 0, 0);
+  layout->setSpacing(10);
+
+  header_ = new QWidget(this);
+  header_->setObjectName(QStringLiteral("hotkeyEditorHeader"));
+  auto* header_layout = new QVBoxLayout(header_);
+  header_layout->setContentsMargins(0, 0, 12, 0);
+  header_layout->setSpacing(10);
+  layout->addWidget(header_);
+
+  auto* top_row = new QWidget(header_);
+  auto* top_layout = new QHBoxLayout(top_row);
+  top_layout->setContentsMargins(0, 0, 0, 0);
+  top_layout->setSpacing(8);
+  search_edit_ = new QLineEdit(top_row);
+  search_edit_->setObjectName(QStringLiteral("hotkeySearchEdit"));
+  search_edit_->setClearButtonEnabled(true);
+  top_layout->addWidget(search_edit_, 1);
+  // GitHub issue 676: limits the list together with the search; the choice is not saved.
+  //: Preferences > Hotkeys: label of the box that limits the list to some kinds of commands.
+  auto* filter_label = new QLabel(tr("Show:"), top_row);
+  top_layout->addWidget(filter_label);
+  filter_combo_ = new QComboBox(top_row);
+  filter_combo_->setObjectName(QStringLiteral("hotkeyFilterCombo"));
+  filter_combo_->setToolTip(tr("List only some kinds of commands"));
+  filter_combo_->setSizeAdjustPolicy(QComboBox::AdjustToContents);
+  fill_filter_combo();
+  update_search_placeholder();
+  fit_combo_popup_to_entries(*filter_combo_);
+  filter_label->setBuddy(filter_combo_);
+  top_layout->addWidget(filter_combo_);
+  header_layout->addWidget(top_row);
+  header_layout->addWidget(build_set_row(header_));
+  transfer_status_ = new QLabel(header_);
+  transfer_status_->setObjectName(QStringLiteral("hotkeyTransferStatus"));
+  transfer_status_->setProperty("hotkeyDim", true);
+  transfer_status_->setWordWrap(true);
+  transfer_status_->hide();
+  header_layout->addWidget(transfer_status_);
+
+  auto* hint = new QLabel(
+      tr("Click a shortcut to change it. Backspace clears it. Esc cancels. Changes apply when you click OK."),
+      header_);
+  hint->setProperty("hotkeyDim", true);
+  hint->setWordWrap(true);
+  header_layout->addWidget(hint);
+
+  list_scroll_ = new QScrollArea(this);
+  list_scroll_->setObjectName(QStringLiteral("hotkeyListScroll"));
+  list_scroll_->setWidgetResizable(true);
+  list_scroll_->setFrameShape(QFrame::NoFrame);
+  list_scroll_->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
+  auto* list = new QWidget(list_scroll_);
+  list->setObjectName(QStringLiteral("hotkeyListContent"));
+  list_layout_ = new QVBoxLayout(list);
+  list_layout_->setContentsMargins(0, 0, 12, 12);
+  list_layout_->setSpacing(10);
+  list_scroll_->setWidget(list);
+  layout->addWidget(list_scroll_, 1);
+  list_scroll_->verticalScrollBar()->installEventFilter(this);
+
+  connect(search_edit_, &QLineEdit::textChanged, this, [this] {
+    filter_rows();
+    list_scroll_->verticalScrollBar()->setValue(0);
+  });
+  connect(filter_combo_, &QComboBox::currentIndexChanged, this, [this] {
+    update_search_placeholder();
+    filter_rows();
+    list_scroll_->verticalScrollBar()->setValue(0);
+  });
+  connect(set_combo_, &QComboBox::activated, this, [this](int index) {
+    QTimer::singleShot(0, this, [this, index] { shortcut_set_chosen(index); });
+  });
+
+  // Set before build_rows() creates its hundreds of command-row widgets: a
+  // stylesheet applied to a widget that already has a large subtree forces Qt
+  // to repolish every descendant, which measured multiple seconds with the
+  // full command list (the September 2026 Preferences-open slowdown).
+  set_themed_style(*this, QStringLiteral(R"(
+    QWidget#hotkeyEditorPanel QWidget#hotkeyEditorHeader,
+    QWidget#hotkeyEditorPanel QScrollArea#hotkeyListScroll,
+    QWidget#hotkeyEditorPanel QWidget#hotkeyListContent {
+      background: transparent;
+    }
+    QWidget#hotkeyEditorPanel QLabel[hotkeyCategoryHeader="true"] {
+      color: @hotkey_hint_text;
+      font-size: 11px;
+      font-weight: 600;
+    }
+    QWidget#hotkeyEditorPanel QLabel[hotkeyCategoryGap="true"] {
+      margin-bottom: 9px;
+    }
+    QWidget#hotkeyEditorPanel QWidget[hotkeyRow="true"] {
+      border-bottom: 1px solid @hotkey_header_border;
+    }
+    QWidget#hotkeyEditorPanel QLabel[hotkeyDim="true"] {
+      color: @hotkey_muted_text;
+      font-size: 11px;
+    }
+    QWidget#hotkeyEditorPanel QLabel[hotkeyNote="true"] {
+      color: @hotkey_conflict_text;
+      font-size: 11px;
+    }
+    QWidget#hotkeyEditorPanel QLabel[hotkeyFixedChip="true"] {
+      background: @hotkey_search_bg;
+      border: 1px solid @hotkey_search_border;
+      border-radius: 3px;
+      color: @hotkey_search_text;
+      font-size: 12px;
+      padding: 2px 9px;
+    }
+    QWidget#hotkeyEditorPanel QPushButton[hotkeyChip="true"] {
+      background: @button_bg;
+      border: 1px solid @field_inset_border;
+      border-top-color: @field_bevel_top;
+      border-radius: 3px;
+      color: @text_bright;
+      font-size: 12px;
+      min-height: 18px;
+      padding: 2px 10px;
+    }
+    QWidget#hotkeyEditorPanel QPushButton[hotkeyChip="true"]:hover {
+      background: @color_button_hover_bg;
+      border-color: @color_button_hover_border;
+    }
+    QWidget#hotkeyEditorPanel QPushButton[hotkeyChipUnbound="true"] {
+      background: transparent;
+      border: 1px dashed @field_border;
+      color: @hotkey_muted_text;
+    }
+    QWidget#hotkeyEditorPanel QToolButton[hotkeyReset="true"] {
+      background: transparent;
+      border: none;
+      color: @hotkey_shortcut_text;
+      font-size: 14px;
+    }
+    QWidget#hotkeyEditorPanel QToolButton[hotkeyReset="true"]:hover {
+      color: @hotkey_shortcut_active_text;
+    }
+    QLineEdit#hotkeyCaptureEdit {
+      background: @hotkey_recording_bg;
+      border: 1px solid @accent_pressed_bg;
+      border-radius: 3px;
+      color: @hotkey_recording_text;
+      font-size: 12px;
+      padding: 1px 8px;
+    }
+    QFrame#hotkeyConflictBanner {
+      background: @hotkey_warning_bg;
+      border: 1px solid @hotkey_warning_border;
+      border-radius: 3px;
+    }
+    QFrame#hotkeyConflictBanner QLabel {
+      background: transparent;
+      border: none;
+      color: @hotkey_warning_text;
+      font-size: 11px;
+    }
+    QFrame#hotkeyConflictBanner QPushButton {
+      background: @button_bg;
+      border: 1px solid @color_button_border;
+      border-radius: 3px;
+      color: @text_bright;
+      font-size: 11px;
+      padding: 2px 10px;
+    }
+    QFrame#hotkeyConflictBanner QPushButton:hover {
+      background: @color_button_hover_bg;
+      border-color: @color_button_hover_border;
+    }
+  )"));
+
+  build_rows(menu_bar);
+  list_layout_->addStretch(1);
+  refresh_rows();
+}
+
+bool HotkeyEditorPanel::eventFilter(QObject* watched, QEvent* event) {
+  // Keeps the search row's right edge in line with the rows' while the list's scroll
+  // bar comes and goes (a search that fits hides it).
+  if (list_scroll_ != nullptr && watched == list_scroll_->verticalScrollBar() &&
+      (event->type() == QEvent::Show || event->type() == QEvent::Hide || event->type() == QEvent::Resize)) {
+    const auto* bar = list_scroll_->verticalScrollBar();
+    const int bar_width = bar->isVisibleTo(list_scroll_) ? bar->width() : 0;
+    auto margins = header_->layout()->contentsMargins();
+    if (margins.right() != 12 + bar_width) {
+      margins.setRight(12 + bar_width);
+      header_->layout()->setContentsMargins(margins);
+    }
+  }
+  return QWidget::eventFilter(watched, event);
+}
+
+void HotkeyEditorPanel::commit() {
+  store_user_hotkey_sets(user_sets_, active_set_id_);
+  set_active_tool_modifier_style(staged_tool_modifier_style());
+  registry_.apply_overrides(staged_);
+}
+
+ToolModifierStyle HotkeyEditorPanel::set_tool_modifier_style(const QString& set_id) const {
+  const auto it = std::find_if(user_sets_.begin(), user_sets_.end(),
+                               [&set_id](const UserHotkeySet& set) { return set.id == set_id; });
+  return it != user_sets_.end() ? it->tool_modifiers : builtin_set_tool_modifier_style(set_id);
+}
+
+ToolModifierStyle HotkeyEditorPanel::staged_tool_modifier_style() const {
+  return set_tool_modifier_style(active_set_id_);
+}
+
+// Which set the page opens on: the one last applied when the registry still holds its keys.
+// Keys changed elsewhere (a script's binding, an older Patchy) go into that user set, or
+// into Custom when a built-in set was active and they no longer match one.
+void HotkeyEditorPanel::load_shortcut_sets() {
+  user_sets_ = load_user_hotkey_sets(registry_.commands());
+  active_set_id_ = load_active_hotkey_set_id();
+  if (auto* set = find_user_set(active_set_id_); set != nullptr) {
+    set->overrides = staged_;
+    return;
+  }
+  if (is_builtin_set(active_set_id_) &&
+      hotkey_override_maps_equivalent(staged_, builtin_set_overrides(active_set_id_))) {
+    return;
+  }
+  if (const auto match = matching_hotkey_set_id(staged_, registry_.commands()); !match.isEmpty()) {
+    active_set_id_ = match;
+    return;
+  }
+  put_staged_in_custom_set();
+}
+
+// Two lines under one label: the set box with the buttons that act on the set shown, then the
+// file buttons and Reset All. One line held too few pixels for six controls in German and Russian,
+// and Reset All on the first line pushed the page past the window in German.
+QWidget* HotkeyEditorPanel::build_set_row(QWidget* parent) {
+  auto* row = new QWidget(parent);
+  auto* grid = new QGridLayout(row);
+  grid->setContentsMargins(0, 0, 0, 0);
+  grid->setHorizontalSpacing(8);
+  grid->setVerticalSpacing(6);
+  grid->setColumnStretch(1, 1);
+  auto* set_line = new QHBoxLayout();
+  set_line->setSpacing(8);
+  auto* file_line = new QHBoxLayout();
+  file_line->setSpacing(8);
+  auto* label = new QLabel(tr("Shortcut set:"), row);
+  grid->addWidget(label, 0, 0);
+  grid->addLayout(set_line, 0, 1);
+  grid->addLayout(file_line, 1, 1);
+  auto* row_layout = set_line;
+  set_combo_ = new QComboBox(row);
+  set_combo_->setObjectName(QStringLiteral("hotkeySetCombo"));
+  set_combo_->setToolTip(tr("Built-in sets never change: changing a key in one puts your keys in the Custom "
+                            "set. Rename it to keep it as a set of your own."));
+  // Built after Preferences fits its other combos' lists, so the panel asks for its own: the
+  // open list shows every entry whole (GitHub issue 489).
+  fit_combo_popup_to_entries(*set_combo_);
+  label->setBuddy(set_combo_);
+  row_layout->addWidget(set_combo_);
+  rename_set_button_ = new QPushButton(tr("Rename..."), row);
+  rename_set_button_->setObjectName(QStringLiteral("hotkeySetRenameButton"));
+  rename_set_button_->setToolTip(tr("Name this set of yours"));
+  row_layout->addWidget(rename_set_button_);
+  delete_set_button_ = new QPushButton(tr("Delete"), row);
+  delete_set_button_->setObjectName(QStringLiteral("hotkeySetDeleteButton"));
+  delete_set_button_->setToolTip(tr("Remove this set of yours"));
+  row_layout->addWidget(delete_set_button_);
+  row_layout->addStretch(1);
+  auto* import_button = new QPushButton(tr("Import..."), row);
+  import_button->setObjectName(QStringLiteral("hotkeyImportButton"));
+  import_button->setToolTip(tr("Add the shortcuts saved in a hotkey file as a set of your own"));
+  file_line->addWidget(import_button);
+  auto* export_button = new QPushButton(tr("Export..."), row);
+  export_button->setObjectName(QStringLiteral("hotkeyExportButton"));
+  export_button->setToolTip(tr("Save the shortcuts shown to a file you can keep or share"));
+  file_line->addWidget(export_button);
+  // A set action, so it sits with the sets rather than the search (GitHub issue 676 follow-up).
+  auto* reset_all_button = new QPushButton(tr("Reset All"), row);
+  reset_all_button->setObjectName(QStringLiteral("hotkeyResetAllButton"));
+  reset_all_button->setToolTip(tr("Restore every hotkey to its default"));
+  file_line->addWidget(reset_all_button);
+  file_line->addStretch(1);
+  rebuild_set_combo();
+  connect(rename_set_button_, &QPushButton::clicked, this, [this] { rename_clicked(); });
+  connect(delete_set_button_, &QPushButton::clicked, this, [this] { delete_clicked(); });
+  connect(reset_all_button, &QPushButton::clicked, this, [this] {
+    // Patchy's defaults as a set: the user's own sets keep their keys.
+    QTimer::singleShot(0, this, [this] { apply_shortcut_set(QString::fromLatin1(kPatchyHotkeySetId)); });
+  });
+  connect(import_button, &QPushButton::clicked, this, [this] { import_clicked(); });
+  connect(export_button, &QPushButton::clicked, this, [this] { export_clicked(); });
+  return row;
+}
+
+bool HotkeyEditorPanel::export_to_file(const QString& path, QString* error) {
+  if (!write_hotkey_file(path, staged_, error, staged_tool_modifier_style())) {
+    return false;
+  }
+  remember_hotkey_file_folder(path);
+  show_transfer_status(tr("Exported \"%1\".").arg(QFileInfo(path).fileName()));
+  return true;
+}
+
+HotkeyFileReadResult HotkeyEditorPanel::import_from_file(const QString& path, const QString& set_name) {
+  auto result = read_hotkey_file(path, registry_.commands());
+  if (!result.ok) {
+    return result;
+  }
+  remember_hotkey_file_folder(path);
+  auto name = set_name.trimmed();
+  if (name.isEmpty()) {
+    name = unique_set_name(QFileInfo(path).completeBaseName().trimmed());
+  }
+  staged_.clear();
+  for (auto it = result.overrides.constBegin(); it != result.overrides.constEnd(); ++it) {
+    stage_override(it.key(), it.value());
+  }
+  const auto id = next_user_set_id();
+  user_sets_.push_back({id, name, staged_, result.tool_modifiers});
+  active_set_id_ = id;
+  refresh_rows();
+  show_transfer_status(tr("Imported \"%1\" as the set \"%2\". Commands: %3. Skipped commands this Patchy does not "
+                          "have: %4. Skipped keys it cannot use: %5. Click OK to apply.")
+                           .arg(QFileInfo(path).fileName(), name)
+                           .arg(result.overrides.size())
+                           .arg(result.skipped_commands)
+                           .arg(result.skipped_keys));
+  return result;
+}
+
+void HotkeyEditorPanel::apply_shortcut_set(const QString& set_id) {
+  if (const auto* set = find_user_set(set_id); set != nullptr) {
+    staged_ = set->overrides;
+  } else if (is_builtin_set(set_id)) {
+    staged_ = builtin_set_overrides(set_id);
+  } else {
+    return;
+  }
+  active_set_id_ = set_id;
+  show_transfer_status(QString());
+  refresh_rows();
+}
+
+bool HotkeyEditorPanel::rename_shortcut_set(const QString& set_id, const QString& name) {
+  auto* set = find_user_set(set_id);
+  const auto trimmed = name.trimmed();
+  if (set == nullptr || trimmed.isEmpty() || set_name_taken(trimmed, set_id)) {
+    return false;
+  }
+  set->name = trimmed;
+  // A named set is no longer the Custom set: the next edit of a built-in starts a new Custom.
+  if (set->id == QLatin1String(kCustomHotkeySetId)) {
+    set->id = next_user_set_id();
+    if (active_set_id_ == QLatin1String(kCustomHotkeySetId)) {
+      active_set_id_ = set->id;
+    }
+  }
+  rebuild_set_combo();
+  return true;
+}
+
+void HotkeyEditorPanel::delete_shortcut_set(const QString& set_id) {
+  const auto it = std::find_if(user_sets_.begin(), user_sets_.end(),
+                               [&set_id](const UserHotkeySet& set) { return set.id == set_id; });
+  if (it == user_sets_.end()) {
+    return;
+  }
+  user_sets_.erase(it);
+  if (active_set_id_ == set_id) {
+    apply_shortcut_set(QString::fromLatin1(kPatchyHotkeySetId));
+  } else {
+    rebuild_set_combo();
+  }
+}
+
+std::optional<QString> HotkeyEditorPanel::ask_set_name(const QString& title, const QString& initial,
+                                                       const QString& except_id) {
+  auto text = initial;
+  for (;;) {
+    QInputDialog dialog(this);
+    dialog.setObjectName(QStringLiteral("hotkeySetNameDialog"));
+    dialog.setWindowTitle(title);
+    dialog.setLabelText(tr("Set name:"));
+    dialog.setInputMode(QInputDialog::TextInput);
+    dialog.setTextValue(text);
+    if (exec_dialog(dialog) != QDialog::Accepted) {
+      return std::nullopt;
+    }
+    text = dialog.textValue().trimmed();
+    if (text.isEmpty()) {
+      continue;
+    }
+    if (!set_name_taken(text, except_id)) {
+      return text;
+    }
+    show_critical_message(this, title,
+                          tr("A shortcut set named \"%1\" already exists. Choose another name.").arg(text),
+                          QStringLiteral("hotkeySetNameTakenMessageBox"));
+  }
+}
+
+void HotkeyEditorPanel::rename_clicked() {
+  const auto* set = find_user_set(active_set_id_);
+  if (set == nullptr) {
+    return;
+  }
+  const auto id = set->id;
+  const auto name = ask_set_name(tr("Rename Shortcut Set"), set->name, id);
+  if (name.has_value()) {
+    rename_shortcut_set(id, *name);
+  }
+}
+
+void HotkeyEditorPanel::delete_clicked() {
+  const auto* set = find_user_set(active_set_id_);
+  if (set == nullptr) {
+    return;
+  }
+  const auto id = set->id;
+  if (show_warning_message(this, tr("Delete Shortcut Set"),
+                           tr("Delete the shortcut set \"%1\"? Patchy's default shortcuts take its place.")
+                               .arg(user_set_display_name(*set)),
+                           QMessageBox::Ok | QMessageBox::Cancel, QMessageBox::Cancel,
+                           QStringLiteral("hotkeySetDeleteMessageBox")) != QMessageBox::Ok) {
+    return;
+  }
+  delete_shortcut_set(id);
+}
+
+void HotkeyEditorPanel::export_clicked() {
+  // The file is named after the set shown, without characters a file name cannot hold.
+  auto base = shortcut_set_name(active_set_id_);
+  if (const auto* set = find_user_set(active_set_id_); set != nullptr) {
+    base = user_set_display_name(*set);
+  }
+  static const QRegularExpression unsafe(QStringLiteral(R"([\\/:*?"<>|])"));
+  base = base.replace(unsafe, QStringLiteral("_")).trimmed();
+  if (base.isEmpty()) {
+    base = QStringLiteral("Patchy hotkeys");
+  }
+  const auto initial =
+      QDir(hotkey_file_folder()).filePath(base + QLatin1Char('.') + QLatin1String(kHotkeyFileSuffix));
+  auto path = get_save_file_name(this, tr("Export Hotkeys"), initial, tr("Patchy hotkeys (*.patchykeys)"), nullptr,
+                                 QStringLiteral("hotkeyExportFileDialog"));
+  if (path.isEmpty()) {
+    return;
+  }
+  if (QFileInfo(path).suffix().isEmpty()) {
+    path += QLatin1Char('.') + QLatin1String(kHotkeyFileSuffix);
+  }
+  QString error;
+  if (!export_to_file(path, &error)) {
+    show_critical_message(this, tr("Export failed"), error, QStringLiteral("hotkeyExportFailedMessageBox"));
+    return;
+  }
+  offer_browser_download_for_saved_file(path);
+}
+
+void HotkeyEditorPanel::import_clicked() {
+  const auto path = get_open_file_name(this, tr("Import Hotkeys"), hotkey_file_folder(),
+                                       tr("Patchy hotkeys (*.patchykeys *.json)"), nullptr,
+                                       QStringLiteral("hotkeyImportFileDialog"));
+  if (path.isEmpty()) {
+    return;
+  }
+  // Read first, so a file that is not a hotkey file never asks for a name.
+  const auto preview = read_hotkey_file(path, registry_.commands());
+  if (!preview.ok) {
+    show_critical_message(this, tr("Import failed"), preview.error, QStringLiteral("hotkeyImportFailedMessageBox"));
+    return;
+  }
+  remember_hotkey_file_folder(path);
+  const auto name =
+      ask_set_name(tr("Import Hotkeys"), unique_set_name(QFileInfo(path).completeBaseName().trimmed()), QString());
+  if (!name.has_value()) {
+    return;
+  }
+  const auto result = import_from_file(path, *name);
+  if (!result.ok) {
+    show_critical_message(this, tr("Import failed"), result.error, QStringLiteral("hotkeyImportFailedMessageBox"));
+  }
+}
+
+void HotkeyEditorPanel::shortcut_set_chosen(int index) {
+  if (set_combo_ == nullptr || index < 0 || index >= set_combo_->count()) {
+    return;
+  }
+  const auto set_id = set_combo_->itemData(index).toString();
+  if (set_id.isEmpty() || set_id == active_set_id_) {
+    rebuild_set_combo();
+    return;
+  }
+  // Nothing is lost: every set, Custom included, keeps its keys.
+  apply_shortcut_set(set_id);
+}
+
+QString HotkeyEditorPanel::shortcut_set_name(const QString& set_id) const {
+  if (set_id == QLatin1String(kPatchyHotkeySetId)) {
+    return tr("Patchy default");
+  }
+  if (const auto* set = find_builtin_hotkey_set(set_id); set != nullptr) {
+    return tr(set->label);
+  }
+  return QString();
+}
+
+QString HotkeyEditorPanel::user_set_display_name(const UserHotkeySet& set) const {
+  return set.name.isEmpty() ? tr("Custom") : set.name;
+}
+
+bool HotkeyEditorPanel::is_builtin_set(const QString& set_id) const {
+  return set_id == QLatin1String(kPatchyHotkeySetId) || find_builtin_hotkey_set(set_id) != nullptr;
+}
+
+HotkeyOverrideMap HotkeyEditorPanel::builtin_set_overrides(const QString& set_id) const {
+  if (const auto* set = find_builtin_hotkey_set(set_id); set != nullptr) {
+    return hotkey_set_overrides(*set, registry_.commands());
+  }
+  return {};
+}
+
+UserHotkeySet* HotkeyEditorPanel::find_user_set(const QString& set_id) {
+  const auto it = std::find_if(user_sets_.begin(), user_sets_.end(),
+                               [&set_id](const UserHotkeySet& set) { return set.id == set_id; });
+  return it != user_sets_.end() ? &*it : nullptr;
+}
+
+QString HotkeyEditorPanel::next_user_set_id() const {
+  int highest = 0;
+  for (const auto& set : user_sets_) {
+    if (set.id.startsWith(QLatin1String("user-"))) {
+      highest = std::max(highest, set.id.mid(5).toInt());
+    }
+  }
+  return QStringLiteral("user-%1").arg(highest + 1);
+}
+
+// Names are unique among the user's sets and never repeat a built-in set's or Custom's, in
+// any letter case, so the list never shows two entries that read alike.
+bool HotkeyEditorPanel::set_name_taken(const QString& name, const QString& except_id) const {
+  const auto same = [&name](const QString& other) { return name.compare(other, Qt::CaseInsensitive) == 0; };
+  if (same(tr("Custom")) || same(shortcut_set_name(QString::fromLatin1(kPatchyHotkeySetId)))) {
+    return true;
+  }
+  for (const auto& set : builtin_hotkey_sets()) {
+    if (same(tr(set.label))) {
+      return true;
+    }
+  }
+  return std::any_of(user_sets_.begin(), user_sets_.end(), [&](const UserHotkeySet& set) {
+    return set.id != except_id && !set.name.isEmpty() && same(set.name);
+  });
+}
+
+QString HotkeyEditorPanel::unique_set_name(const QString& base) const {
+  const auto start = base.isEmpty() ? tr("Imported shortcuts") : base;
+  if (!set_name_taken(start, QString())) {
+    return start;
+  }
+  for (int number = 2;; ++number) {
+    const auto candidate = QStringLiteral("%1 %2").arg(start).arg(number);
+    if (!set_name_taken(candidate, QString())) {
+      return candidate;
+    }
+  }
+}
+
+void HotkeyEditorPanel::put_staged_in_custom_set() {
+  // Custom keeps the tool modifiers of the set its keys came from (GitHub issue 302).
+  const auto style = set_tool_modifier_style(active_set_id_);
+  if (auto* custom = find_user_set(QString::fromLatin1(kCustomHotkeySetId)); custom != nullptr) {
+    custom->overrides = staged_;
+    custom->tool_modifiers = style;
+  } else {
+    user_sets_.push_back({QString::fromLatin1(kCustomHotkeySetId), QString(), staged_, style});
+  }
+  active_set_id_ = QString::fromLatin1(kCustomHotkeySetId);
+}
+
+// Every change to the staged keys lands here (refresh_rows). A user set takes the change; a
+// built-in set never does: its keys move to the Custom set, after a question when Custom
+// already holds other keys (Cancel undoes the change).
+void HotkeyEditorPanel::note_staged_change() {
+  if (auto* set = find_user_set(active_set_id_); set != nullptr) {
+    set->overrides = staged_;
+    return;
+  }
+  const auto expected = builtin_set_overrides(active_set_id_);
+  if (hotkey_override_maps_equivalent(staged_, expected)) {
+    return;
+  }
+  const auto builtin_name = shortcut_set_name(active_set_id_);
+  const auto* custom = find_user_set(QString::fromLatin1(kCustomHotkeySetId));
+  if (custom != nullptr && !hotkey_override_maps_equivalent(custom->overrides, staged_) &&
+      show_warning_message(this, tr("Shortcut Set"),
+                           tr("%1 is built in and never changes, so your change goes into the Custom set, which "
+                              "already holds other changes. Replace them? To keep them, click Cancel and rename "
+                              "Custom first.")
+                               .arg(builtin_name),
+                           QMessageBox::Ok | QMessageBox::Cancel, QMessageBox::Cancel,
+                           QStringLiteral("hotkeyCustomReplaceMessageBox")) != QMessageBox::Ok) {
+    staged_ = expected;
+    refresh_rows();
+    return;
+  }
+  put_staged_in_custom_set();
+  show_transfer_status(
+      tr("%1 is built in, so your changes are in the Custom set. Rename it to keep it as a set of your own.")
+          .arg(builtin_name));
+}
+
+// The list: Patchy's and the other built-in sets, then the user's own after a separator.
+void HotkeyEditorPanel::rebuild_set_combo() {
+  if (set_combo_ == nullptr) {
+    return;
+  }
+  const QSignalBlocker blocker(set_combo_);
+  set_combo_->clear();
+  //: A shortcut set shipped with Patchy, in the Preferences > Hotkeys set list. %1 is its name.
+  const auto builtin_text = [this](const QString& id) { return tr("%1 (built-in)").arg(shortcut_set_name(id)); };
+  set_combo_->addItem(builtin_text(QString::fromLatin1(kPatchyHotkeySetId)), QString::fromLatin1(kPatchyHotkeySetId));
+  for (const auto& set : builtin_hotkey_sets()) {
+    set_combo_->addItem(builtin_text(QString::fromLatin1(set.id)), QString::fromLatin1(set.id));
+  }
+  if (!user_sets_.empty()) {
+    set_combo_->insertSeparator(set_combo_->count());
+  }
+  for (const auto& set : user_sets_) {
+    set_combo_->addItem(user_set_display_name(set), set.id);
+  }
+  set_combo_->setCurrentIndex(set_combo_->findData(active_set_id_));
+  const bool own_set = find_user_set(active_set_id_) != nullptr;
+  if (rename_set_button_ != nullptr) {
+    rename_set_button_->setEnabled(own_set);
+  }
+  if (delete_set_button_ != nullptr) {
+    delete_set_button_->setEnabled(own_set);
+  }
+  fit_set_combo_width();
+}
+
+// The box keeps clear room around its widest entry, "Custom" included though that entry
+// exists only some of the time, so the box neither looks crammed nor changes width when it
+// comes and goes (GitHub issue 633 follow-up): the style's width for that text (frame, padding,
+// drop arrow) plus four average characters. A long name of the user's own counts up to 32
+// characters; longer ones are elided in the box and shown whole in the open list.
+void HotkeyEditorPanel::fit_set_combo_width() {
+  if (set_combo_ == nullptr) {
+    return;
+  }
+  set_combo_->ensurePolished();
+  const auto metrics = set_combo_->fontMetrics();
+  int widest = metrics.horizontalAdvance(tr("Custom"));
+  for (int index = 0; index < set_combo_->count(); ++index) {
+    const int text = metrics.horizontalAdvance(set_combo_->itemText(index));
+    const bool own_name = find_user_set(set_combo_->itemData(index).toString()) != nullptr;
+    widest = std::max(widest, own_name ? std::min(text, 32 * metrics.averageCharWidth()) : text);
+  }
+  QStyleOptionComboBox option;
+  option.initFrom(set_combo_);
+  option.editable = false;
+  const auto content = QSize(widest + 4 * metrics.averageCharWidth(), metrics.height());
+  const int width = set_combo_->style()->sizeFromContents(QStyle::CT_ComboBox, &option, content, set_combo_).width();
+  set_combo_->setMinimumWidth(std::max(width, set_combo_->minimumSizeHint().width()));
+}
+
+void HotkeyEditorPanel::changeEvent(QEvent* event) {
+  QWidget::changeEvent(event);
+  if (event->type() == QEvent::LanguageChange) {
+    fill_filter_combo();
+    update_search_placeholder();
+    rebuild_set_combo();
+  } else if (event->type() == QEvent::StyleChange || event->type() == QEvent::FontChange) {
+    fit_set_combo_width();
+  }
+}
+
+void HotkeyEditorPanel::sync_set_combo() {
+  note_staged_change();
+  rebuild_set_combo();
+}
+
+void HotkeyEditorPanel::show_transfer_status(const QString& text) {
+  if (transfer_status_ == nullptr) {
+    return;
+  }
+  transfer_status_->setText(text);
+  transfer_status_->setVisible(!text.isEmpty());
+}
+
+QFrame* HotkeyEditorPanel::add_category_panel(const QString& title, bool dimmed) {
+  auto* panel = new QFrame(list_layout_->parentWidget());
+  panel->setProperty("preferencesPanel", true);
+  auto* panel_layout = new QVBoxLayout(panel);
+  panel_layout->setContentsMargins(12, 8, 12, 6);
+  panel_layout->setSpacing(0);
+  auto* header = new QLabel(title, panel);
+  header->setProperty(dimmed ? "hotkeyDim" : "hotkeyCategoryHeader", true);
+  // Breathing room between the section title and its first command row. Must be
+  // stylesheet margin, not widget contentsMargins: stylesheet polish overwrites a
+  // styled label's contents margins with the rule's box values.
+  header->setProperty("hotkeyCategoryGap", true);
+  panel_layout->addWidget(header);
+  list_layout_->addWidget(panel);
+  panel_titles_.insert(panel, title);
+  return panel;
+}
+
+HotkeyEditorPanel::Row& HotkeyEditorPanel::add_command_row(QFrame* panel, const HotkeyCommand* command,
+                                                           const QString& label) {
+  auto* container = new QWidget(panel);
+  container->setObjectName(QStringLiteral("hotkeyRow.") + command->id);
+  container->setProperty("hotkeyRow", true);
+  container->setAttribute(Qt::WA_StyledBackground, true);
+  auto* grid = new QGridLayout(container);
+  // The 8px left inset keeps command names off the row's left edge (the chips
+  // carry their own padding on the right).
+  grid->setContentsMargins(8, 5, 0, 5);
+  grid->setHorizontalSpacing(8);
+  grid->setVerticalSpacing(3);
+
+  auto* name_label = new QLabel(container);
+  name_label->setTextFormat(Qt::RichText);
+  grid->addWidget(name_label, 0, 0);
+  grid->setColumnStretch(0, 1);
+
+  auto* chips_host = new QWidget(container);
+  auto* chips_layout = new QHBoxLayout(chips_host);
+  chips_layout->setContentsMargins(0, 0, 0, 0);
+  chips_layout->setSpacing(6);
+  grid->addWidget(chips_host, 0, 1, Qt::AlignRight | Qt::AlignVCenter);
+
+  auto* reset_button = new QToolButton(container);
+  reset_button->setObjectName(QStringLiteral("hotkeyRowReset.") + command->id);
+  reset_button->setProperty("hotkeyReset", true);
+  reset_button->setText(QStringLiteral("↺"));
+  reset_button->setCursor(Qt::PointingHandCursor);
+  grid->addWidget(reset_button, 0, 2);
+
+  auto* note_label = new QLabel(container);
+  note_label->setObjectName(QStringLiteral("hotkeyRowNote.") + command->id);
+  note_label->setProperty("hotkeyNote", true);
+  note_label->setWordWrap(true);
+  note_label->hide();
+  grid->addWidget(note_label, 1, 0, 1, 3);
+
+  qobject_cast<QVBoxLayout*>(panel->layout())->addWidget(container);
+
+  const auto id = command->id;
+  connect(reset_button, &QToolButton::clicked, this, [this, id] {
+    QTimer::singleShot(0, this, [this, id] {
+      staged_.remove(id);
+      refresh_rows();
+    });
+  });
+
+  // Designated, so a member added to Row later needs no change here (clang and GCC warn
+  // when a positional list stops before a member without a default initializer).
+  rows_.push_back(Row{.command = command,
+                      .container = container,
+                      .name_label = name_label,
+                      .chips_host = chips_host,
+                      .chips_layout = chips_layout,
+                      .reset_button = reset_button,
+                      .note_label = note_label,
+                      .panel = panel,
+                      .label = label});
+  return rows_.back();
+}
+
+void HotkeyEditorPanel::add_built_in_row(QFrame* panel, const QString& keys, const QString& description) {
+  auto* container = new QWidget(panel);
+  container->setProperty("hotkeyRow", true);
+  container->setAttribute(Qt::WA_StyledBackground, true);
+  auto* row_layout = new QHBoxLayout(container);
+  row_layout->setContentsMargins(8, 5, 0, 5);
+  row_layout->setSpacing(8);
+  auto* description_label = new QLabel(description, container);
+  description_label->setProperty("hotkeyDim", true);
+  wrap_if_long(*description_label, description);
+  row_layout->addWidget(description_label, 1);
+  auto* keys_label = new QLabel(keys, container);
+  keys_label->setProperty("hotkeyFixedChip", true);
+  row_layout->addWidget(keys_label, 0, Qt::AlignRight);
+  qobject_cast<QVBoxLayout*>(panel->layout())->addWidget(container);
+
+  rows_.push_back({nullptr, container, description_label, nullptr, nullptr, nullptr, nullptr, panel, description,
+                   (description + QLatin1Char(' ') + keys).toLower(), RowSource::BuiltIn, built_in_key_chords(keys)});
+}
+
+void HotkeyEditorPanel::build_rows(QMenuBar* menu_bar) {
+  QHash<QAction*, const HotkeyCommand*> command_by_action;
+  for (const auto& command : registry_.commands()) {
+    if (command.action != nullptr) {
+      command_by_action.insert(command.action.data(), &command);
+    }
+  }
+
+  struct PendingRow {
+    const HotkeyCommand* command;
+    QString label;
+    QString category;
+    RowSource source;
+  };
+  std::vector<PendingRow> pending;
+  QSet<QString> added;
+
+  const QString path_separator = QStringLiteral(" › ");
+  for_each_menu_bar_command(menu_bar, false, [&](QAction* action, const QString& top, const QStringList& submenus) {
+    const auto* command = command_by_action.value(action);
+    // Script commands sit in File > Scripts only once that menu has been opened; listing
+    // them by category keeps their rows the same whether or not it was.
+    if (command == nullptr || added.contains(command->id) || command->category == QStringLiteral("scripts")) {
+      return;
+    }
+    added.insert(command->id);
+    auto label = strip_menu_ellipsis(clean_action_text(action));
+    if (!submenus.isEmpty()) {
+      label = submenus.join(path_separator) + path_separator + label;
+    }
+    pending.push_back({command, label, top, RowSource::Menu});
+  });
+  for (const auto& command : registry_.commands()) {
+    if (added.contains(command.id) || command.action == nullptr) {
+      continue;
+    }
+    added.insert(command.id);
+    pending.push_back({&command, strip_menu_ellipsis(clean_action_text(command.action.data())),
+                       category_display_name(command.category),
+                       command.category == QStringLiteral("tools") ? RowSource::Tools : RowSource::Other});
+  }
+
+  QFrame* current_panel = nullptr;
+  QString current_category;
+  for (const auto& row : pending) {
+    if (current_panel == nullptr || row.category != current_category) {
+      current_panel = add_category_panel(row.category, false);
+      current_category = row.category;
+    }
+    add_command_row(current_panel, row.command, row.label).source = row.source;
+  }
+
+  auto* built_in_panel = add_category_panel(tr("Built-in canvas keys (not editable)"), true);
+  const std::array<std::pair<QString, QString>, 8> built_ins{{
+      {QStringLiteral("Space"), tr("Pan canvas (hold); while dragging, moves the selection or shape")},
+      {QStringLiteral("0-9"), tr("Set tool or layer opacity, 0% to 100% (1 = 10%, 0 = 100%, 00 = 0%; type two digits quickly for an exact value)")},
+      {QStringLiteral("Arrows / Shift+Arrows"), tr("Nudge layer by 1 px / 10 px")},
+      // With a brush tip that has a direction these two turn it instead (GitHub issue 708);
+      // Up and Down nudge, and so do all four with a plain round tip.
+      {QStringLiteral("Left / Right / Shift+Left / Shift+Right"),
+       tr("Brush tools: turn the brush tip by 1 degree / 15 degrees")},
+      {QStringLiteral("Enter / Esc"), tr("Commit / cancel a transform or text edit")},
+      {QStringLiteral("Delete / Backspace"), tr("Delete selected guides")},
+      // Taken only while each letter is still on its tool (docs/hotkey-sets.md, "Crop keys").
+      {QStringLiteral("O / Shift+O / H"),
+       tr("Crop tool, once the crop box has been changed: next overlay / turn overlay / show or hide the cropped area")},
+      {QStringLiteral("P"),
+       tr("Crop tool, once the crop box has been changed: move the image under the crop box, or the box over the image")},
+  }};
+  for (const auto& [keys, description] : built_ins) {
+    add_built_in_row(built_in_panel, keys, description);
+  }
+}
+
+void HotkeyEditorPanel::refresh_rows() {
+  end_capture_widget();
+  remove_conflict_banner();
+  resolution_ = resolve_hotkey_assignments(registry_.commands(), staged_);
+
+  QHash<QString, QStringList> suppression_notes;
+  for (const auto& suppression : resolution_.suppressions) {
+    suppression_notes[suppression.id] << tr("%1 is assigned to %2.")
+                                             .arg(suppression.sequence.toString(QKeySequence::NativeText),
+                                                  display_label(suppression.winner_id));
+  }
+
+  for (auto& row : rows_) {
+    if (row.command == nullptr) {
+      continue;
+    }
+    const auto& id = row.command->id;
+    const bool modified = staged_.contains(id);
+    const auto escaped_label = row.label.toHtmlEscaped();
+    set_themed_label_text(*row.name_label, modified
+                                ? QStringLiteral("<span style=\"color:@accent_border_bright;\">&#9679;</span> ") + escaped_label
+                                : escaped_label);
+    wrap_if_long(*row.name_label, row.label);
+    row.reset_button->setVisible(modified);
+    const auto default_text = hotkey_shortcuts_to_storage(row.command->default_shortcuts)
+                                  .replace(QLatin1Char('\n'), QStringLiteral(", "));
+    row.reset_button->setToolTip(default_text.isEmpty() ? tr("Reset to default (no shortcut)")
+                                                        : tr("Reset to default (%1)").arg(default_text));
+
+    while (auto* item = row.chips_layout->takeAt(0)) {
+      if (auto* widget = item->widget(); widget != nullptr) {
+        widget->hide();
+        widget->setParent(nullptr);
+        widget->deleteLater();
+      }
+      delete item;
+    }
+
+    const auto effective = resolution_.effective.value(id);
+    QStringList chip_texts;
+    row.key_chords.clear();
+    for (int slot = 0; slot < effective.size(); ++slot) {
+      const auto& sequence = effective.at(slot);
+      const auto native = sequence.toString(QKeySequence::NativeText);
+      chip_texts << native << sequence.toString(QKeySequence::PortableText);
+      append_key_chords(sequence, row.key_chords);
+      auto* chip = new QPushButton(native, row.chips_host);
+      chip->setObjectName(QStringLiteral("hotkeyChip.") + id + QLatin1Char('.') + QString::number(slot));
+      chip->setProperty("hotkeyChip", true);
+      chip->setCursor(Qt::PointingHandCursor);
+      chip->setFocusPolicy(Qt::NoFocus);
+      chip->setToolTip(tr("Click to change this shortcut"));
+      row.chips_layout->addWidget(chip);
+      connect(chip, &QPushButton::clicked, this, [this, id, slot] { begin_capture(id, slot); });
+    }
+    if (effective.isEmpty()) {
+      auto* assign_chip = new QPushButton(tr("Click to assign"), row.chips_host);
+      assign_chip->setObjectName(QStringLiteral("hotkeyAssignChip.") + id);
+      assign_chip->setProperty("hotkeyChip", true);
+      assign_chip->setProperty("hotkeyChipUnbound", true);
+      assign_chip->setCursor(Qt::PointingHandCursor);
+      assign_chip->setFocusPolicy(Qt::NoFocus);
+      row.chips_layout->addWidget(assign_chip);
+      connect(assign_chip, &QPushButton::clicked, this, [this, id] { begin_capture(id, -1); });
+    }
+
+    const auto notes = suppression_notes.value(id);
+    row.note_label->setText(notes.join(QLatin1Char(' ')));
+    row.note_label->setVisible(!notes.isEmpty());
+
+    row.search_haystack = (row.label + QLatin1Char(' ') + panel_titles_.value(row.panel) + QLatin1Char(' ') +
+                           chip_texts.join(QLatin1Char(' ')))
+                              .toLower();
+  }
+
+  filter_rows();
+  sync_set_combo();
+}
+
+void HotkeyEditorPanel::fill_filter_combo() {
+  if (filter_combo_ == nullptr) {
+    return;
+  }
+  const QSignalBlocker blocker(filter_combo_);
+  const auto current = filter_combo_->currentData();
+  filter_combo_->clear();
+  //: Preferences > Hotkeys "Show" box: every command.
+  filter_combo_->addItem(tr("All commands"), static_cast<int>(ListFilter::All));
+  //: Preferences > Hotkeys "Show" box: only the commands found in the menus.
+  filter_combo_->addItem(tr("Menu commands"), static_cast<int>(ListFilter::MenuCommands));
+  //: Preferences > Hotkeys "Show" box: only the commands that have a key.
+  filter_combo_->addItem(tr("Commands with shortcuts"), static_cast<int>(ListFilter::WithShortcuts));
+  filter_combo_->addItem(tr("Tools"), static_cast<int>(ListFilter::Tools));
+  //: Preferences > Hotkeys "Show" box: commands outside the menus that are not tools.
+  filter_combo_->addItem(tr("Other commands"), static_cast<int>(ListFilter::OtherCommands));
+  const int index = current.isValid() ? filter_combo_->findData(current) : 0;
+  filter_combo_->setCurrentIndex(std::max(index, 0));
+}
+
+void HotkeyEditorPanel::update_search_placeholder() {
+  if (search_edit_ == nullptr) {
+    return;
+  }
+  if (list_filter() == ListFilter::WithShortcuts) {
+    //: Preferences > Hotkeys search hint while Show is "Commands with shortcuts": the search
+    //: then looks only at the keys.
+    search_edit_->setPlaceholderText(tr("Search shortcuts..."));
+  } else {
+    search_edit_->setPlaceholderText(tr("Search commands or shortcuts..."));
+  }
+}
+
+HotkeyEditorPanel::ListFilter HotkeyEditorPanel::list_filter() const {
+  if (filter_combo_ == nullptr || filter_combo_->currentIndex() < 0) {
+    return ListFilter::All;
+  }
+  return static_cast<ListFilter>(filter_combo_->currentData().toInt());
+}
+
+// Commands with shortcuts counts the keys the rows show (the resolved ones), so assigning or
+// clearing a key updates the list at once: every edit ends in refresh_rows, which filters.
+bool HotkeyEditorPanel::row_matches_filter(const Row& row, ListFilter filter) const {
+  switch (filter) {
+    case ListFilter::All:
+      return true;
+    case ListFilter::MenuCommands:
+      return row.source == RowSource::Menu;
+    case ListFilter::WithShortcuts:
+      return row.command == nullptr || !resolution_.effective.value(row.command->id).isEmpty();
+    case ListFilter::Tools:
+      return row.command != nullptr && row.command->category == QStringLiteral("tools");
+    case ListFilter::OtherCommands:
+      return row.source == RowSource::Other;
+  }
+  return true;
+}
+
+void HotkeyEditorPanel::filter_rows() {
+  const auto needle = search_edit_ != nullptr ? search_edit_->text().trimmed().toLower() : QString();
+  const auto filter = list_filter();
+  // Commands with shortcuts searches the keys alone (GitHub issue 676 follow-up): "u" lists
+  // Ctrl+U, not Undo.
+  const bool keys_only = filter == ListFilter::WithShortcuts;
+  const auto query_tokens = keys_only ? shortcut_query_tokens(needle) : QStringList();
+  QHash<QFrame*, bool> panel_visible;
+  for (auto& row : rows_) {
+    const bool text_matches = needle.isEmpty() || (keys_only ? key_chords_match(row.key_chords, query_tokens)
+                                                             : row.search_haystack.contains(needle));
+    const bool visible = row_matches_filter(row, filter) && text_matches;
+    row.container->setVisible(visible);
+    panel_visible[row.panel] = panel_visible.value(row.panel, false) || visible;
+  }
+  for (auto it = panel_visible.constBegin(); it != panel_visible.constEnd(); ++it) {
+    it.key()->setVisible(it.value());
+  }
+}
+
+void HotkeyEditorPanel::begin_capture(const QString& id, int slot) {
+  end_capture_widget();
+  remove_conflict_banner();
+  auto* row = find_row(id);
+  if (row == nullptr) {
+    return;
+  }
+  for (int i = 0; i < row->chips_layout->count(); ++i) {
+    if (auto* widget = row->chips_layout->itemAt(i)->widget(); widget != nullptr) {
+      widget->hide();
+    }
+  }
+  capture_ = PendingCapture{id, slot};
+  capture_edit_ = new HotkeyCaptureEdit(tr("Reserved for canvas and dialog use"), row->chips_host);
+  capture_edit_->setPlaceholderText(tr("Press a shortcut..."));
+  capture_edit_->on_commit = [this](QKeySequence sequence) { handle_capture_commit(sequence); };
+  capture_edit_->on_cancel = [this] { handle_capture_cancel(); };
+  capture_edit_->on_clear = [this] { handle_capture_clear(); };
+  row->chips_layout->addWidget(capture_edit_);
+  capture_edit_->show();
+  capture_edit_->setFocus(Qt::MouseFocusReason);
+}
+
+void HotkeyEditorPanel::end_capture_widget() {
+  if (capture_) {
+    if (auto* row = find_row(capture_->id); row != nullptr && row->chips_layout != nullptr) {
+      for (int i = 0; i < row->chips_layout->count(); ++i) {
+        if (auto* widget = row->chips_layout->itemAt(i)->widget(); widget != nullptr && widget != capture_edit_) {
+          widget->show();
+        }
+      }
+    }
+  }
+  capture_.reset();
+  if (capture_edit_ != nullptr) {
+    capture_edit_->hide();
+    capture_edit_->setParent(nullptr);
+    capture_edit_->deleteLater();
+    capture_edit_ = nullptr;
+  }
+}
+
+void HotkeyEditorPanel::handle_capture_commit(QKeySequence sequence) {
+  QTimer::singleShot(0, this, [this, sequence] {
+    if (!capture_) {
+      return;
+    }
+    const auto pending = *capture_;
+    end_capture_widget();
+    QString owner_id;
+    for (auto it = resolution_.effective.constBegin(); it != resolution_.effective.constEnd(); ++it) {
+      if (it.key() != pending.id && it.value().contains(sequence)) {
+        owner_id = it.key();
+        break;
+      }
+    }
+    if (owner_id.isEmpty()) {
+      assign_sequence(pending.id, pending.slot, sequence);
+      refresh_rows();
+      return;
+    }
+    if (auto* row = find_row(pending.id); row != nullptr) {
+      show_conflict_banner(*row, pending.id, pending.slot, sequence, owner_id);
+    }
+  });
+}
+
+void HotkeyEditorPanel::handle_capture_cancel() {
+  QTimer::singleShot(0, this, [this] {
+    if (!capture_) {
+      return;
+    }
+    end_capture_widget();
+  });
+}
+
+void HotkeyEditorPanel::handle_capture_clear() {
+  QTimer::singleShot(0, this, [this] {
+    if (!capture_) {
+      return;
+    }
+    const auto pending = *capture_;
+    end_capture_widget();
+    auto shortcuts = resolution_.effective.value(pending.id);
+    if (pending.slot >= 0 && pending.slot < shortcuts.size()) {
+      shortcuts.removeAt(pending.slot);
+    }
+    stage_override(pending.id, shortcuts);
+    refresh_rows();
+  });
+}
+
+void HotkeyEditorPanel::assign_sequence(const QString& id, int slot, const QKeySequence& sequence) {
+  const auto current = resolution_.effective.value(id);
+  QList<QKeySequence> result;
+  const int replace_at = (slot >= 0 && slot < current.size()) ? slot : current.size();
+  for (int i = 0; i < current.size(); ++i) {
+    if (i == replace_at) {
+      result << sequence;
+    } else if (current.at(i) != sequence) {
+      result << current.at(i);
+    }
+  }
+  if (replace_at == current.size()) {
+    result << sequence;
+  }
+  stage_override(id, result);
+}
+
+void HotkeyEditorPanel::show_conflict_banner(Row& row, const QString& id, int slot, const QKeySequence& sequence,
+                                             const QString& owner_id) {
+  remove_conflict_banner();
+  conflict_banner_ = new QFrame(row.container);
+  conflict_banner_->setObjectName(QStringLiteral("hotkeyConflictBanner"));
+  auto* banner_layout = new QHBoxLayout(conflict_banner_);
+  banner_layout->setContentsMargins(8, 5, 8, 5);
+  banner_layout->setSpacing(8);
+  auto* message = new QLabel(tr("%1 is already used by %2.")
+                                 .arg(sequence.toString(QKeySequence::NativeText), display_label(owner_id)),
+                             conflict_banner_);
+  message->setWordWrap(true);
+  banner_layout->addWidget(message, 1);
+  auto* assign_button = new QPushButton(tr("Use here instead"), conflict_banner_);
+  assign_button->setObjectName(QStringLiteral("hotkeyConflictAssignButton"));
+  banner_layout->addWidget(assign_button);
+  auto* cancel_button = new QPushButton(tr("Cancel"), conflict_banner_);
+  cancel_button->setObjectName(QStringLiteral("hotkeyConflictCancelButton"));
+  banner_layout->addWidget(cancel_button);
+  if (auto* grid = qobject_cast<QGridLayout*>(row.container->layout()); grid != nullptr) {
+    grid->addWidget(conflict_banner_, 2, 0, 1, 3);
+  }
+
+  connect(assign_button, &QPushButton::clicked, this, [this, id, slot, sequence, owner_id] {
+    QTimer::singleShot(0, this, [this, id, slot, sequence, owner_id] {
+      if (auto it = staged_.find(owner_id); it != staged_.end()) {
+        it->removeAll(sequence);
+        stage_override(owner_id, *it);
+      }
+      assign_sequence(id, slot, sequence);
+      refresh_rows();
+    });
+  });
+  connect(cancel_button, &QPushButton::clicked, this, [this] {
+    QTimer::singleShot(0, this, [this] { remove_conflict_banner(); });
+  });
+}
+
+void HotkeyEditorPanel::remove_conflict_banner() {
+  if (conflict_banner_ != nullptr) {
+    conflict_banner_->hide();
+    conflict_banner_->setParent(nullptr);
+    conflict_banner_->deleteLater();
+    conflict_banner_ = nullptr;
+  }
+}
+
+void HotkeyEditorPanel::stage_override(const QString& id, QList<QKeySequence> shortcuts) {
+  const auto* command = registry_.find_command(id);
+  if (command != nullptr && hotkey_shortcut_lists_equivalent(shortcuts, command->default_shortcuts)) {
+    staged_.remove(id);
+  } else {
+    staged_.insert(id, std::move(shortcuts));
+  }
+}
+
+HotkeyEditorPanel::Row* HotkeyEditorPanel::find_row(const QString& id) {
+  for (auto& row : rows_) {
+    if (row.command != nullptr && row.command->id == id) {
+      return &row;
+    }
+  }
+  return nullptr;
+}
+
+QString HotkeyEditorPanel::display_label(const QString& id) const {
+  for (const auto& row : rows_) {
+    if (row.command != nullptr && row.command->id == id) {
+      return row.label;
+    }
+  }
+  return id;
+}
+
+QString HotkeyEditorPanel::category_display_name(const QString& category_key) const {
+  if (category_key == QStringLiteral("tools")) {
+    return tr("Tools");
+  }
+  if (category_key == QStringLiteral("color")) {
+    return tr("Color");
+  }
+  if (category_key == QStringLiteral("brush")) {
+    return tr("Brush");
+  }
+  if (category_key == QStringLiteral("channels")) {
+    return tr("Channels");
+  }
+  if (category_key == QStringLiteral("scripts")) {
+    return tr("Scripts");
+  }
+  return tr("Other");
+}
+
+void HotkeyEditorPanel::set_search_text(const QString& text) {
+  if (search_edit_ != nullptr) {
+    search_edit_->setText(text);
+  }
+}
+
+}  // namespace patchy::ui

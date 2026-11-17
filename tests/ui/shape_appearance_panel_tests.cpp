@@ -1,0 +1,1304 @@
+// The stay-open Shape Appearance window (GitHub issue 694, docs/vector-tools-appearance-window.md):
+// it opens without a dialog loop or the edit lock, applies each change at once as one undo
+// step per gesture, follows the selected shape layers, and stays safe while the selection,
+// the history and the documents change under it. Its Show handles boxes put the Gradient
+// tool's handles on the canvas under the other tools, for the fill's gradient or the
+// stroke's (docs/gradients-fill-handles.md).
+#include "core/vector_raster.hpp"
+#include "core/vector_shape.hpp"
+#include "ui/app_settings.hpp"
+#include "ui/canvas_widget.hpp"
+#include "ui/color_panel.hpp"
+#include "ui/main_window.hpp"
+#include "ui/theme_file.hpp"
+#include "ui/theme_manager.hpp"
+#include "ui/theme_palette.hpp"
+#include "test_harness.hpp"
+#include "ui_test_access.hpp"
+#include "ui_test_groups.hpp"
+#include "ui_test_support.hpp"
+
+#include <QAction>
+#include <QApplication>
+#include <QCheckBox>
+#include <QComboBox>
+#include <QDialog>
+#include <QDialogButtonBox>
+#include <QDoubleSpinBox>
+#include <QElapsedTimer>
+#include <QGroupBox>
+#include <QImage>
+#include <QLabel>
+#include <QLayout>
+#include <QLineF>
+#include <QPainter>
+#include <QPointer>
+#include <QPushButton>
+#include <QScrollArea>
+#include <QScrollBar>
+#include <QSpinBox>
+#include <QTest>
+#include <QTimer>
+#include <QToolButton>
+#include <QWindow>
+
+#include <algorithm>
+#include <array>
+#include <cmath>
+#include <cstdio>
+#include <optional>
+#include <string>
+#include <utility>
+#include <vector>
+
+using namespace patchy::test::ui;
+
+namespace {
+
+using Access = patchy::ui::MainWindowTestAccess;
+using patchy::VectorFillKind;
+
+patchy::LayerId make_rect(patchy::ui::MainWindow& window, patchy::ui::CanvasWidget& canvas, QPoint from, QPoint to) {
+  canvas.set_tool(patchy::ui::CanvasTool::Rectangle);
+  auto* radius_spin = window.findChild<QSpinBox*>(QStringLiteral("shapeCornerRadiusSpin"));
+  CHECK(radius_spin != nullptr);
+  radius_spin->setValue(0);
+  drag(canvas, canvas.widget_position_for_document_point(from), canvas.widget_position_for_document_point(to));
+  QApplication::processEvents();
+  const auto active = Access::document(window).active_layer_id();
+  CHECK(active.has_value());
+  return *active;
+}
+
+const patchy::VectorShapeContent& shape_of(const patchy::Document& document, patchy::LayerId id) {
+  const auto* layer = document.find_layer(id);
+  CHECK(layer != nullptr && layer->vector_shape() != nullptr);
+  return *layer->vector_shape();
+}
+
+QDialog* panel_window(patchy::ui::MainWindow& window) {
+  return window.findChild<QDialog*>(QStringLiteral("shapeAppearanceWindow"));
+}
+
+// The window's current page; a replaced page leaves the window at once.
+QWidget* page_of(QDialog& panel) {
+  return panel.findChild<QWidget*>(QStringLiteral("shapeAppearanceBody"));
+}
+
+template <typename Widget>
+Widget* field(QDialog& panel, const char* name) {
+  auto* widget = panel.findChild<Widget*>(QLatin1String(name));
+  CHECK(widget != nullptr);
+  return widget;
+}
+
+QDialog* open_panel(patchy::ui::MainWindow& window) {
+  Access::open_shape_appearance_window(window);
+  QApplication::processEvents();
+  auto* panel = panel_window(window);
+  CHECK(panel != nullptr && panel->isVisible());
+  return panel;
+}
+
+bool panel_usable(QDialog& panel) {
+  auto* page = page_of(panel);
+  auto* reason = panel.findChild<QLabel*>(QStringLiteral("brushToolWindowUnavailableLabel"));
+  return page != nullptr && page->isEnabled() && reason != nullptr && reason->isHidden();
+}
+
+QString panel_reason(QDialog& panel) {
+  auto* reason = panel.findChild<QLabel*>(QStringLiteral("brushToolWindowUnavailableLabel"));
+  return reason != nullptr && !reason->isHidden() ? reason->text() : QString();
+}
+
+void select_only(patchy::ui::MainWindow& window, patchy::LayerId id) {
+  Access::select_layers(window, {id}, id);
+  QApplication::processEvents();
+}
+
+// Where the window's button row sits: `below` is the room under Close down to the window's
+// bottom edge, `above` the room between the lowest visible group box and Close.
+struct ButtonRowRoom {
+  int below{-1};
+  int above{-1};
+  int grip_below{-1};
+  int grip_right{-1};
+  bool grip_clear_of_buttons{false};
+  int note_room{0};  // the height kept for the Density note while it is hidden
+  bool scrolls{false};  // the page is taller than the screen lets the window be
+};
+ButtonRowRoom button_row_room(QDialog& panel) {
+  ButtonRowRoom room;
+  auto* page = page_of(panel);
+  auto* buttons = page != nullptr ? page->findChild<QDialogButtonBox*>() : nullptr;
+  auto* close = buttons != nullptr ? buttons->button(QDialogButtonBox::Close) : nullptr;
+  CHECK(page != nullptr && close != nullptr);
+  if (page == nullptr || close == nullptr) {
+    return room;
+  }
+  panel.layout()->activate();
+  QApplication::processEvents();
+  room.below = panel.height() - close->mapTo(&panel, QPoint(0, close->height())).y();
+  int content_bottom = 0;
+  for (auto* group : page->findChildren<QGroupBox*>()) {
+    if (group->isVisibleTo(page)) {
+      content_bottom = std::max(content_bottom, group->mapTo(&panel, QPoint(0, group->height())).y());
+    }
+  }
+  room.above = close->mapTo(&panel, QPoint(0, 0)).y() - content_bottom;
+  if (auto* grip = panel.findChild<QWidget*>(QStringLiteral("brushToolWindowSizeGrip")); grip != nullptr) {
+    const QRect grip_rect(grip->mapTo(&panel, QPoint(0, 0)), grip->size());
+    room.grip_below = panel.height() - grip_rect.bottom() - 1;
+    room.grip_right = panel.width() - grip_rect.right() - 1;
+    room.grip_clear_of_buttons = grip->isVisible();
+    for (auto* button : page->findChildren<QPushButton*>()) {
+      if (button->isVisibleTo(&panel) &&
+          QRect(button->mapTo(&panel, QPoint(0, 0)), button->size()).intersects(grip_rect)) {
+        room.grip_clear_of_buttons = false;
+      }
+    }
+  }
+  if (auto* note = page->findChild<QLabel*>(QStringLiteral("shapeDensityNote")); note != nullptr && note->isHidden()) {
+    room.note_room = note->minimumHeight() + 12;
+  }
+  if (auto* scroll = page->findChild<QScrollArea*>(QStringLiteral("shapeAppearanceScroll")); scroll != nullptr) {
+    room.scrolls = scroll->verticalScrollBar()->maximum() > 0;
+  }
+  return room;
+}
+
+// The stay-open window ends with its button row (Seth, November 13, 2026: Reset and Close
+// floated well above the bottom edge, over a size grip row of their own). Close sits the
+// window's normal margin above the bottom edge, with the size grip in the window's corner
+// clear of the buttons, for every page the window shows: solid, gradient and pattern fills,
+// a stroke with each paint, No Fill, and the other shape kinds. The window opens at the
+// height its page needs (the room kept for the hidden Density note is part of the page).
+// Height the user adds goes above the row, and a size the user chose is kept.
+void ui_shape_appearance_window_ends_with_its_button_row() {
+  for (const auto scheme : {patchy::ui::ColorSchemePreference::Dark, patchy::ui::ColorSchemePreference::Light}) {
+    ColorSchemeRestorer restore_scheme(scheme);
+    const bool light = scheme == patchy::ui::ColorSchemePreference::Light;
+    VectorSettingsGuard settings_guard;
+    SettingsValueRestorer size_setting{QStringLiteral("shapeAppearance/windowSize")};
+    SettingsValueRestorer sized_setting{QStringLiteral("shapeAppearance/windowUserSized")};
+    SettingsValueRestorer open_setting{QStringLiteral("shapeAppearance/windowOpen")};
+    patchy::ui::app_settings().remove(QStringLiteral("shapeAppearance/windowSize"));
+    patchy::ui::app_settings().remove(QStringLiteral("shapeAppearance/windowUserSized"));
+    auto&& [window, canvas] = ShownWindowFixture{};
+    auto& document = Access::document(window);
+    const auto rect = make_rect(window, *canvas, QPoint(100, 100), QPoint(300, 220));
+    auto* panel = open_panel(window);
+    if (panel == nullptr) {
+      continue;
+    }
+    // The room every page must keep: Close the chrome's margin above the bottom edge, the
+    // grip in the same corner, no grip row under the page.
+    int margin = -1;
+    const auto check_row = [&](const char* what, bool fitted) {
+      const auto room = button_row_room(*panel);
+      std::printf("  %s %-28s window %d x %d: %d px under Close, %d px above it, grip %d / %d px from the corner\n",
+                  light ? "light" : "dark", what, panel->width(), panel->height(), room.below, room.above,
+                  room.grip_below, room.grip_right);
+      if (margin < 0) {
+        margin = room.below;
+      }
+      CHECK(room.below >= 8 && room.below <= 16);
+      CHECK(room.below == margin);  // the same on every page
+      // The grip: in the corner, inside the margin, touching no button.
+      CHECK(room.grip_below >= 2 && room.grip_below <= 6 && room.grip_right >= 2 && room.grip_right <= 6);
+      CHECK(room.grip_clear_of_buttons);
+      if (fitted && !room.scrolls) {
+        // A window at its page's height has no blank band over the row beyond the room the
+        // hidden Density note keeps. (A page taller than the screen scrolls instead.)
+        CHECK(room.above >= 0 && room.above <= 16 + room.note_room);
+      }
+      return room;
+    };
+    const auto reopen = [&] {
+      page_of(*panel)->findChild<QDialogButtonBox*>()->button(QDialogButtonBox::Close)->click();
+      QApplication::processEvents();
+      CHECK(!panel->isVisible());
+      panel = open_panel(window);
+    };
+    check_row("solid fill", true);
+    // The issue shots are taken in Dark only: a window opened after the scheme changed within
+    // one test process keeps some of the first scheme's colors, which the capture check
+    // (rightly) refuses. The layout checks below run in both schemes.
+    if (!light) {
+      save_widget_artifact("issue_716_shape_appearance_window_dark", *panel);
+    }
+    const int solid_height = panel->height();
+
+    // Pages with more rows grow the window; the row stays at the bottom.
+    auto* fill_kind = field<QComboBox>(*panel, "shapeFillKindCombo");
+    fill_kind->setCurrentIndex(fill_kind->findData(static_cast<int>(VectorFillKind::Gradient)));
+    QApplication::processEvents();
+    check_row("gradient fill", false);
+    fill_kind->setCurrentIndex(fill_kind->findData(static_cast<int>(VectorFillKind::Pattern)));
+    QApplication::processEvents();
+    check_row("pattern fill", false);
+    field<QDoubleSpinBox>(*panel, "shapeStrokeWidthSpin")->setValue(6.0);
+    QApplication::processEvents();
+    check_row("pattern fill, stroke", false);
+    auto* stroke_paint = field<QComboBox>(*panel, "shapeStrokePaintCombo");
+    stroke_paint->setCurrentIndex(stroke_paint->findData(static_cast<int>(VectorFillKind::Gradient)));
+    QApplication::processEvents();
+    check_row("gradient stroke", false);
+    stroke_paint->setCurrentIndex(stroke_paint->findData(static_cast<int>(VectorFillKind::Pattern)));
+    QApplication::processEvents();
+    check_row("pattern stroke", false);
+    const int tall_height = panel->height();
+    CHECK(tall_height > solid_height);
+    // Opened again on this tall page, the window is as tall as the page needs now, not as
+    // tall as the page was when it was built.
+    reopen();
+    check_row("pattern fill and stroke, reopened", true);
+    CHECK(panel->height() == tall_height);
+
+    // The dialog keeps No Fill (the bar's Fill menu does not): the shape then draws its
+    // stroke alone.
+    fill_kind = field<QComboBox>(*panel, "shapeFillKindCombo");
+    CHECK(fill_kind->findData(static_cast<int>(VectorFillKind::None)) >= 0);
+    fill_kind->setCurrentIndex(fill_kind->findData(static_cast<int>(VectorFillKind::None)));
+    QApplication::processEvents();
+    CHECK(shape_of(document, rect).fill.kind == VectorFillKind::None);
+    check_row("no fill", false);
+
+    // The other shape kinds bring their own Geometry rows.
+    canvas->set_tool(patchy::ui::CanvasTool::Ellipse);
+    drag(*canvas, canvas->widget_position_for_document_point(QPoint(350, 100)),
+         canvas->widget_position_for_document_point(QPoint(450, 180)));
+    QApplication::processEvents();
+    panel = panel_window(window);
+    check_row("ellipse", false);
+    canvas->set_tool(patchy::ui::CanvasTool::Line);
+    drag(*canvas, canvas->widget_position_for_document_point(QPoint(100, 300)),
+         canvas->widget_position_for_document_point(QPoint(300, 340)));
+    QApplication::processEvents();
+    check_row("line", false);
+    canvas->set_tool(patchy::ui::CanvasTool::Polygon);
+    drag(*canvas, canvas->widget_position_for_document_point(QPoint(450, 330)),
+         canvas->widget_position_for_document_point(QPoint(500, 330)));
+    QApplication::processEvents();
+    check_row("polygon", false);
+
+    // Back on a short page: closed and opened again the window shrinks to it (nobody sized
+    // it), and the row has no blank band over it.
+    const auto simple = make_rect(window, *canvas, QPoint(560, 80), QPoint(640, 140));
+    static_cast<void>(simple);
+    check_row("a second rectangle", false);
+    // Reset gives it the factory look: a solid fill and no stroke, the shortest page.
+    if (auto* reset = page_of(*panel)->findChild<QPushButton*>(QStringLiteral("shapeAppearanceResetButton"))) {
+      reset->click();
+      QApplication::processEvents();
+    }
+    reopen();
+    const auto fitted = check_row("a second rectangle, reopened", true);
+    CHECK(panel->height() < tall_height);
+    CHECK(!patchy::ui::app_settings().value(QStringLiteral("shapeAppearance/windowUserSized"), false).toBool());
+
+    // Height the user adds goes above the button row, never under it, and the size stays
+    // through a close and the next opening.
+    const QSize dragged(panel->width() + 40, panel->height() + 120);
+    panel->resize(dragged);
+    QApplication::processEvents();
+    const auto roomy = check_row("made 120 px taller", false);
+    CHECK(roomy.above >= fitted.above + 110);
+    if (!light) {
+      save_widget_artifact("issue_716_shape_appearance_window_taller_dark", *panel);
+    }
+    reopen();
+    CHECK(panel->size() == dragged);
+    CHECK(patchy::ui::app_settings().value(QStringLiteral("shapeAppearance/windowUserSized"), false).toBool());
+    check_row("the user's size, reopened", false);
+    page_of(*panel)->findChild<QDialogButtonBox*>()->button(QDialogButtonBox::Close)->click();
+    QApplication::processEvents();
+  }
+}
+
+// The chain buttons of the Geometry and Radius sections (GitHub issue 723). In the stay-open
+// window each is a 24 px button with its own frame, whole inside its bracket, centered
+// between the rows it ties with the bracket's ends showing past it, in Dark, Light and a
+// bundled theme. Their style rule used to name the modal dialog, so in the window the
+// buttons fell back to the app's tool button look: no frame, a 34 px box the bracket cut
+// off on the right and that hung below its middle, and the accent block when checked.
+void ui_shape_appearance_window_link_buttons_sit_on_their_brackets() {
+  struct LinkTheme {
+    const char* label;
+    patchy::ui::ColorSchemePreference scheme;
+    const char* bundled;  // a bundled theme's file name, or null for the plain scheme
+  };
+  constexpr std::array<LinkTheme, 3> themes{{
+      {"dark", patchy::ui::ColorSchemePreference::Dark, nullptr},
+      {"light", patchy::ui::ColorSchemePreference::Light, nullptr},
+      {"medium_gray", patchy::ui::ColorSchemePreference::Dark, "medium-gray.patchytheme"},
+  }};
+  const auto near_color = [](const QColor& got, const QColor& want) {
+    return std::abs(got.red() - want.red()) <= 8 && std::abs(got.green() - want.green()) <= 8 &&
+           std::abs(got.blue() - want.blue()) <= 8;
+  };
+  const auto hex = [](const QColor& color) { return color.name().toStdString(); };
+  auto& manager = patchy::ui::ThemeManager::instance();
+  ColorSchemeRestorer restore_scheme;
+  // Declared after the scheme's restorer, so the bundled theme goes first, whatever ends the test.
+  struct ClearCustomTheme {
+    ~ClearCustomTheme() { patchy::ui::ThemeManager::instance().clear_custom_theme(/*persist=*/false); }
+  } clear_custom_theme;
+  for (const auto& link_theme : themes) {
+    manager.clear_custom_theme(/*persist=*/false);
+    ColorSchemeRestorer::apply(link_theme.scheme);
+    if (link_theme.bundled != nullptr) {
+      const QString id = patchy::ui::kBundledThemeIdPrefix + QString::fromLatin1(link_theme.bundled);
+      const auto loaded = patchy::ui::load_theme_by_id(id);
+      CHECK(loaded.theme.has_value());
+      if (loaded.theme) {
+        manager.set_custom_theme(id, *loaded.theme, /*persist=*/false);
+      }
+    }
+    QApplication::processEvents();
+
+    VectorSettingsGuard settings_guard;
+    SettingsValueRestorer size_setting{QStringLiteral("shapeAppearance/windowSize")};
+    SettingsValueRestorer sized_setting{QStringLiteral("shapeAppearance/windowUserSized")};
+    SettingsValueRestorer open_setting{QStringLiteral("shapeAppearance/windowOpen")};
+    patchy::ui::app_settings().remove(QStringLiteral("shapeAppearance/windowSize"));
+    patchy::ui::app_settings().remove(QStringLiteral("shapeAppearance/windowUserSized"));
+    auto&& [window, canvas] = ShownWindowFixture{};
+    make_rect(window, *canvas, QPoint(100, 100), QPoint(300, 220));
+    auto* panel = open_panel(window);
+    if (panel == nullptr) {
+      continue;
+    }
+    struct Link {
+      const char* what;
+      const char* button;
+      const char* bracket;
+      const char* first_row;
+      const char* last_row;
+    };
+    constexpr std::array<Link, 2> links{{
+        {"Width / Height", "shapeGeometryLinkButton", "shapeGeometryLinkBracket", "shapeGeometryWidthSpin",
+         "shapeGeometryHeightSpin"},
+        {"Radius", "shapeGeometryRadiusLinkButton", "shapeGeometryRadiusLinkBracket",
+         "shapeGeometryRadiusTopLeftSpin", "shapeGeometryRadiusBottomLeftSpin"},
+    }};
+    const auto in_panel = [panel](const QWidget& widget) {
+      return QRect(widget.mapTo(panel, QPoint(0, 0)), widget.size());
+    };
+    // Both states first, saved side by side, then the checks: a failure still leaves its picture
+    // and the line of every button (the checks record a failure and go on).
+    QRect shot_rect;
+    std::array<QImage, 2> shots;  // unlinked, linked
+    for (const bool linked : {false, true}) {
+      for (const auto& link : links) {
+        field<QToolButton>(*panel, link.button)->setChecked(linked);
+      }
+      panel->layout()->activate();
+      QApplication::processEvents();
+      const auto image = panel->grab().toImage();
+      const auto& palette = patchy::ui::theme();
+      for (const auto& link : links) {
+        auto* button = field<QToolButton>(*panel, link.button);
+        auto* bracket = field<QWidget>(*panel, link.bracket);
+        auto* first_row = field<QDoubleSpinBox>(*panel, link.first_row);
+        auto* last_row = field<QDoubleSpinBox>(*panel, link.last_row);
+        const auto button_rect = in_panel(*button);
+        const auto bracket_rect = in_panel(*bracket);
+        const double first_middle = in_panel(*first_row).top() + first_row->height() / 2.0;
+        const double last_middle = in_panel(*last_row).top() + last_row->height() / 2.0;
+        const double button_middle = button_rect.top() + button_rect.height() / 2.0;
+        const QColor frame = image.pixelColor(button_rect.left(), button_rect.top() + button_rect.height() / 2);
+        const QColor face = image.pixelColor(button_rect.left() + 2, button_rect.top() + 6);
+        const QColor want_frame = linked ? palette.dlg_focus_border : palette.dlg_button_border;
+        const QColor want_face = linked ? palette.dlg_anchor_active_bg : palette.dlg_button_bg;
+        std::printf("  %-11s %-14s %s: button %d x %d at y %d to %d, rows' middles %.1f and %.1f, bracket x %d to %d, "
+                    "frame %s (want %s), face %s (want %s)\n",
+                    link_theme.label, link.what, linked ? "linked  " : "unlinked", button_rect.width(),
+                    button_rect.height(), button_rect.top(), button_rect.bottom(), first_middle, last_middle,
+                    bracket_rect.left(), bracket_rect.right(), hex(frame).c_str(), hex(want_frame).c_str(),
+                    hex(face).c_str(), hex(want_face).c_str());
+        const auto expect = [&](bool ok, const char* rule) {
+          if (!ok) {
+            patchy::test::report_failure(std::string(link_theme.label) + ", " + link.what +
+                                         (linked ? ", linked: " : ", unlinked: ") + rule);
+          }
+        };
+        expect(button_rect.size() == QSize(24, 24), "the button is 24 x 24");
+        expect(bracket_rect.contains(button_rect), "the bracket cuts none of the button off");
+        expect(std::abs(button_middle - (first_middle + last_middle) / 2.0) <= 1.5,
+               "the button is centered between the rows the bracket ties");
+        expect(first_middle < button_rect.top() && button_rect.bottom() < last_middle,
+               "the bracket's ends show past the button");
+        expect(near_color(frame, want_frame), "the button has its own frame, from the dialog roles");
+        expect(near_color(face, want_face), "the button has its own face, from the dialog roles");
+        // The bracket draws its lines on the section, with no fill of its own (Light showed a
+        // paler strip behind it).
+        expect(image.pixelColor(bracket_rect.left() + 1, bracket_rect.top() + 1) ==
+                   image.pixelColor(bracket_rect.left() - 2, bracket_rect.top() + 1),
+               "the bracket has no background of its own");
+        if (auto* group = bracket->parentWidget(); group != nullptr) {
+          shot_rect = shot_rect.united(in_panel(*group));
+        }
+      }
+      shots[linked ? 1 : 0] = image;
+    }
+    // The two sections, unlinked beside linked.
+    const auto mismatch = capture_theme_mismatch(*panel);
+    if (!mismatch.isEmpty()) {
+      patchy::test::report_failure(std::string(link_theme.label) +
+                                   ": the window is not themed whole: " + mismatch.toStdString());
+    }
+    shot_rect = shot_rect.adjusted(-6, -6, 6, 6).intersected(panel->rect());
+    if (!shot_rect.isEmpty() && !shots[0].isNull() && !shots[1].isNull()) {
+      QImage sheet(shot_rect.width() * 2, shot_rect.height(), QImage::Format_RGB32);
+      QPainter painter(&sheet);
+      painter.drawImage(QPoint(0, 0), shots[0], shot_rect);
+      painter.drawImage(QPoint(shot_rect.width(), 0), shots[1], shot_rect);
+      painter.end();
+      save_image_artifact(std::string("issue_723_link_buttons_") + link_theme.label, sheet);
+    }
+    page_of(*panel)->findChild<QDialogButtonBox*>()->button(QDialogButtonBox::Close)->click();
+    QApplication::processEvents();
+  }
+}
+
+// Every entry point opens the window and returns: the document is not locked, a second
+// shape can be drawn with it open, and the window then edits that one.
+void ui_shape_appearance_window_stays_open_while_editing() {
+  VectorSettingsGuard settings_guard;
+  // With nothing saved, gradient handles are on (checked below).
+  SettingsValueRestorer handles_setting{QStringLiteral("shapeAppearance/showGradientHandles")};
+  SettingsValueRestorer handles_stroke_setting{QStringLiteral("shapeAppearance/gradientHandlesOnStroke")};
+  patchy::ui::app_settings().remove(QStringLiteral("shapeAppearance/showGradientHandles"));
+  patchy::ui::app_settings().remove(QStringLiteral("shapeAppearance/gradientHandlesOnStroke"));
+  auto&& [window, canvas] = ShownWindowFixture{};
+  auto& document = Access::document(window);
+  const auto first = make_rect(window, *canvas, QPoint(100, 100), QPoint(300, 220));
+
+  require_action(window, "layerShapeAppearanceAction")->trigger();
+  QApplication::processEvents();
+  auto* panel = panel_window(window);
+  CHECK(panel != nullptr && panel->isVisible());
+  if (panel == nullptr) return;
+  // No modal dialog and no edit lock.
+  CHECK(find_top_level_dialog(QStringLiteral("shapeAppearanceDialog")) == nullptr);
+  CHECK(require_action_by_text(window, QStringLiteral("Undo"))->isEnabled());
+  CHECK(panel_usable(*panel));
+  CHECK(panel->windowTitle() == QStringLiteral("Shape Appearance"));
+  // Close and Reset; no OK, Cancel or Preview.
+  CHECK(panel->findChild<QCheckBox*>(QStringLiteral("shapeAppearancePreviewCheck")) == nullptr);
+  auto* buttons = page_of(*panel)->findChild<QDialogButtonBox*>();
+  CHECK(buttons != nullptr);
+  CHECK(buttons->button(QDialogButtonBox::Ok) == nullptr && buttons->button(QDialogButtonBox::Cancel) == nullptr);
+  CHECK(buttons->button(QDialogButtonBox::Close) != nullptr);
+  CHECK(panel->findChild<QPushButton*>(QStringLiteral("shapeAppearanceResetButton")) != nullptr);
+  // Gradient handles are on by default and the canvas is told at once. This shape is solid:
+  // the Show handles boxes sit in the Gradient rows, which are hidden, and nothing shows.
+  auto* handles_box = panel->findChild<QCheckBox*>(QStringLiteral("shapeFillGradientHandlesCheck"));
+  CHECK(handles_box != nullptr && !handles_box->isVisibleTo(panel) && !handles_box->isChecked());
+  CHECK(canvas->gradient_handles_forced());
+  CHECK(!canvas->gradient_fill_handles().has_value());
+  // Once the fill is a gradient its box shows, ticked, and the handles are on the canvas.
+  {
+    auto* fill_kind = field<QComboBox>(*panel, "shapeFillKindCombo");
+    fill_kind->setCurrentIndex(fill_kind->findData(static_cast<int>(VectorFillKind::Gradient)));
+    CHECK(handles_box->isVisibleTo(panel) && handles_box->isChecked());
+    CHECK(canvas->gradient_fill_handles().has_value());
+    fill_kind->setCurrentIndex(fill_kind->findData(static_cast<int>(VectorFillKind::Solid)));
+    CHECK(!handles_box->isChecked());
+    CHECK(!canvas->gradient_fill_handles().has_value());
+  }
+
+  // Draw a second shape with the window open: it becomes the window's target.
+  const auto second = make_rect(window, *canvas, QPoint(335, 250), QPoint(420, 300));
+  CHECK(second != first);
+  QApplication::processEvents();
+  CHECK(panel_usable(*panel));
+  field<QDoubleSpinBox>(*panel, "shapeStrokeWidthSpin")->setValue(4.0);
+  CHECK(shape_of(document, second).stroke.enabled);
+  CHECK(!shape_of(document, first).stroke.enabled);
+
+  // The other entry points bring the same window forward.
+  require_action(window, "toolRectAction")->trigger();
+  QApplication::processEvents();
+  auto* appearance_button = window.findChild<QToolButton*>(QStringLiteral("vectorAppearanceButton"));
+  CHECK(appearance_button != nullptr && appearance_button->isEnabled());
+  appearance_button->click();
+  QApplication::processEvents();
+  CHECK(panel_window(window) == panel && panel->isVisible());
+  require_action(window, "toolPathSelectAction")->trigger();
+  QApplication::processEvents();
+  send_double_click(*canvas, canvas->widget_position_for_document_point(QPoint(370, 270)));
+  QApplication::processEvents();
+  CHECK(panel_window(window) == panel && panel->isVisible());
+
+  // Close hides it; the command shows it again.
+  page_of(*panel)->findChild<QDialogButtonBox*>()->button(QDialogButtonBox::Close)->click();
+  QApplication::processEvents();
+  CHECK(!panel->isVisible());
+  require_action(window, "layerShapeAppearanceAction")->trigger();
+  QApplication::processEvents();
+  CHECK(panel->isVisible() && panel_usable(*panel));
+  save_widget_artifact("issue694_shape_appearance_window", *panel);
+}
+
+// A change applies at once. The values of one gesture share one undo step; another
+// property starts the next; Undo steps back and the fields follow.
+void ui_shape_appearance_window_records_one_undo_step_per_gesture() {
+  VectorSettingsGuard settings_guard;
+  auto&& [window, canvas] = ShownWindowFixture{};
+  auto& document = Access::document(window);
+  const auto id = make_rect(window, *canvas, QPoint(100, 100), QPoint(300, 220));
+  auto* panel = open_panel(window);
+  if (panel == nullptr) return;
+  const auto depth = Access::active_session_undo_depth(window);
+
+  auto* width = field<QDoubleSpinBox>(*panel, "shapeStrokeWidthSpin");
+  CHECK(width->value() == 0.0);
+  width->setValue(4.0);
+  CHECK(shape_of(document, id).stroke.enabled);
+  CHECK(std::abs(shape_of(document, id).stroke.width - 4.0) < 1e-9);
+  CHECK(Access::active_session_undo_depth(window) == depth + 1);
+  CHECK(Access::current_history_label(window) == QStringLiteral("Shape appearance"));
+  // More values of the same field (a scrub, a held stepper): the same step.
+  width->setValue(5.0);
+  width->setValue(9.0);
+  CHECK(std::abs(shape_of(document, id).stroke.width - 9.0) < 1e-9);
+  CHECK(Access::active_session_undo_depth(window) == depth + 1);
+
+  // Another property is another step.
+  auto* align = field<QComboBox>(*panel, "shapeStrokeAlignCombo");
+  align->setCurrentIndex(align->findData(static_cast<int>(patchy::VectorStrokeAlignment::Center)));
+  CHECK(shape_of(document, id).stroke.alignment == patchy::VectorStrokeAlignment::Center);
+  CHECK(Access::active_session_undo_depth(window) == depth + 2);
+  CHECK(panel_usable(*panel));
+
+  // An edit made elsewhere ends the gesture: the next value of the same field is a new step.
+  Access::push_undo_snapshot(window, QStringLiteral("Something else"));
+  align->setCurrentIndex(align->findData(static_cast<int>(patchy::VectorStrokeAlignment::Outside)));
+  CHECK(shape_of(document, id).stroke.alignment == patchy::VectorStrokeAlignment::Outside);
+  CHECK(Access::active_session_undo_depth(window) == depth + 4);
+
+  // Undo, through the window's steps; the page is rebuilt from the layer each time.
+  Access::undo(window);
+  QApplication::processEvents();
+  CHECK(shape_of(document, id).stroke.alignment == patchy::VectorStrokeAlignment::Center);
+  Access::undo(window);
+  Access::undo(window);
+  QApplication::processEvents();
+  CHECK(shape_of(document, id).stroke.alignment != patchy::VectorStrokeAlignment::Center);
+  CHECK(std::abs(shape_of(document, id).stroke.width - 9.0) < 1e-9);
+  CHECK(field<QDoubleSpinBox>(*panel, "shapeStrokeWidthSpin")->value() == 9.0);
+  Access::undo(window);
+  QApplication::processEvents();
+  CHECK(!shape_of(document, id).stroke.enabled);
+  CHECK(Access::active_session_undo_depth(window) == depth);
+  CHECK(panel_usable(*panel));
+  CHECK(field<QDoubleSpinBox>(*panel, "shapeStrokeWidthSpin")->value() == 0.0);
+}
+
+// Selecting another shape rebuilds the page for it (a gradient fill gets the gradient rows,
+// several layers get the summary); a layer the window cannot edit greys it out with the
+// reason, and nothing a stale field sends is applied.
+void ui_shape_appearance_window_reconfigures_for_the_selected_shape() {
+  VectorSettingsGuard settings_guard;
+  auto&& [window, canvas] = ShownWindowFixture{};
+  auto& document = Access::document(window);
+  const auto background = document.active_layer_id();
+  CHECK(background.has_value());
+  const auto solid = make_rect(window, *canvas, QPoint(100, 100), QPoint(300, 220));
+  const auto gradient = make_rect(window, *canvas, QPoint(335, 250), QPoint(420, 300));
+  auto* panel = open_panel(window);
+  if (panel == nullptr || !background.has_value()) return;
+
+  // Make the second shape's fill a gradient, through the window.
+  auto* kind = field<QComboBox>(*panel, "shapeFillKindCombo");
+  CHECK(kind->currentData().toInt() == static_cast<int>(VectorFillKind::Solid));
+  CHECK(!field<QComboBox>(*panel, "shapeFillGradientCombo")->isVisibleTo(panel));
+  kind->setCurrentIndex(kind->findData(static_cast<int>(VectorFillKind::Gradient)));
+  CHECK(shape_of(document, gradient).fill.kind == VectorFillKind::Gradient);
+  CHECK(field<QComboBox>(*panel, "shapeFillGradientCombo")->isVisibleTo(panel));
+  field<QSpinBox>(*panel, "shapeGradientAngleSpin")->setValue(35);
+  CHECK(std::abs(shape_of(document, gradient).fill.gradient.angle_degrees - 35.0) < 1e-6);
+  const QPointer<QWidget> gradient_page(page_of(*panel));
+
+  // The solid shape: a new page, solid rows.
+  select_only(window, solid);
+  CHECK(panel_usable(*panel));
+  CHECK(page_of(*panel) != gradient_page.data());
+  CHECK(field<QComboBox>(*panel, "shapeFillKindCombo")->currentData().toInt() ==
+        static_cast<int>(VectorFillKind::Solid));
+  CHECK(!field<QComboBox>(*panel, "shapeFillGradientCombo")->isVisibleTo(panel));
+  CHECK(panel->findChild<QLabel*>(QStringLiteral("shapeAppearanceSelectionSummary")) == nullptr);
+
+  // Back to the gradient shape: its rows and its angle.
+  select_only(window, gradient);
+  CHECK(field<QComboBox>(*panel, "shapeFillKindCombo")->currentData().toInt() ==
+        static_cast<int>(VectorFillKind::Gradient));
+  CHECK(field<QComboBox>(*panel, "shapeFillGradientCombo")->isVisibleTo(panel));
+  CHECK(field<QSpinBox>(*panel, "shapeGradientAngleSpin")->value() == 35);
+  // Once the new page's layout has settled its columns fit the window: nothing is cut off
+  // at the right, with or without a scroll bar.
+  auto* scroll = field<QScrollArea>(*panel, "shapeAppearanceScroll");
+  CHECK(scroll->widget() != nullptr);
+  for (int pass = 0; pass < 5; ++pass) QApplication::processEvents();
+  CHECK(scroll->widget()->width() <= scroll->viewport()->width());
+  CHECK(scroll->viewport()->width() >= scroll->widget()->minimumSizeHint().width());
+  save_widget_artifact("issue694_shape_appearance_window_gradient", *panel);
+
+  // Both shapes: the batch summary, and an edit reaches both.
+  Access::select_layers(window, {solid, gradient}, gradient);
+  QApplication::processEvents();
+  CHECK(panel_usable(*panel));
+  CHECK(panel->findChild<QLabel*>(QStringLiteral("shapeAppearanceSelectionSummary")) != nullptr);
+  field<QDoubleSpinBox>(*panel, "shapeStrokeWidthSpin")->setValue(3.0);
+  CHECK(shape_of(document, solid).stroke.enabled && shape_of(document, gradient).stroke.enabled);
+
+  // A pixel layer: greyed out with the reason, and a stale field applies nothing.
+  auto* stale_width = field<QDoubleSpinBox>(*panel, "shapeStrokeWidthSpin");
+  select_only(window, *background);
+  CHECK(!panel_usable(*panel));
+  CHECK(panel_reason(*panel).contains(QStringLiteral("shape layer")));
+  const auto depth = Access::active_session_undo_depth(window);
+  if (page_of(*panel) != nullptr && stale_width == panel->findChild<QDoubleSpinBox*>(QStringLiteral("shapeStrokeWidthSpin"))) {
+    stale_width->setValue(12.0);
+    QApplication::processEvents();
+  }
+  CHECK(Access::active_session_undo_depth(window) == depth);
+  CHECK(std::abs(shape_of(document, solid).stroke.width - 3.0) < 1e-9);
+
+  select_only(window, solid);
+  CHECK(panel_usable(*panel));
+  CHECK(field<QDoubleSpinBox>(*panel, "shapeStrokeWidthSpin")->value() == 3.0);
+}
+
+// Another document, a closed document and a deleted layer under the open window, each with
+// a gesture still open: nothing is written to the wrong place and nothing dangles.
+void ui_shape_appearance_window_survives_document_switch_close_and_layer_delete() {
+  VectorSettingsGuard settings_guard;
+  auto&& [window, canvas] = ShownWindowFixture{};
+  auto& first_document = Access::document(window);
+  const auto id = make_rect(window, *canvas, QPoint(100, 100), QPoint(300, 220));
+  auto* panel = open_panel(window);
+  if (panel == nullptr) return;
+
+  // A gesture, then a second document (no shape there).
+  field<QDoubleSpinBox>(*panel, "shapeStrokeWidthSpin")->setValue(3.0);
+  Access::create_document(window, 320, 240);
+  QApplication::processEvents();
+  auto* second_canvas = require_canvas(window);
+  CHECK(second_canvas != canvas);
+  CHECK(Access::session_count(window) == 2U);
+  CHECK(!panel_usable(*panel));
+  const auto second_depth = Access::active_session_undo_depth(window);
+  CHECK(std::abs(shape_of(first_document, id).stroke.width - 3.0) < 1e-9);
+
+  // Back on the first document the window shows its shape again.
+  Access::activate_canvas(window, canvas);
+  QApplication::processEvents();
+  CHECK(panel_usable(*panel));
+  CHECK(field<QDoubleSpinBox>(*panel, "shapeStrokeWidthSpin")->value() == 3.0);
+
+  // Delete the target with a gesture open, then bring it back.
+  field<QDoubleSpinBox>(*panel, "shapeStrokeWidthSpin")->setValue(6.0);
+  require_action(window, "layerDeleteAction")->trigger();
+  QApplication::processEvents();
+  CHECK(std::as_const(first_document).find_layer(id) == nullptr);
+  CHECK(!panel_usable(*panel));
+  Access::undo(window);
+  QApplication::processEvents();
+  CHECK(std::abs(shape_of(first_document, id).stroke.width - 6.0) < 1e-9);
+  select_only(window, id);
+  CHECK(panel_usable(*panel));
+
+  // Close the document with a gesture open.
+  field<QDoubleSpinBox>(*panel, "shapeStrokeWidthSpin")->setValue(8.0);
+  Access::mark_active_session_saved(window);
+  CHECK(Access::close_document_tab(window, 0));
+  QApplication::processEvents();
+  CHECK(Access::session_count(window) == 1U);
+  CHECK(!panel_usable(*panel));
+  CHECK(Access::active_session_undo_depth(window) == second_depth);
+
+  // No document at all.
+  Access::mark_active_session_saved(window);
+  CHECK(Access::close_document_tab(window, 0));
+  QApplication::processEvents();
+  CHECK(Access::session_count(window) == 0U);
+  CHECK(!panel_usable(*panel));
+  CHECK(panel_reason(*panel).contains(QStringLiteral("document")));
+}
+
+// Another dialog's edit lock greys the window out for as long as it is held, and a field
+// changed meanwhile applies nothing.
+void ui_shape_appearance_window_is_disabled_under_another_dialogs_lock() {
+  VectorSettingsGuard settings_guard;
+  auto&& [window, canvas] = ShownWindowFixture{};
+  auto& document = Access::document(window);
+  const auto id = make_rect(window, *canvas, QPoint(100, 100), QPoint(300, 220));
+  auto* panel = open_panel(window);
+  if (panel == nullptr) return;
+  const auto depth = Access::active_session_undo_depth(window);
+
+  bool checked = false;
+  when_dialog_visible(QStringLiteral("shapeAppearanceDialog"), [&](QDialog& modal) {
+    checked = true;
+    CHECK(!panel_usable(*panel));
+    CHECK(panel_reason(*panel).contains(QStringLiteral("dialog")));
+    field<QDoubleSpinBox>(*panel, "shapeStrokeWidthSpin")->setValue(7.0);
+    QApplication::processEvents();
+    CHECK(!shape_of(document, id).stroke.enabled);
+    modal.reject();
+  });
+  Access::edit_active_shape_appearance(window);  // the modal dialog, on the same shape
+  QApplication::processEvents();
+  CHECK(checked);
+  CHECK(panel_usable(*panel));
+  CHECK(!shape_of(document, id).stroke.enabled);
+  CHECK(Access::active_session_undo_depth(window) == depth);
+}
+
+// A color picker opened from the window locks the document while it is up and keeps the
+// page it was opened from: Cancel puts the color back with no undo step, OK is one step.
+void ui_shape_appearance_window_color_picker_commits_one_step() {
+  VectorSettingsGuard settings_guard;
+  auto&& [window, canvas] = ShownWindowFixture{};
+  auto& document = Access::document(window);
+  const auto id = make_rect(window, *canvas, QPoint(100, 100), QPoint(300, 220));
+  auto* panel = open_panel(window);
+  if (panel == nullptr) return;
+  const auto original = shape_of(document, id).fill.color;
+  const auto depth = Access::active_session_undo_depth(window);
+  const QPointer<QWidget> page(page_of(*panel));
+
+  const auto pick = [&](bool accept) {
+    bool previewed = false;
+    QTimer::singleShot(0, guarded([&, accept] {
+      auto* picker_dialog = find_top_level_dialog(QStringLiteral("patchyColorDialog"));
+      CHECK(picker_dialog != nullptr);
+      if (picker_dialog == nullptr) return;
+      auto* picker = picker_dialog->findChild<patchy::ui::PatchyColorPicker*>(
+          QStringLiteral("patchyAdvancedColorPicker"));
+      CHECK(picker != nullptr);
+      // Locked while the picker is up, and the page stays.
+      CHECK(!require_action_by_text(window, QStringLiteral("Undo"))->isEnabled());
+      picker->setCurrentColor(QColor(30, 40, 230));
+      previewed = process_events_until([&] { return shape_of(document, id).fill.color.blue == 230; });
+      CHECK(page != nullptr && page.data() == page_of(*panel));
+      if (accept) {
+        picker_dialog->accept();
+      } else {
+        picker_dialog->reject();
+      }
+    }));
+    field<QPushButton>(*panel, "shapeFillColorButton")->click();
+    QApplication::processEvents();
+    return previewed;
+  };
+
+  CHECK(pick(false));
+  CHECK(shape_of(document, id).fill.color == original);
+  CHECK(Access::active_session_undo_depth(window) == depth);
+  CHECK(panel_usable(*panel));
+  CHECK(page != nullptr && page.data() == page_of(*panel));
+
+  CHECK(pick(true));
+  CHECK(shape_of(document, id).fill.color.blue == 230);
+  CHECK(Access::active_session_undo_depth(window) == depth + 1);
+  CHECK(panel_usable(*panel));
+  CHECK(page != nullptr && page.data() == page_of(*panel));
+  // A value after the picker is its own step, on the committed color.
+  field<QDoubleSpinBox>(*panel, "shapeStrokeWidthSpin")->setValue(2.0);
+  CHECK(shape_of(document, id).fill.color.blue == 230);
+  CHECK(shape_of(document, id).stroke.enabled);
+  CHECK(Access::active_session_undo_depth(window) == depth + 2);
+}
+
+// What one value of a gesture costs on a large gradient shape (each is baked on the UI
+// thread). Prints; the only check is that the values land as one step.
+void ui_shape_appearance_window_step_timing() {
+  VectorSettingsGuard settings_guard;
+  SettingsValueRestorer gradient_mode{QStringLiteral("tools/gradientMode")};
+  SettingsValueRestorer active_tool{QStringLiteral("tools/activeTool")};
+  auto&& [window, first_canvas] = ShownWindowFixture{};
+  static_cast<void>(first_canvas);
+  Access::create_document(window, 4000, 3000);
+  QApplication::processEvents();
+  auto* canvas = require_canvas(window);
+  canvas->set_zoom(0.1);
+  QApplication::processEvents();
+  auto& document = Access::document(window);
+  const auto background = document.active_layer_id();
+  CHECK(background.has_value());
+  const auto id = make_rect(window, *canvas, QPoint(200, 200), QPoint(3800, 2800));
+  auto* panel = open_panel(window);
+  if (panel == nullptr || !background.has_value()) return;
+  auto* kind = field<QComboBox>(*panel, "shapeFillKindCombo");
+  kind->setCurrentIndex(kind->findData(static_cast<int>(VectorFillKind::Gradient)));
+  CHECK(shape_of(document, id).fill.kind == VectorFillKind::Gradient);
+  const auto depth = Access::active_session_undo_depth(window);
+  auto* angle = field<QSpinBox>(*panel, "shapeGradientAngleSpin");
+  constexpr int kSteps = 8;
+  QElapsedTimer timer;
+  timer.start();
+  for (int step = 1; step <= kSteps; ++step) {
+    angle->setValue(step * 10);
+  }
+  const auto elapsed = timer.elapsed();
+  std::fprintf(stderr, "[shape-appearance-window] 4000x3000 gradient shape: %.1f ms per value (%d values)\n",
+               static_cast<double>(elapsed) / kSteps, kSteps);
+  CHECK(std::abs(shape_of(document, id).fill.gradient.angle_degrees - kSteps * 10.0) < 1e-6);
+  CHECK(Access::active_session_undo_depth(window) == depth + 1);
+
+  // A Gradient Fill layer (no path) takes the draft bake while the gesture lasts, and the
+  // window is titled Fill Layer Settings for it. Drawn with the background active: on the
+  // gradient shape the drag would set that shape's gradient.
+  select_only(window, *background);
+  require_action(window, "toolGradientAction")->trigger();
+  QApplication::processEvents();
+  auto* mode = window.findChild<QComboBox*>(QStringLiteral("gradientModeCombo"));
+  CHECK(mode != nullptr);
+  if (mode == nullptr) return;
+  mode->setCurrentIndex(1);  // Fill Layer
+  QApplication::processEvents();
+  drag(*canvas, canvas->widget_position_for_document_point(QPoint(400, 400)),
+       canvas->widget_position_for_document_point(QPoint(3400, 2400)));
+  // A fill this large is baked in the background; the layer joins the document when it is
+  // ready (docs/gradients-fill-handles.md, "Release without a pause").
+  QElapsedTimer landing;
+  landing.start();
+  while (canvas->gradient_fill_commit_pending() && landing.elapsed() < 30000) {
+    QTest::qWait(2);
+  }
+  QApplication::processEvents();
+  const auto fill_id = document.active_layer_id();
+  CHECK(fill_id.has_value() && *fill_id != id && *fill_id != *background);
+  if (!fill_id.has_value()) return;
+  CHECK(panel_usable(*panel));
+  CHECK(panel->windowTitle() == QStringLiteral("Fill Layer Settings"));
+  auto* title = panel->findChild<QLabel*>(QStringLiteral("dialogChromeTitleLabel"));
+  CHECK(title != nullptr && title->text() == QStringLiteral("Fill Layer Settings"));
+  const auto fill_depth = Access::active_session_undo_depth(window);
+  auto* fill_angle = field<QSpinBox>(*panel, "shapeGradientAngleSpin");
+  const int start = fill_angle->value();
+  timer.restart();
+  for (int step = 1; step <= kSteps; ++step) {
+    fill_angle->setValue(start + step * 7);
+  }
+  const auto fill_elapsed = timer.elapsed();
+  std::fprintf(stderr, "[shape-appearance-window] 4000x3000 Gradient Fill layer: %.1f ms per value (%d values)\n",
+               static_cast<double>(fill_elapsed) / kSteps, kSteps);
+  CHECK(Access::active_session_undo_depth(window) == fill_depth + 1);
+  // The gesture's end (here another edit's undo snapshot) bakes the last value exactly.
+  Access::push_undo_snapshot(window, QStringLiteral("Something else"));
+  const auto* fill_layer = std::as_const(document).find_layer(*fill_id);
+  CHECK(fill_layer != nullptr);
+  if (fill_layer == nullptr) return;
+  auto exact = *fill_layer;
+  patchy::update_vector_shape_raster(exact, patchy::Rect::from_size(document.width(), document.height()),
+                                     &document.metadata().patterns);
+  CHECK(exact.pixels().width() == fill_layer->pixels().width());
+  bool same = exact.pixels().width() == fill_layer->pixels().width() &&
+              exact.pixels().height() == fill_layer->pixels().height();
+  for (int y = 0; same && y < exact.pixels().height(); y += 97) {
+    for (int x = 0; same && x < exact.pixels().width(); x += 89) {
+      const auto a = exact.pixels().pixel(x, y);
+      const auto b = fill_layer->pixels().pixel(x, y);
+      same = a[0] == b[0] && a[1] == b[1] && a[2] == b[2] && a[3] == b[3];
+    }
+  }
+  CHECK(same);
+}
+
+// The window's Show handles box on a fill gradient: the Gradient tool's handles on the active
+// gradient shape under the shape tools, Path Select and the Move tool. A press on a handle part edits
+// the gradient as one undo step; any other press, and every key the handles do not own, is
+// the tool's. Unticking the box or closing the window takes them away again.
+void ui_shape_appearance_window_shows_gradient_handles_under_other_tools() {
+  using Kind = patchy::ui::CanvasWidget::GradientHandlePartKind;
+  using Part = patchy::ui::CanvasWidget::GradientHandlePart;
+  using Cursor = patchy::ui::CanvasWidget::GradientHandleCursor;
+  using patchy::ui::CanvasTool;
+  VectorSettingsGuard settings_guard;
+  SettingsValueRestorer active_tool{QStringLiteral("tools/activeTool")};
+  SettingsValueRestorer handles_setting{QStringLiteral("shapeAppearance/showGradientHandles")};
+  SettingsValueRestorer handles_stroke_setting{QStringLiteral("shapeAppearance/gradientHandlesOnStroke")};
+  patchy::ui::app_settings().setValue(QStringLiteral("shapeAppearance/showGradientHandles"), false);
+  patchy::ui::app_settings().remove(QStringLiteral("shapeAppearance/gradientHandlesOnStroke"));
+  auto&& [window, canvas] = ShownWindowFixture{};
+  auto& document = Access::document(window);
+  const auto id = make_rect(window, *canvas, QPoint(100, 100), QPoint(300, 220));
+  auto* panel = open_panel(window);
+  if (panel == nullptr) return;
+  // A page is rebuilt after each handle edit, so the box is looked up each time.
+  const auto box = [&] { return field<QCheckBox>(*panel, "shapeFillGradientHandlesCheck"); };
+  const auto rounded = [](QPointF point) {
+    return QPoint(static_cast<int>(std::lround(point.x())), static_cast<int>(std::lround(point.y())));
+  };
+  const auto part_at = [&](Kind kind, int index = -1) {
+    const auto position = canvas->gradient_fill_handle_widget_position(Part{kind, index});
+    CHECK(position.has_value());
+    return rounded(position.value_or(QPointF()));
+  };
+  const auto line = [&] {
+    const auto handles = canvas->gradient_fill_handles();
+    CHECK(handles.has_value());
+    return handles.has_value() ? handles->line : patchy::GradientFillLine{};
+  };
+  const auto start_of = [&] { return QPointF(line().start_x, line().start_y); };
+  const auto end_of = [&] { return QPointF(line().end_x, line().end_y); };
+  const auto depth = [&] { return Access::active_session_undo_depth(window); };
+  const auto gradient = [&] { return shape_of(document, id).fill.gradient; };
+  // A click and a key the way the window system delivers them (through the top-level window).
+  auto* top = canvas->window()->windowHandle();
+  CHECK(top != nullptr);
+  if (top == nullptr) return;
+  const auto window_click = [&](QPoint position) {
+    const auto in_window = canvas->mapTo(canvas->window(), position);
+    QTest::mouseMove(top, in_window);
+    QTest::mousePress(top, Qt::LeftButton, Qt::NoModifier, in_window);
+    QTest::mouseRelease(top, Qt::LeftButton, Qt::NoModifier, in_window);
+    QApplication::processEvents();
+  };
+
+  // A solid fill has no handles: its box is with the Gradient rows, hidden.
+  CHECK(!box()->isVisibleTo(panel) && !box()->isChecked());
+  auto* kind = field<QComboBox>(*panel, "shapeFillKindCombo");
+  kind->setCurrentIndex(kind->findData(static_cast<int>(VectorFillKind::Gradient)));
+  CHECK(shape_of(document, id).fill.kind == VectorFillKind::Gradient);
+  CHECK(box()->isVisibleTo(panel) && box()->isEnabled() && !box()->isChecked());
+  // Unticked: a shape tool shows no gradient handles, as before.
+  CHECK(canvas->tool() == CanvasTool::Rectangle);
+  CHECK(!canvas->gradient_handles_forced());
+  CHECK(!canvas->gradient_fill_handles().has_value());
+
+  box()->click();
+  QApplication::processEvents();
+  CHECK(canvas->gradient_handles_forced());
+  CHECK(patchy::ui::app_settings().value(QStringLiteral("shapeAppearance/showGradientHandles")).toBool());
+  CHECK(canvas->gradient_fill_handles().has_value());
+  if (!canvas->gradient_fill_handles().has_value()) return;
+  CHECK(canvas->gradient_fill_handles()->layer_id == id);
+
+  // The Rectangle tool: a drag of the end handle moves the end, as one undo step, and draws
+  // no shape.
+  auto before = depth();
+  const auto start_before = start_of();
+  const auto end_before = end_of();
+  const auto end_widget = part_at(Kind::End);
+  drag(*canvas, end_widget, end_widget + QPoint(34, 22));
+  QApplication::processEvents();
+  CHECK(depth() == before + 1);
+  CHECK(Access::current_history_label(window) == QStringLiteral("Move Gradient End Point"));
+  CHECK(document.active_layer_id() == std::optional(id));
+  CHECK(QLineF(end_of(), end_before).length() > 10.0);
+  CHECK(QLineF(start_of(), start_before).length() < 1.5);
+  // The window follows: a new page with the new angle, the box still ticked.
+  for (int pass = 0; pass < 3; ++pass) QApplication::processEvents();
+  CHECK(panel_usable(*panel));
+  CHECK(box()->isChecked() && box()->isEnabled());
+  const auto shown_angle = field<QSpinBox>(*panel, "shapeGradientAngleSpin")->value();
+  const auto angle_off = std::fmod(std::abs(shown_angle - static_cast<double>(gradient().angle_degrees)), 360.0);
+  CHECK(angle_off <= 1.0 || angle_off >= 359.0);
+  // Undo puts the end back and the handles follow.
+  Access::undo(window);
+  QApplication::processEvents();
+  CHECK(QLineF(end_of(), end_before).length() < 1.5);
+
+  // A press away from every handle part is the tool's: it draws a shape.
+  const auto drawn = make_rect(window, *canvas, QPoint(330, 240), QPoint(400, 290));
+  CHECK(drawn != id);
+  // That shape is solid: no handles, and its page hides the box.
+  for (int pass = 0; pass < 3; ++pass) QApplication::processEvents();
+  CHECK(!canvas->gradient_fill_handles().has_value());
+  CHECK(!box()->isVisibleTo(panel) && !box()->isChecked());
+  select_only(window, id);
+  CHECK(canvas->gradient_fill_handles().has_value());
+  CHECK(box()->isVisibleTo(panel) && box()->isChecked());
+
+  // Path Select: a click on the shape away from the handles selects its path; a click on
+  // the gradient line then adds a color stop and selects it, and Delete removes that stop,
+  // not the path's anchor points.
+  require_action(window, "toolPathSelectAction")->trigger();
+  QApplication::processEvents();
+  CHECK(canvas->tool() == CanvasTool::PathSelect);
+  CHECK(canvas->gradient_fill_handles().has_value());
+  const auto corner = canvas->widget_position_for_document_point(QPoint(108, 108));
+  CHECK(canvas->gradient_fill_handle_part_at(QPointF(corner)).kind == Kind::None);
+  window_click(corner);
+  CHECK(canvas->path_edit_has_selection());
+  const auto path_before = shape_of(document, id).path;
+  const auto middle = rounded((QPointF(part_at(Kind::Start)) + QPointF(part_at(Kind::End))) / 2.0);
+  CHECK(canvas->gradient_fill_handle_part_at(QPointF(middle)).kind == Kind::Line);
+  before = depth();
+  window_click(middle);
+  CHECK(depth() == before + 1);
+  CHECK(Access::current_history_label(window) == QStringLiteral("Add Color Stop"));
+  CHECK(gradient().color_stops.size() == 3U);
+  CHECK(canvas->gradient_fill_selected_stop() == (std::optional<Part>(Part{Kind::ColorStop, 1})));
+  CHECK(canvas->path_edit_has_selection());  // the path is still selected: Delete has two takers
+  QTest::keyClick(top, Qt::Key_Delete);
+  QApplication::processEvents();
+  CHECK(depth() == before + 2);
+  CHECK(Access::current_history_label(window) == QStringLiteral("Delete Color Stop"));
+  CHECK(gradient().color_stops.size() == 2U);
+  CHECK(std::as_const(document).find_layer(id) != nullptr);
+  CHECK(shape_of(document, id).path == path_before);
+
+  // The Move tool: the start handle moves the gradient's start, not the layer. Over a
+  // handle the cursor is the handle's; with Ctrl held (the tool's own press) it is not.
+  require_action(window, "toolMoveAction")->trigger();
+  QApplication::processEvents();
+  CHECK(canvas->tool() == CanvasTool::Move);
+  CHECK(canvas->gradient_fill_handles().has_value());
+  send_mouse(*canvas, QEvent::MouseMove, part_at(Kind::End), Qt::NoButton, Qt::NoButton);
+  CHECK(canvas->gradient_handle_cursor() == Cursor::Move);
+  send_mouse(*canvas, QEvent::MouseMove, part_at(Kind::End), Qt::NoButton, Qt::NoButton, Qt::ControlModifier);
+  CHECK(canvas->gradient_handle_cursor() == Cursor::None);
+  before = depth();
+  const auto start_widget = part_at(Kind::Start);
+  const auto start_then = start_of();
+  drag(*canvas, start_widget, start_widget + QPoint(-18, 12));
+  QApplication::processEvents();
+  CHECK(depth() == before + 1);
+  CHECK(Access::current_history_label(window) == QStringLiteral("Move Gradient Start Point"));
+  CHECK(QLineF(start_of(), start_then).length() > 8.0);
+  CHECK(shape_of(document, id).path == path_before);
+  save_widget_artifact("issue694_gradient_handles_move_tool", window);
+
+  // The view tools own every press, so no handles show under them; the Gradient tool keeps
+  // its own.
+  canvas->set_tool(CanvasTool::Zoom);
+  CHECK(!canvas->gradient_fill_handles().has_value());
+  canvas->set_tool(CanvasTool::Gradient);
+  CHECK(canvas->gradient_fill_handles().has_value());
+  canvas->set_tool(CanvasTool::Move);
+  CHECK(canvas->gradient_fill_handles().has_value());
+
+  // Unticking mid-drag puts the gradient back and records nothing; the release is inert.
+  for (int pass = 0; pass < 3; ++pass) QApplication::processEvents();
+  before = depth();
+  const auto resting = gradient();
+  const auto grab = part_at(Kind::End);
+  send_mouse(*canvas, QEvent::MouseButtonPress, grab, Qt::LeftButton, Qt::LeftButton);
+  send_mouse(*canvas, QEvent::MouseMove, grab + QPoint(25, 25), Qt::NoButton, Qt::LeftButton);
+  QApplication::processEvents();
+  CHECK(!(gradient() == resting));  // the drag previews live
+  box()->click();
+  QApplication::processEvents();
+  CHECK(!canvas->gradient_handles_forced());
+  CHECK(!canvas->gradient_fill_handles().has_value());
+  CHECK(gradient() == resting);
+  send_mouse(*canvas, QEvent::MouseButtonRelease, grab + QPoint(25, 25), Qt::LeftButton, Qt::NoButton);
+  QApplication::processEvents();
+  CHECK(gradient() == resting);
+  CHECK(depth() == before);
+  CHECK(!patchy::ui::app_settings().value(QStringLiteral("shapeAppearance/showGradientHandles")).toBool());
+
+  // Ticked again, the handles are back; closing the window takes them away and opening it
+  // brings them back, the box still ticked.
+  box()->click();
+  QApplication::processEvents();
+  CHECK(canvas->gradient_fill_handles().has_value());
+  page_of(*panel)->findChild<QDialogButtonBox*>()->button(QDialogButtonBox::Close)->click();
+  for (int pass = 0; pass < 3; ++pass) QApplication::processEvents();
+  CHECK(!panel->isVisible());
+  CHECK(!canvas->gradient_handles_forced());
+  CHECK(!canvas->gradient_fill_handles().has_value());
+  require_action(window, "layerShapeAppearanceAction")->trigger();
+  for (int pass = 0; pass < 3; ++pass) QApplication::processEvents();
+  CHECK(panel->isVisible() && box()->isChecked());
+  CHECK(canvas->gradient_handles_forced());
+  CHECK(canvas->gradient_fill_handles().has_value());
+
+  // A second document's canvas follows the box too, and shows nothing without a gradient.
+  Access::create_document(window, 320, 240);
+  QApplication::processEvents();
+  auto* second_canvas = require_canvas(window);
+  CHECK(second_canvas != canvas);
+  CHECK(second_canvas->gradient_handles_forced());
+  CHECK(!second_canvas->gradient_fill_handles().has_value());
+}
+
+// A stroke's gradient has handles too (GitHub issue 694 follow-up: Seth could not reach
+// them). Each Gradient section has its own Show handles box and one gradient shows handles
+// at a time: the ticked one when the fill and the stroke are both gradients, else the one
+// there is. The handles sit on the stroke's own band and edit the stroke's gradient only.
+void ui_shape_appearance_window_shows_handles_for_a_stroke_gradient() {
+  using Kind = patchy::ui::CanvasWidget::GradientHandlePartKind;
+  using Part = patchy::ui::CanvasWidget::GradientHandlePart;
+  using Target = patchy::ui::GradientHandleTarget;
+  using patchy::ui::CanvasTool;
+  VectorSettingsGuard settings_guard;
+  SettingsValueRestorer active_tool{QStringLiteral("tools/activeTool")};
+  SettingsValueRestorer handles_setting{QStringLiteral("shapeAppearance/showGradientHandles")};
+  SettingsValueRestorer handles_stroke_setting{QStringLiteral("shapeAppearance/gradientHandlesOnStroke")};
+  patchy::ui::app_settings().remove(QStringLiteral("shapeAppearance/showGradientHandles"));
+  patchy::ui::app_settings().remove(QStringLiteral("shapeAppearance/gradientHandlesOnStroke"));
+  auto&& [window, canvas] = ShownWindowFixture{};
+  auto& document = Access::document(window);
+  const auto id = make_rect(window, *canvas, QPoint(100, 100), QPoint(300, 220));
+  auto* panel = open_panel(window);
+  if (panel == nullptr) return;
+  const auto fill_box = [&] { return field<QCheckBox>(*panel, "shapeFillGradientHandlesCheck"); };
+  const auto stroke_box = [&] { return field<QCheckBox>(*panel, "shapeStrokeGradientHandlesCheck"); };
+  const auto rounded = [](QPointF point) {
+    return QPoint(static_cast<int>(std::lround(point.x())), static_cast<int>(std::lround(point.y())));
+  };
+  const auto part_at = [&](Kind kind, int index = -1) {
+    const auto position = canvas->gradient_fill_handle_widget_position(Part{kind, index});
+    CHECK(position.has_value());
+    return rounded(position.value_or(QPointF()));
+  };
+  const auto target = [&]() -> std::optional<Target> {
+    const auto handles = canvas->gradient_fill_handles();
+    return handles.has_value() ? std::optional(handles->target) : std::nullopt;
+  };
+  const auto depth = [&] { return Access::active_session_undo_depth(window); };
+  const auto settle = [] {
+    for (int pass = 0; pass < 3; ++pass) QApplication::processEvents();
+  };
+  const auto on_stroke_saved = [] {
+    return patchy::ui::app_settings().value(QStringLiteral("shapeAppearance/gradientHandlesOnStroke")).toBool();
+  };
+
+  // A solid fill with a gradient stroke: the stroke's is the only gradient, so it has the
+  // handles and its box is the ticked one.
+  field<QDoubleSpinBox>(*panel, "shapeStrokeWidthSpin")->setValue(20.0);
+  auto* paint = field<QComboBox>(*panel, "shapeStrokePaintCombo");
+  paint->setCurrentIndex(paint->findData(static_cast<int>(VectorFillKind::Gradient)));
+  settle();
+  CHECK(shape_of(document, id).stroke.enabled);
+  CHECK(shape_of(document, id).stroke.content.kind == VectorFillKind::Gradient);
+  CHECK(shape_of(document, id).fill.kind == VectorFillKind::Solid);
+  CHECK(stroke_box()->isVisibleTo(panel) && stroke_box()->isEnabled() && stroke_box()->isChecked());
+  CHECK(!fill_box()->isVisibleTo(panel) && !fill_box()->isChecked());
+  CHECK(target() == std::optional(Target::Stroke));
+  if (target() != std::optional(Target::Stroke)) return;
+  {
+    // The handles show the stroke's gradient, over the box the stroke's gradient is baked in.
+    const auto handles = canvas->gradient_fill_handles();
+    const auto* layer = std::as_const(document).find_layer(id);
+    CHECK(handles->layer_id == id);
+    CHECK(handles->gradient == shape_of(document, id).stroke.content.gradient);
+    CHECK(handles->bounds == patchy::gradient_stroke_alignment_bounds(
+                                 *layer, patchy::Rect::from_size(document.width(), document.height())));
+  }
+
+  // The Move tool: dragging the end handle changes the stroke's gradient, one undo step, and
+  // leaves the fill and the path alone. The window's stroke Angle follows.
+  require_action(window, "toolMoveAction")->trigger();
+  QApplication::processEvents();
+  const auto fill_before = shape_of(document, id).fill;
+  const auto path_before = shape_of(document, id).path;
+  const auto stroke_gradient_before = shape_of(document, id).stroke.content.gradient;
+  auto before = depth();
+  const auto end_widget = part_at(Kind::End);
+  drag(*canvas, end_widget, end_widget + QPoint(40, 26));
+  settle();
+  CHECK(depth() == before + 1);
+  CHECK(Access::current_history_label(window) == QStringLiteral("Move Gradient End Point"));
+  CHECK(!(shape_of(document, id).stroke.content.gradient == stroke_gradient_before));
+  CHECK(shape_of(document, id).fill == fill_before);
+  CHECK(shape_of(document, id).path == path_before);
+  const auto stroke_angle = static_cast<double>(shape_of(document, id).stroke.content.gradient.angle_degrees);
+  const auto shown = field<QSpinBox>(*panel, "shapeStrokeGradientAngleSpin")->value();
+  const auto angle_off = std::fmod(std::abs(shown - stroke_angle), 360.0);
+  CHECK(angle_off <= 1.0 || angle_off >= 359.0);
+  CHECK(stroke_box()->isChecked());
+  // A click on the line adds a color stop to the stroke's gradient.
+  const auto stops_before = shape_of(document, id).stroke.content.gradient.color_stops.size();
+  const auto middle = rounded((QPointF(part_at(Kind::Start)) + QPointF(part_at(Kind::End))) / 2.0);
+  CHECK(canvas->gradient_fill_handle_part_at(QPointF(middle)).kind == Kind::Line);
+  send_mouse(*canvas, QEvent::MouseButtonPress, middle, Qt::LeftButton, Qt::LeftButton);
+  send_mouse(*canvas, QEvent::MouseButtonRelease, middle, Qt::LeftButton, Qt::NoButton);
+  settle();
+  CHECK(shape_of(document, id).stroke.content.gradient.color_stops.size() == stops_before + 1U);
+  CHECK(Access::current_history_label(window) == QStringLiteral("Add Color Stop"));
+  CHECK(shape_of(document, id).fill == fill_before);
+  save_widget_artifact("issue694_stroke_gradient_handles", window);
+  save_widget_artifact("issue694_stroke_gradient_window", *panel);
+
+  // The fill becomes a gradient too. Nothing chose the stroke, so the fill takes the handles
+  // and the boxes say so: one ticked at a time.
+  auto* kind = field<QComboBox>(*panel, "shapeFillKindCombo");
+  kind->setCurrentIndex(kind->findData(static_cast<int>(VectorFillKind::Gradient)));
+  settle();
+  CHECK(fill_box()->isVisibleTo(panel) && fill_box()->isChecked());
+  CHECK(stroke_box()->isVisibleTo(panel) && !stroke_box()->isChecked());
+  CHECK(target() == std::optional(Target::Fill));
+  CHECK(canvas->gradient_fill_handles()->gradient == shape_of(document, id).fill.gradient);
+
+  // Ticking the stroke's box unticks the fill's and moves the handles, and back again.
+  stroke_box()->click();
+  settle();
+  CHECK(stroke_box()->isChecked() && !fill_box()->isChecked());
+  CHECK(target() == std::optional(Target::Stroke));
+  CHECK(on_stroke_saved());
+  CHECK(canvas->gradient_fill_handles()->gradient == shape_of(document, id).stroke.content.gradient);
+  fill_box()->click();
+  settle();
+  CHECK(fill_box()->isChecked() && !stroke_box()->isChecked());
+  CHECK(target() == std::optional(Target::Fill));
+  CHECK(!on_stroke_saved());
+  // Unticking the ticked box turns the handles off; neither box is ticked.
+  fill_box()->click();
+  settle();
+  CHECK(!fill_box()->isChecked() && !stroke_box()->isChecked());
+  CHECK(!canvas->gradient_handles_forced());
+  CHECK(!target().has_value());
+  stroke_box()->click();
+  settle();
+  CHECK(stroke_box()->isChecked() && !fill_box()->isChecked());
+  CHECK(target() == std::optional(Target::Stroke));
+
+  // The choice outlives a new page (another shape and back).
+  const auto other = make_rect(window, *canvas, QPoint(520, 420), QPoint(620, 490));
+  CHECK(other != id);
+  settle();
+  CHECK(!target().has_value());
+  select_only(window, id);
+  settle();
+  CHECK(stroke_box()->isChecked() && !fill_box()->isChecked());
+  CHECK(target() == std::optional(Target::Stroke));
+
+  // The Gradient tool edits fills: its handles stay on the fill whatever the boxes say.
+  canvas->set_tool(CanvasTool::Gradient);
+  CHECK(target() == std::optional(Target::Fill));
+  canvas->set_tool(CanvasTool::Move);
+  CHECK(target() == std::optional(Target::Stroke));
+
+  // A stroke of no width draws nothing: its box greys out and the fill has the handles.
+  field<QDoubleSpinBox>(*panel, "shapeStrokeWidthSpin")->setValue(0.0);
+  settle();
+  CHECK(!shape_of(document, id).stroke.enabled);
+  CHECK(!stroke_box()->isEnabled() && !stroke_box()->isChecked());
+  CHECK(fill_box()->isChecked());
+  CHECK(target() == std::optional(Target::Fill));
+}
+
+}  // namespace
+
+std::vector<patchy::test::TestCase> shape_appearance_panel_tests() {
+  return {
+      {"ui_shape_appearance_window_ends_with_its_button_row", ui_shape_appearance_window_ends_with_its_button_row},
+      {"ui_shape_appearance_window_link_buttons_sit_on_their_brackets",
+       ui_shape_appearance_window_link_buttons_sit_on_their_brackets},
+      {"ui_shape_appearance_window_stays_open_while_editing", ui_shape_appearance_window_stays_open_while_editing},
+      {"ui_shape_appearance_window_records_one_undo_step_per_gesture",
+       ui_shape_appearance_window_records_one_undo_step_per_gesture},
+      {"ui_shape_appearance_window_reconfigures_for_the_selected_shape",
+       ui_shape_appearance_window_reconfigures_for_the_selected_shape},
+      {"ui_shape_appearance_window_survives_document_switch_close_and_layer_delete",
+       ui_shape_appearance_window_survives_document_switch_close_and_layer_delete},
+      {"ui_shape_appearance_window_is_disabled_under_another_dialogs_lock",
+       ui_shape_appearance_window_is_disabled_under_another_dialogs_lock},
+      {"ui_shape_appearance_window_color_picker_commits_one_step",
+       ui_shape_appearance_window_color_picker_commits_one_step},
+      {"ui_shape_appearance_window_step_timing", ui_shape_appearance_window_step_timing},
+      {"ui_shape_appearance_window_shows_gradient_handles_under_other_tools",
+       ui_shape_appearance_window_shows_gradient_handles_under_other_tools},
+      {"ui_shape_appearance_window_shows_handles_for_a_stroke_gradient",
+       ui_shape_appearance_window_shows_handles_for_a_stroke_gradient},
+  };
+}

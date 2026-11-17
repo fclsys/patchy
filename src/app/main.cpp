@@ -1,0 +1,1072 @@
+#include "support/cli_flags.hpp"
+#include "support/startup_trace.hpp"
+#include "ui/first_window_gpu_warmup.hpp"
+#include "ui/action_icons.hpp"
+#include "ui/theme_script_host.hpp"
+#include "ui/app_data_migration.hpp"
+#include "ui/app_settings.hpp"
+#include "ui/ui_font.hpp"
+#include "ui/ui_text_size.hpp"
+#include "ui/background_workers.hpp"
+#include "ui/cli_exit.hpp"
+#include "ui/document_recovery.hpp"
+#include "ui/localization.hpp"
+#include "ui/main_window.hpp"
+#include "ui/mcp_attachment.hpp"
+#include "ui/script_engine.hpp"
+#include "ui/single_instance.hpp"
+#include "ui/psd_font_resolver.hpp"
+#include "ui/stress_test.hpp"
+#include "ui/text_font_service.hpp"
+#include "ui/app_style.hpp"
+#include "ui/blocked_window_cursor.hpp"
+#include "ui/spin_box_edit_field_fix.hpp"
+#include "ui/theme_manager.hpp"
+#include "ui/theme_sounds.hpp"
+#include "ui/user_fonts.hpp"
+#include "ui/wayland_pointer_cursor.hpp"
+#include "ui/wayland_popup_anchor.hpp"
+#ifndef Q_OS_WASM
+#include "app/mcp_server.hpp"
+#include <QTemporaryDir>
+#endif
+
+#include <QAbstractEventDispatcher>
+#include <QApplication>
+#include <QByteArray>
+#include <QCommandLineParser>
+#include <QCoreApplication>
+#include <QDir>
+#include <QElapsedTimer>
+#include <QFileInfo>
+#include <QFileOpenEvent>
+#include <QFont>
+#include <QFontDatabase>
+#include <QImageReader>
+#include <QLoggingCategory>
+#include <QRect>
+#include <QSaveFile>
+#include <QSettings>
+#include <QScopedValueRollback>
+#include <QStringList>
+#include <QSysInfo>
+#include <QTimer>
+#include <QWidget>
+
+#include <array>
+#include <chrono>
+#include <clocale>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <deque>
+#include <functional>
+#include <memory>
+#include <optional>
+#include <string>
+#include <thread>
+
+#include "patchy_version.hpp"
+
+namespace {
+
+void load_font_directory(const QDir& directory) {
+  if (!directory.exists()) {
+    return;
+  }
+
+  for (const auto& entry : directory.entryInfoList(QDir::Dirs | QDir::NoDotAndDotDot)) {
+    load_font_directory(QDir(entry.absoluteFilePath()));
+  }
+  const QStringList filters = {QStringLiteral("*.ttf"), QStringLiteral("*.otf"), QStringLiteral("*.ttc")};
+  for (const auto& file : directory.entryInfoList(filters, QDir::Files)) {
+    (void)QFontDatabase::addApplicationFont(file.absoluteFilePath());
+  }
+}
+
+void load_bundled_fonts() {
+  load_font_directory(QDir(QCoreApplication::applicationDirPath() + QStringLiteral("/fonts")));
+#ifdef Q_OS_MACOS
+  // Inside a .app bundle the executable lives in Contents/MacOS; the bundled fonts are
+  // staged in Contents/Resources/fonts.
+  load_font_directory(QDir(QCoreApplication::applicationDirPath() + QStringLiteral("/../Resources/fonts")));
+#endif
+#ifdef Q_OS_LINUX
+  // Installed layout (Flatpak / prefix installs): binary in <prefix>/bin, fonts under
+  // <prefix>/share/patchy/fonts.
+  load_font_directory(QDir(QCoreApplication::applicationDirPath() + QStringLiteral("/../share/patchy/fonts")));
+#endif
+}
+
+// Apply the saved interface scale through Qt's QT_SCALE_FACTOR. This must run before the
+// QApplication is constructed because Qt only reads the variable at construction time. An
+// existing environment override (e.g. from tests/CI) is left untouched.
+void apply_gui_scale_factor() {
+#ifdef Q_OS_WASM
+  // Never set QT_SCALE_FACTOR on wasm: the wasm platform plugin builds pointer events
+  // from the raw DOM offsetX/clientX values and never converts them through Qt's
+  // high-DPI factor, so any factor other than 1 renders correctly but lands every
+  // click offset by that factor (qwasmevent.cpp, Qt 6.10). The web build scales
+  // browser-side instead: the shell page (packaging/web/patchy.html.in) reads the same
+  // preferences/guiScalePercent value from localStorage and wraps the app in a
+  // CSS-transformed iframe, which keeps Qt at factor 1 with geometry and input in one
+  // consistent coordinate space. kDefaultGuiScalePercent still matters here so the
+  // Preferences combo shows the right value; the shell duplicates that default.
+  return;
+#endif
+  if (qEnvironmentVariableIsSet("QT_SCALE_FACTOR")) {
+    return;
+  }
+  const int percent = patchy::ui::stored_gui_scale_percent();
+  if (percent == 100) {
+    return;
+  }
+  qputenv("QT_SCALE_FACTOR", QByteArray::number(percent / 100.0));
+}
+
+// Screenshot requests ride the single-instance file list as one reserved entry. Real entries are
+// absolute file paths, which can never start with this prefix nor contain newlines, so the two
+// kinds cannot collide. Fields are newline-separated: prefix, output path, widget name, region.
+const QString kScreenshotCommandPrefix = QStringLiteral("patchy-cmd:screenshot\n");
+
+QString encode_screenshot_command(const QString& output_path, const QString& widget_name, const QString& region) {
+  return kScreenshotCommandPrefix + output_path + QLatin1Char('\n') + widget_name + QLatin1Char('\n') + region;
+}
+
+// Script-run requests use the same reserved-entry scheme. Fields are
+// newline-separated: prefix, script path, output path (may be empty), then one
+// field per --script-arg "key=value" token (keys/values must not contain
+// newlines). The running instance executes the script and writes console
+// output plus a final [done]/[failed] line to the output path when the run
+// completes; the invoking process exits immediately and the caller polls for
+// the file.
+const QString kRunScriptCommandPrefix = QStringLiteral("patchy-cmd:run-script\n");
+
+QString encode_run_script_command(const QString& script_path, const QString& output_path,
+                                  const QStringList& script_args) {
+  auto command = kRunScriptCommandPrefix + script_path + QLatin1Char('\n') + output_path;
+  for (const auto& arg : script_args) {
+    command += QLatin1Char('\n') + arg;
+  }
+  return command;
+}
+
+// Parses "x,y,w,h" (as taken by --screenshot-rect); anything else yields an invalid rect,
+// which save_debug_screenshot treats as "the whole widget".
+QRect parse_screenshot_rect(const QString& text) {
+  const auto parts = text.split(QLatin1Char(','));
+  if (parts.size() != 4) {
+    return {};
+  }
+  std::array<int, 4> values{};
+  for (int i = 0; i < 4; ++i) {
+    bool ok = false;
+    values[static_cast<size_t>(i)] = parts[i].trimmed().toInt(&ok);
+    if (!ok) {
+      return {};
+    }
+  }
+  return QRect(values[0], values[1], values[2], values[3]);
+}
+
+// macOS delivers Finder opens (double-clicked documents, dock drops) to the RUNNING
+// process as QFileOpenEvent via LaunchServices -- they never arrive as argv. Files that
+// arrive before the main window exists are buffered and merged into the command-line
+// batch. Harmless on other platforms (the event simply never fires for files there).
+class PatchyApplication : public QApplication {
+ public:
+  using QApplication::QApplication;
+
+  std::function<void(const QString&)> file_open_handler;
+  QStringList pending_file_opens;
+
+ protected:
+  bool event(QEvent* event) override {
+    if (event->type() == QEvent::FileOpen) {
+      if (const auto path = static_cast<QFileOpenEvent*>(event)->file(); !path.isEmpty()) {
+        if (file_open_handler) {
+          file_open_handler(path);
+        } else {
+          pending_file_opens.append(path);
+        }
+      }
+      return true;
+    }
+    return QApplication::event(event);
+  }
+};
+
+QFont application_font() {
+#ifdef Q_OS_WIN
+  // Prefer an installed family and register nothing: an application font cannot be
+  // embedded in a PDF, so registering a system font FILE turns every text layer in that
+  // family into glyph outlines on export (patchy::ui::ui_font.hpp, docs/fonts.md).
+  const auto installed = QFontDatabase::families();
+  auto family = patchy::ui::installed_ui_font_family(installed);
+  if (family.isEmpty()) {
+    for (const auto& path : patchy::ui::ui_font_files_to_register(installed)) {
+      if (!QFileInfo::exists(path)) {
+        continue;
+      }
+      const auto font_id = QFontDatabase::addApplicationFont(path);
+      if (const auto families = QFontDatabase::applicationFontFamilies(font_id);
+          family.isEmpty() && !families.isEmpty()) {
+        family = families.front();
+      }
+    }
+  }
+  if (!family.isEmpty()) {
+    QFont font(family);
+    font.setPointSize(9);
+    return font;
+  }
+
+  auto font = QFontDatabase::systemFont(QFontDatabase::GeneralFont);
+  font.setPointSize(9);
+  return font;
+#elif defined(Q_OS_WASM)
+  // The browser exposes no system fonts and Qt's embedded fallback is
+  // Bitstream Vera, so prefer the bundled Noto Sans, with the bundled CJK
+  // families behind it as the per-glyph fallback that keeps a Japanese or
+  // Chinese UI translation from rendering tofu. The CJK order follows the
+  // active language (wasm_cjk_fallback_families), so this runs after the
+  // language is resolved. Point size stays Qt's default; the browser's
+  // devicePixelRatio drives scaling on wasm.
+  auto font = QFontDatabase::systemFont(QFontDatabase::GeneralFont);
+  if (QFontDatabase::families().contains(QStringLiteral("Noto Sans"))) {
+    QStringList families{QStringLiteral("Noto Sans")};
+    families += patchy::ui::wasm_cjk_fallback_families(
+        patchy::ui::LocalizationManager::instance().current_language());
+    font.setFamilies(families);
+  }
+  return font;
+#else
+  // macOS/Linux: the platform's default UI font at its native size (San Francisco 13pt
+  // on macOS; the fontconfig default on Linux). Forcing 9pt reads tiny there.
+  return QFontDatabase::systemFont(QFontDatabase::GeneralFont);
+#endif
+}
+
+bool startup_trace_requested() {
+  return qEnvironmentVariableIsSet("PATCHY_STARTUP_TRACE") && qgetenv("PATCHY_STARTUP_TRACE") != "0";
+}
+
+// Exists only while the startup trace is on (PATCHY_STARTUP_TRACE=1 or
+// --startup-benchmark; docs/startup-performance.md), so an untraced launch installs
+// nothing. Marks the main window's first paint and "startup.idle": the first time
+// the main event loop is about to wait once that paint happened, which is when the
+// window has drawn and every queued startup task has run. It then waits (bounded)
+// for the startup plug-in scan, prints the table and/or writes the JSON report, and
+// a benchmark run exits.
+class StartupTraceObserver : public QObject {
+ public:
+  StartupTraceObserver(patchy::ui::MainWindow& window, QString report_path, bool print_table)
+      : window_(window), report_path_(std::move(report_path)), print_table_(print_table) {
+    qApp->installEventFilter(this);
+    connect(QAbstractEventDispatcher::instance(), &QAbstractEventDispatcher::aboutToBlock, this,
+            [this] { about_to_block(); });
+    if (!report_path_.isEmpty()) {
+      // A benchmark must never hang a test run: report what there is and fail.
+      QTimer::singleShot(120000, this, [this] { finish(/*complete=*/false); });
+    }
+  }
+
+  // Queued right before app.exec(): nested loops before it (a command-line open's
+  // progress) must not count as startup idle.
+  void event_loop_started() {
+    patchy::startup_trace::mark("event_loop.enter");
+    event_loop_running_ = true;
+  }
+
+ protected:
+  bool eventFilter(QObject* watched, QEvent* event) override {
+    if (!first_paint_seen_ && event->type() == QEvent::Paint) {
+      if (auto* widget = qobject_cast<QWidget*>(watched); widget != nullptr && widget->window() == &window_) {
+        first_paint_seen_ = true;
+        patchy::startup_trace::mark("first_paint");
+        qApp->removeEventFilter(this);
+      }
+    }
+    return false;
+  }
+
+ private:
+  void about_to_block() {
+    if (idle_seen_ || !event_loop_running_ || !first_paint_seen_) {
+      return;
+    }
+    idle_seen_ = true;
+    patchy::startup_trace::mark("startup.idle");
+    disconnect(QAbstractEventDispatcher::instance(), nullptr, this, nullptr);
+    idle_clock_.start();
+    wait_for_background();
+  }
+
+  // The plug-in scan runs on a worker after the first paint; its span is reported
+  // under "background", so the report waits for it (at most 20 s).
+  void wait_for_background() {
+    if (window_.legacy_plugin_scan_in_flight() && idle_clock_.elapsed() < 20000) {
+      QTimer::singleShot(10, this, [this] { wait_for_background(); });
+      return;
+    }
+    finish(/*complete=*/true);
+  }
+
+  void finish(bool complete) {
+    if (finished_) {
+      return;
+    }
+    finished_ = true;
+    if (print_table_) {
+      std::fputs(patchy::startup_trace::format_table().c_str(), stderr);
+      std::fflush(stderr);
+    }
+    if (report_path_.isEmpty()) {
+      patchy::startup_trace::stop();
+      return;
+    }
+    const auto json = patchy::startup_trace::format_json({
+        {"patchy_version", PATCHY_VERSION},
+        {"qt_version", qVersion()},
+        {"platform", QGuiApplication::platformName().toStdString()},
+        {"os", QSysInfo::prettyProductName().toStdString()},
+        {"cpu_architecture", QSysInfo::currentCpuArchitecture().toStdString()},
+        {"logical_cpus", std::to_string(std::thread::hardware_concurrency())},
+        {"complete", complete ? "true" : "false"},
+    });
+    patchy::startup_trace::stop();
+    QSaveFile file(report_path_);
+    const bool written = file.open(QIODevice::WriteOnly) &&
+                         file.write(json.data(), static_cast<qint64>(json.size())) ==
+                             static_cast<qint64>(json.size()) &&
+                         file.commit();
+    if (!written) {
+      fprintf(stderr, "Could not write the startup report %s\n", qPrintable(report_path_));
+    }
+    patchy::ui::exit_cli_application(written && complete ? 0 : 3);
+  }
+
+  patchy::ui::MainWindow& window_;
+  QString report_path_;
+  bool print_table_ = false;
+  bool event_loop_running_ = false;
+  bool first_paint_seen_ = false;
+  bool idle_seen_ = false;
+  bool finished_ = false;
+  QElapsedTimer idle_clock_;
+};
+
+}  // namespace
+
+int main(int argc, char* argv[]) {
+  // First, so the trace times everything after the OS created the process.
+  const bool startup_benchmark_requested = patchy::startup_benchmark_flag_value(argc, argv) != nullptr;
+  patchy::startup_trace::initialize(startup_benchmark_requested || startup_trace_requested());
+#ifndef Q_OS_WASM
+  // The MCP connector mode (docs/ai-control.md): the patchy-mcp executable (Windows, macOS)
+  // always runs it; the patchy binary runs it when the first argument is --mcp-connector,
+  // which is how the Linux packages start the connector. Decided before anything else so
+  // the GUI-only startup below (single-instance forwarding, the update prompt, window
+  // restore, file opens) never runs for it. The flag is dropped so the connector parses
+  // the same arguments either way. Inside any AppImage `patchy-mcp` works too, whatever its
+  // AppRun (mcp_connector_argument_first; docs/appimage.md).
+#ifdef PATCHY_MCP_EXECUTABLE
+  const bool connector_mode = true;
+#else
+#ifdef Q_OS_LINUX
+  // APPDIR too: the AppImage runtime sets both. Never inside a Flatpak, which keeps the
+  // environment of whatever AppImage'd program started it.
+  const char* appimage = std::getenv("FLATPAK_ID") == nullptr && std::getenv("APPDIR") != nullptr
+                             ? std::getenv("APPIMAGE")
+                             : nullptr;
+#else
+  const char* appimage = nullptr;
+#endif
+  const bool connector_mode = patchy::mcp_connector_argument_first(argc, argv, appimage);
+  if (connector_mode) {
+    patchy::drop_first_argument(argc, argv);
+  }
+#endif
+  std::optional<QTemporaryDir> connector_settings;
+  bool connector_visible = false;
+  if (connector_mode) {
+    // Share brushes and recent paths with the artist, while keeping window preferences
+    // isolated. Honor an automation settings root before capturing its filename.
+    if (const auto root = qEnvironmentVariable("PATCHY_SETTINGS_DIR"); !root.isEmpty()) {
+      patchy::ui::set_app_settings_root(root);
+      qputenv("PATCHY_MCP_OWNED_SETTINGS", "1");  // a suite's connector: no update check (mcp_server.cpp)
+    }
+    // The connector may run before the upgraded app ever has: bring the shared store across first.
+    patchy::ui::app_data_migration::migrate_legacy_settings();
+    if (qEnvironmentVariableIsEmpty("PATCHY_BRUSH_SETTINGS_FILE"))
+      qputenv("PATCHY_BRUSH_SETTINGS_FILE", patchy::ui::app_settings().fileName().toUtf8());
+    if (qEnvironmentVariableIsEmpty("PATCHY_RECENT_SETTINGS_FILE"))
+      qputenv("PATCHY_RECENT_SETTINGS_FILE", patchy::ui::app_settings().fileName().toUtf8());
+    connector_settings.emplace(QDir::tempPath() + QStringLiteral("/patchy-mcp-XXXXXX"));
+    if (!connector_settings->isValid()) { return 2; }
+    qputenv("PATCHY_SETTINGS_DIR", connector_settings->path().toUtf8());
+    qputenv("QT_COMMAND_LINE_PARSER_NO_GUI_MESSAGE_BOXES", "1");
+    qputenv("PATCHY_NO_SOUND", "1");
+    // Only the complete, valid visible invocation may select a desktop backend.
+    // Checks, help, and malformed invocations must remain safe without a display.
+    connector_visible = argc == 2 && std::strcmp(argv[1], "--visible") == 0;
+  }
+#endif
+  // Automation hook (the README shot driver and similar tooling): redirect the
+  // ini-backed app_settings() store so a driven run never reads or writes the
+  // user's real Patchy settings (recent files, saved window geometry, panels).
+  // Must stay ahead of apply_gui_scale_factor(), the first app_settings() read.
+  if (const auto settings_dir = qEnvironmentVariable("PATCHY_SETTINGS_DIR"); !settings_dir.isEmpty()) {
+#ifdef Q_OS_WASM
+    QSettings::setPath(QSettings::IniFormat, QSettings::UserScope, settings_dir);
+#else
+    patchy::ui::set_app_settings_root(settings_dir);
+#endif
+  }
+  // Moves the 1.19-era Patchy.ini and preset folders into RTsoft/Patchy (app_data_migration.hpp).
+  patchy::ui::app_data_migration::migrate_legacy_settings();
+#ifdef Q_OS_WASM
+  const bool headless_mode = false;  // one tab is one instance; no platform choice
+#else
+  // Decided before the QApplication exists: Qt picks the platform plugin from
+  // QT_QPA_PLATFORM at construction, and the explicit flag beats an ambient value.
+  // PATCHY_HEADLESS marks the run for src/ui (the Windows registry font rescue
+  // stays off for the offscreen test suite but runs for a headless user), and
+  // PATCHY_NO_SOUND because nobody is listening.
+  const bool headless_mode = patchy::headless_flag_present(argc, argv) || (connector_mode && !connector_visible);
+  if (headless_mode) {
+    qputenv("QT_QPA_PLATFORM", "offscreen");
+    qputenv("PATCHY_HEADLESS", "1");
+    qputenv("PATCHY_NO_SOUND", "1");
+  }
+#endif
+#ifdef Q_OS_LINUX
+  // Qt's text-input-v3 code warns "Trying to disable ... but 0x0 is focused" whenever focus
+  // leaves a text field before Qt turns input off for it (every dialog close on labwc and other
+  // wlroots compositors): harmless noise (docs/wayland.md). QT_LOGGING_RULES still overrides.
+  QLoggingCategory::setFilterRules(QStringLiteral("qt.qpa.wayland.textinput.warning=false"));
+  // Qt loads Flatpak's portal theme even with the offscreen platform. Its
+  // synchronous appearance query can block startup on an absent desktop portal,
+  // before MCP can observe client EOF. Offscreen runs need no desktop session
+  // services; an unsupported D-Bus transport fails immediately without autolaunch.
+  if (qgetenv("QT_QPA_PLATFORM").split(':').first() == "offscreen") {
+    qputenv("DBUS_SESSION_BUS_ADDRESS", "disabled:");
+  }
+#endif
+  patchy::startup_trace::Scope gui_scale_phase("settings.gui_scale");
+  apply_gui_scale_factor();
+  gui_scale_phase.end();
+  patchy::startup_trace::Scope application_phase("qt.application");
+  PatchyApplication app(argc, argv);
+  application_phase.end();
+  patchy::startup_trace::Scope identity_phase("app.style_identity");
+  // Qt adopts the user's locale for the C runtime on Unix (setlocale(LC_ALL, "")), which turns
+  // every strtod/to_string in the file codecs decimal-comma under de_DE and friends and
+  // corrupts what PSD text engine data and other text formats write and parse. Keep the C
+  // runtime's numeric conversions on the "C" locale; Qt's own QLocale is unaffected.
+  std::setlocale(LC_NUMERIC, "C");
+#ifdef Q_OS_LINUX
+  // Lets Wayland compositors match the window to its .desktop entry (taskbar icon,
+  // pinning); must match packaging/linux/com.rtsoft.patchy.desktop.
+  QGuiApplication::setDesktopFileName(QStringLiteral("com.rtsoft.patchy"));
+#endif
+  // Qt 6.11 places menus and combo lists off their anchor on Wayland at a non-100% interface
+  // scale (GitHub issue 100); a no-op elsewhere.
+  patchy::ui::install_wayland_popup_anchor_fix();
+  // Qt before 6.10 shows a cursor change in one window over whatever window the pointer is
+  // in on Wayland, so the canvas tool cursor appeared over dialogs (GitHub issue 215).
+  patchy::ui::install_wayland_pointer_cursor_fix();
+  // A window a modal dialog blocks shows the arrow, not the tool cursor its canvas held (GitHub
+  // issue 504). Installed second so it runs first: the Wayland fix then puts the dialog's own
+  // cursor back after this filter's arrow.
+  patchy::ui::install_blocked_window_cursor_fix();
+  // Slider grooves snap to the click; tool flyouts open on a short hold (see the style above).
+  app.setStyle(new patchy::ui::AppStyle);
+  // Qt 6.11.3 collapses the text field of a styled spin box without buttons to 1 px.
+  patchy::ui::install_spin_box_edit_field_fix();
+  app.setApplicationName(QStringLiteral("Patchy"));
+  app.setApplicationVersion(QStringLiteral(PATCHY_VERSION));
+  // Keep the internal app identity for settings without letting Qt append " - Patchy" to every native window title.
+  app.setApplicationDisplayName(QString());
+  // Keys the per-user app-data folder (fonts, scripts); see app_data_migration.hpp before
+  // changing it. app_settings() builds its own path (app_settings_file_path()).
+  app.setOrganizationName(QStringLiteral("RTsoft"));
+#ifndef Q_OS_MACOS
+  // On macOS this call would replace the Dock icon with the edge-to-edge logo; the
+  // bundle's patchy.icns already carries the margin Dock icons are drawn with.
+  app.setWindowIcon(patchy::ui::patchy_app_icon());
+#endif
+  // Qt 6 caps every image decode at 256 MB and fails bigger ones with a bare
+  // "Unable to read image data" (a large-bed flatbed scan at 600 DPI is
+  // enough to trip it). Patchy opens exactly such files on purpose, so the
+  // guard is disabled; the format readers keep their own sanity checks.
+  QImageReader::setAllocationLimit(0);
+  identity_phase.end();
+  patchy::startup_trace::Scope bundled_fonts_phase("fonts.bundled");
+  load_bundled_fonts();
+  bundled_fonts_phase.end();
+#ifdef Q_OS_WASM
+  // Rendering-level stand-ins for system families the browser cannot provide.
+  // The text tool's family matching has its own lookup over the same table
+  // (available_text_family_match) because substitutions never appear in
+  // QFontDatabase::families().
+  for (const auto& alias : patchy::ui::user_fonts::kWasmFamilyAliases) {
+    QFont::insertSubstitution(QString::fromLatin1(alias.missing), QString::fromLatin1(alias.bundled));
+  }
+#endif
+  // Before anything reads AppDataLocation: moves 0.98-era fonts and scripts across, then the
+  // machine-specific folders (models, recovery, stress reports) to AppLocalDataLocation.
+  patchy::startup_trace::Scope migration_phase("app_data.migration");
+  patchy::ui::app_data_migration::migrate_legacy_app_data();
+  patchy::ui::app_data_migration::migrate_local_app_data();
+  migration_phase.end();
+  patchy::startup_trace::Scope user_fonts_phase("fonts.user_store");
+  patchy::ui::user_fonts::restore_user_fonts_at_startup();
+  patchy::ui::install_font_database_psd_font_resolver();
+  user_fonts_phase.end();
+  patchy::startup_trace::Scope localization_phase("localization.load");
+  patchy::ui::LocalizationManager::instance().load_saved_language();
+  // --language overrides the saved preference for this run only (screenshots, tests,
+  // trying a language); a code Patchy does not ship falls back to English.
+  if (const char* language = patchy::language_flag_value(argc, argv); language != nullptr) {
+    patchy::ui::LocalizationManager::instance().set_language(QString::fromUtf8(language), /*persist=*/false);
+  }
+  localization_phase.end();
+  // After the language: on wasm the app font's CJK fallback order depends on it.
+  patchy::startup_trace::Scope ui_font_phase("fonts.ui_family");
+  // The interface text size (GitHub issue 495) before the first stylesheet is built: the
+  // application font and every themed sheet's font sizes follow it. Read once; a change in
+  // Preferences applies on the next start.
+  patchy::ui::set_ui_text_size_percent(patchy::ui::stored_ui_text_size_percent());
+  app.setFont(patchy::ui::ui_text_scaled_font(application_font()));
+  ui_font_phase.end();
+  patchy::startup_trace::Scope theme_phase("theme.load");
+  patchy::ui::ThemeManager::instance().load_saved_preference();
+  theme_phase.end();
+#ifndef Q_OS_WASM
+  // A headless run on Windows draws text through the offscreen platform, whose font database
+  // holds only the bundled and user fonts until something asks for a family it lacks. A PSD's
+  // "Arial Black" never counted as such a miss (a near match answered first), so it rendered in
+  // another face than in a window. Loading the installed fonts before any document opens gives
+  // headless runs (scripts, exports, screenshots, the hidden connector) the window's database
+  // (card local-018, docs/font-resolution.md). The startup benchmark keeps timing the
+  // interactive startup without it; a no-op off Windows, where offscreen sees system fonts.
+  if (headless_mode && !startup_benchmark_requested) {
+    patchy::startup_trace::Scope headless_fonts_phase("fonts.headless_system");
+    patchy::ui::ensure_headless_system_fonts_loaded();
+  }
+  if (connector_mode) { return patchy::run_mcp_server(app); }
+#endif
+
+  // Parse command-line arguments after translations load so option descriptions are localized.
+  patchy::startup_trace::Scope parse_phase("cli.parse");
+  QCommandLineParser parser;
+  parser.setApplicationDescription(
+      QCoreApplication::translate("QObject", "Patchy raster image editor."));
+  parser.addHelpOption();
+  parser.addVersionOption();
+  parser.addPositionalArgument(QStringLiteral("files"),
+                               QCoreApplication::translate("QObject",
+                                                           "Image or Photoshop files, or folders of images, to open."),
+                               QStringLiteral("[files...]"));
+  // Listed first in --help. The platform switch itself already happened above
+  // (headless_flag_present); this entry documents the flag and keeps the parser
+  // from rejecting it as unknown.
+  QCommandLineOption headless_option(
+      QStringLiteral("headless"),
+      QCoreApplication::translate(
+          "QObject", "Run without a display (Qt offscreen platform) and never reuse a running "
+                     "instance. Needs --run-script, --export, --stress-test, or --screenshot; "
+                     "exits 2 otherwise."));
+  parser.addOption(headless_option);
+  // Applied above (language_flag_value); listed so the parser accepts it and --help shows it.
+  QCommandLineOption language_option(
+      QStringLiteral("language"),
+      QCoreApplication::translate(
+          "QObject", "UI language for this run only, not saved: en, de, es, fr, it, ja, ko, pl, pt_BR, ru, zh_CN, or zh_TW."),
+      QStringLiteral("code"));
+  parser.addOption(language_option);
+  QCommandLineOption stress_option(
+      QStringLiteral("stress-test"),
+      QCoreApplication::translate(
+          "QObject", "Run the profiling stress test and exit (preset: quick, small, standard, or huge)."),
+      QStringLiteral("preset"), QString());
+  parser.addOption(stress_option);
+  QCommandLineOption stress_report_dir_option(
+      QStringLiteral("stress-report-dir"),
+      QCoreApplication::translate("QObject", "Directory for stress test reports (with --stress-test)."),
+      QStringLiteral("dir"));
+  parser.addOption(stress_report_dir_option);
+  QCommandLineOption stress_depth_option(
+      QStringLiteral("stress-depth"),
+      QCoreApplication::translate("QObject", "Bits per channel for the stress test documents: 8, 16, or 32."),
+      QStringLiteral("bits"), QStringLiteral("8"));
+  parser.addOption(stress_depth_option);
+  QCommandLineOption screenshot_option(
+      QStringLiteral("screenshot"),
+      QCoreApplication::translate(
+          "QObject", "Save a PNG of the Patchy window to <path>. With a running instance this forwards "
+                     "the request and exits; otherwise the new instance captures after startup and exits."),
+      QStringLiteral("path"));
+  parser.addOption(screenshot_option);
+  QCommandLineOption screenshot_widget_option(
+      QStringLiteral("screenshot-widget"),
+      QCoreApplication::translate("QObject", "Limit --screenshot to the child widget with this Qt object name."),
+      QStringLiteral("name"));
+  parser.addOption(screenshot_widget_option);
+  QCommandLineOption screenshot_rect_option(
+      QStringLiteral("screenshot-rect"),
+      QCoreApplication::translate("QObject", "Limit --screenshot to this region of the captured widget."),
+      QStringLiteral("x,y,w,h"));
+  parser.addOption(screenshot_rect_option);
+  QCommandLineOption export_option(
+      QStringLiteral("export"),
+      QCoreApplication::translate(
+          "QObject", "Open the given file, save it to <path> (format follows the extension), and exit. "
+                     "Runs unattended: prompts are suppressed and no running instance is reused."),
+      QStringLiteral("path"));
+  parser.addOption(export_option);
+  QCommandLineOption append_text_option(
+      QStringLiteral("append-text"),
+      QCoreApplication::translate(
+          "QObject", "With --export: append this text to every text layer, re-rendering each through "
+                     "Patchy's text engine, before saving."),
+      QStringLiteral("text"));
+  parser.addOption(append_text_option);
+  QCommandLineOption run_script_option(
+      QStringLiteral("run-script"),
+      QCoreApplication::translate(
+          "QObject", "Run the JavaScript file. With a running instance this forwards the request and "
+                     "exits; otherwise a new unattended instance opens the given files, runs the "
+                     "script, and exits (0 = ok, 4 = script error)."),
+      QStringLiteral("path"));
+  parser.addOption(run_script_option);
+  QCommandLineOption script_output_option(
+      QStringLiteral("script-output"),
+      QCoreApplication::translate(
+          "QObject", "With --run-script: write console output, errors, and a final [done]/[failed] "
+                     "line to this file when the script completes."),
+      QStringLiteral("path"));
+  parser.addOption(script_output_option);
+  QCommandLineOption script_arg_option(
+      QStringLiteral("script-arg"),
+      QCoreApplication::translate(
+          "QObject", "With --run-script: pass key=value to the script as patchy.args.key "
+                     "(repeatable)."),
+      QStringLiteral("key=value"));
+  parser.addOption(script_arg_option);
+  // Developer timing (docs/startup-performance.md): writes the phase report to <path>
+  // once startup is idle, then exits; never reuses a running instance. Hidden from
+  // --help like the PATCHY_* diagnostics. Read before the QApplication too
+  // (startup_benchmark_flag_value turns the trace on).
+  QCommandLineOption startup_benchmark_option(QStringLiteral("startup-benchmark"), QString(),
+                                              QStringLiteral("path"));
+  startup_benchmark_option.setFlags(QCommandLineOption::HiddenFromHelp);
+  parser.addOption(startup_benchmark_option);
+  // QCommandLineParser has no optional-value options, so let a bare
+  // `--stress-test` mean the default (quick) preset.
+  QStringList arguments = app.arguments();
+  for (auto& argument : arguments) {
+    if (argument == QStringLiteral("--stress-test")) {
+      argument = QStringLiteral("--stress-test=quick");
+    }
+  }
+  parser.process(arguments);
+
+  const bool stress_mode = parser.isSet(stress_option);
+  std::optional<patchy::ui::StressPreset> stress_preset;
+  if (stress_mode) {
+    stress_preset = patchy::ui::stress_preset_from_string(parser.value(stress_option));
+    if (!stress_preset.has_value()) {
+      // GUI subsystem on Windows has no console; the exit code is the signal.
+      fprintf(stderr, "Unknown stress test preset '%s' (use quick, small, standard, or huge)\n",
+              parser.value(stress_option).toUtf8().constData());
+      return 2;
+    }
+  }
+  const auto stress_depth = parser.value(stress_depth_option).toInt();
+  if (stress_mode && stress_depth != 8 && stress_depth != 16 && stress_depth != 32) {
+    fprintf(stderr, "Unknown stress test depth '%s' (use 8, 16, or 32)\n",
+            parser.value(stress_depth_option).toUtf8().constData());
+    return 2;
+  }
+
+  // Resolve the requested files to absolute paths now: a forwarded request runs in the receiving
+  // process, whose working directory differs from this launcher's.
+  QStringList files;
+  for (const auto& arg : parser.positionalArguments()) {
+    if (!arg.isEmpty()) {
+      files.append(QFileInfo(arg).absoluteFilePath());
+    }
+  }
+
+  // A screenshot request travels with the files: to a running instance when one exists, otherwise
+  // this instance captures itself once startup settles (see the singleShot below).
+  const bool screenshot_mode = parser.isSet(screenshot_option);
+  QString screenshot_path;
+  if (screenshot_mode) {
+    screenshot_path = QFileInfo(parser.value(screenshot_option)).absoluteFilePath();
+  }
+  const QString screenshot_widget = parser.value(screenshot_widget_option);
+  const QString screenshot_rect_text = parser.value(screenshot_rect_option);
+
+  const bool export_mode = parser.isSet(export_option);
+  QString export_path;
+  if (export_mode) {
+    export_path = QFileInfo(parser.value(export_option)).absoluteFilePath();
+  }
+  const QString export_append_text = parser.value(append_text_option);
+
+  // A script-run request travels like a screenshot: forwarded to a running
+  // instance when one exists, otherwise this instance runs it unattended.
+  const bool run_script_mode = parser.isSet(run_script_option);
+  QString run_script_path;
+  if (run_script_mode) {
+    run_script_path = QFileInfo(parser.value(run_script_option)).absoluteFilePath();
+  }
+  QString script_output_path;
+  if (parser.isSet(script_output_option)) {
+    script_output_path = QFileInfo(parser.value(script_output_option)).absoluteFilePath();
+  }
+  const QStringList script_args = parser.values(script_arg_option);
+
+  // The benchmark times the interactive startup, so it combines with files but with no
+  // other unattended mode.
+  const bool startup_benchmark_mode = parser.isSet(startup_benchmark_option);
+  QString startup_report_path;
+  if (startup_benchmark_mode) {
+    startup_report_path = QFileInfo(parser.value(startup_benchmark_option)).absoluteFilePath();
+    if (stress_mode || export_mode || run_script_mode || screenshot_mode) {
+      fprintf(stderr, "--startup-benchmark cannot be combined with --stress-test, --export, --run-script, or --screenshot\n");
+      return 2;
+    }
+  }
+
+  // A headless session with nothing to do would sit in the event loop forever with
+  // no window anyone can close; refuse it the way a bad preset is refused.
+  if (headless_mode && !stress_mode && !export_mode && !run_script_mode && !screenshot_mode &&
+      !startup_benchmark_mode) {
+    fprintf(stderr, "--headless needs --run-script, --export, --stress-test, --screenshot, or --startup-benchmark\n");
+    return 2;
+  }
+
+  // Single-instance: if another Patchy is already running, hand it the files and exit so a double-click
+  // reuses the existing window instead of spawning a new process. An env override keeps multi-instance
+  // launches (and tests) possible. A stress-test or export launch opts out entirely: forwarding would
+  // silently drop the run into the other instance, and this instance must not squat on the user's pipe
+  // either. A headless launch opts out for the same reasons: its exit code and output file
+  // must always be its own, and it must never hand the job to the user's open window.
+#ifdef Q_OS_WASM
+  // One browser tab is one instance; there is no pipe/socket transport between
+  // tabs, and QLocalSocket's blocking waits must never run under Asyncify.
+  const bool single_instance_enabled = false;
+#else
+  const bool single_instance_enabled = !headless_mode &&
+                                       !qEnvironmentVariableIsSet("PATCHY_NO_SINGLE_INSTANCE") &&
+                                       !stress_mode && !export_mode && !startup_benchmark_mode;
+#endif
+  QStringList forward_payload = files;
+  if (screenshot_mode) {
+    forward_payload.append(encode_screenshot_command(screenshot_path, screenshot_widget, screenshot_rect_text));
+  }
+  if (run_script_mode) {
+    forward_payload.append(
+        encode_run_script_command(run_script_path, script_output_path, script_args));
+  }
+  parse_phase.end();
+  // Declared before the window, so it outlives every connection made to it below.
+  patchy::ui::SingleInstanceServer single_instance_server;
+  const QString single_instance_name = single_instance_enabled ? patchy::ui::single_instance_server_name() : QString();
+  patchy::startup_trace::Scope forward_phase("single_instance.forward_probe");
+  if (single_instance_enabled && patchy::ui::forward_to_single_instance(single_instance_name, forward_payload)) {
+    return 0;
+  }
+  forward_phase.end();
+  // Nothing answered: become the instance now, before the window is built. A file manager that
+  // opens several files starts one Patchy per file at the same moment; when each built its
+  // window first and listened afterwards, every one of them found nobody listening and stayed
+  // (GitHub issue 722). The claim runs under a per-user lock, so exactly one process listens and
+  // the rest forward to it and exit here. Its listener thread takes their files while this
+  // thread builds the window; they are opened once the window is up (below).
+  patchy::startup_trace::Scope listen_phase("single_instance.listen");
+  if (single_instance_enabled &&
+      patchy::ui::claim_single_instance(single_instance_server, single_instance_name, forward_payload) ==
+          patchy::ui::SingleInstanceRole::Forwarded) {
+    return 0;
+  }
+  listen_phase.end();
+
+  // Wakes the audio output while the window builds, so the theme's startup sound
+  // (fired below for the same runs) keeps its start.
+  if (!stress_mode && !export_mode && !screenshot_mode && !run_script_mode && !startup_benchmark_mode) {
+    patchy::ui::prepare_theme_startup_sound();
+  }
+  // Loads the GPU driver Qt queries when it places the first window, while the window is
+  // built (first_window_gpu_warmup.hpp); released once startup has settled, below.
+  patchy::ui::FirstWindowGpuWarmup first_window_gpu_warmup;
+  first_window_gpu_warmup.start();
+  patchy::startup_trace::Scope window_phase("main_window.construct");
+  patchy::ui::MainWindow window;
+  window_phase.end();
+
+  if (headless_mode) {
+    // Nobody can answer a prompt with no display; export and run-script set this
+    // anyway, screenshot and stress-test did not.
+    window.set_cli_automation_mode(true);
+  }
+
+  // The primary instance adopts the files later launches forward (claimed above).
+  std::deque<QStringList> forwarded_requests;
+  QTimer forwarded_request_timer;
+  forwarded_request_timer.setInterval(50);
+  bool processing_forwarded_request = false;
+  QObject::connect(&forwarded_request_timer, &QTimer::timeout, &window, [&] {
+    if (forwarded_requests.empty()) {
+      forwarded_request_timer.stop();
+      return;
+    }
+    // File dialogs run a nested event loop. Do not change the active document
+    // (or run a script) until the operation that owns that dialog has returned.
+    if (QApplication::activeModalWidget() != nullptr || processing_forwarded_request ||
+        window.script_engine_host().run_active()) {
+      return;
+    }
+    QScopedValueRollback processing(processing_forwarded_request, true);
+    auto forwarded = std::move(forwarded_requests.front());
+    forwarded_requests.pop_front();
+    QStringList forwarded_files;
+    bool handled_command = false;
+    for (const auto& entry : forwarded) {
+      if (entry.startsWith(kRunScriptCommandPrefix)) {
+        const auto parts = entry.split(QLatin1Char('\n'));
+        if (parts.size() >= 3) {
+          window.run_script_command(parts[1], parts[2], parts.mid(3));
+        }
+        handled_command = true;
+      } else {
+        forwarded_files.append(entry);
+      }
+    }
+    if (!forwarded_files.isEmpty() || !handled_command) {
+      window.activate_for_second_instance(forwarded_files);
+    }
+  });
+  // What other launches forwarded, in arrival order (the listener thread received them; some
+  // may have come in while the window was being built).
+  const auto accept_forwarded_requests = [&] {
+    for (auto& forwarded : single_instance_server.take_requests()) {
+      // Peel screenshot commands off the file list. A capture must not raise or focus the
+      // window (that would perturb the very state being captured), so a pure-screenshot
+      // request skips activation; a bare relaunch (no files, no commands) still activates.
+      QStringList deferred;
+      bool handled_command = false;
+      for (const auto& entry : forwarded) {
+        if (entry.startsWith(kScreenshotCommandPrefix)) {
+          const auto parts = entry.split(QLatin1Char('\n'));
+          if (parts.size() == 4) {
+            (void)window.save_debug_screenshot(parts[1], parts[2], parse_screenshot_rect(parts[3]));
+          }
+          handled_command = true;
+        } else {
+          deferred.append(entry);
+        }
+      }
+      // Come forward now, as the dispatch below will for this request (files, or a bare
+      // relaunch): that waits out modal dialogs and a running script, and Windows only
+      // honors the relaunch's foreground grant for a moment.
+      bool has_files = false;
+      bool has_run_script = false;
+      for (const auto& entry : deferred) {
+        (entry.startsWith(kRunScriptCommandPrefix) ? has_run_script : has_files) = true;
+      }
+      if (has_files || (!handled_command && !has_run_script)) {
+        window.bring_to_front_for_second_instance();
+      }
+      if (!deferred.isEmpty() || !handled_command) {
+        forwarded_requests.push_back(std::move(deferred));
+        forwarded_request_timer.start();
+      }
+    }
+  };
+
+  std::unique_ptr<StartupTraceObserver> startup_observer;
+  if (patchy::startup_trace::enabled()) {
+    startup_observer = std::make_unique<StartupTraceObserver>(window, startup_report_path, startup_trace_requested());
+  }
+  patchy::startup_trace::Scope show_phase("main_window.show");
+  window.show();
+  show_phase.end();
+  // From here on forwarded requests are handled as they arrive; first the ones that came in
+  // during startup.
+  QObject::connect(&single_instance_server, &patchy::ui::SingleInstanceServer::request_ready, &window,
+                   accept_forwarded_requests);
+  accept_forwarded_requests();
+  // Not at once: unloading the driver holds the loader lock, and the first event-loop
+  // turns load libraries of their own (the plug-in scan, sound, image formats).
+  QTimer::singleShot(std::chrono::seconds(2), &window,
+                     [&first_window_gpu_warmup] { first_window_gpu_warmup.release(); });
+  // The theme's "startup" event (sound, effect, splash, scripts) once the window is up;
+  // stress runs and other automation leave it out.
+  if (!stress_mode && !window.unattended_automation()) {
+    QTimer::singleShot(0, &window, [] { patchy::ui::fire_theme_event(patchy::ui::ThemeSoundEvent::Startup); });
+  }
+  // Every exit path ends here once the event loop has returned. Detached
+  // preview/render/recovery workers capture the QCoreApplication pointer, so the
+  // window and application must outlive them; a worker still running after the
+  // bounded wait is blocked inside the OS (a stat on a dead share, a resolver),
+  // which nothing can interrupt, and waiting for it is the issue 48 quit freeze.
+  // The process then ends without destructors: settings were flushed by
+  // closeEvent, and the recovery folder is dropped here by hand.
+  const auto finish_after_event_loop = [&window, &first_window_gpu_warmup, &single_instance_server](int result) {
+    // Nothing handles a forwarded request any more: stop answering, so a launch during the
+    // wait below starts its own Patchy instead of handing its files to one that is quitting.
+    single_instance_server.close();
+    first_window_gpu_warmup.release();  // its worker is one of those waited for
+    if (patchy::ui::wait_for_tracked_background_workers(std::chrono::seconds(10))) {
+      return result;
+    }
+    qWarning("Patchy: %d background worker(s) still blocked 10 s after quit; ending the process without destructors.",
+             patchy::ui::tracked_background_worker_count());
+#ifdef Q_OS_WASM
+    Q_UNUSED(window);  // no recovery folder on the web; keeps the capture used
+#else
+    window.discard_recovery_folder_for_forced_exit();
+#endif
+    patchy::ui::end_process_without_destructors(result);
+  };
+  if (stress_mode) {
+    // No update check and no file opens: run the scripted scenario as soon
+    // as the event loop starts, then exit with the report's status code.
+    patchy::ui::StressTestOptions stress_options;
+    stress_options.preset = *stress_preset;
+    stress_options.report_dir = parser.value(stress_report_dir_option);
+    stress_options.bit_depth = stress_depth;
+    window.start_cli_stress_test(stress_options);
+    return finish_after_event_loop(app.exec());
+  }
+  if (export_mode) {
+    // Unattended convert/export: no update check, prompts suppressed, open the
+    // files synchronously, then run the deferred export and exit with its status code.
+    window.set_cli_automation_mode(true);
+    window.open_command_line_files(files);
+    window.run_cli_export(export_path, export_append_text);
+    return finish_after_event_loop(app.exec());
+  }
+  if (run_script_mode) {
+    // No instance was running (a forwarded request already returned above):
+    // run the script unattended in this instance and exit with its status.
+    window.set_cli_automation_mode(true);
+    {
+      // Opening pumps events; requests forwarded meanwhile wait for it (see the timer above).
+      const QScopedValueRollback startup_opens(processing_forwarded_request, true);
+      window.open_command_line_files(files);
+    }
+    window.run_cli_script(run_script_path, script_output_path, script_args);
+    return finish_after_event_loop(app.exec());
+  }
+  // No startup splash: the start panel carries the branding, and the update-check status
+  // lands on its footer (an available update still raises the update dialog).
+  patchy::startup_trace::Scope update_phase("update_check.start");
+  window.begin_startup_update_check();
+  update_phase.end();
+  // Finder opens reuse the second-launch path (raise the window, open the file); any
+  // that arrived before the window existed join the command-line batch below.
+  app.file_open_handler = [&window, &forwarded_requests, &forwarded_request_timer](const QString& path) {
+    if (window.script_engine_host().run_active()) {
+      forwarded_requests.push_back(QStringList{path});
+      forwarded_request_timer.start();
+    } else {
+      window.activate_for_second_instance({path});
+    }
+  };
+  files += app.pending_file_opens;
+  app.pending_file_opens.clear();
+
+  // Recovery and the command-line opens below pump events while they decode. Files other
+  // launches forwarded meanwhile (the rest of a multi-file open from the file manager) wait
+  // until this instance's own are open, then follow in arrival order (the timer above).
+  std::optional<QScopedValueRollback<bool>> startup_opens;
+  startup_opens.emplace(processing_forwarded_request, true);
+#ifndef Q_OS_WASM
+  // Documents a crashed instance left recovery copies of come back first, as
+  // modified "(Recovered)" sessions (docs/document-recovery.md). Never for a
+  // screenshot or headless launch: nobody is there to save them.
+  patchy::startup_trace::Scope recovery_phase("recovery.orphan_scan");
+  if (startup_benchmark_mode) {
+    // Time the scan without adopting anything: a benchmark exits right after startup,
+    // and another instance's recovery copies must stay where they are.
+    (void)window.list_orphaned_recovery();
+  } else if (!headless_mode && !screenshot_mode) {
+    window.recover_orphaned_documents();
+  }
+  recovery_phase.end();
+#endif
+  if (!files.isEmpty()) {
+    const patchy::startup_trace::Scope open_phase("cli.open_files");
+    window.open_command_line_files(files);
+  }
+  startup_opens.reset();
+
+  if (screenshot_mode) {
+    // Solo capture launch: no instance was running, so this one captures itself once startup
+    // (command-line file opens) has settled, then exits. Best-effort timing — a
+    // slow-loading file may need the running-instance flow instead.
+    QTimer::singleShot(1500, &window, [&window, screenshot_path, screenshot_widget, screenshot_rect_text] {
+      const bool saved = window.save_debug_screenshot(screenshot_path, screenshot_widget,
+                                                      parse_screenshot_rect(screenshot_rect_text));
+      patchy::ui::exit_cli_application(saved ? 0 : 3);
+    });
+  }
+
+#ifndef Q_OS_WASM
+  // The connector's --attach mode bridges to this window. The listener belongs
+  // to the interactive app, never an export, script, screenshot, or headless job.
+  // It is destroyed before the window and its scripting host.
+  std::unique_ptr<patchy::ui::McpAttachment> mcp_attachment;
+  if (!headless_mode && !screenshot_mode) {
+    const patchy::startup_trace::Scope attachment_phase("mcp.attachment");
+    mcp_attachment = std::make_unique<patchy::ui::McpAttachment>(window);
+    if (!mcp_attachment->error().isEmpty()) {
+      qWarning("Patchy MCP attachment: %s", qPrintable(mcp_attachment->error()));
+    }
+  }
+  // AppImage only: keep an applications menu entry Patchy added pointing at this file, or
+  // offer once to add one (GitHub issue 226). Nobody is there to answer in the other modes.
+  if (!headless_mode && !screenshot_mode && !startup_benchmark_mode) {
+    const patchy::startup_trace::Scope menu_entry_phase("appimage.menu_entry");
+    window.begin_appimage_menu_entry_startup();
+  }
+#endif
+  // Everything above runs nested event processing before the main loop exists: opening a
+  // file from the command line shows its "Opening ..." progress and pumps events until the
+  // decode is done, and the startup update check answers in there. A one-click update
+  // accepted at that moment closed the window and started the installer before exec(), where
+  // Qt's quit on the last window's close is inactive (nothing is posted and lastWindowClosed
+  // is not emitted before exec) and QCoreApplication::exit has no loop to stop; exec() then
+  // ran with no window, the installer waited two minutes for a process that never ended, and
+  // the single-instance server swallowed every later launch (October 2026, a JPG opened from
+  // Explorer). The same holds for a user closing Patchy during that open. A window already
+  // closed here means the quit has happened: skip the loop.
+  if (!window.isVisible()) {
+    app.file_open_handler = nullptr;
+    return finish_after_event_loop(0);
+  }
+  // Inside exec(), Qt quits by posting a Quit event once the last window closes, and any
+  // window shown before that event runs deletes it (QWindowPrivate::setVisible). Should a
+  // tooltip or float ever do that, end the loop ourselves once the main window stays hidden.
+  QObject::connect(&app, &QGuiApplication::lastWindowClosed, &window, [&window] {
+    QTimer::singleShot(250, &window, [&window] {
+      if (!window.isVisible()) {
+        QCoreApplication::exit(0);
+      }
+    });
+  });
+  if (startup_observer != nullptr) {
+    QTimer::singleShot(0, startup_observer.get(), [observer = startup_observer.get()] { observer->event_loop_started(); });
+  }
+  const int exec_result = app.exec();
+  // The window (declared after `app`) is destroyed before the application object; drop
+  // the handler so a late event cannot reach a dead window.
+  app.file_open_handler = nullptr;
+  return finish_after_event_loop(exec_result);
+}

@@ -1,0 +1,88 @@
+#pragma once
+
+#include "core/layer_alignment.hpp"
+#include "core/pixel_tools.hpp"
+#include "ui/theme_palette.hpp"
+
+#include <QColor>
+#include <QIcon>
+#include <QString>
+
+#include <functional>
+
+class QPainter;
+
+namespace patchy::ui {
+
+// Icons resolve their colors when painted, so a live color-scheme change needs no
+// setIcon call anywhere; see icon_theme.hpp.
+//
+// A default-constructed (invalid) `accent` means "the theme's icon ink", which is
+// what nearly every caller wants. Pass an explicit color only when it carries
+// meaning independent of the scheme, such as a red destructive marker; those are
+// never recolored and must stay legible on both light and dark chrome.
+// A name with an authored SVG (":/patchy/icons/<name>.svg", e.g. "ok", "clear",
+// "cancel") ignores `accent` entirely: the SVG's colors come from the icon color
+// map (icon_success, icon_danger, ...), so pass nothing for those.
+QIcon simple_icon(QString text, QColor accent = QColor());
+
+// Same, but the accent is a palette role resolved at paint time, so the glyph
+// follows the color scheme. Prefer this over passing theme().some_role directly:
+// that would freeze the color at the moment the icon was built.
+QIcon simple_icon(QString text, QColor ThemePalette::* accent_role);
+QIcon patchy_app_icon();
+QIcon window_chrome_icon(QString role);
+QIcon canvas_anchor_icon(CanvasAnchor anchor);
+// Straight arrow for the divide-photos "top edge points" picker; direction is
+// 0 = up, 1 = right, 2 = down, 3 = left (the PhotoUpDirection enum values).
+QIcon up_direction_arrow_icon(int direction);
+// Layer > Arrange > Align glyphs (also the Move tool's options-bar buttons):
+// an anchor line with two bars of different length pushed against it.
+QIcon align_edge_icon(AlignEdge edge);
+// Layer > Arrange > Distribute glyphs (the feature modes are also Move tool
+// options-bar buttons): three bars on evenly spaced anchor lines, or three bars
+// with equal marked gaps for the spacing modes.
+QIcon distribute_mode_icon(DistributeMode mode);
+// Text alignment glyphs for the Type options bar: four lines of text pushed to the
+// start, center, or end. `alignment` is Qt::AlignLeft, Qt::AlignHCenter, Qt::AlignRight,
+// or Qt::AlignJustify (four full lines); `vertical` turns the lines into columns aligned top,
+// center, or bottom, for vertical type.
+QIcon text_alignment_icon(Qt::Alignment alignment, bool vertical);
+// The Type options bar's Vertical and RTL toggles: a capital T with an arrow pointing down
+// beside it (`vertical`) or pointing left under it (right to left).
+QIcon text_flow_toggle_icon(bool vertical);
+// Line tool arrowhead toggles on the options bar: a line with a filled head at its
+// start (left) or end (right).
+QIcon line_arrowhead_icon(bool at_end);
+// Character panel style toggles (GitHub issue 346): 0 All Caps, 1 Small Caps, 2 Superscript,
+// 3 Subscript, 4 Underline, 5 Strikethrough, 6 Ordinals, 7 Fractions; 8 Faux Bold and 9 Faux
+// Italic, which share the rows; 10 Standard Ligatures, 11 Contextual Alternates,
+// 12 Discretionary Ligatures, 13 Swash, 14 Stylistic Alternates, 15 Titling Alternates.
+QIcon text_character_style_icon(int style);
+
+// Layers panel lock glyphs (GitHub issue 484), shared by the panel's lock buttons and the
+// row badges: "transparent" (a checkerboard), "pixels" (a pencil), "position" (a four-way
+// arrow), "autonest" (an artboard frame holding a layer) and "all" (a padlock). Every glyph
+// spans 20 of 22 px in the lock buttons and 11 of 14 px in the row badges, drawn on whole
+// device pixels at any screen scale.
+QIcon layer_lock_icon(const QString& kind, QColor ThemePalette::* ink_role);
+
+// The Layers panel filter button (GitHub issue 671): three bars, each shorter than the one
+// above it, centered; and its clear button's cross.
+QIcon layer_filter_icon();
+QIcon layer_filter_clear_icon();
+
+// A one-off procedural mark: a glyph outside the shared icon vocabulary, drawn by
+// the caller against an `authored_size` square area with the ink handed to it.
+// Use this rather than painting into a QPixmap and wrapping it in a QIcon. A
+// baked pixmap freezes the color of the scheme that happened to be active when
+// the icon was built, which in Light left window buttons and dialog closers as
+// near-white marks on near-white chrome.
+QIcon themed_glyph_icon(QString name, qreal authored_size, QColor ThemePalette::* ink_role,
+                        std::function<void(QPainter&, const QColor&)> glyph);
+
+// A ringed "i" in the theme's icon ink: a clickable info mark beside a field or option
+// (Clone Source's offset, GitHub issue 574; the OpenAI Image Tools key storage note).
+QIcon info_mark_icon();
+
+}  // namespace patchy::ui

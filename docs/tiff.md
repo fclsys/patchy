@@ -1,0 +1,256 @@
+# Layered TIFF
+
+Read before changing TIFF open or save behavior. Flat TIFF decoding is Qt's (libtiff), the
+JPEG-in-TIFF reader ([file-formats.md](file-formats.md)), and Patchy's own decoder for layouts
+Qt refuses ([flat fallback decoder](#flat-fallback-decoder)); File Info capture is
+[file-info.md](file-info.md). This document covers Photoshop's layers inside a TIFF and that
+fallback.
+
+## Wire format
+
+Photoshop's "Save layers" TIFF keeps the flattened composite in the first directory (IFD0) and
+the layers in tag 37724 (ImageSourceData, type UNDEFINED):
+
+- `Adobe Photoshop Document Data Block\0` (36 bytes), or `Adobe Photoshop Document Data V0002\0`
+  for PSB-style widths (u64 channel lengths, u64 lengths for the wide-key set of
+  `tagged_block_length_is_u64`, u32 RLE row counts; never seen in the wild).
+- Then tagged blocks: signature, key, u32 length, payload, padded to 4 bytes. `Layr` (8-bit),
+  `Lr16` or `Lr32` holds the layer info exactly as a PSD's layer info section (count, records,
+  channel data); `LMsk` is the PSD global layer mask info; `Patt`, `FMsk`, `cinf`, `lnk2` and
+  the rest are the PSD's document-level tagged blocks.
+- Tag 34377 is the PSD image resource block, big-endian in either TIFF byte order. Tag 34675
+  carries the ICC profile; the resource block may lack 1039.
+
+### Byte order
+
+The layer data follows the TIFF's byte order. In an IBM PC (`II`) file every structural field
+is little-endian: lengths, counts, rectangles, channel ids, compression codes, RLE row counts,
+four-character codes (so `8BIM` reads `MIB8` and `Layr` reads `ryaL`), UTF-16 code units
+(`luni`, descriptor strings), doubles and every descriptor value. Channel pixel samples stay
+big-endian (16-bit and float samples, inside raw, RLE and ZIP data alike), and embedded files
+in `lnk2` are untouched. Facts pinned on Photoshop CC 2014 and 23.5 files from GIMP merge
+request 910 (local fixture `layered-tiff/gimp-mr910`): their IBM PC and Macintosh `ret` saves
+decode to identical 16-bit layers. Each block's own signature (`8BIM` or `MIB8`) decides the
+order it is read in; a file that mixes them is refused.
+
+Pinned byte for byte: `scripts/dev/tiff/ps-save-layered-tiffs.ps1` saves Photoshop PSDs as
+IBM PC and Macintosh TIFFs into `local-test-fixtures/layered-tiff/photoshop` (11 documents with
+text, effects, adjustments, embedded smart objects with smart filters, vector masks, patterns,
+8/16/32 bits), and `tiff_layers_photoshop_byte_order_pairs_match_if_available` requires each
+little-endian file to convert to exactly its big-endian twin's layer data, nothing dropped.
+Exceptions Photoshop makes, all pinned there:
+
+- `Txt2` and the EngineData inside `TySh` are byte streams, identical in both orders.
+- An unedited legacy text layer keeps its `TySh` text version and descriptor big-endian inside
+  an IBM PC file (the CS4-era Flat-filter-list.psd); the descriptor version (16) tells which.
+- `hue2` ends in doubles after its 136 bytes of i16 fields.
+- `liFD` version 8 ends with a versioned descriptor (`contentID`).
+
+Still unpinned: non-identity blending ranges (read as byte quadruples; identity ranges look the
+same either way).
+
+## Reading
+
+`psd::read_layered_tiff` (src/psd/psd_tiff.cpp, Qt-free) builds a PSD stream and parses it with
+`psd::DocumentIo::read`, so a layered TIFF gets every layer feature a PSD does:
+
+- Header from IFD0: width, height, BitsPerSample (8, 16, or 32 with SampleFormat 3) and
+  Photometric (0/1 gray, 2 RGB, 5 CMYK, 8/9 Lab; anything else is refused). Channels are the
+  color channels plus one when the layer count is negative (merged transparency).
+- Resources from 34377 plus a synthesized 1039 (from 34675) and 1005 (from X/YResolution) when
+  absent. Empty color mode data.
+- 8-bit: the layer block becomes the layer info section. 16/32-bit: an empty section plus the
+  `Lr16`/`Lr32` global block, the PSD layout. A layer block under another depth's key is used
+  only when it is the only one.
+- The image data section is two bytes: the layered read never decodes a composite
+  (`retain_flat_composite` is forced off). Saved alpha channels in IFD0 are not imported.
+- The document is marked `metadata().values["tiff.layers"] = "photoshop"`; `psd.version` stays
+  "PSD", which keeps the flat-alpha promotion off as for PSDs.
+
+Little-endian data converts first (src/psd/psd_little_endian.cpp): a walker reads each field
+little-endian and rewrites it big-endian in place, mirroring the PSD parsers field for field
+(layer records, mask data, channel data, descriptors and every value type the descriptor reader
+knows, `TySh`, `PlLd`, `SoLd`, `shmd`, `lrFX`, path records, `levl`, `curv`, `hue2`, `blnc`,
+`brit`, `expA`, `selc`, `mixr`, `post`, `thrs`, `lsct`, `fxrp`, `Patt`, `lnk2`, `FEid`/`FXid`,
+`LMsk`, `FMsk`, and any key holding a version-16 descriptor; empty payloads and `Txt2` pass
+as they are). A block that does not walk to its end (zero padding allowed) is dropped rather
+than guessed, and the open says so once: `tySh` (the modern `TySh` carries the content),
+`grdm`, `phfl`, `Mt16`/`Mt32`/`Mtrn`/`Alph`, `Anno`, and unknown layouts.
+
+Hostile input: the IFD walk bounds every offset and count (4096 entries, 65536 pages, cycle
+check), the walker bounds every read and nesting (64 levels), and the PSD reader's own limits
+apply after conversion. `tiff_layers_damaged_data_throws_or_opens` truncates and byte-flips
+synthetic files of both orders.
+
+### App open path
+
+`load_document_from_path` (main_window_files.cpp) tries `open_layered_tiff` for `.tif`/`.tiff`
+before Qt. No 37724 header: Qt opens it as always. Header present but unreadable: Qt opens the
+composite and the import notes say why ("could not be read, so it opened as a flat image").
+A layered open shares the PSD branch's notes (`finish_photoshop_layers_import`) and takes File
+Info from the TIFF (`capture_file_info`), not from the PSD resources.
+
+### Multi-page TIFF
+
+Pages are the top-level directories not marked as reduced-resolution previews (NewSubfileType
+bit 0); SubIFD thumbnails are never pages. `psd::tiff_pages` (psd_tiff_pages.cpp, Qt-free)
+lists each page's directory offset, its index in the whole chain (previews counted: the index
+Qt's `jumpToImage` takes), its size and its PageName (285, control characters dropped, ASCII
+only when the bytes are not UTF-8); `tiff_page_count` and `tiff_page_directory_offsets` agree
+with it. A layered (Photoshop) TIFF keeps its own path and is never asked about.
+
+- **The question (GitHub issue 625).** An interactive open of a file with two or more pages
+  asks first (`ask_tiff_pages_choice`, `tiffPagesMessageBox`, buttons `tiffPagesLayersButton`,
+  `tiffPagesDocumentsButton`, `tiffPagesFirstButton`, Cancel), before the worker load; the
+  pages come from a memory map (`probe_tiff_pages`), so a large file is not read twice on the
+  UI thread. The last answer is the next default button (`imports/tiffPagesTarget`: `layers`,
+  the first default, `documents`, `first`). A running script, the CLI, `--headless`, Files as
+  Layers and scanner imports never ask: they open page 1 with a note naming the page count, as a PDF
+  opens page 1 there. `app.open` has no option for it (PDF has none either). After a question
+  the page-count note (`OpenDocumentResult::answered_notices`) is dropped altogether (#664: it
+  only repeats the answer); unread pages still show in the status bar and Import Notes box.
+- **Saved answer (GitHub issue 664).** `imports/tiffPagesOpen` (`ask`, the default, `layers`,
+  `documents`, `first`; permanent tokens) is what an interactive open does: the question's
+  "Don't ask again" box (`tiffPagesDontAskCheck`) writes the answer there, and Preferences >
+  Application "Opening multi-page TIFFs:" (`preferencesTiffPagesCombo`) sets it or puts "Ask
+  every time" back. A saved answer opens without asking and shows one status line naming
+  Preferences (`saved_tiff_pages_note`, from `OpenDocumentResult::tiff_pages_opened`, so a
+  layers open that fell back to page 1 says so); it stays out of the Import Notes box. It
+  applies only where the question would show: scripts, the CLI and the other non-interactive
+  opens above still get page 1.
+- **Decoding a page** (`decode_tiff_page`): Qt's reader at the page's chain index (its size
+  must match the directory's), the JPEG-in-TIFF reader for page 1, then
+  [`read_flat_tiff`](#flat-fallback-decoder) at the page's directory. CMYK pages convert to
+  RGB through their profile; palette and gray pages open as RGB. A page none of them reads is
+  left out, and one note lists the page numbers. When no page reads, the open falls back to
+  the single-page path, whose error names the cause.
+- **Pages as Layers**: `psd::tiff_pages_as_layers` makes one document the size of the largest
+  width and height among the pages (page 1 stays whole either way; the PDF layers import does
+  the same), one pixel layer per page at the top left, page 1 on top and active, every layer
+  visible (the GIF/APNG/WebP frame order, so the animation preview plays the pages), named
+  by PageName or "Page N". Depth is the highest among the pages; the others convert with
+  `convert_document_depth`, so an 8-bit page in a float document is linear light. Uniform
+  alpha is stripped per page before the merge (`prepare_flat_image_alpha`, no masks); saved
+  channels belong to single pages and are left out with a notice. Resolution comes from page
+  1. Without deep editing the document converts to 8 bits.
+- **Separate Documents**: page 1 opens with the file's path and the tab "file.tif - Page 1";
+  the others open as pathless background sessions "file.tif - Page N" through
+  `open_extra_imported_page_sessions` (the PDF pages' path, with no PDF Bit Depth pass), each
+  at its own size and depth with the same finishing as page 1 (flat alpha, File Info,
+  profile). Reopen brings back only page 1 in its own tab, as for a PDF.
+
+## Flat fallback decoder
+
+`psd::read_flat_tiff` (src/psd/psd_tiff_flat.cpp, Qt-free; IFD parsing shared with the
+layered reader through `psd_tiff_internal.hpp`) decodes one directory (`directory_offset`, 0 =
+page 1) of a flat TIFF. `load_via_qt` calls it only when Qt's reader and the JPEG-in-TIFF
+reader both return nothing (GitHub issue 623: 32-bit float RGB with four unspecified extra
+samples). When it throws too, `open_failure_reason` shows the byte diagnosis or, when that
+finds nothing specific, the decoder's own message.
+
+- Structure: either byte order, classic TIFF only (BigTIFF is refused), chunky or planar,
+  strips or tiles, one shared BitsPerSample and SampleFormat, FillOrder 1.
+- Compression: none, PackBits (32773), LZW (5, the TIFF 6.0 MSB-first form; old-style LZW
+  is refused), Deflate (8, 32946) through miniz and Zstandard (50000, and 34926 from older
+  tag lists; GitHub issue 653) through the vendored decoder `src/formats/zstd/zstddeclib.c`
+  (compiled into `patchy_psd`, which `patchy_formats` reaches for Affinity files); predictor
+  2 (integer differencing at the sample width) and 3 (floating point: byte planes, most
+  significant first) after LZW, Deflate or Zstandard. Zstandard decodes frame by frame
+  straight into the segment's expected size (`ZSTD_decompressDCtx`, no window buffer
+  whatever the frame header asks), and a frame that fails ends the segment.
+- Samples: 8, 9 to 15, 16, 32-bit unsigned integers and 16, 32, 64-bit floats; Photometric
+  0/1 gray (WhiteIsZero inverted), 2 RGB, 3 palette (8-bit indexes, ColorMap narrowed to 8
+  bits). Gray and palette open as RGB, like every other flat import. 9 to 15-bit samples
+  (packed most significant bit first, each row on a byte; Qt refuses them; issue 625's
+  12-bit page, issue 653's 10 and 14-bit files) take no predictor. CMYK, YCbCr, Lab, signed
+  and 1 to 7-bit samples are refused (Qt reads most of those).
+- Depth: 8-bit samples open as an 8-bit document, 9 to 15-bit as 16-bit (scaled to the full
+  range, `(v * 65535 + max / 2) / max` with `max = 2^bits - 1`), 16-bit as 16-bit, 32-bit
+  integers as
+  16-bit (rounded top 16 bits: integer data is display-encoded), and every float width as a
+  32-bit document whose values are linear light (NaN and infinities become 0). Without deep
+  editing (`PATCHY_DEEP_EDITING=0`) the open converts to 8 bits.
+- Extra samples: the first associated (1) or unassociated (2) one becomes the layer's alpha
+  (associated alpha is unpremultiplied; float alpha clamps to 0..1). Every other extra sample,
+  unspecified (0) ones included, becomes a saved alpha channel "Alpha N" at the document's
+  depth, as Photoshop opens them; past the 56-channel cap they are left out with a notice.
+- Resolution from X/YResolution (inch or centimeter), 72 PPI when untagged. File Info and
+  the ICC profile come from `capture_file_info` as for Qt's TIFFs (the pixels are the file's
+  own values).
+- Hostile input: the directory walk's bounds, then `checked_decode_bytes` for the whole image
+  against the file size and `decoded_size_plausible` per compressed segment before it is
+  allocated; tiles are at most 65536 per side, segments the offset list lacks are not
+  iterated, and a sample or segment outside the file is never read. Segments that are
+  missing or end early stay zero and the open says so once ("cut short or damaged").
+
+## Writing
+
+`psd::write_layered_tiff` (psd_tiff.cpp) writes the PSD writer's output
+(`write_layered_rgb8`, `preserve_source_color_mode` off, so always RGB) as a big-endian
+(Macintosh) TIFF, which needs no byte swapping of Patchy's own blocks:
+
+- IFD0: the PSD composite (the compositor's flatten, straight color), interleaved, Adobe Deflate
+  (compression 8) in strips of about 256 KB, horizontal differencing (predictor 2) at 8 and
+  16 bits, none for 32-bit float (SampleFormat 3). Extra samples: unassociated alpha (2) when
+  the layer count is negative, then saved channels as unspecified (0). X/YResolution from the
+  print settings in inches.
+- 34377: the PSD image resources minus 1039, 1060, 1058, 1059, 1028 and 1061, which a TIFF
+  keeps in its own tags (Photoshop's own files carry none of them there). 34675: the embedded
+  profile.
+- 37724: the header, then the depth's layer block (`Layr` from the layer info section, or the
+  PSD's `Lr16`/`Lr32` global block), `LMsk` when the global layer mask info is not empty, then
+  the other global blocks in the PSD's order, each padded to 4 bytes.
+- Over 4 GB (classic TIFF offsets) throws, naming PSB.
+
+The UI (`write_flat_image_file`, image_document_io.cpp) then injects File Info like any TIFF
+(`inject_tiff`): XMP (700), IPTC (33723), the profile and EXIF. `inject_tiff` keeps a 34377
+already in the file and replaces only its IPTC record and digest (1028, 1061), so the layer
+resources survive; Qt's flat TIFFs carry no 34377, so their bytes are unchanged.
+
+### When a save is layered
+
+`ImageSaveOptions::tiff_layers` (per save, never persisted) decides; unset, the rule in
+`MainWindow::save_document_to_path` applies: layered when `flat_save_discards_layers` and
+the save is not an export (`export_copy`) and no explicit CMYK color form was asked for. So:
+
+- A document without layers a flat file would lose takes the unchanged Qt path, byte for byte.
+- Save (Ctrl+S) on a `.tif` path writes the layers in place: `save_discards_layers` is false
+  for TIFF, so it no longer routes to Save As.
+- Save As to TIFF with such a document shows TIFF Options (`prompt_tiff_save_options`,
+  `tiffSaveOptionsDialog`, `tiffLayersCheck`, on by default). Unchecked: a flattened copy, as
+  for any flat format, without the flatten warning (the dialog's hint says it).
+- Export Flat Image, a script's `exportAs` and `--export` stay flat; a script's `saveAs` takes
+  `layers` (docs/scripting.md, [scripting-api-changes-2026-10-01-to-19.md](scripting-api-changes-2026-10-01-to-19.md) 2026-10-19).
+- A TIFF with layers is RGB: `cmyk_form_available` is false for it, so CMYK Proof asks to save
+  in RGB, and `layers: true` with `colorMode: "cmyk"` throws.
+
+Photoshop acceptance: `tiff_layers_writer_acceptance_files_if_available` writes local
+Photoshop PSDs and the synthetic document at 8, 16 and 32 bits as layered TIFFs into
+`test-artifacts/layered-tiff-acceptance`; `scripts\dev\photoshop-open-check.ps1` opens them in
+Photoshop and reports CLEAN, UNKNOWN-DATA, or DIALOG with the dialog's text. Photoshop 2026
+opened all 15 such files CLEAN, and its layer inventories (`-InventoryDir`: depth, kind, name,
+visibility, bounds) match its inventories of the source PSDs layer for layer.
+
+## Tests
+
+Core `tiff_pages_*` (tests/core/tiff_flat_tests.cpp) cover the page walk (previews, chain
+indexes, PageName) and the layer assembly (canvas, depth, order, channels). Core `tiff_flat_*`
+(the same file) cover the fallback decoder on files from
+`tests/flat_tiff_fixture.hpp` (every layout, compression and predictor in both orders, the
+#623 layout, float widths, 9 to 15 and 32-bit integers, Zstandard as stored blocks, alpha and
+channels, gray and palette, refusals, damage, pages by directory, Unicode paths) and issue
+653's files from `local-test-fixtures/tiff-flat` when present (compared with the 8-bit page 1
+of `shapes_multi_color.tif` copied beside them); UI
+`ui_flat_tiff_qt_refuses_opens_through_the_fallback_decoder` drives the app open.
+
+Core `tiff_layers_*` (tests/core/tiff_layers_tests.cpp) on synthetic files from
+`tests/layered_tiff_fixture.hpp`: one encoder writes either byte order with big-endian samples,
+so a little-endian file must yield the same PSD stream byte for byte as its big-endian twin, at
+8, 16 and 32 bits. Plus groups, masks, a Color Overlay, Unicode names, merged transparency,
+dropped-block notices, refusals, page counts, damage, Unicode paths, and the local GIMP and
+Photoshop fixtures; `tiff_layers_writer_*` round-trip the writer (composite decoded and
+compared with the compositor, tags, resources, depths, Unicode paths). UI
+(tests/ui/layered_tiff_tests.cpp): `ui_layered_tiff_*` and `ui_multi_page_tiff_*` drive the
+open and save paths (the page question's three answers, Cancel, a script's open, and issue 625's
+samples from `local-test-fixtures/tiff-pages` when present), `ui_tiff_options_dialog_offers_keep_layers` the dialog, and
+`ui_script_save_as_tiff_layers_option` the script key.

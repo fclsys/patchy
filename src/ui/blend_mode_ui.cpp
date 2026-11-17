@@ -1,0 +1,686 @@
+#include "ui/blend_mode_ui.hpp"
+
+#include "core/blend_math.hpp"
+#include "core/document_depth.hpp"
+#include "ui/dialog_utils.hpp"
+#include "ui/theme_palette.hpp"
+#include "filters/filter_registry.hpp"
+
+#include <QAbstractItemView>
+#include <QComboBox>
+#include <QCoreApplication>
+#include <QHelpEvent>
+#include <QKeyEvent>
+#include <QPainter>
+#include <QScopeGuard>
+#include <QSignalBlocker>
+#include <QStyleOptionComboBox>
+#include <QStylePainter>
+#include <QStyledItemDelegate>
+#include <QToolTip>
+#include <QWheelEvent>
+#include <QStandardItemModel>
+#include <QObject>
+#include <QVariant>
+
+#include <algorithm>
+#include <array>
+
+namespace patchy::ui {
+
+namespace {
+
+constexpr char kBlendModeArrowKeysProperty[] = "patchy.blendModeArrowKeys";
+constexpr char kBlendModeListDelegateProperty[] = "patchy.blendModeListDelegate";
+constexpr char kBlendModeSteppingProperty[] = "patchy.blendModeStepping";
+
+// The rows QComboBox::insertSeparator adds carry this accessible description.
+bool is_separator_index(const QModelIndex& index) {
+  return index.data(Qt::AccessibleDescriptionRole).toString() == QLatin1String("separator");
+}
+
+// The list form draws its separators as the style's toolbar separator in the window
+// color, which all but vanishes on the dark schemes. This one draws a menu separator: a
+// 1 px line in the theme's menu_separator role with the menus' margins (GitHub issue 456).
+class BlendModeListDelegate final : public QStyledItemDelegate {
+public:
+  using QStyledItemDelegate::QStyledItemDelegate;
+
+  void paint(QPainter* painter, const QStyleOptionViewItem& option, const QModelIndex& index) const override {
+    if (!is_separator_index(index)) {
+      QStyledItemDelegate::paint(painter, option, index);
+      return;
+    }
+    auto width = option.rect.width();
+    if (const auto* view = qobject_cast<const QAbstractItemView*>(option.widget); view != nullptr) {
+      width = view->viewport()->width();
+    }
+    painter->fillRect(QRect(option.rect.left() + kMargin, option.rect.top() + kSeparatorHeight / 2,
+                            std::max(0, width - 2 * kMargin), 1),
+                      theme().menu_separator);
+  }
+
+  QSize sizeHint(const QStyleOptionViewItem& option, const QModelIndex& index) const override {
+    if (is_separator_index(index)) {
+      return {2 * kMargin, kSeparatorHeight};
+    }
+    return QStyledItemDelegate::sizeHint(option, index);
+  }
+
+private:
+  static constexpr int kMargin = 6;
+  static constexpr int kSeparatorHeight = 9;
+};
+
+// A Paint.NET or GIMP mode's row (GitHub issue 379, docs/xcf.md): offered only while a
+// layer uses it, and never a stop when the closed combo is stepped.
+bool is_non_photoshop_row(const QComboBox* combo, int index) {
+  const auto data = combo->itemData(index);
+  return data.isValid() && blend_mode_is_non_photoshop(static_cast<BlendMode>(data.toInt()));
+}
+
+bool is_step_stop(const QComboBox* combo, int index) {
+  if (is_blend_mode_separator(combo, index)) {
+    return false;
+  }
+  const auto* model = qobject_cast<const QStandardItemModel*>(combo->model());
+  const auto* item = model != nullptr ? model->item(index) : nullptr;
+  return (item == nullptr || item->isEnabled()) && !is_non_photoshop_row(combo, index);
+}
+
+// The next row a step of `direction` (+1/-1) lands on from `from`, or `from` itself.
+int next_step_stop(const QComboBox* combo, int from, int direction) {
+  for (int index = from + direction; index >= 0 && index < combo->count(); index += direction) {
+    if (is_step_stop(combo, index)) {
+      return index;
+    }
+  }
+  return from;
+}
+
+// Qt steps a closed combo box with Up/Down only (Left/Right are keypad-navigation
+// only), while the Opacity and Fill fields beside the layer blend combo take all
+// four arrows. The closed combo is stepped here (arrows, Home/End, Page Up/Down and
+// the wheel) with Qt's rules (end clamping, disabled rows and separators skipped) plus
+// one more: Paint.NET's modes are never a stop, so stepping can leave one but never land
+// on one.
+// In the open list Left/Right are replayed as Up/Down for the highlight.
+class BlendModeArrowKeys final : public QObject {
+public:
+  explicit BlendModeArrowKeys(QComboBox* combo) : QObject(combo), combo_(combo) {
+    combo->installEventFilter(this);
+    combo->view()->installEventFilter(this);
+  }
+
+protected:
+  bool eventFilter(QObject* watched, QEvent* event) override {
+    if (watched == combo_ && !combo_->isEditable()) {
+      if (event->type() == QEvent::Wheel) {
+        const auto* wheel = static_cast<QWheelEvent*>(event);
+        const auto delta = wheel->angleDelta().y();
+        if (delta != 0) {
+          step_to(next_step_stop(combo_, combo_->currentIndex(), delta > 0 ? -1 : 1));
+        }
+        return true;
+      }
+      if (event->type() == QEvent::KeyPress) {
+        const auto* key_event = static_cast<QKeyEvent*>(event);
+        // Left/Right only bare (a modified arrow keeps its own meaning); the keys Qt
+        // itself steps with also with Shift, as Qt does. Alt/Ctrl+Down opens the list.
+        const auto modifiers = key_event->modifiers() & ~Qt::KeypadModifier;
+        const bool horizontal = key_event->key() == Qt::Key_Left || key_event->key() == Qt::Key_Right;
+        if (horizontal ? modifiers == Qt::NoModifier
+                       : (modifiers & (Qt::AltModifier | Qt::ControlModifier | Qt::MetaModifier)) == 0) {
+          const auto current = combo_->currentIndex();
+          switch (key_event->key()) {
+            case Qt::Key_Up:
+            case Qt::Key_Left:
+            case Qt::Key_PageUp:
+              step_to(next_step_stop(combo_, current, -1));
+              return true;
+            case Qt::Key_Down:
+            case Qt::Key_Right:
+            case Qt::Key_PageDown:
+              step_to(next_step_stop(combo_, current, 1));
+              return true;
+            case Qt::Key_Home:
+              step_to(next_step_stop(combo_, -1, 1));
+              return true;
+            case Qt::Key_End:
+              step_to(next_step_stop(combo_, combo_->count(), -1));
+              return true;
+            default:
+              break;
+          }
+        }
+      }
+      return false;
+    }
+    if (event->type() != QEvent::KeyPress) {
+      return false;
+    }
+    const auto* key_event = static_cast<QKeyEvent*>(event);
+    if ((key_event->key() != Qt::Key_Left && key_event->key() != Qt::Key_Right) ||
+        (key_event->modifiers() & ~Qt::KeypadModifier) != Qt::NoModifier) {
+      return false;
+    }
+    if (const auto* combo = qobject_cast<QComboBox*>(watched); combo != nullptr && combo->isEditable()) {
+      return false;  // the line edit owns Left/Right for its caret
+    }
+    QKeyEvent replacement(QEvent::KeyPress, key_event->key() == Qt::Key_Left ? Qt::Key_Up : Qt::Key_Down,
+                          key_event->modifiers(), QString(), key_event->isAutoRepeat(),
+                          static_cast<quint16>(key_event->count()));
+    QCoreApplication::sendEvent(watched, &replacement);
+    return true;
+  }
+
+private:
+  // What Qt's own stepping emits: the index change, then activated.
+  void step_to(int index) {
+    if (index < 0 || index >= combo_->count() || index == combo_->currentIndex()) {
+      return;
+    }
+    step_blend_mode_combo_to(combo_, index);
+    emit combo_->activated(index);
+  }
+
+  QComboBox* combo_;
+};
+
+}  // namespace
+
+QString blend_mode_name(BlendMode mode) {
+  switch (mode) {
+    case BlendMode::PassThrough:
+      return QObject::tr("Pass Through");
+    case BlendMode::Normal:
+      return QObject::tr("Normal");
+    case BlendMode::Dissolve:
+      return QObject::tr("Dissolve");
+    case BlendMode::Multiply:
+      return QObject::tr("Multiply");
+    case BlendMode::Screen:
+      return QObject::tr("Screen");
+    case BlendMode::Overlay:
+      return QObject::tr("Overlay");
+    case BlendMode::Darken:
+      return QObject::tr("Darken");
+    case BlendMode::Lighten:
+      return QObject::tr("Lighten");
+    case BlendMode::ColorDodge:
+      return QObject::tr("Color Dodge");
+    case BlendMode::ColorBurn:
+      return QObject::tr("Color Burn");
+    case BlendMode::HardLight:
+      return QObject::tr("Hard Light");
+    case BlendMode::SoftLight:
+      return QObject::tr("Soft Light");
+    case BlendMode::Difference:
+      return QObject::tr("Difference");
+    case BlendMode::LinearBurn:
+      return QObject::tr("Linear Burn");
+    case BlendMode::PinLight:
+      return QObject::tr("Pin Light");
+    case BlendMode::Saturation:
+      return QObject::tr("Saturation");
+    case BlendMode::Luminosity:
+      return QObject::tr("Luminosity");
+    case BlendMode::Exclusion:
+      return QObject::tr("Exclusion");
+    case BlendMode::Hue:
+      return QObject::tr("Hue");
+    case BlendMode::Color:
+      return QObject::tr("Color");
+    case BlendMode::LinearDodge:
+      return QObject::tr("Linear Dodge (Add)");
+    case BlendMode::Subtract:
+      return QObject::tr("Subtract");
+    case BlendMode::Divide:
+      return QObject::tr("Divide");
+    case BlendMode::VividLight:
+      return QObject::tr("Vivid Light");
+    case BlendMode::LinearLight:
+      return QObject::tr("Linear Light");
+    case BlendMode::HardMix:
+      return QObject::tr("Hard Mix");
+    case BlendMode::DarkerColor:
+      return QObject::tr("Darker Color");
+    case BlendMode::LighterColor:
+      return QObject::tr("Lighter Color");
+    case BlendMode::Reflect:
+      return QObject::tr("Reflect");
+    case BlendMode::Glow:
+      return QObject::tr("Glow");
+    case BlendMode::Negation:
+      return QObject::tr("Negation");
+    case BlendMode::Xor:
+      return QObject::tr("Xor");
+    case BlendMode::GrainExtract:
+      return QObject::tr("Grain Extract");
+    case BlendMode::GrainMerge:
+      return QObject::tr("Grain Merge");
+    case BlendMode::HsvHue:
+      return QObject::tr("HSV Hue");
+    case BlendMode::HsvSaturation:
+      return QObject::tr("HSV Saturation");
+    case BlendMode::HslColor:
+      return QObject::tr("HSL Color");
+    case BlendMode::HsvValue:
+      return QObject::tr("HSV Value");
+    case BlendMode::LchHue:
+      return QObject::tr("LCh Hue");
+    case BlendMode::LchChroma:
+      return QObject::tr("LCh Chroma");
+    case BlendMode::LchColor:
+      return QObject::tr("LCh Color");
+    case BlendMode::LchLightness:
+      return QObject::tr("LCh Lightness");
+    case BlendMode::Luminance:
+      return QObject::tr("Luminance");
+    case BlendMode::LumaDarkenOnly:
+      return QObject::tr("Luma Darken Only");
+    case BlendMode::LumaLightenOnly:
+      return QObject::tr("Luma Lighten Only");
+    case BlendMode::LinearMultiply:
+      return QObject::tr("Multiply (Linear)");
+    case BlendMode::LinearAddition:
+      return QObject::tr("Addition (Linear)");
+    case BlendMode::LinearSubtract:
+      return QObject::tr("Subtract (Linear)");
+    case BlendMode::LinearDivide:
+      return QObject::tr("Divide (Linear)");
+    case BlendMode::SoftLightSvg:
+      return QObject::tr("Soft Light (SVG)");
+    case BlendMode::AdditiveSubtractive:
+      return QObject::tr("Additive-Subtractive");
+    case BlendMode::ArcTangent:
+      return QObject::tr("Arc Tangent");
+    case BlendMode::GeometricMean:
+      return QObject::tr("Geometric Mean");
+    case BlendMode::Allanon:
+      return QObject::tr("Allanon");
+    case BlendMode::Parallel:
+      return QObject::tr("Parallel");
+    case BlendMode::HardOverlay:
+      return QObject::tr("Hard Overlay");
+    case BlendMode::Interpolation:
+      return QObject::tr("Interpolation");
+    case BlendMode::EasyDodge:
+      return QObject::tr("Easy Dodge");
+  }
+  return QObject::tr("Normal");
+}
+
+
+namespace {
+
+// Photoshop's menu grouping order; item data carries the enum value, so display order is
+// free to differ from enum order. A separator goes before each group's first mode
+// (blend_mode_starts_group, GitHub issue 456).
+constexpr std::array kBlendModes = {
+      BlendMode::Normal,     BlendMode::Dissolve,
+      BlendMode::Darken,     BlendMode::Multiply,    BlendMode::ColorBurn,
+      BlendMode::LinearBurn, BlendMode::DarkerColor,
+      BlendMode::Lighten,    BlendMode::Screen,      BlendMode::ColorDodge,
+      BlendMode::LinearDodge, BlendMode::LighterColor,
+      BlendMode::Overlay,    BlendMode::SoftLight,   BlendMode::HardLight,
+      BlendMode::VividLight, BlendMode::LinearLight, BlendMode::PinLight,   BlendMode::HardMix,
+      BlendMode::Difference, BlendMode::Exclusion,   BlendMode::Subtract,   BlendMode::Divide,
+      BlendMode::Hue,        BlendMode::Saturation,  BlendMode::Color,      BlendMode::Luminosity,
+};
+
+// The first mode of each group after Normal/Dissolve: darken, lighten, contrast,
+// comparative and component (GitHub issue 456).
+bool blend_mode_starts_group(BlendMode mode) {
+  return mode == BlendMode::Darken || mode == BlendMode::Lighten || mode == BlendMode::Overlay ||
+         mode == BlendMode::Difference || mode == BlendMode::Hue;
+}
+
+// A separator at the end, unless the list is empty or already ends in one.
+void add_group_separator(QComboBox* combo) {
+  if (combo->count() > 0 && !is_blend_mode_separator(combo, combo->count() - 1)) {
+    combo->insertSeparator(combo->count());
+  }
+}
+
+// Paint.NET's modes (GitHub issue 379) and GIMP's grain modes (docs/xcf.md): no menu
+// lists them. A layer or folder combo shows one, after Photoshop's list, only while the
+// layer it edits uses it (set_non_photoshop_blend_modes_offered), so nobody picks a mode a
+// PSD cannot keep.
+constexpr std::array kNonPhotoshopBlendModes = {
+    BlendMode::Negation, BlendMode::Reflect,      BlendMode::Glow,
+    BlendMode::Xor,      BlendMode::GrainExtract, BlendMode::GrainMerge,
+    BlendMode::HsvHue,
+    BlendMode::HsvSaturation,
+    BlendMode::HslColor,
+    BlendMode::HsvValue,
+    BlendMode::LchHue,
+    BlendMode::LchChroma,
+    BlendMode::LchColor,
+    BlendMode::LchLightness,
+    BlendMode::Luminance,
+    BlendMode::LumaDarkenOnly,
+    BlendMode::LumaLightenOnly,
+    BlendMode::LinearMultiply,
+    BlendMode::LinearAddition,
+    BlendMode::LinearSubtract,
+    BlendMode::LinearDivide,
+    BlendMode::SoftLightSvg,
+    BlendMode::AdditiveSubtractive,
+    BlendMode::ArcTangent,
+    BlendMode::GeometricMean,
+    BlendMode::Allanon,
+    BlendMode::Parallel,
+    BlendMode::HardOverlay,
+    BlendMode::Interpolation,
+    BlendMode::EasyDodge,
+};
+
+// Behind and Clear are not BlendMode values; their item data sits past the enum.
+constexpr int kPaintModeBehindData = 1000;
+constexpr int kPaintModeClearData = 1001;
+
+void install_blend_mode_arrow_keys(QComboBox* combo) {
+  if (!combo->property(kBlendModeArrowKeysProperty).toBool()) {
+    combo->setProperty(kBlendModeArrowKeysProperty, true);
+    new BlendModeArrowKeys(combo);
+  }
+  // The menu form placed the current row over the box and ran off the top of a small
+  // screen (GitHub issue 414); the list form opens below the box and stays on the screen.
+  use_scrolling_list_popup(*combo, kBlendModeListPopupRows);
+  // After the list form is set: Qt replaces only its own delegates on a style change.
+  if (!combo->property(kBlendModeListDelegateProperty).toBool()) {
+    combo->setProperty(kBlendModeListDelegateProperty, true);
+    combo->setItemDelegate(new BlendModeListDelegate(combo));
+  }
+}
+
+}  // namespace
+
+void step_blend_mode_combo_to(QComboBox* combo, int index) {
+  combo->setProperty(kBlendModeSteppingProperty, true);
+  const auto clear = qScopeGuard([combo] { combo->setProperty(kBlendModeSteppingProperty, QVariant()); });
+  combo->setCurrentIndex(index);
+}
+
+bool blend_mode_combo_stepping(const QComboBox* combo) {
+  return combo != nullptr && combo->property(kBlendModeSteppingProperty).toBool();
+}
+
+int blend_mode_step_index(const QComboBox* combo, int direction) {
+  const auto step = direction < 0 ? -1 : 1;
+  const auto current = combo->currentIndex();
+  if (const auto next = next_step_stop(combo, current, step); next != current) {
+    return next;
+  }
+  // Past either end the step wraps to the other one, as Photoshop's does (#476).
+  const auto from = step > 0 ? -1 : combo->count();
+  const auto wrapped = next_step_stop(combo, from, step);
+  return wrapped == from ? current : wrapped;
+}
+
+void add_blend_mode_items(QComboBox* combo, BlendModeMenu menu) {
+  if (menu == BlendModeMenu::Folder) {
+    combo->addItem(blend_mode_name(BlendMode::PassThrough), static_cast<int>(BlendMode::PassThrough));
+  }
+  for (const auto mode : kBlendModes) {
+    if (menu == BlendModeMenu::Filter && !recipe_blend_mode_supported(mode)) {
+      continue;
+    }
+    if (blend_mode_starts_group(mode)) {
+      add_group_separator(combo);
+    }
+    combo->addItem(blend_mode_name(mode), static_cast<int>(mode));
+  }
+  install_blend_mode_arrow_keys(combo);
+}
+
+void set_non_photoshop_blend_modes_offered(QComboBox* combo, const std::vector<BlendMode>& in_use) {
+  if (combo == nullptr) {
+    return;
+  }
+  // The caller sets the current row afterwards; the removals here must not reach a
+  // blend-change handler as a user choice.
+  const QSignalBlocker blocker(combo);
+  bool any_wanted = false;
+  for (const auto mode : kNonPhotoshopBlendModes) {
+    const bool wanted = std::find(in_use.begin(), in_use.end(), mode) != in_use.end();
+    any_wanted = any_wanted || wanted;
+    const auto index = combo->findData(static_cast<int>(mode));
+    if (!wanted && index >= 0) {
+      combo->removeItem(index);
+    }
+  }
+  // A separator sets them apart from Photoshop's list while any shows. Photoshop's list
+  // never ends in a separator, so a trailing one is theirs.
+  if (!any_wanted) {
+    if (is_blend_mode_separator(combo, combo->count() - 1)) {
+      combo->removeItem(combo->count() - 1);
+    }
+    return;
+  }
+  int first_offered = combo->count();
+  for (int index = 0; index < combo->count(); ++index) {
+    if (is_non_photoshop_row(combo, index)) {
+      first_offered = index;
+      break;
+    }
+  }
+  if (first_offered > 0 && !is_blend_mode_separator(combo, first_offered - 1)) {
+    combo->insertSeparator(first_offered);
+  }
+  for (const auto mode : kNonPhotoshopBlendModes) {
+    const bool wanted = std::find(in_use.begin(), in_use.end(), mode) != in_use.end();
+    if (wanted && combo->findData(static_cast<int>(mode)) < 0) {
+      combo->addItem(blend_mode_name(mode), static_cast<int>(mode));
+    }
+  }
+}
+
+void set_blend_mode_pass_through_offered(QComboBox* combo, bool offered) {
+  if (combo == nullptr) {
+    return;
+  }
+  const auto index = combo->findData(static_cast<int>(BlendMode::PassThrough));
+  if (offered && index < 0) {
+    combo->insertItem(0, blend_mode_name(BlendMode::PassThrough), static_cast<int>(BlendMode::PassThrough));
+  } else if (!offered && index >= 0) {
+    combo->removeItem(index);
+  }
+}
+
+QString paint_mode_name(PaintMode mode) {
+  switch (mode.kind) {
+    case PaintModeKind::Behind:
+      return QCoreApplication::translate("patchy::ui::PaintMode", "Behind");
+    case PaintModeKind::Clear:
+      return QCoreApplication::translate("patchy::ui::PaintMode", "Clear");
+    case PaintModeKind::Blend:
+      break;
+  }
+  return blend_mode_name(mode.blend);
+}
+
+int paint_mode_item_data(PaintMode mode) {
+  switch (mode.kind) {
+    case PaintModeKind::Behind:
+      return kPaintModeBehindData;
+    case PaintModeKind::Clear:
+      return kPaintModeClearData;
+    case PaintModeKind::Blend:
+      break;
+  }
+  return static_cast<int>(mode.blend);
+}
+
+PaintMode paint_mode_from_item_data(int data) {
+  if (data == kPaintModeBehindData) {
+    return PaintMode::behind();
+  }
+  if (data == kPaintModeClearData) {
+    return PaintMode::clear();
+  }
+  const auto found = std::find_if(kBlendModes.begin(), kBlendModes.end(),
+                                  [data](BlendMode mode) { return static_cast<int>(mode) == data; });
+  return found != kBlendModes.end() ? PaintMode::of(*found) : PaintMode{};
+}
+
+void add_paint_mode_items(QComboBox* combo) {
+  const auto add = [combo](PaintMode mode) { combo->addItem(paint_mode_name(mode), paint_mode_item_data(mode)); };
+  for (const auto mode : kBlendModes) {
+    if (blend_mode_starts_group(mode)) {
+      add_group_separator(combo);
+    }
+    add(PaintMode::of(mode));
+    if (mode == BlendMode::Dissolve) {
+      add(PaintMode::behind());
+      add(PaintMode::clear());
+    }
+  }
+  install_blend_mode_arrow_keys(combo);
+}
+
+void retranslate_paint_mode_items(QComboBox* combo) {
+  if (combo == nullptr) {
+    return;
+  }
+  for (int index = 0; index < combo->count(); ++index) {
+    if (!is_blend_mode_separator(combo, index)) {
+      combo->setItemText(index, paint_mode_name(paint_mode_from_item_data(combo->itemData(index).toInt())));
+    }
+  }
+}
+
+void retranslate_blend_mode_items(QComboBox* combo) {
+  if (combo == nullptr) {
+    return;
+  }
+  for (int index = 0; index < combo->count(); ++index) {
+    if (!is_blend_mode_separator(combo, index)) {
+      combo->setItemText(index, blend_mode_name(static_cast<BlendMode>(combo->itemData(index).toInt())));
+    }
+  }
+}
+
+bool is_blend_mode_separator(const QComboBox* combo, int index) {
+  return combo != nullptr && index >= 0 && index < combo->count() &&
+         is_separator_index(combo->model()->index(index, combo->modelColumn(), combo->rootModelIndex()));
+}
+
+
+void enable_blend_mode_items_for_depth(QComboBox* combo, BitDepth depth) {
+  auto* model = combo != nullptr ? qobject_cast<QStandardItemModel*>(combo->model()) : nullptr;
+  if (model == nullptr) {
+    return;
+  }
+  for (int index = 0; index < combo->count(); ++index) {
+    if (auto* item = model->item(index); item != nullptr && !is_blend_mode_separator(combo, index)) {
+      item->setEnabled(blend_mode_supported_at_depth(static_cast<BlendMode>(combo->itemData(index).toInt()), depth));
+    }
+  }
+}
+
+void PopupAwareComboBox::showPopup() {
+  if (popup_shown) {
+    popup_shown();
+  }
+  // The list's window exists once view() is called; watching its Hide catches closes
+  // that bypass hidePopup.
+  if (auto* popup = view()->window(); popup != nullptr && popup != watched_popup_ && popup != window()) {
+    if (watched_popup_ != nullptr) {
+      watched_popup_->removeEventFilter(this);
+    }
+    popup->installEventFilter(this);
+    watched_popup_ = popup;
+  }
+  QComboBox::showPopup();
+}
+
+void PopupAwareComboBox::hidePopup() {
+  QComboBox::hidePopup();
+  if (popup_hidden) {
+    popup_hidden();
+  }
+}
+
+bool PopupAwareComboBox::eventFilter(QObject* watched, QEvent* event) {
+  if (watched == watched_popup_ && event->type() == QEvent::Hide && popup_hidden) {
+    popup_hidden();
+  }
+  return QComboBox::eventFilter(watched, event);
+}
+
+void PopupAwareComboBox::set_shrink_widths(int natural, int minimum) {
+  natural = std::max(0, natural);
+  minimum = std::clamp(minimum, 0, natural);
+  if (natural == natural_width_ && minimum == shrink_minimum_width_) {
+    return;
+  }
+  natural_width_ = natural;
+  shrink_minimum_width_ = minimum;
+  updateGeometry();
+}
+
+int PopupAwareComboBox::longest_entry_box_width() const {
+  return QComboBox::minimumSizeHint().width();
+}
+
+QSize PopupAwareComboBox::sizeHint() const {
+  auto hint = QComboBox::sizeHint();
+  if (natural_width_ > 0) {
+    hint.setWidth(natural_width_);
+  }
+  return hint;
+}
+
+QSize PopupAwareComboBox::minimumSizeHint() const {
+  auto hint = QComboBox::minimumSizeHint();
+  if (natural_width_ > 0) {
+    hint.setWidth(shrink_minimum_width_);
+  }
+  return hint;
+}
+
+QString PopupAwareComboBox::displayed_text() const {
+  const auto text = currentText();
+  if (natural_width_ <= 0 || text.isEmpty()) {
+    return text;
+  }
+  const int room = combo_box_text_room(*this);
+  return fontMetrics().horizontalAdvance(text) <= room ? text : fontMetrics().elidedText(text, Qt::ElideRight, room);
+}
+
+QString PopupAwareComboBox::hover_text() const {
+  const auto tip = toolTip();
+  const auto text = currentText();
+  if (displayed_text() == text) {
+    return tip;
+  }
+  return tip.isEmpty() ? text : tip + QLatin1Char('\n') + text;
+}
+
+bool PopupAwareComboBox::event(QEvent* event) {
+  if (event->type() == QEvent::ToolTip && displayed_text() != currentText()) {
+    QToolTip::showText(static_cast<QHelpEvent*>(event)->globalPos(), hover_text(), this);
+    return true;
+  }
+  return QComboBox::event(event);
+}
+
+void PopupAwareComboBox::paintEvent(QPaintEvent* event) {
+  const auto shown = displayed_text();
+  if (shown == currentText()) {
+    QComboBox::paintEvent(event);
+    return;
+  }
+  // QComboBox::paintEvent with the label shortened: the style clips a long label mid-letter.
+  QStylePainter painter(this);
+  painter.setPen(palette().color(QPalette::Text));
+  QStyleOptionComboBox option;
+  initStyleOption(&option);
+  painter.drawComplexControl(QStyle::CC_ComboBox, option);
+  option.currentText = shown;
+  painter.drawControl(QStyle::CE_ComboBoxLabel, option);
+}
+
+}  // namespace patchy::ui

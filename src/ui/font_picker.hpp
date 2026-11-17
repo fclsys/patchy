@@ -1,0 +1,200 @@
+#pragma once
+
+#include <QElapsedTimer>
+#include <QFont>
+#include <QFontComboBox>
+#include <QFontDatabase>
+#include <QHash>
+#include <QList>
+#include <QPointer>
+#include <QString>
+#include <QStringList>
+#include <QWidget>
+
+#include <functional>
+#include <vector>
+
+class QAction;
+class QFrame;
+
+namespace patchy::ui {
+
+class FontPickerCombo;
+
+// objectName of the search/preview popup. MainWindow::is_text_option_widget matches it BY NAME
+// (a Qt::Popup is a window, so isAncestorOf-based ownership checks stop at its boundary);
+// renaming it would make focusing the search box auto-commit an open inline text editor.
+inline constexpr char kFontPickerPopupObjectName[] = "textFontPickerPopup";
+
+// The popup list's rows: families, plus the two section headers when the Recent section shows
+// (GitHub issue 569), or the Favorites header and, when no favorite passes, a one-line note
+// (GitHub issue 630), and the header of each extra section a caller handed the picker (GitHub
+// issue 692). Only family rows are selectable; the row-kind role tells them apart.
+inline constexpr int kFontPickerRowKindRole = Qt::UserRole + 1;
+inline constexpr int kFontPickerRecentRowRole = Qt::UserRole + 2;    // bool: a row of the Recent section
+inline constexpr int kFontPickerFavoriteRole = Qt::UserRole + 3;     // bool: the family is a favorite
+// The text a row draws. A family row's Qt::DisplayRole stays the family as the font database lists
+// it (the key picks, Recent and Favorites use); this is its English name while "Show font names in
+// English" is on and the family has one (GitHub issue 691), else the same family.
+inline constexpr int kFontPickerShownNameRole = Qt::UserRole + 4;
+// A family row of an extra section (FontPickerCombo::set_extra_sections): the section's index
+// (int; -1 for every other row) and the dim note drawn beside the name (QString, may be empty).
+inline constexpr int kFontPickerExtraSectionRole = Qt::UserRole + 5;
+inline constexpr int kFontPickerRowNoteRole = Qt::UserRole + 6;
+// bool: the family row has the remove button (a Recent row, or a row of an extra section with a
+// `remove` action).
+inline constexpr int kFontPickerRowRemovableRole = Qt::UserRole + 7;
+enum class FontPickerRowKind {
+  family = 0,
+  recent_header = 1,
+  all_header = 2,
+  favorites_header = 3,
+  empty_note = 4,
+  extra_section_header = 5,
+};
+
+// A short section a caller puts above the popup's normal list (GitHub issue 692: the Missing
+// Fonts dialog's "Chosen before" and "Suggested"). `title` and each `note` arrive translated.
+struct FontPickerSectionRow {
+  QString family;  // as the font database lists it; a family that is not installed is left out
+  QString note;    // drawn dim beside the name ("same character widths"); may be empty
+};
+struct FontPickerSection {
+  QString title;
+  std::vector<FontPickerSectionRow> rows;
+  // Set: every row gets the remove button the Recent rows have (issue 692 follow-up: "Chosen
+  // before"). A click calls it with the row's family and drops the row from this popup and the
+  // next; the family stays in the rest of the list. `remove_tooltip` arrives translated.
+  std::function<void(const QString& family)> remove{};
+  QString remove_tooltip{};
+};
+
+// The small buttons at the right of a family row (GitHub issues 630 and 569): the favorite star on
+// every family row, and the remove button on Recent rows and on the rows of an extra section with a
+// `remove` action (kFontPickerRowRemovableRole), rightmost, with the star just left of it.
+enum class FontPickerRowButton { none, favorite, remove_recent };
+// The button's rectangle inside a row's visual rect; empty for the remove button of a row that has
+// none.
+[[nodiscard]] QRect font_picker_row_button_rect(const QRect& row_rect, FontPickerRowButton button,
+                                                bool removable_row);
+
+// Per-family info for list rows and previews, computed lazily the first time a family is
+// painted or hovered (never precomputed across the whole database -- hundreds of families).
+struct FontFamilyRenderInfo {
+  QFont display_font;   // the family's own font for its list row; the UI font when the family
+                        // cannot render its own Latin name (symbol fonts)
+  QFont sample_font;    // the family's own font with NoFontMerging (honest glyph coverage)
+  QString row_sample;   // short glyph run drawn beside the name when the name is in the UI font
+  bool latin_capable{false};
+  // A Symbol-class family that claims Latin anyway (URW's Standard Symbols PS and D050000L): its
+  // Latin letters are Greek letters or dingbats, so its name is drawn in the UI font too.
+  bool symbol_glyphs{false};
+  QList<QFontDatabase::WritingSystem> systems;  // the full claimed list, priority-ordered
+};
+
+// The hover preview pane at the bottom of the picker popup: the family name as a large
+// specimen, a Latin pangram, then curated sample lines for the notable scripts the font
+// covers (CJK, Arabic, Hebrew, Thai, Indic, symbol glyphs); minor European scripts collapse
+// into a dim "Also supports" footer. Sample lines render with NoFontMerging so Qt's font
+// fallback cannot fake script coverage.
+class FontPreviewPane : public QWidget {
+  Q_OBJECT
+
+public:
+  FontPreviewPane(FontPickerCombo& combo, QWidget* parent);
+
+  void set_family(const QString& family);
+  [[nodiscard]] const QString& family() const noexcept { return family_; }
+  [[nodiscard]] QStringList line_texts() const;  // sample text per line (test accessor)
+  [[nodiscard]] const QString& footer_text() const noexcept { return footer_; }
+
+protected:
+  void paintEvent(QPaintEvent* event) override;
+
+private:
+  struct PreviewLine {
+    QFont font;
+    QString text;
+    QString label;  // writing-system name, drawn small and dim
+  };
+  void rebuild_lines();
+
+  FontPickerCombo& combo_;
+  QString family_;
+  std::vector<PreviewLine> lines_;
+  QString footer_;  // "Also supports: ..." pinned to the pane bottom; empty when none
+};
+
+// Drop-in QFontComboBox for the Options bar: the closed control is unchanged, but opening it
+// shows a searchable family list (live substring filter, Style and Language filters, a Recent
+// section on top) with a hover/keyboard preview pane instead of the stock dropdown. Selection commits through setCurrentIndex, so
+// currentFontChanged fires exactly like the stock combo and existing wiring keeps working.
+class FontPickerCombo : public QFontComboBox {
+  Q_OBJECT
+
+public:
+  explicit FontPickerCombo(QWidget* parent = nullptr);
+
+  void showPopup() override;
+  void hidePopup() override;
+
+  // Lazy per-family cache shared by the row delegate and the preview pane. The returned
+  // reference is only valid until the next call (QHash rehash); copy it to keep it.
+  const FontFamilyRenderInfo& family_render_info(const QString& family);
+
+  // A text layer set in a font this computer lacks (GitHub issue 652). The family cannot be a
+  // row, so the combo stays parked on an installed row; set_missing_family shows the missing name
+  // in the closed control instead, in italics with the missing-font warning badge and a tooltip.
+  // An empty name, any pick (popup or a name typed into the control) and any edit clear it.
+  // `shown` is the text the control shows (the family without its face words, issue 669;
+  // empty: `family` itself); the tooltip names the whole font.
+  // docs/font-resolution-missing-fonts.md, "The bar names a missing font".
+  void set_missing_family(const QString& family, const QString& shown = QString());
+  [[nodiscard]] const QString& missing_family() const { return missing_family_; }
+  // The installed row the control is parked on: the family new type and the popup start from.
+  // Equals currentText() unless a missing family or the row's English name is shown.
+  [[nodiscard]] QString row_family() const;
+
+  // Extra sections for the top of the popup's list, above Recent (GitHub issue 692). They follow
+  // the Recent section's rules: hidden while the search box has text and in the Favorites view,
+  // and their rows pass the Style and Language filters like any other; a section with no row to
+  // show has no header. Takes effect the next time the popup opens. The options bar's picker
+  // sets none. docs/font-picker.md, "Extra sections".
+  void set_extra_sections(std::vector<FontPickerSection> sections);
+  [[nodiscard]] const std::vector<FontPickerSection>& extra_sections() const noexcept { return extra_sections_; }
+  // The remove button of extra section `section`'s row for `family`: drops the row and runs the
+  // section's `remove` action. The open popup updates its own list.
+  void remove_extra_section_row(int section, const QString& family);
+
+protected:
+  void focusOutEvent(QFocusEvent* event) override;
+  void changeEvent(QEvent* event) override;
+  // Enter on an English name typed (or shown) in the closed control picks the family it stands for.
+  bool eventFilter(QObject* watched, QEvent* event) override;
+
+private:
+  // Scroll the closed control's text back to the start of the family name (GitHub issue 416):
+  // QLineEdit::setText parks the cursor at the end, which hides the start of a long name.
+  void show_name_from_start();
+  // Restyles the line edit for missing_family_ (italic, badge action, tooltip) or back to plain.
+  void refresh_missing_family_decoration();
+  // "Show font names in English" (GitHub issue 691): shows the current row under its English
+  // name in the closed control, with the combo's signals blocked so currentFont() keeps the
+  // family the database lists. Replaces the row's own name; with `replace_shown_name` also a
+  // name set by code earlier (the option or the name table changed).
+  void show_row_display_name(bool replace_shown_name);
+
+  QString missing_family_;
+  QPointer<QAction> missing_badge_;
+  std::vector<FontPickerSection> extra_sections_;
+
+  QPointer<QFrame> popup_;
+  // Toggle guard: the click that dismisses the Qt::Popup is replayed onto the combo (or lands
+  // while the popup is still closing), which would instantly reopen it. Same machinery as
+  // BrushTipPicker::show_popup().
+  QElapsedTimer popup_clock_;
+  qint64 popup_dismissed_ms_{-1};
+  QHash<QString, FontFamilyRenderInfo> render_info_;  // persists across popup opens
+};
+
+}  // namespace patchy::ui

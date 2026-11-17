@@ -1,0 +1,1661 @@
+#include <QStatusBar>
+
+#include "ui/canvas_widget.hpp"
+#include "ui/channel_panel.hpp"
+#include "local_psd_fixtures.hpp"
+#include "color/color_management.hpp"
+#include "core/layer_metadata.hpp"
+#include "ui/main_window.hpp"
+#include "ui/app_settings.hpp"
+#include "ui/tool_cursors.hpp"
+#include "render/compositor.hpp"
+#include "test_harness.hpp"
+#include <QAction>
+#include <QApplication>
+#include <QByteArray>
+#include <QContextMenuEvent>
+#include <QCursor>
+#include <QKeyEvent>
+#include <QMouseEvent>
+#include <QPainter>
+#include <QElapsedTimer>
+#include <QFile>
+#include <QFileDialog>
+#include <QFileInfo>
+#include <QInputDialog>
+#include <QListWidget>
+#include <QTemporaryDir>
+#include <QMenu>
+#include <QMessageBox>
+#include <QIODevice>
+#include <QSpinBox>
+#include <QStringList>
+#include <QTabBar>
+#include <QTabWidget>
+#include <QTimer>
+#include <QToolButton>
+#include <QWidget>
+#include <algorithm>
+#include <atomic>
+#include <array>
+#include <cstdint>
+#include <cmath>
+#include <cstring>
+#include <exception>
+#include <filesystem>
+#include <fstream>
+#include <functional>
+#include <iostream>
+#include <limits>
+#include <memory>
+#include <optional>
+#include <span>
+#include <stdexcept>
+#include <string>
+#include <string_view>
+#include <utility>
+#include <vector>
+#include "ui_test_access.hpp"
+#include "ui_test_groups.hpp"
+#include "ui_test_support.hpp"
+
+namespace {
+
+using namespace patchy::test::ui;
+
+void ui_channels_panel_targets_and_alpha_edits() {
+  patchy::Document document(64, 48, patchy::PixelFormat::rgb8());
+  auto& layer = document.add_pixel_layer(
+      "Locked Color", solid_pixels(64, 48, patchy::PixelFormat::rgb8(), QColor(80, 140, 210)));
+  patchy::set_layer_lock_flags(layer, patchy::kLayerLockImagePixels);
+  const auto add_channel = [&document](std::string name, patchy::DocumentChannelKind kind,
+                                       std::uint8_t value) {
+    patchy::PixelBuffer pixels(document.width(), document.height(), patchy::PixelFormat::gray8());
+    pixels.clear(value);
+    const auto id = document.allocate_channel_id();
+    document.add_channel(patchy::DocumentChannel(id, std::move(name), kind, std::move(pixels)));
+    return id;
+  };
+  const auto alpha_id = add_channel("Alpha A", patchy::DocumentChannelKind::Alpha, 0);
+  const auto spot_id = add_channel("Spot Ink", patchy::DocumentChannelKind::Spot, 96);
+  const auto alpha_b_id = add_channel("Alpha B", patchy::DocumentChannelKind::Alpha, 180);
+
+  patchy::ui::MainWindow window;
+  window.add_document_session(std::move(document), QStringLiteral("Channels"));
+  show_window(window);
+  auto* canvas = require_canvas(window);
+  auto& active_document = patchy::ui::MainWindowTestAccess::document(window);
+  auto* layer_list = window.findChild<QListWidget*>(QStringLiteral("layerList"));
+  auto* layers_dock = window.findChild<QWidget*>(QStringLiteral("layersDock"));
+  auto* channels_dock = window.findChild<QWidget*>(QStringLiteral("channelsDock"));
+  auto* channels_panel = window.findChild<QWidget*>(QStringLiteral("channelPanel"));
+  auto* channels_toggle = window.findChild<QToolButton*>(QStringLiteral("channelsDockCollapseButton"));
+  auto* channels = window.findChild<QListWidget*>(QStringLiteral("channelList"));
+  CHECK(layer_list != nullptr);
+  CHECK(layers_dock != nullptr);
+  CHECK(channels_dock != nullptr);
+  CHECK(channels_panel != nullptr);
+  CHECK(channels_toggle != nullptr);
+  CHECK(channels != nullptr);
+  // Layers and Channels share the column's tab group, its tab bar above the panels.
+  CHECK(patchy::ui::MainWindowTestAccess::panel_column(window)->section_widget(QStringLiteral("layersDock")) ==
+        patchy::ui::MainWindowTestAccess::panel_column(window)->section_widget(QStringLiteral("channelsDock")));
+  QTabBar* dock_tabs = nullptr;
+  int layers_tab = -1;
+  int channels_tab = -1;
+  for (auto* candidate : window.findChildren<QTabBar*>()) {
+    int candidate_layers = -1;
+    int candidate_channels = -1;
+    for (int index = 0; index < candidate->count(); ++index) {
+      if (candidate->tabText(index) == QStringLiteral("Layers")) {
+        candidate_layers = index;
+      } else if (candidate->tabText(index) == QStringLiteral("Channels")) {
+        candidate_channels = index;
+      }
+    }
+    if (candidate_layers >= 0 && candidate_channels >= 0) {
+      dock_tabs = candidate;
+      layers_tab = candidate_layers;
+      channels_tab = candidate_channels;
+      break;
+    }
+  }
+  CHECK(dock_tabs != nullptr);
+  CHECK(dock_tabs->currentIndex() == layers_tab);
+  CHECK(dock_tabs->mapToGlobal(QPoint()).y() < layers_dock->mapToGlobal(QPoint()).y());
+  const auto average_tab_lightness = [dock_tabs](int index) {
+    const auto image = dock_tabs->grab().toImage();
+    auto sample = dock_tabs->tabRect(index).adjusted(5, 4, -5, -4);
+    sample.setRight(std::min(sample.right(), sample.left() + 5));
+    std::int64_t total = 0;
+    int count = 0;
+    for (int y = sample.top(); y <= sample.bottom(); ++y) {
+      for (int x = sample.left(); x <= sample.right(); ++x) {
+        total += image.pixelColor(x, y).lightness();
+        ++count;
+      }
+    }
+    CHECK(count > 0);
+    return static_cast<int>(total / count);
+  };
+  CHECK(average_tab_lightness(layers_tab) >= average_tab_lightness(channels_tab) + 8);
+  CHECK(channels_toggle->isChecked());
+  CHECK(channels_toggle->text() == QStringLiteral("v"));
+  dock_tabs->setCurrentIndex(channels_tab);
+  QApplication::processEvents();
+  CHECK(dock_tabs->currentIndex() == channels_tab);
+  CHECK(channels_panel->isVisible());
+  // The column edge stays grabbable whichever tab is in front.
+  auto* column_edge = window.findChild<QWidget*>(QStringLiteral("rightDockResizeHandle"));
+  CHECK(column_edge != nullptr);
+  CHECK(column_edge->isVisible());
+  dock_tabs->setCurrentIndex(layers_tab);
+  QApplication::processEvents();
+  CHECK(dock_tabs->currentIndex() == layers_tab);
+  CHECK(layer_list->isVisible());
+  dock_tabs->setCurrentIndex(channels_tab);
+  QApplication::processEvents();
+  CHECK(dock_tabs->currentIndex() == channels_tab);
+  CHECK(channels_panel->isVisible());
+  CHECK(channels->count() == 7);
+  const QStringList expected_names{QStringLiteral("Composite"), QStringLiteral("Red"),
+                                   QStringLiteral("Green"), QStringLiteral("Blue"),
+                                   QStringLiteral("Alpha A"), QStringLiteral("Spot Ink"),
+                                   QStringLiteral("Alpha B")};
+  for (int row_index = 0; row_index < channels->count(); ++row_index) {
+    CHECK(channels->item(row_index)->text() == expected_names[row_index]);
+  }
+
+  // Saved alphas cannot be moved above the four derived component rows.
+  CHECK(channels->model()->moveRow(QModelIndex(), 4, QModelIndex(), 0));
+  QApplication::processEvents();
+  QApplication::processEvents();
+  for (int row_index = 0; row_index < channels->count(); ++row_index) {
+    CHECK(channels->item(row_index)->text() == expected_names[row_index]);
+  }
+
+  // Alpha rows cannot cross a spot row: the panel restores the committed order
+  // before asking MainWindow to mutate the document.
+  CHECK(channels->model()->moveRow(QModelIndex(), 6, QModelIndex(), 4));
+  QApplication::processEvents();
+  QApplication::processEvents();
+  CHECK(channels->item(5)->text() == QStringLiteral("Spot Ink"));
+  CHECK(active_document.channels()[0].id() == alpha_id);
+  CHECK(active_document.channels()[1].id() == spot_id);
+  CHECK(active_document.channels()[2].id() == alpha_b_id);
+
+  channels->setCurrentRow(1);
+  QApplication::processEvents();
+  CHECK(canvas->layer_edit_target() == patchy::ui::CanvasWidget::LayerEditTarget::ComponentRed);
+  CHECK(!require_action_by_text(window, QStringLiteral("Brush"))->isEnabled());
+  CHECK(!require_action_by_text(window, QStringLiteral("Move"))->isEnabled());
+  CHECK(!require_hotkey_action(window, QStringLiteral("layer.flip_horizontal"))->isEnabled());
+  CHECK(!require_hotkey_action(window, QStringLiteral("layer.flip_vertical"))->isEnabled());
+  CHECK(!require_action(window, "filterAction_patchy_filters_edge_detect")->isEnabled());
+  const auto red_preview = canvas_pixel(*canvas, QPoint(32, 24));
+  CHECK(std::abs(red_preview.red() - 80) <= 4);
+  CHECK(std::abs(red_preview.green() - red_preview.red()) <= 2);
+  CHECK(std::abs(red_preview.blue() - red_preview.red()) <= 2);
+  auto* chip = window.findChild<QToolButton*>(QStringLiteral("maskEditModeChip"));
+  CHECK(chip != nullptr);
+  CHECK(chip->isVisible());
+  CHECK(chip->text().contains(QStringLiteral("Red")));
+  chip->click();
+  QApplication::processEvents();
+  CHECK(canvas->layer_edit_target() == patchy::ui::CanvasWidget::LayerEditTarget::Content);
+
+  channels->setCurrentRow(5);
+  QApplication::processEvents();
+  CHECK(canvas->layer_edit_target() == patchy::ui::CanvasWidget::LayerEditTarget::DocumentChannel);
+  CHECK(canvas->active_document_channel_id() == spot_id);
+  CHECK(!canvas->document_channel_is_editable());
+  CHECK(!require_action(window, "channelRenameAction")->isEnabled());
+  CHECK(!require_action(window, "channelInvertAction")->isEnabled());
+  CHECK(!require_action(window, "channelDeleteAction")->isEnabled());
+  CHECK(require_action(window, "channelLoadSelectionAction")->isEnabled());
+  patchy::ui::MainWindowTestAccess::update_document_action_state(window);
+  CHECK(!require_action(window, "channelRenameAction")->isEnabled());
+  CHECK(!require_action(window, "channelInvertAction")->isEnabled());
+  CHECK(!require_action(window, "channelDeleteAction")->isEnabled());
+  CHECK(require_action(window, "channelLoadSelectionAction")->isEnabled());
+
+  channels->setCurrentRow(4);
+  QApplication::processEvents();
+  CHECK(canvas->active_document_channel_id() == alpha_id);
+  CHECK(canvas->document_channel_is_editable());
+  CHECK(!require_hotkey_action(window, QStringLiteral("layer.flip_horizontal"))->isEnabled());
+  CHECK(!require_hotkey_action(window, QStringLiteral("layer.flip_vertical"))->isEnabled());
+  CHECK(require_action_by_text(window, QStringLiteral("Brush"))->isEnabled());
+  CHECK(require_action(window, "layerFillForegroundAction")->isEnabled());
+  CHECK(!require_action(window, "filterAction_patchy_filters_edge_detect")->isEnabled());
+
+  // A saved channel's eye shows it as a colored overlay over the composite.
+  auto* panel = window.findChild<patchy::ui::ChannelPanel*>(QStringLiteral("channelPanel"));
+  CHECK(panel != nullptr);
+  const auto click_saved_eye = [&] {
+    const auto eye = panel->eye_rect(4).center();
+    send_mouse(*channels->viewport(), QEvent::MouseButtonPress, eye, Qt::LeftButton, Qt::LeftButton);
+    send_mouse(*channels->viewport(), QEvent::MouseButtonRelease, eye, Qt::LeftButton, Qt::NoButton);
+    QApplication::processEvents();
+  };
+  CHECK(panel->row_eye(4) == std::optional<bool>(false));
+  // Shown alone, a saved channel hides the color channels.
+  CHECK(panel->row_eye(0) == std::optional<bool>(false));
+  CHECK(panel->row_eye(1) == std::optional<bool>(false));
+  click_saved_eye();
+  CHECK(canvas->mask_display_mode() == patchy::ui::CanvasWidget::MaskDisplayMode::Overlay);
+  CHECK(panel->row_eye(4) == std::optional<bool>(true));
+  CHECK(panel->row_eye(0) == std::optional<bool>(true));
+  const auto overlay_preview = canvas_pixel(*canvas, QPoint(32, 24));
+  CHECK(overlay_preview.red() > 120);
+  CHECK(overlay_preview.blue() < 170);
+  click_saved_eye();
+  CHECK(canvas->mask_display_mode() == patchy::ui::CanvasWidget::MaskDisplayMode::Grayscale);
+  CHECK(panel->row_eye(4) == std::optional<bool>(false));
+  // A color eye while the saved channel shows alone: the colors come back under it, and
+  // it stays selected, now as an overlay.
+  {
+    const auto red_eye = panel->eye_rect(1).center();
+    send_mouse(*channels->viewport(), QEvent::MouseButtonPress, red_eye, Qt::LeftButton, Qt::LeftButton);
+    send_mouse(*channels->viewport(), QEvent::MouseMove, red_eye + QPoint(2, 1), Qt::NoButton, Qt::LeftButton);
+    send_mouse(*channels->viewport(), QEvent::MouseButtonRelease, red_eye + QPoint(2, 1), Qt::LeftButton,
+               Qt::NoButton);
+    QApplication::processEvents();
+  }
+  CHECK(channels->currentRow() == 4);
+  CHECK(canvas->active_document_channel_id() == alpha_id);
+  CHECK(canvas->mask_display_mode() == patchy::ui::CanvasWidget::MaskDisplayMode::Overlay);
+  CHECK(panel->row_eye(0) == std::optional<bool>(true));
+  CHECK(panel->row_eye(4) == std::optional<bool>(true));
+  click_saved_eye();
+  CHECK(canvas->mask_display_mode() == patchy::ui::CanvasWidget::MaskDisplayMode::Grayscale);
+
+  const auto composite_before = patchy::Compositor{}.flatten_rgb8(active_document);
+  canvas->set_primary_color(Qt::white);
+  use_solid_fill_settings(canvas);
+  require_action_by_text(window, QStringLiteral("Brush"))->trigger();
+  const auto brush_point = canvas->widget_position_for_document_point(QPoint(12, 12));
+  send_mouse(*canvas, QEvent::MouseButtonPress, brush_point, Qt::LeftButton, Qt::LeftButton);
+  send_mouse(*canvas, QEvent::MouseButtonRelease, brush_point, Qt::LeftButton, Qt::NoButton);
+  QApplication::processEvents();
+  CHECK(*static_cast<const patchy::Document&>(active_document).find_channel(alpha_id)->pixels().pixel(12, 12) > 0);
+
+  const auto diagnostics_before = canvas->render_cache_diagnostics();
+  require_action(window, "layerFillForegroundAction")->trigger();
+  QApplication::processEvents();
+  const auto* filled_channel = static_cast<const patchy::Document&>(active_document).find_channel(alpha_id);
+  CHECK(filled_channel != nullptr);
+  CHECK(*filled_channel->pixels().pixel(12, 12) == 255);
+  const auto diagnostics_after = canvas->render_cache_diagnostics();
+  CHECK(diagnostics_after.full_refreshes == diagnostics_before.full_refreshes);
+  CHECK(diagnostics_after.partial_patches == diagnostics_before.partial_patches);
+  const auto composite_after = patchy::Compositor{}.flatten_rgb8(active_document);
+  CHECK(composite_after.data().size() == composite_before.data().size());
+  CHECK(std::equal(composite_before.data().begin(), composite_before.data().end(),
+                   composite_after.data().begin()));
+
+  channels->setCurrentRow(0);
+  QApplication::processEvents();
+  CHECK(canvas->layer_edit_target() == patchy::ui::CanvasWidget::LayerEditTarget::Content);
+  CHECK(color_close(canvas_pixel(*canvas, QPoint(32, 24)), QColor(80, 140, 210), 4));
+
+  channels->setCurrentItem(require_layer_item(*channels, QStringLiteral("Alpha A")));
+  QApplication::processEvents();
+  const auto diagnostics_before_history = canvas->render_cache_diagnostics();
+  require_action(window, "channelInvertAction")->trigger();
+  QApplication::processEvents();
+  CHECK(*static_cast<const patchy::Document&>(active_document).find_channel(alpha_id)->pixels().pixel(12, 12) == 0);
+  require_hotkey_action(window, QStringLiteral("edit.undo"))->trigger();
+  QApplication::processEvents();
+  (void)canvas_pixel(*canvas, QPoint(20, 16));
+  const auto diagnostics_after_undo = canvas->render_cache_diagnostics();
+  CHECK(diagnostics_after_undo.full_refreshes == diagnostics_before_history.full_refreshes);
+  CHECK(diagnostics_after_undo.partial_patches == diagnostics_before_history.partial_patches);
+  CHECK(*static_cast<const patchy::Document&>(active_document).find_channel(alpha_id)->pixels().pixel(12, 12) == 255);
+  require_hotkey_action(window, QStringLiteral("edit.redo"))->trigger();
+  QApplication::processEvents();
+  (void)canvas_pixel(*canvas, QPoint(20, 16));
+  const auto diagnostics_after_redo = canvas->render_cache_diagnostics();
+  CHECK(diagnostics_after_redo.full_refreshes == diagnostics_before_history.full_refreshes);
+  CHECK(diagnostics_after_redo.partial_patches == diagnostics_before_history.partial_patches);
+  CHECK(*static_cast<const patchy::Document&>(active_document).find_channel(alpha_id)->pixels().pixel(12, 12) == 0);
+  CHECK(chip->isVisible());
+  CHECK(chip->text().contains(QStringLiteral("Alpha A")));
+}
+
+void ui_channel_ctrl_click_context_menu_and_compact_actions() {
+  patchy::Document document(3, 1, patchy::PixelFormat::rgb8());
+  patchy::PixelBuffer pixels(3, 1, patchy::PixelFormat::rgba8());
+  const std::array<std::array<std::uint8_t, 4>, 3> samples{{
+      {64, 128, 192, 255},
+      {200, 100, 50, 128},
+      {10, 20, 30, 0},
+  }};
+  for (int x = 0; x < pixels.width(); ++x) {
+    auto* pixel = pixels.pixel(x, 0);
+    std::copy(samples[static_cast<std::size_t>(x)].begin(),
+              samples[static_cast<std::size_t>(x)].end(), pixel);
+  }
+  document.add_pixel_layer("Pixels", std::move(pixels));
+
+  patchy::PixelBuffer alpha_pixels(3, 1, patchy::PixelFormat::gray8());
+  *alpha_pixels.pixel(0, 0) = 0;
+  *alpha_pixels.pixel(1, 0) = 73;
+  *alpha_pixels.pixel(2, 0) = 255;
+  const auto alpha_id = document.allocate_channel_id();
+  document.add_channel(patchy::DocumentChannel(alpha_id, "Alpha Test",
+                                                patchy::DocumentChannelKind::Alpha,
+                                                std::move(alpha_pixels)));
+  patchy::PixelBuffer spot_pixels(3, 1, patchy::PixelFormat::gray8());
+  *spot_pixels.pixel(0, 0) = 12;
+  *spot_pixels.pixel(1, 0) = 128;
+  *spot_pixels.pixel(2, 0) = 244;
+  const auto spot_id = document.allocate_channel_id();
+  document.add_channel(patchy::DocumentChannel(spot_id, "Spot Test",
+                                                patchy::DocumentChannelKind::Spot,
+                                                std::move(spot_pixels)));
+
+  patchy::ui::MainWindow window;
+  window.add_document_session(std::move(document), QStringLiteral("Channel Gestures"));
+  show_window(window);
+  auto* canvas = require_canvas(window);
+  auto* channels_dock = window.findChild<QWidget*>(QStringLiteral("channelsDock"));
+  auto* panel = window.findChild<QWidget*>(QStringLiteral("channelPanel"));
+  auto* channels = window.findChild<QListWidget*>(QStringLiteral("channelList"));
+  CHECK(channels_dock != nullptr);
+  CHECK(panel != nullptr);
+  CHECK(channels != nullptr);
+  patchy::ui::MainWindowTestAccess::show_panel(window, QStringLiteral("channelsDock"));
+  QApplication::processEvents();
+  CHECK(channels->currentRow() == 0);
+  CHECK(canvas->layer_edit_target() == patchy::ui::CanvasWidget::LayerEditTarget::Content);
+
+  struct ButtonExpectation {
+    const char* button_name;
+    const char* action_name;
+    QString text;
+  };
+  const std::array<ButtonExpectation, 6> button_expectations{{
+      {"channelNewButton", "channelNewAction", QStringLiteral("New Channel")},
+      {"channelSaveSelectionButton", "channelSaveSelectionAction", QStringLiteral("Save Selection as Channel")},
+      {"channelLoadSelectionButton", "channelLoadSelectionAction", QStringLiteral("Load Channel as Selection")},
+      {"channelRenameButton", "channelRenameAction", QStringLiteral("Rename Channel")},
+      {"channelInvertButton", "channelInvertAction", QStringLiteral("Invert Channel")},
+      {"channelDeleteButton", "channelDeleteAction", QStringLiteral("Delete Channel")},
+  }};
+  auto* action_bar = panel->findChild<QWidget*>(QStringLiteral("channelActionBar"));
+  CHECK(action_bar != nullptr);
+  int row_y = -1;
+  int previous_x = -1;
+  std::vector<qint64> icon_keys;
+  for (const auto& expectation : button_expectations) {
+    auto* button = panel->findChild<QToolButton*>(QLatin1String(expectation.button_name));
+    auto* action = require_action(window, expectation.action_name);
+    CHECK(button != nullptr);
+    CHECK(button->defaultAction() == action);
+    CHECK(button->text() == expectation.text);
+    const auto position = button->mapTo(panel, QPoint());
+    CHECK(row_y < 0 || position.y() == row_y);
+    CHECK(position.x() > previous_x);
+    CHECK(button->toolButtonStyle() == Qt::ToolButtonIconOnly);
+    CHECK(!button->icon().isNull());
+    CHECK(!button->icon().pixmap(button->iconSize()).isNull());
+    CHECK(button->toolTip() == action->toolTip());
+    CHECK(button->accessibleName() == expectation.text);
+    CHECK(button->width() <= 36);
+    CHECK(button->height() <= 32);
+    row_y = position.y();
+    previous_x = position.x();
+    icon_keys.push_back(button->icon().cacheKey());
+  }
+  CHECK(action_bar->height() <= 32);
+  std::sort(icon_keys.begin(), icon_keys.end());
+  CHECK(std::adjacent_find(icon_keys.begin(), icon_keys.end()) == icon_keys.end());
+
+  const auto ctrl_click_row = [channels](int row) {
+    const auto point = channels->visualItemRect(channels->item(row)).center();
+    send_mouse(*channels->viewport(), QEvent::MouseButtonPress, point, Qt::LeftButton, Qt::LeftButton,
+               Qt::ControlModifier);
+    send_mouse(*channels->viewport(), QEvent::MouseButtonRelease, point, Qt::LeftButton, Qt::NoButton,
+               Qt::ControlModifier);
+    QApplication::processEvents();
+  };
+
+  ctrl_click_row(1);
+  CHECK(channels->currentRow() == 0);
+  CHECK(canvas->layer_edit_target() == patchy::ui::CanvasWidget::LayerEditTarget::Content);
+  CHECK(canvas->selection_alpha_at(QPoint(0, 0)) == 64);
+  CHECK(canvas->selection_alpha_at(QPoint(1, 0)) == 227);
+  CHECK(canvas->selection_alpha_at(QPoint(2, 0)) == 255);
+
+  ctrl_click_row(0);
+  CHECK(channels->currentRow() == 0);
+  CHECK(canvas->selection_alpha_at(QPoint(0, 0)) == 115);
+  CHECK(canvas->selection_alpha_at(QPoint(1, 0)) == 189);
+  CHECK(canvas->selection_alpha_at(QPoint(2, 0)) == 255);
+
+  ctrl_click_row(4);
+  CHECK(channels->currentRow() == 0);
+  CHECK(canvas->active_document_channel_id() == std::nullopt);
+  CHECK(canvas->selection_alpha_at(QPoint(0, 0)) == 0);
+  CHECK(canvas->selection_alpha_at(QPoint(1, 0)) == 73);
+  CHECK(canvas->selection_alpha_at(QPoint(2, 0)) == 255);
+  require_hotkey_action(window, QStringLiteral("edit.undo"))->trigger();
+  QApplication::processEvents();
+  CHECK(canvas->selection_alpha_at(QPoint(0, 0)) == 115);
+  CHECK(canvas->selection_alpha_at(QPoint(1, 0)) == 189);
+
+  ctrl_click_row(5);
+  CHECK(channels->currentRow() == 0);
+  CHECK(canvas->selection_alpha_at(QPoint(0, 0)) == 12);
+  CHECK(canvas->selection_alpha_at(QPoint(1, 0)) == 128);
+  CHECK(canvas->selection_alpha_at(QPoint(2, 0)) == 244);
+
+  bool saw_context_menu = false;
+  QTimer::singleShot(0, guarded([&window, &saw_context_menu] {
+    auto* menu = window.findChild<QMenu*>(QStringLiteral("channelContextMenu"));
+    CHECK(menu != nullptr);
+    CHECK(menu->objectName() == QStringLiteral("channelContextMenu"));
+    QStringList action_names;
+    for (auto* action : menu->actions()) {
+      if (!action->isSeparator()) {
+        action_names.push_back(action->objectName());
+      }
+    }
+    CHECK(action_names ==
+          QStringList({QStringLiteral("channelNewAction"),
+                       QStringLiteral("channelSaveSelectionAction"),
+                       QStringLiteral("channelLoadSelectionAction"),
+                       QStringLiteral("channelRenameAction"),
+                       QStringLiteral("channelInvertAction"),
+                       QStringLiteral("channelDeleteAction"),
+                       QStringLiteral("channelNewLayerAction"),
+                       QStringLiteral("channelNewColorLayerAction")}));
+    // An alpha channel has values but no color of its own.
+    CHECK(require_action(window, "channelNewLayerAction")->isEnabled());
+    CHECK(!require_action(window, "channelNewColorLayerAction")->isEnabled());
+    CHECK(require_action(window, "channelNewAction")->isEnabled());
+    CHECK(require_action(window, "channelSaveSelectionAction")->isEnabled());
+    CHECK(require_action(window, "channelLoadSelectionAction")->isEnabled());
+    CHECK(require_action(window, "channelRenameAction")->isEnabled());
+    CHECK(require_action(window, "channelInvertAction")->isEnabled());
+    CHECK(require_action(window, "channelDeleteAction")->isEnabled());
+    saw_context_menu = true;
+    menu->close();
+  }));
+  const auto context_point = channels->visualItemRect(channels->item(4)).center();
+  QContextMenuEvent context_event(QContextMenuEvent::Mouse, context_point,
+                                  channels->viewport()->mapToGlobal(context_point));
+  QApplication::sendEvent(channels->viewport(), &context_event);
+  QApplication::processEvents();
+  CHECK(saw_context_menu);
+  CHECK(channels->currentItem()->text() == QStringLiteral("Alpha Test"));
+  CHECK(canvas->active_document_channel_id() == alpha_id);
+  CHECK(static_cast<const patchy::Document&>(patchy::ui::MainWindowTestAccess::document(window))
+            .find_channel(spot_id) != nullptr);
+  save_widget_artifact("ui_channel_compact_actions", *panel);
+}
+
+void ui_channel_shape_previews_match_committed_grayscale_and_overlay() {
+  // Tool settings can flush on a delayed timer during the preview checks.
+  // Do not leave this test's solid-green gradient in later MainWindows.
+  SettingsValueRestorer saved_gradient_method(QStringLiteral("tools/gradientMethod"));
+  SettingsValueRestorer saved_gradient_reverse(QStringLiteral("tools/gradientReverse"));
+  SettingsValueRestorer saved_gradient_opacity(QStringLiteral("tools/gradientOpacity"));
+  SettingsValueRestorer saved_gradient_use_custom(QStringLiteral("tools/gradientUseCustomStops"));
+  SettingsValueRestorer saved_gradient_stops(QStringLiteral("tools/gradientStops"));
+  patchy::Document document(96, 72, patchy::PixelFormat::rgb8());
+  document.add_pixel_layer(
+      "Pixels", solid_pixels(96, 72, patchy::PixelFormat::rgb8(), QColor(80, 140, 210)));
+  patchy::PixelBuffer channel_pixels(96, 72, patchy::PixelFormat::gray8());
+  channel_pixels.clear(0);
+  const auto channel_id = document.allocate_channel_id();
+  document.add_channel(patchy::DocumentChannel(channel_id, "Alpha 1",
+                                                patchy::DocumentChannelKind::Alpha,
+                                                std::move(channel_pixels)));
+
+  patchy::ui::MainWindow window;
+  window.add_document_session(std::move(document), QStringLiteral("Channel Shape Preview"));
+  show_window(window);
+  auto* canvas = require_canvas(window);
+  auto& active_document = patchy::ui::MainWindowTestAccess::document(window);
+  auto* channels = window.findChild<QListWidget*>(QStringLiteral("channelList"));
+  CHECK(channels != nullptr);
+  channels->setCurrentItem(require_layer_item(*channels, QStringLiteral("Alpha 1")));
+  QApplication::processEvents();
+  CHECK(canvas->active_document_channel_id() == channel_id);
+
+  canvas->set_primary_color(QColor(0, 255, 0));  // mask_value_from_color = 150.
+  canvas->set_brush_size(8);
+  canvas->set_brush_opacity(100);
+  canvas->set_brush_softness(0);
+  {
+    // The shapes paint in the foreground color here (a style with no paint of its own), not
+    // in the options bar's fill.
+    auto style = canvas->shape_pixel_style();
+    style.fill_paint.reset();
+    style.stroke_paint.reset();
+    canvas->set_shape_pixel_style(style);
+  }
+  canvas->set_fill_shapes(true);
+  canvas->set_gradient_method(patchy::GradientMethod::Linear);
+  canvas->set_gradient_opacity(100);
+  canvas->set_gradient_reverse(false);
+  canvas->set_gradient_stops(std::vector<patchy::GradientStop>{
+      patchy::GradientStop{0.0F, patchy::EditColor{0, 255, 0, 255}},
+      patchy::GradientStop{1.0F, patchy::EditColor{0, 255, 0, 255}},
+  });
+
+  const QRect full_document(0, 0, active_document.width(), active_document.height());
+  const auto reset_channel = [&](std::uint8_t value) {
+    auto* channel = active_document.find_channel(channel_id);
+    CHECK(channel != nullptr);
+    channel->pixels().clear(value);
+    canvas->grayscale_target_changed(full_document);
+    QApplication::processEvents();
+  };
+  const auto check_solo_preview = [&](patchy::ui::CanvasTool tool, QPoint from, QPoint to,
+                                      QPoint sample) {
+    reset_channel(0);
+    canvas->set_mask_display_mode(patchy::ui::CanvasWidget::MaskDisplayMode::Grayscale);
+    canvas->set_tool(tool);
+    const auto widget_from = canvas->widget_position_for_document_point(from);
+    const auto widget_to = canvas->widget_position_for_document_point(to);
+    send_mouse(*canvas, QEvent::MouseButtonPress, widget_from, Qt::LeftButton, Qt::LeftButton);
+    send_mouse(*canvas, QEvent::MouseMove, widget_to, Qt::NoButton, Qt::LeftButton);
+    const auto preview = canvas_pixel_center(*canvas, sample);
+    send_mouse(*canvas, QEvent::MouseButtonRelease, widget_to, Qt::LeftButton, Qt::NoButton);
+    canvas->commit_pending_pixel_shape();  // a Rectangle or Ellipse stays pending until committed
+    const auto committed = canvas_pixel_center(*canvas, sample);
+    CHECK(color_close(preview, committed, 5));
+    CHECK(std::abs(committed.red() - 150) <= 5);
+    CHECK(std::abs(committed.green() - committed.red()) <= 2);
+    CHECK(std::abs(committed.blue() - committed.red()) <= 2);
+  };
+
+  check_solo_preview(patchy::ui::CanvasTool::Line, QPoint(12, 12), QPoint(76, 12), QPoint(44, 12));
+  check_solo_preview(patchy::ui::CanvasTool::Rectangle, QPoint(18, 18), QPoint(76, 54), QPoint(44, 34));
+  check_solo_preview(patchy::ui::CanvasTool::Ellipse, QPoint(18, 18), QPoint(76, 54), QPoint(47, 36));
+  check_solo_preview(patchy::ui::CanvasTool::Gradient, QPoint(12, 36), QPoint(80, 36), QPoint(46, 36));
+
+  // A white Masked Areas edit removes the existing red overlay. The live
+  // rectangle must reveal the composite immediately and match the release.
+  reset_channel(0);
+  canvas->set_mask_display_mode(patchy::ui::CanvasWidget::MaskDisplayMode::Overlay);
+  canvas->set_primary_color(Qt::white);
+  canvas->set_tool(patchy::ui::CanvasTool::Rectangle);
+  const QPoint overlay_from(18, 18);
+  const QPoint overlay_to(76, 54);
+  const QPoint overlay_sample(44, 34);
+  const auto overlaid_before = canvas_pixel_center(*canvas, overlay_sample);
+  const auto widget_from = canvas->widget_position_for_document_point(overlay_from);
+  const auto widget_to = canvas->widget_position_for_document_point(overlay_to);
+  send_mouse(*canvas, QEvent::MouseButtonPress, widget_from, Qt::LeftButton, Qt::LeftButton);
+  send_mouse(*canvas, QEvent::MouseMove, widget_to, Qt::NoButton, Qt::LeftButton);
+  const auto overlay_preview = canvas_pixel_center(*canvas, overlay_sample);
+  send_mouse(*canvas, QEvent::MouseButtonRelease, widget_to, Qt::LeftButton, Qt::NoButton);
+  // Still pending: the channel's overlay shows it as the drag did.
+  CHECK(canvas->has_pending_pixel_shape());
+  CHECK(color_close(canvas_pixel_center(*canvas, overlay_sample), overlay_preview, 5));
+  canvas->commit_pending_pixel_shape();
+  const auto overlay_committed = canvas_pixel_center(*canvas, overlay_sample);
+  CHECK(!color_close(overlaid_before, QColor(80, 140, 210), 10));
+  CHECK(color_close(overlay_preview, QColor(80, 140, 210), 5));
+  CHECK(color_close(overlay_preview, overlay_committed, 5));
+}
+
+void ui_channels_soft_selection_crud_history_and_layer_exit() {
+  patchy::Document document(96, 72, patchy::PixelFormat::rgb8());
+  document.add_pixel_layer("Pixels",
+                           solid_pixels(96, 72, patchy::PixelFormat::rgb8(), QColor(210, 80, 45)));
+  patchy::ui::MainWindow window;
+  window.add_document_session(std::move(document), QStringLiteral("Channel History"));
+  show_window(window);
+  auto* canvas = require_canvas(window);
+  auto& active_document = patchy::ui::MainWindowTestAccess::document(window);
+  auto* channels_dock = window.findChild<QWidget*>(QStringLiteral("channelsDock"));
+  auto* channels = window.findChild<QListWidget*>(QStringLiteral("channelList"));
+  CHECK(channels_dock != nullptr);
+  CHECK(channels != nullptr);
+  patchy::ui::MainWindowTestAccess::show_panel(window, QStringLiteral("channelsDock"));
+  QApplication::processEvents();
+  CHECK(channels->isVisible());
+
+  require_action_by_text(window, QStringLiteral("Marquee"))->trigger();
+  auto* feather = window.findChild<QSpinBox*>(QStringLiteral("selectionFeatherSpin"));
+  CHECK(feather != nullptr);
+  feather->setValue(12);
+  drag(*canvas, canvas->widget_position_for_document_point(QPoint(24, 18)),
+       canvas->widget_position_for_document_point(QPoint(72, 54)));
+  QApplication::processEvents();
+  std::optional<QPoint> soft_point;
+  for (int y = 0; y < active_document.height() && !soft_point.has_value(); ++y) {
+    for (int x = 0; x < active_document.width(); ++x) {
+      const auto alpha = canvas->selection_alpha_at(QPoint(x, y));
+      if (alpha > 20 && alpha < 230) {
+        soft_point = QPoint(x, y);
+        break;
+      }
+    }
+  }
+  CHECK(soft_point.has_value());
+  const auto saved_alpha = canvas->selection_alpha_at(*soft_point);
+  require_action(window, "channelSaveSelectionAction")->trigger();
+  QApplication::processEvents();
+  CHECK(active_document.channels().size() == 1);
+  const auto first_id = active_document.channels().front().id();
+  CHECK(*active_document.channels().front().pixels().pixel(soft_point->x(), soft_point->y()) == saved_alpha);
+  CHECK(!require_action_by_text(window, QStringLiteral("Move"))->isEnabled());
+  require_hotkey_action(window, QStringLiteral("edit.undo"))->trigger();
+  QApplication::processEvents();
+  CHECK(active_document.channels().empty());
+  CHECK(canvas->layer_edit_target() == patchy::ui::CanvasWidget::LayerEditTarget::Content);
+  CHECK(require_action_by_text(window, QStringLiteral("Move"))->isEnabled());
+  CHECK(require_hotkey_action(window, QStringLiteral("layer.flip_horizontal"))->isEnabled());
+  CHECK(require_action(window, "filterAction_patchy_filters_edge_detect")->isEnabled());
+  require_hotkey_action(window, QStringLiteral("edit.redo"))->trigger();
+  QApplication::processEvents();
+  CHECK(active_document.channels().size() == 1);
+  CHECK(active_document.channels().front().id() == first_id);
+  CHECK(canvas->layer_edit_target() == patchy::ui::CanvasWidget::LayerEditTarget::Content);
+  channels->setCurrentItem(require_layer_item(*channels, QStringLiteral("Alpha 1")));
+  QApplication::processEvents();
+
+  require_action(window, "editDeselectAction")->trigger();
+  QApplication::processEvents();
+  CHECK(!canvas->has_selection());
+  require_action(window, "channelLoadSelectionAction")->trigger();
+  QApplication::processEvents();
+  CHECK(canvas->selection_alpha_at(*soft_point) == saved_alpha);
+
+  require_action(window, "channelNewAction")->trigger();
+  QApplication::processEvents();
+  CHECK(active_document.channels().size() == 2);
+  const auto second_id = active_document.channels().back().id();
+  CHECK(canvas->active_document_channel_id() == second_id);
+
+  bool rename_dialog_seen = false;
+  QTimer::singleShot(0, guarded([&rename_dialog_seen] {
+    auto* dialog = qobject_cast<QInputDialog*>(QApplication::activeModalWidget());
+    CHECK(dialog != nullptr);
+    rename_dialog_seen = true;
+    dialog->setTextValue(QStringLiteral("Custom Alpha"));
+    dialog->accept();
+  }));
+  require_action(window, "channelRenameAction")->trigger();
+  QApplication::processEvents();
+  CHECK(rename_dialog_seen);
+  CHECK(static_cast<const patchy::Document&>(active_document).find_channel(second_id)->name() == "Custom Alpha");
+  require_hotkey_action(window, QStringLiteral("edit.undo"))->trigger();
+  QApplication::processEvents();
+  CHECK(static_cast<const patchy::Document&>(active_document).find_channel(second_id)->name() == "Alpha 2");
+  require_hotkey_action(window, QStringLiteral("edit.redo"))->trigger();
+  QApplication::processEvents();
+  CHECK(static_cast<const patchy::Document&>(active_document).find_channel(second_id)->name() == "Custom Alpha");
+
+  auto* custom_item = require_layer_item(*channels, QStringLiteral("Custom Alpha"));
+  const auto custom_row = channels->row(custom_item);
+  CHECK(custom_row > 4);
+  CHECK(channels->model()->moveRow(QModelIndex(), custom_row, QModelIndex(), 4));
+  QApplication::processEvents();
+  QApplication::processEvents();
+  CHECK(active_document.channels().front().id() == second_id);
+  require_hotkey_action(window, QStringLiteral("edit.undo"))->trigger();
+  QApplication::processEvents();
+  CHECK(active_document.channels().front().id() == first_id);
+  require_hotkey_action(window, QStringLiteral("edit.redo"))->trigger();
+  QApplication::processEvents();
+  CHECK(active_document.channels().front().id() == second_id);
+
+  require_action(window, "channelDeleteAction")->trigger();
+  QApplication::processEvents();
+  CHECK(active_document.channels().size() == 1);
+  CHECK(canvas->layer_edit_target() == patchy::ui::CanvasWidget::LayerEditTarget::Content);
+  require_hotkey_action(window, QStringLiteral("edit.undo"))->trigger();
+  QApplication::processEvents();
+  CHECK(active_document.channels().size() == 2);
+  CHECK(static_cast<const patchy::Document&>(active_document).find_channel(second_id) != nullptr);
+
+  channels->setCurrentItem(require_layer_item(*channels, QStringLiteral("Alpha 1")));
+  QApplication::processEvents();
+  CHECK(canvas->layer_edit_target() == patchy::ui::CanvasWidget::LayerEditTarget::DocumentChannel);
+  auto* layers = window.findChild<QListWidget*>(QStringLiteral("layerList"));
+  CHECK(layers != nullptr);
+  // The Layers tab comes to the front first, as the user brings it there to click it.
+  patchy::ui::MainWindowTestAccess::show_panel(window, QStringLiteral("layersDock"));
+  QApplication::processEvents();
+  CHECK(canvas->layer_edit_target() == patchy::ui::CanvasWidget::LayerEditTarget::DocumentChannel);
+  click_layer_row_thumbnail(*layers, QStringLiteral("Pixels"), QStringLiteral("layerContentThumbnail"));
+  CHECK(canvas->layer_edit_target() == patchy::ui::CanvasWidget::LayerEditTarget::Content);
+}
+
+void ui_save_fragmented_selection_as_channel_stays_responsive() {
+  patchy::Document document(256, 256, patchy::PixelFormat::rgb8());
+  document.add_pixel_layer(
+      "Pixels", solid_pixels(256, 256, patchy::PixelFormat::rgb8(), QColor(220, 80, 45)));
+  patchy::ui::MainWindow window;
+  window.add_document_session(std::move(document), QStringLiteral("Fragmented Selection"));
+  show_window(window);
+  auto* canvas = require_canvas(window);
+
+  patchy::PixelBuffer checkerboard(256, 256, patchy::PixelFormat::gray8());
+  for (int y = 0; y < checkerboard.height(); ++y) {
+    auto row = checkerboard.row(y);
+    for (int x = 0; x < checkerboard.width(); ++x) {
+      row[static_cast<std::size_t>(x)] = ((x + y) & 1) == 0 ? 255 : 0;
+    }
+  }
+  canvas->replace_selection_from_grayscale(checkerboard, QStringLiteral("Checkerboard selection"));
+  CHECK(canvas->has_selection());
+  CHECK(!canvas->selection_has_partial_alpha());
+
+  QElapsedTimer timer;
+  timer.start();
+  require_action(window, "channelSaveSelectionAction")->trigger();
+  const auto elapsed_ms = timer.elapsed();
+  QApplication::processEvents();
+  CHECK(elapsed_ms < patchy::test::time_budget_ms(1500));
+  const auto& active_document = patchy::ui::MainWindowTestAccess::document(window);
+  CHECK(active_document.channels().size() == 1);
+  CHECK(active_document.channels().front().pixels().data().size() == checkerboard.data().size());
+  CHECK(std::equal(active_document.channels().front().pixels().data().begin(),
+                   active_document.channels().front().pixels().data().end(), checkerboard.data().begin()));
+}
+
+void ui_channels_target_survives_document_switch() {
+  const auto make_document = [](QString channel_name, std::uint8_t value) {
+    patchy::Document document(48, 36, patchy::PixelFormat::rgb8());
+    document.add_pixel_layer("Pixels",
+                             solid_pixels(48, 36, patchy::PixelFormat::rgb8(), QColor(90, 150, 210)));
+    patchy::PixelBuffer pixels(48, 36, patchy::PixelFormat::gray8());
+    pixels.clear(value);
+    document.add_channel(patchy::DocumentChannel(document.allocate_channel_id(), channel_name.toStdString(),
+                                                  patchy::DocumentChannelKind::Alpha, std::move(pixels)));
+    return document;
+  };
+
+  patchy::ui::MainWindow window;
+  window.add_document_session(make_document(QStringLiteral("First Alpha"), 40), QStringLiteral("First Channels"));
+  show_window(window);
+  auto* channels = window.findChild<QListWidget*>(QStringLiteral("channelList"));
+  auto* tabs = window.findChild<QTabWidget*>(QStringLiteral("documentTabs"));
+  CHECK(channels != nullptr);
+  CHECK(tabs != nullptr);
+  auto* first_canvas = require_canvas(window);
+  require_action(window, "editFreeTransformAction")->trigger();
+  QApplication::processEvents();
+  CHECK(first_canvas->free_transform_active());
+  channels->setCurrentItem(require_layer_item(*channels, QStringLiteral("First Alpha")));
+  QApplication::processEvents();
+  CHECK(!first_canvas->free_transform_active());
+  const auto first_channel_id = first_canvas->active_document_channel_id();
+  CHECK(first_channel_id.has_value());
+
+  window.add_document_session(make_document(QStringLiteral("Second Alpha"), 210), QStringLiteral("Second Channels"));
+  auto* second_canvas = require_canvas(window);
+  CHECK(second_canvas != first_canvas);
+  channels->setCurrentRow(1);
+  QApplication::processEvents();
+  CHECK(second_canvas->layer_edit_target() == patchy::ui::CanvasWidget::LayerEditTarget::ComponentRed);
+
+  tabs->setCurrentIndex(tabs->indexOf(first_canvas));
+  QApplication::processEvents();
+  CHECK(require_canvas(window) == first_canvas);
+  CHECK(first_canvas->active_document_channel_id() == first_channel_id);
+  CHECK(channels->currentItem() != nullptr);
+  CHECK(channels->currentItem()->text() == QStringLiteral("First Alpha"));
+
+  tabs->setCurrentIndex(tabs->indexOf(second_canvas));
+  QApplication::processEvents();
+  CHECK(require_canvas(window) == second_canvas);
+  CHECK(second_canvas->layer_edit_target() == patchy::ui::CanvasWidget::LayerEditTarget::ComponentRed);
+  CHECK(channels->currentItem() != nullptr);
+  CHECK(channels->currentItem()->text() == QStringLiteral("Red"));
+}
+
+void ui_non_psd_save_warns_before_discarding_channels() {
+  patchy::Document document(24, 18, patchy::PixelFormat::rgb8());
+  document.add_pixel_layer("Pixels",
+                           solid_pixels(24, 18, patchy::PixelFormat::rgb8(), QColor(60, 120, 180)));
+  patchy::PixelBuffer alpha(24, 18, patchy::PixelFormat::gray8());
+  alpha.clear(128);
+  document.add_channel(patchy::DocumentChannel(document.allocate_channel_id(), "Saved Alpha",
+                                                patchy::DocumentChannelKind::Alpha, std::move(alpha)));
+  patchy::ui::MainWindow window;
+  window.add_document_session(std::move(document), QStringLiteral("Channel Save Warning"));
+  show_window(window);
+  QTemporaryDir temp;
+  CHECK(temp.isValid());
+  const auto path = temp.filePath(QStringLiteral("channels.png"));
+  patchy::ui::ImageSaveOptions options;
+
+  bool cancel_prompt_seen = false;
+  QTimer::singleShot(0, guarded([&cancel_prompt_seen] {
+    auto* box = qobject_cast<QMessageBox*>(
+        find_top_level_dialog(QStringLiteral("discardSavedChannelsMessageBox")));
+    CHECK(box != nullptr);
+    cancel_prompt_seen = true;
+    box->button(QMessageBox::Cancel)->click();
+  }));
+  CHECK(!patchy::ui::MainWindowTestAccess::save_document_to_path(window, path, options));
+  CHECK(cancel_prompt_seen);
+  CHECK(!QFileInfo::exists(path));
+
+  bool save_prompt_seen = false;
+  QTimer::singleShot(0, guarded([&save_prompt_seen] {
+    auto* box = qobject_cast<QMessageBox*>(
+        find_top_level_dialog(QStringLiteral("discardSavedChannelsMessageBox")));
+    CHECK(box != nullptr);
+    save_prompt_seen = true;
+    box->button(QMessageBox::Save)->click();
+  }));
+  CHECK(patchy::ui::MainWindowTestAccess::save_document_to_path(window, path, options));
+  CHECK(save_prompt_seen);
+  CHECK(QFileInfo::exists(path));
+}
+
+void ui_save_layered_flat_format_routes_to_save_as_with_psd_default() {
+  patchy::Document document(24, 18, patchy::PixelFormat::rgb8());
+  document.add_pixel_layer("Pixels",
+                           solid_pixels(24, 18, patchy::PixelFormat::rgb8(), QColor(60, 120, 180)));
+  patchy::ui::MainWindow window;
+  window.add_document_session(std::move(document), QStringLiteral("Layered Save Routing"));
+  show_window(window);
+  QTemporaryDir temp;
+  CHECK(temp.isValid());
+  const auto jpg_path = temp.filePath(QStringLiteral("photo.jpg"));
+
+  // A flat single-layer document saves to JPEG silently and becomes that file.
+  patchy::ui::ImageSaveOptions options;
+  CHECK(patchy::ui::MainWindowTestAccess::save_document_to_path(window, jpg_path, options));
+  CHECK(QFileInfo::exists(jpg_path));
+  CHECK(!patchy::ui::MainWindowTestAccess::active_session_is_modified(window));
+  CHECK(patchy::ui::MainWindowTestAccess::active_session_path(window) == jpg_path);
+
+  // Once the document grows layers, Save must not silently flatten over the JPEG:
+  // it routes to Save As with the file name defaulted to .psd (Photoshop behavior).
+  require_action(window, "layerNewAction")->trigger();
+  QApplication::processEvents();
+  CHECK(patchy::ui::MainWindowTestAccess::active_session_is_modified(window));
+  QByteArray jpg_bytes_before;
+  {
+    QFile jpg_file(jpg_path);
+    CHECK(jpg_file.open(QIODevice::ReadOnly));
+    jpg_bytes_before = jpg_file.readAll();
+  }
+
+  bool saw_dialog = false;
+  QString default_name;
+  QTimer::singleShot(0, guarded([&] {
+    auto* dialog = qobject_cast<QFileDialog*>(find_top_level_dialog(QStringLiteral("saveAsFileDialog")));
+    CHECK(dialog != nullptr);
+    const auto selected = dialog->selectedFiles();
+    if (!selected.isEmpty()) {
+      default_name = QFileInfo(selected.first()).fileName();
+    }
+    saw_dialog = true;
+    dialog->reject();
+  }));
+  CHECK(!patchy::ui::MainWindowTestAccess::save_document(window));
+  CHECK(saw_dialog);
+  CHECK(default_name == QStringLiteral("photo.psd"));
+
+  // The canceled Save As left the JPEG untouched and the document unsaved.
+  {
+    QFile jpg_file(jpg_path);
+    CHECK(jpg_file.open(QIODevice::ReadOnly));
+    CHECK(jpg_file.readAll() == jpg_bytes_before);
+  }
+  CHECK(patchy::ui::MainWindowTestAccess::active_session_is_modified(window));
+  CHECK(patchy::ui::MainWindowTestAccess::active_session_path(window) == jpg_path);
+}
+
+// Issue 90: while View > Proof Colors is on, the Channels panel lists the CMYK proof's ink
+// plates. They are read-only views like the color components.
+void ui_channels_panel_shows_cmyk_plates_under_proof_colors() {
+  const auto previous = patchy::working_cmyk_space();
+  const auto restore = qScopeGuard([&previous] { patchy::set_working_cmyk_space(previous); });
+  const auto space = patchy::CmykWorkingSpace::from_icc_profile(patchy::ui::bundled_cmyk_profile(),
+                                                                patchy::RenderingIntent::RelativeColorimetric, true);
+
+  // Left half a blue, right half black.
+  patchy::Document document(64, 48, patchy::PixelFormat::rgb8());
+  auto pixels = solid_pixels(64, 48, patchy::PixelFormat::rgb8(), QColor(0, 160, 224));
+  fill_pixel_rect(pixels, QRect(32, 0, 32, 48), QColor(0, 0, 0));
+  document.add_pixel_layer("Artwork", std::move(pixels));
+  patchy::ui::MainWindow window;
+  // After the window exists: its constructor installs the stored profile choice.
+  patchy::set_working_cmyk_space(space);
+  window.add_document_session(std::move(document), QStringLiteral("Plates"));
+  show_window(window);
+  auto* canvas = require_canvas(window);
+  canvas->set_zoom(1.0);
+  QApplication::processEvents();
+  auto* channels = window.findChild<QListWidget*>(QStringLiteral("channelList"));
+  auto* proof = window.findChild<QAction*>(QStringLiteral("viewProofColorsAction"));
+  CHECK(channels != nullptr && proof != nullptr);
+  CHECK(channels->count() == 4);
+
+  proof->trigger();
+  QApplication::processEvents();
+  CHECK(proof->isChecked());
+  CHECK(channels->count() == 8);
+  const QStringList plates{QStringLiteral("Cyan"), QStringLiteral("Magenta"), QStringLiteral("Yellow"),
+                           QStringLiteral("Black")};
+  for (int index = 0; index < 4; ++index) {
+    CHECK(channels->item(4 + index)->text() == plates[index]);
+    CHECK(channels->item(4 + index)->toolTip().contains(QStringLiteral("ink plate")));
+  }
+
+  // What each plate should show: 255 - ink, from the working space's separation.
+  const auto inks = space->separate_rgba8(std::vector<std::uint8_t>{0, 160, 224, 255, 0, 0, 0, 255});
+  const auto shown = [&](QPoint document_point) {
+    QApplication::processEvents();
+    return canvas->grab().toImage().pixelColor(canvas->widget_position_for_document_point(document_point));
+  };
+  const std::array<patchy::ui::CanvasWidget::LayerEditTarget, 4> targets{
+      patchy::ui::CanvasWidget::LayerEditTarget::ComponentCyan, patchy::ui::CanvasWidget::LayerEditTarget::ComponentMagenta,
+      patchy::ui::CanvasWidget::LayerEditTarget::ComponentYellow, patchy::ui::CanvasWidget::LayerEditTarget::ComponentBlack};
+  for (std::size_t plate = 0; plate < 4; ++plate) {
+    channels->setCurrentRow(4 + static_cast<int>(plate));
+    QApplication::processEvents();
+    CHECK(canvas->layer_edit_target() == targets[plate]);
+    const auto blue = shown(QPoint(10, 20));
+    const auto black = shown(QPoint(50, 20));
+    CHECK(blue.red() == blue.green() && blue.green() == blue.blue());
+    CHECK(std::abs(blue.red() - (255 - inks[plate])) <= 1);
+    CHECK(std::abs(black.red() - (255 - inks[4 + plate])) <= 1);
+  }
+  save_widget_artifact("ui_channels_black_plate", *canvas);
+  CHECK(window.statusBar()->currentMessage().contains(QStringLiteral("Black plate")));
+  auto* chip = window.findChild<QWidget*>(QStringLiteral("maskEditModeChip"));
+  CHECK(chip != nullptr && chip->isVisible());
+
+  // A plate is a view: the painting and moving tools are unavailable, as for Red/Green/Blue.
+  CHECK(!require_action_by_text(window, QStringLiteral("Brush"))->isEnabled());
+  CHECK(!require_action_by_text(window, QStringLiteral("Move"))->isEnabled());
+  CHECK(!require_hotkey_action(window, QStringLiteral("layer.flip_horizontal"))->isEnabled());
+  CHECK(!require_action(window, "filterAction_patchy_filters_edge_detect")->isEnabled());
+
+  // Ctrl-click loads where the plate prints no ink as a selection.
+  const auto point = channels->visualItemRect(channels->item(4)).center();
+  send_mouse(*channels->viewport(), QEvent::MouseButtonPress, point, Qt::LeftButton, Qt::LeftButton,
+             Qt::ControlModifier);
+  send_mouse(*channels->viewport(), QEvent::MouseButtonRelease, point, Qt::LeftButton, Qt::NoButton,
+             Qt::ControlModifier);
+  QApplication::processEvents();
+  CHECK(std::abs(canvas->selection_alpha_at(QPoint(10, 20)) - (255 - inks[0])) <= 1);
+  CHECK(std::abs(canvas->selection_alpha_at(QPoint(50, 20)) - (255 - inks[4])) <= 1);
+
+  // Turning the proof off removes the plates and returns to the composite.
+  channels->setCurrentRow(7);
+  QApplication::processEvents();
+  proof->trigger();
+  QApplication::processEvents();
+  CHECK(!proof->isChecked());
+  CHECK(channels->count() == 4);
+  CHECK(canvas->layer_edit_target() == patchy::ui::CanvasWidget::LayerEditTarget::Content);
+  CHECK(channels->currentRow() == 0);
+}
+
+
+// Brings the Channels tab to the front, so its rows have geometry for eye clicks.
+void show_channels_tab(patchy::ui::MainWindow& window) {
+  for (auto* tabs : window.findChildren<QTabBar*>()) {
+    for (int index = 0; index < tabs->count(); ++index) {
+      if (tabs->tabText(index) == QStringLiteral("Channels")) {
+        tabs->setCurrentIndex(index);
+        QApplication::processEvents();
+        return;
+      }
+    }
+  }
+  CHECK(false);
+}
+
+void click_channel_eye(patchy::ui::ChannelPanel& panel, QListWidget& channels, int row) {
+  const auto rect = panel.eye_rect(row);
+  CHECK(!rect.isEmpty());
+  send_mouse(*channels.viewport(), QEvent::MouseButtonPress, rect.center(), Qt::LeftButton, Qt::LeftButton);
+  send_mouse(*channels.viewport(), QEvent::MouseButtonRelease, rect.center(), Qt::LeftButton, Qt::NoButton);
+  QApplication::processEvents();
+}
+
+// Waits for the derived rows' thumbnails, which follow the canvas composite on a short timer.
+QImage wait_for_channel_thumbnail(patchy::ui::ChannelPanel& panel, int row, qint64 previous_key = 0) {
+  QElapsedTimer timer;
+  timer.start();
+  while (timer.elapsed() < 5000) {
+    QApplication::processEvents();
+    const auto thumbnail = panel.row_thumbnail(row);
+    const auto image = thumbnail.toImage();
+    if (!image.isNull() && thumbnail.cacheKey() != previous_key && image.pixelColor(21, 15) != image.pixelColor(1, 1)) {
+      return image;
+    }
+  }
+  return panel.row_thumbnail(row).toImage();
+}
+
+// Channel visibility (GitHub issue 412; docs/channels.md, "Channel visibility"): the eyes,
+// the composite rules, the canvas view mask, Ctrl+2 to Ctrl+6 and the real thumbnails.
+void ui_channel_eyes_view_mask_shortcuts_and_thumbnails() {
+  // Three stripes: reddish, greenish, bluish.
+  patchy::Document document(60, 40, patchy::PixelFormat::rgb8());
+  auto pixels = solid_pixels(60, 40, patchy::PixelFormat::rgb8(), QColor(200, 40, 20));
+  fill_pixel_rect(pixels, QRect(20, 0, 20, 40), QColor(30, 180, 60));
+  fill_pixel_rect(pixels, QRect(40, 0, 20, 40), QColor(40, 70, 220));
+  document.add_pixel_layer("Stripes", std::move(pixels));
+  patchy::ui::MainWindow window;
+  window.add_document_session(std::move(document), QStringLiteral("Stripes"));
+  show_window(window);
+  auto* canvas = require_canvas(window);
+  canvas->set_zoom(1.0);
+  show_channels_tab(window);
+  auto* panel = window.findChild<patchy::ui::ChannelPanel*>(QStringLiteral("channelPanel"));
+  auto* channels = window.findChild<QListWidget*>(QStringLiteral("channelList"));
+  CHECK(panel != nullptr && channels != nullptr);
+  CHECK(channels->count() == 4);
+  using Target = patchy::ui::CanvasWidget::LayerEditTarget;
+  const auto eyes = [panel] {
+    QString text;
+    for (int row = 0; row < 4; ++row) {
+      text += panel->row_eye(row).value_or(false) ? QLatin1Char('1') : QLatin1Char('0');
+    }
+    return text;
+  };
+  const auto shown = [canvas](QPoint point) {
+    QApplication::processEvents();
+    return canvas_pixel(*canvas, point);
+  };
+  const QPoint red_stripe(10, 20);
+  const QPoint green_stripe(30, 20);
+  const QPoint blue_stripe(50, 20);
+  auto* undo = require_hotkey_action(window, QStringLiteral("edit.undo"));
+  CHECK(!undo->isEnabled());
+  CHECK(eyes() == QStringLiteral("1111"));
+
+  // Hiding Blue: the composite's eye goes off, the composite stays targeted (painting goes
+  // on), and the canvas zeroes blue.
+  click_channel_eye(*panel, *channels, 3);
+  CHECK(eyes() == QStringLiteral("0110"));
+  CHECK(canvas->layer_edit_target() == Target::Content);
+  CHECK(canvas->channel_view().visible == 0b011);
+  CHECK(color_close(shown(blue_stripe), QColor(40, 70, 0), 2));
+  CHECK(color_close(shown(red_stripe), QColor(200, 40, 0), 2));
+  CHECK(require_action_by_text(window, QStringLiteral("Brush"))->isEnabled());
+  auto* chip = window.findChild<QToolButton*>(QStringLiteral("maskEditModeChip"));
+  CHECK(chip != nullptr && chip->isVisible());
+  CHECK(chip->text().contains(QStringLiteral("Red, Green")));
+  // A view only: nothing to undo, and the document keeps its pixels.
+  CHECK(!undo->isEnabled());
+  const auto& active_document = std::as_const(patchy::ui::MainWindowTestAccess::document(window));
+  CHECK(patchy::Compositor{}.flatten_rgb8(active_document).pixel(50, 20)[2] == 220);
+
+  // Hiding Green leaves Red alone: Red becomes the target, shown in grayscale.
+  click_channel_eye(*panel, *channels, 2);
+  CHECK(eyes() == QStringLiteral("0100"));
+  CHECK(canvas->layer_edit_target() == Target::ComponentRed);
+  CHECK(channels->currentRow() == 1);
+  CHECK(color_close(shown(red_stripe), QColor(200, 200, 200), 2));
+  CHECK(color_close(shown(blue_stripe), QColor(40, 40, 40), 2));
+  // The last visible channel cannot be hidden.
+  click_channel_eye(*panel, *channels, 1);
+  CHECK(eyes() == QStringLiteral("0100"));
+  CHECK(canvas->layer_edit_target() == Target::ComponentRed);
+
+  // Showing Green again: Red and Green in color with blue zeroed, and the composite is the
+  // target again (Red was targeted only because it was the one left).
+  click_channel_eye(*panel, *channels, 2);
+  CHECK(eyes() == QStringLiteral("0110"));
+  CHECK(canvas->layer_edit_target() == Target::Content);
+  CHECK(channels->currentRow() == 0);
+  CHECK(color_close(shown(green_stripe), QColor(30, 180, 0), 2));
+  CHECK(color_close(shown(blue_stripe), QColor(40, 70, 0), 2));
+  CHECK(chip->isVisible() && chip->text().contains(QStringLiteral("Red, Green")));
+
+  // Saving while channels are hidden writes the document's own pixels.
+  QTemporaryDir directory;
+  CHECK(directory.isValid());
+  const auto saved_path = directory.filePath(QStringLiteral("hidden-channels.png"));
+  CHECK(patchy::ui::MainWindowTestAccess::save_document_to_path(window, saved_path));
+  const QImage saved(saved_path);
+  CHECK(!saved.isNull());
+  CHECK(saved.pixelColor(50, 20) == QColor(40, 70, 220));
+  CHECK(saved.pixelColor(10, 20) == QColor(200, 40, 20));
+
+  // The composite's eye turns every channel on and targets the composite.
+  click_channel_eye(*panel, *channels, 0);
+  CHECK(eyes() == QStringLiteral("1111"));
+  CHECK(canvas->layer_edit_target() == Target::Content);
+  CHECK(channels->currentRow() == 0);
+  CHECK(color_close(shown(blue_stripe), QColor(40, 70, 220), 2));
+  CHECK(!chip->isVisible());
+
+  // Hide Blue again, then click the already selected Composite row itself: all on.
+  click_channel_eye(*panel, *channels, 3);
+  CHECK(eyes() == QStringLiteral("0110"));
+  const auto composite_row = channels->visualItemRect(channels->item(0)).center() + QPoint(30, 0);
+  send_mouse(*channels->viewport(), QEvent::MouseButtonPress, composite_row, Qt::LeftButton, Qt::LeftButton);
+  send_mouse(*channels->viewport(), QEvent::MouseButtonRelease, composite_row, Qt::LeftButton, Qt::NoButton);
+  QApplication::processEvents();
+  CHECK(eyes() == QStringLiteral("1111"));
+
+  // Ctrl+2 to Ctrl+5: the composite, then Red, Green, Blue alone. Ctrl+6 is Black in CMYK
+  // Proof only.
+  const QStringList ids{QStringLiteral("channel.view_composite"), QStringLiteral("channel.view_first"),
+                        QStringLiteral("channel.view_second"), QStringLiteral("channel.view_third"),
+                        QStringLiteral("channel.view_fourth")};
+  for (int slot = 0; slot < ids.size(); ++slot) {
+    CHECK(require_hotkey_action(window, ids[slot])->shortcut() ==
+          QKeySequence(QKeyCombination(Qt::ControlModifier, static_cast<Qt::Key>(Qt::Key_2 + slot))));
+  }
+  require_hotkey_action(window, ids[1])->trigger();
+  QApplication::processEvents();
+  CHECK(canvas->layer_edit_target() == Target::ComponentRed);
+  CHECK(eyes() == QStringLiteral("0100"));
+  require_hotkey_action(window, ids[2])->trigger();
+  QApplication::processEvents();
+  CHECK(canvas->layer_edit_target() == Target::ComponentGreen);
+  CHECK(eyes() == QStringLiteral("0010"));
+  CHECK(color_close(shown(green_stripe), QColor(180, 180, 180), 2));
+  require_hotkey_action(window, ids[3])->trigger();
+  QApplication::processEvents();
+  CHECK(canvas->layer_edit_target() == Target::ComponentBlue);
+  CHECK(eyes() == QStringLiteral("0001"));
+  require_hotkey_action(window, ids[4])->trigger();
+  QApplication::processEvents();
+  CHECK(canvas->layer_edit_target() == Target::ComponentBlue);
+  require_hotkey_action(window, ids[0])->trigger();
+  QApplication::processEvents();
+  CHECK(canvas->layer_edit_target() == Target::Content);
+  CHECK(eyes() == QStringLiteral("1111"));
+  CHECK(!undo->isEnabled());
+
+  // Thumbnails show the image: Red's is light on the red stripe and dark on the others,
+  // and the composite's is in color.
+  const auto composite_thumbnail = wait_for_channel_thumbnail(*panel, 0);
+  const auto red_thumbnail = wait_for_channel_thumbnail(*panel, 1);
+  const auto blue_thumbnail = wait_for_channel_thumbnail(*panel, 3);
+  CHECK(!red_thumbnail.isNull() && !blue_thumbnail.isNull() && !composite_thumbnail.isNull());
+  const auto thumbnail_point = [](const QImage& image, double fraction) {
+    return image.pixelColor(static_cast<int>(image.width() * fraction), image.height() / 2);
+  };
+  CHECK(std::abs(thumbnail_point(red_thumbnail, 0.2).red() - 200) <= 8);
+  CHECK(std::abs(thumbnail_point(red_thumbnail, 0.5).red() - 30) <= 8);
+  CHECK(std::abs(thumbnail_point(blue_thumbnail, 0.8).red() - 220) <= 8);
+  CHECK(std::abs(thumbnail_point(blue_thumbnail, 0.2).red() - 20) <= 8);
+  CHECK(color_close(thumbnail_point(composite_thumbnail, 0.5), QColor(30, 180, 60), 8));
+  // They follow edits: inverting the image makes Red's dark where it was light.
+  const auto previous_key = panel->row_thumbnail(1).cacheKey();
+  require_hotkey_action(window, QStringLiteral("patchy.filters.invert"))->trigger();
+  QApplication::processEvents();
+  const auto inverted = wait_for_channel_thumbnail(*panel, 1, previous_key);
+  CHECK(std::abs(thumbnail_point(inverted, 0.2).red() - 55) <= 8);
+}
+
+// An eye click the way a hand makes it: the pointer moves a pixel or two while the button
+// is down (Seth's #412 follow-up: that move selected the row whose eye was clicked).
+void click_channel_eye_with_jitter(patchy::ui::ChannelPanel& panel, QListWidget& channels, int row) {
+  const auto rect = panel.eye_rect(row);
+  CHECK(!rect.isEmpty());
+  const auto point = rect.center();
+  send_mouse(*channels.viewport(), QEvent::MouseButtonPress, point, Qt::LeftButton, Qt::LeftButton);
+  send_mouse(*channels.viewport(), QEvent::MouseMove, point + QPoint(1, 0), Qt::NoButton, Qt::LeftButton);
+  send_mouse(*channels.viewport(), QEvent::MouseMove, point + QPoint(2, 1), Qt::NoButton, Qt::LeftButton);
+  send_mouse(*channels.viewport(), QEvent::MouseButtonRelease, point + QPoint(2, 1), Qt::LeftButton, Qt::NoButton);
+  QApplication::processEvents();
+}
+
+// GitHub issue 412 follow-up (docs/channels.md, "Channel visibility"): an eye click changes
+// what shows and never selects its own row or a hidden channel; the selection moves only
+// when the target stops being valid.
+void ui_channel_eye_clicks_never_select_hidden() {
+  patchy::ui::MainWindow window;
+  show_window(window);
+  const auto photo = patchy::test::committed_format_fixture_path("readme", "havana_vintage_car_cc0.jpg");
+  patchy::ui::MainWindowTestAccess::open_document_path(window, QString::fromStdString(photo.string()));
+  QApplication::processEvents();
+  auto* canvas = require_canvas(window);
+  canvas->fit_to_view();
+  show_channels_tab(window);
+  auto* panel = window.findChild<patchy::ui::ChannelPanel*>(QStringLiteral("channelPanel"));
+  auto* channels = window.findChild<QListWidget*>(QStringLiteral("channelList"));
+  CHECK(panel != nullptr && channels != nullptr);
+  if (panel == nullptr || channels == nullptr) {
+    return;
+  }
+  using Target = patchy::ui::CanvasWidget::LayerEditTarget;
+  const auto eyes = [panel] {
+    QString text;
+    for (int row = 0; row < 4; ++row) {
+      text += panel->row_eye(row).value_or(false) ? QLatin1Char('1') : QLatin1Char('0');
+    }
+    return text;
+  };
+  const auto state = [&] { return eyes() + QLatin1Char('/') + QString::number(channels->currentRow()); };
+  int current_changes = 0;
+  QObject::connect(channels, &QListWidget::currentRowChanged, channels, [&current_changes] { ++current_changes; });
+
+  // Seth's sequence: hide Blue, then Green, then show them again.
+  click_channel_eye_with_jitter(*panel, *channels, 3);
+  CHECK(state() == QStringLiteral("0110/0"));
+  CHECK(canvas->layer_edit_target() == Target::Content);
+  click_channel_eye_with_jitter(*panel, *channels, 2);
+  CHECK(state() == QStringLiteral("0100/1"));  // Red is the one left, so it is the target
+  CHECK(canvas->layer_edit_target() == Target::ComponentRed);
+  click_channel_eye_with_jitter(*panel, *channels, 2);
+  CHECK(state() == QStringLiteral("0110/0"));  // two again: back to the composite target
+  CHECK(canvas->layer_edit_target() == Target::Content);
+  CHECK(canvas->channel_view().visible == 0b011);
+  save_widget_artifact("issue_412_fu_after_panel_two_visible", *panel);
+  click_channel_eye_with_jitter(*panel, *channels, 3);
+  CHECK(state() == QStringLiteral("1111/0"));
+
+  // Other orders never land on a hidden channel or on the row whose eye was clicked.
+  for (int first = 1; first <= 3; ++first) {
+    for (int second = 1; second <= 3; ++second) {
+      if (first == second) {
+        continue;
+      }
+      require_hotkey_action(window, QStringLiteral("channel.view_composite"))->trigger();
+      QApplication::processEvents();
+      click_channel_eye_with_jitter(*panel, *channels, first);
+      CHECK(channels->currentRow() == 0);
+      click_channel_eye_with_jitter(*panel, *channels, second);
+      const int left = 6 - first - second;
+      CHECK(channels->currentRow() == left);
+      CHECK(panel->row_eye(left) == std::optional<bool>(true));
+      CHECK(panel->row_eye(first) == std::optional<bool>(false));
+      CHECK(panel->row_eye(second) == std::optional<bool>(false));
+      // The last one cannot be hidden, and showing one again returns to the composite target.
+      click_channel_eye_with_jitter(*panel, *channels, left);
+      CHECK(channels->currentRow() == left);
+      click_channel_eye_with_jitter(*panel, *channels, first);
+      CHECK(channels->currentRow() == 0);
+      CHECK(panel->row_eye(first) == std::optional<bool>(true));
+      CHECK(panel->row_eye(left) == std::optional<bool>(true));
+    }
+  }
+
+  // A channel picked by its row (or Ctrl+3 to Ctrl+5) stays the target while eyes add or
+  // remove other channels; the selection never jumps on the way.
+  require_hotkey_action(window, QStringLiteral("channel.view_first"))->trigger();
+  QApplication::processEvents();
+  CHECK(state() == QStringLiteral("0100/1"));
+  current_changes = 0;
+  click_channel_eye_with_jitter(*panel, *channels, 3);
+  CHECK(state() == QStringLiteral("0101/1"));
+  click_channel_eye_with_jitter(*panel, *channels, 3);
+  CHECK(state() == QStringLiteral("0100/1"));
+  click_channel_eye_with_jitter(*panel, *channels, 2);
+  CHECK(state() == QStringLiteral("0110/1"));
+  CHECK(current_changes == 0);
+  // Hiding the targeted channel moves the target to the one left showing.
+  click_channel_eye_with_jitter(*panel, *channels, 1);
+  CHECK(state() == QStringLiteral("0010/2"));
+
+  // Clicking a hidden channel's row shows it, alone, and targets it.
+  channels->setCurrentRow(3);
+  QApplication::processEvents();
+  CHECK(state() == QStringLiteral("0001/3"));
+  CHECK(canvas->layer_edit_target() == Target::ComponentBlue);
+
+  // Shortcuts after a partial hide: Ctrl+2 restores every channel; Ctrl+4 shows Green alone.
+  require_hotkey_action(window, QStringLiteral("channel.view_composite"))->trigger();
+  QApplication::processEvents();
+  click_channel_eye_with_jitter(*panel, *channels, 1);
+  CHECK(state() == QStringLiteral("0011/0"));
+  require_hotkey_action(window, QStringLiteral("channel.view_second"))->trigger();
+  QApplication::processEvents();
+  CHECK(state() == QStringLiteral("0010/2"));
+  require_hotkey_action(window, QStringLiteral("channel.view_composite"))->trigger();
+  QApplication::processEvents();
+  CHECK(state() == QStringLiteral("1111/0"));
+  // The Composite eye restores everything from any partial view.
+  click_channel_eye_with_jitter(*panel, *channels, 2);
+  click_channel_eye_with_jitter(*panel, *channels, 1);
+  CHECK(state() == QStringLiteral("0001/3"));
+  click_channel_eye_with_jitter(*panel, *channels, 0);
+  CHECK(state() == QStringLiteral("1111/0"));
+  CHECK(canvas->layer_edit_target() == Target::Content);
+}
+
+// Issue shots for GitHub issue 412 on a color photo: the panel's eyes and thumbnails, and
+// the canvas with Red alone and with Red and Green.
+void ui_channel_view_issue_412_shots() {
+  patchy::ui::MainWindow window;
+  show_window(window);
+  const auto photo = patchy::test::committed_format_fixture_path("readme", "havana_vintage_car_cc0.jpg");
+  patchy::ui::MainWindowTestAccess::open_document_path(window, QString::fromStdString(photo.string()));
+  QApplication::processEvents();
+  auto* canvas = require_canvas(window);
+  canvas->fit_to_view();
+  show_channels_tab(window);
+  auto* panel = window.findChild<patchy::ui::ChannelPanel*>(QStringLiteral("channelPanel"));
+  auto* channels = window.findChild<QListWidget*>(QStringLiteral("channelList"));
+  CHECK(panel != nullptr && channels != nullptr);
+  if (panel == nullptr || channels == nullptr) {
+    return;
+  }
+  (void)wait_for_channel_thumbnail(*panel, 1);
+  CHECK(!panel->row_shortcut(0).isEmpty());
+  save_widget_artifact("issue_412_after_panel", *panel);
+  const QPoint sample(1500, 1000);
+  require_hotkey_action(window, QStringLiteral("channel.view_first"))->trigger();
+  QApplication::processEvents();
+  const auto red_only = canvas_pixel(*canvas, sample);
+  CHECK(red_only.red() == red_only.green() && red_only.green() == red_only.blue());
+  save_widget_artifact("issue_412_after_canvas_red", *canvas);
+  click_channel_eye(*panel, *channels, 2);
+  const auto red_green = canvas_pixel(*canvas, sample);
+  CHECK(red_green.blue() == 0);
+  save_widget_artifact("issue_412_after_canvas_red_green", *canvas);
+  save_widget_artifact("issue_412_after_panel_red_green", *panel);
+}
+
+// Each Composite, color and ink plate row shows the key of the channel view action that
+// picks it, in native text, and follows a rebinding (the #412 follow-up). Under Proof
+// Colors in an RGB document Ctrl+3 to Ctrl+5 still pick Red, Green and Blue, so the
+// plates show none.
+void ui_channel_rows_show_their_shortcuts() {
+  const auto previous = patchy::working_cmyk_space();
+  const auto restore = qScopeGuard([&previous] { patchy::set_working_cmyk_space(previous); });
+  patchy::Document document(48, 32, patchy::PixelFormat::rgb8());
+  document.add_pixel_layer("Artwork", solid_pixels(48, 32, patchy::PixelFormat::rgb8(), QColor(200, 120, 40)));
+  patchy::ui::MainWindow window;
+  patchy::set_working_cmyk_space(patchy::CmykWorkingSpace::from_icc_profile(
+      patchy::ui::bundled_cmyk_profile(), patchy::RenderingIntent::RelativeColorimetric, true));
+  window.add_document_session(std::move(document), QStringLiteral("Shortcuts"));
+  show_window(window);
+  show_channels_tab(window);
+  auto* panel = window.findChild<patchy::ui::ChannelPanel*>(QStringLiteral("channelPanel"));
+  auto* channels = window.findChild<QListWidget*>(QStringLiteral("channelList"));
+  CHECK(panel != nullptr && channels != nullptr);
+  if (panel == nullptr || channels == nullptr) {
+    return;
+  }
+  const auto native = [](int key) {
+    return QKeySequence(QKeyCombination(Qt::ControlModifier, static_cast<Qt::Key>(key)))
+        .toString(QKeySequence::NativeText);
+  };
+  CHECK(channels->count() == 4);
+  CHECK(panel->row_shortcut(0) == native(Qt::Key_2));
+  CHECK(panel->row_shortcut(1) == native(Qt::Key_3));
+  CHECK(panel->row_shortcut(2) == native(Qt::Key_4));
+  CHECK(panel->row_shortcut(3) == native(Qt::Key_5));
+
+  // A rebound key shows at once; a channel without a key shows nothing.
+  auto* first = require_hotkey_action(window, QStringLiteral("channel.view_first"));
+  auto* second = require_hotkey_action(window, QStringLiteral("channel.view_second"));
+  const auto first_keys = first->shortcuts();
+  const auto second_keys = second->shortcuts();
+  first->setShortcut(QKeySequence(QKeyCombination(Qt::ControlModifier | Qt::AltModifier, Qt::Key_9)));
+  second->setShortcuts({});
+  QApplication::processEvents();
+  CHECK(panel->row_shortcut(1) ==
+        QKeySequence(QKeyCombination(Qt::ControlModifier | Qt::AltModifier, Qt::Key_9))
+            .toString(QKeySequence::NativeText));
+  CHECK(panel->row_shortcut(2).isEmpty());
+  first->setShortcuts(first_keys);
+  second->setShortcuts(second_keys);
+  QApplication::processEvents();
+  CHECK(panel->row_shortcut(1) == native(Qt::Key_3));
+  CHECK(panel->row_shortcut(2) == native(Qt::Key_4));
+
+  auto* proof = window.findChild<QAction*>(QStringLiteral("viewProofColorsAction"));
+  CHECK(proof != nullptr);
+  if (proof == nullptr) {
+    return;
+  }
+  proof->trigger();
+  QApplication::processEvents();
+  CHECK(channels->count() == 8);
+  CHECK(panel->row_shortcut(1) == native(Qt::Key_3));
+  for (int row = 4; row < 8; ++row) {
+    CHECK(panel->row_shortcut(row).isEmpty());
+  }
+  proof->trigger();
+  QApplication::processEvents();
+
+  // The key is drawn at the right end of the Composite row.
+  const auto composite_rect = channels->visualItemRect(channels->item(0));
+  const auto row_image = channels->viewport()->grab(composite_rect).toImage();
+  const auto background = row_image.pixelColor(row_image.width() - 2, 2);
+  bool key_drawn = false;
+  for (int x = row_image.width() * 3 / 4; x < row_image.width() && !key_drawn; ++x) {
+    for (int y = 0; y < row_image.height() && !key_drawn; ++y) {
+      key_drawn = row_image.pixelColor(x, y) != background;
+    }
+  }
+  CHECK(key_drawn);
+  save_widget_artifact("ui_channel_rows_show_their_shortcuts", *panel);
+
+  // A narrow panel elides the name and keeps the key (the artifact shows both).
+  panel->resize(150, panel->height());
+  QApplication::processEvents();
+  CHECK(panel->row_shortcut(0) == native(Qt::Key_2));
+  save_widget_artifact("ui_channel_rows_show_their_shortcuts_narrow", *panel);
+}
+
+// The channel context menu's New Layer from Channel copies a row's values into a
+// grayscale layer; New Layer from Channel Color copies a component or ink plate in its own
+// color (Screen for components, Multiply for plates).
+// The selection-load cursor over the Channels rows (GitHub issues 480, 525): Ctrl shows it,
+// Shift, Alt and Shift+Alt add their combine badge, live with the keys; a Ctrl-click with them
+// adds, subtracts or intersects the channel with the selection in one history step.
+void ui_channel_rows_ctrl_hover_show_selection_cursors_and_combine() {
+  patchy::Document document(4, 1, patchy::PixelFormat::rgb8());
+  document.add_pixel_layer("Pixels", solid_pixels(4, 1, patchy::PixelFormat::rgb8(), QColor(90, 120, 150)));
+  const auto add_alpha = [&document](const char* name, std::array<std::uint8_t, 4> values) {
+    patchy::PixelBuffer pixels(4, 1, patchy::PixelFormat::gray8());
+    for (int x = 0; x < 4; ++x) {
+      *pixels.pixel(x, 0) = values[static_cast<std::size_t>(x)];
+    }
+    document.add_channel(patchy::DocumentChannel(document.allocate_channel_id(), name,
+                                                  patchy::DocumentChannelKind::Alpha, std::move(pixels)));
+  };
+  add_alpha("Left", {255, 255, 0, 0});
+  add_alpha("Middle", {0, 255, 255, 0});
+  patchy::ui::MainWindow window;
+  window.add_document_session(std::move(document), QStringLiteral("Channel Cursors"));
+  show_window(window);
+  auto* canvas = require_canvas(window);
+  show_channels_tab(window);
+  auto* panel = window.findChild<patchy::ui::ChannelPanel*>(QStringLiteral("channelPanel"));
+  auto* channels = window.findChild<QListWidget*>(QStringLiteral("channelList"));
+  CHECK(panel != nullptr && channels != nullptr);
+  if (panel == nullptr || channels == nullptr) {
+    return;
+  }
+  CHECK(channels->count() == 6);
+  auto* viewport = channels->viewport();
+  const auto row_point = [channels](int row) { return channels->visualItemRect(channels->item(row)).center(); };
+  const auto hover = [viewport](QPoint point, Qt::KeyboardModifiers modifiers) {
+    QMouseEvent move(QEvent::MouseMove, QPointF(point), QPointF(viewport->mapToGlobal(point)), Qt::NoButton,
+                     Qt::NoButton, modifiers);
+    QApplication::sendEvent(viewport, &move);
+    QApplication::processEvents();
+  };
+  const auto key = [&window](QEvent::Type type, Qt::KeyboardModifiers modifiers, int which) {
+    QKeyEvent event(type, which, modifiers);
+    QApplication::sendEvent(&window, &event);
+    QApplication::processEvents();
+  };
+  const auto shows = [viewport](int operation) {
+    return viewport->testAttribute(Qt::WA_SetCursor) &&
+           viewport->cursor().pixmap().toImage() ==
+               patchy::ui::load_selection_pointer_cursor(operation).pixmap().toImage();
+  };
+
+  hover(row_point(4), Qt::NoModifier);
+  CHECK(!viewport->testAttribute(Qt::WA_SetCursor));
+  hover(row_point(4), Qt::ControlModifier);
+  CHECK(shows(0));
+  hover(row_point(1), Qt::ControlModifier);  // a component row loads too
+  CHECK(shows(0));
+  QCursor::setPos(viewport->mapToGlobal(row_point(4)));
+  QApplication::processEvents();
+  key(QEvent::KeyPress, Qt::ControlModifier | Qt::ShiftModifier, Qt::Key_Shift);
+  CHECK(shows(1));
+  {
+    auto shot = panel->grab().toImage();
+    const auto cursor = viewport->cursor();
+    const auto at = viewport->mapTo(panel, row_point(4)) - cursor.hotSpot();
+    QPainter painter(&shot);
+    painter.drawPixmap(at, cursor.pixmap());
+    painter.end();
+    save_image_artifact("issue525_channels_add_cursor", shot);
+  }
+  key(QEvent::KeyPress, Qt::ControlModifier | Qt::ShiftModifier | Qt::AltModifier, Qt::Key_Alt);
+  CHECK(shows(3));
+  key(QEvent::KeyRelease, Qt::ControlModifier | Qt::AltModifier, Qt::Key_Shift);
+  CHECK(shows(2));
+  key(QEvent::KeyRelease, Qt::AltModifier, Qt::Key_Control);
+  CHECK(!viewport->testAttribute(Qt::WA_SetCursor));
+  key(QEvent::KeyRelease, Qt::NoModifier, Qt::Key_Alt);
+  hover(row_point(4), Qt::ControlModifier);
+  CHECK(shows(0));
+  QEvent leave(QEvent::Leave);
+  QApplication::sendEvent(viewport, &leave);
+  CHECK(!viewport->testAttribute(Qt::WA_SetCursor));
+
+  const auto ctrl_click_row = [&](int row, Qt::KeyboardModifiers extra) {
+    const auto modifiers = Qt::ControlModifier | extra;
+    send_mouse(*viewport, QEvent::MouseButtonPress, row_point(row), Qt::LeftButton, Qt::LeftButton, modifiers);
+    send_mouse(*viewport, QEvent::MouseButtonRelease, row_point(row), Qt::LeftButton, Qt::NoButton, modifiers);
+    QApplication::processEvents();
+  };
+  const auto selection = [canvas] {
+    QString text;
+    for (int x = 0; x < 4; ++x) {
+      text += canvas->selection_alpha_at(QPoint(x, 0)) == 255 ? QLatin1Char('1')
+              : canvas->selection_alpha_at(QPoint(x, 0)) == 0 ? QLatin1Char('0')
+                                                              : QLatin1Char('?');
+    }
+    return text;
+  };
+  auto* undo = require_hotkey_action(window, QStringLiteral("edit.undo"));
+  ctrl_click_row(4, Qt::NoModifier);
+  CHECK(selection() == QStringLiteral("1100"));
+  ctrl_click_row(5, Qt::ShiftModifier);
+  CHECK(selection() == QStringLiteral("1110"));
+  CHECK(window.statusBar()->currentMessage() == QStringLiteral("Added to the selection"));
+  CHECK(channels->currentRow() == 0);  // the row target stays where it was
+  undo->trigger();
+  QApplication::processEvents();
+  CHECK(selection() == QStringLiteral("1100"));
+  ctrl_click_row(5, Qt::AltModifier);
+  CHECK(selection() == QStringLiteral("1000"));
+  CHECK(window.statusBar()->currentMessage() == QStringLiteral("Subtracted from the selection"));
+  undo->trigger();
+  QApplication::processEvents();
+  ctrl_click_row(5, Qt::ShiftModifier | Qt::AltModifier);
+  CHECK(selection() == QStringLiteral("0100"));
+  CHECK(window.statusBar()->currentMessage() == QStringLiteral("Intersected with the selection"));
+}
+
+void ui_channel_rows_become_new_layers() {
+  const auto previous = patchy::working_cmyk_space();
+  const auto restore = qScopeGuard([&previous] { patchy::set_working_cmyk_space(previous); });
+  const auto space = patchy::CmykWorkingSpace::from_icc_profile(patchy::ui::bundled_cmyk_profile(),
+                                                                patchy::RenderingIntent::RelativeColorimetric, true);
+  patchy::Document document(32, 24, patchy::PixelFormat::rgb8());
+  document.add_pixel_layer("Artwork", solid_pixels(32, 24, patchy::PixelFormat::rgb8(), QColor(200, 120, 40)));
+  patchy::ui::MainWindow window;
+  patchy::set_working_cmyk_space(space);
+  window.add_document_session(std::move(document), QStringLiteral("Channel layers"));
+  show_window(window);
+  QApplication::processEvents();
+  auto* channels = window.findChild<QListWidget*>(QStringLiteral("channelList"));
+  auto* gray_action = window.findChild<QAction*>(QStringLiteral("channelNewLayerAction"));
+  auto* color_action = window.findChild<QAction*>(QStringLiteral("channelNewColorLayerAction"));
+  CHECK(channels != nullptr && gray_action != nullptr && color_action != nullptr);
+  auto& doc = patchy::ui::MainWindowTestAccess::document(window);
+  const auto top_layer = [&doc]() -> const patchy::Layer& { return std::as_const(doc).layers().back(); };
+  const auto top_pixel = [&](int x, int y) {
+    const auto* pixel = top_layer().pixels().pixel(x, y);
+    return QColor(pixel[0], pixel[1], pixel[2], pixel[3]);
+  };
+
+  // Composite has no color of its own.
+  channels->setCurrentRow(0);
+  QApplication::processEvents();
+  CHECK(gray_action->isEnabled());
+  CHECK(!color_action->isEnabled());
+
+  channels->setCurrentRow(1);  // Red
+  QApplication::processEvents();
+  CHECK(color_action->isEnabled());
+  gray_action->trigger();
+  QApplication::processEvents();
+  CHECK(std::as_const(doc).layers().size() == 2);
+  CHECK(top_layer().name() == "Red channel");
+  CHECK(top_layer().blend_mode() == patchy::BlendMode::Normal);
+  CHECK(top_pixel(5, 5) == QColor(200, 200, 200, 255));
+  // The canvas left the channel view for the new layer.
+  CHECK(require_canvas(window)->layer_edit_target() == patchy::ui::CanvasWidget::LayerEditTarget::Content);
+
+  channels->setCurrentRow(1);
+  QApplication::processEvents();
+  color_action->trigger();
+  QApplication::processEvents();
+  CHECK(std::as_const(doc).layers().size() == 3);
+  CHECK(top_layer().name() == "Red");
+  CHECK(top_layer().blend_mode() == patchy::BlendMode::Screen);
+  CHECK(top_pixel(5, 5) == QColor(200, 0, 0, 255));
+  require_hotkey_action(window, QStringLiteral("edit.undo"))->trigger();
+  QApplication::processEvents();
+  CHECK(std::as_const(doc).layers().size() == 2);
+
+  // An ink plate in color: what that ink alone prints, opaque, in Multiply.
+  auto* proof = window.findChild<QAction*>(QStringLiteral("viewProofColorsAction"));
+  CHECK(proof != nullptr);
+  proof->trigger();
+  QApplication::processEvents();
+  CHECK(channels->count() == 8);
+  channels->setCurrentRow(5);  // Magenta
+  QApplication::processEvents();
+  color_action->trigger();
+  QApplication::processEvents();
+  CHECK(top_layer().name() == "Magenta");
+  CHECK(top_layer().blend_mode() == patchy::BlendMode::Multiply);
+  // The plate is separated from the composite as it now stands (the gray layer on top).
+  const auto ink = space->separate_rgba8(std::vector<std::uint8_t>{200, 200, 200, 255})[1];
+  patchy::CmykPercent magenta;
+  magenta.magenta = static_cast<double>(ink) * 100.0 / 255.0;
+  const auto expected = space->rgb_from_cmyk(magenta);
+  const auto printed = top_pixel(5, 5);
+  CHECK(printed.red() == expected.red && printed.green() == expected.green && printed.blue() == expected.blue);
+  CHECK(printed.alpha() == 255);
+  proof->trigger();
+  QApplication::processEvents();
+}
+
+}  // namespace
+
+std::vector<patchy::test::TestCase> channels_panel_tests() {
+  return {
+      {"ui_channels_panel_targets_and_alpha_edits", ui_channels_panel_targets_and_alpha_edits},
+      {"ui_channel_ctrl_click_context_menu_and_compact_actions",
+       ui_channel_ctrl_click_context_menu_and_compact_actions},
+      {"ui_channel_shape_previews_match_committed_grayscale_and_overlay",
+       ui_channel_shape_previews_match_committed_grayscale_and_overlay},
+      {"ui_channels_soft_selection_crud_history_and_layer_exit",
+       ui_channels_soft_selection_crud_history_and_layer_exit},
+      {"ui_save_fragmented_selection_as_channel_stays_responsive",
+       ui_save_fragmented_selection_as_channel_stays_responsive},
+      {"ui_channels_target_survives_document_switch", ui_channels_target_survives_document_switch},
+      {"ui_channels_panel_shows_cmyk_plates_under_proof_colors", ui_channels_panel_shows_cmyk_plates_under_proof_colors},
+      {"ui_channel_rows_become_new_layers", ui_channel_rows_become_new_layers},
+      {"ui_channel_rows_ctrl_hover_show_selection_cursors_and_combine",
+       ui_channel_rows_ctrl_hover_show_selection_cursors_and_combine},
+      {"ui_channel_eyes_view_mask_shortcuts_and_thumbnails", ui_channel_eyes_view_mask_shortcuts_and_thumbnails},
+      {"ui_channel_view_issue_412_shots", ui_channel_view_issue_412_shots},
+      {"ui_channel_rows_show_their_shortcuts", ui_channel_rows_show_their_shortcuts},
+      {"ui_channel_eye_clicks_never_select_hidden", ui_channel_eye_clicks_never_select_hidden},
+      {"ui_non_psd_save_warns_before_discarding_channels",
+       ui_non_psd_save_warns_before_discarding_channels},
+      {"ui_save_layered_flat_format_routes_to_save_as_with_psd_default",
+       ui_save_layered_flat_format_routes_to_save_as_with_psd_default},
+  };
+}

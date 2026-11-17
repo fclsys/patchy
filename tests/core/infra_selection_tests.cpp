@@ -1,0 +1,1801 @@
+#include <string_view>
+#include "color/color_management.hpp"
+#include "core/document.hpp"
+#include "plugins/legacy_photoshop_adapter.hpp"
+#include "plugins/plugin_host.hpp"
+#include "core/magnetic_lasso.hpp"
+#include "core/exemplar_inpaint.hpp"
+#include "core/heal_membrane.hpp"
+#include "core/quick_select.hpp"
+#include "core/selection_modify.hpp"
+#include "core/spot_heal.hpp"
+#include "core/worker_budget.hpp"
+#include "render/tile_cache.hpp"
+#include "support/cli_flags.hpp"
+#include "support/startup_trace.hpp"
+#include "test_harness.hpp"
+#include "local_psd_fixtures.hpp"
+#include "remove_object_fixture.hpp"
+#include <algorithm>
+#include <array>
+#include <atomic>
+#include <bit>
+#include <cctype>
+#include <chrono>
+#include <cmath>
+#include <cstring>
+#include <filesystem>
+#include <exception>
+#include <cstdint>
+#include <fstream>
+#include <functional>
+#include <initializer_list>
+#include <iomanip>
+#include <iostream>
+#include <iterator>
+#include <limits>
+#include <numeric>
+#include <optional>
+#include <span>
+#include <sstream>
+#include <stdexcept>
+#include <string>
+#include <thread>
+#include <tuple>
+#include <unordered_set>
+#include <utility>
+#include <vector>
+#include "core_test_support.hpp"
+#include "test_groups.hpp"
+
+namespace {
+
+using patchy::test::solid_rgb;
+
+void plugin_host_and_legacy_probe_work() {
+  patchy::PluginHost host;
+  host.register_plugin({PATCHY_PLUGIN_FILTER, "com.patchy.test", "Test", 1, 0, 0, {}});
+  CHECK(host.find("com.patchy.test") != nullptr);
+  CHECK(host.plugins_by_kind(PATCHY_PLUGIN_FILTER).size() == 1);
+
+  const auto fixture = std::filesystem::path("test_sample_filter.8bf");
+  {
+    std::vector<std::uint8_t> bytes(512, 0);
+    bytes[0] = 'M';
+    bytes[1] = 'Z';
+    bytes[0x3c] = 0x80;
+    bytes[0x80] = 'P';
+    bytes[0x81] = 'E';
+    // Windows on Arm runs x64 plug-ins in the emulated x64 helper (docs/plugin-host.md), so
+    // a Windows ARM64 build probes an x64 plug-in like an x64 build does.
+#if defined(_M_IX86) || defined(__i386__)
+    bytes[0x84] = 0x4c;
+    bytes[0x85] = 0x01;
+#elif (defined(_M_ARM64) || defined(__aarch64__)) && !defined(_WIN32)
+    bytes[0x84] = 0x64;
+    bytes[0x85] = 0xaa;
+#else
+    bytes[0x84] = 0x64;
+    bytes[0x85] = 0x86;
+#endif
+    std::ofstream output(fixture, std::ios::binary);
+    output.write(reinterpret_cast<const char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
+  }
+
+  patchy::LegacyPhotoshopAdapter adapter;
+  const auto probe = adapter.probe(fixture);
+#ifdef _WIN32
+  CHECK(probe.supported);
+#else
+  // Legacy plug-ins are Windows PE binaries; off-Windows the probe rejects them with a
+  // platform reason no matter how well the architecture matches the host.
+  CHECK(!probe.supported);
+#endif
+  CHECK(probe.kind == patchy::LegacyPhotoshopPluginKind::Filter8bf);
+  CHECK(!probe.architecture.empty());
+  std::filesystem::remove(fixture);
+
+  // The real Filter Foundry plug-in is a fetched local fixture (scripts/fetch-test-plugins);
+  // legacy_probe_reports_names_and_bitness in pipl_tests covers it, so this is a bonus
+  // probe that runs only when the fixture is present.
+  const auto real_plugin = patchy::test::filter_foundry_fixture_path("Greyscale64.8bf");
+  if (std::filesystem::exists(real_plugin)) {
+    const auto real_probe = adapter.probe(real_plugin);
+    CHECK(real_probe.kind == patchy::LegacyPhotoshopPluginKind::Filter8bf);
+    CHECK(real_probe.architecture == "x64");
+  }
+}
+
+void tile_cache_stores_and_invalidates() {
+  patchy::TileCache cache(128);
+  patchy::TileKey key{0, 0, 0};
+  cache.put(key, solid_rgb(2, 2, 9, 8, 7));
+  CHECK(cache.find(key).has_value());
+  cache.invalidate(key);
+  CHECK(!cache.find(key).has_value());
+}
+
+void color_manager_assigns_profiles() {
+  patchy::Document document(1, 1, patchy::PixelFormat::rgb8());
+  patchy::ColorManager manager;
+  manager.assign_icc_profile(document, {1, 2, 3});
+  CHECK(document.color_state().embedded_icc_profile.size() == 3);
+}
+
+// ---------------------------------------------------------------------------
+// Quick Select
+// ---------------------------------------------------------------------------
+
+std::vector<std::uint8_t> quick_select_image(std::int32_t width, std::int32_t height,
+                                             std::array<std::uint8_t, 4> rgba) {
+  std::vector<std::uint8_t> image(static_cast<std::size_t>(width) * height * 4);
+  for (std::size_t i = 0; i < image.size(); i += 4) {
+    image[i] = rgba[0];
+    image[i + 1] = rgba[1];
+    image[i + 2] = rgba[2];
+    image[i + 3] = rgba[3];
+  }
+  return image;
+}
+
+void quick_select_fill_rect(std::vector<std::uint8_t>& image, std::int32_t width, patchy::Rect rect,
+                            std::array<std::uint8_t, 4> rgba) {
+  for (std::int32_t y = rect.y; y < rect.y + rect.height; ++y) {
+    for (std::int32_t x = rect.x; x < rect.x + rect.width; ++x) {
+      auto* px = image.data() + (static_cast<std::size_t>(y) * width + x) * 4;
+      px[0] = rgba[0];
+      px[1] = rgba[1];
+      px[2] = rgba[2];
+      px[3] = rgba[3];
+    }
+  }
+}
+
+void quick_select_fill_mask(std::vector<std::uint8_t>& mask, std::int32_t width, patchy::Rect rect,
+                            std::uint8_t value) {
+  for (std::int32_t y = rect.y; y < rect.y + rect.height; ++y) {
+    std::fill_n(mask.data() + static_cast<std::size_t>(y) * width + rect.x,
+                static_cast<std::size_t>(rect.width), value);
+  }
+}
+
+void quick_select_apply_delta(std::vector<std::uint8_t>& selection, std::int32_t width,
+                              const patchy::QuickSelectResult& result, bool subtract) {
+  for (const auto& run : result.delta_runs) {
+    for (std::int32_t x = run.x0; x <= run.x1; ++x) {
+      selection[static_cast<std::size_t>(run.y) * width + x] = subtract ? 0 : 255;
+    }
+  }
+}
+
+int quick_select_count_in_rect(const std::vector<std::uint8_t>& mask, std::int32_t width, patchy::Rect rect) {
+  int count = 0;
+  for (std::int32_t y = rect.y; y < rect.y + rect.height; ++y) {
+    for (std::int32_t x = rect.x; x < rect.x + rect.width; ++x) {
+      count += mask[static_cast<std::size_t>(y) * width + x] != 0 ? 1 : 0;
+    }
+  }
+  return count;
+}
+
+void quick_select_maxflow_solves_tiny_grid() {
+  // Three nodes in a row: source-(5)->n0 -(2)- n1 -(4)- n2 -(5)->sink. The only path
+  // bottlenecks on the 2-capacity arc, so flow = 2 and the cut separates n0 from n1/n2.
+  patchy::detail::GridMaxflow graph(3, 1);
+  graph.set_terminal_caps(0, 5.0f, 0.0f);
+  graph.set_terminal_caps(2, 0.0f, 5.0f);
+  graph.set_neighbor_cap(0, 1, 2.0f);
+  graph.set_neighbor_cap(1, 2, 4.0f);
+  const double flow = graph.solve();
+  CHECK(std::abs(flow - 2.0) < 1e-6);
+  CHECK(graph.is_source_side(0));
+  CHECK(!graph.is_source_side(1));
+  CHECK(!graph.is_source_side(2));
+}
+
+// Reference max-flow (Edmonds-Karp over an explicit capacity matrix) used to validate the
+// Boykov-Kolmogorov implementation on small random grids.
+double quick_select_reference_maxflow(std::vector<std::vector<double>> capacity, int source, int sink) {
+  const int node_count = static_cast<int>(capacity.size());
+  double flow = 0.0;
+  while (true) {
+    std::vector<int> parent(node_count, -1);
+    parent[source] = source;
+    std::vector<int> queue{source};
+    for (std::size_t head = 0; head < queue.size() && parent[sink] < 0; ++head) {
+      const int node = queue[head];
+      for (int next = 0; next < node_count; ++next) {
+        if (parent[next] < 0 && capacity[node][next] > 1e-12) {
+          parent[next] = node;
+          queue.push_back(next);
+        }
+      }
+    }
+    if (parent[sink] < 0) {
+      return flow;
+    }
+    double bottleneck = std::numeric_limits<double>::max();
+    for (int node = sink; node != source; node = parent[node]) {
+      bottleneck = std::min(bottleneck, capacity[parent[node]][node]);
+    }
+    for (int node = sink; node != source; node = parent[node]) {
+      capacity[parent[node]][node] -= bottleneck;
+      capacity[node][parent[node]] += bottleneck;
+    }
+    flow += bottleneck;
+  }
+}
+
+void quick_select_maxflow_matches_reference_on_random_grids() {
+  std::uint32_t rng_state = 0xC0FFEE01u;
+  const auto next_random = [&rng_state]() {
+    rng_state ^= rng_state << 13;
+    rng_state ^= rng_state >> 17;
+    rng_state ^= rng_state << 5;
+    return rng_state;
+  };
+  for (int round = 0; round < 60; ++round) {
+    const std::int32_t width = 2 + static_cast<std::int32_t>(next_random() % 4);   // 2..5
+    const std::int32_t height = 2 + static_cast<std::int32_t>(next_random() % 4);  // 2..5
+    const int nodes = width * height;
+    const int source = nodes;
+    const int sink = nodes + 1;
+    std::vector<std::vector<double>> capacity(static_cast<std::size_t>(nodes) + 2,
+                                              std::vector<double>(static_cast<std::size_t>(nodes) + 2, 0.0));
+    patchy::detail::GridMaxflow graph(width, height);
+
+    std::vector<double> source_caps(static_cast<std::size_t>(nodes));
+    std::vector<double> sink_caps(static_cast<std::size_t>(nodes));
+    for (int node = 0; node < nodes; ++node) {
+      // Integer-valued capacities keep every intermediate float sum exact.
+      const auto source_cap = static_cast<double>(next_random() % 11);
+      const auto sink_cap = static_cast<double>(next_random() % 11);
+      source_caps[static_cast<std::size_t>(node)] = source_cap;
+      sink_caps[static_cast<std::size_t>(node)] = sink_cap;
+      graph.set_terminal_caps(node, static_cast<float>(source_cap), static_cast<float>(sink_cap));
+      capacity[static_cast<std::size_t>(source)][static_cast<std::size_t>(node)] = source_cap;
+      capacity[static_cast<std::size_t>(node)][static_cast<std::size_t>(sink)] = sink_cap;
+    }
+    const auto connect = [&](int a, int b) {
+      const auto cap = static_cast<double>(next_random() % 11);
+      graph.set_neighbor_cap(a, b, static_cast<float>(cap));
+      capacity[static_cast<std::size_t>(a)][static_cast<std::size_t>(b)] = cap;
+      capacity[static_cast<std::size_t>(b)][static_cast<std::size_t>(a)] = cap;
+    };
+    for (std::int32_t y = 0; y < height; ++y) {
+      for (std::int32_t x = 0; x < width; ++x) {
+        const int node = y * width + x;
+        if (x + 1 < width) {
+          connect(node, node + 1);
+        }
+        if (y + 1 < height) {
+          connect(node, node + width);
+          if (x + 1 < width) {
+            connect(node, node + width + 1);
+          }
+          if (x > 0) {
+            connect(node, node + width - 1);
+          }
+        }
+      }
+    }
+
+    const double expected = quick_select_reference_maxflow(capacity, source, sink);
+    const double flow = graph.solve();
+    CHECK(std::abs(flow - expected) < 1e-3);
+
+    // The labeling must describe a cut whose value equals the max flow (min-cut duality).
+    double cut = 0.0;
+    for (int node = 0; node < nodes; ++node) {
+      if (graph.is_source_side(node)) {
+        cut += sink_caps[static_cast<std::size_t>(node)];
+      } else {
+        cut += source_caps[static_cast<std::size_t>(node)];
+      }
+    }
+    for (std::int32_t y = 0; y < height; ++y) {
+      for (std::int32_t x = 0; x < width; ++x) {
+        const int node = y * width + x;
+        const auto arc_across = [&](int other) {
+          if (graph.is_source_side(node) && !graph.is_source_side(other)) {
+            cut += capacity[static_cast<std::size_t>(node)][static_cast<std::size_t>(other)];
+          } else if (!graph.is_source_side(node) && graph.is_source_side(other)) {
+            cut += capacity[static_cast<std::size_t>(other)][static_cast<std::size_t>(node)];
+          }
+        };
+        if (x + 1 < width) {
+          arc_across(node + 1);
+        }
+        if (y + 1 < height) {
+          arc_across(node + width);
+          if (x + 1 < width) {
+            arc_across(node + width + 1);
+          }
+          if (x > 0) {
+            arc_across(node + width - 1);
+          }
+        }
+      }
+    }
+    CHECK(std::abs(cut - expected) < 1e-3);
+  }
+}
+
+void quick_select_stroke_grabs_flat_region_and_respects_edges() {
+  const std::int32_t width = 200;
+  const std::int32_t height = 150;
+  const patchy::Rect object{60, 40, 80, 70};
+  auto image = quick_select_image(width, height, {255, 255, 255, 255});
+  quick_select_fill_rect(image, width, object, {200, 30, 20, 255});
+  // Scatter background noise the segmentation must not leak through.
+  std::uint32_t noise_state = 0xBADD5EEDu;
+  for (int i = 0; i < 30; ++i) {
+    noise_state ^= noise_state << 13;
+    noise_state ^= noise_state >> 17;
+    noise_state ^= noise_state << 5;
+    const std::int32_t x = static_cast<std::int32_t>(noise_state % width);
+    const std::int32_t y = static_cast<std::int32_t>((noise_state >> 8) % height);
+    if (!object.contains(x, y)) {
+      quick_select_fill_rect(image, width, patchy::Rect{x, y, 1, 1}, {90, 90, 90, 255});
+    }
+  }
+
+  // The stroke covers the object's middle; the remaining margin to the object edges stays
+  // within the spread budget (growth is bounded like Photoshop's, so a tiny stroke in a huge
+  // shape deliberately does NOT grab far corners).
+  std::vector<std::uint8_t> seeds(static_cast<std::size_t>(width) * height, 0);
+  const patchy::Rect seed_rect{70, 50, 60, 50};
+  quick_select_fill_mask(seeds, width, seed_rect, 255);
+
+  patchy::QuickSelectParams params;
+  params.brush_radius = 10;
+  const auto result = patchy::quick_select_segment(image.data(), width, height,
+                                                   static_cast<std::ptrdiff_t>(width) * 4, nullptr,
+                                                   seeds.data(), seed_rect, params);
+  CHECK(!result.empty());
+
+  std::vector<std::uint8_t> selection(static_cast<std::size_t>(width) * height, 0);
+  quick_select_apply_delta(selection, width, result, false);
+  const int object_hits = quick_select_count_in_rect(selection, width, object);
+  const int total_hits = quick_select_count_in_rect(selection, width, patchy::Rect::from_size(width, height));
+  const int object_area = object.width * object.height;
+  const int background_area = width * height - object_area;
+  CHECK(object_hits >= object_area * 95 / 100);
+  CHECK(total_hits - object_hits <= background_area / 100);
+}
+
+void quick_select_second_stroke_adds_monotonically() {
+  const std::int32_t width = 200;
+  const std::int32_t height = 150;
+  const patchy::Rect object{60, 40, 80, 70};
+  auto image = quick_select_image(width, height, {255, 255, 255, 255});
+  quick_select_fill_rect(image, width, object, {40, 90, 200, 255});
+
+  std::vector<std::uint8_t> selection(static_cast<std::size_t>(width) * height, 0);
+  patchy::QuickSelectParams params;
+  params.brush_radius = 8;
+
+  std::vector<std::uint8_t> seeds(static_cast<std::size_t>(width) * height, 0);
+  const patchy::Rect first_seed{65, 45, 25, 60};
+  quick_select_fill_mask(seeds, width, first_seed, 255);
+  const auto first = patchy::quick_select_segment(image.data(), width, height,
+                                                  static_cast<std::ptrdiff_t>(width) * 4, selection.data(),
+                                                  seeds.data(), first_seed, params);
+  CHECK(!first.empty());
+  quick_select_apply_delta(selection, width, first, false);
+  const int after_first = quick_select_count_in_rect(selection, width, object);
+
+  std::fill(seeds.begin(), seeds.end(), std::uint8_t{0});
+  const patchy::Rect second_seed{110, 45, 25, 60};
+  quick_select_fill_mask(seeds, width, second_seed, 255);
+  const auto second = patchy::quick_select_segment(image.data(), width, height,
+                                                   static_cast<std::ptrdiff_t>(width) * 4, selection.data(),
+                                                   seeds.data(), second_seed, params);
+  // The second stroke may only add pixels that were not already selected.
+  for (const auto& run : second.delta_runs) {
+    for (std::int32_t x = run.x0; x <= run.x1; ++x) {
+      CHECK(selection[static_cast<std::size_t>(run.y) * width + x] == 0);
+    }
+  }
+  quick_select_apply_delta(selection, width, second, false);
+  const int after_second = quick_select_count_in_rect(selection, width, object);
+  CHECK(after_second >= after_first);
+  CHECK(after_second >= object.width * object.height * 95 / 100);
+  const int total = quick_select_count_in_rect(selection, width, patchy::Rect::from_size(width, height));
+  CHECK(total - after_second <= (width * height - object.width * object.height) / 100);
+}
+
+void quick_select_subtract_removes_only_connected_area() {
+  const std::int32_t width = 220;
+  const std::int32_t height = 150;
+  const patchy::Rect blob_a{20, 20, 80, 80};   // larger than a tap's spread budget
+  const patchy::Rect blob_b{150, 80, 40, 40};
+  auto image = quick_select_image(width, height, {255, 255, 255, 255});
+  quick_select_fill_rect(image, width, blob_a, {30, 60, 180, 255});
+  quick_select_fill_rect(image, width, blob_b, {30, 60, 180, 255});
+
+  std::vector<std::uint8_t> selection(static_cast<std::size_t>(width) * height, 0);
+  quick_select_fill_mask(selection, width, blob_a, 255);
+  quick_select_fill_mask(selection, width, blob_b, 255);
+
+  // A subtract tap in a blob much larger than the spread budget shaves a budget-sized area
+  // around the brush, always within the previously-selected blob (Photoshop-like locality).
+  std::vector<std::uint8_t> seeds(static_cast<std::size_t>(width) * height, 0);
+  const patchy::Rect tap_rect{55, 55, 10, 10};
+  quick_select_fill_mask(seeds, width, tap_rect, 255);
+  patchy::QuickSelectParams params;
+  params.brush_radius = 8;
+  params.subtract = true;
+  const auto tap = patchy::quick_select_segment(image.data(), width, height,
+                                                static_cast<std::ptrdiff_t>(width) * 4, selection.data(),
+                                                seeds.data(), tap_rect, params);
+  CHECK(!tap.empty());
+  for (const auto& run : tap.delta_runs) {
+    CHECK(run.y >= blob_a.y && run.y < blob_a.y + blob_a.height);
+    CHECK(run.x0 >= blob_a.x && run.x1 < blob_a.x + blob_a.width);
+  }
+  quick_select_apply_delta(selection, width, tap, true);
+  const int after_tap = quick_select_count_in_rect(selection, width, blob_a);
+  CHECK(after_tap < blob_a.width * blob_a.height);          // something was shaved...
+  CHECK(after_tap >= blob_a.width * blob_a.height * 30 / 100);  // ...but a tap must not nuke the blob
+  CHECK(quick_select_count_in_rect(selection, width, blob_b) == blob_b.width * blob_b.height);
+
+  // A stroke covering most of the blob removes it entirely (the unbrushed remainder is within
+  // the budget and cheaper to drop than to fence off), still without touching blob B.
+  quick_select_fill_mask(selection, width, blob_a, 255);  // restore blob A
+  std::fill(seeds.begin(), seeds.end(), std::uint8_t{0});
+  const patchy::Rect stroke_rect{30, 30, 60, 60};
+  quick_select_fill_mask(seeds, width, stroke_rect, 255);
+  const auto stroke = patchy::quick_select_segment(image.data(), width, height,
+                                                   static_cast<std::ptrdiff_t>(width) * 4, selection.data(),
+                                                   seeds.data(), stroke_rect, params);
+  CHECK(!stroke.empty());
+  quick_select_apply_delta(selection, width, stroke, true);
+  CHECK(quick_select_count_in_rect(selection, width, blob_a) <= blob_a.width * blob_a.height * 5 / 100);
+  CHECK(quick_select_count_in_rect(selection, width, blob_b) == blob_b.width * blob_b.height);
+}
+
+// Regression for the July 2026 "brushing an eye selects half the face" report: on textured
+// photo-like content whose stroke colors also appear in the background samples, the selection
+// must hug the brushed object instead of flooding to the solve-window border. (The original
+// cause was over-smoothed histograms plus a background-decontamination hack that turned every
+// stroke color into strong foreground.)
+void quick_select_photo_texture_stroke_stays_local() {
+  const std::int32_t width = 260;
+  const std::int32_t height = 200;
+  std::vector<std::uint8_t> image(static_cast<std::size_t>(width) * height * 4);
+  std::uint32_t noise_state = 0x1234ABCDu;
+  const auto next_noise = [&noise_state] {
+    noise_state ^= noise_state << 13;
+    noise_state ^= noise_state >> 17;
+    noise_state ^= noise_state << 5;
+    return noise_state;
+  };
+  const double center_x = 130.0;
+  const double center_y = 100.0;
+  const double radius_x = 48.0;
+  const double radius_y = 32.0;
+  const auto ellipse_distance = [&](double x, double y) {
+    const double dx = (x - center_x) / radius_x;
+    const double dy = (y - center_y) / radius_y;
+    return std::sqrt(dx * dx + dy * dy);
+  };
+  for (std::int32_t y = 0; y < height; ++y) {
+    for (std::int32_t x = 0; x < width; ++x) {
+      // Skin-tone background with a horizontal gradient and per-pixel luminance noise.
+      const int gradient = x * 30 / width;
+      const int jitter = static_cast<int>(next_noise() % 25) - 12;
+      const int skin_r = 215 + gradient / 2 + jitter;
+      const int skin_g = 170 + gradient / 3 + jitter;
+      const int skin_b = 140 + gradient / 3 + jitter;
+      // Dark "eye" ellipse with a soft blended rim (a few pixels wide).
+      const int dark_r = 70 + jitter / 2;
+      const int dark_g = 45 + jitter / 2;
+      const int dark_b = 35 + jitter / 2;
+      const double edge = std::clamp((ellipse_distance(x, y) - 1.0) * (radius_x / 4.0), 0.0, 1.0);
+      auto* px = image.data() + (static_cast<std::size_t>(y) * width + x) * 4;
+      px[0] = static_cast<std::uint8_t>(std::clamp(
+          static_cast<int>(std::lround(dark_r + (skin_r - dark_r) * edge)), 0, 255));
+      px[1] = static_cast<std::uint8_t>(std::clamp(
+          static_cast<int>(std::lround(dark_g + (skin_g - dark_g) * edge)), 0, 255));
+      px[2] = static_cast<std::uint8_t>(std::clamp(
+          static_cast<int>(std::lround(dark_b + (skin_b - dark_b) * edge)), 0, 255));
+      px[3] = 255;
+    }
+  }
+
+  std::vector<std::uint8_t> seeds(static_cast<std::size_t>(width) * height, 0);
+  const patchy::Rect seed_rect{115, 92, 30, 14};  // well inside the ellipse
+  quick_select_fill_mask(seeds, width, seed_rect, 255);
+
+  patchy::QuickSelectParams params;
+  params.brush_radius = 10;
+  const auto result = patchy::quick_select_segment(image.data(), width, height,
+                                                   static_cast<std::ptrdiff_t>(width) * 4, nullptr,
+                                                   seeds.data(), seed_rect, params);
+  CHECK(!result.empty());
+
+  std::vector<std::uint8_t> selection(static_cast<std::size_t>(width) * height, 0);
+  quick_select_apply_delta(selection, width, result, false);
+  int inside_area = 0;
+  int inside_hits = 0;
+  int outside_hits = 0;
+  for (std::int32_t y = 0; y < height; ++y) {
+    for (std::int32_t x = 0; x < width; ++x) {
+      const double distance = ellipse_distance(x, y);
+      const bool selected = selection[static_cast<std::size_t>(y) * width + x] != 0;
+      if (distance <= 1.0) {
+        ++inside_area;
+        inside_hits += selected ? 1 : 0;
+      } else if (distance > 1.15 && selected) {
+        ++outside_hits;  // beyond the soft rim: this is leakage
+      }
+    }
+  }
+  CHECK(inside_hits >= inside_area * 70 / 100);
+  CHECK(outside_hits <= width * height * 3 / 100);
+}
+
+void quick_select_enhance_edge_smooths_staircase() {
+  const std::int32_t width = 60;
+  const std::int32_t height = 60;
+  std::vector<std::uint8_t> mask(static_cast<std::size_t>(width) * height, 0);
+  quick_select_fill_mask(mask, width, patchy::Rect{0, 0, 30, height}, 255);  // straight edge at x=30
+  mask[static_cast<std::size_t>(10) * width + 31] = 255;  // 1px spur on the edge
+  mask[static_cast<std::size_t>(15) * width + 15] = 0;    // 1px hole inside
+  mask[static_cast<std::size_t>(45) * width + 45] = 255;  // isolated island outside
+
+  auto banded = mask;  // band-restricted copy: only the top half may change
+  patchy::enhance_selection_edge(mask, width, height, patchy::Rect::from_size(width, height));
+  CHECK(mask[static_cast<std::size_t>(10) * width + 31] == 0);   // spur removed
+  CHECK(mask[static_cast<std::size_t>(15) * width + 15] == 255); // hole filled
+  CHECK(mask[static_cast<std::size_t>(45) * width + 45] == 0);   // island removed
+  for (std::int32_t y = 0; y < height; ++y) {                    // straight edge intact
+    CHECK(mask[static_cast<std::size_t>(y) * width + 29] == 255);
+    CHECK(mask[static_cast<std::size_t>(y) * width + 30] == 0);
+  }
+
+  patchy::enhance_selection_edge(banded, width, height, patchy::Rect{0, 0, width, 30});
+  CHECK(banded[static_cast<std::size_t>(10) * width + 31] == 0);   // inside band: smoothed
+  CHECK(banded[static_cast<std::size_t>(45) * width + 45] == 255); // outside band: untouched
+}
+
+std::vector<std::uint8_t> magnetic_two_tone_image(std::int32_t width, std::int32_t height,
+                                                  const std::function<bool(std::int32_t, std::int32_t)>& is_light,
+                                                  std::uint8_t dark, std::uint8_t light) {
+  std::vector<std::uint8_t> rgba(static_cast<std::size_t>(width) * static_cast<std::size_t>(height) * 4U);
+  for (std::int32_t y = 0; y < height; ++y) {
+    for (std::int32_t x = 0; x < width; ++x) {
+      const auto value = is_light(x, y) ? light : dark;
+      auto* px = rgba.data() + (static_cast<std::size_t>(y) * width + x) * 4U;
+      px[0] = value;
+      px[1] = value;
+      px[2] = value;
+      px[3] = 255;
+    }
+  }
+  return rgba;
+}
+
+std::vector<patchy::PointI32> magnetic_reference_line(patchy::PointI32 from, patchy::PointI32 to) {
+  std::vector<patchy::PointI32> line;
+  const auto dx = std::abs(to.x - from.x);
+  const auto dy = std::abs(to.y - from.y);
+  const std::int32_t sx = from.x < to.x ? 1 : -1;
+  const std::int32_t sy = from.y < to.y ? 1 : -1;
+  std::int32_t error = dx - dy;
+  auto point = from;
+  while (true) {
+    line.push_back(point);
+    if (point == to) {
+      break;
+    }
+    const auto doubled = 2 * error;
+    if (doubled > -dy) {
+      error -= dy;
+      point.x += sx;
+    }
+    if (doubled < dx) {
+      error += dx;
+      point.y += sy;
+    }
+  }
+  return line;
+}
+
+void check_magnetic_path_is_8_connected(const std::vector<patchy::PointI32>& path) {
+  CHECK(!path.empty());
+  for (std::size_t i = 1; i < path.size(); ++i) {
+    CHECK(std::abs(path[i].x - path[i - 1].x) <= 1);
+    CHECK(std::abs(path[i].y - path[i - 1].y) <= 1);
+    CHECK(!(path[i] == path[i - 1]));
+  }
+}
+
+void magnetic_lasso_path_snaps_to_synthetic_edge() {
+  constexpr std::int32_t size = 128;
+  // Triangle-wave boundary, amplitude +-4, slope +-1 per row (integer, deterministic).
+  const auto boundary = [](std::int32_t y) { return 64 + std::abs(y % 16 - 8) - 4; };
+  const auto rgba =
+      magnetic_two_tone_image(size, size, [&](std::int32_t x, std::int32_t y) { return x >= boundary(y); }, 30, 220);
+  patchy::LiveWireEngine engine;
+  engine.set_image(rgba.data(), size, size, size * 4);
+  engine.set_params({});
+  const auto anchor = engine.snap({boundary(8) - 3, 8});
+  CHECK(std::abs(anchor.x - boundary(anchor.y)) <= 2);
+  CHECK(std::abs(anchor.y - 8) <= 5);
+  engine.set_anchor(anchor);
+  const auto target = engine.snap({boundary(120) + 3, 120});
+  const auto path = engine.path_to(target);
+  CHECK(path.size() >= 100);
+  CHECK(path.front() == anchor);
+  CHECK(path.back() == target);
+  check_magnetic_path_is_8_connected(path);
+  for (const auto& p : path) {
+    CHECK(std::abs(p.x - boundary(p.y)) <= 2);
+  }
+}
+
+void magnetic_lasso_flat_region_yields_straight_line() {
+  constexpr std::int32_t size = 128;
+  const auto rgba =
+      magnetic_two_tone_image(size, size, [](std::int32_t, std::int32_t) { return false; }, 128, 128);
+  patchy::LiveWireEngine engine;
+  engine.set_image(rgba.data(), size, size, size * 4);
+  engine.set_params({});
+  CHECK((engine.snap({50, 50}) == patchy::PointI32{50, 50}));
+  engine.set_anchor({10, 10});
+  const auto path = engine.path_to({100, 60});
+  const auto expected = magnetic_reference_line({10, 10}, {100, 60});
+  CHECK(path.size() == expected.size());
+  for (std::size_t i = 0; i < path.size(); ++i) {
+    CHECK(path[i] == expected[i]);
+  }
+}
+
+void magnetic_lasso_edge_contrast_gates_weak_edges() {
+  constexpr std::int32_t size = 128;
+  // Faint step: 128 -> 148 at x = 64 gives gradient G8 = 20.
+  const auto rgba =
+      magnetic_two_tone_image(size, size, [](std::int32_t x, std::int32_t) { return x >= 64; }, 128, 148);
+  patchy::LiveWireEngine engine;
+  engine.set_image(rgba.data(), size, size, size * 4);
+
+  patchy::MagneticLassoParams low{};
+  low.edge_contrast = 5;  // threshold 12 < 20: the faint edge attracts
+  engine.set_params(low);
+  engine.set_anchor(engine.snap({61, 10}));
+  auto path = engine.path_to(engine.snap({61, 118}));
+  check_magnetic_path_is_8_connected(path);
+  bool rode_the_edge = false;
+  for (const auto& p : path) {
+    if (p.y > 20 && p.y < 100) {
+      rode_the_edge = rode_the_edge || (p.x >= 62 && p.x <= 65);
+    }
+  }
+  CHECK(rode_the_edge);
+
+  patchy::MagneticLassoParams high{};
+  high.edge_contrast = 60;  // threshold 153 > 20: gated, traces the literal line
+  engine.set_params(high);
+  CHECK((engine.snap({61, 10}) == patchy::PointI32{61, 10}));
+  engine.set_anchor({61, 10});
+  path = engine.path_to({61, 118});
+  CHECK(path.size() == 109);
+  for (const auto& p : path) {
+    CHECK(p.x == 61);
+  }
+}
+
+void magnetic_lasso_snap_respects_width() {
+  constexpr std::int32_t size = 128;
+  const auto rgba =
+      magnetic_two_tone_image(size, size, [](std::int32_t x, std::int32_t) { return x >= 64; }, 30, 220);
+  patchy::LiveWireEngine engine;
+  engine.set_image(rgba.data(), size, size, size * 4);
+
+  patchy::MagneticLassoParams wide{};
+  wide.width = 10;  // radius 5 reaches the edge columns 63/64 from x = 61
+  engine.set_params(wide);
+  CHECK((engine.snap({61, 40}) == patchy::PointI32{63, 40}));
+
+  patchy::MagneticLassoParams narrow{};
+  narrow.width = 4;  // radius 2 cannot reach the edge from x = 58
+  engine.set_params(narrow);
+  CHECK((engine.snap({58, 40}) == patchy::PointI32{58, 40}));
+}
+
+void magnetic_lasso_is_deterministic() {
+  constexpr std::int32_t width = 512;
+  constexpr std::int32_t height = 64;
+  const auto rgba = magnetic_two_tone_image(
+      width, height, [](std::int32_t, std::int32_t y) { return y >= 32; }, 30, 220);
+  const auto trace = [&] {
+    patchy::LiveWireEngine engine;
+    engine.set_image(rgba.data(), width, height, width * 4);
+    engine.set_params({});
+    engine.set_anchor(engine.snap({8, 30}));
+    // A near target builds the anchor-centered field, then a far target forces the window
+    // regrowth path; both legs must be reproducible.
+    auto path = engine.path_to(engine.snap({120, 30}));
+    auto far_path = engine.path_to(engine.snap({500, 30}));
+    path.insert(path.end(), far_path.begin(), far_path.end());
+    return path;
+  };
+  const auto first = trace();
+  const auto second = trace();
+  CHECK(first.size() == second.size());
+  for (std::size_t i = 0; i < first.size(); ++i) {
+    CHECK(first[i] == second[i]);
+  }
+  CHECK(first.size() > 500);
+  for (const auto& p : first) {
+    CHECK(p.y >= 29 && p.y <= 34);
+  }
+}
+
+void magnetic_lasso_prefers_opaque_side_of_alpha_edge() {
+  // Black art on transparent ground: the gradient lives in the alpha channel and spans an
+  // anti-aliased ramp several pixels wide (columns 62..64 here). The wire and the snap must
+  // settle on the opaque side of the ramp like Photoshop, not the translucent fringe.
+  constexpr std::int32_t size = 128;
+  std::vector<std::uint8_t> rgba(static_cast<std::size_t>(size) * size * 4U, 0);
+  const auto alpha_for_column = [](std::int32_t x) -> std::uint8_t {
+    if (x < 62) {
+      return 0;
+    }
+    switch (x) {
+      case 62:
+        return 64;
+      case 63:
+        return 160;
+      case 64:
+        return 240;
+      default:
+        return 255;
+    }
+  };
+  for (std::int32_t y = 0; y < size; ++y) {
+    for (std::int32_t x = 0; x < size; ++x) {
+      rgba[(static_cast<std::size_t>(y) * size + x) * 4U + 3U] = alpha_for_column(x);
+    }
+  }
+  patchy::LiveWireEngine engine;
+  engine.set_image(rgba.data(), size, size, size * 4);
+  engine.set_params({});
+  const auto anchor = engine.snap({60, 20});
+  CHECK(anchor.x == 64);
+  CHECK(anchor.y == 20);
+  engine.set_anchor(anchor);
+  const auto path = engine.path_to(engine.snap({60, 110}));
+  check_magnetic_path_is_8_connected(path);
+  CHECK(path.size() >= 80);
+  for (const auto& p : path) {
+    CHECK(p.x >= 64);
+    CHECK(p.x <= 66);
+  }
+}
+
+void magnetic_lasso_node_budget_falls_back_to_straight_line() {
+  constexpr std::int32_t size = 256;
+  const auto rgba =
+      magnetic_two_tone_image(size, size, [](std::int32_t x, std::int32_t) { return x >= 128; }, 30, 220);
+  patchy::LiveWireEngine engine;
+  engine.set_image(rgba.data(), size, size, size * 4);
+  patchy::MagneticLassoParams tiny_budget{};
+  tiny_budget.node_budget = 1;  // clamps to the 1024 floor, far below any usable window
+  engine.set_params(tiny_budget);
+  engine.set_anchor({10, 128});
+  const auto path = engine.path_to({245, 128});
+  const auto expected = magnetic_reference_line({10, 128}, {245, 128});
+  CHECK(path.size() == expected.size());
+  for (std::size_t i = 0; i < path.size(); ++i) {
+    CHECK(path[i] == expected[i]);
+  }
+}
+
+std::vector<std::uint8_t> spot_heal_disc_mask(std::int32_t width, std::int32_t height,
+                                              std::int32_t center_x, std::int32_t center_y,
+                                              std::int32_t radius) {
+  std::vector<std::uint8_t> mask(static_cast<std::size_t>(width) * static_cast<std::size_t>(height));
+  for (std::int32_t y = 0; y < height; ++y) {
+    for (std::int32_t x = 0; x < width; ++x) {
+      const auto dx = x - center_x;
+      const auto dy = y - center_y;
+      if (dx * dx + dy * dy <= radius * radius) {
+        mask[static_cast<std::size_t>(y) * width + x] = 255U;
+      }
+    }
+  }
+  return mask;
+}
+
+// Counts covered cells whose mapped source lands off-canvas or back inside
+// the footprint - the same geometric validity the selector scores.
+std::int64_t spot_heal_map_violations(const std::vector<std::uint8_t>& mask, patchy::Rect bounds,
+                                      const patchy::SpotHealSourceMap& map, std::int32_t canvas_width,
+                                      std::int32_t canvas_height) {
+  const auto covered = [&](std::int32_t doc_x, std::int32_t doc_y) {
+    if (!bounds.contains(doc_x, doc_y)) {
+      return false;
+    }
+    return mask[static_cast<std::size_t>(doc_y - bounds.y) * bounds.width + (doc_x - bounds.x)] != 0U;
+  };
+  std::int64_t violations = 0;
+  for (std::int32_t y = 0; y < bounds.height; ++y) {
+    for (std::int32_t x = 0; x < bounds.width; ++x) {
+      if (mask[static_cast<std::size_t>(y) * bounds.width + x] == 0U) {
+        continue;
+      }
+      const auto [sx, sy] = map.map(bounds.x + x, bounds.y + y);
+      if (sx < 0 || sy < 0 || sx >= canvas_width || sy >= canvas_height || covered(sx, sy)) {
+        ++violations;
+      }
+    }
+  }
+  return violations;
+}
+
+void spot_heal_source_map_is_coherent_and_outside() {
+  constexpr std::int32_t canvas = 128;
+  const patchy::Rect bounds{10, 10, 64, 64};
+
+  // Disc footprint: one rigid mapping, zero violations, deterministic rerun.
+  const auto disc = spot_heal_disc_mask(bounds.width, bounds.height, 32, 32, 12);
+  const auto disc_map = patchy::spot_heal_source_map(disc.data(), bounds, canvas, canvas);
+  CHECK(disc_map.valid);
+  CHECK(spot_heal_map_violations(disc, bounds, disc_map, canvas, canvas) == 0);
+  const auto rerun = patchy::spot_heal_source_map(disc.data(), bounds, canvas, canvas);
+  CHECK(rerun.valid == disc_map.valid && rerun.mirrored == disc_map.mirrored);
+  CHECK(rerun.map(20, 20) == disc_map.map(20, 20));
+  CHECK(rerun.map(50, 60) == disc_map.map(50, 60));
+  // Coherence: neighboring pixels map to neighboring sources (a rigid map,
+  // not per-pixel scatter).
+  const auto [ax, ay] = disc_map.map(41, 42);
+  const auto [bx, by] = disc_map.map(42, 42);
+  CHECK(std::abs(ax - bx) <= 2 && std::abs(ay - by) <= 2);
+
+  // Elongated capsule: still one valid rigid mapping with zero violations.
+  std::vector<std::uint8_t> capsule(static_cast<std::size_t>(bounds.width) * bounds.height);
+  for (std::int32_t y = 28; y <= 36; ++y) {
+    for (std::int32_t x = 8; x <= 56; ++x) {
+      capsule[static_cast<std::size_t>(y) * bounds.width + x] = 255U;
+    }
+  }
+  const auto capsule_map = patchy::spot_heal_source_map(capsule.data(), bounds, canvas, canvas);
+  CHECK(capsule_map.valid);
+  CHECK(spot_heal_map_violations(capsule, bounds, capsule_map, canvas, canvas) == 0);
+
+  // A footprint covering its entire bounds has nothing to sample: invalid.
+  const std::vector<std::uint8_t> full(static_cast<std::size_t>(bounds.width) * bounds.height, 255U);
+  CHECK(!patchy::spot_heal_source_map(full.data(), bounds, canvas, canvas).valid);
+}
+
+void spot_heal_source_map_stays_in_canvas_at_edges() {
+  constexpr std::int32_t canvas = 64;
+  // Footprint spilling over the canvas corner: the selector must pick a
+  // direction whose mapped region stays on the canvas (the interior side).
+  const patchy::Rect bounds{0, 0, 40, 40};
+  const auto disc = spot_heal_disc_mask(bounds.width, bounds.height, 4, 4, 10);
+  const auto map = patchy::spot_heal_source_map(disc.data(), bounds, canvas, canvas);
+  CHECK(map.valid);
+  CHECK(spot_heal_map_violations(disc, bounds, map, canvas, canvas) == 0);
+}
+
+// Remove Object's repeat cycle: `attempt` indexes the clean candidates in
+// their fixed order and wraps; attempt 0 is the historical pick, and a
+// footprint with no clean candidate exposes exactly one best-effort choice.
+void spot_heal_source_map_attempt_cycles_valid_candidates() {
+  constexpr std::int32_t canvas = 128;
+  const patchy::Rect bounds{40, 40, 48, 48};
+  // A centered disc with room on every side: several candidates are clean.
+  const auto disc = spot_heal_disc_mask(bounds.width, bounds.height, 24, 24, 10);
+  const auto first = patchy::spot_heal_source_map(disc.data(), bounds, canvas, canvas);
+  CHECK(first.valid);
+  CHECK(first.candidate_count >= 2);
+  const auto explicit_zero = patchy::spot_heal_source_map(disc.data(), bounds, canvas, canvas, 2, 0);
+  CHECK(explicit_zero.mirrored == first.mirrored && explicit_zero.map(60, 60) == first.map(60, 60));
+  const auto second = patchy::spot_heal_source_map(disc.data(), bounds, canvas, canvas, 2, 1);
+  CHECK(second.valid);
+  CHECK(second.candidate_count == first.candidate_count);
+  CHECK(second.map(60, 60) != first.map(60, 60));
+  for (std::int32_t attempt = 0; attempt < first.candidate_count; ++attempt) {
+    const auto map = patchy::spot_heal_source_map(disc.data(), bounds, canvas, canvas, 2, attempt);
+    CHECK(map.valid);
+    CHECK(spot_heal_map_violations(disc, bounds, map, canvas, canvas) == 0);
+  }
+  const auto wrapped =
+      patchy::spot_heal_source_map(disc.data(), bounds, canvas, canvas, 2, first.candidate_count);
+  CHECK(wrapped.mirrored == first.mirrored && wrapped.map(60, 60) == first.map(60, 60));
+
+  // A footprint filling the whole canvas but one cell: no candidate is clean,
+  // so the cycle holds the single first-fewest mapping.
+  constexpr std::int32_t edge = 24;
+  const patchy::Rect full_bounds{0, 0, edge, edge};
+  std::vector<std::uint8_t> crowded(static_cast<std::size_t>(edge) * edge, 255U);
+  crowded[static_cast<std::size_t>(edge - 1) * edge + (edge - 1)] = 0U;
+  const auto best_effort = patchy::spot_heal_source_map(crowded.data(), full_bounds, edge, edge);
+  CHECK(best_effort.valid);
+  CHECK(best_effort.candidate_count == 1);
+  const auto best_effort_again = patchy::spot_heal_source_map(crowded.data(), full_bounds, edge, edge, 2, 3);
+  CHECK(best_effort_again.mirrored == best_effort.mirrored &&
+        best_effort_again.map(10, 10) == best_effort.map(10, 10));
+}
+
+// Content-Aware Move's exclusion: cells of the excluded shape count as violations, so
+// the map steps past a candidate that would read them, and a map that never meets the
+// excluded shape is unchanged by it.
+void spot_heal_source_map_skips_excluded_cells() {
+  constexpr std::int32_t canvas = 128;
+  const patchy::Rect bounds{40, 40, 48, 48};
+  const auto disc = spot_heal_disc_mask(bounds.width, bounds.height, 24, 24, 10);
+  const auto plain = patchy::spot_heal_source_map(disc.data(), bounds, canvas, canvas);
+  CHECK(plain.valid);
+  // Exclude exactly the cells the plain pick reads.
+  std::vector<std::uint8_t> excluded(static_cast<std::size_t>(canvas) * canvas, 0U);
+  for (std::int32_t y = 0; y < bounds.height; ++y) {
+    for (std::int32_t x = 0; x < bounds.width; ++x) {
+      if (disc[static_cast<std::size_t>(y) * bounds.width + x] == 0U) {
+        continue;
+      }
+      const auto [sx, sy] = plain.map(bounds.x + x, bounds.y + y);
+      if (sx >= 0 && sy >= 0 && sx < canvas && sy < canvas) {
+        excluded[static_cast<std::size_t>(sy) * canvas + sx] = 255U;
+      }
+    }
+  }
+  const patchy::Rect canvas_rect{0, 0, canvas, canvas};
+  const auto skipped =
+      patchy::spot_heal_source_map(disc.data(), bounds, canvas, canvas, 2, 0, excluded.data(), canvas_rect);
+  CHECK(skipped.valid);
+  CHECK(skipped.candidate_count >= 1 && skipped.candidate_count < plain.candidate_count);
+  std::int64_t reads_excluded = 0;
+  for (std::int32_t y = 0; y < bounds.height; ++y) {
+    for (std::int32_t x = 0; x < bounds.width; ++x) {
+      if (disc[static_cast<std::size_t>(y) * bounds.width + x] == 0U) {
+        continue;
+      }
+      const auto [sx, sy] = skipped.map(bounds.x + x, bounds.y + y);
+      reads_excluded += excluded[static_cast<std::size_t>(sy) * canvas + sx] != 0U ? 1 : 0;
+    }
+  }
+  CHECK(reads_excluded == 0);
+  CHECK(spot_heal_map_violations(disc, bounds, skipped, canvas, canvas) == 0);
+  // An excluded shape far from every candidate changes nothing.
+  std::vector<std::uint8_t> far(4U * 4U, 255U);
+  const auto unchanged = patchy::spot_heal_source_map(disc.data(), bounds, canvas, canvas, 2, 0, far.data(),
+                                                      patchy::Rect{0, 0, 4, 4});
+  CHECK(unchanged.mirrored == plain.mirrored && unchanged.map(60, 60) == plain.map(60, 60));
+  CHECK(unchanged.candidate_count == plain.candidate_count);
+}
+
+// The exhaustive exemplar fill on a periodic texture: exact source patches
+// exist, so the hole is restored to the pattern byte for byte, the result is
+// identical across runs (fixed scan orders, first-index tie-breaks), pixels
+// outside the hole are untouched, and a hole that swallows every clean source
+// patch reports !filled with the image unchanged.
+void exemplar_inpaint_restores_periodic_stripes_deterministically() {
+  constexpr std::int32_t width = 96;
+  constexpr std::int32_t height = 64;
+  std::vector<std::uint8_t> image(static_cast<std::size_t>(width) * height * 4U);
+  for (std::int32_t y = 0; y < height; ++y) {
+    for (std::int32_t x = 0; x < width; ++x) {
+      auto* px = image.data() + (static_cast<std::size_t>(y) * width + x) * 4U;
+      const bool a = (x / 8) % 2 == 0;
+      px[0] = a ? 30 : 220;
+      px[1] = a ? 60 : 180;
+      px[2] = a ? 200 : 40;
+      px[3] = 255;
+    }
+  }
+  const patchy::Rect hole_bounds{30, 20, 20, 20};
+  std::vector<std::uint8_t> hole(static_cast<std::size_t>(hole_bounds.width) * hole_bounds.height, 255U);
+  auto damaged = image;
+  for (std::int32_t y = 0; y < hole_bounds.height; ++y) {
+    for (std::int32_t x = 0; x < hole_bounds.width; ++x) {
+      auto* px = damaged.data() + (static_cast<std::size_t>(hole_bounds.y + y) * width + hole_bounds.x + x) * 4U;
+      px[0] = px[1] = px[2] = 0;
+    }
+  }
+  patchy::ExemplarInpaintOptions options;
+  options.patch_size = 9;
+  options.search_radius = 32;
+  auto first = damaged;
+  std::int64_t ticks = 0;
+  std::int64_t last_done = -1;
+  std::int64_t reported_total = 0;
+  const auto result = patchy::exemplar_inpaint(first.data(), width, height, hole.data(), hole_bounds, options,
+                                               [&](std::int64_t done, std::int64_t total) {
+                                                 ++ticks;
+                                                 CHECK(done > last_done);
+                                                 last_done = done;
+                                                 reported_total = total;
+                                               });
+  CHECK(result.filled);
+  CHECK(result.patches > 0);
+  CHECK(ticks == result.patches);
+  CHECK(reported_total == static_cast<std::int64_t>(hole_bounds.width) * hole_bounds.height);
+  CHECK(last_done == reported_total);
+  // The single-threaded scan is byte-identical to the fan-out.
+  auto serial = damaged;
+  auto serial_options = options;
+  serial_options.single_threaded = true;
+  CHECK(patchy::exemplar_inpaint(serial.data(), width, height, hole.data(), hole_bounds, serial_options).filled);
+  CHECK(serial == first);
+  CHECK(first == image);
+  auto second = damaged;
+  const auto rerun = patchy::exemplar_inpaint(second.data(), width, height, hole.data(), hole_bounds, options);
+  CHECK(rerun.filled && rerun.patches == result.patches);
+  CHECK(second == first);
+
+  // A hole much deeper than the search radius: every target still reaches a
+  // clean source past the hole edge (the window grows with the target's
+  // distance to the edge), so a uniform image fills exactly.
+  {
+    constexpr std::int32_t deep_w = 400;
+    constexpr std::int32_t deep_h = 300;
+    std::vector<std::uint8_t> uniform(static_cast<std::size_t>(deep_w) * deep_h * 4U);
+    for (std::size_t i = 0; i < uniform.size(); i += 4U) {
+      uniform[i] = 90;
+      uniform[i + 1U] = 120;
+      uniform[i + 2U] = 150;
+      uniform[i + 3U] = 255;
+    }
+    const patchy::Rect deep_bounds{50, 50, 300, 200};
+    std::vector<std::uint8_t> deep_hole(static_cast<std::size_t>(deep_bounds.width) * deep_bounds.height, 255U);
+    auto deep = uniform;
+    for (std::int32_t y = 0; y < deep_bounds.height; ++y) {
+      for (std::int32_t x = 0; x < deep_bounds.width; ++x) {
+        deep[(static_cast<std::size_t>(deep_bounds.y + y) * deep_w + deep_bounds.x + x) * 4U] = 0;
+      }
+    }
+    patchy::ExemplarInpaintOptions deep_options;
+    deep_options.patch_size = 9;
+    deep_options.search_radius = 32;
+    const auto deep_result = patchy::exemplar_inpaint(deep.data(), deep_w, deep_h, deep_hole.data(), deep_bounds,
+                                                      deep_options);
+    CHECK(deep_result.filled);
+    CHECK(deep == uniform);
+  }
+
+  // Nothing but a 4-pixel border is known: no 9x9 source patch is clean.
+  const patchy::Rect crowded_bounds{4, 4, width - 8, height - 8};
+  std::vector<std::uint8_t> crowded_hole(static_cast<std::size_t>(crowded_bounds.width) * crowded_bounds.height, 255U);
+  auto crowded = image;
+  const auto refused = patchy::exemplar_inpaint(crowded.data(), width, height, crowded_hole.data(), crowded_bounds,
+                                                options);
+  CHECK(!refused.filled);
+  CHECK(crowded == image);
+}
+
+// GitHub issue #23's banner (tests/remove_object_fixture.hpp): a 35 x 35 hole
+// around a white "1" on a dark band that runs 3 px past the hole above and
+// below, white background beyond it. The raw fill is dark; the tone match
+// must keep it so (its low-pass reads hole cells of the fill only, so the
+// background past the band's edges cannot lift it) and keep the grungy
+// stripe's contrast; its strength scales the correction and 0 is the raw
+// fill. Attempt 0 is the byte-stable best-match fill; attempts 1 and 2 are
+// different fills, each reproducible and identical single-threaded.
+void exemplar_inpaint_banner_tone_match_stays_dark_and_varies_by_attempt() {
+  const auto f = patchy::test::make_banner_fixture();
+  const patchy::Rect bounds{f.hole_x, f.hole_y, f.hole_width, f.hole_height};
+  const auto hole = f.hole_mask();
+  patchy::ExemplarInpaintOptions options;
+  options.patch_size = 9;
+  options.search_radius = std::clamp(std::max(bounds.width, bounds.height) / 2 + 32, 48, 96);
+  const auto run = [&](std::int32_t attempt, bool single_threaded) {
+    auto image = f.pixels;
+    auto run_options = options;
+    run_options.attempt = attempt;
+    run_options.single_threaded = single_threaded;
+    const auto result = patchy::exemplar_inpaint(image.data(), f.width, f.height, hole.data(), bounds, run_options);
+    CHECK(result.filled);
+    return image;
+  };
+  struct HoleStats {
+    double band_mean{0.0};    // hole rows outside the stripe
+    double stripe_mean{0.0};  // hole rows inside the stripe
+    std::int32_t bright{0};   // hole pixels lighter than 160 (copied glyph or background)
+  };
+  const auto stats = [&](const std::vector<std::uint8_t>& image) {
+    HoleStats result;
+    double band_sum = 0.0;
+    double stripe_sum = 0.0;
+    std::int32_t band_count = 0;
+    std::int32_t stripe_count = 0;
+    for (std::int32_t y = f.hole_y; y < f.hole_y + f.hole_height; ++y) {
+      for (std::int32_t x = f.hole_x; x < f.hole_x + f.hole_width; ++x) {
+        const auto* px = image.data() + (static_cast<std::size_t>(y) * f.width + x) * 4U;
+        const auto luminance = (px[0] * 77 + px[1] * 150 + px[2] * 29) >> 8;
+        if (luminance > 160) {
+          ++result.bright;
+        }
+        if (f.in_stripe(y)) {
+          stripe_sum += luminance;
+          ++stripe_count;
+        } else {
+          band_sum += luminance;
+          ++band_count;
+        }
+      }
+    }
+    result.band_mean = band_sum / std::max(1, band_count);
+    result.stripe_mean = stripe_sum / std::max(1, stripe_count);
+    return result;
+  };
+  const auto outside_untouched = [&](const std::vector<std::uint8_t>& image) {
+    std::int64_t mismatches = 0;
+    for (std::int32_t y = 0; y < f.height; ++y) {
+      for (std::int32_t x = 0; x < f.width; ++x) {
+        if (f.in_hole(x, y)) {
+          continue;
+        }
+        const auto offset = (static_cast<std::size_t>(y) * f.width + x) * 4U;
+        if (std::memcmp(image.data() + offset, f.pixels.data() + offset, 4U) != 0) {
+          ++mismatches;
+        }
+      }
+    }
+    return mismatches == 0;
+  };
+
+  const auto fill0 = run(0, false);
+  CHECK(run(0, false) == fill0);
+  CHECK(run(0, true) == fill0);
+  CHECK(outside_untouched(fill0));
+  const auto raw = stats(fill0);
+
+  const auto band = static_cast<double>(f.band_value);
+  const auto stripe_contrast = static_cast<double>(f.stripe_value) - band;
+  std::cout << "banner raw band=" << raw.band_mean << " stripe=" << raw.stripe_mean << " bright=" << raw.bright << "\n";
+  CHECK(std::abs(raw.band_mean - band) <= 12.0);
+  // The hole-only normalization holds at any radius (the old known-pixel
+  // normalization lifted this band to 82 at radius 24 and to 94 at radius 8);
+  // 24 is Remove Object's radius and keeps the stripe's contrast almost
+  // whole, where a small radius flattens it.
+  for (const auto radius : {8, 24}) {
+    auto toned = fill0;
+    patchy::exemplar_match_tone(toned.data(), f.width, f.height, hole.data(), bounds, radius);
+    const auto toned_stats = stats(toned);
+    std::cout << "banner tone r=" << radius << " band=" << toned_stats.band_mean
+              << " stripe=" << toned_stats.stripe_mean << " bright=" << toned_stats.bright << "\n";
+    CHECK(std::abs(toned_stats.band_mean - band) <= 12.0);
+    CHECK(toned_stats.stripe_mean - toned_stats.band_mean >= 0.5 * stripe_contrast);
+    CHECK(outside_untouched(toned));
+  }
+  constexpr std::int32_t adaptive_radius = 24;
+  auto adaptive = fill0;
+  patchy::exemplar_match_tone(adaptive.data(), f.width, f.height, hole.data(), bounds, adaptive_radius);
+  const auto adaptive_stats = stats(adaptive);
+  CHECK(adaptive_stats.stripe_mean - adaptive_stats.band_mean >= 0.9 * stripe_contrast);
+
+  // Strength: 0 leaves the raw fill; 50 moves every hole pixel at most as far
+  // as 100 does, in the same direction.
+  auto none = fill0;
+  patchy::exemplar_match_tone(none.data(), f.width, f.height, hole.data(), bounds, adaptive_radius, 0);
+  CHECK(none == fill0);
+  auto half = fill0;
+  patchy::exemplar_match_tone(half.data(), f.width, f.height, hole.data(), bounds, adaptive_radius, 50);
+  bool half_bounded = true;
+  bool half_moves = false;
+  for (std::int32_t y = f.hole_y; y < f.hole_y + f.hole_height; ++y) {
+    for (std::int32_t x = f.hole_x; x < f.hole_x + f.hole_width; ++x) {
+      const auto offset = (static_cast<std::size_t>(y) * f.width + x) * 4U;
+      for (std::size_t c = 0; c < 3; ++c) {
+        const auto full = static_cast<int>(adaptive[offset + c]) - static_cast<int>(fill0[offset + c]);
+        const auto part = static_cast<int>(half[offset + c]) - static_cast<int>(fill0[offset + c]);
+        if (part != 0) {
+          half_moves = true;
+        }
+        if (std::abs(part) > std::abs(full) || (part != 0 && (part > 0) != (full > 0))) {
+          half_bounded = false;
+        }
+      }
+    }
+  }
+  CHECK(half_bounded);
+  CHECK(half_moves);
+
+  // Variations.
+  const auto fill1 = run(1, false);
+  CHECK(fill1 != fill0);
+  CHECK(run(1, false) == fill1);
+  CHECK(run(1, true) == fill1);
+  CHECK(outside_untouched(fill1));
+  const auto fill2 = run(2, false);
+  CHECK(fill2 != fill1);
+  CHECK(fill2 != fill0);
+  CHECK(run(2, true) == fill2);
+  const auto stats1 = stats(fill1);
+  const auto stats2 = stats(fill2);
+  std::cout << "banner attempt1 band=" << stats1.band_mean << " bright=" << stats1.bright
+            << " | attempt2 band=" << stats2.band_mean << " bright=" << stats2.bright << "\n";
+  CHECK(std::abs(stats1.band_mean - band) <= 20.0);
+  CHECK(std::abs(stats2.band_mean - band) <= 20.0);
+}
+
+// Content-Aware Move's whole-hole search: on a periodic stripe image with a block hole the
+// best offset re-aligns the stripes (a multiple of the period), the excluded region and
+// the hole are never chosen, a rerun gives the same offset, and a hole wider than the
+// free space finds nothing.
+void exemplar_block_match_finds_an_aligned_clean_offset() {
+  constexpr std::int32_t width = 160;
+  constexpr std::int32_t height = 96;
+  std::vector<std::uint8_t> image(static_cast<std::size_t>(width) * height * 4U);
+  for (std::int32_t y = 0; y < height; ++y) {
+    for (std::int32_t x = 0; x < width; ++x) {
+      auto* p = image.data() + (static_cast<std::size_t>(y) * width + x) * 4U;
+      const bool stripe = (x % 12) < 4;
+      p[0] = stripe ? 200 : 40;
+      p[1] = stripe ? 180 : 60;
+      p[2] = stripe ? 160 : 80;
+      p[3] = 255;
+    }
+  }
+  const patchy::Rect bounds{60, 30, 24, 24};
+  std::vector<std::uint8_t> hole(static_cast<std::size_t>(bounds.width) * bounds.height, 0U);
+  for (std::int32_t y = 2; y < 22; ++y) {
+    for (std::int32_t x = 2; x < 22; ++x) {
+      hole[static_cast<std::size_t>(y) * bounds.width + x] = 255U;
+      // Something that is not stripes inside the hole: it must not matter.
+      auto* p = image.data() + (static_cast<std::size_t>(bounds.y + y) * width + bounds.x + x) * 4U;
+      p[0] = 255;
+      p[1] = 0;
+      p[2] = 0;
+    }
+  }
+  const auto match = patchy::exemplar_block_match(image.data(), width, height, hole.data(), bounds, 6, 96);
+  CHECK(match.found);
+  CHECK(match.dx % 12 == 0);
+  CHECK(match.samples > 0 && match.texture > 0 && match.difference == 0);
+  // The shifted hole (62..81, 32..51) clears the hole's box.
+  CHECK(std::abs(match.dx) >= 20 || std::abs(match.dy) >= 20);
+  const auto again = patchy::exemplar_block_match(image.data(), width, height, hole.data(), bounds, 6, 96);
+  CHECK(again.found && again.dx == match.dx && again.dy == match.dy && again.distance == match.distance);
+  // Exclude the region the first answer used: the next pick avoids it.
+  std::vector<std::uint8_t> excluded(static_cast<std::size_t>(width) * height, 0U);
+  for (std::int32_t y = 32 + match.dy; y < 52 + match.dy; ++y) {
+    for (std::int32_t x = 62 + match.dx; x < 82 + match.dx; ++x) {
+      excluded[static_cast<std::size_t>(y) * width + x] = 255U;
+    }
+  }
+  const auto other = patchy::exemplar_block_match(image.data(), width, height, hole.data(), bounds, 6, 96,
+                                                  excluded.data(), patchy::Rect{0, 0, width, height});
+  CHECK(other.found);
+  CHECK(other.dx != match.dx || other.dy != match.dy);
+  CHECK(other.dx % 12 == 0);
+  // A hole spanning all but a few columns has nowhere to come from.
+  const patchy::Rect wide{2, 2, width - 4, height - 4};
+  const std::vector<std::uint8_t> wide_hole(static_cast<std::size_t>(wide.width) * wide.height, 255U);
+  CHECK(!patchy::exemplar_block_match(image.data(), width, height, wide_hole.data(), wide, 6, 96).found);
+}
+
+// The exemplar fill's excluded cells: a source patch touching one is never copied. With
+// the only clean stripe phase excluded on one side the fill still completes from the
+// other side, and no filled pixel comes from the excluded block (marked blue).
+void exemplar_inpaint_skips_excluded_sources() {
+  constexpr std::int32_t width = 96;
+  constexpr std::int32_t height = 64;
+  std::vector<std::uint8_t> image(static_cast<std::size_t>(width) * height * 4U);
+  for (std::int32_t y = 0; y < height; ++y) {
+    for (std::int32_t x = 0; x < width; ++x) {
+      auto* p = image.data() + (static_cast<std::size_t>(y) * width + x) * 4U;
+      const bool blue = x >= 56;
+      p[0] = blue ? 0 : 120;
+      p[1] = blue ? 0 : 120;
+      p[2] = blue ? 255 : 120;
+      p[3] = 255;
+    }
+  }
+  const patchy::Rect bounds{40, 20, 20, 20};
+  std::vector<std::uint8_t> hole(static_cast<std::size_t>(bounds.width) * bounds.height, 0U);
+  for (std::int32_t y = 4; y < 16; ++y) {
+    for (std::int32_t x = 4; x < 16; ++x) {
+      hole[static_cast<std::size_t>(y) * bounds.width + x] = 255U;
+    }
+  }
+  std::vector<std::uint8_t> excluded(static_cast<std::size_t>(width - 56) * height, 255U);
+  patchy::ExemplarInpaintOptions options;
+  options.excluded = excluded.data();
+  options.excluded_bounds = patchy::Rect{56, 0, width - 56, height};
+  options.single_threaded = true;
+  auto filled = image;
+  const auto result = patchy::exemplar_inpaint(filled.data(), width, height, hole.data(), bounds, options);
+  CHECK(result.filled);
+  for (std::int32_t y = 24; y < 36; ++y) {
+    for (std::int32_t x = 44; x < 56; ++x) {
+      const auto* p = filled.data() + (static_cast<std::size_t>(y) * width + x) * 4U;
+      CHECK(p[2] == 120 && p[0] == 120);
+    }
+  }
+}
+
+// The edge band: offsets keep their solved value next to the boundary and fall to 0 at
+// the band's depth, monotonically in between.
+void heal_membrane_edge_band_fades_offsets() {
+  constexpr std::int32_t width = 41;
+  constexpr std::int32_t height = 41;
+  std::vector<std::uint8_t> interior(static_cast<std::size_t>(width) * height, 0U);
+  std::vector<std::int16_t> offsets(static_cast<std::size_t>(width) * height * 3U, 0);
+  for (std::int32_t y = 0; y < height; ++y) {
+    for (std::int32_t x = 0; x < width; ++x) {
+      const auto index = static_cast<std::size_t>(y) * width + x;
+      interior[index] = x > 0 && y > 0 && x < width - 1 && y < height - 1 ? 1U : 0U;
+      for (std::size_t c = 0; c < 3; ++c) {
+        offsets[index * 3U + c] = 100;
+      }
+    }
+  }
+  patchy::fade_heal_offsets_to_edge_band(interior.data(), width, height, offsets.data(), 10);
+  const auto at = [&](std::int32_t x, std::int32_t y) {
+    return offsets[(static_cast<std::size_t>(y) * width + x) * 3U];
+  };
+  CHECK(at(0, 20) == 100);  // boundary cells untouched
+  CHECK(at(1, 20) == 100);  // first interior cell: full
+  CHECK(at(20, 20) == 0);   // deeper than the band: none
+  std::int16_t previous = 101;
+  for (std::int32_t x = 1; x <= 12; ++x) {
+    CHECK(at(x, 20) <= previous);
+    previous = at(x, 20);
+  }
+  CHECK(at(6, 20) > 0 && at(6, 20) < 100);
+  CHECK(at(11, 20) == 0);
+}
+
+void heal_membrane_interpolates_boundary_offsets() {
+  constexpr std::int32_t size = 32;
+  // Interior disc; Dirichlet cells everywhere else.
+  std::vector<std::uint8_t> interior(size * size);
+  for (std::int32_t y = 0; y < size; ++y) {
+    for (std::int32_t x = 0; x < size; ++x) {
+      const auto dx = x - 16;
+      const auto dy = y - 16;
+      if (dx * dx + dy * dy <= 10 * 10) {
+        interior[static_cast<std::size_t>(y) * size + x] = 1U;
+      }
+    }
+  }
+
+  // Constant boundary offsets solve to the same constant everywhere inside.
+  std::vector<std::int16_t> constant(static_cast<std::size_t>(size) * size * 3U);
+  for (std::size_t index = 0; index < static_cast<std::size_t>(size) * size; ++index) {
+    if (interior[index] == 0U) {
+      constant[index * 3U] = 40;
+      constant[index * 3U + 1U] = -25;
+      constant[index * 3U + 2U] = 7;
+    }
+  }
+  auto solved_constant = constant;
+  patchy::solve_heal_membrane(interior.data(), size, size, solved_constant.data());
+  for (std::size_t index = 0; index < static_cast<std::size_t>(size) * size; ++index) {
+    if (interior[index] == 0U) {
+      continue;
+    }
+    CHECK(std::abs(solved_constant[index * 3U] - 40) <= 1);
+    CHECK(std::abs(solved_constant[index * 3U + 1U] + 25) <= 1);
+    CHECK(std::abs(solved_constant[index * 3U + 2U] - 7) <= 1);
+  }
+
+  // A linear ramp of boundary offsets is harmonic, so the interior must
+  // reproduce the ramp (within fixed-point tolerance).
+  std::vector<std::int16_t> ramp(static_cast<std::size_t>(size) * size * 3U);
+  for (std::int32_t y = 0; y < size; ++y) {
+    for (std::int32_t x = 0; x < size; ++x) {
+      const auto index = static_cast<std::size_t>(y) * size + x;
+      if (interior[index] == 0U) {
+        ramp[index * 3U] = static_cast<std::int16_t>(x * 4 - 64);
+        ramp[index * 3U + 1U] = static_cast<std::int16_t>(y * 2 - 32);
+        ramp[index * 3U + 2U] = 0;
+      }
+    }
+  }
+  auto solved_ramp = ramp;
+  patchy::solve_heal_membrane(interior.data(), size, size, solved_ramp.data());
+  for (std::int32_t y = 0; y < size; ++y) {
+    for (std::int32_t x = 0; x < size; ++x) {
+      const auto index = static_cast<std::size_t>(y) * size + x;
+      if (interior[index] == 0U) {
+        continue;
+      }
+      CHECK(std::abs(solved_ramp[index * 3U] - (x * 4 - 64)) <= 3);
+      CHECK(std::abs(solved_ramp[index * 3U + 1U] - (y * 2 - 32)) <= 3);
+      CHECK(std::abs(solved_ramp[index * 3U + 2U]) <= 1);
+    }
+  }
+
+  // Determinism: identical inputs, identical bytes.
+  auto solved_again = ramp;
+  patchy::solve_heal_membrane(interior.data(), size, size, solved_again.data());
+  CHECK(solved_again == solved_ramp);
+}
+
+// main() decides the Qt platform before the QApplication exists, from a raw argv
+// scan; this pins the scan's contract (exact token, "--" ends it) so the
+// QCommandLineParser definition of --headless and the early scan cannot drift.
+void cli_headless_flag_matches_exact_token() {
+  const auto present = [](std::initializer_list<const char*> args) {
+    std::vector<const char*> argv(args);
+    return patchy::headless_flag_present(static_cast<int>(argv.size()), argv.data());
+  };
+  CHECK(!present({"patchy", "a.psd"}));
+  CHECK(present({"patchy", "--headless"}));
+  CHECK(present({"patchy", "--run-script", "x.js", "--headless"}));
+  // Exact token only: no value form, no single dash, no case folding.
+  CHECK(!present({"patchy", "--headless=1", "-headless", "headless", "--HEADLESS"}));
+  // "--" ends option parsing, so a later --headless is a positional argument.
+  CHECK(!present({"patchy", "--", "--headless"}));
+  CHECK(!patchy::headless_flag_present(0, nullptr));
+}
+
+// The startup trace must be on before QApplication is built, so main() reads
+// --startup-benchmark from argv itself; both spellings, "--" ends the scan.
+void cli_startup_benchmark_flag_reads_value() {
+  const auto value = [](std::initializer_list<const char*> args) -> std::string {
+    std::vector<const char*> argv(args);
+    const char* found = patchy::startup_benchmark_flag_value(static_cast<int>(argv.size()), argv.data());
+    return found == nullptr ? std::string("<none>") : std::string(found);
+  };
+  CHECK(value({"patchy", "a.psd"}) == "<none>");
+  CHECK(value({"patchy", "--startup-benchmark", "r.json"}) == "r.json");
+  CHECK(value({"patchy", "--headless", "--startup-benchmark=r.json"}) == "r.json");
+  CHECK(value({"patchy", "--startup-benchmark"}) == "<none>");
+  CHECK(value({"patchy", "--startup-benchmarks=r.json"}) == "<none>");
+  CHECK(value({"patchy", "--", "--startup-benchmark", "r.json"}) == "<none>");
+}
+
+// `patchy --mcp-connector [args]` must behave exactly like the patchy-mcp executable:
+// only an exact first argument selects the mode, and dropping it leaves the connector's
+// own arguments with argv still null-terminated.
+void cli_mcp_connector_flag_is_first_argument_only() {
+  const auto first = [](std::initializer_list<const char*> args) {
+    std::vector<const char*> argv(args);
+    return patchy::mcp_connector_flag_first(static_cast<int>(argv.size()), argv.data());
+  };
+  CHECK(first({"patchy", "--mcp-connector"}));
+  CHECK(first({"patchy", "--mcp-connector", "--check"}));
+  CHECK(!first({"patchy"}));
+  CHECK(!first({"patchy", "a.psd", "--mcp-connector"}));
+  CHECK(!first({"patchy", "--mcp-connector=1"}));
+  CHECK(!first({"patchy", "--", "--mcp-connector"}));
+  CHECK(!patchy::mcp_connector_flag_first(0, nullptr));
+
+  std::string a0 = "patchy", a1 = "--mcp-connector", a2 = "--attach";
+  std::vector<char*> argv{a0.data(), a1.data(), a2.data(), nullptr};
+  int argc = 3;
+  patchy::drop_first_argument(argc, argv.data());
+  CHECK(argc == 2);
+  CHECK(std::string(argv[0]) == "patchy");
+  CHECK(std::string(argv[1]) == "--attach");
+  CHECK(argv[2] == nullptr);
+  patchy::drop_first_argument(argc, argv.data());
+  CHECK(argc == 1 && argv[1] == nullptr);
+  patchy::drop_first_argument(argc, argv.data());
+  CHECK(argc == 1);
+}
+
+// Inside an AppImage the patchy binary takes `patchy-mcp` as the first argument as well,
+// so the command Help > Set up AI Control prints works in AppImages whose AppRun is not
+// Patchy's (GitHub issue 535). Outside one a file named patchy-mcp still opens.
+void cli_mcp_connector_appimage_argument_needs_appimage() {
+  const auto first = [](const char* appimage, std::initializer_list<const char*> args) {
+    std::vector<const char*> argv(args);
+    return patchy::mcp_connector_argument_first(static_cast<int>(argv.size()), argv.data(), appimage);
+  };
+  const char* appimage = "/home/someone/Apps/Patchy-anylinux-x86_64.AppImage";
+  CHECK(first(appimage, {"patchy", "patchy-mcp"}));
+  CHECK(first(appimage, {"patchy", "patchy-mcp", "--check"}));
+  CHECK(first(appimage, {"patchy", "--mcp-connector", "--attach"}));
+  CHECK(first(nullptr, {"patchy", "--mcp-connector"}));
+  CHECK(!first(nullptr, {"patchy", "patchy-mcp"}));
+  CHECK(!first("", {"patchy", "patchy-mcp"}));
+  CHECK(!first(appimage, {"patchy"}));
+  CHECK(!first(appimage, {"patchy", "a.psd", "patchy-mcp"}));
+  CHECK(!first(appimage, {"patchy", "./patchy-mcp"}));
+  CHECK(!first(appimage, {"patchy", "patchy-mcp.png"}));
+  CHECK(!first(appimage, {"patchy", "--", "patchy-mcp"}));
+  CHECK(!patchy::mcp_connector_argument_first(0, nullptr, appimage));
+}
+
+// Off, nothing is recorded; on, nested scopes come back parent first with their
+// depth, marks keep their order, and both reports name every event.
+void startup_trace_records_nested_phases_and_reports() {
+  namespace trace = patchy::startup_trace;
+  trace::initialize(false);
+  {
+    const trace::Scope ignored("test.off");
+    trace::mark("test.off_mark");
+  }
+  bool any_off = false;
+  for (const auto& event : trace::events()) {
+    any_off = any_off || std::string_view(event.name).starts_with("test.off");
+  }
+  CHECK(!any_off);
+
+  trace::initialize(true);
+  CHECK(trace::enabled());
+  {
+    const trace::Scope outer("test.outer");
+    {
+      const trace::Scope inner("test.inner");
+    }
+    trace::mark("startup.idle");
+  }
+  const double worker_start = trace::now_ms();
+  trace::record_background("test.worker", worker_start, worker_start + 2.0);
+  const auto events = trace::events();
+  std::vector<std::string> names;
+  for (const auto& event : events) {
+    names.emplace_back(event.name);
+  }
+  const auto position = [&names](const char* name) {
+    return std::find(names.begin(), names.end(), name) - names.begin();
+  };
+  CHECK(position("test.outer") < position("test.inner"));
+  CHECK(position("test.inner") < static_cast<std::ptrdiff_t>(names.size()));
+  for (const auto& event : events) {
+    if (std::string_view(event.name) == "test.inner") {
+      CHECK(event.depth == 1);
+      CHECK(event.kind == trace::Kind::Phase);
+    }
+    if (std::string_view(event.name) == "test.worker") {
+      CHECK(event.kind == trace::Kind::Background);
+      CHECK(event.end_ms - event.start_ms >= 1.9);
+    }
+    CHECK(event.end_ms >= event.start_ms);
+  }
+  CHECK(trace::mark_time("startup.idle") >= 0.0);
+  CHECK(trace::mark_time("missing") < 0.0);
+  if (trace::process_start_known()) {
+    CHECK(names.front() == "process.pre_main");
+  }
+
+  const auto json = trace::format_json({{"patchy_version", "1.0"}, {"note", "quote\" and \\"}});
+  CHECK(json.find("\"format\": \"patchy-startup-report\"") != std::string::npos);
+  CHECK(json.find("\"name\": \"test.inner\", \"kind\": \"phase\"") != std::string::npos);
+  CHECK(json.find("\"kind\": \"background\"") != std::string::npos);
+  CHECK(json.find("\"note\": \"quote\\\" and \\\\\"") != std::string::npos);
+  CHECK(json.find("\"ready_ms\": -1") == std::string::npos);
+  const auto table = trace::format_table();
+  CHECK(table.find("test.outer") != std::string::npos);
+  CHECK(table.find("(rest of test.outer)") != std::string::npos);
+  CHECK(table.find("test.worker") != std::string::npos);
+
+  trace::stop();
+  trace::mark("test.after_stop");
+  CHECK(trace::mark_time("test.after_stop") < 0.0);
+}
+
+// Select > Smooth and Select > Feather (GitHub issue 614, src/core/selection_modify.cpp).
+patchy::PixelBuffer selection_modify_mask(std::int32_t width, std::int32_t height,
+                                          std::initializer_list<patchy::Rect> rects) {
+  patchy::PixelBuffer mask(width, height, patchy::PixelFormat::gray8());
+  mask.clear(0);
+  for (const auto& rect : rects) {
+    for (std::int32_t y = rect.y; y < rect.y + rect.height; ++y) {
+      for (std::int32_t x = rect.x; x < rect.x + rect.width; ++x) {
+        *mask.pixel(x, y) = 255;
+      }
+    }
+  }
+  return mask;
+}
+
+std::uint8_t selection_modify_at(const patchy::PixelBuffer& mask, std::int32_t x, std::int32_t y) {
+  return *mask.pixel(x, y);
+}
+
+void selection_smooth_rounds_corners_and_drops_specks_and_holes() {
+  // A 40 px square with a 2 px hole inside, and a 2 px speck outside it.
+  auto mask = selection_modify_mask(80, 80, {patchy::Rect{10, 10, 40, 40}, patchy::Rect{65, 5, 2, 2}});
+  *mask.pixel(30, 30) = 0;
+  *mask.pixel(31, 30) = 0;
+  *mask.pixel(30, 31) = 0;
+  *mask.pixel(31, 31) = 0;
+  const auto smoothed = patchy::smooth_selection_mask(mask, patchy::Rect{0, 0, 80, 80}, 80, 80, 4);
+  CHECK(selection_modify_at(smoothed, 30, 30) == 255);  // hole filled
+  CHECK(selection_modify_at(smoothed, 65, 5) == 0);     // speck gone
+  CHECK(selection_modify_at(smoothed, 66, 6) == 0);
+  CHECK(selection_modify_at(smoothed, 10, 10) < 128);  // corner rounded off
+  CHECK(selection_modify_at(smoothed, 11, 11) < 128);
+  CHECK(selection_modify_at(smoothed, 16, 16) == 255);
+  // Straight edges stay put and hard.
+  CHECK(selection_modify_at(smoothed, 10, 30) == 255);
+  CHECK(selection_modify_at(smoothed, 9, 30) == 0);
+  CHECK(selection_modify_at(smoothed, 49, 30) == 255);
+  CHECK(selection_modify_at(smoothed, 50, 30) == 0);
+  // The rounded corner is symmetric on all four sides.
+  for (int d = 0; d < 6; ++d) {
+    const auto top_left = selection_modify_at(smoothed, 10 + d, 10 + d);
+    CHECK(selection_modify_at(smoothed, 49 - d, 10 + d) == top_left);
+    CHECK(selection_modify_at(smoothed, 10 + d, 49 - d) == top_left);
+    CHECK(selection_modify_at(smoothed, 49 - d, 49 - d) == top_left);
+  }
+}
+
+void selection_smooth_radius_one_cleans_single_pixels_only() {
+  auto mask = selection_modify_mask(30, 30, {patchy::Rect{5, 5, 20, 20}, patchy::Rect{2, 28, 1, 1}});
+  *mask.pixel(15, 15) = 0;
+  const auto smoothed = patchy::smooth_selection_mask(mask, patchy::Rect{0, 0, 30, 30}, 30, 30, 1);
+  CHECK(selection_modify_at(smoothed, 2, 28) == 0);     // single-pixel speck
+  CHECK(selection_modify_at(smoothed, 15, 15) == 255);  // single-pixel hole
+  CHECK(selection_modify_at(smoothed, 5, 5) < 128);     // the corner pixel goes
+  CHECK(selection_modify_at(smoothed, 6, 5) == 255);    // its neighbours stay
+  CHECK(selection_modify_at(smoothed, 5, 6) == 255);
+  for (int y = 6; y < 24; ++y) {
+    CHECK(selection_modify_at(smoothed, 5, y) == 255);
+    CHECK(selection_modify_at(smoothed, 4, y) == 0);
+  }
+}
+
+void selection_smooth_keeps_the_canvas_edge_and_offsets() {
+  // Select All stays selected: the window never counts pixels beyond the canvas.
+  const auto all = selection_modify_mask(40, 30, {patchy::Rect{0, 0, 40, 30}});
+  const auto smoothed = patchy::smooth_selection_mask(all, patchy::Rect{0, 0, 40, 30}, 40, 30, 10);
+  bool every = true;
+  for (std::int32_t y = 0; y < 30; ++y) {
+    for (std::int32_t x = 0; x < 40; ++x) {
+      every = every && selection_modify_at(smoothed, x, y) == 255;
+    }
+  }
+  CHECK(every);
+  // A work area that is part of a larger canvas gives the same pixels as the whole canvas.
+  const auto full = selection_modify_mask(60, 60, {patchy::Rect{20, 20, 15, 12}});
+  const auto whole = patchy::smooth_selection_mask(full, patchy::Rect{0, 0, 60, 60}, 60, 60, 3);
+  const auto part = selection_modify_mask(21, 18, {patchy::Rect{3, 3, 15, 12}});
+  const auto partial = patchy::smooth_selection_mask(part, patchy::Rect{17, 17, 21, 18}, 60, 60, 3);
+  bool same = true;
+  for (std::int32_t y = 0; y < 18; ++y) {
+    for (std::int32_t x = 0; x < 21; ++x) {
+      same = same && selection_modify_at(partial, x, y) == selection_modify_at(whole, x + 17, y + 17);
+    }
+  }
+  CHECK(same);
+  // The largest radius runs and removes a selection far smaller than its window.
+  const auto small = selection_modify_mask(300, 200, {patchy::Rect{100, 50, 60, 60}});
+  const auto gone = patchy::smooth_selection_mask(small, patchy::Rect{0, 0, 300, 200}, 300, 200, 500);
+  CHECK(selection_modify_at(gone, 130, 80) == 0);
+}
+
+void selection_feather_softens_by_radius() {
+  CHECK(patchy::selection_feather_pass_radius(5.0) == 3.0);  // the marquee Feather rule at odd radii
+  CHECK(patchy::selection_feather_pass_radius(0.5) == 0.5);
+  CHECK(patchy::selection_feather_pass_radius(0.0) == 0.0);
+  const auto source = selection_modify_mask(120, 40, {patchy::Rect{40, 0, 40, 40}});
+  const auto profile = [&](double radius) {
+    auto mask = source;
+    patchy::feather_selection_mask(mask, radius);
+    return mask;
+  };
+  const auto five = profile(5.0);
+  const auto ten = profile(10.0);
+  const auto tiny = profile(0.1);
+  // A ramp centred on the edge, flat far inside and far outside.
+  CHECK(selection_modify_at(five, 60, 20) == 255);
+  CHECK(selection_modify_at(five, 20, 20) == 0);
+  CHECK(std::abs(static_cast<int>(selection_modify_at(five, 40, 20)) + selection_modify_at(five, 39, 20) - 255) <= 2);
+  bool monotonic = true;
+  for (std::int32_t x = 20; x < 60; ++x) {
+    monotonic = monotonic && selection_modify_at(five, x, 20) <= selection_modify_at(five, x + 1, 20);
+  }
+  CHECK(monotonic);
+  // A larger radius spreads further; 0.1 px barely touches the edge.
+  CHECK(selection_modify_at(ten, 34, 20) > selection_modify_at(five, 34, 20));
+  CHECK(selection_modify_at(five, 40 - patchy::selection_feather_padding(5.0), 20) == 0);
+  CHECK(selection_modify_at(tiny, 40, 20) >= 190);
+  CHECK(selection_modify_at(tiny, 39, 20) > 0);
+  CHECK(selection_modify_at(tiny, 39, 20) <= 65);
+  CHECK(selection_modify_at(tiny, 41, 20) >= 240);
+  CHECK(selection_modify_at(tiny, 37, 20) == 0);
+  // Deterministic: the same input gives the same bytes.
+  const auto again = profile(5.0);
+  CHECK(std::equal(again.data().begin(), again.data().end(), five.data().begin()));
+}
+
+
+// CONC-03: a ThreadFanoutBudgetScope limits only its own thread, so worker threads can build
+// them concurrently without touching the main thread's published BlockingFanoutBudgetScope.
+void worker_budget_thread_scopes_stay_on_their_thread() {
+  CHECK(patchy::current_blocking_fanout_budget() == -1);
+  std::atomic<int> finished{0};
+  std::atomic<int> wrong{0};
+  const auto worker = [&](int budget) {
+    for (int round = 0; round < 5000; ++round) {
+      const patchy::ThreadFanoutBudgetScope outer(budget);
+      {
+        const patchy::ThreadFanoutBudgetScope looser(budget + 4);  // nesting keeps the tighter value
+        if (patchy::current_blocking_fanout_budget() != budget) {
+          ++wrong;
+        }
+      }
+      if (patchy::current_blocking_fanout_budget() != budget) {
+        ++wrong;
+      }
+    }
+    if (patchy::current_blocking_fanout_budget() != -1) {
+      ++wrong;
+    }
+    ++finished;
+  };
+  std::thread first(worker, 0);
+  std::thread second(worker, 2);
+  while (finished.load() < 2) {
+    if (patchy::current_blocking_fanout_budget() != -1) {  // the main thread never sees theirs
+      ++wrong;
+    }
+  }
+  first.join();
+  second.join();
+  CHECK(wrong.load() == 0);
+  CHECK(patchy::current_blocking_fanout_budget() == -1);
+
+  {
+    const patchy::BlockingFanoutBudgetScope published(5);
+    CHECK(patchy::current_blocking_fanout_budget() == 5);
+    int seen_plain = 0;
+    int seen_scoped = 0;
+    std::thread plain([&] { seen_plain = patchy::current_blocking_fanout_budget(); });
+    std::thread scoped([&] {
+      const patchy::ThreadFanoutBudgetScope local(2);
+      seen_scoped = patchy::current_blocking_fanout_budget();
+    });
+    plain.join();
+    scoped.join();
+    CHECK(seen_plain == 5);
+    CHECK(seen_scoped == 2);
+    const patchy::BlockingFanoutBudgetScope inert(-1);
+    CHECK(patchy::current_blocking_fanout_budget() == 5);
+  }
+  CHECK(patchy::current_blocking_fanout_budget() == -1);
+}
+
+}  // namespace
+
+std::vector<patchy::test::TestCase> infra_selection_tests() {
+  return {
+      {"worker_budget_thread_scopes_stay_on_their_thread", worker_budget_thread_scopes_stay_on_their_thread},
+      {"plugin_host_and_legacy_probe_work", plugin_host_and_legacy_probe_work},
+      {"tile_cache_stores_and_invalidates", tile_cache_stores_and_invalidates},
+      {"color_manager_assigns_profiles", color_manager_assigns_profiles},
+      {"selection_smooth_rounds_corners_and_drops_specks_and_holes",
+       selection_smooth_rounds_corners_and_drops_specks_and_holes},
+      {"selection_smooth_radius_one_cleans_single_pixels_only", selection_smooth_radius_one_cleans_single_pixels_only},
+      {"selection_smooth_keeps_the_canvas_edge_and_offsets", selection_smooth_keeps_the_canvas_edge_and_offsets},
+      {"selection_feather_softens_by_radius", selection_feather_softens_by_radius},
+      {"quick_select_maxflow_solves_tiny_grid", quick_select_maxflow_solves_tiny_grid},
+      {"quick_select_maxflow_matches_reference_on_random_grids",
+       quick_select_maxflow_matches_reference_on_random_grids},
+      {"quick_select_stroke_grabs_flat_region_and_respects_edges",
+       quick_select_stroke_grabs_flat_region_and_respects_edges},
+      {"quick_select_second_stroke_adds_monotonically", quick_select_second_stroke_adds_monotonically},
+      {"quick_select_subtract_removes_only_connected_area", quick_select_subtract_removes_only_connected_area},
+      {"quick_select_photo_texture_stroke_stays_local", quick_select_photo_texture_stroke_stays_local},
+      {"quick_select_enhance_edge_smooths_staircase", quick_select_enhance_edge_smooths_staircase},
+      {"magnetic_lasso_path_snaps_to_synthetic_edge", magnetic_lasso_path_snaps_to_synthetic_edge},
+      {"magnetic_lasso_flat_region_yields_straight_line", magnetic_lasso_flat_region_yields_straight_line},
+      {"magnetic_lasso_edge_contrast_gates_weak_edges", magnetic_lasso_edge_contrast_gates_weak_edges},
+      {"magnetic_lasso_snap_respects_width", magnetic_lasso_snap_respects_width},
+      {"magnetic_lasso_is_deterministic", magnetic_lasso_is_deterministic},
+      {"magnetic_lasso_prefers_opaque_side_of_alpha_edge",
+       magnetic_lasso_prefers_opaque_side_of_alpha_edge},
+      {"magnetic_lasso_node_budget_falls_back_to_straight_line",
+       magnetic_lasso_node_budget_falls_back_to_straight_line},
+      {"spot_heal_source_map_is_coherent_and_outside", spot_heal_source_map_is_coherent_and_outside},
+      {"spot_heal_source_map_stays_in_canvas_at_edges", spot_heal_source_map_stays_in_canvas_at_edges},
+      {"spot_heal_source_map_attempt_cycles_valid_candidates",
+       spot_heal_source_map_attempt_cycles_valid_candidates},
+      {"spot_heal_source_map_skips_excluded_cells", spot_heal_source_map_skips_excluded_cells},
+      {"exemplar_inpaint_restores_periodic_stripes_deterministically",
+       exemplar_inpaint_restores_periodic_stripes_deterministically},
+      {"exemplar_inpaint_banner_tone_match_stays_dark_and_varies_by_attempt",
+       exemplar_inpaint_banner_tone_match_stays_dark_and_varies_by_attempt},
+      {"heal_membrane_interpolates_boundary_offsets", heal_membrane_interpolates_boundary_offsets},
+      {"heal_membrane_edge_band_fades_offsets", heal_membrane_edge_band_fades_offsets},
+      {"exemplar_block_match_finds_an_aligned_clean_offset", exemplar_block_match_finds_an_aligned_clean_offset},
+      {"exemplar_inpaint_skips_excluded_sources", exemplar_inpaint_skips_excluded_sources},
+      {"cli_headless_flag_matches_exact_token", cli_headless_flag_matches_exact_token},
+      {"cli_startup_benchmark_flag_reads_value", cli_startup_benchmark_flag_reads_value},
+      {"cli_mcp_connector_flag_is_first_argument_only", cli_mcp_connector_flag_is_first_argument_only},
+      {"cli_mcp_connector_appimage_argument_needs_appimage", cli_mcp_connector_appimage_argument_needs_appimage},
+      {"startup_trace_records_nested_phases_and_reports", startup_trace_records_nested_phases_and_reports},
+  };
+}

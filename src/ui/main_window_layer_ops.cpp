@@ -1,0 +1,7442 @@
+#include "ui/palette_panel.hpp"
+#include "ui/theme_script_host.hpp"
+#include "core/artboard.hpp"
+#include "core/layer.hpp"
+#include "core/pixel_buffer.hpp"
+#include "core/smart_filter_effects.hpp"
+#include "core/pattern_resource.hpp"
+#include "core/smart_filter.hpp"
+#include "ui/appearance_edits.hpp"
+#include "core/layer_alignment.hpp"
+#include "ui/appearance_properties.hpp"
+#include "ui/fill_dialog.hpp"
+#include <QAction>
+#include <QApplication>
+#include <QByteArray>
+#include <QCheckBox>
+#include <QColor>
+#include <QAbstractItemView>
+#include <QComboBox>
+#include <QFontMetrics>
+#include <QCoreApplication>
+#include <QDialog>
+#include <QDialogButtonBox>
+#include <QEvent>
+#include <QEventLoop>
+#include <QFormLayout>
+#include <QHBoxLayout>
+#include <QImage>
+#include <QLabel>
+#include <QLatin1Char>
+#include <QLineEdit>
+#include <QActionGroup>
+#include <QMenu>
+#include <QPainter>
+#include <QMessageBox>
+#include <QMimeData>
+#include <QObject>
+#include <QPoint>
+#include <QPointF>
+#include <QPointer>
+#include <QPolygonF>
+#include <QProgressDialog>
+#include <QPushButton>
+#include <QRect>
+#include <QRegion>
+#include <QRgb>
+#include <QScopeGuard>
+#include <QSignalBlocker>
+#include <QSlider>
+#include <QSpinBox>
+#include <QStandardItem>
+#include <QStandardItemModel>
+#include <QString>
+#include <QStringList>
+#include <QStringLiteral>
+#include <QStringView>
+#include <QTextEdit>
+#include <QTimer>
+#include <QVBoxLayout>
+#include <QVariant>
+#include <QWidget>
+#include <Qt>
+#include <QtGlobal>
+#include <vector>
+#include <span>
+#include "formats/animation_timing.hpp"
+// MainWindow's clipboard and layer operations, split out of main_window.cpp:
+// the cut/copy/copy-merged/paste flows and system-clipboard plumbing, the
+// transform/warp dialogs, layer add/folder/via-copy/via-cut, masks, duplicate,
+// rename, layer styles (edit/copy/paste/delete + ensure_patterns_for_style),
+// delete/move, the layer context menu, merge-visible, fill/clear/stroke,
+// selection expand/contract/border dialogs, layer flips, crop-to-selection and
+// canvas rotation, plus the anonymous-namespace helpers only they use
+// (clipboard_image_signature, default_new_layer_name, and the edit-options /
+// copy-pixels helper block).
+// rasterize_active_layers, rasterize_active_layer_styles, and merge_down stay
+// in main_window.cpp: they render text layers through the internal text
+// pipeline (render_text_layer_pixels_from_metadata), which is deliberately not
+// promoted out of that file.
+// Pure function moves from main_window.cpp; behavior must stay identical.
+
+#include "ui/main_window.hpp"
+#include <QClipboard>
+#include <QStatusBar>
+#include "ui/canvas_widget.hpp"
+#include "ui/crop_presets.hpp"
+#include "ui/main_window_shared.hpp"
+#include "ui/layer_merge.hpp"
+#include "ui/new_layer_dialog.hpp"
+#include "ui/background_workers.hpp"
+
+#include "core/layer_metadata.hpp"
+#include "core/smart_object.hpp"
+#include "core/layer_render_utils.hpp"
+#include "core/layer_tree.hpp"
+#include "core/pixel_tools.hpp"
+#include "core/rect_utils.hpp"
+#include "core/vector_raster.hpp"
+#include "core/vector_shape.hpp"
+#include "formats/css_layer_export.hpp"
+#include "formats/gif_document_io.hpp"
+#include "formats/svg_document_io.hpp"
+#include "ui/action_icons.hpp"
+#include "ui/app_settings.hpp"
+#include "ui/selection_modify_dialogs.hpp"
+#include "core/selection_modify.hpp"
+#include "ui/brush_dynamics_popup.hpp"
+#include "ui/brush_tip_manager_dialog.hpp"
+#include "ui/image_document_io.hpp"
+#include "core/document_depth.hpp"
+#include "core/pixel_depth.hpp"
+#include "ui/modifier_names.hpp"
+#include "ui/filter_workflows.hpp"
+#include "ui/dialog_utils.hpp"
+#include "ui/document_float_window.hpp"
+#include "ui/edit_conversions.hpp"
+#include "ui/color_panel.hpp"
+#include "ui/layer_style_dialog.hpp"
+#include "ui/canvas_widget_shared.hpp"
+#ifdef Q_OS_WASM
+#include "ui/clipboard_wasm.hpp"
+#endif
+#include "ui/layer_list_widget.hpp"
+#include "ui/localization.hpp"
+#include "ui/pattern_library.hpp"
+#include "ui/photo_pattern_presets.hpp"
+#include "ui/scanner_import.hpp"
+#include "ui/start_panel.hpp"
+#include "ui/tile_preview_window.hpp"
+#include "ui/warp_text_dialog.hpp"
+#include "ui/qt_geometry.hpp"
+#include "ui/theme_qss.hpp"
+#include "ui/update_checker.hpp"
+
+
+#include <algorithm>
+#include <array>
+#include <atomic>
+#include <chrono>
+#include <cstddef>
+#include <cstdint>
+#include <cmath>
+#include <cstdlib>
+#include <exception>
+#include <functional>
+#include <future>
+#include <iterator>
+#include <memory>
+#include <optional>
+#include <set>
+#include <stdexcept>
+#include <string>
+#include <utility>
+
+
+// Icon resources live in the static patchy_ui library; force registration before first use.
+int qInitResources_icons();
+
+namespace patchy::ui {
+
+namespace {
+
+QByteArray clipboard_image_signature(const QImage& image) {
+  if (image.isNull()) {
+    return {};
+  }
+
+  const auto converted = image.convertToFormat(QImage::Format_RGBA8888);
+  QByteArray signature;
+  const qint32 width = converted.width();
+  const qint32 height = converted.height();
+  const auto pixel_bytes = static_cast<qint64>(std::max<qint32>(0, width)) *
+                           static_cast<qint64>(std::max<qint32>(0, height)) * 4;
+  signature.reserve(static_cast<qsizetype>(sizeof(width) + sizeof(height) + pixel_bytes));
+  signature.append(reinterpret_cast<const char*>(&width), static_cast<qsizetype>(sizeof(width)));
+  signature.append(reinterpret_cast<const char*>(&height), static_cast<qsizetype>(sizeof(height)));
+  for (int y = 0; y < converted.height(); ++y) {
+    signature.append(reinterpret_cast<const char*>(converted.constScanLine(y)),
+                     static_cast<qsizetype>(converted.width() * 4));
+  }
+  return signature;
+}
+
+// EditOptions for a menu-command edit (Cut, Layer via Cut, Fill, Clear, Stroke): the current
+// colors and brush, plus the canvas state every edit carries (apply_canvas_edit_state in
+// canvas_widget_shared, the same call the tool factory edit_options makes).
+EditOptions menu_command_edit_options(const CanvasWidget& canvas) {
+  EditOptions options;
+  options.primary = edit_color(canvas.primary_color());
+  options.secondary = edit_color(canvas.secondary_color());
+  options.brush_size = canvas.brush_size();
+  options.brush_softness = canvas.brush_softness();
+  apply_canvas_edit_state(options, canvas);
+  return options;
+}
+
+std::int64_t rect_pixel_count(Rect rect) noexcept {
+  return static_cast<std::int64_t>(std::max(0, rect.width)) * static_cast<std::int64_t>(std::max(0, rect.height));
+}
+
+std::int64_t clear_scan_pixel_count(const Document& document, const Layer& layer, Rect rect, const EditOptions& options) {
+  auto affected = intersect_rect(intersect_rect(rect, Rect::from_size(document.width(), document.height())), layer.bounds());
+  if (options.selection.has_value()) {
+    affected = intersect_rect(affected, *options.selection);
+  }
+  if (affected.empty()) {
+    return 0;
+  }
+  if (options.selection_scan_rects.empty()) {
+    return rect_pixel_count(affected);
+  }
+
+  std::int64_t count = 0;
+  for (const auto& scan_rect : options.selection_scan_rects) {
+    count += rect_pixel_count(intersect_rect(affected, scan_rect));
+  }
+  return count;
+}
+
+Rect intersect_copy_rect(Rect a, Rect b) {
+  const auto left = std::max(a.x, b.x);
+  const auto top = std::max(a.y, b.y);
+  const auto right = std::min(a.x + a.width, b.x + b.width);
+  const auto bottom = std::min(a.y + a.height, b.y + b.height);
+  return Rect{left, top, std::max(0, right - left), std::max(0, bottom - top)};
+}
+
+std::uint8_t layer_mask_value_at(const Layer& layer, std::int32_t x, std::int32_t y) {
+  const auto& mask = layer.mask();
+  if (!mask.has_value() || mask->disabled) {
+    return 255;
+  }
+  if (mask->pixels.empty() || mask->pixels.format().channels != 1U) {
+    return mask->default_color;
+  }
+  if (!mask->bounds.contains(x, y)) {
+    return mask->default_color;
+  }
+  if (mask->pixels.format().bit_depth != BitDepth::UInt8) {
+    return static_cast<std::uint8_t>(
+        std::lround(coverage_at(mask->pixels, x - mask->bounds.x, y - mask->bounds.y) * 255.0F));
+  }
+  return *mask->pixels.pixel(x - mask->bounds.x, y - mask->bounds.y);
+}
+
+// The layer mask at a document point as 0..1, at the mask's own precision.
+float layer_mask_coverage_at(const Layer& layer, std::int32_t x, std::int32_t y) {
+  const auto& mask = layer.mask();
+  if (!mask.has_value() || mask->disabled) {
+    return 1.0F;
+  }
+  if (mask->pixels.empty() || mask->pixels.format().channels != 1U || !mask->bounds.contains(x, y)) {
+    return static_cast<float>(mask->default_color) / 255.0F;
+  }
+  return coverage_at(mask->pixels, x - mask->bounds.x, y - mask->bounds.y);
+}
+
+void apply_selection_mask(PixelBuffer& pixels, Rect document_rect, const CanvasWidget& canvas);
+
+PixelBuffer copy_pixels_from_layer(const Layer& layer, Rect document_rect, const CanvasWidget* canvas = nullptr) {
+  const auto& source = layer.pixels();
+  if (!source.empty() && source.format().channels >= 3 && source.format().bit_depth != BitDepth::UInt8) {
+    // 16/32-bit (docs/high-bit-depth.md): the same copy on float rows at the layer's depth.
+    const auto depth = source.format().bit_depth;
+    const auto domain = depth == BitDepth::Float32 ? DeepDomain::Linear : DeepDomain::Encoded;
+    PixelBuffer deep(document_rect.width, document_rect.height, with_bit_depth(PixelFormat::rgba8(), depth));
+    deep.clear(0);
+    const auto bounds = layer.bounds();
+    const auto first = std::max(document_rect.x, bounds.x);
+    const auto last = std::min(document_rect.x + document_rect.width, bounds.x + source.width());
+    std::vector<float> row(static_cast<std::size_t>(std::max(0, last - first)) * 4U);
+    for (std::int32_t y = 0; y < document_rect.height && last > first; ++y) {
+      const auto sy = document_rect.y + y - bounds.y;
+      if (sy < 0 || sy >= source.height()) {
+        continue;
+      }
+      load_rgba_row(source, sy, first - bounds.x, last - first, domain, row);
+      for (std::int32_t x = first; x < last; ++x) {
+        row[static_cast<std::size_t>(x - first) * 4U + 3U] *= layer_mask_coverage_at(layer, x, document_rect.y + y);
+      }
+      store_rgba_row(deep, y, first - document_rect.x, last - first, domain, row);
+    }
+    if (canvas != nullptr) {
+      apply_selection_mask(deep, document_rect, *canvas);
+    }
+    return deep;
+  }
+  PixelBuffer copied(document_rect.width, document_rect.height, PixelFormat::rgba8());
+  copied.clear(0);
+  if (source.empty() || source.format().bit_depth != BitDepth::UInt8 || source.format().channels < 3) {
+    return copied;
+  }
+
+  const auto bounds = layer.bounds();
+  for (std::int32_t y = 0; y < document_rect.height; ++y) {
+    for (std::int32_t x = 0; x < document_rect.width; ++x) {
+      const auto sx = document_rect.x + x - bounds.x;
+      const auto sy = document_rect.y + y - bounds.y;
+      if (sx < 0 || sy < 0 || sx >= source.width() || sy >= source.height()) {
+        continue;
+      }
+      const auto* src = source.pixel(sx, sy);
+      auto* dst = copied.pixel(x, y);
+      dst[0] = src[0];
+      dst[1] = src[1];
+      dst[2] = src[2];
+      const auto source_alpha = source.format().channels >= 4 ? src[3] : 255;
+      const QPoint document_point(document_rect.x + x, document_rect.y + y);
+      const auto layer_alpha = layer_mask_value_at(layer, document_point.x(), document_point.y());
+      dst[3] = static_cast<std::uint8_t>((static_cast<int>(source_alpha) * static_cast<int>(layer_alpha)) / 255);
+    }
+  }
+  if (canvas != nullptr) {
+    apply_selection_mask(copied, document_rect, *canvas);
+  }
+  return copied;
+}
+
+void apply_selection_mask(PixelBuffer& pixels, Rect document_rect, const CanvasWidget& canvas) {
+  if (!canvas.has_selection() || pixels.empty() || pixels.format().channels < 4) {
+    return;
+  }
+  if (pixels.format().bit_depth != BitDepth::UInt8) {
+    // 16/32-bit: alpha times the selection's coverage, on float rows.
+    const auto domain =
+        pixels.format().bit_depth == BitDepth::Float32 ? DeepDomain::Linear : DeepDomain::Encoded;
+    std::vector<float> row(static_cast<std::size_t>(pixels.width()) * 4U);
+    for (std::int32_t y = 0; y < pixels.height(); ++y) {
+      load_rgba_row(pixels, y, 0, pixels.width(), domain, row);
+      for (std::int32_t x = 0; x < pixels.width(); ++x) {
+        const auto selected = canvas.selection_alpha_at(QPoint(document_rect.x + x, document_rect.y + y));
+        row[static_cast<std::size_t>(x) * 4U + 3U] *= static_cast<float>(selected) / 255.0F;
+      }
+      store_rgba_row(pixels, y, 0, pixels.width(), domain, row);
+    }
+    return;
+  }
+
+  const QRect local_bounds(0, 0, pixels.width(), pixels.height());
+  if (!canvas.selection_has_partial_alpha()) {
+    const auto selected =
+        canvas.selected_document_region().intersected(QRegion(QRect(document_rect.x, document_rect.y,
+                                                                     document_rect.width, document_rect.height)));
+    if (selected.isEmpty()) {
+      const auto pixel_bytes = bytes_per_pixel(pixels.format());
+      for (std::int32_t y = 0; y < pixels.height(); ++y) {
+        auto row = pixels.row(y);
+        for (std::int32_t x = 0; x < pixels.width(); ++x) {
+          row[static_cast<std::size_t>(x) * pixel_bytes + 3U] = 0;
+        }
+      }
+      return;
+    }
+
+    auto original = pixels;
+    const auto pixel_bytes = bytes_per_pixel(pixels.format());
+    for (std::int32_t y = 0; y < pixels.height(); ++y) {
+      auto row = pixels.row(y);
+      for (std::int32_t x = 0; x < pixels.width(); ++x) {
+        row[static_cast<std::size_t>(x) * pixel_bytes + 3U] = 0;
+      }
+    }
+    for (const auto& rect : selected) {
+      const auto local = QRect(rect.x() - document_rect.x, rect.y() - document_rect.y, rect.width(), rect.height())
+                             .intersected(local_bounds);
+      if (local.isEmpty()) {
+        continue;
+      }
+      for (int y = local.top(); y <= local.bottom(); ++y) {
+        const auto* src = original.pixel(local.left(), y);
+        auto* dst = pixels.pixel(local.left(), y);
+        const auto bytes = static_cast<std::size_t>(local.width()) * pixel_bytes;
+        std::copy(src, src + bytes, dst);
+      }
+    }
+    return;
+  }
+
+  for (std::int32_t y = 0; y < pixels.height(); ++y) {
+    for (std::int32_t x = 0; x < pixels.width(); ++x) {
+      auto* pixel = pixels.pixel(x, y);
+      const auto selection_alpha = canvas.selection_alpha_at(QPoint(document_rect.x + x, document_rect.y + y));
+      pixel[3] = static_cast<std::uint8_t>((static_cast<int>(pixel[3]) * static_cast<int>(selection_alpha)) / 255);
+    }
+  }
+}
+
+struct LayerCopyPixels {
+  PixelBuffer pixels;
+  QPoint origin;
+  Rect document_rect;
+  std::vector<LayerId> source_layer_ids;
+};
+
+struct LayerGroupingDestination {
+  std::vector<Layer>* siblings{nullptr};
+  std::size_t insert_index{0};
+};
+
+void collect_layer_names(const std::vector<Layer>& layers, std::set<std::string>& names) {
+  for (const auto& layer : layers) {
+    names.insert(layer.name());
+    collect_layer_names(layer.children(), names);
+  }
+}
+
+std::optional<LayerGroupingDestination> common_sibling_grouping_destination(
+    std::vector<Layer>& layers,
+    const std::vector<LayerId>& ids_top_to_bottom) {
+  if (ids_top_to_bottom.empty()) {
+    return std::nullopt;
+  }
+
+  std::vector<LayerSiblingLocation> locations;
+  locations.reserve(ids_top_to_bottom.size());
+  std::vector<Layer>* siblings = nullptr;
+  for (const auto id : ids_top_to_bottom) {
+    auto location = find_layer_location(layers, id);
+    if (!location.has_value() || location->siblings == nullptr) {
+      return std::nullopt;
+    }
+    if (siblings == nullptr) {
+      siblings = location->siblings;
+    } else if (siblings != location->siblings) {
+      return std::nullopt;
+    }
+    locations.push_back(*location);
+  }
+
+  const auto topmost = std::max_element(locations.begin(), locations.end(), [](const auto& left, const auto& right) {
+    return left.index < right.index;
+  });
+  const auto moved_below_topmost = std::count_if(locations.begin(), locations.end(), [topmost](const auto& location) {
+    return location.index < topmost->index;
+  });
+  return LayerGroupingDestination{siblings, topmost->index - static_cast<std::size_t>(moved_below_topmost)};
+}
+
+void collect_referenced_smart_filter_records(const Layer& layer,
+                                             const SmartFilterEffectsStore& store,
+                                             std::vector<SmartFilterEffectsRecord>& records) {
+  if (layer.smart_filter_stack() != nullptr) {
+    const auto placed_uuid = smart_object_placed_uuid(layer);
+    const auto already_collected = std::any_of(
+        records.begin(), records.end(), [&](const SmartFilterEffectsRecord& record) {
+          return record.placed_uuid == placed_uuid;
+        });
+    if (!already_collected) {
+      if (const auto* record = store.find_unique(placed_uuid); record != nullptr) {
+        records.push_back(*record);
+      }
+    }
+  }
+  for (const auto& child : layer.children()) {
+    collect_referenced_smart_filter_records(child, store, records);
+  }
+}
+
+std::vector<const Layer*> find_layers_top_to_bottom(const std::vector<Layer>& layers,
+                                                    const std::vector<LayerId>& ids_top_to_bottom) {
+  std::vector<const Layer*> found_layers;
+  found_layers.reserve(ids_top_to_bottom.size());
+  for (const auto id : ids_top_to_bottom) {
+    if (const auto* layer = find_layer_in_tree(layers, id); layer != nullptr) {
+      found_layers.push_back(layer);
+    }
+  }
+  return found_layers;
+}
+
+// The top-left of the artboard under the center of `rect`, if any.
+std::optional<QPoint> artboard_origin_at(const Document& document, Rect rect) {
+  const auto* artboard = artboard_at(document, rect.x + rect.width / 2, rect.y + rect.height / 2);
+  if (artboard == nullptr) {
+    return std::nullopt;
+  }
+  const auto origin = artboard->artboard()->rect;
+  return QPoint(origin.x, origin.y);
+}
+
+bool has_visible_pixels(const PixelBuffer& pixels) {
+  if (pixels.empty()) {
+    return false;
+  }
+  if (pixels.format().bit_depth != BitDepth::UInt8) {
+    if (pixels.format().channels < 4) {
+      return pixels.format().channels >= 3;
+    }
+    for (std::int32_t y = 0; y < pixels.height(); ++y) {
+      for (std::int32_t x = 0; x < pixels.width(); ++x) {
+        if (pixel_alpha_at(pixels, x, y) > 0.0F) {
+          return true;
+        }
+      }
+    }
+    return false;
+  }
+  if (pixels.format().channels < 4) {
+    return pixels.format().channels >= 3;
+  }
+  const auto channels = pixels.format().channels;
+  for (std::size_t index = 3; index < pixels.data().size(); index += channels) {
+    if (pixels.data()[index] != 0) {
+      return true;
+    }
+  }
+  return false;
+}
+
+std::optional<LayerCopyPixels> collect_layer_copy_pixels(const Document& document, const std::vector<LayerId>& ids,
+                                                         const CanvasWidget& canvas) {
+  if (ids.empty()) {
+    return std::nullopt;
+  }
+
+  // Anywhere in the tree (a layer on an artboard or in a folder), in stack order.
+  const std::set<LayerId> selected(ids.begin(), ids.end());
+  std::vector<const Layer*> layers_to_copy;
+  const auto collect = [&](const auto& self, const std::vector<Layer>& layers) -> void {
+    for (const auto& layer : layers) {
+      if (selected.contains(layer.id()) && layer.kind() == LayerKind::Pixel && layer.visible()) {
+        layers_to_copy.push_back(&layer);
+      }
+      self(self, layer.children());
+    }
+  };
+  collect(collect, document.layers());
+  if (layers_to_copy.empty()) {
+    return std::nullopt;
+  }
+
+  Rect copy_rect;
+  if (canvas.selected_document_rect().has_value()) {
+    copy_rect = to_core_rect(*canvas.selected_document_rect());
+  } else {
+    for (const auto* layer : layers_to_copy) {
+      copy_rect = unite_rect(copy_rect, layer->bounds());
+    }
+  }
+  copy_rect = intersect_copy_rect(copy_rect, Rect::from_size(document.width(), document.height()));
+  if (copy_rect.empty()) {
+    return std::nullopt;
+  }
+
+  PixelBuffer copied;
+  if (layers_to_copy.size() == 1U) {
+    copied = copy_pixels_from_layer(*layers_to_copy.front(), copy_rect, &canvas);
+  } else {
+    Document selected_document(document.width(), document.height(), document.format());
+    selected_document.color_state().bit_depth = document.color_state().bit_depth;
+    for (const auto* layer : layers_to_copy) {
+      selected_document.add_layer(*layer);
+    }
+    const ScopedDocumentDepthRender depth_render;
+    const auto image =
+        qimage_from_document_rect(selected_document, QRect(copy_rect.x, copy_rect.y, copy_rect.width, copy_rect.height),
+                                  true);
+    copied = pixels_from_image_at_depth(image, document.color_state().bit_depth);
+    apply_selection_mask(copied, copy_rect, canvas);
+  }
+
+  if (!has_visible_pixels(copied)) {
+    return std::nullopt;
+  }
+
+  LayerCopyPixels payload{std::move(copied), QPoint(copy_rect.x, copy_rect.y), copy_rect, {}};
+  payload.source_layer_ids.reserve(layers_to_copy.size());
+  for (const auto* layer : layers_to_copy) {
+    payload.source_layer_ids.push_back(layer->id());
+  }
+  return payload;
+}
+
+}  // namespace
+
+QImage MainWindow::render_layers_for_system_clipboard(const std::vector<Layer>& layers_top_to_bottom) {
+  if (layers_top_to_bottom.empty()) {
+    return {};
+  }
+  const auto& source = std::as_const(document());
+  Document scratch(source.width(), source.height(), source.format());
+  scratch.color_state().bit_depth = source.color_state().bit_depth;
+  // What the copied layers may reference while they render: Smart Object sources,
+  // filter records and pattern tiles (shared payloads, so the copies are cheap).
+  scratch.metadata().smart_objects = source.metadata().smart_objects;
+  scratch.metadata().smart_filter_effects = source.metadata().smart_filter_effects;
+  scratch.metadata().patterns = source.metadata().patterns;
+  Rect painted;
+  bool whole_canvas = false;
+  for (auto it = layers_top_to_bottom.rbegin(); it != layers_top_to_bottom.rend(); ++it) {
+    if (it->kind() == LayerKind::Group) {
+      whole_canvas = true;  // a folder's extent is its children's; render the canvas and trim
+    } else {
+      painted = unite_rect(painted, it->bounds());
+    }
+    scratch.add_layer(*it);
+  }
+  const auto canvas_rect = Rect::from_size(source.width(), source.height());
+  const auto crop = whole_canvas ? canvas_rect : intersect_copy_rect(painted, canvas_rect);
+  if (crop.empty()) {
+    return {};
+  }
+  // A display render (16 and 32-bit composites narrow to sRGB bytes, 32-bit through the
+  // preview exposure): other programs read 8-bit display colors. A render at depth handed
+  // 32-bit linear floats to the ARGB32 conversion as if they were display values.
+  const QImage image =
+      qimage_from_document_rect(scratch, QRect(crop.x, crop.y, crop.width, crop.height), true)
+          .convertToFormat(QImage::Format_ARGB32);
+  // Trim the fully transparent margins (a text layer's bounds include its line box, a
+  // masked layer's its hidden part).
+  int left = image.width();
+  int top = image.height();
+  int right = -1;
+  int bottom = -1;
+  for (int y = 0; y < image.height(); ++y) {
+    const auto* row = reinterpret_cast<const QRgb*>(image.constScanLine(y));
+    for (int x = 0; x < image.width(); ++x) {
+      if (qAlpha(row[x]) == 0) {
+        continue;
+      }
+      left = std::min(left, x);
+      right = std::max(right, x);
+      top = std::min(top, y);
+      bottom = y;
+    }
+  }
+  if (right < left) {
+    return {};
+  }
+  return image.copy(QRect(left, top, right - left + 1, bottom - top + 1));
+}
+
+void MainWindow::clear_system_clipboard() {
+  if (auto* clipboard = QApplication::clipboard(); clipboard != nullptr) {
+    const QSignalBlocker blocker(clipboard);
+    clipboard->clear();
+    patchy_system_clipboard_signature_ = clipboard_image_signature(clipboard->image());
+  }
+}
+
+void MainWindow::set_system_clipboard_image(const QImage& image) {
+  if (auto* clipboard = QApplication::clipboard(); clipboard != nullptr) {
+    const QSignalBlocker blocker(clipboard);
+    clipboard->setImage(image);
+    patchy_system_clipboard_signature_ = clipboard_image_signature(clipboard->image());
+  }
+#ifdef Q_OS_WASM
+  // Qt's own browser write above is rejected by Chromium (untyped Blob; see
+  // clipboard_wasm.hpp), so the Qt clipboard only serves Patchy's internal
+  // paste and the New Document Clipboard preset. This write is what reaches
+  // other apps.
+  wasm_clipboard::write_image_png(image);
+#endif
+}
+
+void MainWindow::set_system_clipboard_mime(QMimeData* mime) {
+  if (auto* clipboard = QApplication::clipboard(); clipboard != nullptr) {
+    const QSignalBlocker blocker(clipboard);
+    clipboard->setMimeData(mime);
+  } else {
+    delete mime;
+  }
+  // Paste prefers the internal layer clipboard; drop it so the SVG wins.
+  clipboard_.reset();
+  patchy_system_clipboard_signature_.reset();
+}
+
+void MainWindow::copy_as_svg() {
+  if (canvas_ == nullptr || !has_active_document()) {
+    return;
+  }
+  canvas_->finish_free_transform();
+  auto& doc = document();
+  select_only_layer_if_none_active();
+  const auto ids = root_drop_layer_ids(doc.layers(), selected_or_active_layer_ids());
+  if (ids.empty()) {
+    show_status_error(tr("Select a layer to copy as SVG"));
+    return;
+  }
+  // A sub-document at the canvas size (same PPI, pattern and smart-object
+  // stores) so the SVG keeps document coordinates and a later Paste lands in
+  // place. The writer rasterizes whatever SVG cannot express and says so.
+  Document svg_document(doc.width(), doc.height(), doc.format());
+  svg_document.print_settings() = doc.print_settings();
+  svg_document.metadata().patterns = doc.metadata().patterns;
+  svg_document.metadata().smart_objects = doc.metadata().smart_objects;
+  svg_document.metadata().smart_filter_effects = doc.metadata().smart_filter_effects;
+  const auto layers = find_layers_top_to_bottom(doc.layers(), ids);
+  for (auto it = layers.rbegin(); it != layers.rend(); ++it) {
+    svg_document.add_layer(**it);
+  }
+  std::vector<std::string> notices;
+  std::vector<std::uint8_t> bytes;
+  try {
+    bytes = svg::DocumentIo::write(svg_document, &notices);
+  } catch (const std::exception& error) {
+    show_status_error(tr("Could not build SVG: %1").arg(translate_data_text(error.what())));
+    return;
+  }
+  const QByteArray svg_bytes(reinterpret_cast<const char*>(bytes.data()), static_cast<qsizetype>(bytes.size()));
+  auto* mime = new QMimeData();
+  mime->setData(QStringLiteral("image/svg+xml"), svg_bytes);
+  mime->setText(QString::fromUtf8(svg_bytes));  // Figma, Inkscape, and browsers read the text form
+  set_system_clipboard_mime(mime);
+  auto message = tr("Copied %n layer(s) as SVG", nullptr, static_cast<int>(layers.size()));
+  if (!notices.empty()) {
+    message += QStringLiteral(" (") + translate_data_text(notices.front()) + QStringLiteral(")");
+  }
+  statusBar()->showMessage(message);
+}
+
+void MainWindow::copy_as_css() {
+  if (canvas_ == nullptr || !has_active_document()) {
+    return;
+  }
+  canvas_->finish_free_transform();
+  finish_active_text_editor();
+  select_only_layer_if_none_active();
+  const auto ids = selected_or_active_layer_ids();
+  const auto css = css::layers_to_css(std::as_const(document()), ids, session().title.toStdString());
+  if (css.classes == 0) {
+    show_status_error(tr("Select a visible layer with content to copy as CSS"));
+    return;
+  }
+  auto* mime = new QMimeData();
+  mime->setText(QString::fromStdString(css.text));
+  set_system_clipboard_mime(mime);
+  auto message = tr("Copied %n layer(s) as CSS", nullptr, css.classes);
+  if (const auto skipped = css.hidden_skipped + css.empty_skipped; skipped > 0) {
+    message += QLatin1Char(' ') + tr("(%n hidden or empty layer(s) left out)", nullptr, skipped);
+  }
+  statusBar()->showMessage(message);
+}
+
+void MainWindow::ungroup_selected_layers() {
+  if (canvas_ == nullptr || !has_active_document()) {
+    return;
+  }
+  if (preview_dialog_edit_locked()) {
+    show_preview_dialog_edit_lock_message();
+    return;
+  }
+  canvas_->finish_free_transform();
+  auto& doc = document();
+  const auto ids = root_drop_layer_ids(doc.layers(), selected_or_active_layer_ids());
+  std::vector<LayerId> groups;
+  for (const auto id : ids) {
+    const auto* layer = std::as_const(doc).find_layer(id);
+    if (layer != nullptr && layer->kind() == LayerKind::Group) {
+      groups.push_back(id);
+    }
+  }
+  if (groups.empty()) {
+    show_status_error(tr("Select a folder to ungroup"));
+    return;
+  }
+  for (const auto id : groups) {
+    if (layer_is_effectively_locked(doc.layers(), id)) {
+      show_status_error(tr("Layer is locked."));
+      return;
+    }
+  }
+  push_undo_snapshot(tr("Ungroup layers"));
+  bool dropped_attributes = false;
+  std::optional<LayerId> first_released;
+  for (const auto id : groups) {
+    if (const auto* group = std::as_const(doc).find_layer(id); group != nullptr) {
+      // Photoshop drops the folder's own attributes; say so afterwards.
+      dropped_attributes = dropped_attributes || group->opacity() < 1.0F ||
+                           group->blend_mode() != BlendMode::PassThrough || group->mask().has_value() ||
+                           group->vector_mask() != nullptr || group->clipped() ||
+                           !group->layer_style().empty();
+    }
+    const auto released = ungroup_layer(doc.layers(), id);
+    if (released.has_value() && !released->empty() && !first_released.has_value()) {
+      first_released = released->front();
+    }
+    session().collapsed_layer_groups.erase(id);
+  }
+  if (first_released.has_value()) {
+    doc.set_active_layer(*first_released);
+  }
+  refresh_layer_list();
+  refresh_layer_controls();
+  refresh_document_info();
+  canvas_->document_changed();
+  if (dropped_attributes) {
+    statusBar()->showMessage(tr("Ungrouped the folder; its opacity, blend mode, mask, or style was discarded"));
+  } else {
+    statusBar()->showMessage(tr("Ungrouped %n folder(s)", nullptr, static_cast<int>(groups.size())));
+  }
+}
+
+void MainWindow::clear_internal_clipboard_on_external_change() {
+  const auto current_signature = clipboard_image_signature(QApplication::clipboard()->image());
+  if (patchy_system_clipboard_signature_.has_value() && current_signature == *patchy_system_clipboard_signature_) {
+    return;
+  }
+  clipboard_.reset();
+  patchy_system_clipboard_signature_.reset();
+}
+
+void MainWindow::cut_selection() {
+  // With keyboard focus inside a color picker, Edit > Cut acts on its colors
+  // (same routing rationale as the Palette panel below: a parallel picker
+  // shortcut would be ambiguous with the application-context hotkeys).
+  if (auto* picker = color_picker_ancestor_of(QApplication::focusWidget()); picker != nullptr) {
+    bool cleared_custom_slot = false;
+    const auto color = picker->cut_color_to_clipboard(cleared_custom_slot);
+    statusBar()->showMessage(cleared_custom_slot ? tr("Cut custom color %1").arg(color.name())
+                                                 : tr("Copied color %1").arg(color.name()));
+    return;
+  }
+  // Path Select or Direct Select with shapes selected: cut those (GitHub #555).
+  if (path_component_clipboard_active()) {
+    copy_path_components(true);
+    return;
+  }
+  select_only_layer_if_none_active();
+  auto ids = selected_layer_ids();
+  if (ids.empty()) {
+    const auto active = document().active_layer_id();
+    if (active.has_value()) {
+      ids.push_back(*active);
+    }
+  }
+  if (ids.empty()) {
+    show_status_error(tr("Select a layer to cut"));
+    return;
+  }
+
+  // Resolve the selection the way Copy does, so a layer inside a folder is cut in place
+  // instead of being missed by a walk over the root list.
+  std::vector<LayerId> layers_to_cut;
+  for (const auto* layer :
+       find_layers_top_to_bottom(document().layers(), root_drop_layer_ids(document().layers(), ids))) {
+    if (layer == nullptr || layer->kind() != LayerKind::Pixel || !layer->visible() ||
+        layer_id_locks_image_pixels(layer->id())) {
+      continue;
+    }
+    layers_to_cut.push_back(layer->id());
+  }
+  if (layers_to_cut.empty()) {
+    if (std::any_of(ids.begin(), ids.end(), [this](LayerId id) { return layer_id_locks_image_pixels(id); })) {
+      show_status_error(tr("Layer pixels are locked."));
+      return;
+    }
+    // Nothing was cut, so whatever the user had on the clipboard stays there.
+    statusBar()->showMessage(tr("Selected layers are hidden or not editable; nothing cut"));
+    return;
+  }
+  if (std::any_of(layers_to_cut.begin(), layers_to_cut.end(), [this](LayerId id) {
+        const auto* layer = std::as_const(document()).find_layer(id);
+        return layer != nullptr && layer_pixels_are_procedural(*layer);
+      })) {
+    show_status_error(
+        tr("Rasterize Text, Smart Object, and Shape layers before editing their pixels"));
+    return;
+  }
+
+  if (!copy_selected_pixels(true) || !clipboard_.has_value() || clipboard_->pixels.empty()) {
+    return;
+  }
+
+  auto& doc = document();
+  push_undo_snapshot(tr("Cut"));
+  Rect affected;
+  auto options = menu_command_edit_options(*canvas_);
+  for (const auto id : layers_to_cut) {
+    auto* layer = doc.find_layer(id);
+    if (layer == nullptr || layer->kind() != LayerKind::Pixel || !layer->visible()) {
+      continue;
+    }
+    options.lock_transparent_pixels = layer_locks_transparent_pixels(*layer);
+    affected = unite_rect(affected, patchy::clear_rect(doc, id, layer->bounds(), options));
+  }
+  if (!affected.empty()) {
+    canvas_->document_changed(to_qrect(affected));
+  }
+  refresh_layer_list();
+  refresh_layer_controls();
+  statusBar()->showMessage(tr("Cut %1 layer(s)").arg(static_cast<qulonglong>(layers_to_cut.size())));
+}
+
+void MainWindow::copy_selection() {
+  // With keyboard focus inside a color picker, Edit > Copy takes the picker's
+  // current color (color mime + hex text).
+  if (auto* picker = color_picker_ancestor_of(QApplication::focusWidget()); picker != nullptr) {
+    statusBar()->showMessage(tr("Copied color %1").arg(picker->copy_color_to_clipboard().name()));
+    return;
+  }
+  // With keyboard focus inside the Palette panel, Edit > Copy acts on the
+  // selected swatch instead of the canvas (a parallel panel shortcut would make
+  // Ctrl+C ambiguous and Qt would fire neither).
+  if (palette_panel_ != nullptr && QApplication::focusWidget() != nullptr &&
+      palette_panel_->isAncestorOf(QApplication::focusWidget())) {
+    copy_selected_palette_color();
+    return;
+  }
+  if (path_component_clipboard_active()) {
+    copy_path_components(false);  // the selected shapes (GitHub #555)
+    return;
+  }
+  static_cast<void>(copy_selected_pixels(false));
+}
+
+void MainWindow::report_empty_copy_area(const QString& title, const QString& text) {
+  if (unattended_automation()) {
+    show_status_error(text);
+    return;
+  }
+  statusBar()->showMessage(text);
+  static_cast<void>(show_warning_message(this, title, text, QMessageBox::Ok, QMessageBox::Ok,
+                                         QStringLiteral("copyEmptySelectionMessageBox")));
+}
+
+bool MainWindow::copy_selected_pixels(bool cutting) {
+  if (canvas_ != nullptr) {
+    canvas_->finish_free_transform();
+  }
+  select_only_layer_if_none_active();
+  auto ids = selected_layer_ids();
+  if (ids.empty()) {
+    const auto active = document().active_layer_id();
+    if (active.has_value()) {
+      ids.push_back(*active);
+    }
+  }
+  if (ids.empty()) {
+    show_status_error(tr("Select a layer to copy"));
+    return false;
+  }
+
+  ids = root_drop_layer_ids(document().layers(), ids);
+  if (ids.empty()) {
+    show_status_error(tr("Select a layer to copy"));
+    return false;
+  }
+
+  const auto selected_layers = find_layers_top_to_bottom(document().layers(), ids);
+  if (selected_layers.empty()) {
+    show_status_error(tr("Select a layer to copy"));
+    return false;
+  }
+
+  const auto contains_non_pixel_layer =
+      std::any_of(selected_layers.begin(), selected_layers.end(), [](const Layer* layer) {
+        return layer != nullptr && layer->kind() != LayerKind::Pixel;
+      });
+  if (!canvas_->selected_document_rect().has_value() || contains_non_pixel_layer) {
+    ClipboardPayload payload;
+    payload.layers_top_to_bottom.reserve(selected_layers.size());
+    for (const auto* layer : selected_layers) {
+      payload.layers_top_to_bottom.push_back(*layer);
+      clear_background_locks_if_copy_of_background(payload.layers_top_to_bottom.back(), layer->id(),
+                                                   std::as_const(document()).layers(), document().width(),
+                                                   document().height());
+      collect_referenced_smart_object_sources(*layer, document().metadata().smart_objects,
+                                              payload.smart_object_sources);
+      collect_referenced_smart_filter_records(
+          *layer, document().metadata().smart_filter_effects,
+          payload.smart_filter_effect_records);
+      collect_referenced_pattern_resources(*layer, document().metadata().patterns,
+                                           payload.pattern_resources);
+    }
+    clipboard_ = std::move(payload);
+    // Other programs get the layers' pixels too. This used to clear the system clipboard,
+    // so a paste into another app came up empty (GitHub issue 116, from a Wayland AppImage,
+    // where the clear reached the compositor as an empty selection). Paste inside Patchy
+    // still prefers the layer payload: the image's signature marks it as Patchy's own.
+    const auto rendered = render_layers_for_system_clipboard(clipboard_->layers_top_to_bottom);
+    if (rendered.isNull()) {
+      clear_system_clipboard();
+    } else {
+      set_system_clipboard_image(rendered);
+    }
+    statusBar()->showMessage(tr("Copied %1 layer(s)").arg(static_cast<qulonglong>(selected_layers.size())));
+    return true;
+  }
+
+  const std::set<LayerId> selected(ids.begin(), ids.end());
+  std::vector<const Layer*> layers_to_copy;
+  for (const auto* layer : selected_layers) {
+    if (layer == nullptr || !selected.contains(layer->id()) || layer->kind() != LayerKind::Pixel ||
+        !layer->visible()) {
+      continue;
+    }
+    layers_to_copy.push_back(layer);
+  }
+  if (layers_to_copy.empty()) {
+    clipboard_.reset();
+    clear_system_clipboard();
+    statusBar()->showMessage(tr("Selected layers are hidden or not editable; nothing copied"));
+    return false;
+  }
+
+  Rect copy_rect;
+  if (canvas_->selected_document_rect().has_value()) {
+    copy_rect = to_core_rect(*canvas_->selected_document_rect());
+  } else {
+    for (const auto* layer : layers_to_copy) {
+      copy_rect = unite_rect(copy_rect, layer->bounds());
+    }
+  }
+  const auto report_empty = [this, cutting] {
+    if (cutting) {
+      report_empty_copy_area(tr("Cut"), tr("Could not complete the Cut command because the selected area is empty."));
+    } else {
+      report_empty_copy_area(tr("Copy"),
+                             tr("Could not complete the Copy command because the selected area is empty."));
+    }
+  };
+  copy_rect = intersect_copy_rect(copy_rect, Rect::from_size(document().width(), document().height()));
+  if (copy_rect.empty()) {
+    report_empty();
+    return false;
+  }
+
+  PixelBuffer copied;
+  if (layers_to_copy.size() == 1U) {
+    copied = copy_pixels_from_layer(*layers_to_copy.front(), copy_rect, canvas_);
+  } else {
+    Document selected_document(document().width(), document().height(), document().format());
+    selected_document.color_state().bit_depth = std::as_const(document()).color_state().bit_depth;
+    for (const auto* layer : layers_to_copy) {
+      selected_document.add_layer(*layer);
+    }
+    const ScopedDocumentDepthRender depth_render;
+    const auto image =
+        qimage_from_document_rect(selected_document, QRect(copy_rect.x, copy_rect.y, copy_rect.width, copy_rect.height),
+                                  true);
+    copied = pixels_from_image_at_depth(image, std::as_const(document()).color_state().bit_depth);
+    apply_selection_mask(copied, copy_rect, *canvas_);
+  }
+  // Only transparent pixels under the marquee (artboard paper is the compositor's, not a
+  // layer's): Photoshop refuses, and so do we, rather than pasting an invisible layer.
+  if (!has_visible_pixels(copied)) {
+    report_empty();
+    return false;
+  }
+
+  clipboard_ = ClipboardPayload{std::move(copied), QPoint(copy_rect.x, copy_rect.y)};
+  clipboard_->source_artboard_origin = artboard_origin_at(std::as_const(document()), copy_rect);
+  clipboard_->source_session_id = session().session_id;
+  set_system_clipboard_image(display_qimage_from_pixel_buffer(clipboard_->pixels));
+  statusBar()->showMessage(
+      tr("Copied %1 layer(s), %2 x %3 px")
+          .arg(static_cast<qulonglong>(layers_to_copy.size()))
+          .arg(copy_rect.width)
+          .arg(copy_rect.height));
+  return true;
+}
+
+void MainWindow::copy_merged() {
+  if (canvas_ != nullptr) {
+    canvas_->finish_free_transform();
+  }
+  auto copy_rect = Rect::from_size(document().width(), document().height());
+  if (canvas_->selected_document_rect().has_value()) {
+    copy_rect = intersect_copy_rect(copy_rect, to_core_rect(*canvas_->selected_document_rect()));
+  }
+  const auto report_empty = [this] {
+    report_empty_copy_area(tr("Copy Merged"),
+                           tr("Could not complete the Copy Merged command because the selected area is empty."));
+  };
+  if (copy_rect.empty()) {
+    report_empty();
+    return;
+  }
+
+  const auto depth = std::as_const(document()).color_state().bit_depth;
+  QImage image;
+  {
+    const ScopedDocumentDepthRender depth_render;
+    // Only the selected rect: compositing the whole canvas first took 20 s on a grid of
+    // imported PDF pages as artboards.
+    image = qimage_from_document_rect(document(), QRect(copy_rect.x, copy_rect.y, copy_rect.width, copy_rect.height),
+                                      true);
+  }
+  auto copied = pixels_from_image_at_depth(image, depth);
+  // The selection's shape, not just its bounding box (a lasso or Object Selection), with soft
+  // edges kept: the same mask Copy applies.
+  apply_selection_mask(copied, copy_rect, *canvas_);
+  if (!has_visible_pixels(copied)) {
+    report_empty();
+    return;
+  }
+  clipboard_ = ClipboardPayload{std::move(copied), QPoint(copy_rect.x, copy_rect.y)};
+  clipboard_->source_artboard_origin = artboard_origin_at(std::as_const(document()), copy_rect);
+  clipboard_->source_session_id = session().session_id;
+  set_system_clipboard_image(display_qimage_from_pixel_buffer(clipboard_->pixels));
+  statusBar()->showMessage(tr("Copied merged %1 x %2 px").arg(copy_rect.width).arg(copy_rect.height));
+}
+
+bool MainWindow::paste_svg_from_clipboard() {
+  const auto* mime = QApplication::clipboard()->mimeData();
+  if (mime == nullptr) {
+    return false;
+  }
+  QByteArray svg_bytes;
+  if (mime->hasFormat(QStringLiteral("image/svg+xml"))) {
+    svg_bytes = mime->data(QStringLiteral("image/svg+xml"));
+  } else if (mime->hasText()) {
+    const auto text = mime->text();
+    const auto head = QStringView(text).trimmed();
+    if (head.startsWith(QStringLiteral("<svg")) ||
+        (head.startsWith(QStringLiteral("<?xml")) && text.contains(QStringLiteral("<svg")))) {
+      svg_bytes = text.toUtf8();
+    }
+  }
+  if (svg_bytes.isEmpty()) {
+    return false;
+  }
+  Document imported;
+  try {
+    imported = svg::DocumentIo::read(std::span<const std::uint8_t>(
+        reinterpret_cast<const std::uint8_t*>(svg_bytes.constData()), static_cast<std::size_t>(svg_bytes.size())));
+  } catch (const std::exception&) {
+    // Not usable as vectors; the caller falls through to the raster rendition
+    // most SVG-producing apps also put on the clipboard.
+    return false;
+  }
+  render_pending_svg_text_layers(imported);
+  render_pending_af_text_layers(imported);
+  render_pending_xcf_text_layers(imported);
+  render_pending_pdf_text_layers(imported);
+  render_pending_pdf_image_layers(imported);
+  QStringList image_notices;
+  decode_pending_svg_images(imported.layers(), image_notices);
+  if (imported.layers().empty()) {
+    return false;
+  }
+
+  auto& doc = document();
+  const auto selected_ids = selected_layer_ids();
+  auto anchor_id = selected_ids.empty() ? std::nullopt : std::optional<LayerId>{selected_ids.front()};
+  push_undo_snapshot(tr("Paste shape"));
+  // Photoshop drops the selection once the clipboard lands on its own layer;
+  // the snapshot above keeps it for Undo.
+  canvas_->clear_selection();
+  for (const auto& resource : imported.metadata().patterns.patterns) {
+    doc.metadata().patterns.adopt(resource);
+  }
+  std::set<std::string> existing_names;
+  collect_layer_names(doc.layers(), existing_names);
+  const auto canvas = Rect::from_size(doc.width(), doc.height());
+  // The imported bake was clipped to the SVG's own canvas; re-rasterize
+  // against this document's.
+  const auto rebake = [&](auto&& self, Layer& layer) -> void {
+    for (auto& child : layer.children()) {
+      self(self, child);
+    }
+    update_vector_shape_raster(layer, canvas, &doc.metadata().patterns);
+    update_vector_mask_raster(layer, canvas);
+  };
+  int added = 0;
+  for (const auto& layer : imported.layers()) {
+    auto pasted = clone_layer_tree_with_document_ids(doc, layer);
+    if (!pasted.has_value()) {
+      continue;
+    }
+    // Fresh content keeps its SVG name; only a collision earns the copy suffix.
+    if (existing_names.contains(layer.name())) {
+      pasted->set_name(next_duplicate_name(layer.name(), existing_names));
+    }
+    existing_names.insert(pasted->name());
+    rebake(rebake, *pasted);
+    const auto pasted_id = pasted->id();
+    insert_layer_after_anchor(doc, std::move(*pasted), anchor_id);
+    anchor_id = pasted_id;
+    doc.set_active_layer(pasted_id);
+    ++added;
+  }
+  refresh_layer_list();
+  refresh_layer_controls();
+  canvas_->document_changed();
+  statusBar()->showMessage(tr("Pasted %n SVG shape layer(s)", nullptr, added));
+  return true;
+}
+
+void MainWindow::paste_clipboard(bool in_place) {
+  // See copy_selection: focus inside a color picker routes the paste to it (a
+  // clipboard color becomes the picker's current color).
+  if (auto* picker = color_picker_ancestor_of(QApplication::focusWidget()); picker != nullptr) {
+    if (const auto color = picker->paste_color_from_clipboard(); color.has_value()) {
+      statusBar()->showMessage(tr("Pasted color %1").arg(color->name()));
+    } else {
+      show_status_error(tr("The clipboard does not contain a color"));
+    }
+    return;
+  }
+  // Focus inside the Palette panel routes the paste to the selected swatch.
+  if (palette_panel_ != nullptr && QApplication::focusWidget() != nullptr &&
+      palette_panel_->isAncestorOf(QApplication::focusWidget())) {
+    paste_clipboard_color_to_palette();
+    return;
+  }
+  // With no document only file paths copied as text paste: they open
+  // (refresh_paste_without_document_state enables the action for them).
+  if (!has_active_document()) {
+    if (!paste_clipboard_text_paths(false)) {
+      show_status_error(tr("Clipboard does not contain an image"));
+    }
+    return;
+  }
+  // Copied shapes paste into the target path, in place (GitHub #555).
+  if (paste_path_components()) {
+    return;
+  }
+  if (canvas_ != nullptr) {
+    canvas_->finish_free_transform();
+  }
+  // Panel order is top to bottom. Capture the destination before inserting
+  // anything, then advance the anchor to preserve the pasted stack's order.
+  const auto selected_ids = selected_layer_ids();
+  auto anchor_id = selected_ids.empty() ? std::nullopt : std::optional<LayerId>{selected_ids.front()};
+  if (clipboard_.has_value() && !clipboard_->layers_top_to_bottom.empty()) {
+    auto& doc = document();
+    const auto caches_available = std::all_of(
+        clipboard_->layers_top_to_bottom.begin(), clipboard_->layers_top_to_bottom.end(),
+        [&](const Layer& layer) {
+          return smart_filter_records_available_for_clone(
+              layer, doc.metadata().smart_filter_effects,
+              &clipboard_->smart_filter_effect_records);
+        });
+    if (!caches_available) {
+      show_status_error(
+          tr("Smart Filter cache data could not be duplicated safely"));
+      return;
+    }
+    std::set<std::string> existing_names;
+    collect_layer_names(doc.layers(), existing_names);
+
+    push_undo_snapshot(in_place ? tr("Paste in Place") : tr("Paste"));
+    canvas_->clear_selection();
+    for (const auto& source : clipboard_->smart_object_sources) {
+      doc.metadata().smart_objects.adopt(source);
+    }
+    for (const auto& resource : clipboard_->pattern_resources) {
+      PatternResource adopted = resource;
+      adopted.provenance = PatternProvenance::Authored;  // target file has no raw block for it
+      doc.metadata().patterns.adopt(adopted);
+    }
+    std::vector<LayerId> pasted_ids;
+    for (auto it = clipboard_->layers_top_to_bottom.rbegin(); it != clipboard_->layers_top_to_bottom.rend(); ++it) {
+      auto pasted = clone_layer_tree_with_document_ids(
+          doc, *it, &clipboard_->smart_filter_effect_records);
+      if (!pasted.has_value()) {
+        undo();
+        show_status_error(
+            tr("Smart Filter cache data could not be duplicated safely"));
+        return;
+      }
+      pasted->set_name(next_duplicate_name(it->name(), existing_names));
+      existing_names.insert(pasted->name());
+      convert_layer_depth(*pasted, std::as_const(doc).color_state().bit_depth);
+      const auto pasted_id = pasted->id();
+      insert_layer_after_anchor(doc, std::move(*pasted), anchor_id);
+      anchor_id = pasted_id;
+      doc.set_active_layer(pasted_id);
+      pasted_ids.push_back(pasted_id);
+    }
+    separate_copied_link_groups(doc.layers(), pasted_ids);
+    refresh_layer_list();
+    refresh_layer_controls();
+    canvas_->document_changed();
+    statusBar()->showMessage(
+        tr("Pasted %1 layer(s)").arg(static_cast<qulonglong>(clipboard_->layers_top_to_bottom.size())));
+    return;
+  }
+
+  // System-clipboard SVG (Illustrator/Inkscape/browser copies) pastes as
+  // editable shape layers, checked before the raster-image fallback (apps
+  // that put SVG on the clipboard usually put a raster rendition on it too).
+  if (!clipboard_.has_value() || clipboard_->pixels.empty()) {
+    if (paste_svg_from_clipboard()) {
+      return;
+    }
+  }
+
+  PixelBuffer pixels;
+  std::optional<QPoint> source_origin;
+  if (clipboard_.has_value() && !clipboard_->pixels.empty()) {
+    pixels = clipboard_->pixels;
+    source_origin = clipboard_->origin;
+  } else {
+    const auto image = QApplication::clipboard()->image();
+    if (image.isNull()) {
+      // A file copied in a file manager carries URLs and no bitmap: paste the
+      // supported image files as layers (Files as Layers, docs/import.md).
+      if (const auto paths = supported_layer_drop_paths(QApplication::clipboard()->mimeData()); !paths.isEmpty()) {
+        add_files_as_layers_interactive(paths, std::nullopt, tr("Paste"));
+        return;
+      }
+      // File paths copied as text: Paste opens them, Paste in Place adds them as
+      // layers (docs/clipboard.md, "File paths copied as text").
+      if (paste_clipboard_text_paths(in_place)) {
+        return;
+      }
+      show_status_error(tr("Clipboard does not contain an image"));
+      return;
+    }
+    pixels = pixels_from_image_rgba(image);
+  }
+  // Pixels from another document or another app join this document at its depth.
+  if (const auto depth = std::as_const(document()).color_state().bit_depth; pixels.format().bit_depth != depth) {
+    pixels = convert_pixel_buffer_depth(pixels, depth, SampleKind::Color);
+  }
+
+  const auto view_point = [this](double x, double y) {
+    return canvas_->document_point_for_widget_position(QPointF(x, y));
+  };
+  // The view is the canvas less its rulers and scroll bars, where Fit and Fill center the
+  // document (docs/view-navigation.md, "View area").
+  const auto view_area = canvas_->view_content_rect();
+  const auto view_center = view_point(view_area.center().x(), view_area.center().y());
+  const auto place_axis = [](double desired, int content_size, int canvas_size) {
+    // Keep pixels at their original size. Oversized content cannot fit, so
+    // center its overflow; otherwise keep the entire pasted rectangle inside.
+    if (content_size > canvas_size) {
+      return static_cast<int>(std::floor((canvas_size - content_size) / 2.0));
+    }
+    return static_cast<int>(std::lround(std::clamp(desired, 0.0, static_cast<double>(canvas_size - content_size))));
+  };
+  // Placement (docs/tools.md, "Clipboard pixel placement"). A marquee left active centers Paste on
+  // itself, on the artboard under its center or at the root (Photoshop 2026), so the marquee
+  // that made a copy brings it back in place. Without one, on an artboard (the selected
+  // layer's, or the selected artboard) Photoshop centers the paste on that artboard, and Paste
+  // in Place keeps the pixels' place on their artboard; the view center or the document
+  // position could land them where the artboard clips them away. Elsewhere, pixels copied
+  // from this document go back to their place while it is in view (GitHub issue 193), and
+  // to the view center otherwise.
+  const auto& doc = std::as_const(document());
+  const auto selection_rect = in_place ? QRect() : canvas_->selected_document_rect().value_or(QRect());
+  const auto* target = anchor_id.has_value() ? artboard_owning_layer(doc, *anchor_id) : nullptr;
+  QPointF center = view_center;
+  bool source_place_in_view = false;
+  // A marquee outside every artboard with a layer on one selected: the root, right above
+  // that artboard (insert_layer_after_anchor would put it inside an artboard anchor).
+  std::optional<LayerId> root_anchor;
+  if (!selection_rect.isEmpty()) {
+    center = QPointF(selection_rect.x() + selection_rect.width() / 2.0,
+                     selection_rect.y() + selection_rect.height() / 2.0);
+    const auto* under = artboard_at(doc, static_cast<std::int32_t>(std::floor(center.x())),
+                                    static_cast<std::int32_t>(std::floor(center.y())));
+    if (under != nullptr && under != target) {
+      anchor_id = under->id();
+    } else if (under == nullptr && target != nullptr) {
+      root_anchor = target->id();
+    }
+  } else if (target != nullptr) {
+    const auto rect = target->artboard()->rect;
+    center = QPointF(rect.x + rect.width / 2.0, rect.y + rect.height / 2.0);
+    if (in_place && source_origin.has_value() && clipboard_.has_value() &&
+        clipboard_->source_artboard_origin.has_value()) {
+      *source_origin += QPoint(rect.x, rect.y) - *clipboard_->source_artboard_origin;
+    }
+  } else if (!in_place && source_origin.has_value() && clipboard_.has_value() &&
+             clipboard_->source_session_id == session().session_id) {
+    const QPolygonF view{view_point(view_area.left(), view_area.top()), view_point(view_area.right(), view_area.top()),
+                         view_point(view_area.right(), view_area.bottom()),
+                         view_point(view_area.left(), view_area.bottom())};
+    source_place_in_view = view.containsPoint(
+        QPointF(source_origin->x() + pixels.width() / 2.0, source_origin->y() + pixels.height() / 2.0),
+        Qt::OddEvenFill);
+  }
+  const bool use_source_origin = source_origin.has_value() && (in_place || source_place_in_view);
+  const QPoint origin(
+      place_axis(use_source_origin ? source_origin->x() : center.x() - pixels.width() / 2.0,
+                 pixels.width(), document().width()),
+      place_axis(use_source_origin ? source_origin->y() : center.y() - pixels.height() / 2.0,
+                 pixels.height(), document().height()));
+
+  push_undo_snapshot(in_place ? tr("Paste in Place") : tr("Paste"));
+  // The marquee that produced the copy must not stay live over the new layer
+  // (Photoshop parity); Undo of the paste brings it back.
+  canvas_->clear_selection();
+  Layer pasted(document().allocate_layer_id(), tr("Pasted Layer").toStdString(), std::move(pixels));
+  pasted.set_bounds(Rect{origin.x(), origin.y(), std::as_const(pasted).pixels().width(),
+                         std::as_const(pasted).pixels().height()});
+  const auto pasted_id = pasted.id();
+  auto& top_level = document().layers();
+  if (const auto above = std::find_if(top_level.begin(), top_level.end(),
+                                      [&](const Layer& layer) { return root_anchor == layer.id(); });
+      above != top_level.end()) {
+    top_level.insert(std::next(above), std::move(pasted));
+  } else {
+    insert_layer_after_anchor(document(), std::move(pasted), anchor_id);
+  }
+  document().set_active_layer(pasted_id);
+  if (move_tool_action_ != nullptr) {
+    move_tool_action_->trigger();
+  } else {
+    current_tool_ = CanvasTool::Move;
+    canvas_->set_tool(current_tool_);
+  }
+  refresh_layer_list();
+  refresh_layer_controls();
+  canvas_->document_changed();
+  statusBar()->showMessage(tr("Pasted as new layer"));
+}
+
+void MainWindow::transform_active_layer_dialog() {
+  if (canvas_ == nullptr) {
+    show_status_error(tr("Select a pixel layer to transform"));
+    return;
+  }
+  if (canvas_->findChild<QTextEdit*>(QStringLiteral("inlineTextEditor")) != nullptr) {
+    finish_active_text_editor();
+  }
+  select_only_layer_if_none_active();
+  // With a path tool active and a targetable path, Ctrl+T transforms the
+  // PATH (Photoshop); the layer position lock governs pixels, not path
+  // geometry (path edits never consulted it). Kept out of
+  // begin_free_transform so its internal callers stay layer-only.
+  if (canvas_->begin_path_transform()) {
+    return;
+  }
+  if (const auto active = document().active_layer_id();
+      active.has_value() && layer_id_locks_position(*active)) {
+    show_status_error(tr("Layer position is locked."));
+    return;
+  }
+  if (!canvas_->begin_free_transform()) {
+    show_status_error(tr("Select a pixel layer to transform"));
+  }
+}
+
+std::vector<std::int64_t> MainWindow::layer_size_target_key() const {
+  std::vector<std::int64_t> key;
+  if (!has_active_document()) {
+    return key;
+  }
+  key.push_back(session().session_id);
+  auto ids = selected_or_active_layer_ids();
+  std::sort(ids.begin(), ids.end());
+  for (const auto id : ids) {
+    key.push_back(static_cast<std::int64_t>(id));
+  }
+  return key;
+}
+
+bool MainWindow::layer_size_fields_take_edits() const {
+  // Layers transform in the layer view only, as they align there (a channel or a single
+  // component on screen is not the layer the fields describe).
+  if (canvas_ == nullptr) {
+    return false;
+  }
+  const auto target = canvas_->layer_edit_target();
+  return target != CanvasWidget::LayerEditTarget::DocumentChannel && !CanvasWidget::is_component_preview(target);
+}
+
+void MainWindow::sync_layer_size_fields() {
+  if (properties_layer_size_panel_ == nullptr) {
+    return;
+  }
+  // A pending debounced edit outranks a passive sync, while it still belongs to these layers.
+  if (layer_size_apply_timer_ != nullptr && layer_size_apply_timer_->isActive()) {
+    if (layer_size_pending_key_ == layer_size_target_key()) {
+      return;
+    }
+    layer_size_apply_timer_->stop();  // the selection moved on: the typed value goes nowhere
+    layer_size_pending_size_ = false;
+    layer_size_pending_position_ = false;
+  }
+  // The frame reads each layer's alpha bounds: cached per pixel revision, a scan of the
+  // layer after every edit to it. A collapsed or closed Properties panel (how it starts)
+  // pays none of that; its Show event syncs (handle_right_dock_resize_event).
+  if (const auto* body = properties_layer_size_panel_->parentWidget(); body != nullptr && !body->isVisible()) {
+    return;
+  }
+  std::optional<CanvasWidget::LayerFrameState> state;
+  if (canvas_ != nullptr && has_active_document()) {
+    state = canvas_->layer_frame_state();
+  }
+  const bool shown = state.has_value();
+  const bool editable = shown && state->editable && !preview_dialog_edit_locked() && layer_size_fields_take_edits();
+  const auto frame = shown ? state->rect : QRectF();
+  const auto show_value = [editable](UnitSpinBox* spin, double value) {
+    if (spin == nullptr) {
+      return;
+    }
+    const QSignalBlocker blocker(spin);
+    spin->setValue(value);
+    spin->setEnabled(editable);
+  };
+  show_value(properties_layer_width_spin_, shown ? frame.width() : 0.0);
+  show_value(properties_layer_height_spin_, shown ? frame.height() : 0.0);
+  show_value(properties_layer_x_spin_, frame.left());
+  show_value(properties_layer_y_spin_, frame.top());
+  if (properties_layer_link_size_button_ != nullptr) {
+    properties_layer_link_size_button_->setEnabled(editable);
+  }
+  properties_layer_size_panel_->setVisible(shown);
+  properties_layer_size_panel_->setEnabled(editable);
+  layer_size_ratio_ = shown && frame.height() > 1e-9 ? frame.width() / frame.height() : 1.0;
+}
+
+void MainWindow::handle_layer_size_value_changed(bool width_changed, double value) {
+  if (properties_layer_width_spin_ == nullptr || properties_layer_height_spin_ == nullptr) {
+    return;
+  }
+  const bool linked =
+      properties_layer_link_size_button_ != nullptr && properties_layer_link_size_button_->isChecked();
+  if (linked && layer_size_ratio_ > 0.0) {
+    auto* other = width_changed ? properties_layer_height_spin_ : properties_layer_width_spin_;
+    const QSignalBlocker blocker(other);
+    other->setValue(width_changed ? value / layer_size_ratio_ : value * layer_size_ratio_);
+  }
+  schedule_layer_size_apply(true);
+}
+
+void MainWindow::schedule_layer_size_apply(bool size_edit) {
+  // Only fields the user can see hold the selection's values (sync_layer_size_fields).
+  if (properties_layer_size_panel_ == nullptr || !properties_layer_size_panel_->isEnabled() ||
+      !properties_layer_size_panel_->isVisible()) {
+    return;
+  }
+  if (layer_size_apply_timer_ == nullptr) {
+    layer_size_apply_timer_ = new QTimer(this);
+    layer_size_apply_timer_->setSingleShot(true);
+    layer_size_apply_timer_->setInterval(250);
+    connect(layer_size_apply_timer_, &QTimer::timeout, this, [this] {
+      // A label or field scrub still under the pointer: each apply resamples a pixel layer
+      // and is an undo step, so the edit lands once, when the drag ends.
+      for (auto* spin : {properties_layer_width_spin_, properties_layer_height_spin_, properties_layer_x_spin_,
+                         properties_layer_y_spin_}) {
+        if (spin != nullptr && spin_box_scrub_active(spin)) {
+          layer_size_apply_timer_->start();
+          return;
+        }
+      }
+      apply_layer_size_fields();
+    });
+  }
+  (size_edit ? layer_size_pending_size_ : layer_size_pending_position_) = true;
+  layer_size_pending_key_ = layer_size_target_key();
+  layer_size_apply_timer_->start();
+}
+
+bool MainWindow::apply_layer_size_fields() {
+  if (layer_size_apply_timer_ != nullptr) {
+    layer_size_apply_timer_->stop();
+  }
+  const bool size_edit = std::exchange(layer_size_pending_size_, false);
+  const bool position_edit = std::exchange(layer_size_pending_position_, false);
+  if (canvas_ == nullptr || !has_active_document() || properties_layer_width_spin_ == nullptr ||
+      properties_layer_height_spin_ == nullptr || properties_layer_x_spin_ == nullptr ||
+      properties_layer_y_spin_ == nullptr) {
+    return false;
+  }
+  // The values were typed for one set of layers; anything else just rereads the fields.
+  const bool same_target = layer_size_pending_key_ == layer_size_target_key();
+  const auto state = canvas_->layer_frame_state();
+  if (!same_target || !state.has_value() || !state->editable || preview_dialog_edit_locked() ||
+      !layer_size_fields_take_edits() || canvas_->pointer_gesture_active()) {
+    sync_layer_size_fields();
+    return false;
+  }
+  // Only the pair that was edited is read back: the fields show the frame rounded, and a
+  // rounded size must not turn a move into a resize.
+  const auto& frame = state->rect;
+  const QRectF wanted(position_edit ? properties_layer_x_spin_->value() : frame.left(),
+                      position_edit ? properties_layer_y_spin_->value() : frame.top(),
+                      size_edit ? properties_layer_width_spin_->value() : frame.width(),
+                      size_edit ? properties_layer_height_spin_->value() : frame.height());
+  constexpr double kUnchanged = 0.05;
+  if (std::abs(wanted.left() - frame.left()) < kUnchanged && std::abs(wanted.top() - frame.top()) < kUnchanged &&
+      std::abs(wanted.width() - frame.width()) < kUnchanged &&
+      std::abs(wanted.height() - frame.height()) < kUnchanged) {
+    return false;  // no-op; also keeps stale debounced applies harmless
+  }
+  if (canvas_->findChild<QTextEdit*>(QStringLiteral("inlineTextEditor")) != nullptr) {
+    finish_active_text_editor();
+  }
+  const bool changed = canvas_->set_layer_frame(wanted);
+  if (changed) {
+    refresh_layer_controls();
+    refresh_document_info();
+  }
+  sync_layer_size_fields();  // what was applied (snapped to whole pixels), or the truth after a refusal
+  return changed;
+}
+
+void MainWindow::transform_selection() {
+  if (canvas_ == nullptr) {
+    return;
+  }
+  if (canvas_->findChild<QTextEdit*>(QStringLiteral("inlineTextEditor")) != nullptr) {
+    finish_active_text_editor();
+  }
+  canvas_->begin_transform_selection();
+  refresh_options_bar();
+}
+
+void MainWindow::create_canvas_session_context_actions() {
+  // Each entry reuses a string Patchy already shows (the options bars' Apply and Cancel,
+  // Image > Rotate & Flip's turns and flips), so the menus add no new text.
+  const auto make = [this](const char* source, const char* object_name, std::function<void()> handler) {
+    auto* action = new QAction(this);
+    action->setObjectName(QLatin1String(object_name));
+    action->setMenuRole(QAction::NoRole);
+    bind_action_text(action, source);
+    apply_bound_translation(action);
+    connect(action, &QAction::triggered, this, [handler = std::move(handler)] { handler(); });
+    return action;
+  };
+  transform_context_apply_action_ = make(QT_TR_NOOP("Apply"), "transformContextApplyAction", [this] {
+    if (canvas_ == nullptr) {
+      return;
+    }
+    if (canvas_->path_transform_active()) {
+      canvas_->commit_path_transform();
+    } else if (canvas_->warp_transform_active()) {
+      canvas_->finish_warp_transform();
+    } else {
+      canvas_->finish_free_transform();
+    }
+    refresh_options_bar();
+  });
+  transform_context_cancel_action_ = make(QT_TR_NOOP("Cancel"), "transformContextCancelAction", [this] {
+    if (canvas_ == nullptr) {
+      return;
+    }
+    if (canvas_->path_transform_active()) {
+      canvas_->cancel_path_transform();
+    } else if (canvas_->warp_transform_active()) {
+      canvas_->cancel_warp_transform();
+    } else {
+      canvas_->cancel_free_transform();
+    }
+    refresh_options_bar();
+  });
+  const auto turn = [this](double degrees) {
+    return [this, degrees] {
+      if (canvas_ != nullptr) {
+        canvas_->rotate_free_transform_session(degrees);
+      }
+    };
+  };
+  const auto flip = [this](bool horizontal) {
+    return [this, horizontal] {
+      if (canvas_ != nullptr) {
+        canvas_->flip_free_transform_session(horizontal);
+      }
+    };
+  };
+  transform_context_turn_actions_ = {
+      make(QT_TR_NOOP("Rotate 1&80"), "transformContextRotate180Action", turn(180.0)),
+      make(QT_TR_NOOP("Rotate &Right"), "transformContextRotateRightAction", turn(90.0)),
+      make(QT_TR_NOOP("Rotate &Left"), "transformContextRotateLeftAction", turn(-90.0)),
+      nullptr,
+      make(QT_TR_NOOP("Flip &Horizontal"), "transformContextFlipHorizontalAction", flip(true)),
+      make(QT_TR_NOOP("Flip &Vertical"), "transformContextFlipVerticalAction", flip(false)),
+  };
+  crop_context_apply_action_ = make(QT_TR_NOOP("Apply"), "cropContextApplyAction", [this] {
+    if (canvas_ != nullptr) {
+      canvas_->commit_crop_session();
+    }
+  });
+  crop_context_cancel_action_ = make(QT_TR_NOOP("Cancel"), "cropContextCancelAction", [this] {
+    if (canvas_ != nullptr) {
+      canvas_->reset_crop_session_to_canvas();
+    }
+  });
+}
+
+// Apply and Cancel first, then (Free Transform and Warp) Edit > Transform's types and
+// Warp, then (Free Transform) the box's own turns and flips. A path transform has no
+// types, and Warp is left out where it would refuse (a selection or several layers).
+QList<QAction*> MainWindow::transform_session_context_actions() {
+  QList<QAction*> actions{transform_context_apply_action_, transform_context_cancel_action_};
+  if (canvas_ == nullptr || canvas_->path_transform_active()) {
+    return actions;
+  }
+  actions.push_back(nullptr);
+  actions.append(transform_mode_actions_);
+  const bool warp_refused = canvas_->free_transform_is_multi_target() || canvas_->free_transform_floats_selection() ||
+                            canvas_->free_transform_targets_selection();
+  if (!warp_refused && warp_transform_action_ != nullptr) {
+    actions.push_back(warp_transform_action_);
+  }
+  if (canvas_->free_transform_active()) {
+    actions.push_back(nullptr);
+    actions.append(transform_context_turn_actions_);
+  }
+  return actions;
+}
+
+// Apply and Cancel (Cancel puts the canvas frame back, like Esc and the X button), then
+// the bar's Preset list (GitHub issue 696): the free modes, the ratio and pixel-size
+// presets and the saved presets, grouped as in the list, the current one checked. Save
+// Preset and Delete Preset stay on the bar.
+QList<QAction*> MainWindow::crop_context_actions() {
+  for (auto* action : std::as_const(crop_context_ratio_actions_)) {
+    action->deleteLater();
+  }
+  crop_context_ratio_actions_.clear();
+  if (canvas_ == nullptr) {
+    return {};
+  }
+  crop_context_apply_action_->setEnabled(canvas_->crop_session_has_changes());
+  crop_context_cancel_action_->setEnabled(canvas_->crop_session_can_reset());
+  QList<QAction*> actions{crop_context_apply_action_, crop_context_cancel_action_};
+  if (crop_preset_combo_ == nullptr) {
+    return actions;
+  }
+  if (crop_context_ratio_group_ == nullptr) {
+    crop_context_ratio_group_ = new QActionGroup(this);
+    crop_context_ratio_group_->setExclusive(true);
+  }
+  const auto* model = qobject_cast<QStandardItemModel*>(crop_preset_combo_->model());
+  bool separator_pending = true;  // one under Cancel, then one per group of the list
+  for (int index = 0; index < crop_preset_combo_->count(); ++index) {
+    if (!crop_preset_combo_->itemData(index).isValid()) {
+      separator_pending = true;
+      continue;
+    }
+    // The two commands close the list; they are disabled items or open a prompt.
+    if (const auto kind = static_cast<CropPresetKind>(crop_preset_combo_->itemData(index).toInt());
+        kind == CropPresetKind::Save || kind == CropPresetKind::Delete) {
+      continue;
+    }
+    if (model != nullptr && model->item(index) != nullptr && !model->item(index)->isEnabled()) {
+      continue;
+    }
+    if (separator_pending) {
+      actions.push_back(nullptr);
+      separator_pending = false;
+    }
+    auto* action = new QAction(crop_preset_combo_->itemText(index), this);
+    action->setObjectName(QStringLiteral("cropContextPresetAction%1").arg(index));
+    action->setCheckable(true);
+    action->setChecked(index == crop_preset_combo_->currentIndex());
+    crop_context_ratio_group_->addAction(action);
+    QPointer<QComboBox> combo(crop_preset_combo_);
+    connect(action, &QAction::triggered, this, [combo, index] {
+      if (combo != nullptr) {
+        combo->setCurrentIndex(index);
+      }
+    });
+    crop_context_ratio_actions_.push_back(action);
+    actions.push_back(action);
+  }
+  return actions;
+}
+
+void MainWindow::transform_active_layer_mode(TransformDistortMode mode) {
+  if (canvas_ == nullptr) {
+    show_status_error(tr("Select a pixel layer to transform"));
+    return;
+  }
+  if (canvas_->findChild<QTextEdit*>(QStringLiteral("inlineTextEditor")) != nullptr) {
+    finish_active_text_editor();
+  }
+  select_only_layer_if_none_active();
+  if (!canvas_->free_transform_active()) {
+    if (const auto active = document().active_layer_id(); active.has_value() && layer_id_locks_position(*active)) {
+      show_status_error(tr("Layer position is locked."));
+      return;
+    }
+  }
+  if (!canvas_->begin_free_transform_mode(mode)) {
+    show_status_error(tr("Select a pixel layer to transform"));
+  }
+  refresh_options_bar();
+}
+
+void MainWindow::warp_transform_active_layer() {
+  if (canvas_ == nullptr) {
+    show_status_error(tr("Select a pixel layer to warp"));
+    return;
+  }
+  if (canvas_->findChild<QTextEdit*>(QStringLiteral("inlineTextEditor")) != nullptr) {
+    finish_active_text_editor();
+  }
+  select_only_layer_if_none_active();
+  if (const auto active = document().active_layer_id();
+      active.has_value() && layer_id_locks_position(*active)) {
+    show_status_error(tr("Layer position is locked."));
+    return;
+  }
+  canvas_->begin_warp_transform();  // refusal reasons land in the status bar
+  refresh_options_bar();
+}
+
+namespace {
+
+// Whether a new layer inserted above `anchor` (insert_layer_after_anchor) has a layer
+// below it to clip to: the New Layer dialog's "Clip to the layer below" option.
+bool new_layer_has_clip_base(const Document& document, std::optional<LayerId> anchor) {
+  if (!anchor.has_value()) {
+    return false;
+  }
+  Document probe = document;  // copy-on-write pixels: only the tree is copied
+  const auto probe_id = probe.allocate_layer_id();
+  Layer marker(probe_id, std::string(), LayerKind::Pixel);
+  insert_layer_after_anchor(probe, std::move(marker), anchor);
+  const auto location = find_layer_location(std::as_const(probe).layers(), probe_id);
+  return location.has_value() && effective_clip_base(*location->siblings, location->index) != nullptr;
+}
+
+// The New Layer dialog's neutral fill (#410) at the document's depth: 50% gray is 128 in
+// 8 bits, the exact midpoint in 16 bits and 0.5 linear in 32 bits, where most modes blend
+// linear light (docs/high-bit-depth.md), so it stays the no-op its mode needs.
+PixelBuffer neutral_fill_pixels(std::int32_t width, std::int32_t height, BitDepth depth, NeutralFillColor color) {
+  const auto format = with_bit_depth(PixelFormat::rgba8(), depth);
+  if (depth == BitDepth::UInt8) {
+    const int value = color == NeutralFillColor::White ? 255 : color == NeutralFillColor::Black ? 0 : 128;
+    return make_solid_pixels(width, height, QColor(value, value, value, 255), format);
+  }
+  const float value = color == NeutralFillColor::White   ? kDeepScale
+                      : color == NeutralFillColor::Black ? 0.0F
+                                                         : kDeepScale / 2.0F;
+  PixelBuffer pixels(width, height, format);
+  std::vector<float> row(static_cast<std::size_t>(std::max(0, width)) * 4U, value);
+  for (std::size_t i = 3; i < row.size(); i += 4U) {
+    row[i] = kDeepScale;
+  }
+  for (std::int32_t y = 0; y < height && width > 0; ++y) {
+    store_rgba_row(pixels, y, 0, width, deep_domain_for(depth), row);
+  }
+  return pixels;
+}
+
+}  // namespace
+
+void MainWindow::add_layer(const NewLayerSettings* settings, bool below) {
+  auto& doc = document();
+  const auto name = settings != nullptr ? settings->name : default_new_layer_name(doc);
+  auto anchor_id = doc.active_layer_id();
+  const auto selected_ids = selected_layer_ids();
+  if (!selected_ids.empty() && !(below && anchor_id.has_value())) {
+    // Above the top selected layer; below goes under the active one, else the lowest selected.
+    anchor_id = below ? selected_ids.back() : selected_ids.front();
+  }
+  // Nothing goes under the Background: a new layer there goes above it, as usual.
+  if (below && (!anchor_id.has_value() || layer_is_document_background(*anchor_id))) {
+    below = false;
+  }
+
+  push_undo_snapshot(tr("New layer"));
+  const auto depth = std::as_const(doc).color_state().bit_depth;
+  const auto format = with_bit_depth(PixelFormat::rgba8(), depth);
+  auto layer_pixels =
+      settings != nullptr && settings->neutral_fill.has_value()
+          ? neutral_fill_pixels(doc.width(), doc.height(), depth, *settings->neutral_fill)
+      : settings != nullptr && settings->fill_color.has_value()
+          ? make_solid_pixels(doc.width(), doc.height(), settings->fill_color->toRgb(), format)
+          : make_solid_pixels(doc.width(), doc.height(), QColor(0, 0, 0, 0), format);
+  Layer layer(doc.allocate_layer_id(), name.toStdString(), std::move(layer_pixels));
+  const auto layer_id = layer.id();
+  layer.set_opacity(settings != nullptr ? settings->opacity : 1.0F);
+  layer.set_blend_mode(settings != nullptr ? settings->blend_mode : BlendMode::Normal);
+  if (settings != nullptr) {
+    layer.set_color_label(settings->color_label);
+  }
+  // Under a clipped layer the new one joins its clipping group, so the group stays whole.
+  const auto* anchor = below ? std::as_const(doc).find_layer(*anchor_id) : nullptr;
+  const bool join_clip = anchor != nullptr && anchor->clipped();
+  if (below) {
+    insert_layer_below_anchor(doc, std::move(layer), anchor_id);
+  } else {
+    insert_layer_after_anchor(doc, std::move(layer), anchor_id);
+  }
+  if (join_clip) {
+    if (const auto location = find_layer_location(doc.layers(), layer_id);
+        location.has_value() && effective_clip_base(*location->siblings, location->index) != nullptr) {
+      (*location->siblings)[location->index].set_clipped(true);
+    }
+  }
+  if (settings != nullptr && settings->clip_to_previous) {
+    if (const auto location = find_layer_location(doc.layers(), layer_id);
+        location.has_value() && effective_clip_base(*location->siblings, location->index) != nullptr) {
+      (*location->siblings)[location->index].set_clipped(true);
+    }
+  }
+  doc.set_active_layer(layer_id);
+  refresh_layer_list();
+  refresh_layer_controls();
+  canvas_->document_changed();
+}
+
+// Layer > New > New Layer... (GitHub issue 275): Photoshop's fields in Patchy's own dialog.
+void MainWindow::add_layer_with_dialog() {
+  if (!has_active_document()) {
+    return;
+  }
+  if (canvas_ != nullptr) {
+    canvas_->finish_free_transform();
+  }
+  finish_active_text_editor();
+  const auto session_id = session().session_id;
+  const auto& doc = std::as_const(document());
+  auto anchor_id = doc.active_layer_id();
+  if (const auto selected_ids = selected_layer_ids(); !selected_ids.empty()) {
+    anchor_id = selected_ids.front();
+  }
+  std::vector<NewLayerColorChoice> colors;
+  for (const auto label : kLayerColorMenuOrder) {
+    const auto* action = layer_color_actions_[label];
+    colors.push_back({action != nullptr ? action->text().remove(QLatin1Char('&')) : QString(),
+                      action != nullptr ? action->icon() : QIcon(), label});
+  }
+  const auto settings = request_new_layer_settings(this, default_new_layer_name(doc),
+                                                   new_layer_has_clip_base(doc, anchor_id),
+                                                   doc.color_state().bit_depth, colors,
+                                                   canvas_ != nullptr ? canvas_->primary_color() : QColor(),
+                                                   canvas_ != nullptr ? canvas_->secondary_color() : QColor());
+  if (!settings.has_value() || active_session() == nullptr || active_session()->session_id != session_id) {
+    return;
+  }
+  add_layer(&*settings);
+}
+
+void MainWindow::create_layer_folder() {
+  create_layer_folder_from_layers(selected_layer_ids());
+}
+
+void MainWindow::create_layer_folder_from_layers(std::vector<LayerId> ids) {
+  auto& doc = document();
+  std::set<std::string> existing_names;
+  collect_layer_names(doc.layers(), existing_names);
+
+  int suffix = 1;
+  std::string name;
+  do {
+    name = tr("Folder %1").arg(suffix++).toStdString();
+  } while (existing_names.contains(name));
+
+  auto grouped_ids = root_drop_layer_ids(doc.layers(), ids);
+  // Artboards never nest (docs/artboards.md).
+  if (std::any_of(grouped_ids.begin(), grouped_ids.end(), [&doc](LayerId id) {
+        const auto* layer = std::as_const(doc).find_layer(id);
+        return layer != nullptr && layer_is_artboard(*layer);
+      })) {
+    show_status_error(tr("An artboard cannot go inside a folder"));
+    return;
+  }
+  if (std::any_of(grouped_ids.begin(), grouped_ids.end(),
+                  [this](LayerId id) { return layer_is_document_background(id); })) {
+    show_status_error(tr("The Background layer cannot go inside a folder"));
+    return;
+  }
+  const auto destination = common_sibling_grouping_destination(doc.layers(), grouped_ids);
+
+  push_undo_snapshot(tr("New folder"));
+  Layer folder(doc.allocate_layer_id(), name, LayerKind::Group);
+  const auto folder_id = folder.id();
+  folder.set_blend_mode(BlendMode::PassThrough);
+  if (!grouped_ids.empty()) {
+    std::vector<Layer> grouped_top_to_bottom;
+    grouped_top_to_bottom.reserve(grouped_ids.size());
+    for (const auto id : grouped_ids) {
+      if (auto grouped = take_layer_from_tree(doc.layers(), id); grouped.has_value()) {
+        grouped_top_to_bottom.push_back(std::move(*grouped));
+      }
+    }
+    for (auto it = grouped_top_to_bottom.rbegin(); it != grouped_top_to_bottom.rend(); ++it) {
+      folder.add_child(std::move(*it));
+    }
+  }
+
+  auto* siblings = destination.has_value() && destination->siblings != nullptr ? destination->siblings : &doc.layers();
+  const auto insert_index =
+      destination.has_value() ? std::min(destination->insert_index, siblings->size()) : siblings->size();
+  siblings->insert(siblings->begin() + static_cast<std::ptrdiff_t>(insert_index), std::move(folder));
+  doc.set_active_layer(folder_id);
+  refresh_layer_list();
+  refresh_layer_controls();
+  refresh_document_info();
+  canvas_->document_changed();
+  statusBar()->showMessage(tr("Created folder"));
+}
+
+void MainWindow::layer_via_copy() {
+  if (canvas_ != nullptr) {
+    canvas_->finish_free_transform();
+  }
+  select_only_layer_if_none_active();
+  const auto ids = selected_or_active_layer_ids();
+  if (ids.empty()) {
+    show_select_layer_first(tr("Layer via Copy"));
+    return;
+  }
+  // With no selection Photoshop's Layer Via Copy is Duplicate Layer: text, shape, Smart
+  // Object, adjustment and group layers keep their kind, masks and effects (#401).
+  if (!canvas_->selected_document_rect().has_value()) {
+    duplicate_layers(ids);
+    return;
+  }
+  const auto payload = collect_layer_copy_pixels(document(), ids, *canvas_);
+  if (!payload.has_value()) {
+    statusBar()->showMessage(tr("Nothing visible to copy to a new layer"));
+    return;
+  }
+
+  auto& doc = document();
+  push_undo_snapshot(tr("Layer via copy"));
+  Layer copied(doc.allocate_layer_id(), tr("Layer Via Copy").toStdString(), payload->pixels);
+  copied.set_bounds(Rect{payload->origin.x(), payload->origin.y(), copied.pixels().width(), copied.pixels().height()});
+  // Directly above the topmost source, so a layer on an artboard or in a folder stays there.
+  const auto copied_id = copied.id();
+  insert_layer_after_anchor(doc, std::move(copied), payload->source_layer_ids.back());
+  doc.set_active_layer(copied_id);
+  refresh_layer_list();
+  refresh_layer_controls();
+  canvas_->document_changed(to_qrect(payload->document_rect));
+  statusBar()->showMessage(tr("Copied selection to a new layer"));
+}
+
+void MainWindow::layer_via_cut() {
+  if (canvas_ != nullptr) {
+    canvas_->finish_free_transform();
+  }
+  select_only_layer_if_none_active();
+  const auto ids = selected_or_active_layer_ids();
+  if (ids.empty()) {
+    show_select_layer_first(tr("Layer via Cut"));
+    return;
+  }
+  auto payload = collect_layer_copy_pixels(document(), ids, *canvas_);
+  if (!payload.has_value()) {
+    statusBar()->showMessage(tr("Nothing visible to cut to a new layer"));
+    return;
+  }
+  if (std::any_of(payload->source_layer_ids.begin(), payload->source_layer_ids.end(),
+                  [this](LayerId id) { return layer_id_locks_image_pixels(id); })) {
+    show_status_error(tr("Layer pixels are locked."));
+    return;
+  }
+  if (std::any_of(payload->source_layer_ids.begin(), payload->source_layer_ids.end(), [this](LayerId id) {
+        const auto* layer = std::as_const(document()).find_layer(id);
+        return layer != nullptr && layer_pixels_are_procedural(*layer);
+      })) {
+    show_status_error(
+        tr("Rasterize Text, Smart Object, and Shape layers before editing their pixels"));
+    return;
+  }
+
+  auto& doc = document();
+  push_undo_snapshot(tr("Layer via cut"));
+  auto options = menu_command_edit_options(*canvas_);
+  Rect affected = payload->document_rect;
+  const auto selected_rect = canvas_->selected_document_rect();
+  for (const auto id : payload->source_layer_ids) {
+    auto* layer = doc.find_layer(id);
+    if (layer == nullptr || layer->kind() != LayerKind::Pixel || !layer->visible()) {
+      continue;
+    }
+    options.lock_transparent_pixels = layer_locks_transparent_pixels(*layer);
+    const auto clear_area = selected_rect.has_value() ? to_core_rect(*selected_rect) : layer->bounds();
+    affected = unite_rect(affected, patchy::clear_rect(doc, id, clear_area, options));
+  }
+
+  Layer cut_layer(doc.allocate_layer_id(), tr("Layer Via Cut").toStdString(), std::move(payload->pixels));
+  cut_layer.set_bounds(Rect{payload->origin.x(), payload->origin.y(), cut_layer.pixels().width(), cut_layer.pixels().height()});
+  const auto cut_id = cut_layer.id();
+  insert_layer_after_anchor(doc, std::move(cut_layer), payload->source_layer_ids.back());
+  doc.set_active_layer(cut_id);
+  refresh_layer_list();
+  refresh_layer_controls();
+  canvas_->document_changed(to_qrect(affected));
+  statusBar()->showMessage(tr("Cut selection to a new layer"));
+}
+
+namespace {
+
+// The layer kinds Add Layer Mask accepts.
+bool layer_kind_takes_layer_mask(const Layer& layer) {
+  return layer.kind() == LayerKind::Pixel || layer.kind() == LayerKind::Adjustment ||
+         layer.kind() == LayerKind::Group;
+}
+
+// Multiplies a pixel layer's alpha by its mask and drops the mask (Apply Layer Mask).
+void apply_layer_mask_to_pixels(Layer& target) {
+  auto* layer = &target;
+  auto& pixels = layer->pixels();
+  const auto bounds = layer->bounds();
+  const auto channels = pixels.format().channels;
+  if (pixels.format().bit_depth != BitDepth::UInt8) {
+    // 16/32-bit (docs/high-bit-depth.md): alpha times the mask's coverage on float rows.
+    const auto depth = pixels.format().bit_depth;
+    const auto domain = depth == BitDepth::Float32 ? DeepDomain::Linear : DeepDomain::Encoded;
+    PixelBuffer rgba(pixels.width(), pixels.height(), with_bit_depth(PixelFormat::rgba8(), depth));
+    std::vector<float> row(static_cast<std::size_t>(pixels.width()) * 4U);
+    for (std::int32_t y = 0; y < pixels.height(); ++y) {
+      load_rgba_row(pixels, y, 0, pixels.width(), domain, row);
+      for (std::int32_t x = 0; x < pixels.width(); ++x) {
+        row[static_cast<std::size_t>(x) * 4U + 3U] *= layer_mask_coverage_at(*layer, bounds.x + x, bounds.y + y);
+      }
+      store_rgba_row(rgba, y, 0, pixels.width(), domain, row);
+    }
+    pixels = std::move(rgba);
+  } else if (channels >= 4) {
+    for (std::int32_t y = 0; y < pixels.height(); ++y) {
+      for (std::int32_t x = 0; x < pixels.width(); ++x) {
+        auto* px = pixels.pixel(x, y);
+        const auto mask_alpha = layer_mask_value_at(*layer, bounds.x + x, bounds.y + y);
+        px[3] = static_cast<std::uint8_t>((static_cast<int>(px[3]) * static_cast<int>(mask_alpha)) / 255);
+      }
+    }
+  } else {
+    PixelBuffer rgba(pixels.width(), pixels.height(), PixelFormat::rgba8());
+    for (std::int32_t y = 0; y < pixels.height(); ++y) {
+      for (std::int32_t x = 0; x < pixels.width(); ++x) {
+        const auto* src = pixels.pixel(x, y);
+        auto* dst = rgba.pixel(x, y);
+        dst[0] = src[0];
+        dst[1] = src[1];
+        dst[2] = src[2];
+        dst[3] = layer_mask_value_at(*layer, bounds.x + x, bounds.y + y);
+      }
+    }
+    pixels = std::move(rgba);
+  }
+  layer->clear_mask();
+  layer->metadata().erase(kLayerMetadataMaskLinked);
+}
+
+}  // namespace
+
+std::vector<LayerId> MainWindow::mask_command_layer_ids(MaskCommandScope scope) const {
+  if (!has_active_document()) {
+    return {};
+  }
+  const auto active = std::as_const(document()).active_layer_id();
+  if (scope == MaskCommandScope::SelectedLayers) {
+    auto ids = selected_or_active_layer_ids();
+    if (!active.has_value() || std::find(ids.begin(), ids.end(), *active) != ids.end()) {
+      return ids;
+    }
+  }
+  return active.has_value() ? std::vector<LayerId>{*active} : std::vector<LayerId>{};
+}
+
+std::vector<LayerId> MainWindow::mask_command_targets(MaskCommandScope scope,
+                                                      const std::function<bool(const Layer&)>& applies) const {
+  std::vector<LayerId> targets;
+  if (!has_active_document()) {
+    return targets;
+  }
+  const auto& doc = std::as_const(document());
+  const auto active = doc.active_layer_id();
+  for (const auto id : mask_command_layer_ids(scope)) {
+    const auto* layer = doc.find_layer(id);
+    if (layer == nullptr || !applies(*layer)) {
+      continue;
+    }
+    if (active == id) {
+      targets.insert(targets.begin(), id);
+    } else {
+      targets.push_back(id);
+    }
+  }
+  return targets;
+}
+
+MainWindow::LayerMaskCommandState MainWindow::layer_mask_command_state() const {
+  LayerMaskCommandState state;
+  if (!has_active_document()) {
+    return state;
+  }
+  const auto& doc = std::as_const(document());
+  const bool has_selection = canvas_ != nullptr && canvas_->has_selection();
+  for (const auto id : mask_command_targets(MaskCommandScope::SelectedLayers, [](const Layer&) { return true; })) {
+    const auto* layer = doc.find_layer(id);
+    if (layer == nullptr || layer_id_locks_image_pixels(id)) {
+      continue;
+    }
+    const bool has_mask = layer->mask().has_value();
+    state.any_add = state.any_add || (layer_kind_takes_layer_mask(*layer) && (has_selection || !has_mask));
+    if (!has_mask) {
+      continue;
+    }
+    state.any_mask = true;
+    state.any_apply = state.any_apply || layer->kind() == LayerKind::Pixel;
+    if (state.toggle_layer == nullptr) {
+      state.toggle_layer = layer;
+    }
+  }
+  return state;
+}
+
+void MainWindow::refresh_layer_list_keeping_selection() {
+  const auto selected = selected_layer_ids();
+  const auto active = has_active_document() ? std::as_const(document()).active_layer_id() : std::nullopt;
+  refresh_layer_list();
+  if (selected.size() > 1U && active.has_value()) {
+    select_layers_in_layer_list(selected, *active);
+  }
+}
+
+void MainWindow::report_no_layer_mask_targets(MaskCommandScope scope) {
+  const auto& doc = std::as_const(document());
+  const auto ids = mask_command_layer_ids(scope);
+  const bool any_mask = std::any_of(ids.begin(), ids.end(), [&doc](LayerId id) {
+    const auto* layer = doc.find_layer(id);
+    return layer != nullptr && layer->mask().has_value();
+  });
+  show_status_error(any_mask ? tr("Layer pixels are locked.") : tr("Active layer has no mask"));
+}
+
+void MainWindow::add_layer_mask(bool hide) {
+  if (canvas_ == nullptr) {
+    return;
+  }
+  auto& doc = document();
+  select_only_layer_if_none_active();
+  const auto selection = canvas_->selected_document_region();
+  const auto selection_rect = selection.boundingRect().intersected(QRect(0, 0, doc.width(), doc.height()));
+  const auto from_selection = !selection.isEmpty() && !selection_rect.isEmpty();
+  // Every selected layer that can take a mask (local-029); with a selection an existing mask
+  // is replaced, as on one layer.
+  const auto targets = mask_command_targets(MaskCommandScope::SelectedLayers, [&](const Layer& candidate) {
+    return layer_kind_takes_layer_mask(candidate) && !layer_id_locks_image_pixels(candidate.id()) &&
+           (from_selection || !candidate.mask().has_value());
+  });
+  if (targets.empty()) {
+    const auto ids = mask_command_layer_ids(MaskCommandScope::SelectedLayers);
+    bool any_kind = false;
+    bool any_unlocked = false;
+    for (const auto id : ids) {
+      const auto* candidate = std::as_const(doc).find_layer(id);
+      if (candidate != nullptr && layer_kind_takes_layer_mask(*candidate)) {
+        any_kind = true;
+        any_unlocked = any_unlocked || !layer_id_locks_image_pixels(id);
+      }
+    }
+    if (!any_kind) {
+      show_status_error(tr("Select a pixel, adjustment, or group layer before adding a mask"));
+    } else if (!any_unlocked) {
+      show_status_error(tr("Layer pixels are locked."));
+    } else {
+      show_status_error(tr("Layer already has a mask"));
+    }
+    return;
+  }
+
+  // One mask, built once and copied to each layer.
+  LayerMask mask;
+  if (from_selection) {
+    auto coverage = selection_mask_pixels(*canvas_, selection_rect);
+    if (hide) {
+      for (std::int32_t y = 0; y < coverage.height(); ++y) {
+        for (auto& value : coverage.row(y)) {
+          value = static_cast<std::uint8_t>(255 - value);
+        }
+      }
+    }
+    mask = LayerMask{to_core_rect(selection_rect), coverage_at_document_depth(doc, std::move(coverage)),
+                     static_cast<std::uint8_t>(hide ? 255 : 0), false};
+  } else {
+    const auto fill = static_cast<std::uint8_t>(hide ? 0 : 255);
+    PixelBuffer mask_pixels(doc.width(), doc.height(), PixelFormat::gray8());
+    mask_pixels.clear(fill);
+    mask = LayerMask{Rect{0, 0, doc.width(), doc.height()}, coverage_at_document_depth(doc, std::move(mask_pixels)),
+                     fill, false};
+  }
+
+  push_undo_snapshot(tr("Add layer mask"));
+  Rect dirty;
+  for (const auto id : targets) {
+    auto* layer = doc.find_layer(id);
+    if (layer == nullptr) {
+      continue;
+    }
+    dirty = unite_rect(dirty, layer_render_bounds(*layer));
+    layer->set_mask(mask);
+    dirty = unite_rect(dirty, layer_render_bounds(*layer));
+  }
+  canvas_->invalidate_mask_display();
+  canvas_->document_changed(to_qrect(dirty));
+  refresh_layer_list_keeping_selection();
+  set_layer_edit_target_ui(CanvasWidget::LayerEditTarget::Mask, false);
+  statusBar()->showMessage(from_selection ? (hide ? tr("Added layer mask hiding the selection")
+                                                  : tr("Added layer mask from selection"))
+                                          : (hide ? tr("Added layer mask hiding the layer. Paint with white to reveal.")
+                                                  : tr("Added layer mask. Paint with black to hide and white to reveal.")));
+}
+
+bool MainWindow::can_add_layer_mask() const {
+  if (canvas_ == nullptr || !has_active_document() || preview_dialog_edit_locked()) {
+    return false;
+  }
+  return !mask_command_targets(MaskCommandScope::SelectedLayers, [this](const Layer& candidate) {
+            return layer_kind_takes_layer_mask(candidate) && !candidate.mask().has_value() &&
+                   !layer_id_locks_image_pixels(candidate.id());
+          }).empty();
+}
+
+void MainWindow::refresh_add_layer_mask_button_state() {
+  if (add_layer_mask_button_ != nullptr) {
+    add_layer_mask_button_->setEnabled(can_add_layer_mask());
+  }
+}
+
+bool MainWindow::can_edit_layer_styles() const {
+  if (!has_active_document() || preview_dialog_edit_locked()) {
+    return false;
+  }
+  const auto& doc = std::as_const(document());
+  const auto ids = selected_or_active_layer_ids();
+  return std::any_of(ids.begin(), ids.end(), [&](LayerId id) {
+    return doc.find_layer(id) != nullptr && !layer_is_effectively_locked(doc.layers(), id) &&
+           !layer_is_document_background(id);
+  });
+}
+
+const Layer* MainWindow::document_background_layer() const {
+  if (!has_active_document()) {
+    return nullptr;
+  }
+  const auto& doc = std::as_const(document());
+  return background_layer(doc.layers(), doc.width(), doc.height());
+}
+
+bool MainWindow::layer_is_document_background(LayerId id) const {
+  const auto* background = document_background_layer();
+  return background != nullptr && background->id() == id;
+}
+
+bool MainWindow::refuse_background_stack_change(const std::vector<Layer>& after) {
+  const auto& doc = std::as_const(document());
+  if (layer_stack_keeps_background(doc.layers(), after, doc.width(), doc.height())) {
+    return false;
+  }
+  show_status_error(tr("The Background layer stays at the bottom of the stack"));
+  return true;
+}
+
+void MainWindow::layer_from_background() {
+  if (preview_dialog_edit_locked()) {
+    show_preview_dialog_edit_lock_message();
+    return;
+  }
+  const auto* background = document_background_layer();
+  if (background == nullptr) {
+    return;
+  }
+  const auto id = background->id();
+  push_undo_snapshot(tr("Layer from Background"));
+  auto* layer = document().find_layer(id);
+  release_background(*layer, layer_from_background_name());
+  refresh_layer_list();
+  refresh_layer_controls();
+  refresh_document_info();
+  canvas_->document_changed();
+}
+
+void MainWindow::refresh_layer_styles_button_state() {
+  if (layer_styles_button_ != nullptr) {
+    layer_styles_button_->setEnabled(can_edit_layer_styles());
+  }
+}
+
+void MainWindow::delete_active_layer_mask(MaskCommandScope scope) {
+  auto& doc = document();
+  const auto active = doc.active_layer_id();
+  if (!active.has_value()) {
+    show_select_layer_first(tr("Delete Layer Mask"));
+    return;
+  }
+  const auto targets = mask_command_targets(scope, [this](const Layer& candidate) {
+    return candidate.mask().has_value() && !layer_id_locks_image_pixels(candidate.id());
+  });
+  if (targets.empty()) {
+    report_no_layer_mask_targets(scope);
+    return;
+  }
+
+  push_undo_snapshot(tr("Delete layer mask"));
+  Rect affected;
+  for (const auto id : targets) {
+    auto* layer = doc.find_layer(id);
+    if (layer == nullptr) {
+      continue;
+    }
+    affected = unite_rect(affected, layer_render_bounds(*layer));
+    layer->clear_mask();
+    layer->metadata().erase(kLayerMetadataMaskLinked);
+  }
+  canvas_->invalidate_mask_display();
+  canvas_->document_changed(to_qrect(affected));
+  refresh_layer_list_keeping_selection();
+  if (targets.front() == *active) {
+    set_layer_edit_target_ui(CanvasWidget::LayerEditTarget::Content, false);
+  } else {
+    refresh_layer_controls();
+  }
+  statusBar()->showMessage(tr("Deleted layer mask"));
+}
+
+void MainWindow::set_active_layer_mask_linked(bool linked, MaskCommandScope scope) {
+  auto& doc = document();
+  if (!doc.active_layer_id().has_value()) {
+    show_select_layer_first(linked ? tr("Link Layer Mask") : tr("Unlink Layer Mask"));
+    return;
+  }
+  const auto candidates = mask_command_targets(scope, [](const Layer& candidate) {
+    return candidate.mask().has_value();
+  });
+  if (candidates.empty()) {
+    return;
+  }
+  const auto targets = mask_command_targets(scope, [this](const Layer& candidate) {
+    return candidate.mask().has_value() && !layer_id_locks_image_pixels(candidate.id());
+  });
+  if (targets.empty()) {
+    show_status_error(tr("Layer pixels are locked."));
+    refresh_layer_controls();
+    return;
+  }
+  // Every layer takes the new state (the toggled state of the active one), not a flip each.
+  std::vector<LayerId> changed;
+  for (const auto id : targets) {
+    const auto* layer = std::as_const(doc).find_layer(id);
+    if (layer != nullptr && layer_mask_linked(*layer) != linked) {
+      changed.push_back(id);
+    }
+  }
+  if (changed.empty()) {
+    refresh_layer_controls();
+    return;
+  }
+
+  push_undo_snapshot(linked ? tr("Link layer mask") : tr("Unlink layer mask"));
+  for (const auto id : changed) {
+    if (auto* layer = doc.find_layer(id); layer != nullptr) {
+      set_layer_mask_linked(*layer, linked);
+    }
+  }
+  refresh_layer_list_keeping_selection();
+  refresh_layer_controls();
+  statusBar()->showMessage(linked ? tr("Layer and mask linked") : tr("Layer and mask unlinked"));
+}
+
+bool MainWindow::set_smart_filter_mask_edit_target_ui(
+    LayerId layer_id, CanvasWidget::MaskDisplayMode mode, bool announce) {
+  if (canvas_ == nullptr || !has_active_document()) {
+    return false;
+  }
+  const auto* layer = std::as_const(document()).find_layer(layer_id);
+  const auto* stack = layer != nullptr ? layer->smart_filter_stack() : nullptr;
+  if (layer == nullptr || stack == nullptr ||
+      stack->support != SmartFilterStackSupport::Supported ||
+      stack->mask.pixels.empty() ||
+      !smart_filter_mask_document_editing_supported(
+          document().width(), document().height()) ||
+      (!smart_object_lock_reason(*layer).empty() &&
+       smart_object_lock_reason(*layer) != "external")) {
+    show_status_error(
+        tr("This Smart Filter mask can only be preserved, not edited"));
+    return false;
+  }
+  auto pixels = materialize_smart_filter_mask(
+      stack->mask, document().width(), document().height());
+  if (!pixels.has_value()) {
+    show_status_error(tr("Could not prepare this Smart Filter mask"));
+    return false;
+  }
+  document().set_active_layer(layer_id);
+  if (!canvas_->set_smart_filter_mask_edit_target(
+          layer_id, std::move(*pixels), mode)) {
+    show_status_error(tr("Could not edit this Smart Filter mask"));
+    return false;
+  }
+  restyle_layer_rows(layer_list_);
+  update_layer_target_styles(layer_list_, document().active_layer_id(),
+                             CanvasWidget::LayerEditTarget::SmartFilterMask);
+  refresh_layer_controls();
+  refresh_channel_panel();
+  update_document_action_state();
+  if (announce) {
+    statusBar()->showMessage(tr("Editing Smart Filter mask"));
+  }
+  return true;
+}
+
+void MainWindow::set_layer_edit_target_ui(CanvasWidget::LayerEditTarget target, bool announce) {
+  if (canvas_ == nullptr) {
+    return;
+  }
+  const auto previous_target = canvas_->layer_edit_target();
+  if (target == CanvasWidget::LayerEditTarget::Mask) {
+    const auto active = document().active_layer_id();
+    const auto* layer = active.has_value() ? document().find_layer(*active) : nullptr;
+    if (layer == nullptr || !layer->mask().has_value()) {
+      target = CanvasWidget::LayerEditTarget::Content;
+    }
+  } else if (target == CanvasWidget::LayerEditTarget::SmartFilterMask &&
+             !canvas_->editing_smart_filter_mask()) {
+    target = CanvasWidget::LayerEditTarget::Content;
+  } else if (target == CanvasWidget::LayerEditTarget::VectorMask) {
+    const auto active = document().active_layer_id();
+    const auto* layer = active.has_value() ? document().find_layer(*active) : nullptr;
+    if (layer == nullptr || layer->vector_mask() == nullptr) {
+      target = CanvasWidget::LayerEditTarget::Content;
+    }
+  }
+  const bool leaving_document_channel = previous_target == CanvasWidget::LayerEditTarget::DocumentChannel ||
+                                        CanvasWidget::is_component_preview(previous_target);
+  if (leaving_document_channel ||
+      (target == CanvasWidget::LayerEditTarget::Content &&
+       canvas_->mask_display_mode() == CanvasWidget::MaskDisplayMode::Grayscale)) {
+    canvas_->set_mask_display_mode(CanvasWidget::MaskDisplayMode::None);
+  }
+  canvas_->set_layer_edit_target(target);
+  canvas_->update();
+  update_layer_target_styles(layer_list_, document().active_layer_id(), target);
+  refresh_layer_controls();
+  refresh_channel_panel();
+  update_document_action_state();
+  if (announce) {
+    statusBar()->showMessage(
+        target == CanvasWidget::LayerEditTarget::Mask
+            ? tr("Editing layer mask")
+            : target == CanvasWidget::LayerEditTarget::SmartFilterMask
+                  ? tr("Editing Smart Filter mask")
+                  : target == CanvasWidget::LayerEditTarget::VectorMask
+                        ? tr("Editing vector mask")
+                        : tr("Editing layer pixels"));
+  }
+}
+
+void MainWindow::set_mask_overlay_shown(bool shown) {
+  if (canvas_ == nullptr) {
+    return;
+  }
+  const auto smart_target = canvas_->editing_smart_filter_mask();
+  if (shown && canvas_->layer_edit_target() != CanvasWidget::LayerEditTarget::Mask &&
+      !smart_target) {
+    const auto active = std::as_const(document()).active_layer_id();
+    const auto* layer = active.has_value()
+                            ? std::as_const(document()).find_layer(*active)
+                            : nullptr;
+    if (layer != nullptr && layer->mask().has_value()) {
+      set_layer_edit_target_ui(CanvasWidget::LayerEditTarget::Mask, false);
+    } else if (active.has_value()) {
+      static_cast<void>(set_smart_filter_mask_edit_target_ui(
+          *active, CanvasWidget::MaskDisplayMode::Overlay, false));
+    }
+  }
+  canvas_->set_mask_display_mode(shown ? CanvasWidget::MaskDisplayMode::Overlay
+                                       : CanvasWidget::MaskDisplayMode::None);
+  refresh_layer_controls();
+  statusBar()->showMessage(shown ? tr("Mask overlay shown. Red marks the areas the mask hides.")
+                                 : tr("Mask overlay hidden"));
+}
+
+// The menu twin of Alt-clicking the mask thumbnail: shows the mask itself in
+// grayscale and selects it for editing with the paint tools.
+void MainWindow::set_layer_mask_view_shown(bool shown) {
+  if (canvas_ == nullptr) {
+    return;
+  }
+  const auto active = document().active_layer_id();
+  const auto* layer = active.has_value() ? document().find_layer(*active) : nullptr;
+  const auto smart_target = canvas_->editing_smart_filter_mask();
+  const auto* smart_filters = layer != nullptr ? layer->smart_filter_stack() : nullptr;
+  const auto has_smart_mask = smart_filters != nullptr &&
+                              smart_filters->support ==
+                                  SmartFilterStackSupport::Supported &&
+                              !smart_filters->mask.pixels.empty();
+  if (layer == nullptr ||
+      (!std::as_const(*layer).mask().has_value() && !has_smart_mask)) {
+    refresh_layer_controls();
+    show_status_error(tr("Active layer has no mask"));
+    return;
+  }
+  if (shown) {
+    if (!smart_target && std::as_const(*layer).mask().has_value()) {
+      set_layer_edit_target_ui(CanvasWidget::LayerEditTarget::Mask, false);
+    } else if (!smart_target && active.has_value() &&
+               !set_smart_filter_mask_edit_target_ui(
+                   *active, CanvasWidget::MaskDisplayMode::Grayscale,
+                   false)) {
+      return;
+    }
+    canvas_->set_mask_display_mode(CanvasWidget::MaskDisplayMode::Grayscale);
+    statusBar()->showMessage(resolve_modifier_names(
+        smart_target || canvas_->editing_smart_filter_mask()
+            ? tr("Showing the Smart Filter mask. %ALT%-click the mask thumbnail to return.")
+            : tr("Showing the layer mask. %ALT%-click the mask thumbnail to return.")));
+  } else {
+    canvas_->set_mask_display_mode(CanvasWidget::MaskDisplayMode::None);
+    statusBar()->showMessage(canvas_->editing_smart_filter_mask()
+                                 ? tr("Editing Smart Filter mask")
+                                 : tr("Editing layer mask"));
+  }
+  refresh_layer_controls();
+}
+
+void MainWindow::set_active_layer_mask_disabled(bool disabled, MaskCommandScope scope) {
+  auto& doc = document();
+  const auto active = doc.active_layer_id();
+  if (canvas_ != nullptr && canvas_->editing_smart_filter_mask() &&
+      active.has_value() && canvas_->smart_filter_mask_owner_id() == active) {
+    set_smart_filter_mask_enabled(*active, !disabled);
+    return;
+  }
+  const auto targets = mask_command_targets(scope, [this](const Layer& candidate) {
+    return candidate.mask().has_value() && !layer_id_locks_image_pixels(candidate.id());
+  });
+  if (targets.empty()) {
+    report_no_layer_mask_targets(scope);
+    refresh_layer_controls();
+    return;
+  }
+  // Every layer takes the new state, not a flip each.
+  std::vector<LayerId> changed;
+  for (const auto id : targets) {
+    const auto* layer = std::as_const(doc).find_layer(id);
+    if (layer != nullptr && layer->mask()->disabled != disabled) {
+      changed.push_back(id);
+    }
+  }
+  if (changed.empty()) {
+    refresh_layer_controls();
+    return;
+  }
+
+  push_undo_snapshot(disabled ? tr("Disable layer mask") : tr("Enable layer mask"));
+  Rect affected;
+  for (const auto id : changed) {
+    if (auto* layer = doc.find_layer(id); layer != nullptr) {
+      layer->mask()->disabled = disabled;
+      affected = unite_rect(affected, layer->bounds());
+    }
+  }
+  canvas_->document_changed(to_qrect(affected));
+  // The mask overlay spans the whole canvas, so a partial repaint of the layer
+  // bounds is not enough when it appears or disappears.
+  canvas_->update();
+  refresh_layer_list_keeping_selection();
+  refresh_layer_controls();
+  statusBar()->showMessage(disabled ? tr("Layer mask disabled") : tr("Layer mask enabled"));
+}
+
+void MainWindow::invert_active_layer_mask(MaskCommandScope scope) {
+  auto& doc = document();
+  const auto active = doc.active_layer_id();
+  if (canvas_ != nullptr && canvas_->editing_smart_filter_mask() &&
+      active.has_value() && canvas_->smart_filter_mask_owner_id() == active) {
+    static_cast<void>(canvas_->invert_smart_filter_mask(
+        tr("Invert Smart Filter mask")));
+    return;
+  }
+  const auto targets = mask_command_targets(scope, [this](const Layer& candidate) {
+    return candidate.mask().has_value() && !layer_id_locks_image_pixels(candidate.id());
+  });
+  if (targets.empty()) {
+    report_no_layer_mask_targets(scope);
+    return;
+  }
+
+  push_undo_snapshot(tr("Invert layer mask"));
+  Rect dirty;
+  for (const auto id : targets) {
+    auto* layer = doc.find_layer(id);
+    if (layer == nullptr) {
+      continue;
+    }
+    auto& mask = *layer->mask();
+    mask.default_color = static_cast<std::uint8_t>(255 - mask.default_color);
+    if (!mask.pixels.empty() && mask.pixels.format().bit_depth == BitDepth::Float32) {
+      // 32-bit masks hold floats: invert the values, not their bytes.
+      std::vector<float> row(static_cast<std::size_t>(mask.pixels.width()));
+      for (std::int32_t y = 0; y < mask.pixels.height(); ++y) {
+        load_coverage_row(mask.pixels, y, 0, mask.pixels.width(), row);
+        for (auto& value : row) {
+          value = 255.0F - value;
+        }
+        store_coverage_row(mask.pixels, y, 0, mask.pixels.width(), row);
+      }
+    } else if (!mask.pixels.empty()) {
+      // 8 and 16 bits: complementing every byte complements the sample (65535 - v).
+      for (auto& value : mask.pixels.data()) {
+        value = static_cast<std::uint8_t>(255 - value);
+      }
+    }
+    dirty = unite_rect(dirty, unite_rect(layer_render_bounds(*layer), mask.bounds.empty() ? layer->bounds() : mask.bounds));
+  }
+  canvas_->invalidate_mask_display();
+  canvas_->document_changed(to_qrect(dirty));
+  refresh_layer_list_keeping_selection();
+  refresh_layer_controls();
+  statusBar()->showMessage(tr("Inverted layer mask"));
+}
+
+void MainWindow::apply_active_layer_mask(MaskCommandScope scope) {
+  auto& doc = document();
+  const auto active = doc.active_layer_id();
+  const auto can_apply = [this](const Layer& candidate) {
+    return candidate.mask().has_value() && !layer_id_locks_image_pixels(candidate.id()) &&
+           !layer_pixels_are_procedural(candidate) && candidate.kind() == LayerKind::Pixel &&
+           candidate.pixels().format().channels >= 3;
+  };
+  const auto targets = mask_command_targets(scope, can_apply);
+  if (targets.empty()) {
+    // Why not, in the order a single layer is checked.
+    const auto masked = mask_command_targets(scope, [](const Layer& candidate) { return candidate.mask().has_value(); });
+    const auto unlocked = mask_command_targets(scope, [this](const Layer& candidate) {
+      return candidate.mask().has_value() && !layer_id_locks_image_pixels(candidate.id());
+    });
+    const auto editable = mask_command_targets(scope, [this](const Layer& candidate) {
+      return candidate.mask().has_value() && !layer_id_locks_image_pixels(candidate.id()) &&
+             !layer_pixels_are_procedural(candidate);
+    });
+    if (masked.empty()) {
+      show_status_error(tr("Active layer has no mask"));
+    } else if (unlocked.empty()) {
+      show_status_error(tr("Layer pixels are locked."));
+    } else if (editable.empty()) {
+      show_status_error(
+          tr("Rasterize Text, Smart Object, and Shape layers before editing their pixels"));
+    } else {
+      show_status_error(tr("Apply mask supports editable 8-bit pixel layers"));
+    }
+    return;
+  }
+
+  push_undo_snapshot(tr("Apply layer mask"));
+  Rect affected;
+  for (const auto id : targets) {
+    auto* layer = doc.find_layer(id);
+    if (layer == nullptr) {
+      continue;
+    }
+    apply_layer_mask_to_pixels(*layer);
+    affected = unite_rect(affected, layer->bounds());
+  }
+  if (canvas_ != nullptr) {
+    if (active.has_value() && targets.front() == *active) {
+      canvas_->set_layer_edit_target(CanvasWidget::LayerEditTarget::Content);
+    }
+    canvas_->invalidate_mask_display();
+    canvas_->document_changed(to_qrect(affected));
+  }
+  refresh_layer_list_keeping_selection();
+  refresh_layer_controls();
+  statusBar()->showMessage(tr("Applied layer mask"));
+}
+
+void MainWindow::duplicate_active_layer() {
+  if (canvas_ != nullptr) {
+    canvas_->finish_free_transform();
+  }
+  if (!require_target_layer(tr("Duplicate Layer"))) {
+    return;
+  }
+  duplicate_layers(selected_or_active_layer_ids());
+}
+
+std::vector<LayerId> MainWindow::duplicate_layers(std::vector<LayerId> ids) {
+  if (canvas_ != nullptr) {
+    canvas_->finish_free_transform();
+  }
+  // A linked layer's partners are duplicated with it, and the copies link to each other
+  // (Photoshop 2026; GitHub issue 656).
+  ids = root_drop_layer_ids(std::as_const(document()).layers(),
+                            with_linked_layer_ids(std::as_const(document()).layers(), ids));
+  if (ids.empty()) {
+    return {};
+  }
+
+  auto& doc = document();
+  const auto caches_available = std::all_of(ids.begin(), ids.end(), [&](LayerId id) {
+    const auto* source = std::as_const(doc).find_layer(id);
+    return source == nullptr || smart_filter_records_available_for_clone(
+                                    *source, doc.metadata().smart_filter_effects);
+  });
+  if (!caches_available) {
+    show_status_error(
+        tr("Smart Filter cache data could not be duplicated safely"));
+    return {};
+  }
+
+  // Photoshop's Duplicate Layer: the copies land as one block directly above
+  // the topmost selected layer, in source order, inside that layer's parent
+  // (GitHub issue 38 was the old add-to-top). Walk the tree top to bottom so
+  // the block order follows the document, whatever order the caller passed.
+  const std::set<LayerId> selected(ids.begin(), ids.end());
+  std::vector<const Layer*> sources_top_to_bottom;
+  sources_top_to_bottom.reserve(ids.size());
+  const auto collect_sources = [&](const auto& self, const std::vector<Layer>& siblings) -> void {
+    for (auto it = siblings.rbegin(); it != siblings.rend(); ++it) {
+      if (selected.contains(it->id())) {
+        sources_top_to_bottom.push_back(&*it);
+        continue;  // root_drop_layer_ids already dropped selected descendants
+      }
+      self(self, it->children());
+    }
+  };
+  collect_sources(collect_sources, std::as_const(doc).layers());
+  if (sources_top_to_bottom.empty()) {
+    return {};
+  }
+
+  // The snapshot precedes cloning: a clone adopts Smart Filter records into the
+  // document's metadata, which undo must roll back on failure. Clone everything
+  // before inserting anything so a failure never leaves a half-duplicated stack.
+  push_undo_snapshot(tr("Duplicate layer"));
+  std::set<std::string> existing_names;
+  collect_layer_names(doc.layers(), existing_names);
+  std::vector<Layer> clones_bottom_to_top;
+  clones_bottom_to_top.reserve(sources_top_to_bottom.size());
+  for (auto it = sources_top_to_bottom.rbegin(); it != sources_top_to_bottom.rend(); ++it) {
+    auto duplicate = clone_layer_tree_with_document_ids(doc, **it);
+    if (!duplicate.has_value()) {
+      undo();
+      show_status_error(
+          tr("Smart Filter cache data could not be duplicated safely"));
+      return {};
+    }
+    clear_background_locks_if_copy_of_background(*duplicate, (*it)->id(), std::as_const(doc).layers(), doc.width(),
+                                                 doc.height());
+    duplicate->set_name(next_duplicate_name((*it)->name(), existing_names));
+    existing_names.insert(duplicate->name());
+    clones_bottom_to_top.push_back(std::move(*duplicate));
+  }
+
+  std::optional<LayerId> anchor = sources_top_to_bottom.front()->id();
+  std::vector<LayerId> copy_ids_top_to_bottom;
+  copy_ids_top_to_bottom.reserve(clones_bottom_to_top.size());
+  for (auto& clone : clones_bottom_to_top) {
+    const auto id = clone.id();
+    insert_layer_after_anchor(doc, std::move(clone), anchor);
+    anchor = id;
+    copy_ids_top_to_bottom.insert(copy_ids_top_to_bottom.begin(), id);
+  }
+  separate_copied_link_groups(doc.layers(), copy_ids_top_to_bottom);
+  doc.set_active_layer(copy_ids_top_to_bottom.front());
+  if (!insert_duplicated_layer_rows(copy_ids_top_to_bottom)) {
+    refresh_layer_list();
+  }
+  refresh_layer_controls();
+  // A copy changes the composite only where it renders; a full refresh would
+  // recomposite every layer per duplicate (GitHub issue 402). Folders, adjustments
+  // and Smart Filter stacks reach past their own bounds, so they take the full path.
+  QRegion copies_region;
+  const bool copies_bounded = std::all_of(
+      copy_ids_top_to_bottom.begin(), copy_ids_top_to_bottom.end(), [&](LayerId id) {
+        const auto* copy = std::as_const(doc).find_layer(id);
+        if (copy == nullptr || copy->smart_filter_stack() != nullptr ||
+            (copy->kind() != LayerKind::Pixel && copy->kind() != LayerKind::Text &&
+             copy->kind() != LayerKind::Vector)) {
+          return false;
+        }
+        copies_region += to_qrect(layer_render_bounds(*copy));
+        return true;
+      });
+  if (copies_bounded && !copies_region.isEmpty()) {
+    canvas_->document_changed_effect_bounds(copies_region);
+  } else {
+    canvas_->document_changed();
+  }
+  select_layers_in_layer_list(copy_ids_top_to_bottom, copy_ids_top_to_bottom.front());
+  // A duplicated artboard does not sit on its original: it goes beside the others.
+  if (std::any_of(copy_ids_top_to_bottom.begin(), copy_ids_top_to_bottom.end(), [&doc](LayerId id) {
+        const auto* copy = std::as_const(doc).find_layer(id);
+        return copy != nullptr && layer_is_artboard(*copy);
+      })) {
+    place_duplicated_artboards(copy_ids_top_to_bottom);
+  }
+  return copy_ids_top_to_bottom;
+}
+
+namespace {
+
+// Union of the copied roots' movable extents (the opaque raster / text rect,
+// else the render bounds), descending into folders so a folder lands where its
+// children are.
+void unite_placement_bounds(const Layer& layer, std::optional<Rect>& bounds) {
+  if (layer.kind() == LayerKind::Group) {
+    for (const auto& child : layer.children()) {
+      unite_placement_bounds(child, bounds);
+    }
+    return;
+  }
+  auto extent = move_layer_outline_bounds(layer);
+  if (!extent.has_value() || extent->empty()) {
+    const auto render = layer_render_bounds(layer);
+    if (render.empty()) {
+      return;
+    }
+    extent = render;
+  }
+  bounds = bounds.has_value() ? unite_rect(*bounds, *extent) : *extent;
+}
+
+// The copied bakes were clipped to the source canvas; re-rasterize against the
+// target's (paste_svg_from_clipboard's rule).
+void rebake_vector_rasters(Layer& layer, Rect canvas, const PatternStore* patterns) {
+  for (auto& child : layer.children()) {
+    rebake_vector_rasters(child, canvas, patterns);
+  }
+  update_vector_shape_raster(layer, canvas, patterns);
+  update_vector_mask_raster(layer, canvas);
+}
+
+}  // namespace
+
+std::vector<LayerId> MainWindow::copy_layers_between_sessions(DocumentSession& source, std::vector<LayerId> ids,
+                                                              DocumentSession& target,
+                                                              const CrossDocumentLayerPlacement& placement,
+                                                              const std::function<bool()>& before_mutation,
+                                                              QString* error) {
+  const auto fail = [error](const QString& message) {
+    if (error != nullptr) {
+      *error = message;
+    }
+    return std::vector<LayerId>{};
+  };
+  if (&source == &target) {
+    return fail(tr("Choose a different document to copy the layers into"));
+  }
+  return copy_layers_between_documents(std::as_const(source.document), std::move(ids), target.document, placement,
+                                       before_mutation, error);
+}
+
+std::vector<LayerId> MainWindow::copy_layers_between_documents(const Document& source_document,
+                                                               std::vector<LayerId> ids, Document& target_document,
+                                                               const CrossDocumentLayerPlacement& placement,
+                                                               const std::function<bool()>& before_mutation,
+                                                               QString* error) {
+  const auto fail = [error](const QString& message) {
+    if (error != nullptr) {
+      *error = message;
+    }
+    return std::vector<LayerId>{};
+  };
+  ids = root_drop_layer_ids(source_document.layers(), ids);
+  const auto roots = find_layers_top_to_bottom(source_document.layers(), ids);
+  if (roots.empty()) {
+    return fail(tr("Select a layer to copy"));
+  }
+
+  // The payload Edit > Copy builds: the layers plus every document-scoped
+  // resource they reference, adopted into the target below.
+  ClipboardPayload payload;
+  payload.layers_top_to_bottom.reserve(roots.size());
+  // A copy of the Background is an ordinary layer in a document that has layers; as the
+  // first layer of an empty one (Duplicate Layer to a New Document) it stays its Background.
+  const bool target_has_layers = !std::as_const(target_document).layers().empty();
+  for (const auto* layer : roots) {
+    payload.layers_top_to_bottom.push_back(*layer);
+    if (target_has_layers) {
+      clear_background_locks_if_copy_of_background(payload.layers_top_to_bottom.back(), layer->id(),
+                                                   source_document.layers(), source_document.width(),
+                                                   source_document.height());
+    }
+    collect_referenced_smart_object_sources(*layer, source_document.metadata().smart_objects,
+                                            payload.smart_object_sources);
+    collect_referenced_smart_filter_records(*layer, source_document.metadata().smart_filter_effects,
+                                            payload.smart_filter_effect_records);
+    collect_referenced_pattern_resources(*layer, source_document.metadata().patterns, payload.pattern_resources);
+  }
+  const auto caches_available = std::all_of(
+      payload.layers_top_to_bottom.begin(), payload.layers_top_to_bottom.end(), [&](const Layer& layer) {
+        return smart_filter_records_available_for_clone(layer, target_document.metadata().smart_filter_effects,
+                                                        &payload.smart_filter_effect_records);
+      });
+  if (!caches_available) {
+    return fail(tr("Smart Filter cache data could not be duplicated safely"));
+  }
+  if (!before_mutation()) {
+    return {};
+  }
+
+  // Clone everything before inserting anything: there is no session-targeted
+  // undo to roll back a half-inserted stack in a background document.
+  std::set<std::string> existing_names;
+  collect_layer_names(target_document.layers(), existing_names);
+  std::vector<Layer> clones_bottom_to_top;
+  clones_bottom_to_top.reserve(payload.layers_top_to_bottom.size());
+  for (auto it = payload.layers_top_to_bottom.rbegin(); it != payload.layers_top_to_bottom.rend(); ++it) {
+    auto clone = clone_layer_tree_with_document_ids(target_document, *it, &payload.smart_filter_effect_records);
+    if (!clone.has_value()) {
+      return fail(tr("Smart Filter cache data could not be duplicated safely"));
+    }
+    // Photoshop keeps the name on a cross-document copy; only a collision earns
+    // the copy suffix.
+    if (!placement.keep_names && existing_names.contains(it->name())) {
+      clone->set_name(next_duplicate_name(it->name(), existing_names));
+    }
+    existing_names.insert(clone->name());
+    // Layers join the target at its depth (docs/high-bit-depth.md).
+    convert_layer_depth(*clone, target_document.color_state().bit_depth);
+    clones_bottom_to_top.push_back(std::move(*clone));
+  }
+  for (const auto& smart_source : payload.smart_object_sources) {
+    target_document.metadata().smart_objects.adopt(smart_source);
+  }
+  for (const auto& resource : payload.pattern_resources) {
+    PatternResource adopted = resource;
+    adopted.provenance = PatternProvenance::Authored;  // target file has no raw block for it
+    target_document.metadata().patterns.adopt(adopted);
+  }
+
+  // One shared offset keeps the set's relative layout: a canvas drop centers
+  // the set's extent on the drop point; keep-position is exact when the
+  // documents share dimensions and centers on the target canvas otherwise.
+  std::int32_t dx = 0;
+  std::int32_t dy = 0;
+  if (placement.exact_offset.has_value()) {
+    // No extent needed: finding one reads every pixel of every copied raster layer.
+    dx = placement.exact_offset->x();
+    dy = placement.exact_offset->y();
+  } else {
+    std::optional<Rect> extent;
+    for (const auto* layer : roots) {
+      unite_placement_bounds(*layer, extent);
+    }
+    const bool same_size = source_document.width() == target_document.width() &&
+                           source_document.height() == target_document.height();
+    if (extent.has_value() && !(placement.keep_source_position && same_size)) {
+      const auto center_x = placement.drop_document_point.has_value() ? placement.drop_document_point->x()
+                                                                        : target_document.width() / 2;
+      const auto center_y = placement.drop_document_point.has_value() ? placement.drop_document_point->y()
+                                                                        : target_document.height() / 2;
+      dx = center_x - (extent->x + extent->width / 2);
+      dy = center_y - (extent->y + extent->height / 2);
+    }
+  }
+  const auto target_canvas = Rect::from_size(target_document.width(), target_document.height());
+  for (auto& clone : clones_bottom_to_top) {
+    // A filtered Smart Object whose filters depend on position keeps its
+    // coordinates: its adopted cache would go stale under an offset.
+    if ((dx != 0 || dy != 0) && !move_layer_requires_smart_filter_rerender(std::as_const(clone))) {
+      offset_copied_layer_tree(clone, dx, dy, target_document.width(), target_document.height());
+    }
+    rebake_vector_rasters(clone, target_canvas, &std::as_const(target_document).metadata().patterns);
+    sync_layer_mask_feather_canvas(clone, target_canvas);
+  }
+
+  // Directly above the target's active layer, in source order, then the
+  // topmost copy becomes active.
+  std::optional<LayerId> anchor = target_document.active_layer_id();
+  if (anchor.has_value() && std::as_const(target_document).find_layer(*anchor) == nullptr) {
+    anchor.reset();
+  }
+  std::vector<LayerId> root_ids_top_to_bottom;
+  root_ids_top_to_bottom.reserve(clones_bottom_to_top.size());
+  for (auto& clone : clones_bottom_to_top) {
+    const auto id = clone.id();
+    insert_layer_after_anchor(target_document, std::move(clone), anchor);
+    anchor = id;
+    root_ids_top_to_bottom.insert(root_ids_top_to_bottom.begin(), id);
+  }
+  // Link groups belong to their document: copies linked together stay linked to each other.
+  separate_copied_link_groups(target_document.layers(), root_ids_top_to_bottom);
+  target_document.set_active_layer(root_ids_top_to_bottom.front());
+  return root_ids_top_to_bottom;
+}
+
+bool MainWindow::duplicate_layers_to_session(std::int64_t source_session_id, std::vector<LayerId> ids,
+                                             std::int64_t target_session_id, CrossDocumentLayerPlacement placement,
+                                             std::optional<std::string> single_copy_name) {
+  auto* source = session_with_id(source_session_id);
+  auto* target = session_with_id(target_session_id);
+  if (source == nullptr || target == nullptr || source == target) {
+    return false;  // a document closed mid-drag
+  }
+  if (preview_dialog_edit_locked()) {
+    show_preview_dialog_edit_lock_message();
+    return false;
+  }
+  if (source == active_session() && canvas_ != nullptr) {
+    // A pending transform or inline text edit belongs in the source before it
+    // is read.
+    canvas_->finish_free_transform();
+    finish_active_text_editor();
+  }
+  QString error;
+  const auto root_ids = copy_layers_between_sessions(
+      *source, std::move(ids), *target, placement,
+      [this, target] {
+        push_undo_snapshot(*target, tr("Duplicate layer"));
+        return true;
+      },
+      &error);
+  if (root_ids.empty()) {
+    if (!error.isEmpty()) {
+      show_status_error(error);
+    }
+    return false;
+  }
+  if (single_copy_name.has_value() && root_ids.size() == 1U) {
+    if (auto* copy = target->document.find_layer(root_ids.front()); copy != nullptr) {
+      copy->set_name(*single_copy_name);
+    }
+  }
+  if (target->canvas != nullptr) {
+    target->canvas->document_changed();
+  }
+  const auto count = root_ids.size();
+  const auto target_title = target->title;
+  activate_document_session(*target);
+  select_layers_in_layer_list(root_ids, root_ids.front());
+  statusBar()->showMessage(tr("Copied %1 layer(s) to %2").arg(static_cast<qulonglong>(count)).arg(target_title));
+  return true;
+}
+
+void MainWindow::duplicate_layer_to_document() {
+  if (!has_active_document()) {
+    return;
+  }
+  if (canvas_ != nullptr) {
+    canvas_->finish_free_transform();
+  }
+  select_only_layer_if_none_active();
+  auto ids = root_drop_layer_ids(std::as_const(document()).layers(), selected_or_active_layer_ids());
+  if (ids.empty()) {
+    show_status_error(tr("Select a layer to copy"));
+    return;
+  }
+  const auto source_session_id = session().session_id;
+  const auto& source_document = std::as_const(session().document);
+  const auto* single_source = ids.size() == 1U ? source_document.find_layer(ids.front()) : nullptr;
+
+  // Photoshop's Duplicate Layer dialog: the copy's name (one layer) and the
+  // destination. Every other open document is offered, plus a new document
+  // the source's size.
+  QDialog dialog(this);
+  dialog.setObjectName(QStringLiteral("duplicateLayerToDocumentDialog"));
+  dialog.setWindowTitle(tr("Duplicate Layer"));
+  auto* layout = new QVBoxLayout(&dialog);
+  auto* form = new QFormLayout();
+  auto* name_edit = new QLineEdit(&dialog);
+  name_edit->setObjectName(QStringLiteral("duplicateLayerNameEdit"));
+  if (single_source != nullptr) {
+    name_edit->setText(QString::fromStdString(single_source->name()));
+  } else {
+    name_edit->setText(tr("%1 layer(s)").arg(static_cast<qulonglong>(ids.size())));
+    name_edit->setEnabled(false);
+  }
+  form->addRow(tr("As:"), name_edit);
+  auto* target_combo = new QComboBox(&dialog);
+  target_combo->setObjectName(QStringLiteral("duplicateLayerTargetCombo"));
+  for (const auto& candidate : sessions_) {
+    if (candidate == nullptr || candidate->session_id == source_session_id) {
+      continue;
+    }
+    target_combo->addItem(candidate->title, QVariant::fromValue<qlonglong>(candidate->session_id));
+  }
+  target_combo->addItem(tr("New Document"), QVariant::fromValue<qlonglong>(0));
+  form->addRow(tr("Destination:"), target_combo);
+  layout->addLayout(form);
+  // At its size hint the dialog was about 200 px wide, which cut the title bar to
+  // "Du...er" and the destination to "New D...ument" (GitHub issue 209). The closed
+  // combo fits the longest destination up to a cap (long document titles elide
+  // there but not in the list), and the dialog leaves the title room for the
+  // window icon and buttons a system title bar adds.
+  target_combo->ensurePolished();
+  const QFontMetrics metrics(target_combo->font());
+  int widest_destination = 0;
+  for (int i = 0; i < target_combo->count(); ++i) {
+    widest_destination = std::max(widest_destination, metrics.horizontalAdvance(target_combo->itemText(i)));
+  }
+  target_combo->setMinimumWidth(std::min(widest_destination + 48, 420));
+  target_combo->view()->setMinimumWidth(widest_destination + 36);
+  dialog.setMinimumWidth(std::max(360, metrics.horizontalAdvance(dialog.windowTitle()) + 200));
+  auto* buttons = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel, &dialog);
+  layout->addWidget(buttons);
+  connect(buttons, &QDialogButtonBox::accepted, &dialog, &QDialog::accept);
+  connect(buttons, &QDialogButtonBox::rejected, &dialog, &QDialog::reject);
+  name_edit->selectAll();
+  if (exec_dialog(dialog) != QDialog::Accepted) {
+    return;
+  }
+
+  std::optional<std::string> copy_name;
+  if (single_source != nullptr) {
+    const auto typed = name_edit->text().trimmed();
+    if (!typed.isEmpty() && typed.toStdString() != single_source->name()) {
+      copy_name = typed.toStdString();
+    }
+  }
+  CrossDocumentLayerPlacement placement;
+  placement.keep_source_position = true;
+  auto target_session_id = static_cast<std::int64_t>(target_combo->currentData().toLongLong());
+  if (target_session_id == 0) {
+    // A fresh document the source's size and print resolution; the copies
+    // become its first layers. Captured ids, not references: adding a session
+    // activates it.
+    Document fresh(source_document.width(), source_document.height(), source_document.format());
+    fresh.print_settings() = source_document.print_settings();
+    add_document_session(std::move(fresh), tr("Untitled"));
+    auto* created = active_session();
+    if (created == nullptr || created->session_id == source_session_id) {
+      return;  // an edit lock kept the source active; nothing to copy into
+    }
+    apply_opening_view(*created);
+    target_session_id = created->session_id;
+  }
+  duplicate_layers_to_session(source_session_id, std::move(ids), target_session_id, placement, copy_name);
+}
+
+void MainWindow::rename_active_layer() {
+  auto& doc = document();
+  select_only_layer_if_none_active();
+  if (!doc.active_layer_id().has_value()) {
+    show_select_layer_first(tr("Rename Layer"));
+    return;
+  }
+  auto* layer = doc.find_layer(*doc.active_layer_id());
+  if (layer == nullptr) {
+    return;
+  }
+
+  // In-place editing needs the row on screen and a single selection; a filtered
+  // or collapsed-away row and a multi-selection fall back to the dialog.
+  if (auto* list = dynamic_cast<LayerListWidget*>(layer_list_);
+      list != nullptr && list->isVisible() && selected_layer_ids().size() <= 1) {
+    if (auto* item = list->item_for_layer_id(layer->id()); item != nullptr && list->begin_inline_rename(item)) {
+      return;
+    }
+  }
+
+  const auto new_name = request_text_input(this, QStringLiteral("patchyRenameLayerDialog"), tr("Rename Layer"),
+                                           tr("Name"), QString::fromStdString(layer->name()));
+  if (!new_name.has_value()) {
+    return;
+  }
+  apply_layer_rename(layer->id(), *new_name);
+}
+
+void MainWindow::apply_layer_rename(LayerId id, const QString& name) {
+  if (!has_active_document()) {
+    return;
+  }
+  auto* layer = document().find_layer(id);
+  const auto trimmed = name.trimmed();
+  if (layer == nullptr || trimmed.isEmpty() || trimmed.toStdString() == layer->name()) {
+    return;
+  }
+
+  push_undo_snapshot(tr("Rename layer"));
+  layer->set_name(trimmed.toStdString());
+  refresh_layer_list();
+  refresh_layer_controls();
+}
+
+void MainWindow::set_selected_layers_frame_time(std::optional<std::uint32_t> delay_ms, bool all_layers) {
+  if (!has_active_document()) {
+    show_status_error(tr("No document"));
+    return;
+  }
+  auto& doc = document();
+  std::vector<LayerId> ids;
+  if (all_layers) {
+    // The animation's frames: every top-level layer, groups included.
+    for (const auto& layer : std::as_const(doc).layers()) {
+      ids.push_back(layer.id());
+    }
+  } else {
+    select_only_layer_if_none_active();
+    ids = selected_or_active_layer_ids();
+  }
+  if (ids.empty()) {
+    show_status_error(all_layers ? tr("No layers") : tr("No layers selected"));
+    return;
+  }
+  std::vector<std::pair<LayerId, std::string>> renames;
+  for (const auto id : ids) {
+    const auto* layer = std::as_const(doc).find_layer(id);
+    if (layer == nullptr) {
+      continue;
+    }
+    std::string next{gif::strip_layer_name_delay_token(layer->name())};
+    if (delay_ms.has_value()) {
+      if (!next.empty()) {
+        next += ' ';
+      }
+      next += animation::format_delay_seconds_token(*delay_ms);
+    } else if (next.empty()) {
+      continue;  // a name that is nothing but a token keeps it; empty layer names help nobody
+    }
+    if (next != layer->name()) {
+      renames.emplace_back(id, std::move(next));
+    }
+  }
+  if (renames.empty()) {
+    if (all_layers) {
+      show_status_error(delay_ms.has_value() ? tr("All layers already end with that time")
+                                             : tr("No frame times on any layer"));
+    } else {
+      show_status_error(delay_ms.has_value() ? tr("Selected layers already end with that time")
+                                             : tr("No frame times on the selected layers"));
+    }
+    return;
+  }
+  push_undo_snapshot(delay_ms.has_value() ? tr("Set frame time") : tr("Remove frame time"));
+  for (auto& [id, name] : renames) {
+    if (auto* layer = doc.find_layer(id); layer != nullptr) {
+      layer->set_name(std::move(name));
+    }
+  }
+  refresh_layer_list();
+  refresh_layer_controls();
+}
+
+namespace {
+
+// Materializes any user-library or legacy built-in pattern a style references
+// into the document store, so previews and saves no longer depend on the
+// application library. Store insertions are benign; unreferenced entries prune
+// at PSD write.
+void ensure_patterns_for_style(Document& doc, const LayerStyle& style,
+                               const PatternLibrary& library,
+                               const PatternStore* transient_patterns = nullptr) {
+  std::vector<std::string> referenced;
+  collect_referenced_pattern_ids(style, referenced);
+  for (const auto& id : referenced) {
+    if (doc.metadata().patterns.find(id) != nullptr) {
+      continue;
+    }
+    if (transient_patterns != nullptr) {
+      if (const auto* resource = transient_patterns->find(id); resource != nullptr) {
+        auto authored = *resource;
+        authored.provenance = PatternProvenance::Authored;
+        doc.metadata().patterns.adopt(authored);
+        continue;
+      }
+    }
+    if (auto resource = library.resource(QString::fromStdString(id)); resource.has_value()) {
+      resource->provenance = PatternProvenance::Authored;
+      doc.metadata().patterns.adopt(*resource);
+    } else if (auto bundled = bundled_pattern_resource(id); bundled.has_value()) {
+      // Repair path when the library entry is gone: generated and photo
+      // presets both re-materialize from the application bundle.
+      doc.metadata().patterns.adopt(*bundled);
+    }
+  }
+}
+
+}  // namespace
+
+void MainWindow::edit_active_layer_style(std::optional<LayerStyleEffect> start_effect, std::size_t start_index,
+                                         bool enable_start_effect) {
+  if (preview_dialog_edit_locked()) { show_preview_dialog_edit_lock_message(); return; }
+  if (!has_active_document() || refuse_layer_dialog_during_transform()) return;
+  finish_pending_shape_appearance_edit();
+  finish_pending_layer_opacity_edit();
+  finish_pending_layer_fill_opacity_edit();
+  finish_pending_layer_blend_edit();
+  finish_active_text_editor();
+  auto& doc = document();
+  const auto selected = selected_or_active_layer_ids();
+  auto ids = selected;
+  const auto active = doc.active_layer_id();
+  if (active) {
+    const auto it = std::find(ids.begin(), ids.end(), *active);
+    if (it != ids.end()) std::rotate(ids.begin(), it, it + 1);
+  }
+  const bool background_selected =
+      std::any_of(ids.begin(), ids.end(), [this](LayerId id) { return layer_is_document_background(id); });
+  std::erase_if(ids, [&](LayerId id) {
+    return !std::as_const(doc).find_layer(id) || layer_is_effectively_locked(doc.layers(), id) ||
+           layer_is_document_background(id);
+  });
+  if (ids.empty()) {
+    if (background_selected) {
+      show_status_error(tr("The Background layer cannot have layer styles"));
+    }
+    return;
+  }
+  std::vector<Layer> originals;
+  AppearanceDialogContext<LayerStyleSettings> context;
+  context.selected_count = selected.size();
+  context.skipped_reason = tr("Locked layers are skipped. Groups receive their own style; their children are unchanged.");
+  for (const auto id : ids) {
+    const auto& layer = *std::as_const(doc).find_layer(id);
+    originals.push_back(layer);
+    context.originals.push_back(layer_style_settings(layer));
+    context.names.push_back(QString::fromStdString(layer.name()));
+    if (layer.blend_if_payload_status() == BlendIfPayloadStatus::Unsupported || !layer.channel_restriction_supported()) {
+      if (!context.notices.isEmpty()) context.notices += QLatin1Char('\n');
+      context.notices += tr("%1: preserved blending data remains protected.").arg(context.names.back());
+    }
+    if (std::any_of(layer.layer_style().satins.begin(), layer.layer_style().satins.end(),
+                    [](const auto& satin) { return satin.unsupported_contour_options; })) {
+      if (!context.notices.isEmpty()) context.notices += QLatin1Char('\n');
+      context.notices += tr("%1: editing effects normalizes unsupported Satin contours.").arg(context.names.back());
+    }
+  }
+  const auto original_patterns = doc.metadata().patterns;
+  const auto effects_equal = [](const LayerStyle& a, const LayerStyle& b) {
+    LayerStyleSettings left, right;
+    left.style = a; right.style = b;
+    return layer_style_settings_equal(left, right);
+  };
+  const auto apply_settings = [&](Layer& target, const Layer& original, const LayerStyleSettings& next) {
+    const auto baseline = layer_style_settings(original);
+    // Percent controls must not quantize untouched imported opacity values.
+    target.set_opacity(!next.opacity_edited && next.opacity == baseline.opacity ? original.opacity() : next.opacity / 100.0F);
+    target.set_fill_opacity(!next.fill_opacity_edited && next.fill_opacity == baseline.fill_opacity ? original.fill_opacity() : next.fill_opacity / 100.0F);
+    // A folder's Pass Through never lands on the batch's other layers (GitHub issue 235).
+    if (next.blend_mode != BlendMode::PassThrough || target.kind() == LayerKind::Group) {
+      target.set_blend_mode(next.blend_mode);
+    }
+    const bool style_changed = !effects_equal(original.layer_style(), next.style);
+    target.layer_style() = next.style;
+    if (style_changed) {
+      for (auto& satin : target.layer_style().satins) satin.unsupported_contour_options = false;
+      clear_layer_psd_style_source(target);
+    }
+    if (original.channel_restriction_supported()) target.set_restricted_channels(next.restricted_channels);
+    if (layer_knockout_setting(original).has_value()) set_layer_knockout(target, next.knockout);
+    target.set_blend_if_payload(original.raw_psd_blending_ranges(), original.blend_if_rgb_compatible());
+    if (next.replace_unsupported_blend_if || next.blend_if != baseline.blend_if)
+      (void)target.set_blend_if(next.blend_if, next.replace_unsupported_blend_if);
+  };
+  const auto restore = [&] {
+    doc.metadata().patterns = original_patterns;
+    for (const auto& original : originals)
+      if (auto* target = doc.find_layer(original.id())) *target = original;
+    if (canvas_) canvas_->document_changed_async_preview();
+  };
+  const auto preview = [&](const LayerStyleSettings& settings) {
+    const auto available = doc.metadata().patterns;
+    restore();
+    if (!settings.preview_enabled) return;
+    for (std::size_t index = 0; index < originals.size(); ++index) {
+      const auto& original = originals[index];
+      const auto next = apply_layer_style_edits(context.originals[index], settings);
+      ensure_patterns_for_style(doc, next.style, pattern_library(), &available);
+      if (auto* target = doc.find_layer(original.id())) apply_settings(*target, original, next);
+    }
+    if (canvas_) canvas_->document_changed_async_preview();
+  };
+  std::vector<std::pair<QString, PixelBuffer>> pending_pattern_images;
+  auto queue_pattern_image = [this, &pending_pattern_images](const QString& name,
+                                                             const PixelBuffer& tile) {
+    pending_pattern_images.emplace_back(name, tile);
+    // The main-window status bar stays visible behind the modal dialogs.
+    statusBar()->showMessage(
+        tr("\"%1\" will open as a new image when the Layer Style dialog closes").arg(name));
+  };
+  auto open_pending_pattern_images = [this, &pending_pattern_images] {
+    for (auto& [name, tile] : pending_pattern_images) {
+      Document image_document(tile.width(), tile.height(), PixelFormat::rgba8());
+      image_document.add_pixel_layer(name.toStdString(), std::move(tile));
+      add_document_session(std::move(image_document), name, QString(),
+                           tr("Open pattern as image"));
+      apply_opening_view(session());
+      // No backing file: closing must warn about unsaved changes.
+      mark_session_modified(session());
+      statusBar()->showMessage(tr("Opened pattern \"%1\" as a new image").arg(name));
+    }
+    pending_pattern_images.clear();
+  };
+
+
+  auto lock = lock_preview_dialog_edits();
+  auto cleanup = qScopeGuard(restore);
+  const auto fg = canvas_->primary_color(), bg = canvas_->secondary_color();
+  const auto accepted = request_layer_style_settings(this, originals.front(), preview,
+      &doc.metadata().patterns, &pattern_library(), &style_library(), queue_pattern_image,
+      &gradient_library(),
+      {static_cast<std::uint8_t>(fg.red()), static_cast<std::uint8_t>(fg.green()), static_cast<std::uint8_t>(fg.blue())},
+      {static_cast<std::uint8_t>(bg.red()), static_cast<std::uint8_t>(bg.green()), static_cast<std::uint8_t>(bg.blue())},
+      &context, std::as_const(doc).color_state().bit_depth, start_effect, start_index, enable_start_effect,
+      &contour_library());
+  const auto available = doc.metadata().patterns;
+  restore();
+  bool changed = false;
+  if (accepted) {
+    std::vector<std::pair<std::size_t, LayerStyleSettings>> changes;
+    for (std::size_t index = 0; index < originals.size(); ++index) {
+      auto next = apply_layer_style_edits(context.originals[index], *accepted);
+      // Unsupported native payloads require the existing explicit replacement action.
+      if (originals[index].blend_if_payload_status() == BlendIfPayloadStatus::Unsupported &&
+          !next.replace_unsupported_blend_if) next.blend_if = context.originals[index].blend_if;
+      if (!originals[index].channel_restriction_supported())
+        next.restricted_channels = context.originals[index].restricted_channels;
+      if (!layer_knockout_setting(originals[index]).has_value()) next.knockout = context.originals[index].knockout;
+      if (!layer_style_settings_equal(context.originals[index], next) ||
+          (next.opacity_edited && originals[index].opacity() != next.opacity / 100.0F) ||
+          (next.fill_opacity_edited && originals[index].fill_opacity() != next.fill_opacity / 100.0F))
+        changes.emplace_back(index, std::move(next));
+    }
+    if (!changes.empty()) {
+      // Finish allocations and pattern resolution before publishing anything or
+      // recording history. Applying fields to the prepared tree also keeps an
+      // explicitly selected child independent of its selected parent group.
+      auto prepared = doc;
+      for (const auto& [index, next] : changes) {
+        ensure_patterns_for_style(prepared, next.style, pattern_library(), &available);
+        if (auto* target = prepared.find_layer(originals[index].id())) apply_settings(*target, originals[index], next);
+      }
+      push_undo_snapshot(tr("Layer style"));
+      doc = std::move(prepared);
+      changed = true;
+      // An effect added here opens the layer's effect rows so the new row is in view.
+      for (const auto& [index, next] : changes) {
+        if (next.style.effect_count() > context.originals[index].style.effect_count()) {
+          reveal_layer_effects(originals[index].id());
+        }
+      }
+    }
+  }
+  cleanup.dismiss();
+  lock.release();
+  if (changed) {
+    canvas_->document_changed();
+    refresh_layer_list();
+    select_layers_in_layer_list(selected, active.value_or(ids.front()));
+    statusBar()->showMessage(tr("Updated layer style"));
+  }
+  refresh_layer_thumbnails();
+  refresh_layer_controls();
+  open_pending_pattern_images();
+}
+
+bool MainWindow::apply_layer_effect_row_edit(LayerId layer_id, const QString& undo_text, const QString& status_text,
+                                             const std::function<bool(LayerStyle&)>& edit) {
+  if (!has_active_document() || canvas_ == nullptr) {
+    return false;
+  }
+  if (preview_dialog_edit_locked()) {
+    show_preview_dialog_edit_lock_message();
+    refresh_layer_list();
+    return false;
+  }
+  auto& doc = document();
+  const auto* layer = std::as_const(doc).find_layer(layer_id);
+  if (layer == nullptr) {
+    return false;
+  }
+  if (layer_is_effectively_locked(doc.layers(), layer_id)) {
+    show_status_error(tr("Layer is locked."));
+    refresh_layer_list();
+    return false;
+  }
+  // Decide on a copy first: a no-op (the eye already agrees) records no history step.
+  auto next = layer->layer_style();
+  if (!edit(next)) {
+    refresh_layer_list();
+    return false;
+  }
+  push_undo_snapshot(undo_text);
+  auto* target = doc.find_layer(layer_id);
+  target->layer_style() = std::move(next);
+  // The preserved lfx2 bytes no longer describe the style; the writer regenerates it.
+  clear_layer_psd_style_source(*target);
+  canvas_->document_changed();
+  refresh_layer_list();
+  refresh_layer_thumbnails();
+  refresh_layer_controls();
+  statusBar()->showMessage(status_text);
+  return true;
+}
+
+void MainWindow::set_layer_effects_visible(LayerId layer_id, bool visible) {
+  apply_layer_effect_row_edit(layer_id, visible ? tr("Show Layer Styles") : tr("Hide Layer Styles"),
+                              visible ? tr("Layer styles shown") : tr("Layer styles hidden"),
+                              [visible](LayerStyle& style) {
+    if (style.effects_visible == visible) {
+      return false;
+    }
+    style.effects_visible = visible;
+    return true;
+  });
+}
+
+void MainWindow::set_layer_effect_enabled(LayerId layer_id, LayerStyleEffect effect, std::size_t index,
+                                          bool enabled) {
+  const auto name = layer_effect_display_name(effect);
+  apply_layer_effect_row_edit(layer_id, enabled ? tr("Show %1").arg(name) : tr("Hide %1").arg(name),
+                              enabled ? tr("%1 shown").arg(name) : tr("%1 hidden").arg(name),
+                              [effect, index, enabled](LayerStyle& style) {
+    auto* flag = layer_effect_enabled_flag(style, effect, index);
+    if (flag == nullptr || *flag == enabled) {
+      return false;
+    }
+    *flag = enabled;
+    return true;
+  });
+}
+
+void MainWindow::delete_layer_effect(LayerId layer_id, LayerStyleEffect effect, std::size_t index) {
+  const auto name = layer_effect_display_name(effect);
+  apply_layer_effect_row_edit(layer_id, tr("Delete %1").arg(name), tr("%1 deleted").arg(name),
+                              [effect, index](LayerStyle& style) {
+    return remove_layer_effect_instance(style, effect, index);
+  });
+}
+
+void MainWindow::toggle_layer_effects_expanded(LayerId layer_id) {
+  if (!has_active_document() || document().find_layer(layer_id) == nullptr) {
+    return;
+  }
+  auto& expanded = session().expanded_layer_effects;
+  if (!expanded.erase(layer_id)) {
+    expanded.insert(layer_id);
+  }
+  refresh_layer_list();  // a disclosure toggle is not an edit (the folder rule)
+}
+
+void MainWindow::toggle_layer_smart_filters_expanded(LayerId layer_id) {
+  if (!has_active_document() || document().find_layer(layer_id) == nullptr) {
+    return;
+  }
+  auto& collapsed = session().collapsed_smart_filters;
+  if (!collapsed.erase(layer_id)) {
+    collapsed.insert(layer_id);
+  }
+  refresh_layer_list();  // a disclosure toggle is not an edit (the folder rule)
+}
+
+void MainWindow::reveal_layer_effects(LayerId layer_id) {
+  if (has_active_document()) {
+    session().expanded_layer_effects.insert(layer_id);
+  }
+}
+
+void MainWindow::show_layer_effect_context_menu(LayerId layer_id, LayerStyleEffect effect, std::size_t index,
+                                                QPoint global_position) {
+  if (!has_active_document()) {
+    return;
+  }
+  const auto* layer = std::as_const(document()).find_layer(layer_id);
+  if (layer == nullptr) {
+    return;
+  }
+  auto style = layer->layer_style();
+  const auto* flag = layer_effect_enabled_flag(style, effect, index);
+  if (flag == nullptr) {
+    return;
+  }
+  const bool enabled = *flag;
+  const bool locked = layer_is_effectively_locked(document().layers(), layer_id);
+  const auto name = layer_effect_display_name(effect);
+  QMenu menu(this);
+  menu.setObjectName(QStringLiteral("layerEffectContextMenu"));
+  auto* edit_action = menu.addAction(tr("Edit %1...").arg(name));
+  edit_action->setObjectName(QStringLiteral("layerEffectEditAction"));
+  auto* visibility_action = menu.addAction(enabled ? tr("Hide %1").arg(name) : tr("Show %1").arg(name));
+  visibility_action->setObjectName(QStringLiteral("layerEffectVisibilityAction"));
+  visibility_action->setEnabled(!locked);
+  menu.addSeparator();
+  auto* delete_action = menu.addAction(tr("Delete %1").arg(name));
+  delete_action->setObjectName(QStringLiteral("layerEffectDeleteAction"));
+  delete_action->setEnabled(!locked);
+  // Deferred like the row buttons: each command rebuilds the rows under the menu's caller.
+  connect(edit_action, &QAction::triggered, this, [this, layer_id, effect, index] {
+    QTimer::singleShot(0, this, [this, layer_id, effect, index] { edit_layer_effect(layer_id, effect, index); });
+  });
+  connect(visibility_action, &QAction::triggered, this, [this, layer_id, effect, index, enabled] {
+    QTimer::singleShot(0, this, [this, layer_id, effect, index, enabled] {
+      set_layer_effect_enabled(layer_id, effect, index, !enabled);
+    });
+  });
+  connect(delete_action, &QAction::triggered, this, [this, layer_id, effect, index] {
+    QTimer::singleShot(0, this, [this, layer_id, effect, index] { delete_layer_effect(layer_id, effect, index); });
+  });
+  menu.exec(global_position);
+}
+
+void MainWindow::edit_layer_effect(LayerId layer_id, LayerStyleEffect effect, std::size_t index) {
+  if (!has_active_document() || document().find_layer(layer_id) == nullptr) {
+    return;
+  }
+  // Like the fx badge: keep a multi-selection that holds the row, keep the panel still.
+  const auto selected = selected_layer_ids();
+  if (std::find(selected.begin(), selected.end(), layer_id) != selected.end()) {
+    select_layers_in_layer_list(selected, layer_id, true);
+  } else {
+    reveal_layer_in_layer_list(layer_id, true);
+  }
+  if (document().active_layer_id() != layer_id) {
+    document().set_active_layer(layer_id);
+  }
+  edit_active_layer_style(effect, index, false);
+}
+
+void MainWindow::copy_active_layer_style() {
+  if (!has_active_document()) {
+    return;
+  }
+
+  const auto ids = selected_or_active_layer_ids();
+  if (ids.size() != 1U) {
+    refresh_layer_style_action_states();
+    return;
+  }
+
+  const auto* layer = document().find_layer(ids.front());
+  if (layer == nullptr) {
+    refresh_layer_style_action_states();
+    return;
+  }
+
+  layer_style_clipboard_ = LayerStyleClipboard{
+      layer->layer_style(),
+      layer->blend_if_payload_status() == BlendIfPayloadStatus::Unsupported
+          ? std::optional<LayerBlendIf>{}
+          : std::optional<LayerBlendIf>{layer->blend_if()},
+      layer->channel_restriction_supported()
+          ? std::optional<std::uint8_t>{layer->restricted_channels()}
+          : std::optional<std::uint8_t>{},
+      {}};
+  // Carry the referenced pattern tiles so a cross-document paste can embed them.
+  std::vector<std::string> referenced_pattern_ids;
+  collect_referenced_pattern_ids(layer_style_clipboard_->style, referenced_pattern_ids);
+  for (const auto& pattern_id : referenced_pattern_ids) {
+    if (const auto* resource = document().metadata().patterns.find(pattern_id); resource != nullptr) {
+      layer_style_clipboard_->patterns.push_back(*resource);
+    }
+  }
+  // The style clipboard carries modeled settings, not the source layer's raw
+  // lfx2 bytes. Pasted custom Satin curves and contour anti-aliasing are
+  // therefore normalized to the Linear contour that Patchy can regenerate.
+  for (auto& satin : layer_style_clipboard_->style.satins) {
+    satin.unsupported_contour_options = false;
+  }
+  statusBar()->showMessage(tr("Copied layer style"));
+  refresh_layer_style_action_states();
+}
+
+void MainWindow::paste_layer_style_to_selected_layers() {
+  if (!has_active_document() || !layer_style_clipboard_.has_value()) {
+    refresh_layer_style_action_states();
+    return;
+  }
+
+  const auto ids = selected_or_active_layer_ids();
+  std::vector<LayerId> targets;
+  targets.reserve(ids.size());
+  const auto& doc = document();
+  for (const auto id : ids) {
+    if (doc.find_layer(id) != nullptr && !layer_is_document_background(id)) {
+      targets.push_back(id);
+    }
+  }
+  if (targets.empty()) {
+    if (std::any_of(ids.begin(), ids.end(), [this](LayerId id) { return layer_is_document_background(id); })) {
+      show_status_error(tr("The Background layer cannot have layer styles"));
+    }
+    refresh_layer_style_action_states();
+    return;
+  }
+
+  auto& mutable_doc = document();
+  push_undo_snapshot(tr("Paste layer style"));
+  for (const auto& resource : layer_style_clipboard_->patterns) {
+    PatternResource adopted = resource;
+    adopted.provenance = PatternProvenance::Authored;  // the target file has no raw block for it
+    mutable_doc.metadata().patterns.adopt(adopted);
+  }
+  ensure_patterns_for_style(mutable_doc, layer_style_clipboard_->style, pattern_library());
+  Rect affected;
+  std::size_t pasted_count = 0;
+  for (const auto id : targets) {
+    auto* layer = mutable_doc.find_layer(id);
+    if (layer == nullptr) {
+      continue;
+    }
+    affected = unite_rect(affected, layer_render_bounds(*layer));
+    clear_layer_psd_style_source(*layer);
+    if (layer_style_clipboard_->style.effect_count() > layer->layer_style().effect_count()) {
+      reveal_layer_effects(id);
+    }
+    layer->layer_style() = layer_style_clipboard_->style;
+    if (layer_style_clipboard_->blend_if.has_value()) {
+      (void)layer->set_blend_if(*layer_style_clipboard_->blend_if, true);
+    }
+    if (layer_style_clipboard_->restricted_channels.has_value() &&
+        layer->channel_restriction_supported()) {
+      layer->set_restricted_channels(*layer_style_clipboard_->restricted_channels);
+    }
+    affected = unite_rect(affected, layer_render_bounds(*layer));
+    ++pasted_count;
+  }
+
+  refresh_layer_list();
+  refresh_layer_controls();
+  if (canvas_ != nullptr) {
+    canvas_->document_changed(affected.empty() ? QRect() : to_qrect(affected));
+  }
+  statusBar()->showMessage(
+      tr("Pasted layer style to %1 layer(s)").arg(static_cast<qulonglong>(pasted_count)));
+}
+
+void MainWindow::delete_selected_layer_styles() {
+  if (!has_active_document()) {
+    return;
+  }
+
+  const auto ids = selected_or_active_layer_ids();
+  std::vector<LayerId> targets;
+  targets.reserve(ids.size());
+  const auto& doc = document();
+  for (const auto id : ids) {
+    const auto* layer = doc.find_layer(id);
+    if (layer != nullptr && !layer->layer_style().empty()) {
+      targets.push_back(id);
+    }
+  }
+  if (targets.empty()) {
+    refresh_layer_style_action_states();
+    return;
+  }
+
+  auto& mutable_doc = document();
+  push_undo_snapshot(tr("Delete layer style"));
+  Rect affected;
+  std::size_t deleted_count = 0;
+  for (const auto id : targets) {
+    auto* layer = mutable_doc.find_layer(id);
+    if (layer == nullptr || layer->layer_style().empty()) {
+      continue;
+    }
+    affected = unite_rect(affected, layer_render_bounds(*layer));
+    clear_layer_psd_style_source(*layer);
+    layer->layer_style() = {};
+    affected = unite_rect(affected, layer_render_bounds(*layer));
+    ++deleted_count;
+  }
+
+  refresh_layer_list();
+  refresh_layer_controls();
+  if (canvas_ != nullptr) {
+    canvas_->document_changed(affected.empty() ? QRect() : to_qrect(affected));
+  }
+  statusBar()->showMessage(
+      tr("Deleted layer style from %1 layer(s)").arg(static_cast<qulonglong>(deleted_count)));
+}
+
+void MainWindow::populate_layer_color_actions(QMenu* menu) {
+  if (layer_color_actions_.front() == nullptr) {
+    struct ColorEntry {
+      const char* text;
+      const char* object_name;
+      const char* hotkey_id;
+      QColor ThemePalette::* role;
+    };
+    // Indexed by LayerColorLabel; the hotkey ids are permanent.
+    const std::array<ColorEntry, kLayerColorLast + 1U> entries{{
+        {QT_TR_NOOP("None"), "layerColorNoneAction", "layer.color_none", nullptr},
+        {QT_TR_NOOP("Red"), "layerColorRedAction", "layer.color_red", &ThemePalette::layer_color_red},
+        {QT_TR_NOOP("Orange"), "layerColorOrangeAction", "layer.color_orange", &ThemePalette::layer_color_orange},
+        {QT_TR_NOOP("Yellow"), "layerColorYellowAction", "layer.color_yellow", &ThemePalette::layer_color_yellow},
+        {QT_TR_NOOP("Green"), "layerColorGreenAction", "layer.color_green", &ThemePalette::layer_color_green},
+        {QT_TR_NOOP("Blue"), "layerColorBlueAction", "layer.color_blue", &ThemePalette::layer_color_blue},
+        {QT_TR_NOOP("Violet"), "layerColorVioletAction", "layer.color_violet", &ThemePalette::layer_color_violet},
+        {QT_TR_NOOP("Gray"), "layerColorGrayAction", "layer.color_gray", &ThemePalette::layer_color_gray},
+        {QT_TR_NOOP("Seafoam"), "layerColorSeafoamAction", "layer.color_seafoam", &ThemePalette::layer_color_seafoam},
+        {QT_TR_NOOP("Indigo"), "layerColorIndigoAction", "layer.color_indigo", &ThemePalette::layer_color_indigo},
+        {QT_TR_NOOP("Magenta"), "layerColorMagentaAction", "layer.color_magenta", &ThemePalette::layer_color_magenta},
+        {QT_TR_NOOP("Fuchsia"), "layerColorFuchsiaAction", "layer.color_fuchsia", &ThemePalette::layer_color_fuchsia},
+    }};
+    // Optional exclusivity: a mixed selection checks nothing.
+    auto* group = new QActionGroup(this);
+    group->setExclusionPolicy(QActionGroup::ExclusionPolicy::ExclusiveOptional);
+    for (std::size_t index = 0; index < entries.size(); ++index) {
+      const auto& entry = entries[index];
+      auto* action = new QAction(tr(entry.text), this);
+      action->setObjectName(QLatin1String(entry.object_name));
+      action->setCheckable(true);
+      action->setMenuRole(QAction::NoRole);
+      bind_action_text(action, entry.text);
+      if (entry.role != nullptr) {
+        // A swatch in the label's own role, so menu and row strip always agree.
+        action->setIcon(themed_glyph_icon(QStringLiteral("layer-color-%1").arg(index), 16.0, entry.role,
+                                          [](QPainter& painter, const QColor& ink) {
+                                            painter.setPen(Qt::NoPen);
+                                            painter.setBrush(ink);
+                                            painter.drawRoundedRect(QRectF(2.0, 2.0, 12.0, 12.0), 2.5, 2.5);
+                                          }));
+      }
+      group->addAction(action);
+      register_hotkey(action, QLatin1String(entry.hotkey_id));
+      register_document_action(action);
+      const auto label = static_cast<LayerColorLabel>(index);
+      connect(action, &QAction::triggered, this, [this, label] { set_selected_layers_color(label); });
+      layer_color_actions_[index] = action;
+    }
+  }
+  // Hue order (kLayerColorMenuOrder), not index order: Photoshop 2024 appended 8..11.
+  for (const auto label : kLayerColorMenuOrder) {
+    auto* action = layer_color_actions_[label];
+    menu->addAction(action);
+    if (label == kLayerColorNone) {
+      menu->addSeparator();
+    }
+  }
+}
+
+void MainWindow::refresh_layer_color_action_states() {
+  std::optional<LayerColorLabel> common;
+  bool mixed = false;
+  bool any = false;
+  if (has_active_document() && !preview_dialog_edit_locked()) {
+    const auto& doc = std::as_const(document());
+    for (const auto id : selected_or_active_layer_ids()) {
+      const auto* layer = doc.find_layer(id);
+      if (layer == nullptr) {
+        continue;
+      }
+      any = true;
+      // An index Patchy does not know shows as no color.
+      const auto label = layer->color_label() <= kLayerColorLast ? layer->color_label() : kLayerColorNone;
+      mixed = mixed || (common.has_value() && *common != label);
+      common = label;
+    }
+  }
+  for (std::size_t index = 0; index < layer_color_actions_.size(); ++index) {
+    if (auto* action = layer_color_actions_[index]; action != nullptr) {
+      // Enabled state stays with the document-action registry, so hotkeys work.
+      action->setChecked(any && !mixed && common == static_cast<LayerColorLabel>(index));
+    }
+  }
+}
+
+void MainWindow::set_selected_layers_color(LayerColorLabel label) {
+  if (preview_dialog_edit_locked()) {
+    show_preview_dialog_edit_lock_message();
+    return;
+  }
+  if (!has_active_document()) {
+    return;
+  }
+  const auto ids = selected_or_active_layer_ids();
+  auto& doc = document();
+  const bool changes = std::any_of(ids.begin(), ids.end(), [&](LayerId id) {
+    const auto* layer = std::as_const(doc).find_layer(id);
+    return layer != nullptr && layer->color_label() != label;
+  });
+  if (!changes) {
+    refresh_layer_color_action_states();
+    return;
+  }
+  // A label is no pixel edit: locked layers take one too, as in Photoshop.
+  push_undo_snapshot(tr("Layer color"));
+  for (const auto id : ids) {
+    if (auto* layer = doc.find_layer(id); layer != nullptr) {
+      layer->set_color_label(label);
+    }
+  }
+  const auto active = doc.active_layer_id();
+  refresh_layer_list();
+  if (!ids.empty()) {
+    select_layers_in_layer_list(ids, active.value_or(ids.front()));
+  }
+  refresh_layer_color_action_states();
+}
+
+bool MainWindow::can_link_selected_layers() const {
+  if (!has_active_document() || preview_dialog_edit_locked()) {
+    return false;
+  }
+  const auto& layers = std::as_const(document()).layers();
+  const auto ids = selected_or_active_layer_ids();
+  std::set<std::uint32_t> groups;
+  std::size_t found = 0;
+  for (const auto id : ids) {
+    if (find_layer_in_tree(layers, id) != nullptr) {
+      ++found;
+      groups.insert(effective_link_group(layers, id));
+    }
+  }
+  // Two layers or more, unless they already are one link group.
+  return found >= 2U && !(groups.size() == 1U && *groups.begin() != 0U);
+}
+
+bool MainWindow::selected_layers_have_links() const {
+  if (!has_active_document() || preview_dialog_edit_locked()) {
+    return false;
+  }
+  const auto& layers = std::as_const(document()).layers();
+  const auto ids = selected_or_active_layer_ids();
+  return std::any_of(ids.begin(), ids.end(), [&layers](LayerId id) { return effective_link_group(layers, id) != 0U; });
+}
+
+bool MainWindow::selected_layers_are_one_link_group() const {
+  if (!has_active_document() || preview_dialog_edit_locked()) {
+    return false;
+  }
+  const auto& layers = std::as_const(document()).layers();
+  const auto ids = selected_or_active_layer_ids();
+  std::set<std::uint32_t> groups;
+  for (const auto id : ids) {
+    if (find_layer_in_tree(layers, id) != nullptr) {
+      groups.insert(effective_link_group(layers, id));
+    }
+  }
+  return groups.size() == 1U && *groups.begin() != 0U;
+}
+
+void MainWindow::refresh_layer_link_action_states() {
+  const bool can_link = can_link_selected_layers();
+  const bool linked = selected_layers_have_links();
+  // One rule for the Arrange entry, the row menu and the footer button (GitHub issue 656).
+  const bool unlinks = selected_layers_are_one_link_group();
+  if (layer_link_action_ != nullptr) {
+    layer_link_action_->setEnabled(can_link || unlinks);
+    const auto text = unlinks ? tr("U&nlink Layers") : tr("&Link Layers");
+    if (layer_link_action_->text() != text) {
+      layer_link_action_->setText(text);
+    }
+  }
+  if (layer_unlink_action_ != nullptr) {
+    layer_unlink_action_->setEnabled(linked);
+  }
+  if (layer_select_linked_action_ != nullptr) {
+    layer_select_linked_action_->setEnabled(linked);
+  }
+  if (layer_link_button_ != nullptr) {
+    layer_link_button_->setEnabled(can_link || unlinks);
+    const auto tip = unlinks ? tr("Unlink Layers") : tr("Link Layers");
+    if (layer_link_button_->toolTip() != tip) {
+      layer_link_button_->setToolTip(tip);
+    }
+  }
+}
+
+void MainWindow::link_selected_layers() {
+  if (preview_dialog_edit_locked()) {
+    show_preview_dialog_edit_lock_message();
+    return;
+  }
+  if (!has_active_document()) {
+    return;
+  }
+  if (!can_link_selected_layers()) {
+    show_status_error(tr("Select two or more layers to link"));
+    return;
+  }
+  const auto ids = selected_or_active_layer_ids();
+  auto& doc = document();
+  // A link is no pixel edit: locked layers take one too, as in Photoshop.
+  push_undo_snapshot(tr("Link Layers"));
+  link_layers(doc.layers(), ids);
+  const auto active = std::as_const(doc).active_layer_id();
+  refresh_layer_list();
+  select_layers_in_layer_list(ids, active.value_or(ids.front()));
+  refresh_layer_link_action_states();
+  if (canvas_ != nullptr) {
+    canvas_->update();
+  }
+  refresh_options_bar();
+}
+
+void MainWindow::unlink_selected_layers() {
+  if (preview_dialog_edit_locked()) {
+    show_preview_dialog_edit_lock_message();
+    return;
+  }
+  if (!has_active_document()) {
+    return;
+  }
+  if (!selected_layers_have_links()) {
+    show_status_error(tr("The selected layers are not linked"));
+    return;
+  }
+  const auto ids = selected_or_active_layer_ids();
+  auto& doc = document();
+  push_undo_snapshot(tr("Unlink Layers"));
+  unlink_layers(doc.layers(), ids);
+  const auto active = std::as_const(doc).active_layer_id();
+  refresh_layer_list();
+  select_layers_in_layer_list(ids, active.value_or(ids.front()));
+  refresh_layer_link_action_states();
+  if (canvas_ != nullptr) {
+    canvas_->update();
+  }
+  refresh_options_bar();
+}
+
+void MainWindow::toggle_selected_layers_link() {
+  if (selected_layers_are_one_link_group()) {
+    unlink_selected_layers();
+  } else {
+    link_selected_layers();
+  }
+}
+
+void MainWindow::select_linked_layers() {
+  if (preview_dialog_edit_locked()) {
+    show_preview_dialog_edit_lock_message();
+    return;
+  }
+  if (!has_active_document()) {
+    return;
+  }
+  if (!selected_layers_have_links()) {
+    show_status_error(tr("The selected layers are not linked"));
+    return;
+  }
+  finish_active_text_editor();
+  const auto& layers = std::as_const(document()).layers();
+  const auto ids = with_linked_layer_ids(layers, selected_or_active_layer_ids());
+  const auto active = std::as_const(document()).active_layer_id();
+  select_layers_in_layer_list(ids, active.value_or(ids.front()));
+  refresh_options_bar();
+}
+
+void MainWindow::refresh_layer_menu_lock_and_style_states() {
+  const bool has_document = has_active_document() && !preview_dialog_edit_locked();
+  const auto ids = has_document ? selected_or_active_layer_ids() : std::vector<LayerId>{};
+  const auto all_selected_have_lock = [this, &ids](LayerLockFlags flag) {
+    return !ids.empty() && std::all_of(ids.begin(), ids.end(), [this, flag](LayerId id) {
+      const auto* layer = std::as_const(document()).find_layer(id);
+      return layer != nullptr && (layer_lock_flags(*layer) & flag) == flag;
+    });
+  };
+  // The layer context menu's Lock submenu checks these the same way.
+  const std::array<std::pair<QAction*, LayerLockFlags>, 5> locks{{
+      {layer_lock_transparent_pixels_action_, kLayerLockTransparentPixels},
+      {layer_menu_lock_image_pixels_action_, kLayerLockImagePixels},
+      {layer_menu_lock_position_action_, kLayerLockPosition},
+      {layer_menu_lock_all_action_, kLayerLockAll},
+      {layer_prevent_auto_nesting_action_, kLayerLockArtboardAutonest},
+  }};
+  for (const auto& [action, flag] : locks) {
+    if (action != nullptr) {
+      action->setChecked(all_selected_have_lock(flag));
+    }
+  }
+  refresh_layer_style_action_states();
+  const bool can_edit = has_document && can_edit_layer_styles();
+  for (auto* action : layer_menu_style_page_actions_) {
+    action->setEnabled(can_edit);
+  }
+  if (layer_menu_show_layer_styles_action_ != nullptr) {
+    const Layer* active = nullptr;
+    if (has_document) {
+      if (const auto id = std::as_const(document()).active_layer_id(); id.has_value()) {
+        active = std::as_const(document()).find_layer(*id);
+      }
+    }
+    const bool has_style = active != nullptr && !active->layer_style().empty();
+    layer_menu_show_layer_styles_action_->setEnabled(
+        has_style && !layer_is_effectively_locked(std::as_const(document()).layers(), active->id()));
+    layer_menu_show_layer_styles_action_->setChecked(has_style && active->layer_style().effects_visible);
+  }
+}
+
+void MainWindow::edit_active_fill_layer_settings() {
+  if (!has_active_document()) {
+    return;
+  }
+  const auto shape_ids = editable_selected_shape_layer_ids();
+  const bool only_fill_layers =
+      !shape_ids.empty() && std::all_of(shape_ids.begin(), shape_ids.end(), [this](LayerId id) {
+        const auto* layer = std::as_const(document()).find_layer(id);
+        return layer != nullptr && layer_is_fill_layer(*layer);
+      });
+  if (!only_fill_layers) {
+    show_status_error(tr("Select a fill layer to edit its settings"));
+    return;
+  }
+  edit_active_shape_appearance();
+}
+
+void MainWindow::refresh_layer_style_action_states() {
+  bool can_copy = false;
+  bool can_paste = false;
+  bool can_delete = false;
+  if (has_active_document() && !preview_dialog_edit_locked()) {
+    const auto ids = selected_or_active_layer_ids();
+    int valid_layer_count = 0;
+    int paste_target_count = 0;
+    for (const auto id : ids) {
+      const auto* layer = document().find_layer(id);
+      if (layer == nullptr) {
+        continue;
+      }
+      ++valid_layer_count;
+      paste_target_count += layer_is_document_background(id) ? 0 : 1;
+      can_delete = can_delete || !layer->layer_style().empty();
+    }
+    can_copy = ids.size() == 1U && valid_layer_count == 1;
+    can_paste = layer_style_clipboard_.has_value() && paste_target_count > 0;
+  }
+
+  if (layer_copy_style_action_ != nullptr) {
+    layer_copy_style_action_->setEnabled(can_copy);
+  }
+  if (layer_paste_style_action_ != nullptr) {
+    layer_paste_style_action_->setEnabled(can_paste);
+  }
+  if (layer_delete_style_action_ != nullptr) {
+    layer_delete_style_action_->setEnabled(can_delete);
+  }
+}
+
+namespace {
+
+// The layer that becomes active after deleting `deleted_roots` (GitHub issue 249): the
+// sibling below the lowest deleted root in its group, the one above when that root was the
+// bottom of its group, else the group itself; nullopt when the root had no parent and no
+// sibling is left. Layers are stored bottom first, so "below" is a lower index.
+std::optional<LayerId> layer_to_activate_after_delete(const std::vector<Layer>& layers,
+                                                      const std::vector<LayerId>& deleted_roots) {
+  const std::set<LayerId> deleted(deleted_roots.begin(), deleted_roots.end());
+  struct Found {
+    const std::vector<Layer>* siblings{nullptr};
+    std::size_t index{0};
+    std::optional<LayerId> parent;
+  };
+  std::optional<Found> lowest;
+  // Panel order, top to bottom: a folder, then its contents, then the sibling below it. The
+  // last deleted root met is the lowest in the panel.
+  const auto visit = [&](auto&& self, const std::vector<Layer>& siblings, std::optional<LayerId> parent) -> void {
+    for (std::size_t index = siblings.size(); index-- > 0;) {
+      const auto& layer = siblings[index];
+      if (deleted.contains(layer.id())) {
+        lowest = Found{&siblings, index, parent};
+        continue;
+      }
+      self(self, layer.children(), layer.id());
+    }
+  };
+  visit(visit, layers, std::nullopt);
+  if (!lowest.has_value()) {
+    return std::nullopt;
+  }
+  const auto& siblings = *lowest->siblings;
+  for (std::size_t index = lowest->index; index-- > 0;) {
+    if (!deleted.contains(siblings[index].id())) {
+      return siblings[index].id();
+    }
+  }
+  for (auto index = lowest->index + 1; index < siblings.size(); ++index) {
+    if (!deleted.contains(siblings[index].id())) {
+      return siblings[index].id();
+    }
+  }
+  return lowest->parent;
+}
+
+// Delete (Clear) and Delete Layer in a Free Transform or Warp session cancel it, then
+// act on the untransformed layer (GitHub issue 455): the session would otherwise outlive
+// its layer, or commit pixels the clear had removed.
+void cancel_transform_session_for_layer_command(CanvasWidget* canvas) {
+  if (canvas == nullptr) {
+    return;
+  }
+  if (canvas->warp_transform_active()) {
+    canvas->cancel_warp_transform();
+  } else if (canvas->free_transform_active()) {
+    canvas->cancel_free_transform();
+  }
+}
+
+}  // namespace
+
+void MainWindow::delete_active_layer() {
+  // No select_only_layer_if_none_active here (docs/layer-panel-selection.md, "Deselected state").
+  auto ids = selected_or_active_layer_ids();
+  if (ids.empty()) {
+    if (has_active_document()) {
+      show_select_layer_first(tr("Delete Layer"));
+    }
+    return;
+  }
+  delete_layers(std::move(ids));
+}
+
+void MainWindow::delete_layers(std::vector<LayerId> ids) {
+  if (preview_dialog_edit_locked()) {
+    show_preview_dialog_edit_lock_message();
+    refresh_layer_list();
+    return;
+  }
+  ids = root_drop_layer_ids(document().layers(), ids);
+  if (ids.empty()) {
+    return;
+  }
+  cancel_transform_session_for_layer_command(canvas_);
+  push_undo_snapshot(tr("Delete layer"));
+  const auto deleted = static_cast<int>(ids.size());
+  remove_layers_in_open_undo_step(std::move(ids));
+  fire_theme_event(ThemeSoundEvent::LayerDeleted, {{QStringLiteral("count"), deleted}});
+}
+
+void MainWindow::remove_layers_in_open_undo_step(std::vector<LayerId> ids) {
+  ids = root_drop_layer_ids(document().layers(), ids);
+  if (ids.empty()) {
+    return;
+  }
+  auto& doc = document();
+  const auto next_active = layer_to_activate_after_delete(std::as_const(doc).layers(), ids);
+  for (const auto id : ids) {
+    doc.remove_layer(id);
+  }
+  if (next_active.has_value() && std::as_const(doc).find_layer(*next_active) != nullptr) {
+    doc.set_active_layer(*next_active);
+  }
+  refresh_layer_list();
+  refresh_layer_controls();
+  canvas_->document_changed();
+}
+
+void MainWindow::move_active_layer(int direction) {
+  if (preview_dialog_edit_locked()) {
+    show_preview_dialog_edit_lock_message();
+    refresh_layer_list();
+    return;
+  }
+  const auto ids = selected_or_active_layer_ids();
+  if (ids.empty()) {
+    show_select_layer_first(tr("Arrange"));
+    return;
+  }
+  if (direction == 0) {
+    return;
+  }
+
+  auto moved_document = document();
+  const std::set<LayerId> selected(ids.begin(), ids.end());
+  bool changed = false;
+  const auto move_siblings = [&](auto&& self, std::vector<Layer>& layers) -> void {
+    for (auto& layer : layers) {
+      if (!selected.contains(layer.id()) && !std::as_const(layer).children().empty()) {
+        self(self, layer.children());
+      }
+    }
+    if (direction > 0) {
+      for (int index = static_cast<int>(layers.size()) - 2; index >= 0; --index) {
+        if (selected.contains(layers[static_cast<std::size_t>(index)].id()) &&
+            !selected.contains(layers[static_cast<std::size_t>(index + 1)].id())) {
+          std::iter_swap(layers.begin() + index, layers.begin() + index + 1);
+          changed = true;
+        }
+      }
+    } else {
+      for (int index = 1; index < static_cast<int>(layers.size()); ++index) {
+        if (selected.contains(layers[static_cast<std::size_t>(index)].id()) &&
+            !selected.contains(layers[static_cast<std::size_t>(index - 1)].id())) {
+          std::iter_swap(layers.begin() + index, layers.begin() + index - 1);
+          changed = true;
+        }
+      }
+    }
+  };
+  move_siblings(move_siblings, moved_document.layers());
+  if (!changed || refuse_background_stack_change(moved_document.layers())) {
+    return;
+  }
+  push_undo_snapshot(tr("Move layer"));
+  document() = std::move(moved_document);
+  refresh_layer_list();
+  refresh_layer_controls();
+  canvas_->document_changed();
+}
+
+void MainWindow::arrange_selected_layers_to_end(bool front) {
+  if (preview_dialog_edit_locked()) {
+    show_preview_dialog_edit_lock_message();
+    refresh_layer_list();
+    return;
+  }
+  const auto ids = selected_or_active_layer_ids();
+  if (ids.empty()) {
+    show_select_layer_first(tr("Arrange"));
+    return;
+  }
+  std::set<LayerId> listed(ids.begin(), ids.end());
+  std::optional<LayerId> background_id;
+  if (const auto* background = document_background_layer(); background != nullptr) {
+    // The Background stays at the bottom; the rest of the selection still moves.
+    background_id = background->id();
+    listed.erase(*background_id);
+  }
+  if (listed.empty()) {
+    return;
+  }
+  auto& doc = document();
+  auto trial_layers = std::as_const(doc).layers();
+  if (!arrange_layers_to_end(trial_layers, listed, front, background_id) ||
+      refuse_background_stack_change(trial_layers)) {
+    return;
+  }
+  push_undo_snapshot(front ? tr("Bring to front") : tr("Send to back"));
+  doc.layers() = std::move(trial_layers);
+  refresh_layer_list();
+  refresh_layer_controls();
+  canvas_->document_changed();
+}
+
+void MainWindow::reverse_selected_layers() {
+  if (preview_dialog_edit_locked()) {
+    show_preview_dialog_edit_lock_message();
+    refresh_layer_list();
+    return;
+  }
+  const auto ids = selected_or_active_layer_ids();
+  std::optional<LayerId> background_id;
+  if (const auto* background = document_background_layer(); background != nullptr) {
+    background_id = background->id();  // the Background stays at the bottom
+  }
+  auto& doc = document();
+  auto trial_layers = std::as_const(doc).layers();
+  if (!reverse_layers(trial_layers, std::set<LayerId>(ids.begin(), ids.end()), background_id)) {
+    show_status_error(tr("Select two or more layers in the same folder to reverse their order"));
+    return;
+  }
+  if (refuse_background_stack_change(trial_layers)) {
+    return;
+  }
+  push_undo_snapshot(tr("Reverse layers"));
+  doc.layers() = std::move(trial_layers);
+  refresh_layer_list();
+  refresh_layer_controls();
+  canvas_->document_changed();
+}
+
+void MainWindow::move_selected_layers_out_of_folder(bool above) {
+  if (preview_dialog_edit_locked()) {
+    show_preview_dialog_edit_lock_message();
+    refresh_layer_list();
+    return;
+  }
+  const auto ids = selected_or_active_layer_ids();
+  if (ids.empty()) {
+    return;
+  }
+  auto& doc = document();
+  auto trial_layers = std::as_const(doc).layers();
+  if (!move_layers_out_of_folder(trial_layers, std::set<LayerId>(ids.begin(), ids.end()), above)) {
+    show_status_error(tr("The selected layers are not in a folder"));
+    return;
+  }
+  if (refuse_background_stack_change(trial_layers)) {
+    return;
+  }
+  push_undo_snapshot(tr("Move layer out of folder"));
+  doc.layers() = std::move(trial_layers);
+  refresh_layer_list();
+  refresh_layer_controls();
+  canvas_->document_changed();
+}
+
+void MainWindow::populate_layer_rasterize_menu(QMenu* menu) {
+  if (menu == nullptr) {
+    return;
+  }
+  menu->clear();  // the shared actions belong to the window and other menus, so they stay
+  if (layer_rasterize_action_ != nullptr) {
+    menu->addAction(layer_rasterize_action_);
+  }
+  if (layer_rasterize_layer_style_action_ != nullptr) {
+    menu->addAction(layer_rasterize_layer_style_action_);
+  }
+  if (layer_trace_image_action_ != nullptr) {
+    menu->addSeparator();
+    menu->addAction(layer_trace_image_action_);  // its own guards report non-pixel layers
+  }
+  // Text layers: the Type menu's outline commands (GitHub issue 598). They sit with the other
+  // conversions because the context menu's top level is at its row bound (#461).
+  if (!has_active_document() || type_convert_to_shape_action_ == nullptr ||
+      type_create_work_path_action_ == nullptr) {
+    return;
+  }
+  const auto& doc = std::as_const(document());
+  const auto active_id = doc.active_layer_id();
+  const auto* active_layer = active_id.has_value() ? doc.find_layer(*active_id) : nullptr;
+  if (active_layer != nullptr && layer_is_text(*active_layer)) {
+    menu->addSeparator();
+    menu->addAction(type_convert_to_shape_action_);
+    menu->addAction(type_create_work_path_action_);
+  }
+}
+
+void MainWindow::show_layer_context_menu(QPoint position) {
+  if (layer_list_ == nullptr || !has_active_document()) {
+    return;
+  }
+
+  auto* item = layer_list_->itemAt(position);
+  if (item != nullptr && !item->isSelected()) {
+    layer_list_->clearSelection();
+    layer_list_->setCurrentItem(item);
+    item->setSelected(true);
+  }
+  // A right-click inside an effect row opens that effect's own menu (GitHub issue 256).
+  if (item != nullptr) {
+    if (auto* row_widget = layer_list_->itemWidget(item); row_widget != nullptr) {
+      const auto global = layer_list_->viewport()->mapToGlobal(position);
+      // The eye column of the main row (the eye and the color-label strip left of it) opens
+      // the eye menu (GitHub issues 276 and 407).
+      auto* eye = row_widget->findChild<QWidget*>(QStringLiteral("layerVisibilityCheck"));
+      auto* main_row = row_widget->findChild<QWidget*>(QStringLiteral("layerMainRow"));
+      if (eye != nullptr && eye->isVisible() && main_row != nullptr) {
+        const auto local = main_row->mapFromGlobal(global);
+        const auto eye_right = eye->mapTo(main_row, QPoint(eye->width(), 0)).x();
+        if (main_row->rect().contains(local) && local.x() < eye_right) {
+          show_layer_eye_color_menu(static_cast<LayerId>(item->data(kLayerIdRole).toULongLong()), global);
+          return;
+        }
+      }
+      // A layer or mask thumbnail opens its short menu (#431, #432).
+      if (show_layer_thumbnail_context_menu(item, position)) {
+        return;
+      }
+      // So does an fx or smart object badge (#473, #474).
+      if (show_layer_badge_context_menu(item, position)) {
+        return;
+      }
+      for (auto* entry_row : row_widget->findChildren<QWidget*>(QStringLiteral("layerEffectEntryRow"))) {
+        if (!entry_row->isVisible() || !entry_row->rect().contains(entry_row->mapFromGlobal(global))) {
+          continue;
+        }
+        const auto kind = entry_row->property("layerEffectKind");
+        const auto index = entry_row->property("layerEffectIndex");
+        if (kind.isValid() && index.isValid()) {
+          show_layer_effect_context_menu(static_cast<LayerId>(item->data(kLayerIdRole).toULongLong()),
+                                         static_cast<LayerStyleEffect>(kind.toInt()),
+                                         static_cast<std::size_t>(index.toULongLong()), global);
+          return;
+        }
+      }
+    }
+  }
+
+  const auto ids = selected_or_active_layer_ids();
+  if (ids.size() == 1U && layer_is_document_background(ids.front())) {
+    show_background_context_menu(layer_list_->viewport()->mapToGlobal(position));
+    return;
+  }
+  const auto has_layer = !ids.empty();
+  const auto active_id = document().active_layer_id();
+  // Const on purpose: the menu only reads the layer, and the non-const
+  // mask()/smart_filter_stack() accessors bump revisions on access (see
+  // docs/performance.md) — a plain right-click was
+  // invalidating the layer's thumbnail and style-mask cache entries.
+  const auto* active_layer = active_id.has_value() ? std::as_const(document()).find_layer(*active_id) : nullptr;
+  // Selected folders count through their contents, matching what the
+  // rasterize actions actually touch.
+  const auto rasterize_ids = rasterize_target_layer_ids(ids);
+  const auto has_rasterizable_layer =
+      std::any_of(rasterize_ids.begin(), rasterize_ids.end(), [this](LayerId id) {
+        const auto* layer = document().find_layer(id);
+        return layer != nullptr && !layer_id_locks_image_pixels(id) && layer_can_rasterize(*layer);
+      });
+  const auto has_rasterizable_layer_style =
+      std::any_of(rasterize_ids.begin(), rasterize_ids.end(), [this](LayerId id) {
+        const auto* layer = document().find_layer(id);
+        return layer != nullptr && !layer_id_locks_image_pixels(id) && layer_can_rasterize_layer_style(*layer);
+      });
+
+  // The flat menu outgrew the screen (July 2026, and again at 1366x768 in #461), so related
+  // actions live in submenus. Edit Layer Styles... deliberately stays the FIRST item, always;
+  // ui_layer_context_menu_fits_short_screens caps the top-level rows and the menu height.
+  QMenu menu(this);
+  menu.setObjectName(QStringLiteral("layerContextMenu"));
+  if (layer_blending_options_action_ != nullptr) {
+    layer_blending_options_action_->setEnabled(active_layer != nullptr);
+    menu.addAction(layer_blending_options_action_);
+  }
+  QAction* edit_adjustment_action = nullptr;
+  if (active_layer != nullptr && active_layer->kind() == LayerKind::Adjustment) {
+    edit_adjustment_action = menu.addAction(simple_icon(QStringLiteral("ADJ"), QColor(190, 220, 255)),
+                                            tr("Edit Adjustment..."));
+  }
+  // Shape and fill layers surface their appearance editor here too (double-
+  // click on the row is the other entry point); same gate as that site.
+  QAction* edit_shape_appearance_action = nullptr;
+  if (const auto shape_ids = editable_selected_shape_layer_ids(); !shape_ids.empty()) {
+    // Fill layers alone open their fill settings (GitHub issue 580 follow-up).
+    const bool only_fill_layers = std::all_of(shape_ids.begin(), shape_ids.end(), [this](LayerId id) {
+      const auto* layer = std::as_const(document()).find_layer(id);
+      return layer != nullptr && layer_is_fill_layer(*layer);
+    });
+    edit_shape_appearance_action =
+        menu.addAction(simple_icon(QStringLiteral("SHP"), QColor(190, 220, 255)),
+                       only_fill_layers ? tr("Edit Fill Settings...") : tr("Edit Shape Appearance..."));
+    edit_shape_appearance_action->setObjectName(
+        QStringLiteral("layerContextEditShapeAppearanceAction"));
+  }
+  // Two or more combinable shape layers: Layer > Shape's Combine Shapes commands (GitHub #521).
+  refresh_combine_shapes_action_states();
+  if (layer_combine_actions_[0] != nullptr && layer_combine_actions_[0]->isEnabled() &&
+      editable_selected_shape_layer_ids().size() >= 2) {
+    auto* combine_menu = menu.addMenu(simple_icon(QStringLiteral("SHP"), QColor(190, 220, 255)), tr("Combine Shapes"));
+    combine_menu->setObjectName(QStringLiteral("layerContextCombineShapesMenu"));
+    for (auto* action : layer_combine_actions_) {
+      combine_menu->addAction(action);
+    }
+    // Merge Shapes bakes the layers into one outline (GitHub #555).
+    if (path_merge_shapes_action_ != nullptr) {
+      refresh_path_edit_action_states();
+      combine_menu->addSeparator();
+      combine_menu->addAction(path_merge_shapes_action_);
+    }
+  }
+  QAction* warp_text_action = nullptr;
+  QAction* text_orientation_action = nullptr;
+  if (active_layer != nullptr && layer_is_text(*active_layer)) {
+    warp_text_action = menu.addAction(simple_icon(QStringLiteral("T"), QColor(190, 220, 255)),
+                                      tr("Warp Text..."));
+    warp_text_action->setObjectName(QStringLiteral("layerContextWarpTextAction"));
+    const bool vertical = active_layer->metadata().contains(kLayerMetadataTextOrientation) &&
+                          active_layer->metadata().at(kLayerMetadataTextOrientation) == kTextOrientationVertical;
+    refresh_flip_text_on_path_action_state();
+    if (type_flip_text_on_path_action_ != nullptr && type_flip_text_on_path_action_->isEnabled()) {
+      // Text on a path offers its flip in this row instead: vertical type is not set on paths
+      // (Type > Orientation still switches it), and the top level is at its row bound (#461).
+      menu.addAction(type_flip_text_on_path_action_);
+    } else {
+      text_orientation_action = menu.addAction(simple_icon(QStringLiteral("T"), QColor(190, 220, 255)),
+                                               vertical ? tr("Horizontal Text") : tr("Vertical Text"));
+      text_orientation_action->setObjectName(QStringLiteral("layerContextTextOrientationAction"));
+    }
+  }
+  if (layer_clipping_mask_action_ != nullptr) {
+    // Kept near the top so Create/Release Clipping Mask stays discoverable.
+    refresh_layer_clipping_action_state();
+    menu.addAction(layer_clipping_mask_action_);
+  }
+  refresh_layer_style_action_states();
+  auto* style_menu = menu.addMenu(tr("Layer Style"));
+  style_menu->setObjectName(QStringLiteral("layerContextStyleMenu"));
+  if (layer_copy_style_action_ != nullptr) {
+    style_menu->addAction(layer_copy_style_action_);
+  }
+  if (layer_paste_style_action_ != nullptr) {
+    style_menu->addAction(layer_paste_style_action_);
+  }
+  if (layer_delete_style_action_ != nullptr) {
+    style_menu->addAction(layer_delete_style_action_);
+  }
+  menu.addSeparator();
+  auto* new_menu = menu.addMenu(tr("New"));
+  new_menu->setObjectName(QStringLiteral("layerContextNewMenu"));
+  auto* new_action = new_menu->addAction(simple_icon(QStringLiteral("new")), tr("New Layer"));
+  auto* new_folder_action =
+      new_menu->addAction(simple_icon(QStringLiteral("dir"), QColor(245, 205, 105)), tr("New Folder"));
+  auto* new_adjustment_menu = new_menu->addMenu(simple_icon(QStringLiteral("ADJ"), QColor(190, 220, 255)),
+                                                tr("New Adjustment Layer"));
+  populate_new_adjustment_layer_menu(new_adjustment_menu);
+  // A right-clicked group (every selected row a group) gets Photoshop's group wording
+  // for the commands that act on it (GitHub issue 203).
+  const bool group_target =
+      active_layer != nullptr && active_layer->kind() == LayerKind::Group &&
+      std::all_of(ids.begin(), ids.end(), [this](LayerId id) {
+        const auto* layer = std::as_const(document()).find_layer(id);
+        return layer != nullptr && layer->kind() == LayerKind::Group;
+      });
+  auto* duplicate_action = menu.addAction(simple_icon(QStringLiteral("dup")),
+                                          group_target ? tr("Duplicate Group") : tr("Duplicate Layer"));
+  auto* rename_action = menu.addAction(simple_icon(QStringLiteral("RN")),
+                                       group_target ? tr("Rename Group...") : tr("Rename Layer..."));
+  auto* delete_action = menu.addAction(simple_icon(QStringLiteral("trash")),
+                                       group_target ? tr("Delete Group") : tr("Delete Layer"));
+  // Color and Ungroup apart from Delete (GitHub issue 656).
+  menu.addSeparator();
+  // The Layer menu's color labels (GitHub issue 244), on the same shared actions.
+  auto* color_menu = menu.addMenu(tr("Color"));
+  color_menu->setObjectName(QStringLiteral("layerContextColorMenu"));
+  populate_layer_color_actions(color_menu);
+  refresh_layer_color_action_states();
+  QAction* ungroup_action = nullptr;
+  if (active_layer != nullptr && active_layer->kind() == LayerKind::Group) {
+    ungroup_action = menu.addAction(simple_icon(QStringLiteral("dir"), QColor(245, 205, 105)),
+                                    tr("Ungroup Layers"));
+  }
+  // Layer linking (GitHub issue 656): the Arrange menu's one Link Layers / Unlink Layers
+  // entry when it applies, Select Linked when a selected layer is linked. A single unlinked
+  // layer gets neither. A group of their own (QMenu collapses the separator when neither shows).
+  refresh_layer_link_action_states();
+  menu.addSeparator();
+  if (layer_link_action_ != nullptr && layer_link_action_->isEnabled()) {
+    menu.addAction(layer_link_action_);
+  }
+  if (layer_select_linked_action_ != nullptr && layer_select_linked_action_->isEnabled()) {
+    menu.addAction(layer_select_linked_action_);
+  }
+  menu.addSeparator();
+  auto* merge_down_action =
+      menu.addAction(simple_icon(QStringLiteral("merge-down")), tr("Merge Down"));
+  // Merge Down stays on top as the common one; the whole-document merges share a submenu.
+  auto* merge_menu = menu.addMenu(tr("Merge"));
+  merge_menu->setObjectName(QStringLiteral("layerContextMergeMenu"));
+  auto* merge_visible_layers_action = merge_menu->addAction(simple_icon(QStringLiteral("merge")), tr("Merge Visible"));
+  merge_visible_layers_action->setObjectName(QStringLiteral("layerContextMergeVisibleLayersAction"));
+  merge_visible_layers_action->setEnabled(merge_visible_available(std::as_const(document())));
+  auto* merge_visible_action =
+      merge_menu->addAction(simple_icon(QStringLiteral("merge")), tr("Merge Visible to New Layer (Copy)"));
+  // Off here when nothing selected draws; the window's hotkey stays live (the command reports it).
+  const auto reenable_merge_selected = qScopeGuard([this] {
+    if (layer_merge_selected_to_new_action_ != nullptr) { layer_merge_selected_to_new_action_->setEnabled(has_active_document()); }
+  });
+  if (layer_merge_selected_to_new_action_ != nullptr) {
+    layer_merge_selected_to_new_action_->setEnabled(
+        !selected_document_for_merge_copy(std::as_const(document()), selected_or_active_layer_ids()).layers().empty());
+    merge_menu->addAction(layer_merge_selected_to_new_action_);
+  }
+  if (image_flatten_action_ != nullptr) {
+    merge_menu->addAction(image_flatten_action_);
+  }
+  auto* rasterize_menu = menu.addMenu(tr("Rasterize"));
+  rasterize_menu->setObjectName(QStringLiteral("layerContextRasterizeMenu"));
+  if (layer_rasterize_action_ != nullptr) {
+    layer_rasterize_action_->setEnabled(has_rasterizable_layer);
+  }
+  if (layer_rasterize_layer_style_action_ != nullptr) {
+    layer_rasterize_layer_style_action_->setEnabled(has_rasterizable_layer_style);
+  }
+  populate_layer_rasterize_menu(rasterize_menu);
+  {
+    refresh_smart_object_action_states();
+    auto* smart_objects_menu = menu.addMenu(tr("Smart Objects"));
+    smart_objects_menu->setObjectName(QStringLiteral("layerContextSmartObjectsMenu"));
+    for (auto* action : {layer_convert_smart_object_action_, layer_smart_object_edit_action_,
+                         layer_smart_object_replace_action_, layer_smart_object_update_action_,
+                         layer_smart_object_relink_action_, layer_smart_object_embed_action_,
+                         layer_smart_object_export_action_, layer_smart_object_via_copy_action_}) {
+      if (action != nullptr) {
+        smart_objects_menu->addAction(action);
+      }
+    }
+    smart_objects_menu->addSeparator();
+    for (auto* action : {layer_smart_object_to_layers_action_, layer_smart_object_to_normal_action_}) {
+      if (action != nullptr) {
+        smart_objects_menu->addAction(action);
+      }
+    }
+  }
+  // No Visible entry (#461): the eye and its right-click menu cover it.
+  menu.addSeparator();
+  auto* lock_menu = menu.addMenu(tr("Lock"));
+  const auto all_selected_have_lock = [this, &ids](LayerLockFlags flag) {
+    return !ids.empty() && std::all_of(ids.begin(), ids.end(), [this, flag](LayerId id) {
+      const auto* layer = document().find_layer(id);
+      return layer != nullptr && (layer_lock_flags(*layer) & flag) == flag;
+    });
+  };
+  // The shared registered action (its "/" shows here, GitHub issue 529); it runs from its own
+  // triggered signal, so the dispatch below has no branch for it.
+  if (layer_lock_transparent_pixels_action_ != nullptr) {
+    layer_lock_transparent_pixels_action_->setChecked(all_selected_have_lock(kLayerLockTransparentPixels));
+    lock_menu->addAction(layer_lock_transparent_pixels_action_);
+  }
+  auto* image_lock_action = lock_menu->addAction(tr("Lock Image Pixels"));
+  image_lock_action->setCheckable(true);
+  image_lock_action->setChecked(all_selected_have_lock(kLayerLockImagePixels));
+  auto* position_lock_action = lock_menu->addAction(tr("Lock Position"));
+  position_lock_action->setCheckable(true);
+  position_lock_action->setChecked(all_selected_have_lock(kLayerLockPosition));
+  lock_menu->addSeparator();
+  auto* all_lock_action = lock_menu->addAction(tr("Lock All"));
+  all_lock_action->setCheckable(true);
+  all_lock_action->setChecked(all_selected_have_lock(kLayerLockAll));
+  if (layer_prevent_auto_nesting_action_ != nullptr) {
+    // The shared registered action (its hotkey shows here); it runs from its own triggered
+    // signal, so the dispatch below has no branch for it.
+    lock_menu->addSeparator();
+    layer_prevent_auto_nesting_action_->setChecked(all_selected_have_lock(kLayerLockArtboardAutonest));
+    lock_menu->addAction(layer_prevent_auto_nesting_action_);
+  }
+  auto* select_opaque_action = menu.addAction(tr("Load Layer Transparency"));
+  const auto* active_smart_filters =
+      active_layer != nullptr ? active_layer->smart_filter_stack() : nullptr;
+  const auto has_editable_smart_mask =
+      active_smart_filters != nullptr &&
+      active_smart_filters->support == SmartFilterStackSupport::Supported &&
+      !active_smart_filters->mask.pixels.empty() &&
+      smart_filter_mask_document_editing_supported(
+          document().width(), document().height());
+  const auto editing_smart_mask =
+      active_layer != nullptr && canvas_ != nullptr &&
+      canvas_->editing_smart_filter_mask() &&
+      canvas_->smart_filter_mask_owner_id() == active_layer->id();
+  const auto smart_mask_context =
+      editing_smart_mask ||
+      (active_layer != nullptr && !active_layer->mask().has_value() &&
+       has_editable_smart_mask);
+  // Add, Link, Disable, Invert, Apply and Delete act on every selected layer they apply to
+  // (local-029); the checkable entries show the active layer's mask, else the first selected one's.
+  const auto mask_state = layer_mask_command_state();
+  const auto* mask_toggle_layer = mask_state.toggle_layer != nullptr ? mask_state.toggle_layer : active_layer;
+  auto* mask_menu = menu.addMenu(tr("Layer Mask"));
+  mask_menu->setObjectName(QStringLiteral("layerContextMaskMenu"));
+  auto* add_mask_action = mask_menu->addAction(simple_icon(QStringLiteral("mask"), QColor(210, 220, 230)),
+                                               tr("Add Layer Mask"));
+  auto* edit_mask_action = mask_menu->addAction(simple_icon(QStringLiteral("mask"), QColor(150, 205, 255)),
+                                                tr("Edit Layer Mask"));
+  edit_mask_action->setCheckable(true);
+  edit_mask_action->setChecked(
+      canvas_ != nullptr &&
+      ((active_layer != nullptr && active_layer->mask().has_value() &&
+        canvas_->layer_edit_target() == CanvasWidget::LayerEditTarget::Mask) ||
+       editing_smart_mask));
+  auto* overlay_mask_action = mask_menu->addAction(simple_icon(QStringLiteral("mask"), QColor(255, 120, 120)),
+                                                   tr("Show Mask Overlay"));
+  overlay_mask_action->setCheckable(true);
+  overlay_mask_action->setChecked(
+      canvas_ != nullptr &&
+      (canvas_->layer_edit_target() == CanvasWidget::LayerEditTarget::Mask ||
+       editing_smart_mask) &&
+      canvas_->mask_display_mode() == CanvasWidget::MaskDisplayMode::Overlay);
+  auto* view_mask_action = mask_menu->addAction(simple_icon(QStringLiteral("mask"), QColor(235, 235, 235)),
+                                                tr("View Layer Mask"));
+  view_mask_action->setCheckable(true);
+  view_mask_action->setChecked(
+      canvas_ != nullptr &&
+      (canvas_->layer_edit_target() == CanvasWidget::LayerEditTarget::Mask ||
+       editing_smart_mask) &&
+      canvas_->mask_display_mode() == CanvasWidget::MaskDisplayMode::Grayscale);
+  mask_menu->addSeparator();
+  auto* link_mask_action = mask_menu->addAction(simple_icon(QStringLiteral("link"), QColor(210, 220, 230)),
+                                                tr("Link Layer Mask"));
+  link_mask_action->setCheckable(true);
+  link_mask_action->setChecked(mask_toggle_layer == nullptr || layer_mask_linked(*mask_toggle_layer));
+  auto* disable_mask_action = mask_menu->addAction(simple_icon(QStringLiteral("off"), QColor(220, 185, 120)),
+                                                   tr("Disable Layer Mask"));
+  disable_mask_action->setCheckable(true);
+  disable_mask_action->setChecked(
+      smart_mask_context ? !active_smart_filters->mask.enabled
+                         : mask_toggle_layer != nullptr &&
+                               mask_toggle_layer->mask().has_value() &&
+                               mask_toggle_layer->mask()->disabled);
+  auto* invert_mask_action = mask_menu->addAction(simple_icon(QStringLiteral("inv"), QColor(210, 220, 230)),
+                                                  tr("Invert Layer Mask"));
+  mask_menu->addSeparator();
+  auto* apply_mask_action = mask_menu->addAction(simple_icon(QStringLiteral("ok"), QColor(150, 220, 170)),
+                                                 tr("Apply Layer Mask"));
+  auto* delete_mask_action = mask_menu->addAction(simple_icon(QStringLiteral("mask"), QColor(255, 150, 150)),
+                                                  tr("Delete Layer Mask"));
+  add_mask_action->setObjectName(QStringLiteral("layerContextAddMaskAction"));
+  link_mask_action->setObjectName(QStringLiteral("layerContextLinkMaskAction"));
+  disable_mask_action->setObjectName(QStringLiteral("layerContextDisableMaskAction"));
+  invert_mask_action->setObjectName(QStringLiteral("layerContextInvertMaskAction"));
+  apply_mask_action->setObjectName(QStringLiteral("layerContextApplyMaskAction"));
+  delete_mask_action->setObjectName(QStringLiteral("layerContextDeleteMaskAction"));
+  // The Layer > Vector Mask commands themselves (#449), so their shortcuts and behavior are
+  // the Layer menu's; they run from their own triggered signals, like the shared lock action.
+  auto* vector_mask_menu = menu.addMenu(tr("Vector Mask"));
+  vector_mask_menu->setObjectName(QStringLiteral("layerContextVectorMaskMenu"));
+  for (const auto* name : {"layerVectorMaskRevealAllAction", "layerVectorMaskHideAllAction",
+                           "layerVectorMaskCurrentPathAction", "", "layerVectorMaskDeleteAction",
+                           "layerVectorMaskDisableAction", "layerVectorMaskRasterizeAction"}) {
+    if (*name == '\0') {
+      vector_mask_menu->addSeparator();
+    } else if (auto* action = findChild<QAction*>(QLatin1String(name)); action != nullptr) {
+      vector_mask_menu->addAction(action);
+    }
+  }
+  vector_mask_menu->setEnabled(active_layer != nullptr);
+  auto* duplicate_to_document_action = add_layer_context_export_menu(&menu, group_target);
+
+  duplicate_action->setEnabled(has_layer);
+  duplicate_to_document_action->setEnabled(has_layer);
+  rename_action->setEnabled(active_layer != nullptr);
+  delete_action->setEnabled(has_layer);
+  merge_down_action->setEnabled(has_layer);
+  lock_menu->setEnabled(has_layer);
+  select_opaque_action->setEnabled(active_layer != nullptr && canvas_ != nullptr);
+  const auto active_pixels_locked = active_layer != nullptr && layer_id_locks_image_pixels(active_layer->id());
+  add_mask_action->setEnabled(canvas_ != nullptr && mask_state.any_add);
+  edit_mask_action->setEnabled(
+      active_layer != nullptr &&
+      (active_layer->mask().has_value() || has_editable_smart_mask));
+  overlay_mask_action->setEnabled(
+      active_layer != nullptr &&
+      (active_layer->mask().has_value() || has_editable_smart_mask));
+  view_mask_action->setEnabled(
+      active_layer != nullptr &&
+      (active_layer->mask().has_value() || has_editable_smart_mask));
+  delete_mask_action->setEnabled(mask_state.any_mask);
+  link_mask_action->setEnabled(mask_state.any_mask);
+  disable_mask_action->setEnabled(
+      mask_state.any_mask || (active_layer != nullptr && !active_pixels_locked && has_editable_smart_mask));
+  invert_mask_action->setEnabled(
+      mask_state.any_mask || (active_layer != nullptr && !active_pixels_locked && has_editable_smart_mask));
+  apply_mask_action->setEnabled(mask_state.any_apply);
+
+  // Thumbnail Size lives on the pixel thumbnail's own menu (#481); with no thumbnails there is
+  // none to right-click, so the row menu keeps it until a size is picked again.
+  if (layer_thumbnail_size_ == LayerThumbnailSize::None) {
+    add_layer_thumbnail_size_menu(&menu);
+  }
+  hide_menu_action_icons(&menu);
+  auto* chosen = menu.exec(layer_list_->viewport()->mapToGlobal(position));
+  if (chosen == nullptr) {
+    return;
+  }
+  if (chosen == layer_blending_options_action_ || chosen == layer_copy_style_action_ ||
+      chosen == layer_paste_style_action_ || chosen == layer_delete_style_action_ ||
+      chosen == layer_rasterize_action_ || chosen == layer_rasterize_layer_style_action_ ||
+      chosen == layer_trace_image_action_ || chosen == layer_clipping_mask_action_ ||
+      chosen == layer_quick_export_png_action_ || chosen == layer_export_as_action_ ||
+      chosen == layer_copy_css_action_) {
+    return;
+  }
+  if (chosen == edit_adjustment_action) {
+    edit_active_adjustment_layer();
+  } else if (chosen == edit_shape_appearance_action && edit_shape_appearance_action != nullptr) {
+    edit_active_shape_appearance();
+  } else if (chosen == warp_text_action && warp_text_action != nullptr) {
+    request_warp_text_dialog();
+  } else if (chosen == text_orientation_action && text_orientation_action != nullptr) {
+    const bool vertical = active_layer != nullptr && active_layer->metadata().contains(kLayerMetadataTextOrientation) &&
+                          active_layer->metadata().at(kLayerMetadataTextOrientation) == kTextOrientationVertical;
+    apply_text_orientation(!vertical);
+  } else if (chosen == new_action) {
+    add_layer();
+  } else if (chosen == new_folder_action) {
+    create_layer_folder();
+  } else if (chosen == duplicate_action) {
+    duplicate_active_layer();
+  } else if (chosen == duplicate_to_document_action) {
+    duplicate_layer_to_document();
+  } else if (chosen == rename_action) {
+    rename_active_layer();
+  } else if (chosen == delete_action) {
+    delete_active_layer();
+  } else if (chosen == ungroup_action && ungroup_action != nullptr) {
+    ungroup_selected_layers();
+  } else if (chosen == merge_down_action) {
+    merge_down();
+  } else if (chosen == merge_visible_layers_action) {
+    merge_visible_layers();
+  } else if (chosen == merge_visible_action) {
+    merge_visible_to_new_layer();
+  } else if (chosen == image_lock_action) {
+    set_active_layer_lock_flag(kLayerLockImagePixels, image_lock_action->isChecked());
+  } else if (chosen == position_lock_action) {
+    set_active_layer_lock_flag(kLayerLockPosition, position_lock_action->isChecked());
+  } else if (chosen == all_lock_action) {
+    set_active_layer_lock_all(all_lock_action->isChecked());
+  } else if (chosen == select_opaque_action && active_layer != nullptr && canvas_ != nullptr) {
+    canvas_->select_layer_opaque_pixels(active_layer->id());
+  } else if (chosen == add_mask_action) {
+    add_layer_mask();
+  } else if (chosen == edit_mask_action) {
+    if (!edit_mask_action->isChecked()) {
+      set_layer_edit_target_ui(CanvasWidget::LayerEditTarget::Content, true);
+    } else if (smart_mask_context && active_layer != nullptr) {
+      static_cast<void>(set_smart_filter_mask_edit_target_ui(
+          active_layer->id(), CanvasWidget::MaskDisplayMode::Overlay, true));
+    } else {
+      set_layer_edit_target_ui(CanvasWidget::LayerEditTarget::Mask, true);
+    }
+  } else if (chosen == overlay_mask_action) {
+    set_mask_overlay_shown(overlay_mask_action->isChecked());
+  } else if (chosen == view_mask_action) {
+    set_layer_mask_view_shown(view_mask_action->isChecked());
+  } else if (chosen == delete_mask_action) {
+    delete_active_layer_mask();
+  } else if (chosen == link_mask_action) {
+    set_active_layer_mask_linked(link_mask_action->isChecked());
+  } else if (chosen == disable_mask_action) {
+    if (smart_mask_context && active_layer != nullptr) {
+      set_smart_filter_mask_enabled(active_layer->id(),
+                                    !disable_mask_action->isChecked());
+    } else {
+      set_active_layer_mask_disabled(disable_mask_action->isChecked());
+    }
+  } else if (chosen == invert_mask_action) {
+    if (smart_mask_context && active_layer != nullptr &&
+        (!canvas_->editing_smart_filter_mask() ||
+         canvas_->smart_filter_mask_owner_id() != active_layer->id())) {
+      static_cast<void>(set_smart_filter_mask_edit_target_ui(
+          active_layer->id(), CanvasWidget::MaskDisplayMode::Overlay, false));
+    }
+    invert_active_layer_mask();
+  } else if (chosen == apply_mask_action) {
+    apply_active_layer_mask();
+  }
+}
+
+void MainWindow::show_layer_eye_color_menu(LayerId id, QPoint global_position) {
+  QMenu menu(this);
+  menu.setObjectName(QStringLiteral("layerEyeColorMenu"));
+  // Visibility for the row under the pointer (#407), outside history like the eye itself. The
+  // picks run deferred and only on the same document: a group's change rebuilds the rows,
+  // including the eye this menu opened from.
+  if (const auto* layer = std::as_const(document()).find_layer(id); layer != nullptr) {
+    const auto session_id = session().session_id;
+    const auto deferred = [this, session_id](std::function<void()> apply) {
+      QTimer::singleShot(0, this, [this, session_id, apply = std::move(apply)] {
+        if (has_active_document() && session().session_id == session_id) {
+          apply();
+        }
+      });
+    };
+    const bool visible = layer->visible();
+    auto* toggle = menu.addAction(visible ? tr("Hide This Layer") : tr("Show This Layer"));
+    toggle->setObjectName(QStringLiteral("layerEyeToggleThisAction"));
+    connect(toggle, &QAction::triggered, this,
+            [this, deferred, id, visible] { deferred([this, id, visible] { set_layer_visibility(id, !visible); }); });
+    auto* others = menu.addAction(tr("Show/Hide All Other Layers"));
+    others->setObjectName(QStringLiteral("layerEyeIsolateAction"));
+    connect(others, &QAction::triggered, this,
+            [this, deferred, id] { deferred([this, id] { isolate_layer_visibility(id); }); });
+    menu.addSeparator();
+    auto* show_all = menu.addAction(tr("Show All Layers"));
+    show_all->setObjectName(QStringLiteral("layerEyeShowAllAction"));
+    connect(show_all, &QAction::triggered, this,
+            [this, deferred] { deferred([this] { set_all_layers_visible(true); }); });
+    auto* hide_all = menu.addAction(tr("Hide All Layers"));
+    hide_all->setObjectName(QStringLiteral("layerEyeHideAllAction"));
+    connect(hide_all, &QAction::triggered, this,
+            [this, deferred] { deferred([this] { set_all_layers_visible(false); }); });
+    menu.addSeparator();
+  }
+  // None, then the seven colors: the Layer > Color actions, so a pick labels every selected
+  // layer in one undo step (set_selected_layers_color).
+  populate_layer_color_actions(&menu);
+  refresh_layer_color_action_states();
+  // The swatches name the colors, as in Photoshop's eye menu; the row menu hides the shared
+  // actions' icons (hide_menu_action_icons), so show them again here.
+  for (auto* action : menu.actions()) {
+    if (!action->icon().isNull()) {
+      action->setIconVisibleInMenu(true);
+    }
+  }
+  menu.exec(global_position);
+}
+
+void MainWindow::add_layer_thumbnail_size_menu(QMenu* menu) {
+  if (layer_thumbnail_size_actions_.front() == nullptr) {
+    struct SizeEntry {
+      const char* text;
+      const char* object_name;
+    };
+    // Indexed by LayerThumbnailSize.
+    const std::array<SizeEntry, 4> entries{{
+        {QT_TR_NOOP("None"), "layerThumbnailSizeNoneAction"},
+        {QT_TR_NOOP("Small"), "layerThumbnailSizeSmallAction"},
+        {QT_TR_NOOP("Medium"), "layerThumbnailSizeMediumAction"},
+        {QT_TR_NOOP("Large"), "layerThumbnailSizeLargeAction"},
+    }};
+    auto* group = new QActionGroup(this);
+    for (std::size_t index = 0; index < entries.size(); ++index) {
+      auto* action = new QAction(tr(entries[index].text), this);
+      action->setObjectName(QLatin1String(entries[index].object_name));
+      action->setCheckable(true);
+      action->setMenuRole(QAction::NoRole);
+      bind_action_text(action, entries[index].text);
+      group->addAction(action);
+      const auto size = static_cast<LayerThumbnailSize>(index);
+      connect(action, &QAction::triggered, this, [this, size] { set_layer_thumbnail_size(size); });
+      layer_thumbnail_size_actions_[index] = action;
+    }
+  }
+  layer_thumbnail_size_actions_[static_cast<std::size_t>(layer_thumbnail_size_)]->setChecked(true);
+  if (menu == nullptr) {
+    return;
+  }
+  menu->addSeparator();
+  auto* size_menu = menu->addMenu(QString());
+  size_menu->setObjectName(QStringLiteral("layerThumbnailSizeMenu"));
+  // Bound, so the Layers panel settings gear's lasting menu follows a language change.
+  bind_widget_text(size_menu, QT_TR_NOOP("Thumbnail Size"));
+  size_menu->menuAction()->setMenuRole(QAction::NoRole);
+  for (auto* action : layer_thumbnail_size_actions_) {
+    size_menu->addAction(action);
+  }
+}
+
+void MainWindow::set_layer_thumbnail_size(LayerThumbnailSize size) {
+  add_layer_thumbnail_size_menu(nullptr);
+  if (size == layer_thumbnail_size_) {
+    return;
+  }
+  layer_thumbnail_size_ = size;
+  layer_thumbnail_size_actions_[static_cast<std::size_t>(size)]->setChecked(true);
+  auto settings = app_settings();
+  settings.setValue(QLatin1String(kLayerThumbnailSizeSettingsKey), layer_thumbnail_size_token(size));
+  // Customize Layers Panel shows the size too (GitHub issue 680): an open one follows.
+  for (auto* combo : findChildren<QComboBox*>(QStringLiteral("layerThumbnailSizeCombo"))) {
+    if (const int index = combo->findData(layer_thumbnail_size_token(size)); index >= 0) {
+      combo->setCurrentIndex(index);
+    }
+  }
+  // The tile size is a shape input the revision-keyed cache does not track (the
+  // zoom-to-content preference precedent): drop the pixmaps and rebuild the rows.
+  layer_thumbnail_cache_.clear();
+  if (has_active_document()) {
+    refresh_layer_list();
+  }
+}
+
+void MainWindow::add_layer_thumbnail_bounds_actions(QMenu* menu) {
+  if (layer_thumbnail_bounds_actions_.front() == nullptr) {
+    struct BoundsEntry {
+      const char* text;
+      const char* object_name;
+    };
+    // Index 0 zooms to the layer content, 1 shows the whole document.
+    const std::array<BoundsEntry, 2> entries{{
+        {QT_TR_NOOP("Layer Content"), "layerThumbnailBoundsLayerAction"},
+        {QT_TR_NOOP("Whole Document"), "layerThumbnailBoundsDocumentAction"},
+    }};
+    auto* group = new QActionGroup(this);
+    for (std::size_t index = 0; index < entries.size(); ++index) {
+      auto* action = new QAction(tr(entries[index].text), this);
+      action->setObjectName(QLatin1String(entries[index].object_name));
+      action->setCheckable(true);
+      action->setMenuRole(QAction::NoRole);
+      bind_action_text(action, entries[index].text);
+      group->addAction(action);
+      const bool zoom = index == 0;
+      connect(action, &QAction::triggered, this, [this, zoom] { set_zoom_layer_thumbnails_to_content(zoom); });
+      layer_thumbnail_bounds_actions_[index] = action;
+    }
+  }
+  // Preferences may have changed the setting since the menu last opened.
+  layer_thumbnail_bounds_actions_[zoom_layer_thumbnails_to_content_ ? 0 : 1]->setChecked(true);
+  if (menu == nullptr) {
+    return;
+  }
+  // A submenu like Thumbnail Size, right under it.
+  auto* display_menu = menu->addMenu(QString());
+  display_menu->setObjectName(QStringLiteral("layerThumbnailDisplayMenu"));
+  bind_widget_text(display_menu, QT_TR_NOOP("Thumbnail Display"));
+  display_menu->menuAction()->setMenuRole(QAction::NoRole);
+  for (auto* action : layer_thumbnail_bounds_actions_) {
+    display_menu->addAction(action);
+  }
+}
+
+void MainWindow::add_layer_thumbnail_view_menus(QMenu* menu) {
+  add_layer_thumbnail_size_menu(menu);  // after its own separator
+  add_layer_thumbnail_bounds_actions(menu);
+}
+
+void MainWindow::set_zoom_layer_thumbnails_to_content(bool zoom) {
+  add_layer_thumbnail_bounds_actions(nullptr);
+  if (zoom == zoom_layer_thumbnails_to_content_) {
+    return;
+  }
+  zoom_layer_thumbnails_to_content_ = zoom;
+  layer_thumbnail_bounds_actions_[zoom ? 0 : 1]->setChecked(true);
+  auto settings = app_settings();
+  settings.setValue(QStringLiteral("view/zoomLayerThumbnailsToContent"), zoom);
+  // Customize Layers Panel and Preferences show it too (GitHub issue 680): open ones follow.
+  for (auto* combo : findChildren<QComboBox*>(QStringLiteral("layerThumbnailDisplayCombo"))) {
+    combo->setCurrentIndex(std::max(0, combo->findData(zoom)));
+  }
+  for (auto* check : findChildren<QCheckBox*>(QStringLiteral("preferencesZoomLayerThumbnailsCheck"))) {
+    check->setChecked(zoom);
+  }
+  // The mode is a shape input the revision-keyed cache does not track; drop the pixmaps and
+  // rebuild (the color-scheme precedent).
+  layer_thumbnail_cache_.clear();
+  if (has_active_document()) {
+    refresh_layer_list();
+  }
+}
+
+void MainWindow::apply_layer_row_options(const LayerRowOptions& options) {
+  if (options == layer_row_options_) {
+    return;
+  }
+  // The Fill field sits above the list: showing or hiding it rebuilds no row.
+  auto rows_before = layer_row_options_;
+  rows_before.show_fill = options.show_fill;
+  const bool rows_changed = rows_before != options;
+  layer_row_options_ = options;
+  set_stored_layer_row_options(options);
+  apply_layer_fill_field_visibility();
+  if (rows_changed && has_active_document()) {
+    refresh_layer_list();
+  }
+}
+
+void MainWindow::apply_layer_fill_field_visibility() {
+  if (fill_opacity_spin_ == nullptr || fill_opacity_spin_->isHidden() != layer_row_options_.show_fill) {
+    return;
+  }
+  if (!layer_row_options_.show_fill) {
+    // A value still on its way to the layers lands before the field goes.
+    finish_pending_layer_fill_opacity_edit();
+  }
+  // A hidden widget is an empty layout item, so the wrapping blend row drops it from its lines
+  // and its widths; the column's content-fit and compact widths follow.
+  fill_opacity_spin_->setVisible(layer_row_options_.show_fill);
+  update_right_dock_minimum_width();
+}
+
+QAction* MainWindow::add_layer_context_export_menu(QMenu* menu, bool group_target) {
+  // Export (#462): the selected layers as files, plus Duplicate Layer to Document..., which
+  // also sends the layer somewhere else. The row menu and the Background's menu (#657) share it.
+  menu->addSeparator();
+  auto* export_menu = menu->addMenu(tr("Export"));
+  export_menu->setObjectName(QStringLiteral("layerContextExportMenu"));
+  add_layer_export_actions(export_menu);
+  export_menu->addSeparator();
+  auto* duplicate_to_document_action =
+      export_menu->addAction(simple_icon(QStringLiteral("dup")),
+                             group_target ? tr("Duplicate Group to Document...") : tr("Duplicate Layer to Document..."));
+  duplicate_to_document_action->setObjectName(QStringLiteral("layerContextDuplicateToDocumentAction"));
+  // Copy CSS (GitHub issue 688): the Layer > Export command itself, so it runs from its own
+  // triggered signal.
+  if (layer_copy_css_action_ != nullptr) {
+    export_menu->addSeparator();
+    export_menu->addAction(layer_copy_css_action_);
+  }
+  return duplicate_to_document_action;
+}
+
+void MainWindow::show_background_context_menu(QPoint global_position) {
+  // Photoshop's shorter menu for its Background (GitHub issue 274): no layer styles, masks,
+  // locks or stacking commands apply to it. Delete and the Merge Visible pair need another layer.
+  const bool other_layers = layer_tree_count(std::as_const(document()).layers()) > 1U;
+  QMenu menu(this);
+  menu.setObjectName(QStringLiteral("layerContextMenu"));
+  auto* from_background_action = menu.addAction(tr("Layer from Background"));
+  from_background_action->setObjectName(QStringLiteral("layerFromBackgroundAction"));
+  menu.addSeparator();
+  auto* duplicate_action = menu.addAction(tr("Duplicate Layer"));
+  duplicate_action->setObjectName(QStringLiteral("layerContextDuplicateAction"));
+  auto* delete_action = menu.addAction(tr("Delete Layer"));
+  delete_action->setObjectName(QStringLiteral("layerContextDeleteAction"));
+  delete_action->setEnabled(other_layers);
+  menu.addSeparator();
+  if (layer_convert_smart_object_action_ != nullptr) {
+    layer_convert_smart_object_action_->setEnabled(true);
+    menu.addAction(layer_convert_smart_object_action_);
+  }
+  menu.addSeparator();
+  auto* merge_visible_layers_action = menu.addAction(tr("Merge Visible"));
+  merge_visible_layers_action->setObjectName(QStringLiteral("layerContextMergeVisibleLayersAction"));
+  merge_visible_layers_action->setEnabled(merge_visible_available(std::as_const(document())));
+  auto* merge_visible_action = menu.addAction(tr("Merge Visible to New Layer (Copy)"));
+  merge_visible_action->setObjectName(QStringLiteral("layerContextMergeVisibleAction"));
+  merge_visible_action->setEnabled(other_layers);
+  if (image_flatten_action_ != nullptr) {
+    menu.addAction(image_flatten_action_);
+  }
+  // The same Export submenu as every other row (#657); its two export entries are the shared
+  // Layer > Export actions and run from their own triggered signals.
+  auto* duplicate_to_document_action = add_layer_context_export_menu(&menu, false);
+  // Thumbnail Size lives on the pixel thumbnail's own menu (#481); with no thumbnails there is
+  // none to right-click, so the row menu keeps it until a size is picked again.
+  if (layer_thumbnail_size_ == LayerThumbnailSize::None) {
+    add_layer_thumbnail_size_menu(&menu);
+  }
+  hide_menu_action_icons(&menu);
+  auto* chosen = menu.exec(global_position);
+  if (chosen == from_background_action) {
+    layer_from_background();
+  } else if (chosen == duplicate_action) {
+    duplicate_active_layer();
+  } else if (chosen == duplicate_to_document_action) {
+    duplicate_layer_to_document();
+  } else if (chosen == delete_action) {
+    delete_active_layer();
+  } else if (chosen == merge_visible_layers_action) {
+    merge_visible_layers();
+  } else if (chosen == merge_visible_action) {
+    merge_visible_to_new_layer();
+  }
+}
+
+void MainWindow::merge_visible_to_new_layer() {
+  if (canvas_ != nullptr) { canvas_->finish_free_transform(); }
+  finish_active_text_editor();
+  if (active_session() == nullptr) { return; }
+  const auto session_id = active_session()->session_id;
+  const Document source = std::as_const(document());
+  auto visible = visible_document_for_merge_copy(source);
+  if (visible.layers().empty()) {
+    statusBar()->showMessage(tr("No visible layers to copy"));
+    return;
+  }
+  std::vector<LayerId> ids;
+  for (const auto& layer : std::as_const(visible).layers()) { ids.push_back(layer.id()); }
+  const bool vectors = merge_selection_contains_vectors(visible, ids);
+  auto edit_lock = lock_preview_dialog_edits();
+  LayerMergeOptions options;
+  std::optional<Document> preview_result;
+  if (vectors) {
+    const auto choice = show_layer_merge_dialog(this, visible, ids, true, &preview_result);
+    if (!choice || active_session() == nullptr || active_session()->session_id != session_id) { return; }
+    options = *choice;
+  }
+  const QPointer<CanvasWidget> target(canvas_);
+  if (target) { target->begin_processing_operation(tr("Merging layers...")); }
+  const auto finish_processing = qScopeGuard([target] { if (target) { target->end_processing_operation(); } });
+  Document prepared = source;
+  LayerId copy_id = 0;
+  try {
+    if (vectors) {
+      const auto plan = plan_layer_merge(visible, ids, options, true);
+      auto rendered = preview_result ? std::move(*preview_result) : render_layer_merge_with_processing(target, visible, plan);
+      Layer group(0, {}, LayerKind::Group);
+      group.set_blend_mode(BlendMode::Normal);
+      group.children() = std::as_const(rendered).layers();
+      const auto& content = std::as_const(group).children().size() == 1 ? std::as_const(group).children().front() : group;
+      auto copy = clone_layer_tree_with_document_ids(prepared, content);
+      if (!copy) { throw std::runtime_error("Could not duplicate merged layer resources"); }
+      copy->set_name(tr("Merged Visible (Copy)").toStdString());
+      copy_id = copy->id();
+      if (options.hide_originals) {
+        for (auto& layer : prepared.layers()) { if (layer.visible()) { layer.set_visible(false); } }
+      }
+      prepared.add_layer(std::move(*copy));
+    } else {
+      // Keep canvas transparency and partial coverage in the copied pixels.
+      auto future = launch_async([source] {
+        const ScopedDocumentDepthRender depth_render;
+        return pixels_from_image_at_depth(qimage_from_document(source, true), source.color_state().bit_depth);
+      });
+      if (target) {
+        target->wait_for_processing_operation([&future] {
+          return future.wait_for(std::chrono::milliseconds(16)) == std::future_status::ready;
+        });
+      }
+      auto pixels = future.get();
+      copy_id = prepared.add_pixel_layer(tr("Merged Visible (Copy)").toStdString(), std::move(pixels)).id();
+    }
+  } catch (const std::exception&) {
+    show_status_error(tr("Could not copy the visible layers. The original layers are unchanged."));
+    return;
+  }
+  if (active_session() == nullptr || active_session()->session_id != session_id) { return; }
+  prepared.set_active_layer(copy_id);
+  edit_lock.release();
+  push_undo_snapshot(tr("Merge visible (copy)"));
+  document() = std::move(prepared);
+  if (canvas_ != nullptr) {
+    canvas_->clear_path_edit_selection();
+    canvas_->set_layer_edit_target(CanvasWidget::LayerEditTarget::Content);
+    canvas_->set_selected_layer_ids({copy_id});
+  }
+  refresh_layer_list();
+  refresh_layer_controls();
+  refresh_document_info();
+  path_row_hidden_for_layer_.reset();
+  refresh_paths_panel();
+  if (canvas_ != nullptr) { canvas_->document_changed(); }
+  statusBar()->showMessage(tr("Created a merged copy of the visible layers"));
+}
+
+// Photoshop's Ctrl+Alt+E with layers selected (GitHub issue 475; docs/layer-merging.md): what
+// the selected layers draw, rendered like a bitmap merge, as one new pixel layer named after the
+// topmost selected layer and placed directly above it. The originals stay as they are.
+void MainWindow::merge_selected_to_new_layer() {
+  if (canvas_ != nullptr) { canvas_->finish_free_transform(); }
+  finish_active_text_editor();
+  if (active_session() == nullptr) { return; }
+  if (preview_dialog_edit_locked()) {
+    show_preview_dialog_edit_lock_message();
+    return;
+  }
+  const auto session_id = active_session()->session_id;
+  // Panel rows run top to bottom, so the first id is the topmost selected layer.
+  const auto ids = selected_or_active_layer_ids();
+  const Document source = std::as_const(document());
+  const auto* top = ids.empty() ? nullptr : source.find_layer(ids.front());
+  auto selected = top != nullptr ? selected_document_for_merge_copy(source, ids) : Document{};
+  if (top == nullptr || std::as_const(selected).layers().empty()) {
+    statusBar()->showMessage(tr("No visible selected layers to merge"));
+    return;
+  }
+  const auto anchor_id = top->id();
+  const auto name = tr("%1 (merged)").arg(QString::fromStdString(top->name())).toStdString();
+  auto edit_lock = lock_preview_dialog_edits();
+  const QPointer<CanvasWidget> target(canvas_);
+  if (target) { target->begin_processing_operation(tr("Merging layers...")); }
+  const auto finish_processing = qScopeGuard([target] { if (target) { target->end_processing_operation(); } });
+  PixelBuffer pixels;
+  try {
+    auto future = launch_async([selected = std::move(selected)] {
+      const ScopedDocumentDepthRender depth_render;
+      return pixels_from_image_at_depth(qimage_from_document(selected, true), selected.color_state().bit_depth);
+    });
+    if (target) {
+      target->wait_for_processing_operation([&future] {
+        return future.wait_for(std::chrono::milliseconds(16)) == std::future_status::ready;
+      });
+    }
+    pixels = future.get();
+  } catch (const std::exception&) {
+    show_status_error(tr("Could not merge the selected layers. The original layers are unchanged."));
+    return;
+  }
+  if (active_session() == nullptr || active_session()->session_id != session_id) { return; }
+  Document prepared = source;
+  const auto copy_id = prepared.allocate_layer_id();
+  insert_layer_after_anchor(prepared, Layer(copy_id, name, std::move(pixels)), anchor_id);
+  prepared.set_active_layer(copy_id);
+  edit_lock.release();
+  push_undo_snapshot(tr("Merge selected (copy)"));
+  document() = std::move(prepared);
+  if (canvas_ != nullptr) {
+    canvas_->clear_path_edit_selection();
+    canvas_->set_layer_edit_target(CanvasWidget::LayerEditTarget::Content);
+    canvas_->set_selected_layer_ids({copy_id});
+  }
+  refresh_layer_list();
+  refresh_layer_controls();
+  refresh_document_info();
+  path_row_hidden_for_layer_.reset();
+  refresh_paths_panel();
+  if (canvas_ != nullptr) { canvas_->document_changed(); }
+  statusBar()->showMessage(tr("Merged the selected layers into a new layer"));
+}
+
+// Layer > Smart Objects and the layer context menu share these actions: Convert takes any
+// selection (a smart object nests inside a new one, as in Photoshop); the rest act on the
+// active layer only when it is a smart object.
+void MainWindow::refresh_smart_object_action_states() {
+  const auto set_enabled = [](QAction* action, bool enabled) {
+    if (action != nullptr) {
+      action->setEnabled(enabled);
+    }
+  };
+  const std::array<QAction*, 10> actions{
+      layer_convert_smart_object_action_, layer_smart_object_edit_action_,
+      layer_smart_object_replace_action_, layer_smart_object_update_action_,
+      layer_smart_object_relink_action_,  layer_smart_object_embed_action_,
+      layer_smart_object_export_action_,  layer_smart_object_via_copy_action_,
+      layer_smart_object_to_layers_action_, layer_smart_object_to_normal_action_};
+  if (!has_active_document()) {
+    for (auto* action : actions) {
+      set_enabled(action, false);
+    }
+    return;
+  }
+  const auto ids = selected_or_active_layer_ids();
+  const auto active_id = std::as_const(document()).active_layer_id();
+  const auto* active_layer = active_id.has_value() ? std::as_const(document()).find_layer(*active_id) : nullptr;
+  const bool is_smart_object = active_layer != nullptr && layer_is_smart_object(*active_layer);
+  const auto* source = is_smart_object
+                           ? std::as_const(document()).metadata().smart_objects.find(
+                                 smart_object_source_uuid(*active_layer))
+                           : nullptr;
+  const bool has_embedded_bytes = source != nullptr && source->file_bytes != nullptr;
+  const auto smart_lock = is_smart_object ? smart_object_lock_reason(*active_layer) : std::string();
+  const bool is_external = smart_lock == "external";
+  const bool editable = has_embedded_bytes && smart_lock.empty();
+  const auto rasterize_ids = rasterize_target_layer_ids(ids);
+  const bool has_rasterizable_layer =
+      std::any_of(rasterize_ids.begin(), rasterize_ids.end(), [this](LayerId id) {
+        const auto* layer = std::as_const(document()).find_layer(id);
+        return layer != nullptr && !layer_id_locks_image_pixels(id) && layer_can_rasterize(*layer);
+      });
+  set_enabled(layer_convert_smart_object_action_, !ids.empty());
+  // Linked (external) smart objects open their file from disk.
+  set_enabled(layer_smart_object_edit_action_, editable || is_external);
+  set_enabled(layer_smart_object_replace_action_, editable);
+  set_enabled(layer_smart_object_update_action_, is_external);
+  set_enabled(layer_smart_object_relink_action_, is_external);
+  set_enabled(layer_smart_object_embed_action_, is_external);
+  set_enabled(layer_smart_object_export_action_, has_embedded_bytes);
+  set_enabled(layer_smart_object_via_copy_action_, editable);
+  set_enabled(layer_smart_object_to_layers_action_,
+              editable && !layer_tree_contains_smart_filters(*active_layer));
+  set_enabled(layer_smart_object_to_normal_action_, is_smart_object && has_rasterizable_layer);
+}
+
+void MainWindow::refresh_merge_visible_action_state() {
+  if (layer_merge_visible_layers_action_ != nullptr) {
+    layer_merge_visible_layers_action_->setEnabled(has_active_document() && !preview_dialog_edit_locked() &&
+                                                   merge_visible_available(std::as_const(document())));
+  }
+}
+
+// Photoshop's Merge Visible (GitHub issue 294; docs/layer-merging.md): the visible composite
+// replaces every layer that draws, in the target's slot (merge_visible_target), as one pixel
+// layer, rasterizing text, shapes, Smart Objects, adjustments and styles. Hidden layers stay.
+// One layer that draws merges too when it has something to apply, such as a mask (issue 519).
+void MainWindow::merge_visible_layers() {
+  if (canvas_ != nullptr) { canvas_->finish_free_transform(); }
+  finish_active_text_editor();
+  if (active_session() == nullptr) { return; }
+  const auto session_id = active_session()->session_id;
+  const Document source = std::as_const(document());
+  if (!merge_visible_available(source)) {
+    show_status_error(tr("Merge Visible needs at least two visible layers"));
+    return;
+  }
+  const auto target_id = merge_visible_target(source);
+  const auto* target = source.find_layer(target_id);
+  if (target == nullptr) { return; }
+  // A visible Background takes the merge and stays the Background (opaque RGB, its locks).
+  const bool background = background_layer(source.layers(), source.width(), source.height()) == target;
+  auto edit_lock = lock_preview_dialog_edits();
+  const QPointer<CanvasWidget> processing(canvas_);
+  if (processing) { processing->begin_processing_operation(tr("Merging layers...")); }
+  const auto finish_processing = qScopeGuard([processing] { if (processing) { processing->end_processing_operation(); } });
+  PixelBuffer pixels;
+  try {
+    auto future = launch_async([source, background] {
+      const ScopedDocumentDepthRender depth_render;
+      auto composite = pixels_from_image_at_depth(qimage_from_document(source, true), source.color_state().bit_depth);
+      return background ? composite_onto_white(composite) : composite;
+    });
+    if (processing) {
+      processing->wait_for_processing_operation([&future] {
+        return future.wait_for(std::chrono::milliseconds(16)) == std::future_status::ready;
+      });
+    }
+    pixels = future.get();
+  } catch (const std::exception&) {
+    show_status_error(tr("Could not merge the layers. The original layers are unchanged."));
+    return;
+  }
+  if (active_session() == nullptr || active_session()->session_id != session_id) { return; }
+  Layer merged(target_id, target->name(), std::move(pixels));
+  merged.set_color_label(target->color_label());
+  if (background) {
+    set_layer_locks_position(merged, true);
+    set_layer_locks_transparent_pixels(merged, true);
+  }
+  Document prepared = source;
+  prepared.layers() = merge_visible_layer_stack(source, target_id, std::move(merged));
+  prepared.set_active_layer(target_id);
+  edit_lock.release();
+  push_undo_snapshot(tr("Merge visible"));
+  document() = std::move(prepared);
+  if (canvas_ != nullptr) {
+    canvas_->clear_path_edit_selection();
+    canvas_->set_layer_edit_target(CanvasWidget::LayerEditTarget::Content);
+    canvas_->set_selected_layer_ids({target_id});
+  }
+  refresh_layer_list();
+  refresh_layer_controls();
+  refresh_document_info();
+  path_row_hidden_for_layer_.reset();
+  refresh_paths_panel();
+  if (canvas_ != nullptr) { canvas_->document_changed(); }
+  statusBar()->showMessage(tr("Merged the visible layers"));
+}
+
+namespace {
+
+bool any_layer_hidden(const std::vector<Layer>& layers) {
+  return std::any_of(layers.begin(), layers.end(), [](const Layer& layer) {
+    return !layer.visible() || any_layer_hidden(layer.children());
+  });
+}
+
+// One plain opaque bitmap and nothing else: Flatten Image would change nothing.
+bool document_is_flat(const Document& document) {
+  const auto& layers = document.layers();
+  if (layers.size() != 1) {
+    return false;
+  }
+  const auto& layer = layers.front();
+  return layer.kind() == LayerKind::Pixel && !layer_pixels_are_procedural(layer) && layer.visible() &&
+         layer.opacity() >= 1.0F && layer.fill_opacity() >= 1.0F && layer.blend_mode() == BlendMode::Normal &&
+         !layer.mask().has_value() && layer.vector_mask() == nullptr && layer.layer_style().empty() &&
+         layer.pixels().format().channels == 3 && layer.bounds().x == 0 && layer.bounds().y == 0 &&
+         layer.bounds().width == document.width() && layer.bounds().height == document.height();
+}
+
+
+}  // namespace
+
+// Photoshop's Flatten Image fills transparent areas with white: straight-alpha RGBA in,
+// opaque RGB at the same depth out. 32-bit rows blend in linear light, like the compositor.
+PixelBuffer composite_onto_white(const PixelBuffer& rgba) {
+  const auto depth = rgba.format().bit_depth;
+  const auto domain = depth == BitDepth::Float32 ? DeepDomain::Linear : DeepDomain::Encoded;
+  PixelBuffer rgb(rgba.width(), rgba.height(), with_bit_depth(PixelFormat::rgb8(), depth));
+  std::vector<float> row(static_cast<std::size_t>(rgba.width()) * 4U);
+  for (std::int32_t y = 0; y < rgba.height(); ++y) {
+    load_rgba_row(rgba, y, 0, rgba.width(), domain, row);
+    for (std::size_t i = 0; i < row.size(); i += 4U) {
+      const auto alpha = std::clamp(row[i + 3U] / 255.0F, 0.0F, 1.0F);
+      for (std::size_t c = 0; c < 3U; ++c) {
+        row[i + c] = row[i + c] * alpha + 255.0F * (1.0F - alpha);
+      }
+      row[i + 3U] = 255.0F;
+    }
+    store_rgba_row(rgb, y, 0, rgba.width(), domain, row);
+  }
+  return rgb;
+}
+
+// Image > Flatten Image (and the Layers panel menu): every visible layer, vectors, text and
+// effects included, becomes one opaque, locked "Background" like a new document's; hidden
+// layers are discarded after Photoshop's confirmation. See docs/tools.md.
+void MainWindow::flatten_image() {
+  if (canvas_ != nullptr) { canvas_->finish_free_transform(); }
+  finish_active_text_editor();
+  if (active_session() == nullptr) { return; }
+  const auto session_id = active_session()->session_id;
+  const Document source = std::as_const(document());
+  if (source.layers().empty()) {
+    statusBar()->showMessage(tr("No layers to flatten"));
+    return;
+  }
+  if (document_is_flat(source)) {
+    statusBar()->showMessage(tr("The image is already flat"));
+    return;
+  }
+  if (any_layer_hidden(source.layers())) {
+    const auto answer = show_warning_message(this, tr("Flatten Image"), tr("Discard hidden layers?"),
+                                             QMessageBox::Ok | QMessageBox::Cancel, QMessageBox::Ok,
+                                             QStringLiteral("flattenDiscardHiddenMessageBox"));
+    if (answer != QMessageBox::Ok || active_session() == nullptr || active_session()->session_id != session_id) {
+      return;
+    }
+  }
+  auto edit_lock = lock_preview_dialog_edits();
+  const QPointer<CanvasWidget> target(canvas_);
+  if (target) { target->begin_processing_operation(tr("Flattening image...")); }
+  const auto finish_processing = qScopeGuard([target] { if (target) { target->end_processing_operation(); } });
+  Document prepared = source;
+  try {
+    auto future = launch_async([source] {
+      const ScopedDocumentDepthRender depth_render;
+      return composite_onto_white(
+          pixels_from_image_at_depth(qimage_from_document(source, true), source.color_state().bit_depth));
+    });
+    if (target) {
+      target->wait_for_processing_operation([&future] {
+        return future.wait_for(std::chrono::milliseconds(16)) == std::future_status::ready;
+      });
+    }
+    auto pixels = future.get();
+    prepared.layers().clear();
+    auto& background = prepared.add_pixel_layer("Background", std::move(pixels));
+    set_layer_locks_position(background, true);
+    set_layer_locks_transparent_pixels(background, true);
+    prepared.set_active_layer(background.id());
+  } catch (const std::exception&) {
+    show_status_error(tr("Could not flatten the image. The layers are unchanged."));
+    return;
+  }
+  if (active_session() == nullptr || active_session()->session_id != session_id) { return; }
+  const auto background_id = *std::as_const(prepared).active_layer_id();
+  edit_lock.release();
+  push_undo_snapshot(tr("Flatten image"));
+  document() = std::move(prepared);
+  session().collapsed_layer_groups.clear();
+  if (canvas_ != nullptr) {
+    canvas_->clear_path_edit_selection();
+    canvas_->set_layer_edit_target(CanvasWidget::LayerEditTarget::Content);
+    canvas_->set_selected_layer_ids({background_id});
+  }
+  refresh_layer_list();
+  refresh_layer_controls();
+  refresh_document_info();
+  path_row_hidden_for_layer_.reset();
+  refresh_paths_panel();
+  if (canvas_ != nullptr) { canvas_->document_changed(); }
+  statusBar()->showMessage(tr("Flattened the image"));
+}
+
+void MainWindow::fill_active_layer() {
+  fill_active_layer_with_color(canvas_->primary_color(), tr("Fill"), std::nullopt,
+                               canvas_->paint_intensity().foreground);
+}
+
+void MainWindow::edit_fill_dialog() {
+  if (canvas_ == nullptr || !has_active_document()) {
+    return;
+  }
+  // Refuse a target the fill would refuse before showing the dialog, as Stroke Selection does.
+  const auto edit_target = canvas_->layer_edit_target();
+  if (CanvasWidget::is_component_preview(edit_target) ||
+      (edit_target == CanvasWidget::LayerEditTarget::DocumentChannel && !canvas_->document_channel_is_editable())) {
+    show_status_error(tr("This channel is read-only"));
+    return;
+  }
+  if (!canvas_->quick_mask_active() && !canvas_->editing_smart_filter_mask() &&
+      edit_target == CanvasWidget::LayerEditTarget::Content) {
+    select_only_layer_if_none_active();
+    const auto ids = selected_or_active_layer_ids();
+    if (ids.empty()) {
+      show_select_layer_first(tr("Fill"));
+      return;
+    }
+    const auto editable_ids = layer_ids_without_image_pixel_lock(ids);
+    if (show_pixel_lock_message_if_all_locked(ids, editable_ids)) {
+      return;
+    }
+    const auto& doc = std::as_const(document());
+    const bool any_fillable = std::any_of(editable_ids.begin(), editable_ids.end(), [&](LayerId id) {
+      const auto* layer = doc.find_layer(id);
+      return layer != nullptr && layer->kind() == LayerKind::Pixel && !layer_pixels_are_procedural(*layer);
+    });
+    if (!any_fillable) {
+      show_status_error(
+          tr("Text, Smart Object, and Shape pixels cannot be filled. Rasterize the layer first."));
+      return;
+    }
+  }
+  // Content-Aware fills a selection on a layer's own pixels (not a mask, channel or Quick Mask).
+  const bool content_aware_available = canvas_->has_selection() && !canvas_->quick_mask_active() &&
+                                       !canvas_->editing_smart_filter_mask() &&
+                                       edit_target == CanvasWidget::LayerEditTarget::Content;
+  auto* const document_before = &document();
+  const auto chosen =
+      request_fill_settings(this, canvas_->primary_color(), canvas_->secondary_color(), content_aware_available);
+  if (!chosen.has_value() || canvas_ == nullptr || !has_active_document() || &document() != document_before) {
+    return;
+  }
+  if (chosen->contents == FillContents::ContentAware) {
+    // Mode and Opacity apply to the new layer; the dialog offers only layer blend modes then.
+    const auto blend = chosen->mode.kind == PaintModeKind::Blend ? chosen->mode.blend : BlendMode::Normal;
+    content_aware_fill_selection(chosen->content_aware_new_layer, blend, chosen->opacity);
+    return;
+  }
+  const auto color = fill_contents_color(*chosen, canvas_->primary_color(), canvas_->secondary_color());
+  const auto intensity = chosen->contents == FillContents::Foreground   ? canvas_->paint_intensity().foreground
+                         : chosen->contents == FillContents::Background ? canvas_->paint_intensity().background
+                                                                        : 0.0;
+  fill_active_layer_with_color(color, tr("Fill"),
+                               FillCommandBlend{chosen->opacity, chosen->mode, chosen->preserve_transparency},
+                               intensity);
+}
+
+void MainWindow::fill_active_layer_with_color(QColor color, QString label, std::optional<FillCommandBlend> blend,
+                                              double intensity_stops) {
+  if (canvas_ != nullptr && canvas_->quick_mask_active()) {
+    canvas_->begin_processing_operation();
+    const auto finish_processing = qScopeGuard([this] {
+      if (canvas_ != nullptr) {
+        canvas_->end_processing_operation();
+      }
+    });
+    (void)canvas_->fill_quick_mask(color, std::move(label));
+    return;
+  }
+  if (canvas_ != nullptr && canvas_->editing_smart_filter_mask()) {
+    const auto dirty =
+        canvas_->fill_smart_filter_mask(color, std::move(label));
+    if (!dirty.isEmpty()) {
+      statusBar()->showMessage(tr("Filled Smart Filter mask"));
+    }
+    return;
+  }
+  const auto edit_target = canvas_ != nullptr ? canvas_->layer_edit_target() : CanvasWidget::LayerEditTarget::Content;
+  const bool document_channel = edit_target == CanvasWidget::LayerEditTarget::DocumentChannel;
+  const bool component_channel = CanvasWidget::is_component_preview(edit_target);
+  if (component_channel || (document_channel && !canvas_->document_channel_is_editable())) {
+    show_status_error(tr("This channel is read-only"));
+    return;
+  }
+  if (canvas_ != nullptr && (edit_target == CanvasWidget::LayerEditTarget::Mask || document_channel)) {
+    if (!document_channel) {
+      const auto active = document().active_layer_id();
+      if (active.has_value() && layer_id_locks_image_pixels(*active)) {
+        show_status_error(tr("Layer pixels are locked."));
+        return;
+      }
+    }
+    canvas_->begin_processing_operation();
+    const auto finish_processing = qScopeGuard([this] {
+      if (canvas_ != nullptr) {
+        canvas_->end_processing_operation();
+      }
+    });
+    push_undo_snapshot(label);
+    const auto dirty = canvas_->fill_active_layer_mask(color);
+    if (!dirty.isEmpty()) {
+      if (document_channel) {
+        canvas_->grayscale_target_changed(dirty);
+        refresh_channel_panel();
+      } else {
+        canvas_->document_changed(dirty);
+        refresh_layer_thumbnails();
+      }
+      refresh_document_info();
+      statusBar()->showMessage(document_channel ? tr("Filled channel") : tr("Filled layer mask"));
+    }
+    return;
+  }
+
+  if ((blend.has_value() ? blend->opacity : canvas_->fill_opacity()) <= 0) {
+    return;  // Fill Opacity 0% paints nothing (issue 253): no undo entry, no document change
+  }
+  select_only_layer_if_none_active();
+  const auto ids = selected_or_active_layer_ids();
+  if (ids.empty()) {
+    show_select_layer_first(tr("Fill"));
+    return;
+  }
+  const auto editable_ids = layer_ids_without_image_pixel_lock(ids);
+  if (show_pixel_lock_message_if_all_locked(ids, editable_ids)) {
+    return;
+  }
+
+  auto& doc = document();
+  std::vector<LayerId> fillable_ids;
+  fillable_ids.reserve(editable_ids.size());
+  for (const auto id : editable_ids) {
+    const auto* layer = std::as_const(doc).find_layer(id);
+    if (layer != nullptr && layer->kind() == LayerKind::Pixel &&
+        !layer_pixels_are_procedural(*layer)) {
+      fillable_ids.push_back(id);
+    }
+  }
+  if (fillable_ids.empty()) {
+    show_status_error(
+        tr("Text, Smart Object, and Shape pixels cannot be filled. Rasterize the layer first."));
+    return;
+  }
+  canvas_->begin_processing_operation();
+  const auto finish_processing = qScopeGuard([this] {
+    if (canvas_ != nullptr) {
+      canvas_->end_processing_operation();
+    }
+  });
+  push_undo_snapshot(label);
+  auto options = menu_command_edit_options(*canvas_);
+  options.primary = edit_color(color);
+  options.primary_gain = color_intensity_gain(intensity_stops);
+  // Fill honors its own Opacity and Soft settings (Fill tool options bar; default 100% / 0). Opacity
+  // scales the fill alpha; Soft feathers the fill inward from the selection edge. Tol and
+  // Contiguous only matter to the Fill tool's flood. Edit > Fill brings its own Opacity and
+  // Mode instead, with no feather.
+  if (blend.has_value()) {
+    options.primary.a = static_cast<std::uint8_t>(std::clamp(
+        std::lround(static_cast<double>(options.primary.a) * std::clamp(blend->opacity, 0, 100) / 100.0), 1L, 255L));
+    options.fill_paint_mode = blend->mode;
+    options.fill_softness_feather = 0.0;
+  } else {
+    apply_fill_settings(options, *canvas_);
+  }
+  Rect affected;
+  for (const auto id : fillable_ids) {
+    auto* layer = doc.find_layer(id);
+    if (layer == nullptr || layer->kind() != LayerKind::Pixel) {
+      continue;
+    }
+    options.lock_transparent_pixels =
+        layer_locks_transparent_pixels(*layer) || (blend.has_value() && blend->preserve_transparency);
+    // No selection fills the whole canvas: fill_rect grows a layer whose buffer covers only
+    // its content (GitHub issue 498); under the transparency lock it stays inside the buffer.
+    const auto target = canvas_->has_selection() && canvas_->selected_document_rect().has_value()
+                            ? to_core_rect(*canvas_->selected_document_rect())
+                            : Rect{0, 0, doc.width(), doc.height()};
+    affected = unite_rect(affected, patchy::fill_rect(doc, id, target, options));
+  }
+  if (!affected.empty()) {
+    canvas_->document_changed(to_qrect(affected));
+  }
+}
+
+void MainWindow::clear_active_layer() {
+  cancel_transform_session_for_layer_command(canvas_);
+  if (canvas_ != nullptr && canvas_->quick_mask_active()) {
+    canvas_->begin_processing_operation();
+    const auto finish_processing = qScopeGuard([this] {
+      if (canvas_ != nullptr) {
+        canvas_->end_processing_operation();
+      }
+    });
+    (void)canvas_->fill_quick_mask(Qt::black, tr("Clear Quick Mask"));
+    return;
+  }
+  if (canvas_ != nullptr && canvas_->editing_smart_filter_mask()) {
+    const auto dirty = canvas_->fill_smart_filter_mask(
+        Qt::black, tr("Clear Smart Filter mask"));
+    if (!dirty.isEmpty()) {
+      statusBar()->showMessage(tr("Cleared Smart Filter mask"));
+    }
+    return;
+  }
+  const auto edit_target = canvas_ != nullptr ? canvas_->layer_edit_target() : CanvasWidget::LayerEditTarget::Content;
+  const bool document_channel = edit_target == CanvasWidget::LayerEditTarget::DocumentChannel;
+  const bool component_channel = CanvasWidget::is_component_preview(edit_target);
+  if (component_channel || (document_channel && !canvas_->document_channel_is_editable())) {
+    show_status_error(tr("This channel is read-only"));
+    return;
+  }
+  if (canvas_ != nullptr && (edit_target == CanvasWidget::LayerEditTarget::Mask || document_channel)) {
+    if (!document_channel) {
+      const auto active = document().active_layer_id();
+      if (active.has_value() && layer_id_locks_image_pixels(*active)) {
+        show_status_error(tr("Layer pixels are locked."));
+        return;
+      }
+    }
+    canvas_->begin_processing_operation();
+    const auto finish_processing = qScopeGuard([this] {
+      if (canvas_ != nullptr) {
+        canvas_->end_processing_operation();
+      }
+    });
+    push_undo_snapshot(document_channel ? tr("Clear channel") : tr("Clear layer mask"));
+    const auto dirty = canvas_->clear_active_layer_mask();
+    if (!dirty.isEmpty()) {
+      if (document_channel) {
+        canvas_->grayscale_target_changed(dirty);
+        refresh_channel_panel();
+      } else {
+        canvas_->document_changed(dirty);
+        refresh_layer_thumbnails();
+      }
+      refresh_document_info();
+      statusBar()->showMessage(document_channel ? tr("Cleared channel") : tr("Cleared layer mask"));
+    }
+    return;
+  }
+
+  select_only_layer_if_none_active();
+  const auto ids = selected_or_active_layer_ids();
+  if (ids.empty()) {
+    show_select_layer_first(tr("Clear"));
+    return;
+  }
+  const auto editable_ids = layer_ids_without_image_pixel_lock(ids);
+  if (show_pixel_lock_message_if_all_locked(ids, editable_ids)) {
+    return;
+  }
+
+  auto& doc = document();
+
+  // Delete on a text, smart-object, or shape layer removes the whole object,
+  // matching Photoshop. Clearing its pixels would leave an invisible layer whose
+  // source data (text metadata, placed-layer data, vector content) still exists,
+  // so the "erased" content comes back the next time that data is used. Such
+  // layers are left untouched while an inline text edit is in progress (Delete
+  // belongs to typing) or while a selection is active (Photoshop refuses to
+  // Clear these layers). A selected artboard goes the same way, with its layers,
+  // as a folder is deleted (GitHub issue 277): it has no pixels of its own to clear.
+  std::vector<LayerId> object_layer_ids;
+  bool only_artboard_objects = true;
+  for (const auto id : editable_ids) {
+    if (const auto* layer = doc.find_layer(id);
+        layer != nullptr && (layer_pixels_are_procedural(*layer) || layer_is_artboard(*layer))) {
+      object_layer_ids.push_back(id);
+      only_artboard_objects = only_artboard_objects && layer_is_artboard(*layer);
+    }
+  }
+  const auto text_editing_active = canvas_->findChild<QTextEdit*>(QStringLiteral("inlineTextEditor")) != nullptr;
+  std::vector<LayerId> object_delete_ids;
+  std::set<LayerId> deleted_artboard_ids;
+  if (!text_editing_active && !canvas_->has_selection()) {
+    // A layer inside a deleted artboard goes with it, so only the roots are removed.
+    object_delete_ids = root_drop_layer_ids(std::as_const(doc).layers(), object_layer_ids);
+    for (const auto id : object_delete_ids) {
+      if (const auto* layer = std::as_const(doc).find_layer(id); layer != nullptr && layer_is_artboard(*layer)) {
+        deleted_artboard_ids.insert(id);
+      }
+    }
+  }
+
+  canvas_->begin_processing_operation();
+  const auto finish_processing = qScopeGuard([this] {
+    if (canvas_ != nullptr) {
+      canvas_->end_processing_operation();
+    }
+  });
+  struct ClearCandidate {
+    LayerId id{};
+    Rect bounds{};
+    bool lock_transparent_pixels{false};
+  };
+  struct ClearTarget {
+    LayerId id{};
+    Rect bounds{};
+    bool lock_transparent_pixels{false};
+  };
+  std::vector<ClearCandidate> candidates;
+  std::int64_t scan_pixels = 0;
+  auto options = menu_command_edit_options(*canvas_);
+  for (const auto id : editable_ids) {
+    const auto* layer = doc.find_layer(id);
+    if (layer == nullptr || layer->kind() != LayerKind::Pixel || layer_pixels_are_procedural(*layer)) {
+      continue;
+    }
+    if (const auto* owner = artboard_owning_layer(std::as_const(doc), id);
+        owner != nullptr && deleted_artboard_ids.contains(owner->id())) {
+      continue;  // deleted with its artboard
+    }
+    options.lock_transparent_pixels = layer_locks_transparent_pixels(*layer);
+    const auto pixels_to_scan = clear_scan_pixel_count(doc, *layer, layer->bounds(), options);
+    scan_pixels += pixels_to_scan;
+    if (pixels_to_scan > 0) {
+      candidates.push_back(ClearCandidate{id, layer->bounds(), options.lock_transparent_pixels});
+    }
+  }
+
+  constexpr std::int64_t kClearProgressPixelThreshold = 250'000;
+  std::unique_ptr<QProgressDialog> progress;
+  if (scan_pixels >= kClearProgressPixelThreshold) {
+    progress = std::make_unique<QProgressDialog>(tr("Clearing..."), QString(), 0, 0, this);
+    progress->setObjectName(QStringLiteral("clearProgressDialog"));
+    progress->setWindowTitle(tr("Clearing"));
+    progress->setWindowModality(Qt::WindowModal);
+    progress->setMinimumDuration(0);
+    progress->setCancelButton(nullptr);
+    progress->setAutoClose(false);
+    progress->setAutoReset(false);
+    remember_dialog_position(*progress);
+    progress->show();
+    progress->raise();
+    progress->activateWindow();
+    QApplication::processEvents(QEventLoop::ExcludeUserInputEvents);
+  }
+  const auto close_progress = qScopeGuard([&progress] {
+    if (progress != nullptr) {
+      progress->close();
+      QApplication::processEvents(QEventLoop::ExcludeUserInputEvents);
+    }
+  });
+  Q_UNUSED(close_progress);
+
+  std::vector<ClearTarget> targets;
+  for (const auto& candidate : candidates) {
+    options.lock_transparent_pixels = candidate.lock_transparent_pixels;
+    const auto changed = patchy::clear_rect_change_bounds(doc, candidate.id, candidate.bounds, options);
+    if (!changed.empty()) {
+      targets.push_back(ClearTarget{candidate.id, changed, candidate.lock_transparent_pixels});
+    }
+  }
+
+  if (targets.empty() && object_delete_ids.empty()) {
+    if (object_layer_ids.empty()) {
+      statusBar()->showMessage(tr("Nothing to clear"));
+    } else if (!text_editing_active && only_artboard_objects) {
+      show_status_error(tr("Artboards can't be cleared. Deselect first, then Delete removes the artboard."));
+    } else if (!text_editing_active) {
+      show_status_error(
+          tr("Text and smart object layers can't be cleared. Deselect first, then Delete removes the layer."));
+    }
+    return;
+  }
+
+  if (targets.empty()) {
+    const auto deleted_count = object_delete_ids.size();
+    const bool artboards_only = deleted_artboard_ids.size() == deleted_count;
+    delete_layers(std::move(object_delete_ids));
+    if (artboards_only) {
+      statusBar()->showMessage(deleted_count == 1 ? tr("Deleted artboard")
+                                                  : tr("Deleted %1 artboards").arg(deleted_count));
+    } else {
+      statusBar()->showMessage(deleted_count == 1 ? tr("Deleted layer") : tr("Deleted %1 layers").arg(deleted_count));
+    }
+    return;
+  }
+
+  push_undo_snapshot(tr("Clear"));
+  Rect affected;
+  for (const auto& target : targets) {
+    options.lock_transparent_pixels = target.lock_transparent_pixels;
+    affected = unite_rect(affected, patchy::clear_rect(doc, target.id, target.bounds, options));
+  }
+  for (const auto id : object_delete_ids) {
+    doc.remove_layer(id);
+  }
+  if (!object_delete_ids.empty()) {
+    refresh_layer_list();
+    refresh_layer_controls();
+    canvas_->document_changed();
+  } else if (!affected.empty()) {
+    canvas_->document_changed(to_qrect(affected));
+  }
+}
+
+namespace {
+
+struct StrokeSelectionSettings {
+  int width{2};
+  SelectionStrokeLocation location{SelectionStrokeLocation::Center};
+  QColor color;
+};
+
+const QString kStrokeSelectionWidthKey = QStringLiteral("tools/strokeSelectionWidth");
+const QString kStrokeSelectionLocationKey = QStringLiteral("tools/strokeSelectionLocation");
+const char* const kStrokeSwatchColorProperty = "strokeColor";
+
+ThemedQss stroke_selection_swatch_style(QColor color) {
+  return ThemedQss(QStringLiteral("QPushButton#strokeSelectionColorSwatch { background: rgb(%1, %2, %3); "
+                                  "border: 1px solid @dlg_neutral_border; border-radius: 3px; padding: 0; "
+                                  "min-width: 49px; max-width: 49px; min-height: 24px; max-height: 24px; } "
+                                  "QPushButton#strokeSelectionColorSwatch:hover { "
+                                  "border-color: @dlg_neutral_border_bright; }")
+                       .arg(color.red())
+                       .arg(color.green())
+                       .arg(color.blue()));
+}
+
+// Photoshop's Edit > Stroke dialog, reduced to what Patchy strokes: width, location, color. The
+// width and location persist; the color always starts from the foreground color.
+std::optional<StrokeSelectionSettings> request_stroke_selection_settings(QWidget* parent, QColor initial_color) {
+  StrokeSelectionSettings remembered;
+  {
+    auto settings = app_settings();
+    remembered.width = std::clamp(settings.value(kStrokeSelectionWidthKey, remembered.width).toInt(), 1, 250);
+    remembered.location = selection_stroke_location_from_token(
+        settings.value(kStrokeSelectionLocationKey).toString(), remembered.location);
+  }
+
+  QDialog dialog(parent);
+  dialog.setObjectName(QStringLiteral("patchyStrokeSelectionDialog"));
+  dialog.setWindowTitle(QObject::tr("Stroke Selection"));
+  auto* layout = new QVBoxLayout(&dialog);
+  auto* form = new QFormLayout();
+
+  auto* width_spin = new QSpinBox(&dialog);
+  width_spin->setObjectName(QStringLiteral("strokeSelectionWidthSpin"));
+  width_spin->setRange(1, 250);
+  width_spin->setValue(remembered.width);
+  width_spin->setSuffix(QObject::tr(" px"));
+  configure_dialog_spinbox(width_spin);
+  form->addRow(QObject::tr("Width"), width_spin);
+
+  auto* location_combo = new QComboBox(&dialog);
+  location_combo->setObjectName(QStringLiteral("strokeSelectionLocationCombo"));
+  location_combo->addItem(QObject::tr("Inside"),
+                          QString::fromLatin1(selection_stroke_location_token(SelectionStrokeLocation::Inside)));
+  location_combo->addItem(QObject::tr("Center"),
+                          QString::fromLatin1(selection_stroke_location_token(SelectionStrokeLocation::Center)));
+  location_combo->addItem(QObject::tr("Outside"),
+                          QString::fromLatin1(selection_stroke_location_token(SelectionStrokeLocation::Outside)));
+  location_combo->setCurrentIndex(std::max(
+      0, location_combo->findData(QString::fromLatin1(selection_stroke_location_token(remembered.location)))));
+  form->addRow(QObject::tr("Location"), location_combo);
+
+  // The swatch's property is the chosen color's source of truth, so automation can set it
+  // without driving the picker.
+  auto* color_swatch = new QPushButton(&dialog);
+  color_swatch->setObjectName(QStringLiteral("strokeSelectionColorSwatch"));
+  color_swatch->setAccessibleName(QObject::tr("Stroke color"));
+  color_swatch->setToolTip(QObject::tr("Choose the stroke color (starts from the foreground color)"));
+  color_swatch->setCursor(Qt::PointingHandCursor);
+  color_swatch->setFocusPolicy(Qt::StrongFocus);
+  color_swatch->setFixedSize(49, 24);
+  color_swatch->setProperty(kStrokeSwatchColorProperty, initial_color);
+  const auto update_swatch = [color_swatch] {
+    set_themed_style(*color_swatch, stroke_selection_swatch_style(
+                                        color_swatch->property(kStrokeSwatchColorProperty).value<QColor>()));
+  };
+  update_swatch();
+  QObject::connect(color_swatch, &QPushButton::clicked, &dialog, [&dialog, color_swatch, update_swatch] {
+    const auto original = color_swatch->property(kStrokeSwatchColorProperty).value<QColor>();
+    const auto selected = request_patchy_color(&dialog, original, QObject::tr("Stroke Color"),
+                                               [color_swatch, update_swatch](QColor color) {
+                                                 color_swatch->setProperty(kStrokeSwatchColorProperty, color);
+                                                 update_swatch();
+                                               });
+    color_swatch->setProperty(kStrokeSwatchColorProperty, selected.value_or(original));
+    update_swatch();
+  });
+  form->addRow(QObject::tr("Color"), color_swatch);
+  layout->addLayout(form);
+
+  auto* buttons = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel, &dialog);
+  layout->addWidget(buttons);
+  QObject::connect(buttons, &QDialogButtonBox::accepted, &dialog, &QDialog::accept);
+  QObject::connect(buttons, &QDialogButtonBox::rejected, &dialog, &QDialog::reject);
+  width_spin->selectAll();
+  if (exec_dialog(dialog) != QDialog::Accepted) {
+    return std::nullopt;
+  }
+
+  StrokeSelectionSettings chosen;
+  chosen.width = width_spin->value();
+  chosen.location =
+      selection_stroke_location_from_token(location_combo->currentData().toString(), remembered.location);
+  chosen.color = color_swatch->property(kStrokeSwatchColorProperty).value<QColor>();
+  if (!chosen.color.isValid()) {
+    chosen.color = initial_color;
+  }
+  auto settings = app_settings();
+  settings.setValue(kStrokeSelectionWidthKey, chosen.width);
+  settings.setValue(kStrokeSelectionLocationKey, QString::fromLatin1(selection_stroke_location_token(chosen.location)));
+  return chosen;
+}
+
+}  // namespace
+
+namespace {
+
+// Persisted Remove Object dialog settings (new keys, September 2026).
+const QString kRemoveObjectToneMatchKey = QStringLiteral("tools/removeObjectToneMatch");
+const QString kRemoveObjectFeatherKey = QStringLiteral("tools/removeObjectFeather");
+constexpr int kRemoveObjectFeatherMax = 50;
+
+// One fill in flight on a worker thread: the job it computes, its cancel
+// flag (polled per copied patch), and the percent it has reached.
+struct RemoveObjectWorker {
+  CanvasWidget::RemoveObjectJob job;
+  std::atomic<bool> cancel{false};
+  std::atomic<int> percent{0};
+  std::future<CanvasWidget::RemoveObjectComputed> future;
+  int attempt{0};
+};
+
+std::uint64_t remove_object_selection_hash(const QRegion& region) {
+  std::uint64_t hash = 14695981039346656037ULL;
+  const auto mix = [&hash](int value) {
+    hash ^= static_cast<std::uint64_t>(static_cast<std::uint32_t>(value));
+    hash *= 1099511628211ULL;
+  };
+  for (const auto& rect : region) {
+    mix(rect.left());
+    mix(rect.top());
+    mix(rect.width());
+    mix(rect.height());
+  }
+  return hash;
+}
+
+}  // namespace
+
+// Edit > Remove Object: a non-modal dialog with Reroll (the next content-aware
+// variation), Tone match (0 = the raw exemplar fill), Edge feather, and
+// Duplicate to New Layer. Every fill is one CanvasWidget::RemoveObjectJob:
+// prepared on the UI thread from the ORIGINAL layer (the previous preview is
+// restored first), computed on a worker thread (the UI stays live; the
+// status label shows the percent), and committed into the layer as the
+// preview under the preview edit lock. A changed setting or a Reroll cancels
+// the fill in flight and starts the new one. OK restores the original,
+// pushes one history entry, and puts the last result back, so the session is
+// a single undo step; Cancel (or an unwinding call) restores the original
+// with no history entry. Duplicate to New Layer copies the current result's
+// filled region onto a new hidden layer above the active one as its own
+// history entry, so several variations can be kept and compared. Reopening
+// on the same selection continues after the last variation shown.
+//
+// Legal: a fill runs only on an explicit click (Reroll), on a slider release,
+// or on a settled spin/step value (one run per discrete change, coalesced),
+// never per slider move or pointer move: US 8050498 (live classify-and-
+// display, to Nov 3, 2029) bars a live per-move healing preview. See
+// docs/legal-constraints-filters.md and docs/patent-research-inpainting.md.
+void MainWindow::remove_object_dialog() {
+  if (canvas_ == nullptr) {
+    return;
+  }
+  if (!canvas_->has_selection()) {
+    show_status_error(tr("Remove Object needs a selection: select the area to remove first"));
+    return;
+  }
+  // The canvas precheck reports its own refusal (lock, layer kind, rasterize
+  // prompt) and may rasterize the layer, so the layer is looked up after it.
+  if (!require_target_layer(tr("Remove Object")) || !canvas_->can_begin_pixel_edit(true)) {
+    return;
+  }
+  auto& doc = document();
+  const auto active = doc.active_layer_id();
+  if (!active.has_value()) {
+    return;
+  }
+  auto* layer = doc.find_layer(*active);
+  if (layer == nullptr || layer->kind() != LayerKind::Pixel) {
+    show_status_error(tr("Select an editable pixel layer first"));
+    return;
+  }
+  const auto active_id = *active;
+  const Layer original = *layer;
+  // A reopened dialog on the same selection continues the variations.
+  const auto selection_hash = remove_object_selection_hash(canvas_->selected_document_region());
+  const int first_attempt =
+      selection_hash == remove_object_last_selection_hash_ && remove_object_last_attempt_ >= 0
+          ? remove_object_last_attempt_ + 1
+          : 0;
+
+  int remembered_tone = 0;  // both settings start at 0 on a new install (Seth, September 2026)
+  int remembered_feather = 0;
+  {
+    auto settings = app_settings();
+    remembered_tone = std::clamp(settings.value(kRemoveObjectToneMatchKey, remembered_tone).toInt(), 0, 100);
+    remembered_feather =
+        std::clamp(settings.value(kRemoveObjectFeatherKey, remembered_feather).toInt(), 0, kRemoveObjectFeatherMax);
+  }
+
+  QDialog dialog(this);
+  dialog.setObjectName(QStringLiteral("patchyRemoveObjectDialog"));
+  dialog.setWindowTitle(tr("Remove Object"));
+  auto* layout = new QVBoxLayout(&dialog);
+  auto* form = new QFormLayout();
+  auto* tone_spin = add_dialog_slider_spin_row(form, &dialog, tr("Tone match"),
+                                               QStringLiteral("removeObjectToneMatchSlider"),
+                                               QStringLiteral("removeObjectToneMatchSpin"), 0, 100, remembered_tone,
+                                               QStringLiteral("%"));
+  tone_spin->setToolTip(tr("How strongly the fill's brightness is smoothed to its own edges (0 keeps the raw fill)"));
+  auto* feather_spin = add_dialog_slider_spin_row(form, &dialog, tr("Edge feather"),
+                                                  QStringLiteral("removeObjectFeatherSlider"),
+                                                  QStringLiteral("removeObjectFeatherSpin"), 0,
+                                                  kRemoveObjectFeatherMax, remembered_feather, tr(" px"));
+  feather_spin->setToolTip(tr("Softens the fill's edge outward from the selection, on top of its own feather. The "
+                              "filled area grows by the feather, so keep it small when the selection hugs an edge"));
+  layout->addLayout(form);
+
+  auto* variation_row = new QHBoxLayout();
+  auto* reroll_button = new QPushButton(tr("Reroll"), &dialog);
+  reroll_button->setObjectName(QStringLiteral("removeObjectRerollButton"));
+  reroll_button->setToolTip(tr("Fill again with the next variation"));
+  variation_row->addWidget(reroll_button);
+  auto* duplicate_button = new QPushButton(tr("Duplicate to New Layer"), &dialog);
+  duplicate_button->setObjectName(QStringLiteral("removeObjectDuplicateButton"));
+  duplicate_button->setToolTip(
+      tr("Copies this variation's filled area onto a new hidden layer above this one, so several variations can be "
+         "kept and compared"));
+  variation_row->addWidget(duplicate_button);
+  auto* variation_label = new QLabel(&dialog);
+  variation_label->setObjectName(QStringLiteral("removeObjectVariationLabel"));
+  variation_row->addWidget(variation_label, 1);
+  layout->addLayout(variation_row);
+  auto* status_label = new QLabel(&dialog);
+  status_label->setObjectName(QStringLiteral("removeObjectStatusLabel"));
+  status_label->setWordWrap(true);
+  layout->addWidget(status_label);
+  // The dialog grows with the wrapped status text instead of cropping rows (#612).
+  keep_dialog_tall_enough_for_wrapped_text(dialog);
+
+  auto* buttons = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel, &dialog);
+  layout->addWidget(buttons);
+  QObject::connect(buttons, &QDialogButtonBox::accepted, &dialog, &QDialog::accept);
+  QObject::connect(buttons, &QDialogButtonBox::rejected, &dialog, &QDialog::reject);
+  auto* ok_button = buttons->button(QDialogButtonBox::Ok);
+
+  // Preview state: the last committed result's layer and the settings it
+  // ran with (a settled value equal to the applied one runs nothing), plus
+  // the fill in flight. Cancelled workers are kept until their future is
+  // ready so no thread outlives the dialog.
+  int attempt = first_attempt;           // the variation shown (committed)
+  int requested_attempt = first_attempt;  // the variation asked for (in flight or committed)
+  int applied_tone = -1;
+  int applied_feather = -1;
+  std::optional<Layer> result_layer;
+  CanvasWidget::RemoveObjectJob result_job;
+  CanvasWidget::RemoveObjectResult last_result;
+  std::shared_ptr<RemoveObjectWorker> worker;
+  std::vector<std::shared_ptr<RemoveObjectWorker>> retired;
+  const auto changed_rect = [&] {
+    auto rect = to_qrect(original.bounds());
+    if (const auto* current = doc.find_layer(active_id); current != nullptr) {
+      rect = rect.united(to_qrect(current->bounds()));
+    }
+    return rect;
+  };
+  const auto restore_original = [&] {
+    if (auto* target = doc.find_layer(active_id); target != nullptr) {
+      const auto rect = changed_rect();
+      *target = original;
+      if (canvas_ != nullptr) {
+        canvas_->document_changed(rect);
+      }
+    }
+  };
+  // Settled slider and spin values coalesce into one run; a slider that is
+  // still held runs nothing until it is released. While the change is
+  // pending (or a fill is in flight) OK and Duplicate wait, so nothing is
+  // accepted or copied that the pending settings would replace.
+  QTimer settle;
+  settle.setSingleShot(true);
+  settle.setInterval(250);
+  const auto update_buttons = [&] {
+    const bool busy = worker != nullptr || settle.isActive();
+    if (ok_button != nullptr) {
+      ok_button->setEnabled(!busy && result_layer.has_value());
+    }
+    duplicate_button->setEnabled(!busy && result_layer.has_value());
+  };
+  const auto retire_worker = [&] {
+    if (worker == nullptr) {
+      return;
+    }
+    worker->cancel.store(true, std::memory_order_relaxed);
+    retired.push_back(std::move(worker));
+    worker.reset();
+  };
+  // A waited drain never blocks this thread outright: the canvas processing
+  // wait pumps (desktop) or suspends in a nested event loop (threaded wasm).
+  // A plain future.wait() on the wasm main thread froze the tab on Cancel
+  // mid-fill (September 2026): the fill's strip threads only start and
+  // return to the pool through the main thread's JS event loop, so a
+  // blocked main thread waited forever on a worker waiting on it.
+  const auto drain_retired = [&](bool wait) {
+    for (auto it = retired.begin(); it != retired.end();) {
+      auto& old = *it;
+      if (wait) {
+        auto& future = old->future;
+        const auto ready = [&future] {
+          return future.wait_for(std::chrono::milliseconds(16)) == std::future_status::ready;
+        };
+        if (canvas_ != nullptr) {
+          canvas_->wait_for_processing_operation(ready, false);
+        } else {
+          future.wait();
+        }
+      }
+      if (old->future.wait_for(std::chrono::seconds(0)) == std::future_status::ready) {
+        (void)old->future.get();
+        it = retired.erase(it);
+      } else {
+        ++it;
+      }
+    }
+  };
+  QTimer poll;
+  poll.setInterval(50);
+  const auto start_job = [&](int next_attempt) {
+    if (canvas_ == nullptr || doc.find_layer(active_id) == nullptr) {
+      return;
+    }
+    const auto tone = tone_spin->value();
+    const auto feather = feather_spin->value();
+    if (worker == nullptr && result_layer.has_value() && next_attempt == attempt && tone == applied_tone &&
+        feather == applied_feather) {
+      return;
+    }
+    retire_worker();
+    requested_attempt = next_attempt;
+    // The job's snapshot must be the document before any fill: put the
+    // original back (the canvas shows it while the new fill computes).
+    if (result_layer.has_value()) {
+      restore_original();
+    }
+    CanvasWidget::RemoveObjectOptions options;
+    options.method = CanvasWidget::RemoveObjectMethod::ContentAware;
+    options.attempt = next_attempt;
+    options.tone_match = tone;
+    options.feather = feather;
+    options.record_history = false;
+    auto next = std::make_shared<RemoveObjectWorker>();
+    next->job = canvas_->prepare_remove_object(options);
+    next->attempt = next_attempt;
+    if (!next->job.valid) {
+      status_label->setText(next->job.error);
+      update_buttons();
+      return;
+    }
+    status_label->setText(tr("Filling..."));
+    variation_label->setText(tr("Variation %1").arg(next_attempt + 1));
+    worker = next;
+    worker->future = launch_async([next] {
+      return CanvasWidget::compute_remove_object(next->job, &next->cancel, [next](int percent) {
+        next->percent.store(percent, std::memory_order_relaxed);
+      });
+    });
+    update_buttons();
+    poll.start();
+  };
+  // Completion runs on the UI thread from the poll: the commit writes the
+  // preview into the layer; a cancelled or superseded fill is dropped.
+  const auto poll_worker = [&] {
+    drain_retired(false);
+    if (worker == nullptr) {
+      if (retired.empty()) {
+        poll.stop();
+      }
+      return;
+    }
+    if (worker->future.wait_for(std::chrono::seconds(0)) != std::future_status::ready) {
+      status_label->setText(tr("Filling... %1%").arg(worker->percent.load(std::memory_order_relaxed)));
+      return;
+    }
+    auto finished = std::move(worker);
+    worker.reset();
+    const auto computed = finished->future.get();
+    if (computed.cancelled || canvas_ == nullptr || doc.find_layer(active_id) == nullptr) {
+      update_buttons();
+      return;
+    }
+    const auto result = canvas_->commit_remove_object(finished->job, computed);
+    if (!result.applied) {
+      status_label->setText(result.error);
+      update_buttons();
+      return;
+    }
+    attempt = finished->attempt;
+    applied_tone = finished->job.options.tone_match;
+    applied_feather = finished->job.options.feather;
+    last_result = result;
+    result_job = finished->job;
+    if (const auto* current = doc.find_layer(active_id); current != nullptr) {
+      result_layer = *current;
+    }
+    remove_object_last_selection_hash_ = selection_hash;
+    remove_object_last_attempt_ = attempt;
+    variation_label->setText(tr("Variation %1").arg(attempt + 1));
+    status_label->setText(result.method == CanvasWidget::RemoveObjectMethod::ContentAware
+                              ? tr("Content-aware fill (%1 patches)").arg(result.patches)
+                              : tr("No clean source patches nearby; used the nearest edge (source %1 of %2)")
+                                    .arg(result.source_index)
+                                    .arg(result.source_count));
+    update_buttons();
+  };
+  QObject::connect(&poll, &QTimer::timeout, &dialog, poll_worker);
+  QObject::connect(&settle, &QTimer::timeout, &dialog, [&] {
+    start_job(requested_attempt);
+    update_buttons();
+  });
+  const auto wire_row = [&](QSpinBox* spin, const QString& slider_name) {
+    QObject::connect(spin, qOverload<int>(&QSpinBox::valueChanged), &dialog, [&, slider_name] {
+      auto* slider = dialog.findChild<QSlider*>(slider_name);
+      if (slider != nullptr && slider->isSliderDown()) {
+        return;
+      }
+      settle.start();
+      update_buttons();
+    });
+    if (auto* slider = dialog.findChild<QSlider*>(slider_name); slider != nullptr) {
+      QObject::connect(slider, &QSlider::sliderReleased, &dialog, [&] {
+        settle.stop();
+        start_job(requested_attempt);
+      });
+    }
+  };
+  wire_row(tone_spin, QStringLiteral("removeObjectToneMatchSlider"));
+  wire_row(feather_spin, QStringLiteral("removeObjectFeatherSlider"));
+  QObject::connect(reroll_button, &QPushButton::clicked, &dialog, [&] {
+    settle.stop();
+    start_job(requested_attempt + 1);
+  });
+  // Duplicate to New Layer: the current result's filled area (coverage > 0)
+  // on a transparent layer above the active one, hidden so the next preview
+  // stays visible; its own history entry, pushed with the original in place
+  // so Undo never captures a preview.
+  QObject::connect(duplicate_button, &QPushButton::clicked, &dialog, [&] {
+    if (worker != nullptr || !result_layer.has_value() || canvas_ == nullptr) {
+      return;
+    }
+    auto copy = make_solid_pixels(doc.width(), doc.height(), QColor(0, 0, 0, 0), PixelFormat::rgba8());
+    const auto& bounds = result_job.bounds;
+    const auto source_bounds = result_layer->bounds();
+    const auto& source_pixels = std::as_const(*result_layer).pixels();
+    const auto source_channels = source_pixels.format().channels;
+    for (int y = 0; y < bounds.height(); ++y) {
+      for (int x = 0; x < bounds.width(); ++x) {
+        if (result_job.mask[static_cast<std::size_t>(y) * static_cast<std::size_t>(bounds.width()) + x] == 0U) {
+          continue;
+        }
+        const auto doc_x = bounds.left() + x;
+        const auto doc_y = bounds.top() + y;
+        const auto sx = doc_x - source_bounds.x;
+        const auto sy = doc_y - source_bounds.y;
+        if (sx < 0 || sy < 0 || sx >= source_bounds.width || sy >= source_bounds.height || doc_x < 0 || doc_y < 0 ||
+            doc_x >= doc.width() || doc_y >= doc.height()) {
+          continue;
+        }
+        const auto* src = source_pixels.pixel(sx, sy);
+        auto* dst = copy.pixel(doc_x, doc_y);
+        dst[0] = src[0];
+        dst[1] = src[1];
+        dst[2] = src[2];
+        dst[3] = source_channels >= 4 ? src[3] : 255;
+      }
+    }
+    restore_original();
+    push_undo_snapshot(tr("Duplicate Remove Object variation to layer"));
+    std::set<std::string> existing_names;
+    collect_layer_names(doc.layers(), existing_names);
+    const auto base_name = tr("Remove Object variation %1").arg(attempt + 1);
+    auto name = base_name.toStdString();
+    for (int suffix = 2; existing_names.contains(name); ++suffix) {
+      name = QStringLiteral("%1 (%2)").arg(base_name).arg(suffix).toStdString();
+    }
+    Layer copy_layer(doc.allocate_layer_id(), name, std::move(copy));
+    copy_layer.set_opacity(1.0F);
+    copy_layer.set_blend_mode(BlendMode::Normal);
+    copy_layer.set_visible(false);
+    insert_layer_after_anchor(doc, std::move(copy_layer), active_id);
+    if (auto* target = doc.find_layer(active_id); target != nullptr) {
+      *target = *result_layer;
+    }
+    refresh_layer_list();
+    refresh_layer_controls();
+    canvas_->document_changed();
+    status_label->setText(tr("Copied to \"%1\"").arg(QString::fromStdString(name)));
+  });
+
+  auto preview_edit_lock = lock_preview_dialog_edits();
+  auto preview_cleanup = qScopeGuard([&] {
+    settle.stop();
+    poll.stop();
+    retire_worker();
+    drain_retired(true);
+    restore_original();
+  });
+  update_buttons();
+  start_job(first_attempt);
+  const auto code = run_non_modal_dialog(dialog);
+  settle.stop();
+  poll.stop();
+  retire_worker();
+  drain_retired(true);
+  restore_original();
+  preview_cleanup.dismiss();
+  preview_edit_lock.release();
+  if (code != QDialog::Accepted || !result_layer.has_value()) {
+    statusBar()->showMessage(tr("Cancelled Remove Object"));
+    return;
+  }
+  {
+    auto settings = app_settings();
+    settings.setValue(kRemoveObjectToneMatchKey, applied_tone);
+    settings.setValue(kRemoveObjectFeatherKey, applied_feather);
+  }
+  push_undo_snapshot(tr("Remove Object"));
+  auto* target = doc.find_layer(active_id);
+  if (target == nullptr) {
+    return;
+  }
+  const auto rect = to_qrect(original.bounds()).united(to_qrect(result_layer->bounds()));
+  *target = *result_layer;
+  canvas_->document_changed(rect);
+  statusBar()->showMessage(last_result.method == CanvasWidget::RemoveObjectMethod::ContentAware
+                               ? tr("Removed object with content-aware fill, variation %1 (%2 patches)")
+                                     .arg(attempt + 1)
+                                     .arg(last_result.patches)
+                               : tr("Removed object with the nearest edge (source %1 of %2)")
+                                     .arg(last_result.source_index)
+                                     .arg(last_result.source_count));
+}
+
+void MainWindow::content_aware_fill_selection(bool to_new_layer, BlendMode blend, int opacity_percent) {
+  if (canvas_ == nullptr || !has_active_document()) {
+    return;
+  }
+  if (!canvas_->has_selection()) {
+    show_status_error(tr("Content-Aware fill needs a selection: select the area to fill first"));
+    return;
+  }
+  // The canvas precheck reports its own refusal (lock, layer kind, rasterize prompt).
+  if (!require_target_layer(tr("Content-Aware Fill")) || !canvas_->can_begin_pixel_edit(true)) {
+    return;
+  }
+  auto* const doc_before = &document();
+  const auto session_id = session().session_id;
+  const auto active = std::as_const(*doc_before).active_layer_id();
+  const auto* layer = active.has_value() ? std::as_const(*doc_before).find_layer(*active) : nullptr;
+  if (layer == nullptr || layer->kind() != LayerKind::Pixel) {
+    show_status_error(tr("Select an editable pixel layer first"));
+    return;
+  }
+  const auto active_id = *active;
+  const Layer original = *layer;
+  // Remove Object's dialog-free run at its defaults (best match, no tone match, no edge
+  // feather; docs/healing-remove-object.md), written into the layer without history so
+  // the one entry below holds the original.
+  CanvasWidget::RemoveObjectResult result;
+  {
+    QApplication::setOverrideCursor(Qt::WaitCursor);
+    const auto restore_cursor = qScopeGuard([] { QApplication::restoreOverrideCursor(); });
+    CanvasWidget::RemoveObjectOptions options;
+    options.attempt = 0;
+    options.record_history = false;
+    result = canvas_->remove_object_in_selection(options);
+  }
+  if (!result.applied || canvas_ == nullptr || active_session() == nullptr ||
+      active_session()->session_id != session_id || &document() != doc_before) {
+    return;
+  }
+  auto& doc = document();
+  auto* target = doc.find_layer(active_id);
+  if (target == nullptr) {
+    return;
+  }
+  Layer filled = std::move(*target);
+  *target = original;
+  const auto changed = to_qrect(original.bounds()).united(to_qrect(filled.bounds()));
+  push_undo_snapshot(tr("Content-Aware Fill"));
+  if (!to_new_layer) {
+    *target = std::move(filled);
+    canvas_->document_changed(changed);
+    statusBar()->showMessage(tr("Filled the selection with content-aware fill (%1 patches)").arg(result.patches));
+    return;
+  }
+  // The new layer holds the filled pixels under the selection (Layer Via Copy's copy of
+  // the filled layer), transparent elsewhere.
+  const auto selected = canvas_->selected_document_rect();
+  const auto copy_rect = intersect_copy_rect(selected.has_value() ? to_core_rect(*selected) : filled.bounds(),
+                                             Rect::from_size(doc.width(), doc.height()));
+  if (copy_rect.empty()) {
+    canvas_->document_changed(changed);
+    return;
+  }
+  Layer copied(doc.allocate_layer_id(), tr("Content-Aware Fill").toStdString(),
+               copy_pixels_from_layer(filled, copy_rect, canvas_));
+  copied.set_bounds(Rect{copy_rect.x, copy_rect.y, copied.pixels().width(), copied.pixels().height()});
+  copied.set_blend_mode(blend_mode_supported_at_depth(blend, document_bit_depth(doc)) ? blend : BlendMode::Normal);
+  copied.set_opacity(static_cast<float>(std::clamp(opacity_percent, 1, 100)) / 100.0F);
+  const auto copied_id = copied.id();
+  insert_layer_after_anchor(doc, std::move(copied), active_id);
+  doc.set_active_layer(copied_id);
+  refresh_layer_list();
+  refresh_layer_controls();
+  canvas_->document_changed(changed);
+  statusBar()->showMessage(
+      tr("Filled the selection with content-aware fill on a new layer (%1 patches)").arg(result.patches));
+}
+
+void MainWindow::stroke_selection() {
+  auto& doc = document();
+  select_only_layer_if_none_active();
+  const auto active = doc.active_layer_id();
+  if (!active.has_value()) {
+    show_select_layer_first(tr("Stroke Selection"));
+    return;
+  }
+  const auto selection = canvas_->selected_document_region();
+  if (selection.isEmpty()) {
+    show_status_error(tr("Make a selection before stroking"));
+    return;
+  }
+  auto* layer = doc.find_layer(*active);
+  if (layer == nullptr || layer->kind() != LayerKind::Pixel) {
+    show_status_error(tr("Select an editable pixel layer first"));
+    return;
+  }
+  if (layer_pixels_are_procedural(*layer)) {
+    show_status_error(
+        tr("Rasterize Text, Smart Object, and Shape layers before editing their pixels"));
+    return;
+  }
+  if (layer_id_locks_image_pixels(*active)) {
+    show_status_error(tr("Layer pixels are locked."));
+    return;
+  }
+
+  // Every guard runs before the dialog so a refused layer never shows it.
+  const auto chosen = request_stroke_selection_settings(this, canvas_->primary_color());
+  if (!chosen.has_value()) {
+    return;
+  }
+  if (!has_active_document() || &document() != &doc || doc.find_layer(*active) == nullptr) {
+    return;
+  }
+
+  canvas_->begin_processing_operation();
+  const auto finish_processing = qScopeGuard([this] {
+    if (canvas_ != nullptr) {
+      canvas_->end_processing_operation();
+    }
+  });
+  const QRect canvas_rect(0, 0, doc.width(), doc.height());
+  const auto stroke_region = selection_stroke_region(selection, chosen->width, chosen->location, canvas_rect);
+  if (stroke_region.isEmpty()) {
+    statusBar()->showMessage(tr("Nothing to stroke"));
+    return;
+  }
+  push_undo_snapshot(tr("Stroke selection"));
+  auto options = menu_command_edit_options(*canvas_);
+  options.primary = edit_color(chosen->color);
+  options.lock_transparent_pixels = layer_locks_transparent_pixels(*layer);
+  const auto stroke_bounds = stroke_region.boundingRect();
+  const auto stroke_mask = hard_mask_from_region(stroke_region, stroke_bounds);
+  options.selection = to_core_rect(stroke_bounds);
+  options.selection_scan_rects.clear();
+  // fill_rect queries coverage per pixel (unlike clear_rect's scan-rect path).
+  // Rasterize the stroke band once so disconnected islands cannot stall it.
+  options.selection_mask = [stroke_mask, stroke_bounds](std::int32_t x, std::int32_t y) {
+    return stroke_bounds.contains(x, y) &&
+           stroke_mask.constScanLine(y - stroke_bounds.y())[x - stroke_bounds.x()] != 0U;
+  };
+  options.selection_coverage = {};
+  const auto affected = patchy::fill_rect(doc, *active, to_core_rect(stroke_region.boundingRect()), options);
+  if (!affected.empty()) {
+    canvas_->document_changed(to_qrect(affected));
+  }
+  statusBar()->showMessage(tr("Stroked selection"));
+}
+
+void MainWindow::expand_selection_dialog() {
+  if (!canvas_->has_selection()) {
+    show_status_error(tr("Make a selection before expanding"));
+    return;
+  }
+  const auto pixels = request_integer_input(this, QStringLiteral("patchyExpandSelectionDialog"),
+                                            tr("Expand Selection"), tr("Expand by:"), 4, 1,
+                                            kMaxSelectionModifyRadius, 1);
+  if (pixels.has_value()) {
+    canvas_->run_selection_command(tr("Expand Selection"), [this, pixels] { canvas_->expand_selection(*pixels); });
+  }
+}
+
+void MainWindow::contract_selection_dialog() {
+  if (!canvas_->has_selection()) {
+    show_status_error(tr("Make a selection before contracting"));
+    return;
+  }
+  const auto pixels = request_integer_input(this, QStringLiteral("patchyContractSelectionDialog"),
+                                            tr("Contract Selection"), tr("Contract by:"), 4, 1,
+                                            kMaxSelectionModifyRadius, 1);
+  if (pixels.has_value()) {
+    canvas_->run_selection_command(tr("Contract Selection"), [this, pixels] { canvas_->contract_selection(*pixels); });
+  }
+}
+
+void MainWindow::border_selection_dialog() {
+  if (!canvas_->has_selection()) {
+    show_status_error(tr("Make a selection before selecting a border"));
+    return;
+  }
+  const auto pixels = request_integer_input(this, QStringLiteral("patchyBorderSelectionDialog"),
+                                            tr("Border Selection"), tr("Width:"), 4, 1, 250, 1);
+  if (pixels.has_value()) {
+    canvas_->run_selection_command(tr("Border Selection"), [this, pixels] { canvas_->border_selection(*pixels); });
+  }
+}
+
+// Select > Smooth and Select > Feather (GitHub issue 614): each remembers its last radius.
+void MainWindow::smooth_selection_dialog() {
+  if (!canvas_->has_selection()) {
+    show_status_error(tr("Make a selection before smoothing"));
+    return;
+  }
+  const auto key = QString::fromLatin1(kSelectionSmoothRadiusKey);
+  const auto remembered = std::clamp(app_settings().value(key, kMinSelectionSmoothRadius).toInt(),
+                                     kMinSelectionSmoothRadius, kMaxSelectionSmoothRadius);
+  const auto radius = request_selection_smooth_radius(this, remembered);
+  if (!radius.has_value() || canvas_ == nullptr || !canvas_->has_selection()) {
+    return;
+  }
+  app_settings().setValue(key, *radius);
+  canvas_->run_selection_command(tr("Smooth Selection"), [this, radius] { canvas_->smooth_selection(*radius); });
+}
+
+void MainWindow::feather_selection_dialog() {
+  if (!canvas_->has_selection()) {
+    show_status_error(tr("Make a selection before feathering"));
+    return;
+  }
+  const auto key = QString::fromLatin1(kSelectionFeatherRadiusKey);
+  const auto remembered = std::clamp(app_settings().value(key, 5.0).toDouble(), kMinSelectionFeatherCommandRadius,
+                                     kMaxSelectionFeatherCommandRadius);
+  const auto radius = request_selection_feather_radius(this, remembered);
+  if (!radius.has_value() || canvas_ == nullptr || !canvas_->has_selection()) {
+    return;
+  }
+  app_settings().setValue(key, *radius);
+  canvas_->run_selection_command(tr("Feather Selection"), [this, radius] { canvas_->feather_selection(*radius); });
+}
+
+bool MainWindow::refuse_layer_alignment_command() {
+  if (canvas_ == nullptr || !has_active_document()) {
+    return true;
+  }
+  if (preview_dialog_edit_locked()) {
+    return show_preview_dialog_edit_lock_message();
+  }
+  if (refuse_layer_dialog_during_transform()) {
+    return true;
+  }
+  if (canvas_->pointer_gesture_active()) {
+    show_status_error(tr("Finish the current drag before aligning layers"));
+    return true;
+  }
+  const auto target = canvas_->layer_edit_target();
+  if (target == CanvasWidget::LayerEditTarget::DocumentChannel ||
+      CanvasWidget::is_component_preview(target)) {
+    show_status_error(tr("Return to the layer view to align layers"));
+    return true;
+  }
+  return false;
+}
+
+void MainWindow::align_selected_layers(AlignEdge edge) {
+  if (refuse_layer_alignment_command()) {
+    return;
+  }
+  // Two or more shapes picked with Path Select or Direct Select align inside their layer (#555).
+  if (align_selected_path_components(edge)) {
+    return;
+  }
+  const auto result = canvas_->align_layers(edge, align_to_canvas_, {});
+  if (result.unit_count == 0) {
+    show_status_error(tr("Select a movable layer to align"));
+    return;
+  }
+  if (result.moved_layers == 0) {
+    statusBar()->showMessage(tr("The selected layers are already aligned"));
+    return;
+  }
+  canvas_->document_changed_effect_bounds(result.dirty);
+  // The row rebuild collapses a multi-selection to the active row; put the
+  // selection back so a second Align/Distribute works on the same set.
+  const auto selected_ids = selected_layer_ids();
+  const auto active_id = document().active_layer_id();
+  refresh_layer_list();
+  if (selected_ids.size() > 1U) {
+    select_layers_in_layer_list(selected_ids, active_id.value_or(selected_ids.front()));
+  }
+  refresh_layer_controls();
+  statusBar()->showMessage(tr("Aligned %n layer(s)", nullptr, result.moved_layers));
+}
+
+void MainWindow::distribute_selected_layers(DistributeMode mode) {
+  if (refuse_layer_alignment_command()) {
+    return;
+  }
+  const auto result = canvas_->distribute_layers(mode, {});
+  if (result.unit_count < 3) {
+    show_status_error(tr("Select at least three layers to distribute"));
+    return;
+  }
+  if (result.moved_layers == 0) {
+    statusBar()->showMessage(tr("The selected layers are already distributed"));
+    return;
+  }
+  canvas_->document_changed_effect_bounds(result.dirty);
+  // The row rebuild collapses a multi-selection to the active row; put the
+  // selection back so a second Align/Distribute works on the same set.
+  const auto selected_ids = selected_layer_ids();
+  const auto active_id = document().active_layer_id();
+  refresh_layer_list();
+  if (selected_ids.size() > 1U) {
+    select_layers_in_layer_list(selected_ids, active_id.value_or(selected_ids.front()));
+  }
+  refresh_layer_controls();
+  statusBar()->showMessage(tr("Distributed %n layer(s)", nullptr, result.moved_layers));
+}
+
+void MainWindow::set_align_to_canvas(bool align_to_canvas) {
+  align_to_canvas_ = align_to_canvas;
+  // Check the chosen action with its signals live: the exclusive QActionGroup
+  // unchecks the other one from QAction::changed. Blocking them left the group's
+  // current action stale, so a later click could show both entries checked.
+  auto* chosen = align_to_canvas ? layer_align_to_canvas_action_ : layer_align_to_selection_action_;
+  if (chosen != nullptr && !chosen->isChecked()) {
+    chosen->setChecked(true);
+  }
+}
+
+void MainWindow::refresh_layer_alignment_action_states() {
+  const bool document_ready = has_active_document() && canvas_ != nullptr && !preview_dialog_edit_locked();
+  int units = document_ready ? canvas_->alignment_unit_count({}) : 0;
+  if (document_ready && (canvas_->tool() == CanvasTool::PathSelect || canvas_->tool() == CanvasTool::DirectSelect) &&
+      canvas_->path_edit_selected_groups().size() >= 2) {
+    units = std::max(units, 1);  // shapes inside one layer align too
+  }
+  for (auto* action : layer_align_actions_) {
+    if (action != nullptr) {
+      action->setEnabled(document_ready && units >= 1);
+    }
+  }
+  for (auto* action : layer_distribute_actions_) {
+    if (action != nullptr) {
+      action->setEnabled(document_ready && units >= 3);
+    }
+  }
+}
+
+void MainWindow::flip_active_layer_horizontal() {
+  if (canvas_ != nullptr) {
+    const auto target = canvas_->layer_edit_target();
+    if (target == CanvasWidget::LayerEditTarget::DocumentChannel ||
+        CanvasWidget::is_component_preview(target)) {
+      return;
+    }
+  }
+  select_only_layer_if_none_active();
+  const auto ids = selected_or_active_layer_ids();
+  if (ids.empty()) {
+    show_select_layer_first(tr("Flip Horizontal"));
+    return;
+  }
+  if (std::any_of(ids.begin(), ids.end(), [this](LayerId id) {
+        const auto* layer = std::as_const(document()).find_layer(id);
+        return layer != nullptr && layer_tree_contains_smart_object(*layer);
+      })) {
+    show_status_error(
+        tr("Use Free Transform or rasterize Smart Objects before flipping"));
+    return;
+  }
+  const auto editable_ids = layer_ids_without_image_pixel_lock(ids);
+  if (show_pixel_lock_message_if_all_locked(ids, editable_ids)) {
+    return;
+  }
+
+  auto& doc = document();
+  push_undo_snapshot(tr("Flip horizontal"));
+  Rect affected;
+  for (const auto id : editable_ids) {
+    affected = unite_rect(affected, patchy::flip_layer_horizontal(doc, id));
+  }
+  canvas_->document_changed(to_qrect(affected));
+  refresh_layer_list();
+  refresh_layer_controls();
+}
+
+// Layer > Arrange > Rotate (GitHub issue 139): the flip handler's guards (channel
+// targets, smart objects, pixel locks) apply unchanged; `turn` does the geometry.
+void MainWindow::rotate_active_layers(const char* undo_name, const QString& status,
+                                      Rect (*turn)(Document&, LayerId)) {
+  if (canvas_ != nullptr) {
+    const auto target = canvas_->layer_edit_target();
+    if (target == CanvasWidget::LayerEditTarget::DocumentChannel ||
+        CanvasWidget::is_component_preview(target)) {
+      return;
+    }
+  }
+  select_only_layer_if_none_active();
+  const auto ids = selected_or_active_layer_ids();
+  if (ids.empty()) {
+    show_select_layer_first(tr("Rotate"));
+    return;
+  }
+  if (std::any_of(ids.begin(), ids.end(), [this](LayerId id) {
+        const auto* layer = std::as_const(document()).find_layer(id);
+        return layer != nullptr && layer_tree_contains_smart_object(*layer);
+      })) {
+    show_status_error(tr("Use Free Transform or rasterize Smart Objects before rotating"));
+    return;
+  }
+  const auto editable_ids = layer_ids_without_image_pixel_lock(ids);
+  if (show_pixel_lock_message_if_all_locked(ids, editable_ids)) {
+    return;
+  }
+
+  auto& doc = document();
+  push_undo_snapshot(QCoreApplication::translate(kMainWindowTranslationContext, undo_name));
+  Rect affected;
+  for (const auto id : editable_ids) {
+    affected = unite_rect(affected, turn(doc, id));
+  }
+  canvas_->document_changed(to_qrect(affected));
+  refresh_layer_list();
+  refresh_layer_controls();
+  statusBar()->showMessage(status);
+}
+
+void MainWindow::rotate_active_layers_clockwise() {
+  rotate_active_layers(QT_TR_NOOP("Rotate layer"), tr("Rotated layer clockwise"), &patchy::rotate_layer_clockwise);
+}
+
+void MainWindow::rotate_active_layers_counterclockwise() {
+  rotate_active_layers(QT_TR_NOOP("Rotate layer"), tr("Rotated layer counterclockwise"),
+                       &patchy::rotate_layer_counterclockwise);
+}
+
+void MainWindow::rotate_active_layers_180() {
+  rotate_active_layers(QT_TR_NOOP("Rotate layer"), tr("Rotated layer 180 degrees"), &patchy::rotate_layer_180);
+}
+
+void MainWindow::flip_active_layer_vertical() {
+  if (canvas_ != nullptr) {
+    const auto target = canvas_->layer_edit_target();
+    if (target == CanvasWidget::LayerEditTarget::DocumentChannel ||
+        CanvasWidget::is_component_preview(target)) {
+      return;
+    }
+  }
+  select_only_layer_if_none_active();
+  const auto ids = selected_or_active_layer_ids();
+  if (ids.empty()) {
+    show_select_layer_first(tr("Flip Vertical"));
+    return;
+  }
+  if (std::any_of(ids.begin(), ids.end(), [this](LayerId id) {
+        const auto* layer = std::as_const(document()).find_layer(id);
+        return layer != nullptr && layer_tree_contains_smart_object(*layer);
+      })) {
+    show_status_error(
+        tr("Use Free Transform or rasterize Smart Objects before flipping"));
+    return;
+  }
+  const auto editable_ids = layer_ids_without_image_pixel_lock(ids);
+  if (show_pixel_lock_message_if_all_locked(ids, editable_ids)) {
+    return;
+  }
+
+  auto& doc = document();
+  push_undo_snapshot(tr("Flip vertical"));
+  Rect affected;
+  for (const auto id : editable_ids) {
+    affected = unite_rect(affected, patchy::flip_layer_vertical(doc, id));
+  }
+  canvas_->document_changed(to_qrect(affected));
+}
+
+void MainWindow::crop_to_selection() {
+  // With the Crop tool active, a box the user laid out is the crop selection:
+  // the command commits it exactly like Enter (an off-canvas box expands, a
+  // rotated one straightens). The untouched canvas frame defers to a marquee
+  // selection (it stays after Esc or Select commands); with neither, the
+  // commit reports "Nothing to crop".
+  if (canvas_->crop_session_active() && (canvas_->crop_session_has_changes() || !canvas_->has_selection())) {
+    canvas_->commit_crop_session();
+    return;
+  }
+  const auto selection = canvas_->selected_document_rect();
+  if (!selection.has_value() || selection->isEmpty()) {
+    show_status_error(tr("Make a rectangular selection before cropping"));
+    return;
+  }
+  if (refuse_crop_with_artboards() || refuse_document_geometry_change()) {
+    return;
+  }
+
+  auto& doc = document();
+  auto cropped_document = doc;
+  if (!patchy::crop_document(cropped_document, to_core_rect(*selection))) {
+    return;
+  }
+  push_undo_snapshot(tr("Crop"));
+  doc = std::move(cropped_document);
+  canvas_->clear_selection();
+  const auto previous_channel_target = canvas_->layer_edit_target();
+  const auto previous_channel_id = canvas_->active_document_channel_id();
+  const auto previous_channel_display = canvas_->mask_display_mode();
+  canvas_->set_document(&doc);
+  restore_channel_target_after_document_reset(previous_channel_target, previous_channel_id,
+                                              previous_channel_display);
+  // The old pan is meaningless for the smaller document and can leave it
+  // mostly off screen, so recenter at the current zoom.
+  canvas_->center_document_in_view();
+  refresh_layer_list();
+  refresh_layer_controls();
+  refresh_document_info();
+  statusBar()->showMessage(tr("Cropped to selection"));
+}
+
+bool MainWindow::refuse_crop_with_artboards() {
+  if (!has_active_document() || !document_has_artboards(std::as_const(document()))) {
+    return false;
+  }
+  show_status_error(tr("Crop does not apply to a document with artboards; resize an artboard with the Artboard tool"));
+  return true;
+}
+
+void MainWindow::commit_crop_rect(QRect rect, double angle_degrees) {
+  if (rect.isEmpty()) {
+    return;
+  }
+  // A refusal leaves the crop session alive so the user can still adjust or Esc.
+  if (refuse_crop_with_artboards() || refuse_document_geometry_change()) {
+    return;
+  }
+
+  auto& doc = document();
+  auto cropped_document = doc;
+  const auto extension_color = edit_color(canvas_->secondary_color());
+  const auto frame = to_core_rect(rect);
+  const auto rotated = std::abs(angle_degrees) >= 0.01;
+  std::size_t deleted_layers = 0;
+  if (current_crop_delete_layers_) {
+    // Canvas Size's "delete layers fully off the canvas". It runs against the
+    // frame BEFORE the crop (the crop empties off-frame layers, which would
+    // then no longer test as outside). For a rotated box the axis-aligned rect
+    // is a conservative test: a layer outside it is certainly outside the box.
+    deleted_layers = patchy::remove_layers_outside_canvas(cropped_document, frame);
+  }
+  if (rotated || current_crop_delete_pixels_) {
+    // Delete Cropped Pixels (the default, as in Photoshop): the expansion
+    // fills with the background color under a "Background" layer, transparent
+    // elsewhere; a rotated box straightens on commit. `crop_document` crops
+    // every layer to the box (tight buffers); the rotated path always does.
+    if (!patchy::crop_document(cropped_document, frame, angle_degrees, extension_color)) {
+      return;
+    }
+  } else {
+    // Delete Cropped Pixels off: the same frame resize as Canvas Size, so
+    // layers keep their pixels beyond the new canvas and a later canvas
+    // extension or move brings them back. A Background left with pixels beyond
+    // the canvas becomes "Layer 0" (GitHub issue 701).
+    if (frame.empty()) {
+      return;
+    }
+    patchy::resize_canvas_to_frame(cropped_document, frame, extension_color, false, layer_from_background_name());
+  }
+  push_undo_snapshot(tr("Crop"));
+  doc = std::move(cropped_document);
+  canvas_->cancel_crop_session();
+  canvas_->clear_selection();
+  const auto previous_channel_target = canvas_->layer_edit_target();
+  const auto previous_channel_id = canvas_->active_document_channel_id();
+  const auto previous_channel_display = canvas_->mask_display_mode();
+  canvas_->set_document(&doc);
+  restore_channel_target_after_document_reset(previous_channel_target, previous_channel_id,
+                                              previous_channel_display);
+  // The old pan is meaningless for the resized document and can leave it
+  // mostly off screen, so recenter at the current zoom.
+  canvas_->center_document_in_view();
+  refresh_layer_list();
+  refresh_layer_controls();
+  refresh_document_info();
+  refresh_options_bar();
+  statusBar()->showMessage(deleted_layers > 0
+                               ? tr("Cropped, off-canvas layers deleted: %1").arg(deleted_layers)
+                               : tr("Cropped"));
+}
+
+void MainWindow::commit_perspective_crop_quad(const std::array<QPointF, 4>& quad) {
+  // A refusal leaves the corners in place so the user can still adjust or Esc.
+  if (refuse_crop_with_artboards() || refuse_document_geometry_change()) {
+    return;
+  }
+  const std::array<double, 8> corners{quad[0].x(), quad[0].y(), quad[1].x(), quad[1].y(),
+                                      quad[2].x(), quad[2].y(), quad[3].x(), quad[3].y()};
+  const auto auto_size = patchy::perspective_crop_auto_size(corners);
+  const auto width = perspective_crop_width_spin_ != nullptr && perspective_crop_width_spin_->value() > 0
+                         ? perspective_crop_width_spin_->value()
+                         : auto_size[0];
+  const auto height = perspective_crop_height_spin_ != nullptr && perspective_crop_height_spin_->value() > 0
+                          ? perspective_crop_height_spin_->value()
+                          : auto_size[1];
+  const auto resolution =
+      perspective_crop_resolution_spin_ != nullptr ? perspective_crop_resolution_spin_->value() : 0.0;
+
+  auto& doc = document();
+  auto cropped_document = doc;
+  if (!patchy::perspective_crop_document(cropped_document, corners, width, height,
+                                         edit_color(canvas_->secondary_color()))) {
+    show_status_error(tr("The corners must form a convex shape"));
+    return;
+  }
+  if (resolution > 0.0) {
+    cropped_document.print_settings().horizontal_ppi = resolution;
+    cropped_document.print_settings().vertical_ppi = resolution;
+  }
+  push_undo_snapshot(tr("Perspective Crop"));
+  doc = std::move(cropped_document);
+  canvas_->cancel_perspective_crop_session();
+  canvas_->clear_selection();
+  const auto previous_channel_target = canvas_->layer_edit_target();
+  const auto previous_channel_id = canvas_->active_document_channel_id();
+  const auto previous_channel_display = canvas_->mask_display_mode();
+  canvas_->set_document(&doc);
+  restore_channel_target_after_document_reset(previous_channel_target, previous_channel_id,
+                                              previous_channel_display);
+  canvas_->center_document_in_view();
+  refresh_layer_list();
+  refresh_layer_controls();
+  refresh_document_info();
+  refresh_options_bar();
+  statusBar()->showMessage(tr("Cropped and straightened"));
+}
+
+void MainWindow::straighten_with_ruler(bool whole_image) {
+  if (canvas_ == nullptr || !has_active_document()) {
+    return;
+  }
+  const auto line = canvas_->ruler_line();
+  if (!line.has_value()) {
+    show_status_error(tr("Draw a line with the Ruler first"));
+    return;
+  }
+  // Counterclockwise degrees that put the line on the nearest axis.
+  const auto degrees = ruler_straighten_degrees(*line);
+  if (std::abs(degrees) < 0.01) {
+    statusBar()->showMessage(tr("The line is already straight"));
+    return;
+  }
+  finish_active_text_editor();
+  const auto degrees_text = QString::number(std::abs(degrees), 'f', 2);
+  if (!whole_image) {
+    const auto layer_id = std::as_const(document()).active_layer_id();
+    if (!layer_id.has_value()) {
+      show_status_error(tr("Select a layer to straighten"));
+      return;
+    }
+    // The Free Transform commit takes the undo snapshot and reports any refusal.
+    if (!canvas_->straighten_layer(*layer_id, degrees)) {
+      return;
+    }
+    canvas_->clear_ruler_line();
+    refresh_layer_list();
+    refresh_layer_controls();
+    refresh_document_info();
+    statusBar()->showMessage(degrees > 0.0 ? tr("Straightened layer %1 degrees counterclockwise").arg(degrees_text)
+                                           : tr("Straightened layer %1 degrees clockwise").arg(degrees_text));
+    return;
+  }
+  if (refuse_crop_with_artboards() || refuse_document_geometry_change()) {
+    return;
+  }
+  // The Crop tool's rotated crop (crop_document): a box turned with the line, as large as
+  // fits inside the canvas with the canvas's own shape. The box angle is clockwise on
+  // screen, the line's tilt is the opposite of the correction.
+  auto& doc = document();
+  const auto box = ruler_straighten_crop(doc.width(), doc.height(), degrees);
+  auto straightened = doc;
+  if (!patchy::crop_document(straightened, Rect{box.x, box.y, box.width, box.height}, degrees,
+                             edit_color(canvas_->secondary_color()))) {
+    return;
+  }
+  push_undo_snapshot(tr("Straighten Image"));
+  doc = std::move(straightened);
+  canvas_->clear_ruler_line();
+  canvas_->clear_selection();
+  const auto previous_channel_target = canvas_->layer_edit_target();
+  const auto previous_channel_id = canvas_->active_document_channel_id();
+  const auto previous_channel_display = canvas_->mask_display_mode();
+  canvas_->set_document(&doc);
+  restore_channel_target_after_document_reset(previous_channel_target, previous_channel_id,
+                                              previous_channel_display);
+  canvas_->center_document_in_view();
+  refresh_layer_list();
+  refresh_layer_controls();
+  refresh_document_info();
+  refresh_options_bar();
+  statusBar()->showMessage(degrees > 0.0 ? tr("Straightened image %1 degrees counterclockwise").arg(degrees_text)
+                                         : tr("Straightened image %1 degrees clockwise").arg(degrees_text));
+}
+
+void MainWindow::refresh_ruler_readout() {
+  if (ruler_readout_labels_[0] == nullptr) {
+    return;
+  }
+  const auto line = canvas_ != nullptr && has_active_document() ? canvas_->ruler_line() : std::nullopt;
+  if (line.has_value()) {
+    const auto& doc = std::as_const(document());
+    const auto readout = format_ruler_readout(measure_ruler(*line), ruler_unit_, doc.print_settings().horizontal_ppi,
+                                              doc.print_settings().vertical_ppi, doc.width(), doc.height());
+    const std::array<const QString*, 7> texts{&readout.x,     &readout.y,       &readout.width, &readout.height,
+                                              &readout.angle, &readout.length1, &readout.length2};
+    for (std::size_t i = 0; i < texts.size(); ++i) {
+      ruler_readout_labels_[i]->setText(*texts[i]);
+    }
+  } else {
+    for (auto* label : ruler_readout_labels_) {
+      label->clear();
+    }
+  }
+  const bool edit_allowed = has_active_document() && !preview_dialog_edit_locked();
+  const auto active_id = has_active_document() ? std::as_const(document()).active_layer_id() : std::nullopt;
+  if (ruler_straighten_layer_button_ != nullptr) {
+    ruler_straighten_layer_button_->setEnabled(edit_allowed && line.has_value() && active_id.has_value() &&
+                                               !layer_id_locks_position(*active_id));
+  }
+  if (ruler_straighten_image_button_ != nullptr) {
+    ruler_straighten_image_button_->setEnabled(edit_allowed && line.has_value());
+  }
+  if (ruler_clear_button_ != nullptr) {
+    ruler_clear_button_->setEnabled(line.has_value());
+  }
+}
+
+void MainWindow::rotate_canvas_clockwise() {
+  auto& doc = document();
+  if (refuse_document_geometry_change()) {
+    return;
+  }
+  push_undo_snapshot(tr("Rotate canvas"));
+  patchy::rotate_document_clockwise(doc);
+  canvas_->clear_selection();
+  const auto previous_channel_target = canvas_->layer_edit_target();
+  const auto previous_channel_id = canvas_->active_document_channel_id();
+  const auto previous_channel_display = canvas_->mask_display_mode();
+  canvas_->set_document(&doc);
+  restore_channel_target_after_document_reset(previous_channel_target, previous_channel_id,
+                                              previous_channel_display);
+  // Swapped dimensions make the old pan stale, so recenter at the current zoom.
+  canvas_->center_document_in_view();
+  refresh_layer_list();
+  refresh_layer_controls();
+  refresh_document_info();
+  statusBar()->showMessage(tr("Rotated canvas clockwise"));
+}
+
+// Image > Rotate 180 / Flip (GitHub issue 139): the canvas keeps its size, so
+// unlike the quarter turns nothing needs recentering.
+void MainWindow::transform_whole_canvas(const char* undo_name, const QString& status, void (*apply)(Document&)) {
+  auto& doc = document();
+  if (refuse_document_geometry_change()) {
+    return;
+  }
+  push_undo_snapshot(QCoreApplication::translate(kMainWindowTranslationContext, undo_name));
+  apply(doc);
+  canvas_->clear_selection();
+  const auto previous_channel_target = canvas_->layer_edit_target();
+  const auto previous_channel_id = canvas_->active_document_channel_id();
+  const auto previous_channel_display = canvas_->mask_display_mode();
+  canvas_->set_document(&doc);
+  restore_channel_target_after_document_reset(previous_channel_target, previous_channel_id,
+                                              previous_channel_display);
+  refresh_layer_list();
+  refresh_layer_controls();
+  refresh_document_info();
+  statusBar()->showMessage(status);
+}
+
+void MainWindow::rotate_canvas_180() {
+  transform_whole_canvas(QT_TR_NOOP("Rotate canvas"), tr("Rotated canvas 180 degrees"), &patchy::rotate_document_180);
+}
+
+void MainWindow::flip_canvas_horizontal() {
+  transform_whole_canvas(QT_TR_NOOP("Flip canvas"), tr("Flipped canvas horizontally"),
+                         &patchy::flip_document_horizontal);
+}
+
+void MainWindow::flip_canvas_vertical() {
+  transform_whole_canvas(QT_TR_NOOP("Flip canvas"), tr("Flipped canvas vertically"), &patchy::flip_document_vertical);
+}
+
+void MainWindow::rotate_canvas_counterclockwise() {
+  auto& doc = document();
+  if (refuse_document_geometry_change()) {
+    return;
+  }
+  push_undo_snapshot(tr("Rotate canvas"));
+  patchy::rotate_document_counterclockwise(doc);
+  canvas_->clear_selection();
+  const auto previous_channel_target = canvas_->layer_edit_target();
+  const auto previous_channel_id = canvas_->active_document_channel_id();
+  const auto previous_channel_display = canvas_->mask_display_mode();
+  canvas_->set_document(&doc);
+  restore_channel_target_after_document_reset(previous_channel_target, previous_channel_id,
+                                              previous_channel_display);
+  // Swapped dimensions make the old pan stale, so recenter at the current zoom.
+  canvas_->center_document_in_view();
+  refresh_layer_list();
+  refresh_layer_controls();
+  refresh_document_info();
+  statusBar()->showMessage(tr("Rotated canvas counterclockwise"));
+}
+
+void MainWindow::toggle_tile_seam_offset() {
+  if (!has_active_document()) {
+    show_status_error(tr("No document"));
+    return;
+  }
+  auto& doc = document();
+  if (document_contains_smart_objects(std::as_const(doc))) {
+    show_status_error(tr("Rasterize Smart Objects before changing document geometry"));
+    return;
+  }
+  // Parity lives in document metadata ("dx,dy" of the applied shift) so the second press
+  // applies the exact inverse even for odd dimensions, and undo/redo (which snapshot the
+  // whole Document, metadata included) can never desync the toggle state.
+  std::int32_t dx = doc.width() / 2;
+  std::int32_t dy = doc.height() / 2;
+  bool shifting_back = false;
+  auto& values = doc.metadata().values;
+  if (const auto stored = values.find(kTileSeamOffsetMetadataKey); stored != values.end()) {
+    const auto parts = QString::fromStdString(stored->second).split(QLatin1Char(','));
+    if (parts.size() == 2) {
+      dx = -parts[0].toInt();
+      dy = -parts[1].toInt();
+      shifting_back = true;
+    }
+  }
+  if (dx == 0 && dy == 0) {
+    show_status_error(tr("Document too small to shift seams"));
+    return;
+  }
+  push_undo_snapshot(tr("Shift seams"));
+  patchy::wrap_offset_document(doc, dx, dy);
+  if (shifting_back) {
+    values.erase(kTileSeamOffsetMetadataKey);
+  } else {
+    values[kTileSeamOffsetMetadataKey] = std::to_string(dx) + "," + std::to_string(dy);
+  }
+  canvas_->clear_selection();
+  const auto previous_channel_target = canvas_->layer_edit_target();
+  const auto previous_channel_id = canvas_->active_document_channel_id();
+  const auto previous_channel_display = canvas_->mask_display_mode();
+  canvas_->set_document(&doc);
+  restore_channel_target_after_document_reset(previous_channel_target, previous_channel_id,
+                                              previous_channel_display);
+  refresh_layer_list();
+  refresh_layer_controls();
+  refresh_document_info();
+  statusBar()->showMessage(shifting_back ? tr("Shifted seams back to the edges")
+                                         : tr("Shifted seams to the center"));
+}
+
+}  // namespace patchy::ui

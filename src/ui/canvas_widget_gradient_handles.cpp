@@ -1,0 +1,2096 @@
+// CanvasWidget's handles for an existing Gradient Fill (GitHub issue 663, docs/gradients-fill-handles.md,
+// "Gradient Fill handles"). With the Gradient tool active on a Gradient Fill layer or a
+// single-fill gradient shape, the gradient's line is drawn from its start handle (location 0,
+// or 1 when reversed) to its end handle, with the color stops on one side of it, the opacity
+// stops on the other and each segment's midpoint beside its stops. Dragging an end changes
+// the angle and length (Shift: 15-degree steps), dragging the line moves the gradient, a stop
+// slides along the line or leaves it to be deleted, a midpoint slides between its stops, a
+// click on the line adds a color stop, and a double-click on a color stop opens its color.
+// Every gesture previews through MainWindow and lands as one undo step; Esc cancels it. A
+// press anywhere else still draws a new gradient. The overlay is drawn from the stored
+// placement through view_transform(); the only per-layer work, the alignment bounds, is
+// cached by revision.
+
+#include "ui/canvas_widget.hpp"
+
+#include "core/blend_math.hpp"
+#include "core/gradient_fill_drag.hpp"
+#include "core/layer_render_utils.hpp"
+#include "core/vector_raster.hpp"
+#include "core/vector_shape.hpp"
+#include "ui/canvas_types.hpp"
+#include "ui/canvas_widget_shared.hpp"
+#include "ui/image_document_io.hpp"
+#include "ui/theme_palette.hpp"
+
+#include <QApplication>
+#include <QColor>
+#include <QElapsedTimer>
+#include <QTimer>
+#include <QHelpEvent>
+#include <QAction>
+#include <QFrame>
+#include <QGuiApplication>
+#include <QHBoxLayout>
+#include <QKeyEvent>
+#include <QLabel>
+#include <QLineF>
+#include <QMenu>
+#include <QMouseEvent>
+#include <QPainter>
+#include <QPainterPath>
+#include <QPen>
+#include <QPointF>
+#include <QPolygonF>
+#include <QRectF>
+#include <QScreen>
+#include <QSignalBlocker>
+#include <QSlider>
+#include <QSpinBox>
+#include <QToolTip>
+#include <Qt>
+
+#include <algorithm>
+#include <cmath>
+#include <functional>
+#include <initializer_list>
+#include <numbers>
+#include <optional>
+#include <utility>
+#include <vector>
+
+namespace patchy::ui {
+
+namespace {
+
+// Screen-pixel sizes and reaches.
+constexpr double kEndReach = 8.0;
+constexpr double kStopReach = 8.0;
+constexpr double kMidpointReach = 5.0;
+// The drawn line is a 3 px band: a click a few pixels beside it still means the line
+// (GitHub issue 663 follow-up: at 4 px a slightly low click started a new gradient instead).
+constexpr double kLineReach = 7.0;
+constexpr double kHandleRadius = 6.0;
+// A stop marker sits this far off the line: color stops on one side, opacity stops on the other.
+constexpr double kStopOffset = 16.0;
+constexpr double kStopHalf = 6.0;
+constexpr double kMidpointHalf = 4.0;
+// A stop dragged this far past its marker's place beside the line is deleted on release.
+constexpr double kRemoveDistance = 24.0;
+// Midpoints hide when their stops are closer than this on screen.
+constexpr double kMinMidpointGap = 16.0;
+constexpr double kSnapDegrees = 15.0;
+// How far either side of the line a click still lands on it: the stop markers' band and a
+// little past it (the opacity side adds opacity stops, the color side color stops).
+constexpr double kSideReach = kStopOffset + kStopHalf + 3.0;
+// The live preview re-bakes the fill: at most one per this many milliseconds while the
+// pointer moves (the overlay itself follows every move).
+constexpr int kGradientPreviewIntervalMs = 33;
+
+using PartKind = CanvasWidget::GradientHandlePartKind;
+using Part = CanvasWidget::GradientHandlePart;
+
+double distance_to_segment(QPointF point, QPointF a, QPointF b) {
+  const QPointF ab = b - a;
+  const double length_squared = QPointF::dotProduct(ab, ab);
+  if (length_squared <= 0.0) {
+    return QLineF(point, a).length();
+  }
+  const double t = std::clamp(QPointF::dotProduct(point - a, ab) / length_squared, 0.0, 1.0);
+  return QLineF(point, a + ab * t).length();
+}
+
+double distance_to_line(QPointF point, QPointF a, QPointF b) {
+  const QPointF ab = b - a;
+  const double length = std::hypot(ab.x(), ab.y());
+  if (length <= 0.0) {
+    return QLineF(point, a).length();
+  }
+  return std::abs((point.x() - a.x()) * ab.y() - (point.y() - a.y()) * ab.x()) / length;
+}
+
+// The side of the line the color stops sit on (a unit normal in widget space); the opacity
+// stops take the other side. A screen-down normal for a left-to-right line.
+QPointF stop_side_normal(QPointF start, QPointF end) {
+  const QPointF along = end - start;
+  const double length = std::hypot(along.x(), along.y());
+  if (length <= 1e-9) {
+    return {0.0, 1.0};
+  }
+  return {-along.y() / length, along.x() / length};
+}
+
+bool solid_stops(const LayerStyleGradient& gradient) {
+  return gradient.form != GradientDefinitionForm::Noise;
+}
+
+// Widget-space positions of everything the overlay draws for one gradient.
+struct HandleGeometry {
+  QPointF start;
+  QPointF end;
+  QPointF normal;
+  std::vector<QPointF> color_stops;
+  std::vector<QPointF> alpha_stops;
+  // Indexed like the stops (the destination stop owns the midpoint); nullopt when hidden.
+  std::vector<std::optional<QPointF>> color_midpoints;
+  std::vector<std::optional<QPointF>> alpha_midpoints;
+};
+
+template <typename Stop, typename Map>
+void place_stops(const std::vector<Stop>& stops, const Map& on_line, QPointF offset, std::vector<QPointF>& points,
+                 std::vector<std::optional<QPointF>>& midpoints) {
+  points.clear();
+  midpoints.clear();
+  for (const auto& stop : stops) {
+    points.push_back(on_line(static_cast<double>(stop.location)) + offset);
+  }
+  midpoints.resize(stops.size());
+  for (std::size_t i = 1; i < stops.size(); ++i) {
+    if (QLineF(points[i - 1], points[i]).length() < kMinMidpointGap) {
+      continue;
+    }
+    const auto from = static_cast<double>(stops[i - 1].location);
+    const auto to = static_cast<double>(stops[i].location);
+    midpoints[i] = on_line(from + (to - from) * static_cast<double>(stops[i].midpoint)) + offset;
+  }
+}
+
+QPolygonF diamond_at(QPointF center, double half) {
+  return QPolygonF({center + QPointF(0.0, -half), center + QPointF(half, 0.0), center + QPointF(0.0, half),
+                    center + QPointF(-half, 0.0)});
+}
+
+}  // namespace
+
+void CanvasWidget::set_gradient_fill_edit_callback(GradientFillEditCallback callback) {
+  gradient_fill_edit_callback_ = std::move(callback);
+}
+
+void CanvasWidget::set_gradient_fill_stop_color_requested_callback(
+    std::function<void(LayerId, int, GradientHandleTarget)> callback) {
+  gradient_fill_stop_color_requested_callback_ = std::move(callback);
+}
+
+bool CanvasWidget::gradient_handles_enabled() const noexcept {
+  return tool_ == CanvasTool::Gradient || gradient_handles_under_other_tool();
+}
+
+bool CanvasWidget::gradient_handles_under_other_tool() const noexcept {
+  if (!gradient_handles_forced_) {
+    return false;
+  }
+  switch (tool_) {
+    case CanvasTool::Gradient:  // its own handles, with its own rules
+    // These own every press (or only move the view), so handles shown under them could
+    // never be pressed.
+    case CanvasTool::Pan:
+    case CanvasTool::Zoom:
+    case CanvasTool::RotateView:
+    case CanvasTool::Eyedropper:
+    case CanvasTool::Ruler:
+    case CanvasTool::Artboard:
+    case CanvasTool::Crop:
+    case CanvasTool::PerspectiveCrop:
+      return false;
+    default:
+      break;
+  }
+  // A transform session owns the canvas, and a path or lasso being built by clicks owns
+  // each click.
+  return !transforming_layer_ && !warping_layer_ && !path_transform_active_ && !pen_session_active_ &&
+         !polygon_lassoing_ && !magnetic_lassoing_;
+}
+
+void CanvasWidget::set_gradient_handles_forced(bool forced, GradientHandleTarget preferred) {
+  if (gradient_handles_forced_ == forced && gradient_handles_preferred_ == preferred) {
+    return;
+  }
+  gradient_handles_forced_ = forced;
+  gradient_handles_preferred_ = preferred;
+  gradient_handle_bounds_cache_.reset();
+  if (tool_ != CanvasTool::Gradient) {
+    // As a switch away from the Gradient tool: the drag is put back, the popup commits. The
+    // handles may now be gone or on the shape's other gradient.
+    cancel_gradient_fill_handle_drag();
+    finish_gradient_opacity_popup(true);
+    gradient_stop_selection_.reset();
+    if (gradient_handle_hover_.kind != PartKind::None || gradient_handle_cursor_ != GradientHandleCursor::None) {
+      gradient_handle_hover_ = {};
+      gradient_handle_cursor_ = GradientHandleCursor::None;
+      update_tool_cursor();
+    }
+  }
+  update();
+}
+
+bool CanvasWidget::handle_gradient_handle_key(QKeyEvent* event) {
+  if (gradient_handles_enabled() && event->modifiers() == Qt::NoModifier &&
+      (event->key() == Qt::Key_Delete || event->key() == Qt::Key_Backspace) && !event->isAutoRepeat() &&
+      delete_selected_gradient_stop()) {
+    return true;
+  }
+  if (gradient_handle_drag_.has_value() && event->key() == Qt::Key_Escape) {
+    // Esc mid-drag puts the gradient back as it was before the press.
+    cancel_gradient_fill_handle_drag();
+    return true;
+  }
+  return false;
+}
+
+const Layer* CanvasWidget::gradient_fill_handle_layer() const {
+  if (document_ == nullptr || !gradient_handles_enabled() || quick_mask_active_ ||
+      layer_edit_target_ != LayerEditTarget::Content) {
+    return nullptr;
+  }
+  const auto& document = std::as_const(*document_);
+  const auto active = document.active_layer_id();
+  if (!active.has_value()) {
+    return nullptr;
+  }
+  const auto* layer = document.find_layer(*active);
+  if (layer == nullptr || !layer_is_vector_shape(*layer)) {
+    return nullptr;
+  }
+  return gradient_handle_target(*layer).has_value() ? layer : nullptr;
+}
+
+std::optional<GradientHandleTarget> CanvasWidget::gradient_handle_target(const Layer& layer) const {
+  const auto* shape = layer.vector_shape();
+  if (shape == nullptr || !shape->parts.empty()) {
+    return std::nullopt;
+  }
+  const bool fill = shape->fill.kind == VectorFillKind::Gradient &&
+                    shape->fill.gradient.type != LayerStyleGradientType::ShapeBurst;
+  if (tool_ == CanvasTool::Gradient) {
+    // The Gradient tool draws and edits fills.
+    return fill ? std::optional(GradientHandleTarget::Fill) : std::nullopt;
+  }
+  const auto& stroke = shape->stroke;
+  const bool stroke_gradient = stroke.enabled && stroke.width > 0.0 && !shape->path.empty() &&
+                               !shape->path_disabled && stroke.content.kind == VectorFillKind::Gradient &&
+                               stroke.content.gradient.type != LayerStyleGradientType::ShapeBurst;
+  // The preferred gradient when the shape has both; otherwise the one it has.
+  if (gradient_handles_preferred_ == GradientHandleTarget::Stroke && stroke_gradient) {
+    return GradientHandleTarget::Stroke;
+  }
+  if (fill) {
+    return GradientHandleTarget::Fill;
+  }
+  return stroke_gradient ? std::optional(GradientHandleTarget::Stroke) : std::nullopt;
+}
+
+const LayerStyleGradient& CanvasWidget::gradient_handle_gradient(const Layer& layer) const {
+  const auto* shape = layer.vector_shape();
+  if (gradient_handle_target(layer) == GradientHandleTarget::Stroke) {
+    return shape->stroke.content.gradient;
+  }
+  // A live edit shown through the view preview has not reached the layer yet (GitHub #714):
+  // the handles, the stop colors and the opacity popup follow the gradient on screen.
+  if (gradient_view_preview_.has_value() && !gradient_view_preview_->drag &&
+      (!gradient_view_preview_->held || gradient_view_preview_->awaiting_commit) &&
+      gradient_view_preview_->layer_id == layer.id()) {
+    return gradient_view_preview_->gradient;
+  }
+  // So does a commit the host is still baking (GitHub #714 follow-up): the layer keeps the
+  // gradient from before until the bake lands.
+  if (gradient_pending_commit_.has_value() && !gradient_pending_commit_->new_layer &&
+      gradient_pending_commit_->layer_id == layer.id()) {
+    return gradient_pending_commit_->gradient;
+  }
+  return shape->fill.gradient;
+}
+
+namespace {
+
+// Whether `id` is `layer` or inside it, and whether a group on the way down to it has
+// layer effects (they read the group's whole alpha, the fill's included).
+bool find_with_styled_ancestor(const Layer& layer, LayerId id, bool& styled_ancestor) {
+  if (layer.id() == id) {
+    return true;
+  }
+  for (const auto& child : layer.children()) {
+    if (find_with_styled_ancestor(child, id, styled_ancestor)) {
+      styled_ancestor = styled_ancestor || !layer.layer_style().empty();
+      return true;
+    }
+  }
+  return false;
+}
+
+}  // namespace
+
+bool CanvasWidget::show_gradient_fill_view_preview(LayerId layer_id, const LayerStyleGradient& gradient,
+                                                   Rect gradient_bounds) {
+  return show_gradient_view_preview(layer_id, gradient, gradient_bounds, GradientViewPreviewKind::FillEdit);
+}
+
+bool CanvasWidget::show_gradient_view_preview(LayerId layer_id, const LayerStyleGradient& gradient,
+                                              Rect gradient_bounds, GradientViewPreviewKind kind) {
+  if (document_ == nullptr || !gradient_view_preview_enabled_ || !isVisible() || width() <= 0 || height() <= 0) {
+    return false;
+  }
+  const auto& document = std::as_const(*document_);
+  const QRect canvas_rect(0, 0, document.width(), document.height());
+  const auto canvas = Rect::from_size(document.width(), document.height());
+  // The patches go over the composite as it is shown, so the view must be showing that
+  // composite: no mask or channel picture, no palette display, no clipping view.
+  if (render_cache_.isNull() || render_cache_.size() != canvas_rect.size() ||
+      document.color_state().bit_depth != BitDepth::UInt8 || palette_snap_context() != nullptr ||
+      curves_clipping_mode_.has_value() || mask_display_mode_ != MaskDisplayMode::None || quick_mask_active_ ||
+      !channel_view_is_composite(channel_view_) ||
+      layer_edit_target_ != LayerEditTarget::Content || transforming_layer_ || warping_layer_ || moving_layer_ ||
+      tiling_preview_enabled_) {
+    return false;
+  }
+  const auto* layer = document.find_layer(layer_id);
+  if (layer == nullptr) {
+    return false;
+  }
+  const bool paints_pixels = kind == GradientViewPreviewKind::PixelsDrag;
+  if (paints_pixels) {
+    // Pixels mode paints over the layer's own 8-bit pixels.
+    const auto format = layer->pixels().format();
+    if (layer->kind() != LayerKind::Pixel || layer_is_vector_shape(*layer) ||
+        (!layer->pixels().empty() && (format.bit_depth != BitDepth::UInt8 || format.channels < 3))) {
+      return false;
+    }
+  } else if (kind == GradientViewPreviewKind::FillEdit) {
+    if (!gradient_fill_draft_supported(*layer, canvas) || layer->bounds() != canvas) {
+      return false;
+    }
+  } else {
+    // A fill redrawn by a drag: what the draft covers, at any document size.
+    const auto* shape = layer->vector_shape();
+    if (shape == nullptr || !shape->parts.empty() || shape->fill.kind != VectorFillKind::Gradient ||
+        !(shape->path.empty() || shape->path_disabled) || shape->path_inverted || shape->feather > 0.05 ||
+        shape->density != 255 || !shape->stroke.fill_enabled || layer->bounds() != canvas) {
+      return false;
+    }
+  }
+  // Layer effects on the layer, or on a group around it, read the layer's edge (a stroke, an
+  // inner shadow, a gradient overlay aligned with the layer), so the raster then keeps the
+  // layer's whole extent. For a fill they also read its silhouette, which for a gradient
+  // with transparent stops is a plane only the exact bake makes: that case previews through
+  // the document (or, for a drag, as the painted overlay).
+  bool styled = !layer->layer_style().empty();
+  for (const auto& top : document.layers()) {
+    if (find_with_styled_ancestor(top, layer_id, styled)) {
+      break;
+    }
+  }
+  bool opaque_gradient = true;
+  for (int sample = 0; sample <= 64 && opaque_gradient; ++sample) {
+    opaque_gradient = gradient_stop_opacity(gradient, static_cast<float>(sample) / 64.0F, true) >= 0.999F;
+  }
+  if (styled && !paints_pixels && !opaque_gradient) {
+    return false;
+  }
+  // Pixels mode paints over the layer's raster. A gradient that covers it everywhere (opaque
+  // stops at full Opacity, no selection, no transparency lock) leaves none of it showing, so
+  // the raster is the gradient alone and the layer need not be scaled down for the preview
+  // (once per drag, and proportional to the layer).
+  const bool over_layer = paints_pixels && !(opaque_gradient && gradient_opacity_ >= 100 && !has_selection() &&
+                                             !active_layer_locks_transparent_pixels());
+  // The display's composite level, as the Warp preview picks it (GitHub #200, #298): one
+  // level down between 50% and 100%, where full resolution is up to twice the screen's
+  // pixels each way.
+  int level = preview_composite_level_for_zoom(view_zoom());
+  if (level == 0 && view_zoom() < 1.0) {
+    level = 1;
+  }
+  // The document at that level, built once per edit. A fill's own raster is left out:
+  // every preview supplies it, so scaling the one in the layer down would be wasted work
+  // proportional to the document. Pixels mode paints over the layer's raster and keeps it.
+  QElapsedTimer stage_timer;
+  stage_timer.start();
+  const auto stage_ms = [&stage_timer] {
+    const auto elapsed = static_cast<double>(stage_timer.nsecsElapsed()) / 1e6;
+    stage_timer.start();
+    return elapsed;
+  };
+  if (!gradient_view_preview_source_.has_value() || gradient_view_preview_source_->layer_id != layer_id ||
+      gradient_view_preview_source_->level != level ||
+      gradient_view_preview_source_->keeps_layer_pixels != over_layer) {
+    ++render_cache_diagnostics_.gradient_view_preview_source_builds;
+    Document source(document);
+    if (!over_layer) {
+      if (auto* fill = source.find_layer(layer_id); fill != nullptr) {
+        fill->set_pixels(PixelBuffer());
+      }
+    }
+    if (!preview_scale_cache_) {
+      preview_scale_cache_ = std::make_shared<PreviewScaleCache>();
+    }
+    gradient_view_preview_source_ = GradientFillViewPreviewSource{
+        layer_id, level, over_layer, build_preview_scaled_document(source, level, preview_scale_cache_.get()),
+        {}, QRect()};
+  }
+  render_cache_diagnostics_.gradient_view_preview_source_ms += stage_ms();
+  const Document& composite_document = gradient_view_preview_source_->document;
+  const auto* composite_layer = composite_document.find_layer(layer_id);
+  if (composite_layer == nullptr) {
+    return false;
+  }
+  auto covered = warp_preview_view_rect(0.0);
+  if (level >= 1) {
+    covered = rect_aligned_to_mip_grid(covered, level).intersected(canvas_rect);
+  }
+  const QRect composite_canvas(0, 0, composite_document.width(), composite_document.height());
+  const auto patch_rect =
+      (level >= 1 ? preview_scaled_document_rect(covered, level) : covered).intersected(composite_canvas);
+
+  GradientFillViewPreview preview;
+  preview.layer_id = layer_id;
+  preview.gradient = gradient;
+  preview.level = level;
+  preview.gradient_bounds = gradient_bounds;
+  preview.view = view_transform().to_widget();
+  preview.view_size = size();
+  if (!patch_rect.isEmpty()) {
+    // The gradient is rendered for the area on screen only, or whole under layer effects.
+    const QRect raster_rect = styled ? composite_canvas : patch_rect;
+    const std::int32_t step = std::int32_t{1} << level;
+    render_gradient_fill_draft(gradient, gradient_bounds, raster_rect.x() * step, raster_rect.y() * step, step,
+                               raster_rect.width(), raster_rect.height(), gradient_view_preview_raster_);
+    if (over_layer) {
+      paint_gradient_view_preview_over_layer(*composite_layer, raster_rect, step);
+    }
+    render_cache_diagnostics_.gradient_view_preview_raster_ms += stage_ms();
+    preview.patches = qimage_patch_from_document_rect_with_layer_pixels_banded(
+        composite_document, patch_rect, true, layer_id, gradient_view_preview_raster_,
+        Rect{raster_rect.x(), raster_rect.y(), raster_rect.width(), raster_rect.height()});
+    for (auto& patch : preview.patches) {
+      // A scaled patch is only ever drawn, and Qt scales a premultiplied image faster; a
+      // full-resolution one may go through the deep-zoom pixel renderer, which reads RGBA.
+      patch.image = patch.image.convertToFormat(level >= 1 ? QImage::Format_ARGB32_Premultiplied
+                                                           : QImage::Format_RGBA8888);
+      if (level >= 1) {
+        // Full-resolution document_rect for the paint math; the image is its mip.
+        patch.document_rect = QRect(patch.document_rect.x() << level, patch.document_rect.y() << level,
+                                    patch.document_rect.width() << level, patch.document_rect.height() << level)
+                                  .intersected(canvas_rect);
+      }
+    }
+    render_cache_diagnostics_.gradient_view_preview_composite_ms += stage_ms();
+    render_cache_diagnostics_.gradient_view_preview_last_pixels =
+        static_cast<std::uint64_t>(raster_rect.width()) * static_cast<std::uint64_t>(raster_rect.height());
+  } else {
+    render_cache_diagnostics_.gradient_view_preview_last_pixels = 0;
+  }
+  ++render_cache_diagnostics_.gradient_view_previews;
+  gradient_view_preview_ = std::move(preview);
+  update();
+  return true;
+}
+
+void CanvasWidget::paint_gradient_view_preview_over_layer(const Layer& scaled_layer, QRect raster_rect,
+                                                          std::int32_t step) {
+  // What core draw_gradient leaves in the layer, at the preview's scale: the gradient at
+  // the tool's Opacity over the layer's pixels, inside the selection, keeping the layer's
+  // alpha under a transparency lock. The layer's raster is `scaled_layer`'s, in the same
+  // scaled pixels as `raster_rect`.
+  auto& raster = gradient_view_preview_raster_;
+  const auto width = raster_rect.width();
+  const auto height = raster_rect.height();
+  const auto& base = scaled_layer.pixels();
+  const auto base_bounds = base.empty() ? Rect{} : scaled_layer.bounds();
+  const auto base_channels = base.empty() ? 0 : static_cast<int>(base.format().channels);
+  const bool lock_alpha = active_layer_locks_transparent_pixels();
+  const auto opacity = std::clamp(gradient_opacity_, 0, 100) * 255 / 100;
+  // The selection's coverage for these pixels, sampled once per drag (the document point in
+  // the middle of each scaled pixel).
+  const std::uint8_t* selection = nullptr;
+  if (has_selection() && gradient_view_preview_source_.has_value()) {
+    auto& source = *gradient_view_preview_source_;
+    if (source.selection_rect != raster_rect ||
+        source.selection_alpha.size() != static_cast<std::size_t>(width) * static_cast<std::size_t>(height)) {
+      source.selection_rect = raster_rect;
+      source.selection_alpha.assign(static_cast<std::size_t>(width) * static_cast<std::size_t>(height), 0);
+      const auto half = step / 2;
+      for (int y = 0; y < height; ++y) {
+        auto* row = source.selection_alpha.data() + static_cast<std::size_t>(y) * static_cast<std::size_t>(width);
+        for (int x = 0; x < width; ++x) {
+          row[x] = selection_alpha_at(
+              QPoint((raster_rect.x() + x) * step + half, (raster_rect.y() + y) * step + half));
+        }
+      }
+    }
+    selection = source.selection_alpha.data();
+  }
+  auto* bytes = raster.data().data();
+  const auto stride = raster.stride_bytes();
+  for (int y = 0; y < height; ++y) {
+    auto* row = bytes + static_cast<std::size_t>(y) * stride;
+    const auto base_y = raster_rect.y() + y - base_bounds.y;
+    const bool base_row = base_channels >= 3 && base_y >= 0 && base_y < base_bounds.height;
+    for (int x = 0; x < width; ++x) {
+      auto* px = row + static_cast<std::size_t>(x) * 4U;
+      int source_alpha = px[3] * opacity / 255;
+      if (selection != nullptr) {
+        source_alpha = source_alpha * selection[static_cast<std::size_t>(y) * static_cast<std::size_t>(width) +
+                                                static_cast<std::size_t>(x)] / 255;
+      }
+      const auto base_x = raster_rect.x() + x - base_bounds.x;
+      int under[4] = {0, 0, 0, 0};
+      if (base_row && base_x >= 0 && base_x < base_bounds.width) {
+        const auto* under_px = base.pixel(base_x, base_y);
+        under[0] = under_px[0];
+        under[1] = under_px[1];
+        under[2] = under_px[2];
+        under[3] = base_channels >= 4 ? under_px[3] : 255;
+      }
+      if (lock_alpha) {
+        // Color only where the layer has pixels; its alpha stays.
+        for (int c = 0; c < 3; ++c) {
+          px[c] = static_cast<std::uint8_t>((px[c] * source_alpha + under[c] * (255 - source_alpha) + 127) / 255);
+        }
+        px[3] = static_cast<std::uint8_t>(under[3]);
+        continue;
+      }
+      const int kept = under[3] * (255 - source_alpha) / 255;
+      const int out_alpha = source_alpha + kept;
+      if (out_alpha <= 0) {
+        px[0] = px[1] = px[2] = px[3] = 0;
+        continue;
+      }
+      for (int c = 0; c < 3; ++c) {
+        px[c] = static_cast<std::uint8_t>((px[c] * source_alpha + under[c] * kept + out_alpha / 2) / out_alpha);
+      }
+      px[3] = static_cast<std::uint8_t>(std::min(out_alpha, 255));
+    }
+  }
+}
+
+bool CanvasWidget::show_gradient_drag_view_preview(QPoint from, QPoint to) {
+  if (document_ == nullptr || from == to) {
+    return false;
+  }
+  const auto& document = std::as_const(*document_);
+  const auto active = document.active_layer_id();
+  const auto* layer = active.has_value() ? document.find_layer(*active) : nullptr;
+  if (layer == nullptr) {
+    return false;
+  }
+  const auto canvas = Rect::from_size(document.width(), document.height());
+  // The gradient a Fill Layer made from this drag holds; Pixels mode paints the same ramp
+  // (gradient_fill_from_drag_renders_the_gradient_tool_drag).
+  const auto gradient =
+      gradient_fill_from_drag(resolved_gradient(), gradient_method_, gradient_reverse_, canvas, from.x(), from.y(),
+                              to.x(), to.y());
+  GradientViewPreviewKind kind = GradientViewPreviewKind::PixelsDrag;
+  if (gradient_drag_makes_fill_layer()) {
+    // Only a drag that redraws the active fill: a new layer does not exist yet, and has no
+    // effects to show.
+    if (!layer_is_vector_shape(*layer) || !vector_lock_reason(*layer).empty() ||
+        layer_effectively_locks_image_pixels(*layer)) {
+      return false;
+    }
+    kind = GradientViewPreviewKind::FillDrag;
+  }
+  if (!show_gradient_view_preview(*active, gradient, canvas, kind)) {
+    return false;
+  }
+  gradient_view_preview_->drag = true;
+  gradient_view_preview_->drag_from = from;
+  gradient_view_preview_->drag_to = to;
+  return true;
+}
+
+void CanvasWidget::refresh_gradient_drag_view_preview() {
+  const bool shown = gradient_view_preview_.has_value() && gradient_view_preview_->drag;
+  const bool dragging = drawing_shape_ && tool_ == CanvasTool::Gradient && shape_current_ != shape_start_;
+  if (!dragging) {
+    if (shown && !gradient_view_preview_->held) {
+      // The drag ended without a commit (Esc, a lost release, a click).
+      gradient_view_preview_.reset();
+      restore_gradient_fill_pending_preview();
+    }
+    return;
+  }
+  if (shown && gradient_view_preview_->drag_from == shape_start_ && gradient_view_preview_->drag_to == shape_current_ &&
+      gradient_view_preview_->view == view_transform().to_widget() && gradient_view_preview_->view_size == size()) {
+    return;
+  }
+  if (!show_gradient_drag_view_preview(shape_start_, shape_current_) && shown) {
+    gradient_view_preview_.reset();
+    restore_gradient_fill_pending_preview();
+  }
+}
+
+void CanvasWidget::hold_gradient_drag_view_preview() {
+  if (!gradient_view_preview_.has_value() || !gradient_view_preview_->drag || document_ == nullptr) {
+    return;
+  }
+  const auto* layer = std::as_const(*document_).find_layer(gradient_view_preview_->layer_id);
+  if (layer == nullptr) {
+    gradient_view_preview_.reset();
+    return;
+  }
+  gradient_view_preview_->drag = false;
+  gradient_view_preview_->held = true;
+  gradient_view_preview_->held_render_revision = layer->render_revision();
+  gradient_view_preview_->held_content_revision = layer->content_revision();
+}
+
+bool CanvasWidget::gradient_drag_view_preview_shown() const noexcept {
+  return gradient_view_preview_.has_value() && gradient_view_preview_->drag;
+}
+
+void CanvasWidget::hold_gradient_fill_view_preview(LayerId layer_id, const LayerStyleGradient& gradient,
+                                                   Rect gradient_bounds) {
+  if (!gradient_view_preview_.has_value() || gradient_view_preview_->layer_id != layer_id) {
+    clear_gradient_fill_view_preview();
+    return;
+  }
+  // The throttle may have left an older gradient on screen: the held frame shows the
+  // committed one.
+  if (gradient_view_preview_->gradient != gradient &&
+      !show_gradient_view_preview(layer_id, gradient, gradient_bounds,
+                                  gradient_view_preview_->drag ? GradientViewPreviewKind::FillDrag
+                                                               : GradientViewPreviewKind::FillEdit)) {
+    clear_gradient_fill_view_preview();
+    return;
+  }
+  const auto* layer = document_ != nullptr ? std::as_const(*document_).find_layer(layer_id) : nullptr;
+  if (layer == nullptr) {
+    clear_gradient_fill_view_preview();
+    return;
+  }
+  gradient_view_preview_->held = true;
+  gradient_view_preview_->drag = false;
+  gradient_view_preview_->held_render_revision = layer->render_revision();
+  gradient_view_preview_->held_content_revision = layer->content_revision();
+  gradient_drag_hold_.reset();  // a Fill Layer mode release: this frame is its picture, not the overlay
+}
+
+void CanvasWidget::clear_gradient_fill_view_preview() {
+  if (!gradient_view_preview_.has_value()) {
+    return;
+  }
+  gradient_view_preview_.reset();
+  update();
+}
+
+bool CanvasWidget::begin_gradient_fill_pending_commit(LayerId layer_id, const LayerStyleGradient& gradient,
+                                                      Rect gradient_bounds) {
+  // The picture on screen may be an older gradient (the throttle), another layer's, or the
+  // drag overlay of a Fill Layer mode release: the kept frame shows the committed one.
+  if ((!gradient_view_preview_.has_value() || gradient_view_preview_->layer_id != layer_id ||
+       gradient_view_preview_->gradient != gradient) &&
+      !show_gradient_fill_view_preview(layer_id, gradient, gradient_bounds)) {
+    return false;
+  }
+  gradient_view_preview_->held = true;
+  gradient_view_preview_->awaiting_commit = true;
+  gradient_view_preview_->drag = false;
+  gradient_pending_commit_ = GradientFillPendingCommit{layer_id, gradient, gradient_bounds, false};
+  gradient_drag_hold_.reset();  // the view preview is the release's picture now
+  update();
+  return true;
+}
+
+void CanvasWidget::begin_gradient_fill_pending_new_layer() {
+  gradient_pending_commit_ = GradientFillPendingCommit{0, LayerStyleGradient{}, Rect{}, true};
+}
+
+void CanvasWidget::finish_gradient_fill_pending_commit(bool landed) {
+  if (!gradient_pending_commit_.has_value()) {
+    return;
+  }
+  const auto pending = std::move(*gradient_pending_commit_);
+  gradient_pending_commit_.reset();
+  if (pending.new_layer) {
+    // The host's notification marked the held drag preview; tie it to the layer now.
+    if (landed) {
+      settle_gradient_fill_drag_hold();
+    } else {
+      clear_gradient_fill_drag_hold();
+    }
+    return;
+  }
+  if (!gradient_view_preview_.has_value() || !gradient_view_preview_->awaiting_commit) {
+    return;  // a later drag's own preview is up, or nothing is
+  }
+  const auto* layer =
+      landed && document_ != nullptr ? std::as_const(*document_).find_layer(pending.layer_id) : nullptr;
+  if (layer == nullptr) {
+    clear_gradient_fill_view_preview();
+    return;
+  }
+  // From here it is the held frame of an ordinary commit: up until the composite lands.
+  gradient_view_preview_->awaiting_commit = false;
+  gradient_view_preview_->held = true;
+  gradient_view_preview_->held_render_revision = layer->render_revision();
+  gradient_view_preview_->held_content_revision = layer->content_revision();
+  update();
+}
+
+bool CanvasWidget::gradient_fill_commit_pending() const noexcept {
+  return gradient_pending_commit_.has_value();
+}
+
+void CanvasWidget::set_gradient_fill_pending_flush_callback(std::function<void()> callback) {
+  gradient_fill_pending_flush_callback_ = std::move(callback);
+}
+
+void CanvasWidget::flush_gradient_fill_pending_commit() {
+  if (gradient_pending_commit_.has_value() && gradient_fill_pending_flush_callback_) {
+    gradient_fill_pending_flush_callback_();
+  }
+}
+
+void CanvasWidget::restore_gradient_fill_pending_preview() {
+  if (!gradient_pending_commit_.has_value() || gradient_pending_commit_->new_layer ||
+      (gradient_view_preview_.has_value() && gradient_view_preview_->awaiting_commit)) {
+    return;
+  }
+  const auto pending = *gradient_pending_commit_;
+  if (show_gradient_fill_view_preview(pending.layer_id, pending.gradient, pending.gradient_bounds)) {
+    gradient_view_preview_->held = true;
+    gradient_view_preview_->awaiting_commit = true;
+    return;
+  }
+  // The view cannot show it any more: the layer itself has to.
+  flush_gradient_fill_pending_commit();
+}
+
+bool CanvasWidget::gradient_fill_view_preview_shown() const noexcept {
+  return gradient_view_preview_.has_value();
+}
+
+void CanvasWidget::set_gradient_fill_view_preview_enabled_for_testing(bool enabled) noexcept {
+  gradient_view_preview_enabled_ = enabled;
+}
+
+bool CanvasWidget::gradient_fill_view_preview_drawn() {
+  if (!gradient_view_preview_.has_value()) {
+    return false;
+  }
+  if (gradient_view_preview_->awaiting_commit) {
+    // Kept for a commit the host is baking. A zoom, pan or rotation since it was made left
+    // it covering the old view: render it once for the view as it is now.
+    const auto view = view_transform().to_widget();
+    if (gradient_view_preview_->view != view || gradient_view_preview_->view_size != size()) {
+      const auto layer_id = gradient_view_preview_->layer_id;
+      const auto gradient = gradient_view_preview_->gradient;
+      const auto bounds = gradient_view_preview_->gradient_bounds;
+      if (show_gradient_fill_view_preview(layer_id, gradient, bounds)) {
+        gradient_view_preview_->held = true;
+        gradient_view_preview_->awaiting_commit = true;
+      } else {
+        gradient_view_preview_->view = view;
+        gradient_view_preview_->view_size = size();
+      }
+    }
+    return true;
+  }
+  if (gradient_view_preview_->held && render_settled() && !processing_operation_active()) {
+    // The committed document's composite is on screen now.
+    gradient_view_preview_.reset();
+    return false;
+  }
+  return true;
+}
+
+void CanvasWidget::note_document_changed_for_gradient_view_preview() noexcept {
+  gradient_view_preview_source_.reset();
+  if (!gradient_view_preview_.has_value()) {
+    return;
+  }
+  if (gradient_view_preview_->awaiting_commit) {
+    return;  // the host ends it when its bake lands (finish_gradient_fill_pending_commit)
+  }
+  if (gradient_pending_commit_.has_value() && !gradient_pending_commit_->new_layer &&
+      !gradient_view_preview_->held && gradient_handle_drag_.has_value() &&
+      gradient_handle_drag_->layer_id == gradient_view_preview_->layer_id) {
+    // The pending commit landing under a drag that began on top of it: the drag's own
+    // preview still shows what the pointer holds.
+    return;
+  }
+  if (gradient_view_preview_->held && document_ != nullptr) {
+    // The commit's own notification, and any other that leaves the committed layer as it
+    // is: the held frame still shows that layer; the settled render replaces it.
+    const auto* layer = std::as_const(*document_).find_layer(gradient_view_preview_->layer_id);
+    if (layer != nullptr && layer->render_revision() == gradient_view_preview_->held_render_revision &&
+        layer->content_revision() == gradient_view_preview_->held_content_revision) {
+      return;
+    }
+  }
+  gradient_view_preview_.reset();
+}
+
+void CanvasWidget::begin_gradient_fill_drag_hold(QPoint start, QPoint end) {
+  gradient_drag_hold_ = GradientFillDragHold{start, end};
+}
+
+void CanvasWidget::settle_gradient_fill_drag_hold() {
+  if (!gradient_drag_hold_.has_value()) {
+    return;
+  }
+  if (!gradient_drag_hold_->document_changed && gradient_pending_commit_.has_value() &&
+      gradient_pending_commit_->new_layer) {
+    return;  // the host is baking the new layer: the preview waits for it to land
+  }
+  // No change (a locked fill, a preview dialog that owns the document): nothing is on its
+  // way, so nothing is held.
+  const auto active = gradient_drag_hold_->document_changed && document_ != nullptr
+                          ? std::as_const(*document_).active_layer_id()
+                          : std::optional<LayerId>();
+  const auto* layer = active.has_value() ? std::as_const(*document_).find_layer(*active) : nullptr;
+  if (layer == nullptr || !gradient_drag_makes_fill_layer()) {
+    clear_gradient_fill_drag_hold();
+    return;
+  }
+  gradient_drag_hold_->settled = true;
+  gradient_drag_hold_->layer_id = layer->id();
+  gradient_drag_hold_->render_revision = layer->render_revision();
+  gradient_drag_hold_->content_revision = layer->content_revision();
+}
+
+void CanvasWidget::clear_gradient_fill_drag_hold() {
+  if (!gradient_drag_hold_.has_value()) {
+    return;
+  }
+  gradient_drag_hold_.reset();
+  update();
+}
+
+bool CanvasWidget::gradient_fill_drag_hold_shown() const noexcept {
+  return gradient_drag_hold_.has_value();
+}
+
+bool CanvasWidget::gradient_fill_drag_hold_drawn() {
+  if (!gradient_drag_hold_.has_value()) {
+    return false;
+  }
+  if (gradient_drag_hold_->settled && render_settled() && !processing_operation_active()) {
+    // The composite with the layer is on screen now.
+    gradient_drag_hold_.reset();
+    return false;
+  }
+  return true;
+}
+
+void CanvasWidget::note_document_changed_for_gradient_drag_hold() noexcept {
+  if (!gradient_drag_hold_.has_value()) {
+    return;
+  }
+  if (!gradient_drag_hold_->settled) {
+    gradient_drag_hold_->document_changed = true;  // the release's own change
+    return;
+  }
+  // Like the held view preview: a later notification that leaves the layer as the release
+  // made it keeps the hold; any other change to it ends the hold.
+  const auto* layer =
+      document_ != nullptr ? std::as_const(*document_).find_layer(gradient_drag_hold_->layer_id) : nullptr;
+  if (layer != nullptr && layer->render_revision() == gradient_drag_hold_->render_revision &&
+      layer->content_revision() == gradient_drag_hold_->content_revision) {
+    return;
+  }
+  gradient_drag_hold_.reset();
+}
+
+Rect CanvasWidget::gradient_fill_handle_bounds(const Layer& layer) const {
+  const auto canvas = Rect::from_size(document_->width(), document_->height());
+  const auto target = gradient_handle_target(layer).value_or(GradientHandleTarget::Fill);
+  auto& cache = gradient_handle_bounds_cache_;
+  if (cache.has_value() && cache->layer_id == layer.id() && cache->render_revision == layer.render_revision() &&
+      cache->content_revision == layer.content_revision() && cache->canvas_width == canvas.width &&
+      cache->canvas_height == canvas.height && cache->target == target) {
+    return cache->bounds;
+  }
+  // A stroke's gradient spans the stroke's own band, a fill's the fill (docs/gradients-fill-handles.md).
+  const auto bounds = target == GradientHandleTarget::Stroke ? gradient_stroke_alignment_bounds(layer, canvas)
+                                                             : gradient_fill_alignment_bounds(layer, canvas);
+  cache = GradientHandleBoundsCache{layer.id(),   layer.render_revision(), layer.content_revision(),
+                                    canvas.width, canvas.height,           bounds,
+                                    target};
+  return bounds;
+}
+
+std::optional<CanvasWidget::GradientFillHandles> CanvasWidget::gradient_fill_handles() const {
+  if (gradient_handle_drag_.has_value()) {
+    const auto& drag = *gradient_handle_drag_;
+    return GradientFillHandles{drag.layer_id, drag.current, drag.bounds, gradient_fill_line(drag.current, drag.bounds),
+                               drag.target};
+  }
+  const auto* layer = gradient_fill_handle_layer();
+  if (layer == nullptr) {
+    return std::nullopt;
+  }
+  const auto& gradient = gradient_handle_gradient(*layer);
+  const auto bounds = gradient_fill_handle_bounds(*layer);
+  return GradientFillHandles{layer->id(), gradient, bounds, gradient_fill_line(gradient, bounds),
+                             gradient_handle_target(*layer).value_or(GradientHandleTarget::Fill)};
+}
+
+namespace {
+
+HandleGeometry handle_geometry(const CanvasWidget::GradientFillHandles& handles,
+                               const std::function<QPointF(QPointF)>& to_widget) {
+  HandleGeometry geometry;
+  const auto& line = handles.line;
+  geometry.start = to_widget(QPointF(line.start_x, line.start_y));
+  geometry.end = to_widget(QPointF(line.end_x, line.end_y));
+  geometry.normal = stop_side_normal(geometry.start, geometry.end);
+  if (!solid_stops(handles.gradient)) {
+    return geometry;
+  }
+  const auto reverse = handles.gradient.reverse;
+  const auto on_line = [&](double location) {
+    const auto [x, y] = gradient_fill_line_point(line, reverse, location);
+    return to_widget(QPointF(x, y));
+  };
+  place_stops(handles.gradient.color_stops, on_line, geometry.normal * kStopOffset, geometry.color_stops,
+              geometry.color_midpoints);
+  place_stops(handles.gradient.alpha_stops, on_line, geometry.normal * -kStopOffset, geometry.alpha_stops,
+              geometry.alpha_midpoints);
+  return geometry;
+}
+
+}  // namespace
+
+std::optional<QPointF> CanvasWidget::gradient_fill_handle_widget_position(GradientHandlePart part) const {
+  const auto handles = gradient_fill_handles();
+  if (!handles.has_value()) {
+    return std::nullopt;
+  }
+  const auto geometry = handle_geometry(*handles, [this](QPointF point) { return widget_position_f(point); });
+  const auto index = static_cast<std::size_t>(std::max(part.index, 0));
+  switch (part.kind) {
+    case PartKind::Start:
+      return geometry.start;
+    case PartKind::End:
+      return geometry.end;
+    case PartKind::Line:
+      return (geometry.start + geometry.end) / 2.0;
+    case PartKind::AlphaLine:
+      return (geometry.start + geometry.end) / 2.0 - geometry.normal * (kStopOffset * 0.75);
+    case PartKind::ColorStop:
+      return part.index >= 0 && index < geometry.color_stops.size() ? std::optional(geometry.color_stops[index])
+                                                                     : std::nullopt;
+    case PartKind::AlphaStop:
+      return part.index >= 0 && index < geometry.alpha_stops.size() ? std::optional(geometry.alpha_stops[index])
+                                                                     : std::nullopt;
+    case PartKind::ColorMidpoint:
+      return part.index >= 0 && index < geometry.color_midpoints.size() ? geometry.color_midpoints[index]
+                                                                         : std::nullopt;
+    case PartKind::AlphaMidpoint:
+      return part.index >= 0 && index < geometry.alpha_midpoints.size() ? geometry.alpha_midpoints[index]
+                                                                         : std::nullopt;
+    case PartKind::None:
+      break;
+  }
+  return std::nullopt;
+}
+
+CanvasWidget::GradientHandlePart CanvasWidget::gradient_fill_handle_part_at(QPointF widget_point) const {
+  const auto handles = gradient_fill_handles();
+  if (!handles.has_value()) {
+    return {};
+  }
+  const auto geometry = handle_geometry(*handles, [this](QPointF point) { return widget_position_f(point); });
+  const auto distance = [&widget_point](QPointF at) { return QLineF(widget_point, at).length(); };
+  // The end wins over the start where they overlap, so a gradient of no length can grow.
+  if (distance(geometry.end) <= kEndReach) {
+    return {PartKind::End, -1};
+  }
+  if (distance(geometry.start) <= kEndReach) {
+    return {PartKind::Start, -1};
+  }
+  // The nearest stop within reach; ties go to the later stop (drawn on top).
+  const auto nearest = [&](const std::vector<QPointF>& points, double reach) {
+    int best = -1;
+    double best_distance = reach;
+    for (std::size_t i = 0; i < points.size(); ++i) {
+      if (const auto d = distance(points[i]); d <= best_distance) {
+        best = static_cast<int>(i);
+        best_distance = d;
+      }
+    }
+    return std::pair{best, best_distance};
+  };
+  const auto [color_stop, color_distance] = nearest(geometry.color_stops, kStopReach);
+  const auto [alpha_stop, alpha_distance] = nearest(geometry.alpha_stops, kStopReach);
+  if (color_stop >= 0 && (alpha_stop < 0 || color_distance <= alpha_distance)) {
+    return {PartKind::ColorStop, color_stop};
+  }
+  if (alpha_stop >= 0) {
+    return {PartKind::AlphaStop, alpha_stop};
+  }
+  const auto nearest_midpoint = [&](const std::vector<std::optional<QPointF>>& points) {
+    int best = -1;
+    double best_distance = kMidpointReach;
+    for (std::size_t i = 0; i < points.size(); ++i) {
+      if (points[i].has_value()) {
+        if (const auto d = distance(*points[i]); d <= best_distance) {
+          best = static_cast<int>(i);
+          best_distance = d;
+        }
+      }
+    }
+    return best;
+  };
+  if (const auto midpoint = nearest_midpoint(geometry.color_midpoints); midpoint >= 0) {
+    return {PartKind::ColorMidpoint, midpoint};
+  }
+  if (const auto midpoint = nearest_midpoint(geometry.alpha_midpoints); midpoint >= 0) {
+    return {PartKind::AlphaMidpoint, midpoint};
+  }
+  // The line and the bands beside it, out to just past the stop markers: the line and the color
+  // side add color stops, the opacity side opacity stops (or drag the whole gradient).
+  const QPointF along = geometry.end - geometry.start;
+  const double length_squared = QPointF::dotProduct(along, along);
+  if (length_squared > 0.0) {
+    const double t = QPointF::dotProduct(widget_point - geometry.start, along) / length_squared;
+    const double side = QPointF::dotProduct(widget_point - geometry.start, geometry.normal);
+    if (t >= 0.0 && t <= 1.0 && side <= kSideReach && side >= -kSideReach) {
+      if (side < -kLineReach && solid_stops(handles->gradient)) {
+        return {PartKind::AlphaLine, -1};
+      }
+      if (side <= kLineReach || solid_stops(handles->gradient)) {
+        return {PartKind::Line, -1};
+      }
+    }
+  }
+  if (distance_to_segment(widget_point, geometry.start, geometry.end) <= kLineReach) {
+    return {PartKind::Line, -1};
+  }
+  return {};
+}
+
+QString CanvasWidget::gradient_fill_handle_hint(GradientHandlePart part) const {
+  switch (part.kind) {
+    case PartKind::Start:
+      return tr("Drag to move the gradient's start point. Shift keeps the angle in 15-degree steps.");
+    case PartKind::End:
+      return tr("Drag to move the gradient's end point. Shift keeps the angle in 15-degree steps.");
+    case PartKind::Line:
+      return tr("Click to add a color stop here (on the opacity stops' side, an opacity stop), or drag to move "
+                "the gradient.");
+    case PartKind::AlphaLine:
+      return tr("Click to add an opacity stop here, or drag to move the gradient.");
+    case PartKind::ColorStop:
+      return tr("Drag to move this color stop. Drag it off the line or select it and press Delete to remove it, "
+                "right-click for more, double-click to change its color.");
+    case PartKind::AlphaStop:
+      return tr("Drag to move this opacity stop. Drag it off the line or select it and press Delete to remove "
+                "it, right-click for more, double-click to set its opacity.");
+    case PartKind::ColorMidpoint:
+      return tr("Drag to move the color midpoint between these color stops.");
+    case PartKind::AlphaMidpoint:
+      if (gradient_fill_midpoint_dimmed(part)) {
+        return tr("Drag to move the opacity midpoint between these opacity stops.") + QLatin1Char(' ') +
+               tr("Both stops have the same opacity, so it has no effect yet.");
+      }
+      return tr("Drag to move the opacity midpoint between these opacity stops.");
+    case PartKind::None:
+      break;
+  }
+  return {};
+}
+
+QString CanvasWidget::gradient_fill_handle_tooltip(GradientHandlePart part) const {
+  const auto handles = gradient_fill_handles();
+  if (!handles.has_value()) {
+    return {};
+  }
+  const auto& gradient = handles->gradient;
+  const auto index = static_cast<std::size_t>(std::max(part.index, 0));
+  const auto percent = [](float value) { return QString::number(static_cast<int>(std::lround(value * 100.0F))); };
+  switch (part.kind) {
+    case PartKind::Start:
+      return tr("Gradient start point");
+    case PartKind::End:
+      return tr("Gradient end point");
+    case PartKind::Line:
+      return tr("Gradient line");
+    case PartKind::AlphaLine:
+      return tr("Opacity side of the gradient line");
+    case PartKind::ColorStop:
+      if (index < gradient.color_stops.size()) {
+        return tr("Color stop at %1%").arg(percent(gradient.color_stops[index].location)) + QLatin1Char('\n') +
+               gradient_fill_handle_hint(part);
+      }
+      break;
+    case PartKind::AlphaStop:
+      if (index < gradient.alpha_stops.size()) {
+        return tr("Opacity stop at %1%: %2% opacity")
+                   .arg(percent(gradient.alpha_stops[index].location), percent(gradient.alpha_stops[index].opacity)) +
+               QLatin1Char('\n') + gradient_fill_handle_hint(part);
+      }
+      break;
+    case PartKind::ColorMidpoint:
+      if (index < gradient.color_stops.size()) {
+        return tr("Color midpoint: %1%").arg(percent(gradient.color_stops[index].midpoint));
+      }
+      break;
+    case PartKind::AlphaMidpoint:
+      if (index < gradient.alpha_stops.size()) {
+        const auto text = tr("Opacity midpoint: %1%").arg(percent(gradient.alpha_stops[index].midpoint));
+        return gradient_fill_midpoint_dimmed(part)
+                   ? text + QLatin1Char('\n') + tr("Both stops have the same opacity, so it has no effect yet.")
+                   : text;
+      }
+      break;
+    case PartKind::None:
+      break;
+  }
+  return {};
+}
+
+void CanvasWidget::set_gradient_fill_handle_hover(GradientHandlePart part) {
+  if (part == gradient_handle_hover_) {
+    return;
+  }
+  gradient_handle_hover_ = part;
+  update();
+  if (part.kind != PartKind::None && status_callback_) {
+    status_callback_(gradient_fill_handle_hint(part));
+  }
+}
+
+bool CanvasWidget::press_gradient_fill_handle(QMouseEvent* event) {
+  if ((event->modifiers() & (Qt::ControlModifier | Qt::AltModifier | Qt::MetaModifier)) != 0) {
+    return false;
+  }
+  const auto* layer = gradient_fill_handle_layer();
+  if (layer == nullptr) {
+    return false;
+  }
+  const auto part = gradient_fill_handle_part_at(event->position());
+  if (part.kind == PartKind::None) {
+    // A press away from the handles (a new gradient) drops the stop selection.
+    if (gradient_stop_selection_.has_value()) {
+      gradient_stop_selection_.reset();
+      update();
+    }
+    return false;
+  }
+  if (!vector_lock_reason(*layer).empty() || layer_effectively_locks_image_pixels(*layer)) {
+    report_status_error(tr("Unlock the Gradient Fill layer to change its gradient"));
+    return true;
+  }
+  GradientFillHandleDrag drag;
+  drag.layer_id = layer->id();
+  drag.bounds = gradient_fill_handle_bounds(*layer);
+  drag.target = gradient_handle_target(*layer).value_or(GradientHandleTarget::Fill);
+  drag.original = gradient_handle_gradient(*layer);
+  drag.current = drag.original;
+  drag.part = part;
+  drag.current_index = part.index;
+  drag.press_widget = event->position();
+  drag.pointer_widget = event->position();
+  drag.press_document = document_position_f(event->position());
+  drag.press_line = gradient_fill_line(drag.original, drag.bounds);
+  drag.serial = ++gradient_handle_drag_serial_;
+  gradient_handle_drag_ = std::move(drag);
+  // A press on a stop selects it (Delete removes it); any other part drops the selection.
+  if (part.kind == PartKind::ColorStop || part.kind == PartKind::AlphaStop) {
+    gradient_stop_selection_ =
+        GradientStopSelection{layer->id(), part.kind == PartKind::AlphaStop, part.index, gradient_handle_drag_->target};
+  } else {
+    gradient_stop_selection_.reset();
+  }
+  set_gradient_fill_handle_hover(part);
+  apply_gradient_handle_cursor(gradient_handle_cursor_for(part));
+  update();
+  return true;
+}
+
+void CanvasWidget::update_gradient_fill_handle_drag(QPointF widget_point, Qt::KeyboardModifiers modifiers) {
+  if (!gradient_handle_drag_.has_value()) {
+    return;
+  }
+  auto& drag = *gradient_handle_drag_;
+  drag.pointer_widget = widget_point;
+  const bool grabs_end = drag.part.kind == PartKind::Start || drag.part.kind == PartKind::End;
+  if (!drag.moved) {
+    // The ends move at once; everything else waits for a real drag, so a click on the line
+    // adds a stop and a click on a stop changes nothing.
+    if (!grabs_end && (widget_point - drag.press_widget).manhattanLength() < QApplication::startDragDistance()) {
+      return;
+    }
+    drag.moved = true;
+  }
+  const auto point = document_position_f(widget_point);
+  auto edited = drag.original;
+  drag.removing = false;
+  drag.current_index = drag.part.index;
+  const auto index = static_cast<std::size_t>(std::max(drag.part.index, 0));
+  const auto location = static_cast<float>(
+      gradient_fill_line_location(drag.press_line, drag.original.reverse, point.x(), point.y()));
+  switch (drag.part.kind) {
+    case PartKind::Start:
+    case PartKind::End: {
+      auto line = drag.press_line;
+      const bool start = drag.part.kind == PartKind::Start;
+      QPointF moved = point;
+      if ((modifiers & Qt::ShiftModifier) != 0) {
+        const QPointF anchor = start ? QPointF(line.end_x, line.end_y) : QPointF(line.start_x, line.start_y);
+        const QPointF along = moved - anchor;
+        const double length = std::hypot(along.x(), along.y());
+        const double step = kSnapDegrees * std::numbers::pi / 180.0;
+        const double angle = std::round(std::atan2(along.y(), along.x()) / step) * step;
+        moved = anchor + QPointF(std::cos(angle), std::sin(angle)) * length;
+      }
+      if (start) {
+        line.start_x = moved.x();
+        line.start_y = moved.y();
+      } else {
+        line.end_x = moved.x();
+        line.end_y = moved.y();
+      }
+      place_gradient_fill_line(edited, drag.bounds, line);
+      break;
+    }
+    case PartKind::Line:
+    case PartKind::AlphaLine: {
+      const auto delta = point - drag.press_document;
+      auto line = drag.press_line;
+      line.start_x += delta.x();
+      line.start_y += delta.y();
+      line.end_x += delta.x();
+      line.end_y += delta.y();
+      place_gradient_fill_line(edited, drag.bounds, line);
+      break;
+    }
+    case PartKind::ColorStop:
+    case PartKind::AlphaStop: {
+      const bool color = drag.part.kind == PartKind::ColorStop;
+      const auto count = color ? edited.color_stops.size() : edited.alpha_stops.size();
+      const auto start = widget_position_f(QPointF(drag.press_line.start_x, drag.press_line.start_y));
+      const auto end = widget_position_f(QPointF(drag.press_line.end_x, drag.press_line.end_y));
+      if (count > 2U && distance_to_line(widget_point, start, end) > kRemoveDistance + kStopOffset) {
+        drag.removing = true;
+        drag.current_index = -1;
+        if (color) {
+          remove_gradient_color_stop(edited, index);
+        } else {
+          remove_gradient_alpha_stop(edited, index);
+        }
+      } else {
+        drag.current_index = static_cast<int>(color ? move_gradient_color_stop(edited, index, location)
+                                                    : move_gradient_alpha_stop(edited, index, location));
+      }
+      break;
+    }
+    case PartKind::ColorMidpoint:
+    case PartKind::AlphaMidpoint: {
+      const bool color = drag.part.kind == PartKind::ColorMidpoint;
+      const auto count = color ? edited.color_stops.size() : edited.alpha_stops.size();
+      if (index == 0U || index >= count) {
+        break;
+      }
+      const auto from = color ? edited.color_stops[index - 1U].location : edited.alpha_stops[index - 1U].location;
+      const auto to = color ? edited.color_stops[index].location : edited.alpha_stops[index].location;
+      if (std::abs(to - from) <= 1e-6F) {
+        break;
+      }
+      const auto midpoint = (location - from) / (to - from);
+      if (color) {
+        set_gradient_color_midpoint(edited, index, midpoint);
+      } else {
+        set_gradient_alpha_midpoint(edited, index, midpoint);
+      }
+      break;
+    }
+    case PartKind::None:
+      break;
+  }
+  // The line moves the gradient once the press has really moved; a stop past the delete
+  // distance shows the delete cursor (and turns back when it returns).
+  apply_gradient_handle_cursor(drag.removing                                     ? GradientHandleCursor::DeleteStop
+                               : grabs_end || drag.part.kind == PartKind::Line || drag.part.kind == PartKind::AlphaLine
+                                   ? GradientHandleCursor::Move
+                                                                               : GradientHandleCursor::AlongLine);
+  if (drag.removing && status_callback_) {
+    status_callback_(tr("Release to delete this stop."));
+  }
+  if (edited == drag.current) {
+    update();
+    return;
+  }
+  drag.current = std::move(edited);
+  // The first change previews at once; later ones at most every kGradientPreviewIntervalMs,
+  // the newest one when the interval ends.
+  if (!drag.previewed || !gradient_handle_preview_clock_.isValid() ||
+      gradient_handle_preview_clock_.elapsed() >= kGradientPreviewIntervalMs) {
+    send_gradient_fill_preview();
+  } else if (!drag.preview_scheduled) {
+    drag.preview_scheduled = true;
+    const auto serial = drag.serial;
+    const auto wait = std::max<qint64>(1, kGradientPreviewIntervalMs - gradient_handle_preview_clock_.elapsed());
+    QTimer::singleShot(static_cast<int>(wait), this, [this, serial] {
+      if (gradient_handle_drag_.has_value() && gradient_handle_drag_->serial == serial &&
+          gradient_handle_drag_->preview_scheduled) {
+        send_gradient_fill_preview();
+      }
+    });
+  }
+  update();
+}
+
+void CanvasWidget::send_gradient_fill_preview() {
+  if (!gradient_handle_drag_.has_value()) {
+    return;
+  }
+  auto& drag = *gradient_handle_drag_;
+  drag.preview_scheduled = false;
+  if (!gradient_fill_edit_callback_ || (drag.previewed && drag.current == drag.previewed_gradient)) {
+    return;
+  }
+  drag.previewed = true;
+  drag.previewed_gradient = drag.current;
+  gradient_handle_preview_clock_.start();
+  // The callback renders the layer and may repaint; copy what it needs first.
+  const auto layer_id = drag.layer_id;
+  const auto gradient = drag.current;
+  const auto serial = drag.serial;
+  const auto target = drag.target;
+  gradient_fill_edit_callback_(layer_id, gradient, GradientFillEditPhase::Preview, serial, QString(), target);
+}
+
+bool CanvasWidget::move_gradient_fill_handle(QMouseEvent* event) {
+  if (gradient_handle_drag_.has_value()) {
+    if ((event->buttons() & Qt::LeftButton) == 0) {
+      // The release never arrived: put the gradient back rather than commit a guess.
+      cancel_gradient_fill_handle_drag();
+      return true;
+    }
+    update_gradient_fill_handle_drag(event->position(), event->modifiers());
+    return true;
+  }
+  if (event->buttons() != Qt::NoButton || drawing_shape_) {
+    return false;
+  }
+  // Under another tool Ctrl, Alt and Meta presses are that tool's (press_gradient_fill_handle
+  // lets them through), so the hover shows that tool's cursor too.
+  const bool tool_modifier_held =
+      tool_ != CanvasTool::Gradient &&
+      (event->modifiers() & (Qt::ControlModifier | Qt::AltModifier | Qt::MetaModifier)) != 0;
+  const auto part = gradient_fill_handle_layer() != nullptr && !tool_modifier_held
+                        ? gradient_fill_handle_part_at(event->position())
+                        : GradientHandlePart{};
+  const bool was_hovering = gradient_handle_hover_.kind != PartKind::None;
+  set_gradient_fill_handle_hover(part);
+  if (part.kind == PartKind::None) {
+    if (was_hovering || gradient_handle_cursor_ != GradientHandleCursor::None) {
+      gradient_handle_cursor_ = GradientHandleCursor::None;
+      update_tool_cursor();
+    }
+    return false;
+  }
+  apply_gradient_handle_cursor(gradient_handle_cursor_for(part));
+  return true;
+}
+
+bool CanvasWidget::release_gradient_fill_handle(QMouseEvent* event) {
+  if (!gradient_handle_drag_.has_value() || event->button() != Qt::LeftButton) {
+    return false;
+  }
+  update_gradient_fill_handle_drag(event->position(), event->modifiers());
+  auto drag = std::move(*gradient_handle_drag_);
+  gradient_handle_drag_.reset();
+  const auto send = [this, &drag](const LayerStyleGradient& gradient, GradientFillEditPhase phase,
+                                  const QString& label) {
+    if (gradient_fill_edit_callback_) {
+      gradient_fill_edit_callback_(drag.layer_id, gradient, phase, drag.serial, label, drag.target);
+    }
+  };
+  if (!drag.moved) {
+    if (drag.part.kind == PartKind::Line && solid_stops(drag.original)) {
+      // A click on the line adds a color stop there, in the color the gradient has there.
+      const auto location = std::clamp(
+          gradient_fill_line_location(drag.press_line, drag.original.reverse, drag.press_document.x(),
+                                      drag.press_document.y()),
+          0.0, 1.0);
+      auto added = drag.original;
+      const auto added_index = add_gradient_color_stop(added, static_cast<float>(location));
+      send(added, GradientFillEditPhase::Commit, tr("Add Color Stop"));
+      gradient_stop_selection_ =
+          GradientStopSelection{drag.layer_id, false, static_cast<int>(added_index), drag.target};
+    } else if (drag.part.kind == PartKind::AlphaLine && solid_stops(drag.original)) {
+      // On the opacity side it adds an opacity stop, with the opacity the gradient has there.
+      const auto location = std::clamp(
+          gradient_fill_line_location(drag.press_line, drag.original.reverse, drag.press_document.x(),
+                                      drag.press_document.y()),
+          0.0, 1.0);
+      auto added = drag.original;
+      const auto added_index = add_gradient_alpha_stop(added, static_cast<float>(location));
+      send(added, GradientFillEditPhase::Commit, tr("Add Opacity Stop"));
+      gradient_stop_selection_ =
+          GradientStopSelection{drag.layer_id, true, static_cast<int>(added_index), drag.target};
+    }
+  } else if (drag.current == drag.original) {
+    if (drag.previewed) {
+      send(drag.original, GradientFillEditPhase::Cancel, QString());
+    }
+  } else {
+    QString label;
+    switch (drag.part.kind) {
+      case PartKind::Start:
+        label = tr("Move Gradient Start Point");
+        break;
+      case PartKind::End:
+        label = tr("Move Gradient End Point");
+        break;
+      case PartKind::Line:
+      case PartKind::AlphaLine:
+        label = tr("Move Gradient");
+        break;
+      case PartKind::ColorStop:
+        label = drag.removing ? tr("Delete Color Stop") : tr("Move Color Stop");
+        break;
+      case PartKind::AlphaStop:
+        label = drag.removing ? tr("Delete Opacity Stop") : tr("Move Opacity Stop");
+        break;
+      case PartKind::ColorMidpoint:
+      case PartKind::AlphaMidpoint:
+        label = tr("Move Gradient Midpoint");
+        break;
+      case PartKind::None:
+        break;
+    }
+    send(drag.current, GradientFillEditPhase::Commit, label);
+    if (drag.part.kind == PartKind::ColorStop || drag.part.kind == PartKind::AlphaStop) {
+      if (drag.removing || drag.current_index < 0) {
+        gradient_stop_selection_.reset();
+      } else {
+        gradient_stop_selection_ = GradientStopSelection{drag.layer_id, drag.part.kind == PartKind::AlphaStop,
+                                                         drag.current_index, drag.target};
+      }
+    }
+  }
+  // The drag is over: a view preview nobody committed (held) or cancelled goes with it.
+  if (gradient_view_preview_.has_value() && !gradient_view_preview_->held) {
+    gradient_view_preview_.reset();
+  }
+  restore_gradient_fill_pending_preview();
+  gradient_handle_hover_ = {};
+  set_gradient_fill_handle_hover(gradient_fill_handle_layer() != nullptr
+                                     ? gradient_fill_handle_part_at(event->position())
+                                     : GradientHandlePart{});
+  if (gradient_handle_hover_.kind == PartKind::None) {
+    gradient_handle_cursor_ = GradientHandleCursor::None;
+    update_tool_cursor();
+  } else {
+    apply_gradient_handle_cursor(gradient_handle_cursor_for(gradient_handle_hover_));
+  }
+  update();
+  return true;
+}
+
+void CanvasWidget::cancel_gradient_fill_handle_drag() {
+  if (!gradient_handle_drag_.has_value()) {
+    return;
+  }
+  const auto drag = std::move(*gradient_handle_drag_);
+  gradient_handle_drag_.reset();
+  if (drag.previewed && gradient_fill_edit_callback_) {
+    gradient_fill_edit_callback_(drag.layer_id, drag.original, GradientFillEditPhase::Cancel, drag.serial, QString(),
+                                 drag.target);
+  }
+  if (gradient_view_preview_.has_value() && !gradient_view_preview_->held) {
+    gradient_view_preview_.reset();
+  }
+  restore_gradient_fill_pending_preview();
+  gradient_handle_hover_ = {};
+  gradient_handle_cursor_ = GradientHandleCursor::None;
+  update_tool_cursor();
+  update();
+}
+
+void CanvasWidget::abandon_gradient_fill_handle_drag() {
+  // The document under the drag was swapped (undo, redo, a history jump): its preview went
+  // with it, so nothing is restored and a later call for this drag is stale.
+  gradient_handle_drag_.reset();
+  gradient_view_preview_.reset();
+  gradient_drag_hold_.reset();
+  gradient_pending_commit_.reset();  // the host finishes its bake before it swaps a document
+  gradient_handle_hover_ = {};
+  gradient_handle_cursor_ = GradientHandleCursor::None;
+  gradient_handle_bounds_cache_.reset();
+  gradient_stop_selection_.reset();
+  if (gradient_opacity_edit_.has_value()) {
+    const QPointer<QWidget> popup = gradient_opacity_edit_->popup;
+    gradient_opacity_edit_->finished = true;
+    gradient_opacity_edit_.reset();
+    if (popup != nullptr) {
+      popup->close();
+    }
+  }
+}
+
+bool CanvasWidget::gradient_fill_midpoint_dimmed(GradientHandlePart part) const {
+  if (part.kind != PartKind::AlphaMidpoint || part.index < 1) {
+    return false;
+  }
+  const auto handles = gradient_fill_handles();
+  if (!handles.has_value()) {
+    return false;
+  }
+  const auto& stops = handles->gradient.alpha_stops;
+  const auto index = static_cast<std::size_t>(part.index);
+  return index < stops.size() && stops[index - 1U].opacity == stops[index].opacity;
+}
+
+CanvasWidget::GradientHandleCursor CanvasWidget::gradient_handle_cursor() const noexcept {
+  return gradient_handle_cursor_;
+}
+
+CanvasWidget::GradientHandleCursor CanvasWidget::gradient_handle_cursor_for(GradientHandlePart part) {
+  switch (part.kind) {
+    case PartKind::Start:
+    case PartKind::End:
+      return GradientHandleCursor::Move;
+    case PartKind::Line:
+    case PartKind::AlphaLine:
+      // A click here adds a stop; a press that moves on drags the gradient (Move from then on).
+      return GradientHandleCursor::AddStop;
+    case PartKind::ColorStop:
+    case PartKind::AlphaStop:
+    case PartKind::ColorMidpoint:
+    case PartKind::AlphaMidpoint:
+      return GradientHandleCursor::AlongLine;
+    case PartKind::None:
+      break;
+  }
+  return GradientHandleCursor::None;
+}
+
+void CanvasWidget::apply_gradient_handle_cursor(GradientHandleCursor kind) {
+  if (kind == GradientHandleCursor::None) {
+    gradient_handle_cursor_ = kind;
+    update_tool_cursor();
+    return;
+  }
+  gradient_handle_cursor_ = kind;
+  setCursor(gradient_handle_qcursor(kind));
+}
+
+std::optional<CanvasWidget::GradientHandlePart> CanvasWidget::gradient_fill_selected_stop() const {
+  if (!gradient_stop_selection_.has_value()) {
+    return std::nullopt;
+  }
+  const auto* layer = gradient_fill_handle_layer();
+  if (layer == nullptr || layer->id() != gradient_stop_selection_->layer_id ||
+      gradient_handle_target(*layer) != gradient_stop_selection_->target) {
+    return std::nullopt;
+  }
+  const auto& gradient = gradient_handle_gradient(*layer);
+  const auto count = gradient_stop_selection_->alpha ? gradient.alpha_stops.size() : gradient.color_stops.size();
+  if (gradient_stop_selection_->index < 0 || static_cast<std::size_t>(gradient_stop_selection_->index) >= count) {
+    return std::nullopt;
+  }
+  return GradientHandlePart{gradient_stop_selection_->alpha ? PartKind::AlphaStop : PartKind::ColorStop,
+                            gradient_stop_selection_->index};
+}
+
+bool CanvasWidget::delete_selected_gradient_stop() {
+  const auto selected = gradient_fill_selected_stop();
+  if (!selected.has_value() || gradient_handle_drag_.has_value()) {
+    gradient_stop_selection_.reset();
+    return false;
+  }
+  const auto* layer = gradient_fill_handle_layer();
+  if (!vector_lock_reason(*layer).empty() || layer_effectively_locks_image_pixels(*layer)) {
+    report_status_error(tr("Unlock the Gradient Fill layer to change its gradient"));
+    return true;
+  }
+  const bool alpha = selected->kind == PartKind::AlphaStop;
+  const auto target = gradient_stop_selection_->target;
+  auto edited = gradient_handle_gradient(*layer);
+  const auto index = static_cast<std::size_t>(selected->index);
+  const bool removed = alpha ? remove_gradient_alpha_stop(edited, index) : remove_gradient_color_stop(edited, index);
+  if (!removed) {
+    // The stop stays selected; the key does nothing else (it never reaches Edit > Clear).
+    report_status_error(alpha ? tr("A gradient keeps at least two opacity stops.")
+                              : tr("A gradient keeps at least two color stops."));
+    return true;
+  }
+  gradient_stop_selection_.reset();
+  if (gradient_fill_edit_callback_) {
+    const auto layer_id = layer->id();
+    gradient_fill_edit_callback_(layer_id, edited, GradientFillEditPhase::Commit, ++gradient_handle_drag_serial_,
+                                 alpha ? tr("Delete Opacity Stop") : tr("Delete Color Stop"), target);
+  }
+  update();
+  return true;
+}
+
+bool CanvasWidget::show_gradient_stop_context_menu(QPoint widget_point, QPoint global_position) {
+  const auto* layer = gradient_fill_handle_layer();
+  if (layer == nullptr || gradient_handle_drag_.has_value()) {
+    return false;
+  }
+  const auto part = gradient_fill_handle_part_at(QPointF(widget_point));
+  if (part.kind != PartKind::ColorStop && part.kind != PartKind::AlphaStop) {
+    return false;
+  }
+  const bool alpha = part.kind == PartKind::AlphaStop;
+  const auto layer_id = layer->id();
+  const auto target = gradient_handle_target(*layer).value_or(GradientHandleTarget::Fill);
+  gradient_stop_selection_ = GradientStopSelection{layer_id, alpha, part.index, target};
+  update();
+  const auto& gradient = gradient_handle_gradient(*layer);
+  const bool deletable = (alpha ? gradient.alpha_stops.size() : gradient.color_stops.size()) > 2U;
+  auto* menu = new QMenu(this);
+  menu->setObjectName(QStringLiteral("gradientStopContextMenu"));
+  menu->setToolTipsVisible(true);
+  canvas_context_menu_ = menu;
+  connect(menu, &QMenu::aboutToHide, this, [this, menu] { retire_canvas_context_menu(menu); });
+  connect(menu, &QMenu::triggered, this, [this, menu](QAction*) {
+    std::erase_if(retired_context_menus_,
+                  [menu](const RetiredContextMenu& retired) { return retired.menu == menu; });
+    menu->deleteLater();
+  });
+  // Each entry re-checks that its stop is still the selected one on the same layer.
+  const auto still_selected = [this, layer_id, alpha, index = part.index] {
+    const auto selected = gradient_fill_selected_stop();
+    return selected.has_value() && gradient_stop_selection_->layer_id == layer_id &&
+           (selected->kind == PartKind::AlphaStop) == alpha && selected->index == index;
+  };
+  if (alpha) {
+    auto* opacity = menu->addAction(tr("Opacity..."));
+    opacity->setObjectName(QStringLiteral("gradientStopOpacityAction"));
+    connect(opacity, &QAction::triggered, this, [this, still_selected, index = part.index] {
+      if (still_selected()) {
+        open_gradient_opacity_popup(GradientHandlePart{PartKind::AlphaStop, index});
+      }
+    });
+  }
+  auto* remove = menu->addAction(tr("Delete Stop"));
+  remove->setObjectName(QStringLiteral("gradientStopDeleteAction"));
+  remove->setEnabled(deletable);
+  if (!deletable) {
+    remove->setToolTip(alpha ? tr("A gradient keeps at least two opacity stops.")
+                             : tr("A gradient keeps at least two color stops."));
+  }
+  connect(remove, &QAction::triggered, this, [this, still_selected] {
+    if (still_selected()) {
+      delete_selected_gradient_stop();
+    }
+  });
+  if (alpha) {
+    auto* settings = menu->addAction(tr("Fill Layer Settings..."));
+    settings->setObjectName(QStringLiteral("gradientStopFillSettingsAction"));
+    connect(settings, &QAction::triggered, this, [this, still_selected] {
+      if (still_selected() && shape_appearance_requested_callback_) {
+        shape_appearance_requested_callback_();
+      }
+    });
+  } else {
+    auto* color = menu->addAction(tr("Change Color..."));
+    color->setObjectName(QStringLiteral("gradientStopColorAction"));
+    connect(color, &QAction::triggered, this, [this, still_selected, layer_id, target, index = part.index] {
+      if (still_selected() && gradient_fill_stop_color_requested_callback_) {
+        gradient_fill_stop_color_requested_callback_(layer_id, index, target);
+      }
+    });
+    auto* opacity_here = menu->addAction(tr("Opacity Here..."));
+    opacity_here->setObjectName(QStringLiteral("gradientStopOpacityHereAction"));
+    opacity_here->setToolTip(tr("Set the gradient's opacity at this color stop (adds an opacity stop here when "
+                                "there is none)"));
+    connect(opacity_here, &QAction::triggered, this, [this, still_selected, index = part.index] {
+      if (still_selected()) {
+        open_gradient_opacity_popup(GradientHandlePart{PartKind::ColorStop, index});
+      }
+    });
+  }
+  menu->popup(global_position);
+  return true;
+}
+
+bool CanvasWidget::double_click_gradient_fill_handle(QMouseEvent* event) {
+  if (event->button() != Qt::LeftButton || gradient_handle_drag_.has_value()) {
+    return false;
+  }
+  const auto* layer = gradient_fill_handle_layer();
+  if (layer == nullptr) {
+    return false;
+  }
+  const auto part = gradient_fill_handle_part_at(event->position());
+  switch (part.kind) {
+    case PartKind::ColorStop:
+      if (!vector_lock_reason(*layer).empty() || layer_effectively_locks_image_pixels(*layer)) {
+        report_status_error(tr("Unlock the Gradient Fill layer to change its gradient"));
+      } else if (gradient_fill_stop_color_requested_callback_) {
+        gradient_fill_stop_color_requested_callback_(
+            layer->id(), part.index, gradient_handle_target(*layer).value_or(GradientHandleTarget::Fill));
+      }
+      return true;
+    case PartKind::AlphaStop:
+      // The opacity popup beside the stop.
+      open_gradient_opacity_popup(part);
+      return true;
+    case PartKind::Start:
+    case PartKind::End:
+    case PartKind::Line:
+    case PartKind::AlphaLine:
+    case PartKind::ColorMidpoint:
+    case PartKind::AlphaMidpoint:
+      // The first click already did its work (a click on the line added a stop); the second
+      // must not add another one.
+      return true;
+    case PartKind::None:
+      break;
+  }
+  return false;
+}
+
+bool CanvasWidget::show_gradient_fill_handle_tooltip(QEvent* event) {
+  if (event->type() != QEvent::ToolTip || !gradient_handles_enabled()) {
+    return false;
+  }
+  const auto* help = static_cast<QHelpEvent*>(event);
+  const auto part = gradient_fill_handle_layer() != nullptr ? gradient_fill_handle_part_at(QPointF(help->pos()))
+                                                            : GradientHandlePart{};
+  if (part.kind == PartKind::None) {
+    return false;
+  }
+  QToolTip::showText(help->globalPos(), gradient_fill_handle_tooltip(part), this);
+  return true;
+}
+
+namespace {
+
+// Enter commits, Esc cancels, and the popup closing any other way (a click away from it, a
+// tool switch) commits: the opacity popup's keys and close, watched on the popup and its
+// fields before they handle them.
+class GradientOpacityPopupKeys final : public QObject {
+public:
+  GradientOpacityPopupKeys(QObject* parent, std::function<void(bool)> finish)
+      : QObject(parent), finish_(std::move(finish)) {}
+
+protected:
+  bool eventFilter(QObject* watched, QEvent* event) override {
+    if (event->type() == QEvent::KeyPress) {
+      const auto* key = static_cast<QKeyEvent*>(event);
+      if (key->key() == Qt::Key_Escape) {
+        finish_(false);
+        return true;
+      }
+      if (key->key() == Qt::Key_Return || key->key() == Qt::Key_Enter) {
+        if (auto* spin = qobject_cast<QSpinBox*>(watched); spin != nullptr) {
+          spin->interpretText();
+        }
+        finish_(true);
+        return true;
+      }
+    } else if (event->type() == QEvent::Hide && watched == parent()) {
+      finish_(true);
+    }
+    return false;
+  }
+
+private:
+  std::function<void(bool)> finish_;
+};
+
+}  // namespace
+
+QWidget* CanvasWidget::gradient_opacity_popup() const {
+  return gradient_opacity_edit_.has_value() ? gradient_opacity_edit_->popup.data() : nullptr;
+}
+
+bool CanvasWidget::open_gradient_opacity_popup(GradientHandlePart part) {
+  if (gradient_handle_drag_.has_value() || gradient_opacity_edit_.has_value()) {
+    return false;
+  }
+  const auto* layer = gradient_fill_handle_layer();
+  if (layer == nullptr || (part.kind != PartKind::AlphaStop && part.kind != PartKind::ColorStop) || part.index < 0) {
+    return false;
+  }
+  if (!vector_lock_reason(*layer).empty() || layer_effectively_locks_image_pixels(*layer)) {
+    report_status_error(tr("Unlock the Gradient Fill layer to change its gradient"));
+    return true;
+  }
+  const auto& gradient = gradient_handle_gradient(*layer);
+  const auto index = static_cast<std::size_t>(part.index);
+  GradientOpacityEdit edit;
+  edit.target = gradient_handle_target(*layer).value_or(GradientHandleTarget::Fill);
+  edit.layer_id = layer->id();
+  edit.original = gradient;
+  edit.serial = ++gradient_handle_drag_serial_;
+  if (part.kind == PartKind::AlphaStop) {
+    if (index >= gradient.alpha_stops.size()) {
+      return false;
+    }
+    edit.alpha_index = part.index;
+    edit.location = gradient.alpha_stops[index].location;
+  } else {
+    if (index >= gradient.color_stops.size()) {
+      return false;
+    }
+    // Opacity Here: the opacity stop already at this color stop, else a new one on commit.
+    edit.location = gradient.color_stops[index].location;
+    constexpr float kSameLocation = 0.001F;
+    for (std::size_t alpha = 0; alpha < gradient.alpha_stops.size(); ++alpha) {
+      if (std::abs(gradient.alpha_stops[alpha].location - edit.location) <= kSameLocation) {
+        edit.alpha_index = static_cast<int>(alpha);
+        break;
+      }
+    }
+  }
+  const auto opacity = edit.alpha_index >= 0
+                           ? gradient.alpha_stops[static_cast<std::size_t>(edit.alpha_index)].opacity
+                           : gradient_stop_opacity(gradient, edit.location, true);
+  edit.initial_percent = std::clamp(static_cast<int>(std::lround(opacity * 100.0F)), 0, 100);
+  edit.percent = edit.initial_percent;
+
+  auto* popup = new QFrame(this, Qt::Popup);
+  popup->setAttribute(Qt::WA_DeleteOnClose);
+  // A click away closes and commits; it must not also start a gradient drag on the canvas.
+  popup->setAttribute(Qt::WA_NoMouseReplay);
+  popup->setObjectName(QStringLiteral("gradientOpacityStopPopup"));
+  popup->setFrameShape(QFrame::StyledPanel);
+  auto* layout = new QHBoxLayout(popup);
+  layout->setContentsMargins(8, 6, 8, 6);
+  layout->setSpacing(6);
+  auto* label = new QLabel(tr("Opacity:"), popup);
+  auto* slider = new QSlider(Qt::Horizontal, popup);
+  slider->setObjectName(QStringLiteral("gradientOpacityStopSlider"));
+  slider->setRange(0, 100);
+  slider->setValue(edit.percent);
+  slider->setMinimumWidth(120);
+  auto* spin = new QSpinBox(popup);
+  spin->setObjectName(QStringLiteral("gradientOpacityStopSpin"));
+  spin->setRange(0, 100);
+  spin->setSuffix(QStringLiteral("%"));
+  spin->setValue(edit.percent);
+  spin->setAccessibleName(tr("Stop opacity"));
+  layout->addWidget(label);
+  layout->addWidget(slider, 1);
+  layout->addWidget(spin);
+  edit.popup = popup;
+  gradient_opacity_edit_ = std::move(edit);
+
+  connect(slider, &QSlider::valueChanged, popup, [this, spin](int value) {
+    const QSignalBlocker blocker(spin);
+    spin->setValue(value);
+    set_gradient_opacity_popup_value(value);
+  });
+  connect(spin, qOverload<int>(&QSpinBox::valueChanged), popup, [this, slider](int value) {
+    const QSignalBlocker blocker(slider);
+    slider->setValue(value);
+    set_gradient_opacity_popup_value(value);
+  });
+  auto* keys = new GradientOpacityPopupKeys(popup, [this](bool commit) { finish_gradient_opacity_popup(commit); });
+  for (QObject* watched : std::initializer_list<QObject*>{popup, slider, spin}) {
+    watched->installEventFilter(keys);
+  }
+
+  // Beside the stop, on the far side of the line from it, kept on the screen.
+  popup->adjustSize();
+  const auto anchor = gradient_fill_handle_widget_position(part).value_or(QPointF(rect().center()));
+  const auto handles = gradient_fill_handles();
+  QPointF away(0.0, -1.0);
+  if (handles.has_value()) {
+    const auto start = widget_position_f(QPointF(handles->line.start_x, handles->line.start_y));
+    const auto end = widget_position_f(QPointF(handles->line.end_x, handles->line.end_y));
+    away = stop_side_normal(start, end) * (part.kind == PartKind::AlphaStop ? -1.0 : 1.0);
+  }
+  const QSize size = popup->sizeHint();
+  QPointF corner = anchor + away * (kStopHalf + 10.0);
+  // Grow away from the line: the popup's near edge sits at `corner`.
+  corner.rx() -= size.width() / 2.0;
+  if (away.y() < 0.0) {
+    corner.ry() -= size.height();
+  }
+  QPoint global = mapToGlobal(corner.toPoint());
+  if (const auto* screen = this->screen(); screen != nullptr) {
+    const auto area = screen->availableGeometry();
+    global.setX(std::clamp(global.x(), area.left(), std::max(area.left(), area.right() - size.width())));
+    global.setY(std::clamp(global.y(), area.top(), std::max(area.top(), area.bottom() - size.height())));
+  }
+  popup->move(global);
+  popup->show();
+  spin->setFocus(Qt::PopupFocusReason);
+  spin->selectAll();
+  if (status_callback_) {
+    status_callback_(tr("Set the opacity. Enter or a click outside keeps it, Esc puts it back."));
+  }
+  return true;
+}
+
+void CanvasWidget::set_gradient_opacity_popup_value(int percent) {
+  if (!gradient_opacity_edit_.has_value() || gradient_opacity_edit_->finished) {
+    return;
+  }
+  auto& edit = *gradient_opacity_edit_;
+  edit.percent = std::clamp(percent, 0, 100);
+  auto edited = edit.original;
+  const auto opacity = static_cast<float>(edit.percent) / 100.0F;
+  if (edit.alpha_index >= 0) {
+    edited.alpha_stops[static_cast<std::size_t>(edit.alpha_index)].opacity = opacity;
+  } else {
+    const auto added = add_gradient_alpha_stop(edited, edit.location);
+    edited.alpha_stops[added].opacity = opacity;
+  }
+  if (gradient_fill_edit_callback_) {
+    edit.previewed = true;
+    const auto layer_id = edit.layer_id;
+    const auto serial = edit.serial;
+    const auto target = edit.target;
+    gradient_fill_edit_callback_(layer_id, edited, GradientFillEditPhase::Preview, serial, QString(), target);
+  }
+  update();
+}
+
+void CanvasWidget::finish_gradient_opacity_popup(bool commit) {
+  if (!gradient_opacity_edit_.has_value() || gradient_opacity_edit_->finished) {
+    return;
+  }
+  auto edit = *gradient_opacity_edit_;
+  gradient_opacity_edit_->finished = true;
+  const QPointer<QWidget> popup = edit.popup;
+  gradient_opacity_edit_.reset();
+  const bool inserting = edit.alpha_index < 0;
+  const bool changed = inserting || edit.percent != edit.initial_percent;
+  if (gradient_fill_edit_callback_) {
+    if (commit && changed) {
+      auto edited = edit.original;
+      const auto opacity = static_cast<float>(edit.percent) / 100.0F;
+      int selected = edit.alpha_index;
+      if (inserting) {
+        const auto added = add_gradient_alpha_stop(edited, edit.location);
+        edited.alpha_stops[added].opacity = opacity;
+        selected = static_cast<int>(added);
+      } else {
+        edited.alpha_stops[static_cast<std::size_t>(edit.alpha_index)].opacity = opacity;
+      }
+      gradient_fill_edit_callback_(edit.layer_id, edited, GradientFillEditPhase::Commit, edit.serial,
+                                   inserting ? tr("Add Opacity Stop") : tr("Change Opacity Stop"), edit.target);
+      gradient_stop_selection_ = GradientStopSelection{edit.layer_id, true, selected, edit.target};
+    } else if (edit.previewed) {
+      gradient_fill_edit_callback_(edit.layer_id, edit.original, GradientFillEditPhase::Cancel, edit.serial,
+                                   QString(), edit.target);
+    }
+  }
+  if (popup != nullptr && popup->isVisible()) {
+    popup->close();
+  }
+  update();
+}
+
+void CanvasWidget::draw_gradient_fill_handles(QPainter& painter) const {
+  const auto handles = gradient_fill_handles();
+  if (!handles.has_value()) {
+    return;
+  }
+  const auto geometry = handle_geometry(*handles, [this](QPointF point) { return widget_position_f(point); });
+  const auto& palette = theme();
+  const QColor ink = palette.canvas_gradient_handle_ink;
+  const QColor light = palette.canvas_gradient_handle_fill;
+  const QColor active = palette.canvas_gradient_handle_active;
+  const auto highlighted = [&](PartKind kind, int index) {
+    if (gradient_handle_drag_.has_value()) {
+      const auto& drag = *gradient_handle_drag_;
+      if (drag.part.kind != kind) {
+        return false;
+      }
+      return index < 0 || (drag.part.kind == PartKind::ColorStop || drag.part.kind == PartKind::AlphaStop
+                               ? index == drag.current_index
+                               : index == drag.part.index);
+    }
+    if (const auto selected = gradient_fill_selected_stop(); selected.has_value() && selected->kind == kind &&
+                                                               selected->index == index) {
+      return true;
+    }
+    return gradient_handle_hover_.kind == kind && (index < 0 || gradient_handle_hover_.index == index);
+  };
+
+  painter.save();
+  painter.setRenderHint(QPainter::Antialiasing, true);
+  // The line: light over a wider dark band, readable on any artwork.
+  painter.setBrush(Qt::NoBrush);
+  const bool line_active = highlighted(PartKind::Line, -1) || highlighted(PartKind::AlphaLine, -1);
+  painter.setPen(QPen(ink, 3.0, Qt::SolidLine, Qt::RoundCap));
+  painter.drawLine(QLineF(geometry.start, geometry.end));
+  painter.setPen(QPen(line_active ? active : light, 1.0, Qt::SolidLine, Qt::FlatCap));
+  painter.drawLine(QLineF(geometry.start, geometry.end));
+
+  const auto& gradient = handles->gradient;
+  const auto draw_connector = [&](QPointF marker, double side) {
+    const QPointF foot = marker - geometry.normal * (kStopOffset * side);
+    painter.setPen(QPen(ink, 1.0));
+    painter.drawLine(QLineF(foot, marker - geometry.normal * (kStopHalf * side)));
+  };
+  const auto draw_midpoints = [&](const std::vector<std::optional<QPointF>>& midpoints, PartKind kind) {
+    for (std::size_t i = 0; i < midpoints.size(); ++i) {
+      if (!midpoints[i].has_value()) {
+        continue;
+      }
+      const bool on = highlighted(kind, static_cast<int>(i));
+      // An opacity midpoint between equal opacities does nothing yet: drawn faded (the
+      // same roles at reduced opacity), back to normal once the opacities differ.
+      const bool dimmed = kind == PartKind::AlphaMidpoint && i < gradient.alpha_stops.size() && i > 0U &&
+                          gradient.alpha_stops[i - 1U].opacity == gradient.alpha_stops[i].opacity;
+      painter.setOpacity(dimmed && !on ? 0.4 : 1.0);
+      painter.setPen(QPen(on ? active : ink, on ? 2.0 : 1.0));
+      painter.setBrush(light);
+      painter.drawPolygon(diamond_at(*midpoints[i], kMidpointHalf));
+      painter.setOpacity(1.0);
+    }
+  };
+  draw_midpoints(geometry.color_midpoints, PartKind::ColorMidpoint);
+  draw_midpoints(geometry.alpha_midpoints, PartKind::AlphaMidpoint);
+  const auto removing_index = [&](PartKind kind) {
+    return gradient_handle_drag_.has_value() && gradient_handle_drag_->removing && gradient_handle_drag_->part.kind == kind;
+  };
+  // Color stops: a square in the stop's color with a light rim inside a dark outline.
+  for (std::size_t i = 0; i < geometry.color_stops.size() && i < gradient.color_stops.size(); ++i) {
+    const auto at = geometry.color_stops[i];
+    draw_connector(at, 1.0);
+    const auto& color = gradient.color_stops[i].color;
+    const bool on = highlighted(PartKind::ColorStop, static_cast<int>(i));
+    const QRectF box(at.x() - kStopHalf, at.y() - kStopHalf, kStopHalf * 2.0, kStopHalf * 2.0);
+    painter.setPen(QPen(on ? active : ink, on ? 2.0 : 1.0));
+    painter.setBrush(light);
+    painter.drawRect(box.adjusted(-1.0, -1.0, 1.0, 1.0));
+    painter.setPen(Qt::NoPen);
+    painter.setBrush(QColor(color.red, color.green, color.blue));
+    painter.drawRect(box.adjusted(1.0, 1.0, -1.0, -1.0));
+  }
+  // Opacity stops: a circle whose gray shows the opacity (black is opaque, like a mask).
+  for (std::size_t i = 0; i < geometry.alpha_stops.size() && i < gradient.alpha_stops.size(); ++i) {
+    const auto at = geometry.alpha_stops[i];
+    draw_connector(at, -1.0);
+    const auto value = 255 - static_cast<int>(std::lround(std::clamp(gradient.alpha_stops[i].opacity, 0.0F, 1.0F) * 255.0F));
+    const bool on = highlighted(PartKind::AlphaStop, static_cast<int>(i));
+    painter.setPen(QPen(on ? active : ink, on ? 2.0 : 1.0));
+    painter.setBrush(light);
+    painter.drawEllipse(at, kStopHalf + 1.0, kStopHalf + 1.0);
+    painter.setPen(Qt::NoPen);
+    painter.setBrush(QColor(value, value, value));
+    painter.drawEllipse(at, kStopHalf - 1.0, kStopHalf - 1.0);
+  }
+  // A stop pulled off the line to be deleted follows the pointer, struck through.
+  if (removing_index(PartKind::ColorStop) || removing_index(PartKind::AlphaStop)) {
+    const auto at = gradient_handle_drag_->pointer_widget;
+    painter.setPen(QPen(ink, 3.0, Qt::SolidLine, Qt::RoundCap));
+    painter.setBrush(Qt::NoBrush);
+    painter.drawLine(QLineF(at + QPointF(-kStopHalf, -kStopHalf), at + QPointF(kStopHalf, kStopHalf)));
+    painter.drawLine(QLineF(at + QPointF(-kStopHalf, kStopHalf), at + QPointF(kStopHalf, -kStopHalf)));
+    painter.setPen(QPen(active, 1.5, Qt::SolidLine, Qt::RoundCap));
+    painter.drawLine(QLineF(at + QPointF(-kStopHalf, -kStopHalf), at + QPointF(kStopHalf, kStopHalf)));
+    painter.drawLine(QLineF(at + QPointF(-kStopHalf, kStopHalf), at + QPointF(kStopHalf, -kStopHalf)));
+  }
+  // The ends: light discs in a dark ring; the end handle carries a dark center dot.
+  const auto draw_end = [&](QPointF at, bool end, bool on) {
+    painter.setPen(QPen(on ? active : ink, on ? 2.5 : 1.5));
+    painter.setBrush(light);
+    painter.drawEllipse(at, kHandleRadius, kHandleRadius);
+    if (end) {
+      painter.setPen(Qt::NoPen);
+      painter.setBrush(on ? active : ink);
+      painter.drawEllipse(at, 1.75, 1.75);
+    }
+  };
+  draw_end(geometry.start, false, highlighted(PartKind::Start, -1));
+  draw_end(geometry.end, true, highlighted(PartKind::End, -1));
+  painter.restore();
+}
+
+}  // namespace patchy::ui

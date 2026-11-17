@@ -1,0 +1,420 @@
+#pragma once
+
+#include "core/layer.hpp"
+
+#include <array>
+#include <cstdint>
+#include <optional>
+#include <string>
+#include <string_view>
+#include <vector>
+
+// Vector shape/path data model: shape layers, vector masks, and document paths.
+// A shape layer stays LayerKind::Pixel (the text/smart-object pattern): the
+// editable source of truth is a VectorShapeContent held on the layer, and
+// pixels() carries the rasterized fill+stroke cache. Photoshop interop encodes
+// this model into the vmsk/vogk/vstk/SoCo/GdFl/PtFl tagged blocks; every
+// encoding fact referenced here was pinned by observation of Photoshop 27.8
+// (docs/vector-psd-encodings.md, July 2026).
+namespace patchy {
+
+// One bezier knot. Control points are absolute document-pixel positions:
+// control_in leads toward the PREVIOUS anchor, control_out toward the NEXT.
+// (PSD knot records store the pairs in (in, anchor, out) order, y before x,
+// as 8.24 fixed-point fractions of the canvas extent - converted at I/O.)
+// smooth mirrors Photoshop's linked-knot selectors (1/4) vs corner (2/5).
+struct PathAnchor {
+  double anchor_x{0.0};
+  double anchor_y{0.0};
+  double in_x{0.0};
+  double in_y{0.0};
+  double out_x{0.0};
+  double out_y{0.0};
+  bool smooth{false};
+
+  friend bool operator==(const PathAnchor&, const PathAnchor&) = default;
+};
+
+// Values match the PSD subpath-length-record operation field.
+enum class PathCombineOp : std::uint8_t {
+  Xor = 0,
+  Add = 1,
+  Subtract = 2,
+  Intersect = 3
+};
+
+struct PathSubpath {
+  std::vector<PathAnchor> anchors;
+  bool closed{true};
+  PathCombineOp op{PathCombineOp::Add};
+  // PSD length records carry a per-subpath index that groups the subpaths of
+  // one shape unit (a custom-shape stamp is several subpaths sharing a group;
+  // vogk origination entries join via the same value). Subpaths of one group
+  // rasterize together under the even-odd rule; combine ops apply BETWEEN
+  // groups. Simple shapes use one subpath per group.
+  std::int32_t shape_group{0};
+
+  friend bool operator==(const PathSubpath&, const PathSubpath&) = default;
+};
+
+struct VectorPathBounds {
+  double left{0.0};
+  double top{0.0};
+  double right{0.0};
+  double bottom{0.0};
+};
+
+struct VectorPath {
+  std::vector<PathSubpath> subpaths;
+  // Raw values of the selector-6 (path fill rule) and selector-8 (initial
+  // fill) records; Photoshop 27.8 writes zeros and renders even-odd within a
+  // group regardless, so these are preserved rather than interpreted.
+  std::uint16_t fill_rule_value{0};
+  std::uint16_t initial_fill_value{0};
+
+  [[nodiscard]] bool empty() const noexcept;
+  // Hull of anchors and control points (a bezier never escapes it). nullopt
+  // for an empty path.
+  [[nodiscard]] std::optional<VectorPathBounds> bounds() const noexcept;
+  // Next unused shape_group value (for appending independent subpaths).
+  [[nodiscard]] std::int32_t next_shape_group() const noexcept;
+
+  friend bool operator==(const VectorPath&, const VectorPath&) = default;
+};
+
+enum class VectorFillKind : std::uint8_t {
+  None,
+  Solid,
+  Gradient,
+  Pattern
+};
+
+struct NativeCmykFill;
+struct NativeGrayFill;
+
+// Fill appearance for shape layers, fill layers, and stroke paint. The
+// gradient reuses the layer-style gradient model (GdFl's Grad object parses
+// with the same code as gradient overlays); pattern tiles live in the
+// document PatternStore, referenced by id like pattern overlays.
+struct VectorFill {
+  VectorFillKind kind{VectorFillKind::Solid};
+  RgbColor color{0, 0, 0};
+  LayerStyleGradient gradient{};
+  // GdFl noisePreSeed, preserved on read; authored fills write 0.
+  std::int32_t gradient_noise_pre_seed{0};
+  std::string pattern_id{};
+  std::string pattern_name{};
+  double pattern_scale{1.0};
+  double pattern_angle_degrees{0.0};
+  bool pattern_linked{true};
+  double pattern_phase_x{0.0};
+  double pattern_phase_y{0.0};
+  // Imported CMYK paint, before conversion to the RGB editing colors. The
+  // reference fill detects edits; no private PSD data is written for this cache.
+  std::shared_ptr<const NativeCmykFill> native_cmyk{};
+  std::shared_ptr<const NativeGrayFill> native_gray{};
+
+  friend bool operator==(const VectorFill&, const VectorFill&) = default;
+};
+
+struct NativeGrayFill {
+  VectorFill reference;
+  VectorFill gray;
+};
+
+struct NativeCmykFill {
+  VectorFill reference;
+  VectorFill cmy;
+  VectorFill black;
+};
+
+enum class VectorStrokeAlignment : std::uint8_t { Inside, Center, Outside };
+enum class VectorStrokeCap : std::uint8_t { Butt, Round, Square };
+enum class VectorStrokeJoin : std::uint8_t { Miter, Round, Bevel };
+
+// Shape stroke (vstk strokeStyle descriptor; 16-item canonical order recorded
+// in docs/vector-psd-encodings.md). Dash entries are stored in stroke-width multiples,
+// matching the descriptor's unitless values.
+struct VectorStroke {
+  bool enabled{false};
+  bool fill_enabled{true};
+  double width{1.0};
+  double dash_offset{0.0};
+  double miter_limit{100.0};
+  VectorStrokeCap cap{VectorStrokeCap::Butt};
+  VectorStrokeJoin join{VectorStrokeJoin::Miter};
+  VectorStrokeAlignment alignment{VectorStrokeAlignment::Center};
+  bool scale_lock{false};
+  bool stroke_adjust{false};
+  std::vector<double> dashes;
+  BlendMode blend_mode{BlendMode::Normal};
+  double opacity{1.0};
+  VectorFill content{};
+  double resolution{72.0};
+
+  friend bool operator==(const VectorStroke&, const VectorStroke&) = default;
+};
+
+// The Dotted dash preset for a cap (stroke-width multiples). Zero-length
+// dashes draw only through a round or square cap (Photoshop and SVG draw
+// nothing for them with butt caps), so a butt-capped stroke's dots are
+// one-width dashes: the same square dots a square cap draws from {0, 2}.
+std::vector<double> dotted_dash_pattern(VectorStrokeCap cap);
+bool is_dotted_dash_pattern(const std::vector<double>& dashes, VectorStrokeCap cap);
+
+// Shape Appearance's named dash patterns (GitHub #548). Values are UI row ids (3 is its Custom row),
+// not saved anywhere; files keep only the dash array. Dashed is a fixed {2, 2};
+// the others are written for butt caps and, with a round or square cap, each
+// dash is one width shorter and each gap one width longer, so they look the
+// same on every cap (a dot becomes a zero-length dash: Dotted is
+// dotted_dash_pattern).
+enum class StrokeDashPreset {
+  Solid = 0,
+  Dashed = 1,
+  Dotted = 2,
+  LongDashes = 4,
+  ShortDashes = 5,
+  SparseDots = 6,
+  DashDot = 7,
+  DashDotDot = 8,
+};
+std::vector<double> stroke_dash_preset_pattern(StrokeDashPreset preset, VectorStrokeCap cap);
+// Whether the preset's array depends on the cap (all but Solid and Dashed).
+bool stroke_dash_preset_follows_cap(StrokeDashPreset preset);
+// Whether the preset draws dots alone, which read as dots with round caps.
+bool stroke_dash_preset_is_dots(StrokeDashPreset preset);
+// The caps and corners picking a preset sets (GitHub #548): Dashed, Long
+// dashes and Short dashes set Butt caps; the presets with dots (Dotted, Sparse
+// dots, Dash dot, Dash dot dot) set Round caps and Round corners, so every dot
+// is round; Solid sets neither. Both stay editable afterwards.
+std::optional<VectorStrokeCap> stroke_dash_preset_cap(StrokeDashPreset preset);
+std::optional<VectorStrokeJoin> stroke_dash_preset_join(StrokeDashPreset preset);
+// Picks the preset on a stroke: its caps and corners, then its dash array for
+// that cap. Shape Appearance and the options bar's dash combo both use it.
+void apply_stroke_dash_preset(VectorStroke& stroke, StrokeDashPreset preset);
+// Every preset, in menu order (Solid, Dashed, Long dashes, Short dashes,
+// Dotted, Sparse dots, Dash dot, Dash dot dot).
+const std::array<StrokeDashPreset, 8>& stroke_dash_presets_in_menu_order();
+// The preset's settings token for the options bar's last pick
+// (tools/vectorStrokeDashes; persisted, never rename one). An unknown token reads as Solid.
+const char* stroke_dash_preset_token(StrokeDashPreset preset);
+StrokeDashPreset stroke_dash_preset_from_token(std::string_view token);
+// The preset a file's dash array shows as, or nullopt (Custom). Arrays that
+// repeat a shorter period ({1, 1, 1, 1}) compare by that period; a dot preset
+// also matches its zero-length form on any cap, as Dotted always has.
+std::optional<StrokeDashPreset> stroke_dash_preset_for(const std::vector<double>& dashes,
+                                                       VectorStrokeCap cap);
+
+// Live-shape parameter kinds. Values are Patchy's own; the PSD keyOriginType
+// integers (rect 1, rounded rect 2, line 4, ellipse 5) map at I/O. Kinds
+// Photoshop was not observed writing import as Custom with the raw origination
+// descriptor preserved (the path still renders and stays editable; only
+// live-parameter editing is unavailable). Polygon (GitHub #521) has no record in
+// the file: Photoshop's polygon origination (keyOriginType 7) is only partly
+// probed, so the writers leave it out, and the PSD reader gives a reopened
+// single-outline regular polygon or star its parameters back by recognizing the
+// path (recognize_live_polygon, GitHub #643). Append only.
+enum class LiveShapeKind : std::uint8_t {
+  None,
+  Rectangle,
+  RoundedRectangle,
+  Line,
+  Ellipse,
+  Custom,
+  Polygon
+};
+
+// One vogk keyDescriptorList entry: the regenerating annotation for a live
+// subpath group. The PATH stays the render source of truth; editing a live
+// parameter regenerates the group's subpaths, and direct anchor edits drop
+// the origination for that group (Photoshop's live-shape invalidation).
+struct LiveShapeParams {
+  LiveShapeKind kind{LiveShapeKind::None};
+  double resolution{72.0};
+  // keyOriginShapeBBox, document pixels.
+  double left{0.0};
+  double top{0.0};
+  double right{0.0};
+  double bottom{0.0};
+  // Rounded-rect corner radii in model order TL, TR, BR, BL. (The descriptor
+  // stores them as topRight, topLeft, bottomLeft, bottomRight.)
+  std::array<double, 4> corner_radii{0.0, 0.0, 0.0, 0.0};
+  // keyOriginBoxCorners rectangleCornerA..D as (x, y) pairs.
+  std::array<double, 8> box_corners{};
+  // vogk Trnf: xx, xy, yx, yy, tx, ty.
+  std::array<double, 6> transform{1.0, 0.0, 0.0, 1.0, 0.0, 0.0};
+  // Line kind (keyOriginLine*).
+  double line_start_x{0.0};
+  double line_start_y{0.0};
+  double line_end_x{0.0};
+  double line_end_y{0.0};
+  double line_weight{1.0};
+  bool arrow_start{false};
+  bool arrow_end{false};
+  double arrow_width{0.0};
+  double arrow_length{0.0};
+  std::int32_t arrow_concavity{0};
+  bool arrow_width_unit_pixels{true};
+  bool arrow_length_unit_pixels{true};
+  // Polygon kind: the regular polygon (or star, inset percent > 0) inscribed in the
+  // left/top/right/bottom box, first vertex at polygon_angle radians from the center
+  // (a box that is not square stretches it, like the Create Polygon dialog's W x H).
+  std::int32_t polygon_sides{5};
+  std::int32_t polygon_star_inset{0};
+  double polygon_angle{0.0};
+  // Joins this entry to PathSubpath::shape_group.
+  std::int32_t index{0};
+  // Custom/unmodeled origination: the entry's raw descriptor bytes, re-emitted
+  // verbatim while the group is untouched.
+  std::vector<std::uint8_t> raw_descriptor;
+
+  friend bool operator==(const LiveShapeParams&, const LiveShapeParams&) = default;
+};
+
+// An independently painted part of a merged vector layer. Geometry stays in
+// the owning shape's path, so existing point editing works on the same knots.
+// Parts paint bottom-to-top, each with its original fill, stroke and opacity.
+struct VectorShapePart {
+  std::vector<std::int32_t> groups;
+  bool whole_canvas{false};
+  bool path_disabled{false};
+  bool path_inverted{false};
+  VectorFill fill;
+  VectorStroke stroke;
+  float opacity{1.0F};
+  float fill_opacity{1.0F};
+  std::array<double, 2> pattern_anchor{};
+};
+
+// The whole editable content of a shape/fill layer.
+struct VectorShapeContent {
+  VectorPath path;         // empty path == full-canvas fill layer
+  // The shape's vmsk flags: a disabled path fills the whole canvas, an
+  // inverted one fills the complement.
+  bool path_disabled{false};
+  bool path_inverted{false};
+  // Photoshop's vector-mask parameters on the shape's own path (mask-data
+  // parameter bits 2/3, photoshop-shape-feather.psd): density < 255 shows the
+  // fill everywhere at (255 - density)/255, or with a stroke the stroke's paint
+  // (the fill then sits under a wash of it; docs/vector-tools-appearance.md,
+  // "Density with a stroke"), and feather (px) gaussian-blurs the whole rendered
+  // shape, stroke included, unclamped at the canvas.
+  std::uint8_t density{255};
+  double feather{0.0};
+  VectorFill fill{};
+  VectorStroke stroke{};
+  std::vector<LiveShapeParams> origination;
+  // The Custom Shape library entry (CustomShapeLibraryEntry::id) the whole path was
+  // stamped from or last replaced with (GitHub #644), so Shape Appearance's picker can
+  // show it. Session only: never serialized (Photoshop has no field for it). A direct
+  // geometry edit clears it (drop_live_shape_origination); the picker also checks that
+  // the path still is that shape fitted to its bounds before showing it.
+  std::string library_shape_id;
+  // Empty for an ordinary single-appearance PSD shape. When nonempty, these
+  // independent paints replace the top-level fill/stroke during rendering.
+  std::vector<VectorShapePart> parts;
+  // Style-compositing caches (never serialized; rebuilt with the pixel bake):
+  // straight-alpha planes over the layer's baked bounds. Interior overlay
+  // effects apply over fill_cache and the vector stroke re-composites above
+  // from stroke_cache (PS 2026 probes fx-sofi-*). fill_cache's alpha is the
+  // fill's COVERAGE: a gradient or pattern fill that is transparent inside the
+  // shape does not thin the overlays (see effect_matte_cache). Empty when the layer has no
+  // stroke, a non-Normal stroke blend, or an un-rebaked import - the
+  // compositor then keeps the legacy combined-plane behavior.
+  PixelBuffer fill_cache{};
+  PixelBuffer stroke_cache{};
+  // The layer's effect silhouette, when it is not simply the alpha of its pixels: the
+  // layer's own RGBA with alpha replaced by the shape's COVERAGE (fill and stroke).
+  // A gradient or pattern fill can be transparent inside the shape; Photoshop still
+  // treats the whole shape as the layer for every layer effect (stroke, shadows, glows,
+  // bevel, satin, overlays all follow the outline at full strength; PS 2026 probes on
+  // psd-tools' stroke-effects.psd, October 2026, docs/layer-effects-render.md). Empty
+  // when coverage and alpha agree (every solid fill), which keeps those layers on
+  // exactly the path they always took. Same lifetime rules as the two caches above.
+  PixelBuffer effect_matte_cache{};
+};
+
+// A vector mask on any layer. Coexists with (multiplies against) the raster
+// mask. The cache is the rasterized grayscale coverage, regenerated on edit -
+// never at render time. When a PSD carried Photoshop's baked derived plane
+// (density/feather set), the cache seeds from that plane until the first edit.
+struct LayerVectorMask {
+  VectorPath path;
+  bool disabled{false};   // vmsk flags bit 2
+  bool inverted{false};   // vmsk flags bit 0
+  bool unlinked{false};   // vmsk flags bit 1 (does not follow layer moves)
+  // Mask parameters (Properties panel): density raw 0..255, feather pixels.
+  std::uint8_t density{255};
+  double feather{0.0};
+  Rect cache_bounds{};
+  PixelBuffer cache{};    // gray8 coverage within cache_bounds
+};
+
+// --- layer metadata flags (tiny status strings; the structured content lives
+// in Layer's vector fields, added with the compositor integration) ---
+
+inline constexpr const char* kLayerMetadataVectorShape = "patchy.vector.shape";  // "1" = shape/fill layer
+// "psd_raster_preview" (Photoshop's baked pixels kept at import) or
+// "patchy_raster" (rasterized by Patchy).
+inline constexpr const char* kLayerMetadataVectorRasterStatus = "patchy.vector.raster_status";
+// Present when vector content diverged from the preserved PSD blocks; the
+// writer then regenerates vmsk/vogk/vstk/SoCo/GdFl/PtFl instead of re-emitting
+// the originals.
+inline constexpr const char* kLayerMetadataVectorBlockDirty = "patchy.vector.block_dirty";
+// Why the vector content cannot be edited: "" (editable) or "unparsed" (a
+// vector block failed to parse; everything stays byte-preserved and locked).
+inline constexpr const char* kLayerMetadataVectorLock = "patchy.vector.lock";
+
+inline constexpr const char* kVectorRasterStatusPhotoshop = "psd_raster_preview";
+inline constexpr const char* kVectorRasterStatusPatchy = "patchy_raster";
+
+[[nodiscard]] bool layer_has_vector_shape_marker(const Layer& layer);
+// The real predicate: the metadata marker AND the structured content.
+[[nodiscard]] bool layer_is_vector_shape(const Layer& layer);
+// A Solid Color, Gradient or Pattern Fill layer: a vector shape layer with no path, so it
+// fills the whole canvas (Layer > New Fill Layer, the Gradient tool's Fill Layer mode). A
+// path (vector mask) makes it a shape layer. Its UI is the fill's settings alone: a stroke,
+// feather or density shows nothing there (GitHub issue 580 follow-up).
+[[nodiscard]] bool layer_is_fill_layer(const Layer& layer);
+// Text, smart-object, or vector-shape: pixels are a derived cache of richer
+// content, so hand edits must rasterize first (the shared guard condition).
+[[nodiscard]] bool layer_pixels_are_procedural(const Layer& layer);
+[[nodiscard]] std::string vector_lock_reason(const Layer& layer);
+[[nodiscard]] bool layer_vector_block_dirty(const Layer& layer);
+void mark_layer_vector_block_dirty(Layer& layer);
+// A direct geometry edit invalidates the live-shape annotation of the touched
+// shape groups (Photoshop's keyShapeInvalidated rule); the path itself stays.
+// It also clears library_shape_id (the outline is no longer that library shape).
+void drop_live_shape_origination(VectorShapeContent& content, const std::vector<int>& groups);
+// The rasterize / merge-target semantic: drops the vector fields, every
+// patchy.vector.* key, and the preserved PSD vector blocks so the layer
+// becomes a plain pixel layer everywhere, resave included (the
+// strip_layer_smart_object_data pattern).
+void strip_layer_vector_data(Layer& layer);
+
+// --- path text codec (tests, custom-shape library storage; PSD uses the
+// binary record forms instead) ---
+
+[[nodiscard]] std::string serialize_vector_path(const VectorPath& path);
+[[nodiscard]] std::optional<VectorPath> parse_vector_path(std::string_view text);
+
+// --- PSD path-record fixed point (i32 8.24 as a fraction of the canvas
+// extent; the same convention translate_vector_mask_payload patches) ---
+
+[[nodiscard]] std::int32_t path_coordinate_to_fixed(double pixels, std::int32_t extent) noexcept;
+[[nodiscard]] double path_coordinate_from_fixed(std::int32_t fixed, std::int32_t extent) noexcept;
+
+// Uniform affine transform of every anchor/control point (a*x + c*y + tx,
+// b*x + d*y + ty), used by move/transform/resize integration.
+void transform_vector_path(VectorPath& path, const std::array<double, 6>& matrix);
+// Projective (perspective) map of every anchor/control point, row-major for column
+// vectors: x' = (h0 x + h1 y + h2) / w, y' = (h3 x + h4 y + h5) / w, w = h6 x + h7 y + h8.
+// The curves between the mapped control points approximate the exact (rational)
+// image, as Photoshop's Distort/Perspective do for paths. A point at w = 0 stays put.
+void transform_vector_path_projective(VectorPath& path, const std::array<double, 9>& homography);
+void translate_vector_path(VectorPath& path, double dx, double dy);
+// Translates the path AND every absolute-coordinate origination field
+// (bbox, box corners, line endpoints, transform translation).
+void translate_vector_shape_content(VectorShapeContent& content, double dx, double dy);
+
+}  // namespace patchy

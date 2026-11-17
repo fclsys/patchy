@@ -1,0 +1,110 @@
+#pragma once
+
+// Font lookup shared by text rendering, editing, the PSD resolver and font diagnostics.
+// Platform registration and caches live in the implementation; this interface owns no UI.
+#include "core/font_substitutes.hpp"
+
+#include <QFont>
+#include <QFontDatabase>
+#include <QHash>
+#include <QString>
+#include <QStringList>
+#include <optional>
+#include <vector>
+
+namespace patchy { class Layer; }
+namespace patchy::ui {
+struct AvailableTextFamilyStyle {
+  QString family;
+  QString style;
+};
+
+struct TextStyleFlags {
+  bool bold{false};
+  bool italic{false};
+};
+
+// What the style list sort knows about one face (GitHub issue 649). An unknown weight comes from
+// the face name instead; the width always does (text_style_order_key).
+struct TextStyleSortFacts {
+  QString style;
+  int weight{-1};      // 1-1000 on the OpenType scale (QFontDatabase::weight); <= 0 unknown
+  bool italic{false};  // the database calls the face italic (the name can still say so)
+};
+
+// Sort key of one face in the style list, compared lexicographically: italic, width block, weight.
+struct TextStyleOrderKey {
+  int italic{0};
+  int width_block{0};
+  int weight{400};
+  friend bool operator==(const TextStyleOrderKey&, const TextStyleOrderKey&) = default;
+};
+
+struct TextFontProblems {
+  QStringList not_installed;  // absent from the font database
+  QStringList no_glyphs;      // installed, with no glyph for any character asked of it
+  [[nodiscard]] bool empty() const { return not_installed.isEmpty() && no_glyphs.isEmpty(); }
+};
+
+
+// Resolve Missing Fonts: each missing family the user replaced, mapped to the installed family
+// chosen for it, keyed by text_font_replacement_key. A missing family absent from the map is left
+// unresolved.
+using TextFontReplacements = QHash<QString, QString>;
+QString text_font_replacement_key(const QString& family);
+
+// An installed stand-in for a missing font (GitHub issue 463): a pair from the built-in substitute
+// table (core/font_substitutes.hpp) or an installed default of the same font type.
+struct TextFontSubstitute {
+  QString family;       // the installed family, as the font database lists it
+  QString face_family;  // `family` plus the face a face-baked request named ("Source Sans 3 Semibold")
+                        // when the substitute has that face; `family` otherwise
+  bool metric{false};   // same character widths as the requested font (and face)
+  // The requested font's type when this is a same-type default rather than a table pair;
+  // unknown for table pairs.
+  FontClass same_type{FontClass::unknown};
+};
+// Installed stand-ins for `family` that draw `demanded` (empty: availability only), best first:
+// the table's metric pairs, its look-alikes, then one installed default of the same font type
+// (text_font_class). Empty when none applies.
+std::vector<TextFontSubstitute> installed_text_font_substitutes(const QString& family,
+                                                                const QString& demanded = QString());
+// A family's font type: the table's column, then a symbol font's name words, then (Linux) the
+// type fontconfig's rules give it, then the words of its name (classify_font_name_words).
+// docs/font-resolution-missing-fonts.md, "Font types".
+FontClass text_font_class(const QString& family);
+
+std::optional<QString> available_text_family_match(const QString& family);
+std::optional<AvailableTextFamilyStyle> available_text_family_style_match(const QString& family,
+                                                                        bool consult_name_tables = true);
+QString canonical_text_display_family(const QString& family);
+QString installed_text_family(const QString& family);
+QString default_text_family();
+QStringList available_text_family_styles(const QString& family);
+TextStyleOrderKey text_style_order_key(const TextStyleSortFacts& facts);
+QStringList text_styles_in_photoshop_order(std::vector<TextStyleSortFacts> faces);
+QStringList order_text_family_styles(const QString& family, const QStringList& styles);
+QString text_style_query_family(const QString& family);
+TextStyleFlags text_style_flags_for_name(const QString& style);
+TextStyleFlags text_style_flags_for_style(const QString& family, const QString& style);
+bool text_style_is_flag_expressible(const QString& style);
+QString text_style_name_for_flags(bool bold, bool italic);
+bool family_offers_face_axis(const QString& family, bool bold_axis);
+QString real_face_style_name(const QString& family, bool bold, bool italic);
+bool text_family_uses_photoshop_latin_fallback(const QString& family);
+QString display_text_family_from_font(const QFont& font);
+QStringList render_text_families_for_display_family(const QString& family);
+QString substituted_text_family(const QString& family, const QString& demanded);
+void append_missing_text_family(QStringList& missing, const QString& family, const QString& demanded,
+                                QStringList* no_glyphs = nullptr);
+QStringList missing_text_families_for_psd_raster_preview(const QString& primary_family, const QString& runs_text,
+                                                       const QString& text, QStringList* no_glyphs = nullptr);
+QFont render_text_font_for_display_family(const QString& family, int pixel_size, bool bold, bool italic,
+                                         int anti_alias, const QString& style_name = QString());
+QFontDatabase::WritingSystem fallback_writing_system_for_character(QChar character);
+void configure_text_font_smoothing(QFont& font, int anti_alias);
+QStringList missing_text_families_for_layer(const Layer& layer);
+TextFontProblems text_font_problems_for_layer(const Layer& layer);
+bool ensure_headless_system_fonts_loaded();
+
+}  // namespace patchy::ui

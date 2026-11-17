@@ -1,0 +1,611 @@
+#include "filters/smart_filter_recipe_mapping.hpp"
+
+#include <algorithm>
+#include <cmath>
+#include <cstdint>
+#include <string>
+#include <utility>
+
+namespace patchy {
+
+namespace {
+
+struct NativeSmartFilterCommand {
+  std::string_view filter_id;
+  SmartFilterKind kind;
+};
+
+// The Filter-menu commands that append a native Smart Filter on a Smart Object; the
+// table-described ones (Solarize through Fibers) came with GitHub issue 496.
+constexpr NativeSmartFilterCommand kNativeSmartFilterCommands[] = {
+    {"patchy.filters.gaussian_blur", SmartFilterKind::GaussianBlur},
+    {"patchy.filters.high_pass", SmartFilterKind::HighPass},
+    {"patchy.filters.median", SmartFilterKind::Median},
+    {"patchy.filters.dust_and_scratches", SmartFilterKind::DustAndScratches},
+    {"patchy.filters.surface_blur", SmartFilterKind::SurfaceBlur},
+    {"patchy.filters.unsharp_mask", SmartFilterKind::UnsharpMask},
+    {"patchy.filters.motion_blur", SmartFilterKind::MotionBlur},
+    {"patchy.filters.plastic_wrap", SmartFilterKind::PlasticWrap},
+    {"patchy.filters.pixelate", SmartFilterKind::Mosaic},
+    {"patchy.filters.emboss", SmartFilterKind::Emboss},
+    {"patchy.filters.box_blur", SmartFilterKind::BoxBlur},
+    {"patchy.filters.radial_blur", SmartFilterKind::RadialBlur},
+    {"patchy.filters.add_noise", SmartFilterKind::AddNoise},
+    {"patchy.filters.blur", SmartFilterKind::Blur},
+    {"patchy.filters.blur_more", SmartFilterKind::BlurMore},
+    {"patchy.filters.sharpen_more", SmartFilterKind::SharpenMore},
+    {"patchy.filters.average", SmartFilterKind::Average},
+    {"patchy.filters.sharpen_edges", SmartFilterKind::SharpenEdges},
+    {"patchy.filters.solarize", SmartFilterKind::Solarize},
+    {"patchy.filters.find_edges", SmartFilterKind::FindEdges},
+    {"patchy.filters.trace_contour", SmartFilterKind::TraceContour},
+    {"patchy.filters.diffuse", SmartFilterKind::Diffuse},
+    {"patchy.filters.fibers", SmartFilterKind::Fibers},
+};
+
+}  // namespace
+
+std::optional<SmartFilterKind> native_smart_filter_kind_for(
+    std::string_view filter_id) {
+  for (const auto& command : kNativeSmartFilterCommands) {
+    if (command.filter_id == filter_id) {
+      return command.kind;
+    }
+  }
+  return std::nullopt;
+}
+
+std::optional<std::string_view> native_smart_filter_command_id(SmartFilterKind kind) {
+  for (const auto& command : kNativeSmartFilterCommands) {
+    if (command.kind == kind) {
+      return command.filter_id;
+    }
+  }
+  return std::nullopt;
+}
+
+namespace {
+
+[[nodiscard]] std::optional<double> invocation_number(const FilterInvocation& invocation,
+                                                      std::string_view key) {
+  const auto found = invocation.parameters.find(key);
+  if (found == invocation.parameters.end()) {
+    return std::nullopt;
+  }
+  if (const auto* integer = std::get_if<std::int64_t>(&found->second); integer != nullptr) {
+    return static_cast<double>(*integer);
+  }
+  if (const auto* real = std::get_if<double>(&found->second);
+      real != nullptr && std::isfinite(*real)) {
+    return *real;
+  }
+  return std::nullopt;
+}
+
+[[nodiscard]] const std::string* invocation_option(const FilterInvocation& invocation,
+                                                   std::string_view key) {
+  const auto found = invocation.parameters.find(key);
+  return found == invocation.parameters.end() ? nullptr
+                                              : std::get_if<std::string>(&found->second);
+}
+
+[[nodiscard]] const bool* invocation_boolean(const FilterInvocation& invocation,
+                                             std::string_view key) {
+  const auto found = invocation.parameters.find(key);
+  return found == invocation.parameters.end() ? nullptr : std::get_if<bool>(&found->second);
+}
+
+}  // namespace
+
+SchemaSmartFilter schema_smart_filter_from_invocation(const SmartFilterSchema& schema,
+                                                      const FilterInvocation& invocation) {
+  auto settings = default_schema_settings(schema);
+  for (std::size_t index = 0; index < schema.fields.size() && index < settings.values.size();
+       ++index) {
+    const auto& field = schema.fields[index];
+    if (field.hidden || field.parameter_key == nullptr) {
+      continue;
+    }
+    auto& value = settings.values[index];
+    switch (field.type) {
+      case SmartFilterFieldType::Integer:
+        if (const auto number = invocation_number(invocation, field.parameter_key);
+            number.has_value()) {
+          value = static_cast<std::int32_t>(std::clamp(std::floor(*number + 0.5),
+                                                       static_cast<double>(field.minimum),
+                                                       static_cast<double>(field.maximum)));
+        }
+        break;
+      case SmartFilterFieldType::Boolean:
+        if (const auto* flag = invocation_boolean(invocation, field.parameter_key);
+            flag != nullptr) {
+          value = *flag ? 1 : 0;
+        }
+        break;
+      case SmartFilterFieldType::Enum:
+        if (const auto* option = invocation_option(invocation, field.parameter_key);
+            option != nullptr) {
+          for (std::size_t option_index = 0; option_index < field.options.size(); ++option_index) {
+            if (*option == field.options[option_index].parameter_value) {
+              value = static_cast<std::int32_t>(option_index);
+            }
+          }
+        }
+        break;
+      case SmartFilterFieldType::PointList:
+        break;
+    }
+  }
+  return settings;
+}
+
+TableSmartFilter table_smart_filter_from_catalog_invocation(const SmartFilterTableSpec& spec,
+                                                            const FilterInvocation& invocation) {
+  auto settings = default_table_smart_filter(spec);
+  for (std::size_t index = 0; index < spec.fields.size() && index < settings.values.size();
+       ++index) {
+    const auto& field = spec.fields[index];
+    if (field.parameter_key == nullptr || std::string_view(field.parameter_key).empty()) {
+      continue;
+    }
+    auto& value = settings.values[index];
+    switch (field.type) {
+      case SmartFilterTableFieldType::Integer:
+        if (const auto number = invocation_number(invocation, field.parameter_key);
+            number.has_value()) {
+          value = static_cast<std::int32_t>(
+              std::clamp(std::floor(*number + 0.5), field.minimum, field.maximum));
+        }
+        break;
+      case SmartFilterTableFieldType::UnitDouble:
+        if (const auto number = invocation_number(invocation, field.parameter_key);
+            number.has_value()) {
+          const auto clamped = std::clamp(*number, field.minimum, field.maximum);
+          value = field.whole_numbers ? std::floor(clamped + 0.5) : clamped;
+        }
+        break;
+      case SmartFilterTableFieldType::Enumerated:
+        if (const auto* option = invocation_option(invocation, field.parameter_key);
+            option != nullptr) {
+          for (const auto& candidate : field.options) {
+            if (*option == candidate.token) {
+              value = std::string(candidate.token);
+            }
+          }
+        }
+        break;
+      case SmartFilterTableFieldType::Boolean:
+        if (const auto* flag = invocation_boolean(invocation, field.parameter_key);
+            flag != nullptr) {
+          value = *flag;
+        }
+        break;
+      case SmartFilterTableFieldType::IntegerList:
+        break;
+    }
+  }
+  return settings;
+}
+
+bool native_smart_filter_kind_supported(SmartFilterKind kind) {
+  switch (kind) {
+    case SmartFilterKind::GaussianBlur:
+    case SmartFilterKind::HighPass:
+    case SmartFilterKind::Median:
+    case SmartFilterKind::DustAndScratches:
+    case SmartFilterKind::SurfaceBlur:
+    case SmartFilterKind::UnsharpMask:
+    case SmartFilterKind::MotionBlur:
+    case SmartFilterKind::PlasticWrap:
+    case SmartFilterKind::Mosaic:
+    case SmartFilterKind::Emboss:
+    case SmartFilterKind::BoxBlur:
+    case SmartFilterKind::RadialBlur:
+    case SmartFilterKind::AddNoise:
+    case SmartFilterKind::Solarize:
+    case SmartFilterKind::FindEdges:
+    case SmartFilterKind::ZigZag:
+    case SmartFilterKind::Wave:
+    case SmartFilterKind::Ripple:
+    case SmartFilterKind::Shear:
+    // Imported only: no Filter-menu action appends one, but its settings open the
+    // adjustment's own dialog (docs/smart-filters-adjustments.md).
+    case SmartFilterKind::Adjustment:
+    case SmartFilterKind::Twirl:
+    case SmartFilterKind::Pinch:
+    case SmartFilterKind::Spherize:
+    case SmartFilterKind::PolarCoordinates:
+    case SmartFilterKind::TraceContour:
+    case SmartFilterKind::Diffuse:
+    // Imported only; a single-effect gallery edits through its effect's dialog.
+    case SmartFilterKind::FilterGallery:
+    case SmartFilterKind::Blur:
+    case SmartFilterKind::BlurMore:
+    case SmartFilterKind::Sharpen:
+    case SmartFilterKind::SharpenMore:
+    case SmartFilterKind::Invert:
+    case SmartFilterKind::Average:
+    case SmartFilterKind::SharpenEdges:
+    // Imported only: no Filter-menu command maps onto Smart Sharpen.
+    case SmartFilterKind::SmartSharpen:
+      return true;
+    case SmartFilterKind::Offset:
+    case SmartFilterKind::Maximum:
+    case SmartFilterKind::Minimum:
+    case SmartFilterKind::Custom:
+    case SmartFilterKind::Fragment:
+    case SmartFilterKind::Crystallize:
+    case SmartFilterKind::Pointillize:
+    case SmartFilterKind::Mezzotint:
+    case SmartFilterKind::Fibers:
+      return smart_filter_table_spec(kind) != nullptr;
+    case SmartFilterKind::Unsupported:
+      return false;
+  }
+  return false;
+}
+
+std::optional<std::vector<SmartFilterEntry>>
+smart_filter_entries_from_recipe(const FilterRecipe& recipe,
+                                 const FilterRegistry& registry) {
+  if (recipe.entries.empty() || !registry.supports(recipe)) {
+    return std::nullopt;
+  }
+  std::vector<SmartFilterEntry> mapped;
+  mapped.reserve(recipe.entries.size());
+  for (const auto& recipe_entry : recipe.entries) {
+    const auto normalized = registry.normalize(recipe_entry.invocation);
+    if (!normalized.has_value() || normalized->schema_version != 1U ||
+        !native_smart_filter_kind_for(normalized->filter_id).has_value()) {
+      return std::nullopt;
+    }
+    const auto dust =
+        normalized->filter_id == "patchy.filters.dust_and_scratches";
+    const auto surface =
+        normalized->filter_id == "patchy.filters.surface_blur";
+    const auto median = normalized->filter_id == "patchy.filters.median";
+    const auto high_pass = normalized->filter_id == "patchy.filters.high_pass";
+    const auto unsharp = normalized->filter_id == "patchy.filters.unsharp_mask";
+    const auto motion = normalized->filter_id == "patchy.filters.motion_blur";
+    const auto plastic =
+        normalized->filter_id == "patchy.filters.plastic_wrap";
+    const auto mosaic = normalized->filter_id == "patchy.filters.pixelate";
+    const auto emboss = normalized->filter_id == "patchy.filters.emboss";
+    const auto box_blur = normalized->filter_id == "patchy.filters.box_blur";
+    const auto radial_blur = normalized->filter_id == "patchy.filters.radial_blur";
+    const auto add_noise = normalized->filter_id == "patchy.filters.add_noise";
+    SmartFilterEntry entry;
+    const auto native_kind = *native_smart_filter_kind_for(normalized->filter_id);
+    if (const auto* schema = find_smart_filter_schema(native_kind); schema != nullptr) {
+      entry.kind = native_kind;
+      entry.native_name = schema->entry_name;
+      entry.native_class_id = schema->class_id;
+      entry.native_filter_id = schema->filter_id;
+      entry.has_options = schema->has_filter_object;
+      entry.parameters = schema_smart_filter_from_invocation(*schema, *normalized);
+    } else if (const auto* table = smart_filter_table_spec(native_kind); table != nullptr) {
+      entry.kind = native_kind;
+      entry.native_name = table->entry_name;
+      entry.native_class_id = table->class_id != nullptr ? table->class_id : "";
+      entry.native_filter_id = table->filter_id;
+      entry.has_options = table->has_options;
+      entry.parameters = table_smart_filter_from_catalog_invocation(*table, *normalized);
+    }
+    if (entry.kind != SmartFilterKind::Unsupported) {
+      entry.enabled = recipe_entry.enabled;
+      entry.opacity = recipe_entry.opacity;
+      entry.blend_mode = recipe_entry.blend_mode;
+      entry.foreground = normalized->foreground;
+      entry.background = normalized->background;
+      mapped.push_back(std::move(entry));
+      continue;
+    }
+    if (const auto *classic = parameterless_smart_filter_native(native_kind);
+        classic != nullptr) {
+      // Photoshop's parameterless filters: no settings, no Fltr object.
+      entry.kind = classic->kind;
+      entry.native_name = classic->native_name;
+      entry.native_filter_id = classic->filter_id;
+      entry.parameters = std::monostate{};
+      entry.enabled = recipe_entry.enabled;
+      entry.has_options = false;
+      entry.opacity = recipe_entry.opacity;
+      entry.blend_mode = recipe_entry.blend_mode;
+      entry.foreground = normalized->foreground;
+      entry.background = normalized->background;
+      mapped.push_back(std::move(entry));
+      continue;
+    }
+    if (radial_blur) {
+      const auto amount_value = normalized->parameters.find("amount");
+      const auto samples_value = normalized->parameters.find("samples");
+      const auto center_x_value = normalized->parameters.find("center_x");
+      const auto center_y_value = normalized->parameters.find("center_y");
+      if (amount_value == normalized->parameters.end() ||
+          samples_value == normalized->parameters.end() ||
+          center_x_value == normalized->parameters.end() ||
+          center_y_value == normalized->parameters.end()) {
+        return std::nullopt;
+      }
+      const auto *amount = std::get_if<std::int64_t>(&amount_value->second);
+      const auto *samples = std::get_if<std::int64_t>(&samples_value->second);
+      const auto *center_x = std::get_if<double>(&center_x_value->second);
+      const auto *center_y = std::get_if<double>(&center_y_value->second);
+      // Photoshop's descriptor has no blur center and its Amount minimum is
+      // 1, so an edited center or amount 0 stays destructive-only. Samples
+      // must land exactly on a quality tier (Draft 8, Good 16, Best 32).
+      if (amount == nullptr || *amount < 1 || *amount > 100 ||
+          samples == nullptr ||
+          (*samples != 8 && *samples != 16 && *samples != 32) ||
+          center_x == nullptr || *center_x != 50.0 || center_y == nullptr ||
+          *center_y != 50.0) {
+        return std::nullopt;
+      }
+      entry.kind = SmartFilterKind::RadialBlur;
+      entry.native_name = "Radial Blur...";
+      entry.native_class_id = "RdlB";
+      entry.native_filter_id = 0x52646c42U;
+      entry.parameters = RadialBlurSmartFilter{
+          static_cast<std::int32_t>(*amount),
+          *samples == 8 ? RadialBlurQuality::Draft
+                        : (*samples == 16 ? RadialBlurQuality::Good
+                                          : RadialBlurQuality::Best)};
+    } else if (add_noise) {
+      const auto amount_value = normalized->parameters.find("amount");
+      const auto distribution_value =
+          normalized->parameters.find("distribution");
+      const auto monochromatic_value =
+          normalized->parameters.find("monochromatic");
+      const auto seed_value = normalized->parameters.find("seed");
+      if (amount_value == normalized->parameters.end() ||
+          distribution_value == normalized->parameters.end() ||
+          monochromatic_value == normalized->parameters.end() ||
+          seed_value == normalized->parameters.end()) {
+        return std::nullopt;
+      }
+      const auto *amount = std::get_if<double>(&amount_value->second);
+      const auto *distribution =
+          std::get_if<std::string>(&distribution_value->second);
+      const auto *monochromatic =
+          std::get_if<bool>(&monochromatic_value->second);
+      const auto *seed = std::get_if<std::int64_t>(&seed_value->second);
+      if (amount == nullptr || !std::isfinite(*amount) || *amount < 0.1 ||
+          *amount > 400.0 || distribution == nullptr ||
+          (*distribution != "uniform" && *distribution != "gaussian") ||
+          monochromatic == nullptr || seed == nullptr || *seed < 0 ||
+          *seed > 999999999) {
+        return std::nullopt;
+      }
+      entry.kind = SmartFilterKind::AddNoise;
+      entry.native_name = "Add Noise...";
+      entry.native_class_id = "AdNs";
+      entry.native_filter_id = 0x41644e73U;
+      entry.parameters = AddNoiseSmartFilter{
+          *amount, *distribution == "gaussian", *monochromatic,
+          static_cast<std::int32_t>(*seed)};
+    } else if (box_blur) {
+      const auto radius_value = normalized->parameters.find("radius");
+      if (radius_value == normalized->parameters.end()) {
+        return std::nullopt;
+      }
+      const auto *radius = std::get_if<std::int64_t>(&radius_value->second);
+      if (radius == nullptr || *radius < 1 || *radius > 2000) {
+        return std::nullopt;
+      }
+      entry.kind = SmartFilterKind::BoxBlur;
+      entry.native_name = "Box Blur...";
+      entry.native_class_id = "boxblur";
+      entry.native_filter_id = 843U;
+      entry.parameters = BoxBlurSmartFilter{static_cast<double>(*radius)};
+    } else if (emboss) {
+      const auto angle_value = normalized->parameters.find("angle");
+      const auto height_value = normalized->parameters.find("height");
+      const auto amount_value = normalized->parameters.find("amount");
+      if (angle_value == normalized->parameters.end() ||
+          height_value == normalized->parameters.end() ||
+          amount_value == normalized->parameters.end()) {
+        return std::nullopt;
+      }
+      const auto *angle = std::get_if<std::int64_t>(&angle_value->second);
+      const auto *height = std::get_if<std::int64_t>(&height_value->second);
+      const auto *amount = std::get_if<std::int64_t>(&amount_value->second);
+      // Photoshop's Amount minimum is 1; a Patchy amount of 0 stays
+      // destructive-only, which keeps the all-or-nothing rule intact.
+      if (angle == nullptr || *angle < -360 || *angle > 360 ||
+          height == nullptr || *height < 1 || *height > 100 ||
+          amount == nullptr || *amount < 1 || *amount > 500) {
+        return std::nullopt;
+      }
+      entry.kind = SmartFilterKind::Emboss;
+      entry.native_name = "Emboss...";
+      entry.native_class_id = "Embs";
+      entry.native_filter_id = 0x456d6273U;
+      entry.parameters = EmbossSmartFilter{
+          static_cast<std::int32_t>(*angle),
+          static_cast<std::int32_t>(*height),
+          static_cast<std::int32_t>(*amount)};
+    } else if (mosaic) {
+      const auto block_value = normalized->parameters.find("block_size");
+      if (block_value == normalized->parameters.end()) {
+        return std::nullopt;
+      }
+      const auto *block = std::get_if<std::int64_t>(&block_value->second);
+      if (block == nullptr || *block < 2 || *block > 200) {
+        return std::nullopt;
+      }
+      entry.kind = SmartFilterKind::Mosaic;
+      entry.native_name = "Mosaic...";
+      entry.native_class_id = "Msc ";
+      entry.native_filter_id = 0x4d736320U;
+      entry.parameters =
+          MosaicSmartFilter{static_cast<std::int32_t>(*block)};
+    } else if (plastic) {
+      const auto highlight_value =
+          normalized->parameters.find("highlight_strength");
+      const auto detail_value = normalized->parameters.find("detail");
+      const auto smoothness_value =
+          normalized->parameters.find("smoothness");
+      if (highlight_value == normalized->parameters.end() ||
+          detail_value == normalized->parameters.end() ||
+          smoothness_value == normalized->parameters.end()) {
+        return std::nullopt;
+      }
+      const auto *highlight =
+          std::get_if<std::int64_t>(&highlight_value->second);
+      const auto *detail = std::get_if<std::int64_t>(&detail_value->second);
+      const auto *smoothness =
+          std::get_if<std::int64_t>(&smoothness_value->second);
+      if (highlight == nullptr || *highlight < 0 || *highlight > 20 ||
+          detail == nullptr || *detail < 1 || *detail > 15 ||
+          smoothness == nullptr || *smoothness < 1 || *smoothness > 15) {
+        return std::nullopt;
+      }
+      entry.kind = SmartFilterKind::PlasticWrap;
+      entry.native_name = "Plastic Wrap...";
+      entry.native_class_id = "PlsW";
+      entry.native_filter_id = 0x506c7357U;
+      entry.parameters = PlasticWrapSmartFilter{
+          static_cast<std::int32_t>(*highlight),
+          static_cast<std::int32_t>(*detail),
+          static_cast<std::int32_t>(*smoothness)};
+    } else if (unsharp) {
+      const auto amount_value = normalized->parameters.find("amount");
+      const auto radius_value = normalized->parameters.find("radius");
+      const auto threshold_value = normalized->parameters.find("threshold");
+      if (amount_value == normalized->parameters.end() ||
+          radius_value == normalized->parameters.end() ||
+          threshold_value == normalized->parameters.end()) {
+        return std::nullopt;
+      }
+      const auto *amount = std::get_if<std::int64_t>(&amount_value->second);
+      const auto *radius = std::get_if<double>(&radius_value->second);
+      const auto *threshold =
+          std::get_if<std::int64_t>(&threshold_value->second);
+      if (amount == nullptr || *amount < 1 || *amount > 500 ||
+          radius == nullptr || !std::isfinite(*radius) || *radius < 0.1 ||
+          *radius > 1000.0 || threshold == nullptr || *threshold < 0 ||
+          *threshold > 255) {
+        return std::nullopt;
+      }
+      entry.kind = SmartFilterKind::UnsharpMask;
+      entry.native_name = "Unsharp Mask...";
+      entry.native_class_id = "UnsM";
+      entry.native_filter_id = 0x556e734dU;
+      entry.parameters =
+          UnsharpMaskSmartFilter{static_cast<double>(*amount), *radius,
+                                 static_cast<std::int32_t>(*threshold)};
+    } else if (motion) {
+      const auto angle_value = normalized->parameters.find("angle");
+      const auto distance_value = normalized->parameters.find("distance");
+      if (angle_value == normalized->parameters.end() ||
+          distance_value == normalized->parameters.end()) {
+        return std::nullopt;
+      }
+      const auto *angle = std::get_if<std::int64_t>(&angle_value->second);
+      const auto *distance = std::get_if<std::int64_t>(&distance_value->second);
+      if (angle == nullptr || *angle < -360 || *angle > 360 ||
+          distance == nullptr || *distance < 1 || *distance > 2000) {
+        return std::nullopt;
+      }
+      entry.kind = SmartFilterKind::MotionBlur;
+      entry.native_name = "Motion Blur...";
+      entry.native_class_id = "MtnB";
+      entry.native_filter_id = 0x4d746e42U;
+      entry.parameters =
+          MotionBlurSmartFilter{static_cast<std::int32_t>(*angle),
+                                static_cast<std::int32_t>(*distance)};
+    } else if (dust) {
+      const auto radius_value = normalized->parameters.find("radius");
+      const auto threshold_value = normalized->parameters.find("threshold");
+      if (radius_value == normalized->parameters.end() ||
+          threshold_value == normalized->parameters.end()) {
+        return std::nullopt;
+      }
+      const auto* radius =
+          std::get_if<std::int64_t>(&radius_value->second);
+      const auto* threshold =
+          std::get_if<std::int64_t>(&threshold_value->second);
+      if (radius == nullptr || threshold == nullptr || *radius < 1 ||
+          *radius > 500 || *threshold < 0 || *threshold > 255) {
+        return std::nullopt;
+      }
+      entry.kind = SmartFilterKind::DustAndScratches;
+      entry.native_name = "Dust && Scratches...";
+      entry.native_class_id = "DstS";
+      entry.native_filter_id = 0x44737453U;
+      entry.parameters = DustAndScratchesSmartFilter{
+          static_cast<std::int32_t>(*radius),
+          static_cast<std::int32_t>(*threshold)};
+    } else if (surface) {
+      const auto radius_value = normalized->parameters.find("radius");
+      const auto threshold_value = normalized->parameters.find("threshold");
+      if (radius_value == normalized->parameters.end() ||
+          threshold_value == normalized->parameters.end()) {
+        return std::nullopt;
+      }
+      const auto* radius = std::get_if<double>(&radius_value->second);
+      const auto* threshold =
+          std::get_if<std::int64_t>(&threshold_value->second);
+      if (radius == nullptr || !std::isfinite(*radius) || *radius < 1.0 ||
+          *radius > 100.0 || threshold == nullptr || *threshold < 2 ||
+          *threshold > 255) {
+        return std::nullopt;
+      }
+      entry.kind = SmartFilterKind::SurfaceBlur;
+      entry.native_name = "Surface Blur...";
+      entry.native_class_id = "surfaceBlur";
+      entry.native_filter_id = 854U;
+      entry.parameters = SurfaceBlurSmartFilter{
+          *radius, static_cast<std::int32_t>(*threshold)};
+    } else {
+      const auto radius_value = normalized->parameters.find("radius");
+      if (radius_value == normalized->parameters.end()) {
+        return std::nullopt;
+      }
+      double radius = 0.0;
+      if (const auto* integer =
+              std::get_if<std::int64_t>(&radius_value->second);
+          integer != nullptr) {
+        radius = static_cast<double>(*integer);
+      } else if (const auto* real =
+                     std::get_if<double>(&radius_value->second);
+                 real != nullptr) {
+        radius = *real;
+      } else {
+        return std::nullopt;
+      }
+      if (!std::isfinite(radius) || radius < (median ? 1.0 : 0.1) ||
+          radius > (median ? 500.0 : 1000.0)) {
+        return std::nullopt;
+      }
+      entry.kind = median ? SmartFilterKind::Median
+                          : (high_pass ? SmartFilterKind::HighPass
+                                       : SmartFilterKind::GaussianBlur);
+      entry.native_name = median ? "Median..."
+                                 : (high_pass ? "High Pass..."
+                                              : "Gaussian Blur...");
+      entry.native_class_id =
+          median ? "Mdn " : (high_pass ? "HghP" : "GsnB");
+      entry.native_filter_id = median ? 0x4d646e20U
+                                      : (high_pass ? 0x48676850U
+                                                   : 0x47736e42U);
+      if (median) {
+        entry.parameters = MedianSmartFilter{radius};
+      } else if (high_pass) {
+        entry.parameters = HighPassSmartFilter{radius};
+      } else {
+        entry.parameters = GaussianBlurSmartFilter{radius};
+      }
+    }
+    entry.enabled = recipe_entry.enabled;
+    entry.has_options = true;
+    entry.opacity = recipe_entry.opacity;
+    entry.blend_mode = recipe_entry.blend_mode;
+    entry.foreground = normalized->foreground;
+    entry.background = normalized->background;
+    mapped.push_back(std::move(entry));
+  }
+  return mapped;
+}
+
+}  // namespace patchy

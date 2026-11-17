@@ -1,0 +1,466 @@
+#include <string_view>
+#include "core/adjustment_layer.hpp"
+#include "core/layer_metadata.hpp"
+#include "core/layer_tree.hpp"
+#include "core/smart_object.hpp"
+#include "core/vector_shape.hpp"
+#include "psd/psd_binary.hpp"
+#include "test_harness.hpp"
+#include <algorithm>
+#include <array>
+#include <bit>
+#include <cctype>
+#include <chrono>
+#include <cmath>
+#include <cstring>
+#include <filesystem>
+#include <exception>
+#include <cstdint>
+#include <fstream>
+#include <functional>
+#include <iomanip>
+#include <iostream>
+#include <iterator>
+#include <limits>
+#include <numeric>
+#include <optional>
+#include <span>
+#include <sstream>
+#include <stdexcept>
+#include <string>
+#include <tuple>
+#include <unordered_set>
+#include <utility>
+#include <vector>
+#include "core_test_support.hpp"
+#include "psd_test_support.hpp"
+#include "test_groups.hpp"
+
+namespace {
+
+using patchy::test::read_u32_be_at;
+using patchy::test::solid_rgba;
+
+void layer_affine_transform_metadata_parses_serializes_and_composes() {
+  const auto parsed = patchy::parse_layer_affine_transform("1 2 3 4 5 6");
+  CHECK(parsed.has_value());
+  CHECK((*parsed)[0] == 1.0);
+  CHECK((*parsed)[5] == 6.0);
+  CHECK(!patchy::parse_layer_affine_transform("1 2 3 4 5").has_value());
+
+  const patchy::LayerAffineTransform translate{1.0, 0.0, 0.0, 1.0, 10.0, 20.0};
+  const patchy::LayerAffineTransform scale{2.0, 0.0, 0.0, 3.0, 0.0, 0.0};
+  const auto composed = patchy::compose_layer_affine_transform(translate, scale);
+  CHECK(composed[0] == 2.0);
+  CHECK(composed[3] == 3.0);
+  CHECK(composed[4] == 10.0);
+  CHECK(composed[5] == 20.0);
+
+  const auto serialized = patchy::serialize_layer_affine_transform(composed);
+  const auto reparsed = patchy::parse_layer_affine_transform(serialized);
+  CHECK(reparsed.has_value());
+  CHECK((*reparsed)[0] == composed[0]);
+  CHECK((*reparsed)[3] == composed[3]);
+  CHECK((*reparsed)[4] == composed[4]);
+  CHECK((*reparsed)[5] == composed[5]);
+
+  patchy::Layer layer(7, "Text", patchy::PixelBuffer(4, 4, patchy::PixelFormat::rgba8()));
+  layer.metadata()[patchy::kLayerMetadataTextTransform] = serialized;
+  layer.metadata()[patchy::kLayerMetadataPsdTextTransform] = "1 0 0 1 99 99";
+  CHECK(patchy::parse_layer_affine_transform(layer.metadata().at(patchy::kLayerMetadataTextTransform)).has_value());
+}
+
+// GitHub issue 274: the Background is the bottom top-level pixel layer with no alpha that
+// covers the canvas and has its position locked; a stack change that moves it off the
+// bottom is refused.
+void layer_background_rule_matches_photoshop_background() {
+  using patchy::test::solid_rgb;
+  using patchy::test::solid_rgba;
+  const auto make_stack = [] {
+    std::vector<patchy::Layer> layers;
+    layers.emplace_back(1, "Background", solid_rgb(4, 3, 255, 255, 255));
+    patchy::set_layer_locks_position(layers.back(), true);
+    patchy::set_layer_locks_transparent_pixels(layers.back(), true);
+    layers.emplace_back(2, "Layer 1", solid_rgba(4, 3, 10, 20, 30, 255));
+    return layers;
+  };
+  auto layers = make_stack();
+  CHECK(patchy::background_layer(layers, 4, 3) == &layers.front());
+  CHECK(patchy::background_layer({}, 4, 3) == nullptr);
+  // The position lock is what keeps it a Background (Layer from Background clears it).
+  patchy::set_layer_locks_position(layers.front(), false);
+  CHECK(patchy::background_layer(layers, 4, 3) == nullptr);
+  // Transparency, a smaller extent, or another layer underneath: an ordinary layer.
+  auto with_alpha = make_stack();
+  with_alpha.front().set_pixels(solid_rgba(4, 3, 255, 255, 255, 255));
+  CHECK(patchy::background_layer(with_alpha, 4, 3) == nullptr);
+  auto offset = make_stack();
+  CHECK(patchy::background_layer(offset, 5, 3) == nullptr);
+  auto reordered = make_stack();
+  std::swap(reordered.front(), reordered.back());
+  CHECK(patchy::background_layer(reordered, 4, 3) == nullptr);
+
+  const auto before = make_stack();
+  CHECK(!patchy::layer_stack_keeps_background(before, reordered, 4, 3));
+  auto added_on_top = make_stack();
+  added_on_top.emplace_back(3, "Layer 2", solid_rgba(4, 3, 1, 2, 3, 255));
+  CHECK(patchy::layer_stack_keeps_background(before, added_on_top, 4, 3));
+  auto added_below = make_stack();
+  added_below.insert(added_below.begin(), patchy::Layer(3, "Layer 2", solid_rgba(4, 3, 1, 2, 3, 255)));
+  CHECK(!patchy::layer_stack_keeps_background(before, added_below, 4, 3));
+  CHECK(!patchy::layer_stack_keeps_background(before, {}, 4, 3));
+  // Without a Background any order goes.
+  CHECK(patchy::layer_stack_keeps_background(with_alpha, reordered, 4, 3));
+}
+
+// GitHub issue 604: a copy of the Background loses only the locks that status carries
+// (position, transparent pixels, artboard auto-nest); a copy of any other layer, and every
+// other lock, is left alone.
+void layer_copy_of_background_clears_background_locks() {
+  using patchy::test::solid_rgb;
+  std::vector<patchy::Layer> layers;
+  layers.emplace_back(1, "Background", solid_rgb(4, 3, 255, 255, 255));
+  patchy::set_layer_lock_flags(layers.back(), patchy::kLayerLockPosition | patchy::kLayerLockTransparentPixels |
+                                                  patchy::kLayerLockArtboardAutonest |
+                                                  patchy::kLayerLockImagePixels);
+  layers.emplace_back(2, "Layer 1", solid_rgb(4, 3, 10, 20, 30));
+  patchy::set_layer_lock_flags(layers.back(), patchy::kLayerLockPosition | patchy::kLayerLockTransparentPixels);
+  CHECK(patchy::background_layer(layers, 4, 3) == &layers.front());
+
+  auto background_copy = layers.front();
+  patchy::clear_background_locks_if_copy_of_background(background_copy, 1, layers, 4, 3);
+  CHECK(patchy::layer_lock_flags(background_copy) == patchy::kLayerLockImagePixels);
+  auto ordinary_copy = layers.back();
+  patchy::clear_background_locks_if_copy_of_background(ordinary_copy, 2, layers, 4, 3);
+  CHECK(patchy::layer_lock_flags(ordinary_copy) == patchy::layer_lock_flags(layers.back()));
+  // Without a Background (position lock cleared) nothing is a copy of one.
+  auto no_background = layers;
+  patchy::set_layer_locks_position(no_background.front(), false);
+  auto plain_copy = no_background.front();
+  patchy::clear_background_locks_if_copy_of_background(plain_copy, 1, no_background, 4, 3);
+  CHECK(patchy::layer_lock_flags(plain_copy) == patchy::layer_lock_flags(no_background.front()));
+  patchy::clear_background_locks(layers.front());
+  CHECK(patchy::layer_lock_flags(layers.front()) == patchy::kLayerLockImagePixels);
+  CHECK(patchy::background_layer(layers, 4, 3) == nullptr);
+}
+
+void layer_lock_flags_and_inheritance_work() {
+  patchy::Layer folder(1, "Folder", patchy::LayerKind::Group);
+  patchy::Layer child(2, "Child", solid_rgba(2, 2, 20, 40, 60, 255));
+  const auto child_id = child.id();
+  folder.add_child(std::move(child));
+
+  std::vector<patchy::Layer> layers;
+  layers.push_back(std::move(folder));
+  CHECK(patchy::layer_lock_flags(layers.front()) == patchy::kLayerLockNone);
+  CHECK(patchy::layer_effective_lock_flags(layers, child_id) == patchy::kLayerLockNone);
+  CHECK(!patchy::layer_has_locked_ancestor(layers, child_id));
+
+  patchy::set_layer_locks_position(layers.front(), true);
+  CHECK(patchy::layer_locks_position(layers.front()));
+  CHECK(patchy::layer_effectively_locks_position(layers, child_id));
+  CHECK(!patchy::layer_effectively_locks_image_pixels(layers, child_id));
+  CHECK(patchy::layer_has_locked_ancestor(layers, child_id));
+
+  auto* child_layer = patchy::find_layer_in_tree(layers, child_id);
+  CHECK(child_layer != nullptr);
+  patchy::set_layer_locks_image_pixels(*child_layer, true);
+  CHECK(patchy::layer_effective_lock_flags(layers, child_id) ==
+        (patchy::kLayerLockImagePixels | patchy::kLayerLockPosition));
+
+  patchy::set_layer_locks_position(layers.front(), false);
+  CHECK(patchy::layer_effective_lock_flags(layers, child_id) == patchy::kLayerLockImagePixels);
+
+  patchy::set_layer_locked(layers.front(), true);
+  CHECK(patchy::layer_is_locked(layers.front()));
+  CHECK(patchy::layer_is_effectively_locked(layers, child_id));
+}
+
+void layer_content_revision_ignores_translation_and_tracks_render_content() {
+  patchy::Layer layer(7, "Paint", solid_rgba(4, 4, 20, 40, 60, 255));
+  const auto initial_content_revision = layer.content_revision();
+  const auto initial_render_revision = layer.render_revision();
+  const auto initial_pixel_revision = layer.pixel_revision();
+
+  layer.raw_psd_blending_ranges() = {0, 12, 240, 255, 3, 18, 220, 251};
+  layer.raw_psd_group_boundary_blending_ranges() = {5, 20, 210, 245, 9, 24, 200, 239};
+  CHECK(layer.content_revision() == initial_content_revision);
+  CHECK(layer.render_revision() == initial_render_revision);
+  CHECK(layer.pixel_revision() == initial_pixel_revision);
+
+  layer.set_bounds(patchy::Rect{10, 12, 4, 4});
+  CHECK(layer.content_revision() == initial_content_revision);
+  CHECK(layer.render_revision() > initial_render_revision);
+  CHECK(layer.pixel_revision() == initial_pixel_revision);
+
+  const auto after_move_content_revision = layer.content_revision();
+  layer.set_name("Renamed Paint");
+  CHECK(layer.content_revision() == after_move_content_revision);
+
+  layer.set_opacity(0.5F);
+  CHECK(layer.content_revision() > after_move_content_revision);
+  CHECK(layer.pixel_revision() == initial_pixel_revision);
+
+  const auto after_opacity_content_revision = layer.content_revision();
+  layer.set_fill_opacity(0.37F);
+  CHECK(layer.content_revision() > after_opacity_content_revision);
+  CHECK(layer.pixel_revision() == initial_pixel_revision);
+
+  const auto after_fill_opacity_content_revision = layer.content_revision();
+  layer.set_blend_mode(patchy::BlendMode::Multiply);
+  CHECK(layer.content_revision() > after_fill_opacity_content_revision);
+
+  const auto after_blend_content_revision = layer.content_revision();
+  auto* px = layer.pixels().pixel(0, 0);
+  px[0] = 120;
+  CHECK(layer.content_revision() > after_blend_content_revision);
+  CHECK(layer.pixel_revision() > initial_pixel_revision);
+
+  const auto after_pixels_content_revision = layer.content_revision();
+  const auto after_pixels_pixel_revision = layer.pixel_revision();
+  patchy::LayerStroke stroke;
+  stroke.enabled = true;
+  layer.layer_style().strokes.push_back(stroke);
+  CHECK(layer.content_revision() > after_pixels_content_revision);
+  CHECK(layer.pixel_revision() == after_pixels_pixel_revision);
+
+  const auto after_style_content_revision = layer.content_revision();
+  patchy::LayerMask mask;
+  mask.bounds = patchy::Rect{10, 12, 4, 4};
+  mask.pixels = patchy::PixelBuffer(4, 4, patchy::PixelFormat::gray8());
+  mask.pixels.clear(255);
+  layer.set_mask(std::move(mask));
+  CHECK(layer.content_revision() > after_style_content_revision);
+  CHECK(layer.pixel_revision() == after_pixels_pixel_revision);
+
+  // A pure translation (the Move commit's metadata pass) bumps ONLY the render
+  // revision: linked masks, vector paths, and smart-object/text transforms all
+  // move, but origin-relative content is unchanged, so content-keyed caches
+  // (style masks, baked styled images) stay warm across move commits.
+  patchy::Layer moved(11, "Moved", solid_rgba(4, 4, 90, 40, 10, 255));
+  moved.set_bounds(patchy::Rect{5, 6, 4, 4});
+  patchy::LayerMask moved_mask;
+  moved_mask.bounds = patchy::Rect{5, 6, 4, 4};
+  moved_mask.pixels = patchy::PixelBuffer(4, 4, patchy::PixelFormat::gray8());
+  moved_mask.pixels.clear(200);
+  moved.set_mask(std::move(moved_mask));
+  patchy::LayerVectorMask moved_vector_mask;
+  moved_vector_mask.cache_bounds = patchy::Rect{5, 6, 4, 4};
+  moved.set_vector_mask(std::move(moved_vector_mask));
+  moved.metadata()[patchy::kLayerMetadataSmartObject] = "test-uuid";
+  moved.metadata()[patchy::kLayerMetadataSmartObjectTransform] =
+      patchy::serialize_smart_object_transform({5.0, 6.0, 9.0, 6.0, 9.0, 10.0, 5.0, 10.0});
+  moved.metadata()[patchy::kLayerMetadataText] = "Hello";
+  moved.metadata()[patchy::kLayerMetadataTextTransform] =
+      patchy::serialize_layer_affine_transform(patchy::LayerAffineTransform{1.0, 0.0, 0.0, 1.0, 5.0, 6.0});
+
+  const auto content_before_translation = moved.content_revision();
+  const auto pixel_before_translation = moved.pixel_revision();
+  const auto render_before_translation = moved.render_revision();
+  moved.set_bounds(patchy::Rect{25, 16, 4, 4});
+  patchy::translate_moved_layer_metadata(moved, 20, 10, 100, 100);
+  CHECK(moved.content_revision() == content_before_translation);
+  CHECK(moved.pixel_revision() == pixel_before_translation);
+  CHECK(moved.render_revision() > render_before_translation);
+  CHECK(std::as_const(moved).mask()->bounds.x == 25);
+  CHECK(std::as_const(moved).mask()->bounds.y == 16);
+  CHECK(std::as_const(moved).vector_mask() != nullptr);
+  CHECK(std::as_const(moved).vector_mask()->cache_bounds.x == 25);
+  CHECK(std::as_const(moved).vector_mask()->cache_bounds.y == 16);
+  // The writer dirty marks still fire, and they must not bump content either.
+  CHECK(patchy::layer_vector_block_dirty(moved));
+  CHECK(patchy::layer_smart_object_block_dirty(moved));
+  CHECK(moved.content_revision() == content_before_translation);
+  const auto translated_quad = patchy::parse_smart_object_transform(
+      std::as_const(moved).metadata().at(patchy::kLayerMetadataSmartObjectTransform));
+  CHECK(translated_quad.has_value());
+  CHECK((*translated_quad)[0] == 25.0);
+  CHECK((*translated_quad)[1] == 16.0);
+  const auto translated_text = patchy::parse_layer_affine_transform(
+      std::as_const(moved).metadata().at(patchy::kLayerMetadataTextTransform));
+  CHECK(translated_text.has_value());
+  CHECK((*translated_text)[4] == 25.0);
+  CHECK((*translated_text)[5] == 16.0);
+}
+
+void layer_set_clipped_bumps_render_revision_only() {
+  patchy::Layer layer(9, "Clip", solid_rgba(2, 2, 10, 20, 30, 255));
+  CHECK(!layer.clipped());
+  const auto content_before = layer.content_revision();
+  const auto render_before = layer.render_revision();
+
+  layer.set_clipped(true);
+  CHECK(layer.clipped());
+  CHECK(layer.render_revision() > render_before);
+  CHECK(layer.content_revision() == content_before);
+
+  const auto render_after_set = layer.render_revision();
+  layer.mark_render_changed();
+  CHECK(layer.render_revision() > render_after_set);
+  CHECK(layer.content_revision() == content_before);
+
+  layer.unknown_psd_blocks().push_back(
+      patchy::UnknownPsdBlock{"lyid", {0, 0, 0, 7}});
+  layer.unknown_psd_blocks().push_back(
+      patchy::UnknownPsdBlock{"test", {1, 2, 3, 4}});
+  const auto clone = layer.clone_with_id(42);
+  CHECK(clone.clipped());
+  CHECK(clone.id() == 42);
+  CHECK(patchy::photoshop_layer_id(clone) == 7U);
+  CHECK(std::any_of(clone.unknown_psd_blocks().begin(),
+                    clone.unknown_psd_blocks().end(),
+                    [](const patchy::UnknownPsdBlock& block) {
+                      return block.key == "test";
+                    }));
+  auto rekeyed_clone = clone;
+  patchy::set_photoshop_layer_id(rekeyed_clone, 9U);
+  CHECK(patchy::photoshop_layer_id(rekeyed_clone) == 9U);
+  CHECK(patchy::photoshop_layer_id(clone) == 7U);
+  CHECK(patchy::next_photoshop_layer_id(
+            std::vector<patchy::Layer>{layer, rekeyed_clone}) == 10U);
+
+  auto max_id = clone.clone_with_id(45);
+  patchy::set_photoshop_layer_id(
+      max_id, std::numeric_limits<std::uint32_t>::max());
+  auto id_one = clone.clone_with_id(46);
+  patchy::set_photoshop_layer_id(id_one, 1U);
+  auto id_three = clone.clone_with_id(47);
+  patchy::set_photoshop_layer_id(id_three, 3U);
+  CHECK(patchy::next_photoshop_layer_id(
+            std::vector<patchy::Layer>{max_id, id_one, id_three}) == 2U);
+
+  std::vector<patchy::Layer> siblings;
+  siblings.push_back(patchy::Layer(1, "Base", solid_rgba(2, 2, 1, 2, 3, 255)));
+  siblings.push_back(std::move(layer));
+  siblings.push_back(clone.clone_with_id(43));
+  CHECK(patchy::effective_clip_base(siblings, 1) == &siblings[0]);
+  // A run member higher up walks through the clipped sibling below to the base.
+  CHECK(patchy::effective_clip_base(siblings, 2) == &siblings[0]);
+  CHECK(patchy::effective_clip_base(siblings, 0) == nullptr);
+
+  std::vector<patchy::Layer> group_base;
+  group_base.push_back(patchy::Layer(4, "Folder", patchy::LayerKind::Group));
+  group_base.push_back(clone.clone_with_id(44));
+  CHECK(patchy::effective_clip_base(group_base, 1) == &group_base[0]);
+  group_base.push_back(clone.clone_with_id(45));
+  CHECK(patchy::effective_clip_base(group_base, 2) == &group_base[0]);
+}
+
+std::int32_t read_i32_be_at(std::span<const std::uint8_t> bytes, std::size_t offset) {
+  return static_cast<std::int32_t>(read_u32_be_at(bytes, offset));
+}
+
+std::int32_t test_path_fixed_value(std::int32_t value, std::int32_t extent) {
+  return static_cast<std::int32_t>(
+      std::llround((static_cast<double>(value) * 16777216.0) / static_cast<double>(extent)));
+}
+
+std::vector<std::uint8_t> single_knot_vector_mask_payload(std::int32_t document_x, std::int32_t document_y,
+                                                          std::int32_t document_width,
+                                                          std::int32_t document_height) {
+  patchy::psd::BigEndianWriter writer;
+  writer.write_u32(3);
+  writer.write_u32(0);
+  writer.write_u16(1);
+
+  const auto fixed_x = test_path_fixed_value(document_x, document_width);
+  const auto fixed_y = test_path_fixed_value(document_y, document_height);
+  for (int index = 0; index < 3; ++index) {
+    writer.write_u32(static_cast<std::uint32_t>(fixed_y));
+    writer.write_u32(static_cast<std::uint32_t>(fixed_x));
+  }
+  return writer.bytes();
+}
+
+void moved_layer_metadata_translates_linked_masks_and_vector_paths() {
+  patchy::Layer layer(51, "Masked", solid_rgba(10, 10, 30, 40, 50, 255));
+  layer.set_bounds(patchy::Rect{30, 40, 10, 10});
+  patchy::LayerMask mask;
+  mask.bounds = patchy::Rect{30, 40, 10, 10};
+  mask.pixels = patchy::PixelBuffer(10, 10, patchy::PixelFormat::gray8());
+  mask.pixels.clear(255);
+  layer.set_mask(std::move(mask));
+  layer.unknown_psd_blocks().push_back(
+      patchy::UnknownPsdBlock{"vmsk", single_knot_vector_mask_payload(30, 40, 100, 200)});
+  layer.metadata()[patchy::kLayerMetadataText] = "Text";
+  layer.metadata()[patchy::kLayerMetadataTextTransform] = "1 0 0 1 30 40";
+
+  patchy::translate_moved_layer_metadata(layer, 5, -10, 100, 200);
+
+  CHECK(layer.mask().has_value());
+  CHECK(layer.mask()->bounds.x == 35);
+  CHECK(layer.mask()->bounds.y == 30);
+  const auto& vector_mask = layer.unknown_psd_blocks().front().payload;
+  const auto expected_x = test_path_fixed_value(30, 100) + test_path_fixed_value(5, 100);
+  const auto expected_y = test_path_fixed_value(40, 200) + test_path_fixed_value(-10, 200);
+  CHECK(read_i32_be_at(vector_mask, 10U) == expected_y);
+  CHECK(read_i32_be_at(vector_mask, 14U) == expected_x);
+  CHECK(read_i32_be_at(vector_mask, 18U) == expected_y);
+  CHECK(read_i32_be_at(vector_mask, 22U) == expected_x);
+  CHECK(read_i32_be_at(vector_mask, 26U) == expected_y);
+  CHECK(read_i32_be_at(vector_mask, 30U) == expected_x);
+
+  const auto transform = patchy::parse_layer_affine_transform(
+      layer.metadata().at(patchy::kLayerMetadataTextTransform));
+  CHECK(transform.has_value());
+  CHECK((*transform)[4] == 35.0);
+  CHECK((*transform)[5] == 30.0);
+}
+
+void moved_layer_metadata_leaves_unlinked_masks_stationary() {
+  patchy::Layer layer(52, "Masked", solid_rgba(10, 10, 30, 40, 50, 255));
+  patchy::LayerMask mask;
+  mask.bounds = patchy::Rect{30, 40, 10, 10};
+  mask.pixels = patchy::PixelBuffer(10, 10, patchy::PixelFormat::gray8());
+  mask.pixels.clear(255);
+  layer.set_mask(std::move(mask));
+  auto vector_mask = single_knot_vector_mask_payload(30, 40, 100, 200);
+  layer.unknown_psd_blocks().push_back(patchy::UnknownPsdBlock{"vmsk", vector_mask});
+  patchy::set_layer_mask_linked(layer, false);
+
+  patchy::translate_moved_layer_metadata(layer, 5, -10, 100, 200);
+
+  CHECK(layer.mask().has_value());
+  CHECK(layer.mask()->bounds.x == 30);
+  CHECK(layer.mask()->bounds.y == 40);
+  CHECK(layer.unknown_psd_blocks().front().payload == vector_mask);
+}
+
+// Photoshop stores fractional anchors (tx 267.35); the serializer must round-trip every
+// double exactly so a move or a re-save never drifts the anchor off Photoshop's rounding.
+void layer_affine_transform_serialization_round_trips_every_double() {
+  const patchy::LayerAffineTransform transform{1.0772238306426084, 0.17364817766693, -0.17364817766693,
+                                               0.98480775301221,   267.35,            0.1 + 0.2};
+  const auto reparsed = patchy::parse_layer_affine_transform(patchy::serialize_layer_affine_transform(transform));
+  CHECK(reparsed.has_value());
+  if (!reparsed.has_value()) {
+    return;
+  }
+  for (std::size_t index = 0; index < transform.size(); ++index) {
+    CHECK((*reparsed)[index] == transform[index]);
+  }
+  // Integer transforms keep their short spelling (pinned metadata literals elsewhere).
+  CHECK(patchy::serialize_layer_affine_transform(patchy::LayerAffineTransform{1.0, 0.0, 0.0, 1.0, 5.0, 6.0}) ==
+        "1 0 0 1 5 6");
+}
+
+}  // namespace
+
+std::vector<patchy::test::TestCase> layer_metadata_tests() {
+  return {
+      {"layer_affine_transform_metadata_parses_serializes_and_composes",
+       layer_affine_transform_metadata_parses_serializes_and_composes},
+      {"layer_affine_transform_serialization_round_trips_every_double",
+       layer_affine_transform_serialization_round_trips_every_double},
+      {"layer_lock_flags_and_inheritance_work", layer_lock_flags_and_inheritance_work},
+      {"layer_background_rule_matches_photoshop_background", layer_background_rule_matches_photoshop_background},
+      {"layer_copy_of_background_clears_background_locks", layer_copy_of_background_clears_background_locks},
+      {"moved_layer_metadata_translates_linked_masks_and_vector_paths",
+       moved_layer_metadata_translates_linked_masks_and_vector_paths},
+      {"moved_layer_metadata_leaves_unlinked_masks_stationary",
+       moved_layer_metadata_leaves_unlinked_masks_stationary},
+      {"layer_content_revision_ignores_translation_and_tracks_render_content",
+       layer_content_revision_ignores_translation_and_tracks_render_content},
+      {"layer_set_clipped_bumps_render_revision_only", layer_set_clipped_bumps_render_revision_only},
+  };
+}

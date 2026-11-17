@@ -1,0 +1,3032 @@
+#include "core/vector_raster.hpp"
+#include "core/vector_compound.hpp"
+
+#include "core/blend_math.hpp"
+#include "core/layer_render_utils.hpp"
+#include "core/pattern_sampler.hpp"
+#include "core/pixel_depth.hpp"
+#include "core/pixel_grid.hpp"
+#include "core/rect_utils.hpp"
+#include "core/worker_budget.hpp"
+
+#include <algorithm>
+#include <array>
+#include <functional>
+#include <cmath>
+#include <cstring>
+#include <future>
+#include <map>
+#include <mutex>
+#include <numeric>
+#include <optional>
+#include <tuple>
+#include <utility>
+#include <vector>
+
+namespace patchy {
+
+namespace {
+
+// 24.8 fixed point; one pixel = 256 subpixels.
+constexpr std::int32_t kSub = 256;
+
+struct FixedPoint {
+  std::int32_t x{0};
+  std::int32_t y{0};
+};
+
+struct Edge {
+  FixedPoint from{};
+  FixedPoint to{};
+};
+
+std::int32_t to_fixed(double v) noexcept {
+  return static_cast<std::int32_t>(std::llround(v * 256.0));
+}
+
+// Rounded division, symmetric about zero (deterministic tie-break away from
+// zero, matching llround).
+std::int64_t divide_rounded(std::int64_t numerator, std::int64_t denominator) noexcept {
+  if (denominator == 0) {
+    return 0;
+  }
+  if ((numerator >= 0) == (denominator >= 0)) {
+    const auto n = numerator >= 0 ? numerator : -numerator;
+    const auto d = denominator >= 0 ? denominator : -denominator;
+    return (n + d / 2) / d;
+  }
+  const auto n = numerator >= 0 ? numerator : -numerator;
+  const auto d = denominator >= 0 ? denominator : -denominator;
+  return -((n + d / 2) / d);
+}
+
+// The fixed-point area whose pixels a flattening must reproduce exactly. A
+// (sub)cubic whose control box lies wholly to one side of it is emitted as
+// its chord instead of being subdivided further: the curve and its chord stay
+// inside that box and share their endpoints, so nothing changes inside the
+// area (vector-preview.md, "Clipped flattening"). Without it a zoomed shape
+// flattened all of its off-screen curves for every 256 px preview tile.
+struct FixedCullBox {
+  std::int64_t left{0};
+  std::int64_t top{0};
+  std::int64_t right{0};
+  std::int64_t bottom{0};
+};
+
+bool cubic_outside(const FixedCullBox& box, FixedPoint p0, FixedPoint p1, FixedPoint p2,
+                   FixedPoint p3) noexcept {
+  const auto [min_x, max_x] = std::minmax({p0.x, p1.x, p2.x, p3.x});
+  const auto [min_y, max_y] = std::minmax({p0.y, p1.y, p2.y, p3.y});
+  return max_x < box.left || min_x > box.right || max_y < box.top || min_y > box.bottom;
+}
+
+// Appends the flattened segments of one cubic (from -> to with control points
+// c1/c2, all fixed). Subdivision is integer-only de Casteljau halving (no
+// floating point anywhere), so output is bit-identical across toolchains
+// regardless of FMA contraction differences. Every midpoint stays inside the
+// control box of its parent (floor averages of in-range integers).
+void flatten_cubic_recursive(FixedPoint p0, FixedPoint p1, FixedPoint p2, FixedPoint p3,
+                             std::int32_t depth, std::vector<Edge>& edges,
+                             const FixedCullBox* cull = nullptr) {
+  if (depth <= 0 || (cull != nullptr && cubic_outside(*cull, p0, p1, p2, p3))) {
+    if (p0.y != p3.y || p0.x != p3.x) {
+      edges.push_back(Edge{p0, p3});
+    }
+    return;
+  }
+  const auto mid = [](std::int32_t a, std::int32_t b) {
+    // Floor average: exact when the sum is even; the half-subpixel bias is
+    // far below the coverage quantum and fully deterministic.
+    return static_cast<std::int32_t>((static_cast<std::int64_t>(a) + b) >> 1);
+  };
+  const FixedPoint m01{mid(p0.x, p1.x), mid(p0.y, p1.y)};
+  const FixedPoint m12{mid(p1.x, p2.x), mid(p1.y, p2.y)};
+  const FixedPoint m23{mid(p2.x, p3.x), mid(p2.y, p3.y)};
+  const FixedPoint m012{mid(m01.x, m12.x), mid(m01.y, m12.y)};
+  const FixedPoint m123{mid(m12.x, m23.x), mid(m12.y, m23.y)};
+  const FixedPoint m{mid(m012.x, m123.x), mid(m012.y, m123.y)};
+  flatten_cubic_recursive(p0, m01, m012, m, depth - 1, edges, cull);
+  flatten_cubic_recursive(m, m123, m23, p3, depth - 1, edges, cull);
+}
+
+void flatten_cubic(FixedPoint from, FixedPoint c1, FixedPoint c2, FixedPoint to,
+                   std::vector<Edge>& edges, const FixedCullBox* cull = nullptr) {
+  const auto deviation = std::max(
+      std::max(std::abs(static_cast<std::int64_t>(from.x) - 2 * c1.x + c2.x),
+               std::abs(static_cast<std::int64_t>(from.y) - 2 * c1.y + c2.y)),
+      std::max(std::abs(static_cast<std::int64_t>(c1.x) - 2 * c2.x + to.x),
+               std::abs(static_cast<std::int64_t>(c1.y) - 2 * c2.y + to.y)));
+  if (deviation <= 8) {  // within 1/32 px of straight
+    if (from.y != to.y || from.x != to.x) {
+      edges.push_back(Edge{from, to});
+    }
+    return;
+  }
+  // Chord error after n segments <= 3 * deviation / (4 * n^2); each halving
+  // quarters the error, so depth = ceil(log4(deviation * 3 / 32)) reaches the
+  // 8-subpixel (1/32 px) target. Integer search keeps it float-free.
+  std::int32_t depth = 1;
+  std::int64_t error = deviation * 3 / 4;
+  while (error > 8 && depth < 8) {
+    error /= 4;
+    ++depth;
+  }
+  flatten_cubic_recursive(from, c1, c2, to, depth, edges, cull);
+}
+
+// Flattens every subpath of one shape group into edges relative to
+// `origin` (document pixels), closing open subpaths with their chord. `cull`
+// is the buffer the edges rasterize into (same relative coordinates):
+// rasterize_edges gives an edge wholly left of its buffer the full cover of
+// the rows it spans and drops edges above, below or right of it, so curves
+// there only need their endpoints.
+void flatten_group(const VectorPath& path, std::size_t first_subpath, std::size_t subpath_end,
+                   std::int32_t origin_x, std::int32_t origin_y, std::vector<Edge>& edges,
+                   const FixedCullBox* cull = nullptr) {
+  const std::int32_t shift_x = origin_x * kSub;
+  const std::int32_t shift_y = origin_y * kSub;
+  for (std::size_t s = first_subpath; s < subpath_end; ++s) {
+    const auto& subpath = path.subpaths[s];
+    const auto count = subpath.anchors.size();
+    if (count < 2) {
+      continue;
+    }
+    for (std::size_t i = 0; i < count; ++i) {
+      const auto& a = subpath.anchors[i];
+      const auto& b = subpath.anchors[(i + 1) % count];
+      if (i + 1 == count && !subpath.closed) {
+        // Open subpath: the implied closing chord (straight), matching the
+        // Photoshop render of open shape subpaths.
+        FixedPoint from{to_fixed(a.anchor_x) - shift_x, to_fixed(a.anchor_y) - shift_y};
+        FixedPoint to{to_fixed(b.anchor_x) - shift_x, to_fixed(b.anchor_y) - shift_y};
+        if (from.y != to.y) {
+          edges.push_back(Edge{from, to});
+        }
+        continue;
+      }
+      FixedPoint from{to_fixed(a.anchor_x) - shift_x, to_fixed(a.anchor_y) - shift_y};
+      FixedPoint c1{to_fixed(a.out_x) - shift_x, to_fixed(a.out_y) - shift_y};
+      FixedPoint c2{to_fixed(b.in_x) - shift_x, to_fixed(b.in_y) - shift_y};
+      FixedPoint to{to_fixed(b.anchor_x) - shift_x, to_fixed(b.anchor_y) - shift_y};
+      if (c1.x == from.x && c1.y == from.y && c2.x == to.x && c2.y == to.y) {
+        if (from.y != to.y) {
+          edges.push_back(Edge{from, to});
+        }
+      } else {
+        flatten_cubic(from, c1, c2, to, edges, cull);
+      }
+    }
+  }
+}
+
+struct Cell {
+  std::int32_t cover{0};
+  std::int64_t area{0};
+};
+
+enum class WindingRule { EvenOdd, NonZero };
+
+// Exact-area cell rasterizer over one buffer-relative edge list. Emits gray8
+// coverage into `out` (width x height, buffer-relative).
+void rasterize_edges(const std::vector<Edge>& edges, std::int32_t width, std::int32_t height,
+                     WindingRule rule, PixelBuffer& out) {
+  // Bucket edges by their first touched row.
+  std::vector<std::int32_t> bucket_heads(static_cast<std::size_t>(height) + 1, -1);
+  std::vector<std::int32_t> bucket_next(edges.size(), -1);
+  std::vector<std::int32_t> edge_min_row(edges.size(), 0);
+  std::vector<std::int32_t> edge_max_row(edges.size(), 0);
+  for (std::size_t i = 0; i < edges.size(); ++i) {
+    const auto& edge = edges[i];
+    const auto y_min = std::min(edge.from.y, edge.to.y);
+    const auto y_max = std::max(edge.from.y, edge.to.y);
+    if (y_min == y_max) {
+      edge_min_row[i] = 1;
+      edge_max_row[i] = 0;  // never active
+      continue;
+    }
+    auto first_row = static_cast<std::int32_t>(std::floor(static_cast<double>(y_min) / kSub));
+    auto last_row = static_cast<std::int32_t>(std::floor(static_cast<double>(y_max - 1) / kSub));
+    first_row = std::clamp(first_row, 0, height - 1);
+    last_row = std::clamp(last_row, 0, height - 1);
+    edge_min_row[i] = first_row;
+    edge_max_row[i] = last_row;
+    bucket_next[i] = bucket_heads[static_cast<std::size_t>(first_row)];
+    bucket_heads[static_cast<std::size_t>(first_row)] = static_cast<std::int32_t>(i);
+  }
+
+  std::vector<Cell> cells(static_cast<std::size_t>(width) + 1);
+  std::vector<std::int32_t> active;
+  auto* bytes = out.data().data();
+  const auto stride = out.stride_bytes();
+
+  // Emits one within-row, within-cell piece.
+  const auto emit_piece = [&cells, width](std::int32_t cell_x, std::int64_t fx0, std::int64_t fx1,
+                                          std::int64_t dy) {
+    if (dy == 0) {
+      return;
+    }
+    if (cell_x < 0) {
+      cell_x = 0;
+      fx0 = 0;
+      fx1 = 0;
+    } else if (cell_x >= width) {
+      // Right of the buffer: contributes full-width cover to the row's tail,
+      // which is clipped away; drop it.
+      return;
+    }
+    auto& cell = cells[static_cast<std::size_t>(cell_x)];
+    cell.cover += static_cast<std::int32_t>(dy);
+    cell.area += dy * (2 * kSub - fx0 - fx1);
+  };
+
+  // Walks the sub-segment (sx, sy) -> (ex, ey) (fixed, already clipped to one
+  // row) across cell boundaries.
+  const auto emit_span = [&emit_piece](std::int64_t sx, std::int64_t sy, std::int64_t ex,
+                                       std::int64_t ey) {
+    if (sy == ey) {
+      return;
+    }
+    auto cell_of = [](std::int64_t x) {
+      // floor division for negatives
+      return static_cast<std::int32_t>(x >= 0 ? x / kSub : -((-x + kSub - 1) / kSub));
+    };
+    std::int32_t cx = cell_of(sx);
+    const std::int32_t cx_end = cell_of(ex);
+    if (cx == cx_end) {
+      emit_piece(cx, sx - static_cast<std::int64_t>(cx) * kSub, ex - static_cast<std::int64_t>(cx) * kSub,
+                 ey - sy);
+      return;
+    }
+    const bool rightward = ex > sx;
+    std::int64_t previous_x = sx;
+    std::int64_t previous_y = sy;
+    while (cx != cx_end) {
+      const std::int64_t boundary =
+          rightward ? (static_cast<std::int64_t>(cx) + 1) * kSub : static_cast<std::int64_t>(cx) * kSub;
+      const std::int64_t boundary_y =
+          sy + divide_rounded((ey - sy) * (boundary - sx), ex - sx);
+      emit_piece(cx, previous_x - static_cast<std::int64_t>(cx) * kSub,
+                 boundary - static_cast<std::int64_t>(cx) * kSub, boundary_y - previous_y);
+      previous_x = boundary;
+      previous_y = boundary_y;
+      cx += rightward ? 1 : -1;
+    }
+    emit_piece(cx, previous_x - static_cast<std::int64_t>(cx) * kSub,
+               ex - static_cast<std::int64_t>(cx) * kSub, ey - previous_y);
+  };
+
+  for (std::int32_t row = 0; row < height; ++row) {
+    // Admit edges starting on this row; retire finished ones.
+    for (auto i = bucket_heads[static_cast<std::size_t>(row)]; i != -1;
+         i = bucket_next[static_cast<std::size_t>(i)]) {
+      active.push_back(i);
+    }
+    std::fill(cells.begin(), cells.end(), Cell{});
+    const std::int64_t row_top = static_cast<std::int64_t>(row) * kSub;
+    const std::int64_t row_bottom = row_top + kSub;
+    std::size_t keep = 0;
+    for (std::size_t a = 0; a < active.size(); ++a) {
+      const auto index = active[a];
+      const auto& edge = edges[static_cast<std::size_t>(index)];
+      // Order endpoints by y; remember the true direction sign.
+      const bool downward = edge.to.y > edge.from.y;
+      const FixedPoint& top = downward ? edge.from : edge.to;
+      const FixedPoint& bottom = downward ? edge.to : edge.from;
+      const std::int64_t ys = std::max<std::int64_t>(top.y, row_top);
+      const std::int64_t ye = std::min<std::int64_t>(bottom.y, row_bottom);
+      if (ys < ye) {
+        const std::int64_t dy_total = static_cast<std::int64_t>(bottom.y) - top.y;
+        const std::int64_t xs =
+            top.x + divide_rounded((static_cast<std::int64_t>(bottom.x) - top.x) * (ys - top.y), dy_total);
+        const std::int64_t xe =
+            top.x + divide_rounded((static_cast<std::int64_t>(bottom.x) - top.x) * (ye - top.y), dy_total);
+        if (downward) {
+          emit_span(xs, ys, xe, ye);
+        } else {
+          emit_span(xe, ye, xs, ys);
+        }
+      }
+      if (edge_max_row[static_cast<std::size_t>(index)] > row) {
+        active[keep++] = index;
+      }
+    }
+    active.resize(keep);
+
+    // Sweep the row: signed winding coverage folded by the winding rule.
+    auto* row_bytes = bytes + static_cast<std::size_t>(row) * stride;
+    std::int64_t running_cover = 0;
+    for (std::int32_t x = 0; x < width; ++x) {
+      const auto& cell = cells[static_cast<std::size_t>(x)];
+      const std::int64_t twice_area = running_cover * (2 * kSub) + cell.area;
+      running_cover += cell.cover;
+      std::int64_t c = divide_rounded(twice_area, 2 * kSub);
+      if (rule == WindingRule::EvenOdd) {
+        c = ((c % (2 * kSub)) + 2 * kSub) % (2 * kSub);
+        if (c > kSub) {
+          c = 2 * kSub - c;
+        }
+      } else {
+        c = std::min<std::int64_t>(c >= 0 ? c : -c, kSub);
+      }
+      row_bytes[x] = static_cast<std::uint8_t>((c * 255 + kSub / 2) / kSub);
+    }
+  }
+}
+
+Rect intersect_rects(Rect a, Rect b) noexcept {
+  const auto x0 = std::max(a.x, b.x);
+  const auto y0 = std::max(a.y, b.y);
+  const auto x1 = std::min(a.x + a.width, b.x + b.width);
+  const auto y1 = std::min(a.y + a.height, b.y + b.height);
+  if (x1 <= x0 || y1 <= y0) {
+    return Rect{};
+  }
+  return Rect{x0, y0, x1 - x0, y1 - y0};
+}
+
+Rect group_pixel_bounds(const VectorPath& path, std::size_t first_subpath, std::size_t subpath_end) {
+  bool any = false;
+  double min_x = 0.0;
+  double min_y = 0.0;
+  double max_x = 0.0;
+  double max_y = 0.0;
+  const auto extend = [&](double x, double y) {
+    if (!any) {
+      min_x = max_x = x;
+      min_y = max_y = y;
+      any = true;
+      return;
+    }
+    min_x = std::min(min_x, x);
+    max_x = std::max(max_x, x);
+    min_y = std::min(min_y, y);
+    max_y = std::max(max_y, y);
+  };
+  for (std::size_t s = first_subpath; s < subpath_end; ++s) {
+    for (const auto& anchor : path.subpaths[s].anchors) {
+      extend(anchor.anchor_x, anchor.anchor_y);
+      extend(anchor.in_x, anchor.in_y);
+      extend(anchor.out_x, anchor.out_y);
+    }
+  }
+  if (!any) {
+    return Rect{};
+  }
+  const auto x0 = static_cast<std::int32_t>(std::floor(min_x));
+  const auto y0 = static_cast<std::int32_t>(std::floor(min_y));
+  const auto x1 = static_cast<std::int32_t>(std::ceil(max_x)) + 1;
+  const auto y1 = static_cast<std::int32_t>(std::ceil(max_y)) + 1;
+  return Rect{x0, y0, x1 - x0, y1 - y0};
+}
+
+std::uint8_t coverage_at(const CoverageBuffer& buffer, std::int32_t x, std::int32_t y) noexcept {
+  if (buffer.bounds.empty() || !buffer.bounds.contains(x, y)) {
+    return 0;
+  }
+  return buffer.pixels
+      .data()[static_cast<std::size_t>(y - buffer.bounds.y) * buffer.pixels.stride_bytes() +
+              static_cast<std::size_t>(x - buffer.bounds.x)];
+}
+
+std::uint8_t combine_coverage(PathCombineOp op, std::uint8_t accumulated, std::uint8_t group) noexcept {
+  const auto a = static_cast<std::int32_t>(accumulated);
+  const auto b = static_cast<std::int32_t>(group);
+  const auto mul = [](std::int32_t p, std::int32_t q) { return (p * q + 127) / 255; };
+  switch (op) {
+    case PathCombineOp::Add:
+      return static_cast<std::uint8_t>(a + b - mul(a, b));
+    case PathCombineOp::Subtract:
+      return static_cast<std::uint8_t>(a - mul(a, b));
+    case PathCombineOp::Intersect:
+      return static_cast<std::uint8_t>(mul(a, b));
+    case PathCombineOp::Xor:
+      return static_cast<std::uint8_t>(a + b - 2 * mul(a, b));
+  }
+  return accumulated;
+}
+
+CoverageBuffer full_coverage(Rect bounds) {
+  CoverageBuffer buffer;
+  if (bounds.empty()) {
+    return buffer;
+  }
+  buffer.bounds = bounds;
+  buffer.pixels = PixelBuffer(bounds.width, bounds.height, PixelFormat::gray8());
+  buffer.pixels.clear(255);
+  return buffer;
+}
+
+// Trims a coverage buffer to its non-zero extent (empty result when blank).
+void trim_coverage(CoverageBuffer& buffer) {
+  if (buffer.bounds.empty()) {
+    return;
+  }
+  const auto width = buffer.bounds.width;
+  const auto height = buffer.bounds.height;
+  const auto* bytes = buffer.pixels.data().data();
+  const auto stride = buffer.pixels.stride_bytes();
+  std::int32_t min_x = width;
+  std::int32_t min_y = height;
+  std::int32_t max_x = -1;
+  std::int32_t max_y = -1;
+  for (std::int32_t y = 0; y < height; ++y) {
+    const auto* row = bytes + static_cast<std::size_t>(y) * stride;
+    for (std::int32_t x = 0; x < width; ++x) {
+      if (row[x] != 0) {
+        min_x = std::min(min_x, x);
+        max_x = std::max(max_x, x);
+        min_y = std::min(min_y, y);
+        max_y = std::max(max_y, y);
+      }
+    }
+  }
+  if (max_x < 0) {
+    buffer = CoverageBuffer{};
+    return;
+  }
+  if (min_x == 0 && min_y == 0 && max_x == width - 1 && max_y == height - 1) {
+    return;
+  }
+  const Rect trimmed{buffer.bounds.x + min_x, buffer.bounds.y + min_y, max_x - min_x + 1,
+                     max_y - min_y + 1};
+  PixelBuffer pixels(trimmed.width, trimmed.height, PixelFormat::gray8());
+  auto* out = pixels.data().data();
+  for (std::int32_t y = 0; y < trimmed.height; ++y) {
+    std::memcpy(out + static_cast<std::size_t>(y) * pixels.stride_bytes(),
+                bytes + static_cast<std::size_t>(y + min_y) * stride + min_x,
+                static_cast<std::size_t>(trimmed.width));
+  }
+  buffer.bounds = trimmed;
+  buffer.pixels = std::move(pixels);
+}
+
+// ---------------------------------------------------------------------------
+// Stroker: flattens subpaths to polylines, applies dashes, and emits closed
+// outline loops (segment quads + join/cap fans) rasterized with NONZERO
+// winding so overlapping pieces union. Outline math uses doubles (normals
+// need sqrt); every emitted point is quantized to 24.8 fixed before
+// rasterization, and expressions stay simple sums/products, keeping output
+// deterministic in practice (verified by the pinned goldens across
+// toolchains).
+// ---------------------------------------------------------------------------
+
+struct DPoint {
+  double x{0.0};
+  double y{0.0};
+};
+
+// Flattens one subpath into a document-space polyline. Curves go through the
+// same integer flattener as fills (converted back to doubles exactly), so
+// stroke and fill geometry always agree.
+// `cull` (absolute fixed) is the stroke clip grown by the outline's reach: a
+// curve outside it becomes its chord, whose outline pieces stay outside too.
+std::vector<DPoint> subpath_polyline(const PathSubpath& subpath, const FixedCullBox* cull = nullptr) {
+  std::vector<DPoint> points;
+  const auto count = subpath.anchors.size();
+  if (count == 0) {
+    return points;
+  }
+  // Every vertex snaps to the 1/256 flattener lattice. Curve interiors arrive
+  // quantized from the integer flattener; anchor endpoints must land on the
+  // same lattice or the sub-quantum residual survives as a micro-segment whose
+  // direction is rounding noise - the miter join then amplifies it into a
+  // spike up to miter_limit x half-width long (the translation-dependent
+  // spikes/bars on imported stroked curves, July 2026). On-lattice values
+  // round-trip exactly, so the exact-equality dedupe needs no epsilon.
+  const auto push = [&points](double x, double y) {
+    x = static_cast<double>(to_fixed(x)) / kSub;
+    y = static_cast<double>(to_fixed(y)) / kSub;
+    if (!points.empty() && points.back().x == x && points.back().y == y) {
+      return;
+    }
+    points.push_back(DPoint{x, y});
+  };
+  push(subpath.anchors[0].anchor_x, subpath.anchors[0].anchor_y);
+  const auto segment_count = subpath.closed ? count : count - 1;
+  for (std::size_t i = 0; i < segment_count; ++i) {
+    const auto& a = subpath.anchors[i];
+    const auto& b = subpath.anchors[(i + 1) % count];
+    const FixedPoint from{to_fixed(a.anchor_x), to_fixed(a.anchor_y)};
+    const FixedPoint c1{to_fixed(a.out_x), to_fixed(a.out_y)};
+    const FixedPoint c2{to_fixed(b.in_x), to_fixed(b.in_y)};
+    const FixedPoint to{to_fixed(b.anchor_x), to_fixed(b.anchor_y)};
+    if ((c1.x == from.x && c1.y == from.y && c2.x == to.x && c2.y == to.y)) {
+      push(b.anchor_x, b.anchor_y);
+      continue;
+    }
+    std::vector<Edge> segment_edges;
+    flatten_cubic(from, c1, c2, to, segment_edges, cull);
+    for (const auto& edge : segment_edges) {
+      push(static_cast<double>(edge.to.x) / kSub, static_cast<double>(edge.to.y) / kSub);
+    }
+    // Ensure the exact endpoint lands (flatten skips zero-length tails).
+    push(b.anchor_x, b.anchor_y);
+  }
+  // Closed subpaths wrap implicitly: drop the duplicated closing point so the
+  // wrap-around segment/join indexing sees clean vertices.
+  if (subpath.closed && points.size() > 1 && points.front().x == points.back().x &&
+      points.front().y == points.back().y) {
+    points.pop_back();
+  }
+  return points;
+}
+
+struct StrokeRun {
+  std::vector<DPoint> points;
+  bool closed{false};
+  // A zero-length dash still needs its path tangent to orient square/round caps.
+  DPoint dot_direction{};
+};
+
+std::vector<StrokeRun> fill_boundary_contours(const VectorPath& path, const std::vector<StrokeRun>& original,
+                                              bool exhaustive = false);
+
+// A shape's stroke follows the Boolean result, not the hidden contours of its
+// operands. Split the flattened segments at crossings, retain only edges with
+// different final fill on their two sides, then walk the directed boundaries.
+// Source paths stay intact for editing and native PSD preservation.
+// `cull` applies to single-group paths only (the Boolean walk needs every
+// crossing), and to open subpaths only with `cull_open` (an off-center open
+// contour is offset sideways before outlining).
+std::vector<StrokeRun> combined_stroke_contours(const VectorPath& path, const FixedCullBox* cull = nullptr,
+                                                bool cull_open = true, bool exhaustive = false) {
+  std::vector<StrokeRun> original;
+  bool multiple_groups = false;
+  bool all_closed = true;
+  for (const auto& subpath : path.subpaths) {
+    all_closed &= subpath.closed;
+    multiple_groups |= subpath.shape_group != path.subpaths.front().shape_group;
+  }
+  if (multiple_groups) {
+    cull = nullptr;
+  }
+  for (const auto& subpath : path.subpaths) {
+    original.push_back({subpath_polyline(subpath, subpath.closed || cull_open ? cull : nullptr), subpath.closed});
+  }
+  // Photoshop fills a leading Intersect contour, but its stroke starts from an
+  // empty operand. A lone closed Intersect group consequently has no outline.
+  if (!multiple_groups && all_closed && !path.subpaths.empty() &&
+      path.subpaths.front().op == PathCombineOp::Intersect) return {};
+  if (!multiple_groups || !all_closed) return original;
+  if (exhaustive) return fill_boundary_contours(path, original, true);
+  // The Boolean outline does not depend on the clip, and a zoomed Dynamic Vector Preview
+  // strokes the same path for every 256 px tile it reaches, so recent outlines stay cached
+  // per thread. Tiles visit every shape in turn: the cache holds a view's worth of paths
+  // (bounded by their outline points, about 32 MB) rather than a few, which that cycle
+  // would evict.
+  struct CachedBoundary {
+    VectorPath path;
+    std::vector<StrokeRun> contours;
+    std::size_t points{0};
+  };
+  thread_local std::vector<CachedBoundary> cache;
+  thread_local std::size_t cached_points = 0;
+  for (std::size_t i = 0; i < cache.size(); ++i) {
+    if (cache[i].path == path) {
+      std::rotate(cache.begin(), cache.begin() + static_cast<std::ptrdiff_t>(i),
+                  cache.begin() + static_cast<std::ptrdiff_t>(i) + 1);
+      return cache.front().contours;
+    }
+  }
+  auto contours = fill_boundary_contours(path, original, false);
+  std::size_t points = 0;
+  for (const auto& contour : contours) points += contour.points.size();
+  constexpr std::size_t kCachedPoints = 2'000'000;
+  if (points <= kCachedPoints) {
+    while (!cache.empty() && cached_points + points > kCachedPoints) {
+      cached_points -= cache.back().points;
+      cache.pop_back();
+    }
+    cached_points += points;
+    cache.insert(cache.begin(), CachedBoundary{path, contours, points});
+  }
+  return contours;
+}
+
+// The directed boundary of the path's combined fill (inside on the left): the flattened
+// segments of every contour split at crossings, kept where the fill differs on the two sides,
+// then walked into closed loops on the 1/256 lattice. `original` holds the flattened contours of
+// path.subpaths in order (open ones close with their chord, as the fill does).
+// `exhaustive` tests every segment pair and every edge per parity query: the reference
+// the faster search must match (VectorRasterOptions::reference_geometry).
+std::vector<StrokeRun> fill_boundary_contours(const VectorPath& path, const std::vector<StrokeRun>& original,
+                                              bool exhaustive) {
+  struct Segment { DPoint a, b; std::vector<double> cuts{0.0, 1.0}; };
+  std::vector<Segment> segments;
+  for (const auto& contour : original) {
+    for (std::size_t i = 0; i < contour.points.size(); ++i) {
+      const auto a = contour.points[i], b = contour.points[(i + 1) % contour.points.size()];
+      if (a.x != b.x || a.y != b.y) segments.push_back({a, b});
+    }
+  }
+  const auto cross = [](DPoint a, DPoint b) { return a.x * b.y - a.y * b.x; };
+  const auto delta = [](DPoint a, DPoint b) { return DPoint{a.x - b.x, a.y - b.y}; };
+  const auto add_cut = [](Segment& segment, double t) {
+    if (t >= 0.0 && t <= 1.0) segment.cuts.push_back(t);
+  };
+  // Cuts one pair of segments (document order: a before b) whose boxes overlap.
+  const auto cut_pair = [&](Segment& a, Segment& b) {
+    if (std::max(a.a.x, a.b.x) < std::min(b.a.x, b.b.x) ||
+        std::max(b.a.x, b.b.x) < std::min(a.a.x, a.b.x) ||
+        std::max(a.a.y, a.b.y) < std::min(b.a.y, b.b.y) ||
+        std::max(b.a.y, b.b.y) < std::min(a.a.y, a.b.y)) return;
+    const auto r = delta(a.b, a.a);
+    const auto s = delta(b.b, b.a), q = delta(b.a, a.a);
+    const auto divisor = cross(r, s);
+    if (divisor != 0.0) {
+      const auto t = cross(q, s) / divisor, u = cross(q, r) / divisor;
+      if (t >= 0.0 && t <= 1.0 && u >= 0.0 && u <= 1.0) {
+        add_cut(a, t); add_cut(b, u);
+      }
+    } else if (cross(q, r) == 0.0) {
+      const auto parameter = [](DPoint p, const Segment& edge) {
+        return std::abs(edge.b.x - edge.a.x) >= std::abs(edge.b.y - edge.a.y)
+            ? (p.x - edge.a.x) / (edge.b.x - edge.a.x)
+            : (p.y - edge.a.y) / (edge.b.y - edge.a.y);
+      };
+      add_cut(a, parameter(b.a, a)); add_cut(a, parameter(b.b, a));
+      add_cut(b, parameter(a.a, b)); add_cut(b, parameter(a.b, b));
+    }
+  };
+  if (exhaustive) {
+    for (std::size_t i = 0; i < segments.size(); ++i) {
+      for (std::size_t j = i + 1; j < segments.size(); ++j) cut_pair(segments[i], segments[j]);
+    }
+  } else {
+    // The same pairs, found by a sweep over the boxes' left edges: a zoomed view (Dynamic
+    // Vector Preview) flattens tens of thousands of segments, and testing all pairs took
+    // seconds per tile. The cuts are sorted below, so the visiting order does not matter.
+    std::vector<std::size_t> by_left(segments.size());
+    std::iota(by_left.begin(), by_left.end(), std::size_t{0});
+    const auto left_of = [&](std::size_t index) { return std::min(segments[index].a.x, segments[index].b.x); };
+    std::sort(by_left.begin(), by_left.end(), [&](std::size_t x, std::size_t y) {
+      const auto lx = left_of(x), ly = left_of(y);
+      return lx != ly ? lx < ly : x < y;
+    });
+    for (std::size_t k = 0; k < by_left.size(); ++k) {
+      const auto right = std::max(segments[by_left[k]].a.x, segments[by_left[k]].b.x);
+      for (std::size_t m = k + 1; m < by_left.size() && left_of(by_left[m]) <= right; ++m) {
+        cut_pair(segments[std::min(by_left[k], by_left[m])], segments[std::max(by_left[k], by_left[m])]);
+      }
+    }
+  }
+  // Each group's crossing parity reads only the edges spanning the query row: the edges
+  // sit in horizontal bands by their y range (every edge whose range holds y is in y's
+  // band), and parity does not depend on the order the crossings are counted in.
+  struct GroupEdges {
+    std::size_t first{0};
+    double top{0.0};
+    double bottom{0.0};
+    double right{0.0};
+    double band_height{1.0};
+    std::vector<std::vector<std::pair<DPoint, DPoint>>> bands;
+  };
+  std::vector<GroupEdges> groups;
+  for (std::size_t first = 0; first < original.size();) {
+    auto end = first + 1;
+    while (end < original.size() && path.subpaths[end].shape_group == path.subpaths[first].shape_group) ++end;
+    GroupEdges group;
+    group.first = first;
+    std::vector<std::pair<DPoint, DPoint>> edges;
+    double top = 0.0, bottom = 0.0, right = 0.0;
+    for (auto s = first; s < end; ++s) {
+      const auto& points = original[s].points;
+      for (std::size_t i = 0; i < points.size(); ++i) {
+        const auto a = points[i], b = points[(i + 1) % points.size()];
+        if (a.y == b.y) continue;  // never satisfies the crossing test
+        top = edges.empty() ? std::min(a.y, b.y) : std::min({top, a.y, b.y});
+        bottom = edges.empty() ? std::max(a.y, b.y) : std::max({bottom, a.y, b.y});
+        right = edges.empty() ? std::max(a.x, b.x) : std::max({right, a.x, b.x});
+        edges.emplace_back(a, b);
+      }
+    }
+    auto count = exhaustive ? std::size_t{1} : std::clamp<std::size_t>(edges.size() / 4, 1, 4096);
+    group.top = top;
+    group.bottom = bottom;
+    group.right = right;
+    // Tall edges sit in every band they cross: fewer bands keep that copy count linear.
+    const auto copies = [&](std::size_t bands) {
+      const double height = bottom > top ? (bottom - top) / static_cast<double>(bands) : 1.0;
+      double total = 0.0;
+      for (const auto& edge : edges) total += std::abs(edge.second.y - edge.first.y) / height + 2.0;
+      return total;
+    };
+    while (count > 1 && copies(count) > 16.0 * static_cast<double>(edges.size()) + 1024.0) count /= 2;
+    group.band_height = bottom > top ? (bottom - top) / static_cast<double>(count) : 1.0;
+    group.bands.resize(count);
+    const auto band_of = [&group, count](double y) {
+      const auto band = std::floor((y - group.top) / group.band_height);
+      return static_cast<std::size_t>(std::clamp(band, 0.0, static_cast<double>(count - 1)));
+    };
+    for (const auto& edge : edges) {
+      const auto last = band_of(std::max(edge.first.y, edge.second.y));
+      for (auto band = band_of(std::min(edge.first.y, edge.second.y)); band <= last; ++band) {
+        group.bands[band].push_back(edge);
+      }
+    }
+    groups.push_back(std::move(group));
+    first = end;
+  }
+  const auto filled = [&](DPoint point) {
+    bool result = path.subpaths.front().op == PathCombineOp::Subtract;
+    for (const auto& group : groups) {
+      const auto first = group.first;
+      bool inside = false;
+      // A crossing needs an edge whose y range holds the point and an x right of it (the
+      // computed x stays within far less than a pixel of its edge's x range).
+      if (!group.bands.front().empty() && point.y >= group.top && point.y < group.bottom &&
+          point.x < group.right + 1.0) {
+        const auto band = std::floor((point.y - group.top) / group.band_height);
+        const auto& edges = group.bands[static_cast<std::size_t>(
+            std::clamp(band, 0.0, static_cast<double>(group.bands.size() - 1)))];
+        for (const auto& [a, b] : edges) {
+          if ((a.y > point.y) != (b.y > point.y) &&
+              point.x < a.x + (point.y - a.y) * (b.x - a.x) / (b.y - a.y)) inside = !inside;
+        }
+      }
+      const auto op = path.subpaths[first].op;
+      if (first == 0 && op != PathCombineOp::Subtract) result = inside;
+      else switch (op) {
+        case PathCombineOp::Add: result |= inside; break;
+        case PathCombineOp::Subtract: result &= !inside; break;
+        case PathCombineOp::Intersect: result &= inside; break;
+        case PathCombineOp::Xor: result ^= inside; break;
+      }
+    }
+    return result;
+  };
+  using Vertex = std::pair<std::int32_t, std::int32_t>;
+  struct Boundary { Vertex a, b; bool used{false}; };
+  std::vector<Boundary> boundary;
+  std::map<std::pair<Vertex, Vertex>, bool> unique;
+  for (auto& segment : segments) {
+    auto& cuts = segment.cuts;
+    std::sort(cuts.begin(), cuts.end());
+    cuts.erase(std::unique(cuts.begin(), cuts.end()), cuts.end());
+    const auto d = delta(segment.b, segment.a);
+    const auto length = std::hypot(d.x, d.y);
+    const auto at = [&](double t) { return DPoint{segment.a.x + d.x * t, segment.a.y + d.y * t}; };
+    for (std::size_t i = 1; i < cuts.size(); ++i) {
+      const auto middle = at((cuts[i - 1] + cuts[i]) * 0.5);
+      // Below one lattice quantum, but bounded by the segment's own length.
+      const auto epsilon = std::min(1.0 / 65536.0, length * (cuts[i] - cuts[i - 1]) / 8.0);
+      const DPoint normal{-d.y / length * epsilon, d.x / length * epsilon};
+      const bool left = filled({middle.x + normal.x, middle.y + normal.y});
+      if (left == filled({middle.x - normal.x, middle.y - normal.y})) continue;
+      const auto from = at(cuts[i - 1]), to = at(cuts[i]);
+      Vertex a{to_fixed(from.x), to_fixed(from.y)}, b{to_fixed(to.x), to_fixed(to.y)};
+      if (a == b) continue;
+      if (!left) std::swap(a, b);
+      if (unique.emplace(std::make_pair(a, b), true).second) boundary.push_back({a, b});
+    }
+  }
+  std::map<Vertex, std::vector<std::size_t>> outgoing;
+  for (std::size_t i = 0; i < boundary.size(); ++i) outgoing[boundary[i].a].push_back(i);
+  std::vector<StrokeRun> contours;
+  for (std::size_t start = 0; start < boundary.size(); ++start) {
+    if (boundary[start].used) continue;
+    StrokeRun contour;
+    auto current = start;
+    while (!boundary[current].used) {
+      auto& edge = boundary[current];
+      edge.used = true;
+      contour.points.push_back({static_cast<double>(edge.a.first) / kSub,
+                                static_cast<double>(edge.a.second) / kSub});
+      if (edge.b == boundary[start].a) { contour.closed = true; break; }
+      const auto found = outgoing.find(edge.b);
+      if (found == outgoing.end()) break;
+      auto next = boundary.size();
+      double best_turn = -4.0;
+      const DPoint incoming{static_cast<double>(edge.b.first) - edge.a.first,
+                            static_cast<double>(edge.b.second) - edge.a.second};
+      for (const auto candidate : found->second) {
+        const auto& other = boundary[candidate];
+        if (other.used) continue;
+        const DPoint direction{static_cast<double>(other.b.first) - other.a.first,
+                               static_cast<double>(other.b.second) - other.a.second};
+        const auto turn = std::atan2(cross(incoming, direction), incoming.x * direction.x + incoming.y * direction.y);
+        if (turn > best_turn) { best_turn = turn; next = candidate; }
+      }
+      if (next == boundary.size()) break;
+      current = next;
+    }
+    if (contour.closed && contour.points.size() >= 3) contours.push_back(std::move(contour));
+  }
+  return contours;
+}
+
+double distance(const DPoint& a, const DPoint& b) noexcept {
+  const double dx = b.x - a.x;
+  const double dy = b.y - a.y;
+  return std::sqrt(dx * dx + dy * dy);
+}
+
+// An open contour encloses no area to clip an inside/outside band to (a
+// two-point Pen line drew nothing, issue 553). Photoshop instead moves the
+// centered stroke half a width sideways: Inside to the right of the path's
+// direction on the y-down canvas, Outside to the left (measured on a PS file
+// with a dotted and a dashed 2-point line). `offset` > 0 moves right. Joins
+// meet at the offset lines' intersection; a turn sharper than that limit keeps
+// both segment ends instead, so a hairpin never throws a vertex far away. A
+// zero-length run (a dot) moves along the normal of `dot_direction`.
+//
+// Two things keep the moved line from folding back on itself (local-051 follow-up 2). A
+// fold is two near reversals, and the stroker's miter join on one threw a spike along the
+// path, as far as the canvas edge.
+//
+// 1. Short steps are skipped first (`offset_source_points`). A flattened curve bunches its
+//    points where an anchor has no handle, in steps of a lattice unit or two, and a step
+//    that short points anywhere: its normal is not the curve's. A lattice point is up to
+//    0.003 px off the curve, so two steps of length L turn by up to 0.011 / L by rounding
+//    alone, and the moved step between them (L - offset * turn long) keeps its direction
+//    while L * L > 0.011 * offset. The least step is twice that bound, 0.25 * sqrt(offset),
+//    and never under an eighth of a pixel; on a curve no tighter than the offset it costs
+//    under 0.01 px of chord. A corner among the skipped points is kept: a skipped point
+//    more than 1/32 px off the step that passes it takes the place of the last kept point,
+//    since a corner cut by a short chord folds on its inner side.
+// 2. A moved step that ends before it starts is dropped (`forward` below). On the inner
+//    side of a sharp corner between curves the two moved arms cross well past the steps
+//    next to the corner (offset * tan(turn / 2) along each arm), so those steps come out
+//    reversed. Dropping them, innermost first, leaves the crossing of the first steps that
+//    reach it: the inner corner of the band. Steps left without a shared point meet where
+//    their moved lines cross, or are joined end to end when the lines are near parallel or
+//    cross far away. A polyline of long steps is untouched.
+std::vector<DPoint> offset_source_points(const std::vector<DPoint>& input, double offset) {
+  std::vector<DPoint> points;
+  if (input.empty()) {
+    return points;
+  }
+  const double min_step = std::max(0.125, 0.25 * std::sqrt(std::abs(offset)));
+  constexpr double kCornerDeviation = 1.0 / 32.0;
+  points.reserve(input.size());
+  points.push_back(input.front());
+  std::size_t skipped_from = 1;  // input[skipped_from, i) were passed over since the last kept point
+  const auto distance_to_step = [](const DPoint& a, const DPoint& b, const DPoint& p) {
+    const double abx = b.x - a.x;
+    const double aby = b.y - a.y;
+    const double apx = p.x - a.x;
+    const double apy = p.y - a.y;
+    const double length_squared = abx * abx + aby * aby;
+    const double t = length_squared > 0.0 ? std::clamp((apx * abx + apy * aby) / length_squared, 0.0, 1.0) : 0.0;
+    const double dx = apx - t * abx;
+    const double dy = apy - t * aby;
+    return std::sqrt(dx * dx + dy * dy);
+  };
+  const auto keep_hidden_corner = [&](const DPoint& to, std::size_t end) {
+    double worst = kCornerDeviation;
+    std::size_t corner = end;
+    for (std::size_t j = skipped_from; j < end; ++j) {
+      const double deviation = distance_to_step(points.back(), to, input[j]);
+      if (deviation > worst) {
+        worst = deviation;
+        corner = j;
+      }
+    }
+    if (corner == end) {
+      return false;
+    }
+    if (points.size() >= 2) {
+      points.back() = input[corner];
+    } else {
+      points.push_back(input[corner]);
+    }
+    skipped_from = corner + 1;
+    return true;
+  };
+  for (std::size_t i = 1; i < input.size(); ++i) {
+    const bool last = i + 1 == input.size();  // the run keeps its true end
+    bool keep = true;
+    for (;;) {
+      if (!last && distance(points.back(), input[i]) < min_step) {
+        keep = false;
+        break;
+      }
+      if (!keep_hidden_corner(input[i], i)) {
+        break;
+      }
+    }
+    if (!keep) {
+      continue;
+    }
+    if (last && points.size() >= 2 && distance(points.back(), input[i]) < min_step) {
+      points.back() = input[i];
+    } else {
+      points.push_back(input[i]);
+    }
+    skipped_from = i + 1;
+  }
+  points.erase(std::unique(points.begin(), points.end(),
+                           [](const DPoint& a, const DPoint& b) { return a.x == b.x && a.y == b.y; }),
+               points.end());
+  return points;
+}
+
+std::vector<DPoint> offset_open_polyline(const std::vector<DPoint>& input, double offset,
+                                         DPoint dot_direction = {}) {
+  const auto points = offset_source_points(input, offset);
+  if (points.size() < 2) {
+    std::vector<DPoint> result = input;  // no direction of its own to offset along
+    for (auto& point : result) {
+      point.x -= dot_direction.y * offset;
+      point.y += dot_direction.x * offset;
+    }
+    return result;
+  }
+  std::vector<DPoint> normals;
+  normals.reserve(points.size() - 1);
+  for (std::size_t i = 0; i + 1 < points.size(); ++i) {
+    const double length = distance(points[i], points[i + 1]);
+    normals.push_back({-(points[i + 1].y - points[i].y) / length, (points[i + 1].x - points[i].x) / length});
+  }
+  const auto moved = [&](std::size_t point, std::size_t step) {
+    return DPoint{points[point].x + normals[step].x * offset, points[point].y + normals[step].y * offset};
+  };
+  const auto direction = [&](std::size_t step) { return DPoint{normals[step].y, -normals[step].x}; };
+  // The vertices that join step `from` to a later step `to`: one where the moved lines
+  // meet, or both step ends.
+  const auto join = [&](std::size_t from, std::size_t to, std::array<DPoint, 2>& out) {
+    const auto& before = normals[from];
+    const auto& after = normals[to];
+    const DPoint sum{before.x + after.x, before.y + after.y};
+    const double sum_squared = sum.x * sum.x + sum.y * sum.y;
+    const DPoint from_end = moved(from + 1, from);
+    const DPoint to_start = moved(to, to);
+    // |sum| = 2 cos(turn / 2); the intersection lies offset / cos(turn / 2) out.
+    constexpr double kMinSumSquared = 0.25;  // cos(turn / 2) >= 0.25: at most 4x out
+    if (sum_squared >= kMinSumSquared) {
+      if (to == from + 1) {
+        const double scale = 2.0 * offset / sum_squared;
+        out[0] = {points[to].x + sum.x * scale, points[to].y + sum.y * scale};
+        return 1;
+      }
+      const DPoint a = direction(from);
+      const DPoint b = direction(to);
+      const double cross = a.x * b.y - a.y * b.x;
+      constexpr double kMinCross = 0.05;
+      if (std::abs(cross) >= kMinCross) {
+        const double along = ((to_start.x - from_end.x) * b.y - (to_start.y - from_end.y) * b.x) / cross;
+        const DPoint meet{from_end.x + a.x * along, from_end.y + a.y * along};
+        const double limit = 4.0 * std::abs(offset) + distance(from_end, to_start);
+        if (distance(meet, from_end) <= limit && distance(meet, to_start) <= limit) {
+          out[0] = meet;
+          return 1;
+        }
+      }
+    }
+    out[0] = from_end;
+    out[1] = to_start;
+    return 2;
+  };
+  struct Piece {
+    std::size_t step{0};
+    std::array<DPoint, 2> lead{};  // the vertices before this step
+    int leads{0};
+  };
+  // Whether `step`, starting at `from`, still runs its own way when it ends at `to`.
+  const auto forward = [&](const Piece& piece, const DPoint& to) {
+    const auto& from = piece.lead[static_cast<std::size_t>(piece.leads - 1)];
+    const DPoint along = direction(piece.step);
+    return (to.x - from.x) * along.x + (to.y - from.y) * along.y > 0.0;
+  };
+  std::vector<Piece> pieces;
+  pieces.reserve(normals.size());
+  pieces.push_back({0, {moved(0, 0), DPoint{}}, 1});
+  for (std::size_t step = 1; step < normals.size(); ++step) {
+    Piece piece{step, {}, 0};
+    for (;;) {
+      piece.leads = join(pieces.back().step, step, piece.lead);
+      if (pieces.size() == 1 || forward(pieces.back(), piece.lead[0])) {
+        break;
+      }
+      pieces.pop_back();
+    }
+    pieces.push_back(piece);
+  }
+  const DPoint end = moved(points.size() - 1, normals.size() - 1);
+  while (pieces.size() > 1 && !forward(pieces.back(), end)) {
+    pieces.pop_back();
+  }
+  std::vector<DPoint> result;
+  result.reserve(pieces.size() + 2);
+  for (const auto& piece : pieces) {
+    for (int lead = 0; lead < piece.leads; ++lead) {
+      result.push_back(piece.lead[static_cast<std::size_t>(lead)]);
+    }
+  }
+  result.push_back(end);
+  return result;
+}
+
+// Splits a polyline into dash runs. Dash entries are stroke-width multiples
+// (the vstk descriptor's unitless values); offset likewise.
+std::vector<StrokeRun> apply_dashes(const std::vector<DPoint>& points, bool closed,
+                                    const std::vector<double>& input_dashes, double offset_px) {
+  std::vector<StrokeRun> runs;
+  if (points.size() < 2) {
+    return runs;
+  }
+  auto dashes_px = input_dashes;
+  for (auto& dash : dashes_px) {
+    if (!std::isfinite(dash)) {
+      return {StrokeRun{points, closed}};
+    }
+    if (dash > 0.0) {
+      dash = std::max(dash, 1.0 / kSub);
+    }
+  }
+  if (!std::isfinite(offset_px)) {
+    offset_px = 0.0;
+  }
+  std::size_t boundaries = 0;
+  constexpr std::size_t kMaxDashBoundaries = 262144;
+  double pattern_total = 0.0;
+  for (const auto dash : dashes_px) {
+    pattern_total += std::max(dash, 0.0);
+  }
+  if (dashes_px.empty() || !std::isfinite(pattern_total) || pattern_total <= 0.0) {
+    runs.push_back(StrokeRun{points, closed});
+    return runs;
+  }
+
+  // Walk the (possibly closed) polyline, toggling on/off at dash boundaries.
+  std::vector<DPoint> walk = points;
+  if (closed) {
+    walk.push_back(points.front());
+  }
+  double phase = std::fmod(offset_px, pattern_total);
+  if (phase < 0.0) {
+    phase += pattern_total;
+  }
+  std::size_t dash_index = 0;
+  while (phase > 0.0 && phase >= std::max(dashes_px[dash_index], 0.0)) {
+    phase -= std::max(dashes_px[dash_index], 0.0);
+    dash_index = (dash_index + 1) % dashes_px.size();
+    if (phase <= 0.0) {
+      break;
+    }
+  }
+  bool on = dash_index % 2 == 0;
+  double remaining = std::max(dashes_px[dash_index], 0.0) - phase;
+
+  StrokeRun current;
+  const auto begin_run = [&current](const DPoint& at) {
+    current.points.clear();
+    current.points.push_back(at);
+  };
+  const auto finish_run = [&runs, &current](DPoint dot_direction = {}) {
+    if (current.points.size() >= 2) {
+      runs.push_back(StrokeRun{current.points, false, dot_direction});
+    }
+    current.points.clear();
+  };
+  if (on) {
+    begin_run(walk.front());
+  }
+  for (std::size_t i = 0; i + 1 < walk.size(); ++i) {
+    DPoint a = walk[i];
+    const DPoint b = walk[i + 1];
+    double segment_left = distance(a, b);
+    while (segment_left > remaining && remaining >= 0.0) {
+      if (++boundaries > kMaxDashBoundaries) {
+        return {StrokeRun{points, closed}};
+      }
+      const double t = remaining / segment_left;
+      const DPoint cut{a.x + (b.x - a.x) * t, a.y + (b.y - a.y) * t};
+      if (on) {
+        current.points.push_back(cut);
+        finish_run(DPoint{(b.x - a.x) / segment_left, (b.y - a.y) / segment_left});
+      } else {
+        begin_run(cut);
+      }
+      on = !on;
+      segment_left -= remaining;
+      a = cut;
+      dash_index = (dash_index + 1) % dashes_px.size();
+      remaining = std::max(dashes_px[dash_index], 0.0);
+      // Zero entries advance on the next iteration, emitting a real dot for
+      // an on-entry. An epsilon segment loses its direction at large coordinates.
+    }
+    remaining -= segment_left;
+    if (on) {
+      current.points.push_back(b);
+    }
+  }
+  finish_run();
+  return runs;
+}
+
+// Emits one closed outline loop into the edge list (buffer-relative fixed).
+// The stroke band unions its loops under nonzero winding, so every loop must
+// carry the SAME orientation: a join wedge emitted with the opposite winding
+// cancels the segment quads it overlaps instead of accumulating - on a
+// densely flattened arc the long wedges sweep across many short quads and
+// bite a hatched notch out of the band (the vectors_overlay_stroke top-right
+// corner glitch, July 2026). Normalize by signed area before emitting.
+// Document-pixel box a stroke's outline pieces must reach to matter: its clip
+// plus quantization and Align Edges snapping. Every piece is a small convex
+// loop; one whose box misses this lies wholly to one side of the band buffer
+// and adds nothing there (rasterize_edges: no cover right, above or below it,
+// and a net zero per row left of it), so it is not emitted.
+struct OutlineKeep {
+  double left{0.0};
+  double top{0.0};
+  double right{0.0};
+  double bottom{0.0};
+  [[nodiscard]] bool misses(double x0, double y0, double x1, double y1) const noexcept {
+    return x1 < left || x0 > right || y1 < top || y0 > bottom;
+  }
+};
+
+void append_outline_loop(const std::vector<DPoint>& loop, std::int32_t origin_x, std::int32_t origin_y,
+                         std::vector<Edge>& edges, const OutlineKeep* keep = nullptr) {
+  if (loop.size() < 3) {
+    return;
+  }
+  if (keep != nullptr) {
+    double x0 = loop.front().x, x1 = x0, y0 = loop.front().y, y1 = y0;
+    for (const auto& point : loop) {
+      x0 = std::min(x0, point.x); x1 = std::max(x1, point.x);
+      y0 = std::min(y0, point.y); y1 = std::max(y1, point.y);
+    }
+    if (keep->misses(x0, y0, x1, y1)) {
+      return;
+    }
+  }
+  double doubled_area = 0.0;
+  for (std::size_t i = 0; i < loop.size(); ++i) {
+    const auto& a = loop[i];
+    const auto& b = loop[(i + 1) % loop.size()];
+    doubled_area += a.x * b.y - b.x * a.y;
+  }
+  const bool reverse = doubled_area > 0.0;
+  const std::int32_t shift_x = origin_x * kSub;
+  const std::int32_t shift_y = origin_y * kSub;
+  const auto point_at = [&](std::size_t index) {
+    const auto& p = reverse ? loop[loop.size() - 1 - index] : loop[index];
+    return FixedPoint{to_fixed(p.x) - shift_x, to_fixed(p.y) - shift_y};
+  };
+  FixedPoint previous = point_at(0);
+  const FixedPoint first = previous;
+  for (std::size_t i = 1; i < loop.size(); ++i) {
+    const FixedPoint point = point_at(i);
+    if (point.x != previous.x || point.y != previous.y) {
+      edges.push_back(Edge{previous, point});
+    }
+    previous = point;
+  }
+  if (previous.x != first.x || previous.y != first.y) {
+    edges.push_back(Edge{previous, first});
+  }
+}
+
+// Subdivided arc fan between two unit vectors around `center` (radius h),
+// using normalized-midpoint halving (sqrt only; no trig).
+void append_arc_fan(const DPoint& center, DPoint from_unit, DPoint to_unit, double radius,
+                    std::int32_t origin_x, std::int32_t origin_y, std::vector<Edge>& edges, int depth = 0,
+                    const OutlineKeep* keep = nullptr) {
+  if (keep != nullptr && depth == 0 &&
+      keep->misses(center.x - radius, center.y - radius, center.x + radius, center.y + radius)) {
+    return;  // every triangle of the fan lies inside its circle's box
+  }
+  const double chord_x = to_unit.x - from_unit.x;
+  const double chord_y = to_unit.y - from_unit.y;
+  const double chord = std::sqrt(chord_x * chord_x + chord_y * chord_y);
+  if (depth >= 6 || chord * radius <= 0.25) {
+    append_outline_loop({center,
+                         DPoint{center.x + from_unit.x * radius, center.y + from_unit.y * radius},
+                         DPoint{center.x + to_unit.x * radius, center.y + to_unit.y * radius}},
+                        origin_x, origin_y, edges, keep);
+    return;
+  }
+  double mid_x = from_unit.x + to_unit.x;
+  double mid_y = from_unit.y + to_unit.y;
+  const double mid_length = std::sqrt(mid_x * mid_x + mid_y * mid_y);
+  if (mid_length <= 1e-12) {
+    // Opposite vectors (half circle): split via the perpendicular.
+    mid_x = -from_unit.y;
+    mid_y = from_unit.x;
+  } else {
+    mid_x /= mid_length;
+    mid_y /= mid_length;
+  }
+  const DPoint mid{mid_x, mid_y};
+  append_arc_fan(center, from_unit, mid, radius, origin_x, origin_y, edges, depth + 1, keep);
+  append_arc_fan(center, mid, to_unit, radius, origin_x, origin_y, edges, depth + 1, keep);
+}
+
+// Builds the stroke outline loops for one run at half-width h.
+void append_run_outline(const StrokeRun& run, double h, double cap_half_width,
+                        VectorStrokeCap cap, VectorStrokeJoin join,
+                        double miter_limit, std::int32_t origin_x, std::int32_t origin_y,
+                        std::vector<Edge>& edges, const OutlineKeep* keep = nullptr) {
+  const auto& pts = run.points;
+  if (pts.size() < 2 || h <= 0.0) {
+    return;
+  }
+  const std::size_t segment_count = run.closed ? pts.size() : pts.size() - 1;
+
+  // Segment quads.
+  std::vector<DPoint> directions(segment_count);
+  for (std::size_t i = 0; i < segment_count; ++i) {
+    const auto& a = pts[i];
+    const auto& b = pts[(i + 1) % pts.size()];
+    const double length = distance(a, b);
+    if (length <= 1e-12) {
+      directions[i] = DPoint{0.0, 0.0};
+      continue;
+    }
+    directions[i] = DPoint{(b.x - a.x) / length, (b.y - a.y) / length};
+    const DPoint n{-directions[i].y * h, directions[i].x * h};
+    append_outline_loop({DPoint{a.x + n.x, a.y + n.y}, DPoint{b.x + n.x, b.y + n.y},
+                         DPoint{b.x - n.x, b.y - n.y}, DPoint{a.x - n.x, a.y - n.y}},
+                        origin_x, origin_y, edges, keep);
+  }
+
+  // Joins at interior vertices (every vertex for closed runs).
+  const std::size_t first_join = run.closed ? 0 : 1;
+  const std::size_t join_count = run.closed ? pts.size() : (pts.size() >= 2 ? pts.size() - 2 : 0);
+  for (std::size_t j = 0; j < join_count; ++j) {
+    const std::size_t vertex = (first_join + j) % pts.size();
+    const std::size_t incoming = (vertex + segment_count - 1) % segment_count;
+    const std::size_t outgoing = vertex % segment_count;
+    const DPoint du = directions[incoming];
+    const DPoint dv = directions[outgoing];
+    if ((du.x == 0.0 && du.y == 0.0) || (dv.x == 0.0 && dv.y == 0.0)) {
+      continue;
+    }
+    const double cross = du.x * dv.y - du.y * dv.x;
+    if (std::abs(cross) <= 1e-12) {
+      continue;  // straight or reversal; quads already overlap
+    }
+    const double side = cross > 0.0 ? -1.0 : 1.0;  // outer side of the turn
+    const DPoint n_in{-du.y * side, du.x * side};
+    const DPoint n_out{-dv.y * side, dv.x * side};
+    const DPoint& v = pts[vertex];
+    if (join == VectorStrokeJoin::Bevel) {
+      append_outline_loop({v, DPoint{v.x + n_in.x * h, v.y + n_in.y * h},
+                           DPoint{v.x + n_out.x * h, v.y + n_out.y * h}},
+                          origin_x, origin_y, edges, keep);
+    } else if (join == VectorStrokeJoin::Round) {
+      append_arc_fan(v, n_in, n_out, h, origin_x, origin_y, edges, 0, keep);
+    } else {
+      // Miter: outer point along the normal bisector at h / cos(alpha/2);
+      // ratio 1/cos(alpha/2) checked against the limit (bevel fallback).
+      double bis_x = n_in.x + n_out.x;
+      double bis_y = n_in.y + n_out.y;
+      const double bis_length = std::sqrt(bis_x * bis_x + bis_y * bis_y);
+      if (bis_length <= 1e-12) {
+        append_outline_loop({v, DPoint{v.x + n_in.x * h, v.y + n_in.y * h},
+                             DPoint{v.x + n_out.x * h, v.y + n_out.y * h}},
+                            origin_x, origin_y, edges, keep);
+        continue;
+      }
+      bis_x /= bis_length;
+      bis_y /= bis_length;
+      const double cos_half = n_in.x * bis_x + n_in.y * bis_y;  // unit dot
+      const double ratio = cos_half > 1e-9 ? 1.0 / cos_half : 1e9;
+      if (ratio > std::max(miter_limit, 1.0)) {
+        append_outline_loop({v, DPoint{v.x + n_in.x * h, v.y + n_in.y * h},
+                             DPoint{v.x + n_out.x * h, v.y + n_out.y * h}},
+                            origin_x, origin_y, edges, keep);
+      } else {
+        const DPoint m{v.x + bis_x * h * ratio, v.y + bis_y * h * ratio};
+        append_outline_loop({v, DPoint{v.x + n_in.x * h, v.y + n_in.y * h}, m,
+                             DPoint{v.x + n_out.x * h, v.y + n_out.y * h}},
+                            origin_x, origin_y, edges, keep);
+      }
+    }
+  }
+
+  // Caps on open runs.
+  if (!run.closed && cap != VectorStrokeCap::Butt) {
+    const auto add_cap = [&](const DPoint& end, DPoint direction) {
+      if (direction.x == 0.0 && direction.y == 0.0) {
+        return;
+      }
+      const DPoint n{-direction.y, direction.x};
+      const auto emit_cap = [&](const DPoint& center) {
+        const double radius = cap_half_width;
+        if (cap == VectorStrokeCap::Square) {
+          append_outline_loop(
+              {DPoint{center.x + n.x * radius, center.y + n.y * radius},
+               DPoint{center.x + n.x * radius + direction.x * radius,
+                      center.y + n.y * radius + direction.y * radius},
+               DPoint{center.x - n.x * radius + direction.x * radius,
+                      center.y - n.y * radius + direction.y * radius},
+               DPoint{center.x - n.x * radius, center.y - n.y * radius}},
+              origin_x, origin_y, edges, keep);
+        } else {
+          append_arc_fan(center, n, direction, radius, origin_x, origin_y, edges, 0, keep);
+          append_arc_fan(center, direction, DPoint{-n.x, -n.y}, radius, origin_x, origin_y, edges, 0, keep);
+        }
+      };
+      const double shift = h - cap_half_width;
+      if (shift > 0.0) {
+        // An aligned dash has the original width on EACH side of the path.
+        // Give each half-band its own normal-sized cap; fill clipping below
+        // selects the appropriate side even for holes and reversed contours.
+        emit_cap(DPoint{end.x + n.x * shift, end.y + n.y * shift});
+        emit_cap(DPoint{end.x - n.x * shift, end.y - n.y * shift});
+      } else {
+        emit_cap(end);
+      }
+    };
+    // Find the first/last non-degenerate directions.
+    DPoint first_dir = run.dot_direction;
+    for (const auto& d : directions) {
+      if (d.x != 0.0 || d.y != 0.0) {
+        first_dir = d;
+        break;
+      }
+    }
+    DPoint last_dir = run.dot_direction;
+    for (auto it = directions.rbegin(); it != directions.rend(); ++it) {
+      if (it->x != 0.0 || it->y != 0.0) {
+        last_dir = *it;
+        break;
+      }
+    }
+    add_cap(pts.front(), DPoint{-first_dir.x, -first_dir.y});
+    add_cap(pts.back(), last_dir);
+  }
+}
+
+}  // namespace
+
+std::vector<std::vector<std::array<double, 2>>> vector_path_fill_contours(const VectorPath& path) {
+  std::vector<std::vector<std::array<double, 2>>> result;
+  if (path.subpaths.empty()) {
+    return result;
+  }
+  std::vector<StrokeRun> original;
+  original.reserve(path.subpaths.size());
+  for (const auto& subpath : path.subpaths) {
+    original.push_back({subpath_polyline(subpath), subpath.closed});
+  }
+  for (const auto& contour : fill_boundary_contours(path, original)) {
+    std::vector<std::array<double, 2>> points;
+    points.reserve(contour.points.size());
+    for (const auto& point : contour.points) {
+      points.push_back({point.x, point.y});
+    }
+    result.push_back(std::move(points));
+  }
+  return result;
+}
+
+std::vector<std::array<double, 2>> flatten_subpath_polyline(const PathSubpath& subpath) {
+  std::vector<std::array<double, 2>> points;
+  for (const auto& point : subpath_polyline(subpath)) {
+    points.push_back({point.x, point.y});
+  }
+  return points;
+}
+
+namespace {
+
+// The rectangle a path is when it is nothing else: one closed subpath of four corners
+// with straight sides on whole pixels (an artboard's paper and clip, a mask made from a
+// marquee, a rectangle drawn on the pixel grid). Its coverage is 255 inside and nothing
+// outside, exactly what the scan conversion below produces for it.
+std::optional<Rect> pixel_aligned_rect(const VectorPath& path) {
+  if (path.subpaths.size() != 1U) {
+    return std::nullopt;
+  }
+  const auto& subpath = path.subpaths.front();
+  // A first group that subtracts starts from a covered canvas instead.
+  if (!subpath.closed || subpath.op == PathCombineOp::Subtract || subpath.anchors.size() != 4U) {
+    return std::nullopt;
+  }
+  constexpr double kLimit = 100'000'000.0;
+  for (const auto& anchor : subpath.anchors) {
+    if (anchor.in_x != anchor.anchor_x || anchor.in_y != anchor.anchor_y || anchor.out_x != anchor.anchor_x ||
+        anchor.out_y != anchor.anchor_y || !(std::abs(anchor.anchor_x) <= kLimit) ||
+        !(std::abs(anchor.anchor_y) <= kLimit) || anchor.anchor_x != std::floor(anchor.anchor_x) ||
+        anchor.anchor_y != std::floor(anchor.anchor_y)) {
+      return std::nullopt;
+    }
+  }
+  const auto& a = subpath.anchors;
+  // Sides alternate horizontal and vertical, from any corner, in either direction.
+  const bool horizontal_first = a[0].anchor_y == a[1].anchor_y && a[1].anchor_x == a[2].anchor_x &&
+                                a[2].anchor_y == a[3].anchor_y && a[3].anchor_x == a[0].anchor_x;
+  const bool vertical_first = a[0].anchor_x == a[1].anchor_x && a[1].anchor_y == a[2].anchor_y &&
+                              a[2].anchor_x == a[3].anchor_x && a[3].anchor_y == a[0].anchor_y;
+  if (!horizontal_first && !vertical_first) {
+    return std::nullopt;
+  }
+  const auto left = static_cast<std::int32_t>(std::min(a[0].anchor_x, a[2].anchor_x));
+  const auto right = static_cast<std::int32_t>(std::max(a[0].anchor_x, a[2].anchor_x));
+  const auto top = static_cast<std::int32_t>(std::min(a[0].anchor_y, a[2].anchor_y));
+  const auto bottom = static_cast<std::int32_t>(std::max(a[0].anchor_y, a[2].anchor_y));
+  if (right <= left || bottom <= top) {
+    return std::nullopt;
+  }
+  return Rect{left, top, right - left, bottom - top};
+}
+
+}  // namespace
+
+CoverageBuffer rasterize_vector_path(const VectorPath& path, const VectorRasterOptions& options) {
+  if (options.clip.empty()) {
+    return CoverageBuffer{};
+  }
+  if (path.empty()) {
+    // Empty path = cover everything (fill layers without a mask path).
+    return full_coverage(options.clip);
+  }
+  if (!options.reference_geometry) {
+    // Scan-converting a page-sized rectangle was 13 s of a 115 Mpx artboard page's
+    // export derivation (paper plus clip); the answer needs no edges at all.
+    if (const auto rect = pixel_aligned_rect(path); rect.has_value()) {
+      return full_coverage(intersect_rects(*rect, options.clip));
+    }
+  }
+
+  // Split subpaths into shape groups (consecutive runs of equal shape_group).
+  struct Group {
+    std::size_t first{0};
+    std::size_t end{0};
+    PathCombineOp op{PathCombineOp::Add};
+  };
+  std::vector<Group> groups;
+  for (std::size_t i = 0; i < path.subpaths.size();) {
+    std::size_t j = i + 1;
+    while (j < path.subpaths.size() && path.subpaths[j].shape_group == path.subpaths[i].shape_group) {
+      ++j;
+    }
+    groups.push_back(Group{i, j, path.subpaths[i].op});
+    i = j;
+  }
+
+  // Accumulator bounds: subtract-first shapes cover the whole clip;
+  // otherwise the union of group bounds suffices.
+  Rect accumulator_bounds{};
+  if (!groups.empty() && groups.front().op == PathCombineOp::Subtract) {
+    accumulator_bounds = options.clip;
+  } else {
+    for (const auto& group : groups) {
+      const auto bounds = intersect_rects(group_pixel_bounds(path, group.first, group.end), options.clip);
+      if (bounds.empty()) {
+        continue;
+      }
+      if (accumulator_bounds.empty()) {
+        accumulator_bounds = bounds;
+      } else {
+        const auto x0 = std::min(accumulator_bounds.x, bounds.x);
+        const auto y0 = std::min(accumulator_bounds.y, bounds.y);
+        const auto x1 = std::max(accumulator_bounds.x + accumulator_bounds.width, bounds.x + bounds.width);
+        const auto y1 =
+            std::max(accumulator_bounds.y + accumulator_bounds.height, bounds.y + bounds.height);
+        accumulator_bounds = Rect{x0, y0, x1 - x0, y1 - y0};
+      }
+    }
+  }
+  if (accumulator_bounds.empty()) {
+    return CoverageBuffer{};
+  }
+
+  CoverageBuffer accumulator;
+  accumulator.bounds = accumulator_bounds;
+  accumulator.pixels = PixelBuffer(accumulator_bounds.width, accumulator_bounds.height, PixelFormat::gray8());
+  bool first_group = true;
+
+  for (const auto& group : groups) {
+    const auto group_bounds =
+        intersect_rects(group_pixel_bounds(path, group.first, group.end), options.clip);
+    CoverageBuffer group_coverage;
+    if (!group_bounds.empty()) {
+      group_coverage.bounds = group_bounds;
+      group_coverage.pixels = PixelBuffer(group_bounds.width, group_bounds.height, PixelFormat::gray8());
+      std::vector<Edge> edges;
+      const FixedCullBox cull{0, 0, static_cast<std::int64_t>(group_bounds.width) * kSub,
+                              static_cast<std::int64_t>(group_bounds.height) * kSub};
+      flatten_group(path, group.first, group.end, group_bounds.x, group_bounds.y, edges,
+                    options.reference_geometry ? nullptr : &cull);
+      rasterize_edges(edges, group_bounds.width, group_bounds.height, WindingRule::EvenOdd,
+                      group_coverage.pixels);
+    }
+
+    if (first_group) {
+      first_group = false;
+      auto* out = accumulator.pixels.data().data();
+      const auto stride = accumulator.pixels.stride_bytes();
+      if (group.op == PathCombineOp::Subtract) {
+        // Subtract-first: full canvas minus the shape.
+        for (std::int32_t y = 0; y < accumulator_bounds.height; ++y) {
+          auto* row = out + static_cast<std::size_t>(y) * stride;
+          for (std::int32_t x = 0; x < accumulator_bounds.width; ++x) {
+            const auto coverage =
+                coverage_at(group_coverage, accumulator_bounds.x + x, accumulator_bounds.y + y);
+            row[x] = static_cast<std::uint8_t>(255 - coverage);
+          }
+        }
+      } else {
+        // Add/Intersect/Xor first: exactly the group's coverage.
+        for (std::int32_t y = 0; y < accumulator_bounds.height; ++y) {
+          auto* row = out + static_cast<std::size_t>(y) * stride;
+          for (std::int32_t x = 0; x < accumulator_bounds.width; ++x) {
+            row[x] = coverage_at(group_coverage, accumulator_bounds.x + x, accumulator_bounds.y + y);
+          }
+        }
+      }
+      continue;
+    }
+
+    auto* out = accumulator.pixels.data().data();
+    const auto stride = accumulator.pixels.stride_bytes();
+    // Only the affected region needs touching for Add/Xor/Subtract; Intersect
+    // clears everything outside the group too.
+    if (group.op == PathCombineOp::Intersect) {
+      for (std::int32_t y = 0; y < accumulator_bounds.height; ++y) {
+        auto* row = out + static_cast<std::size_t>(y) * stride;
+        for (std::int32_t x = 0; x < accumulator_bounds.width; ++x) {
+          const auto coverage =
+              coverage_at(group_coverage, accumulator_bounds.x + x, accumulator_bounds.y + y);
+          row[x] = combine_coverage(PathCombineOp::Intersect, row[x], coverage);
+        }
+      }
+    } else if (!group_coverage.bounds.empty()) {
+      const auto region = intersect_rects(group_coverage.bounds, accumulator_bounds);
+      for (std::int32_t y = 0; y < region.height; ++y) {
+        auto* row = out + static_cast<std::size_t>(region.y - accumulator_bounds.y + y) * stride;
+        for (std::int32_t x = 0; x < region.width; ++x) {
+          const auto document_x = region.x + x;
+          const auto document_y = region.y + y;
+          const auto coverage = coverage_at(group_coverage, document_x, document_y);
+          auto& pixel = row[region.x - accumulator_bounds.x + x];
+          pixel = combine_coverage(group.op, pixel, coverage);
+        }
+      }
+    }
+  }
+
+  trim_coverage(accumulator);
+  return accumulator;
+}
+
+namespace {
+
+// A stroke's coverage, and whether all of it is the double-width band cut by the path's own
+// coverage (an Inside or Outside stroke on closed contours). Such a stroke lies wholly on one
+// side of the path, which rasterize_vector_shape uses to composite it beside the fill.
+struct StrokeBand {
+  CoverageBuffer coverage;
+  bool cut_by_path{false};
+};
+
+// `path_coverage`, when given, is rasterize_vector_path(path) over options.clip (the caller
+// already has it); null rasterizes it here.
+StrokeBand rasterize_stroke_band(const VectorPath& path, const VectorStroke& stroke,
+                                 const VectorRasterOptions& options, const CoverageBuffer* path_coverage) {
+  if (options.clip.empty() || path.empty() || !(stroke.width > 0.0)) {
+    return StrokeBand{};
+  }
+  // Inside/outside strokes rasterize the centered band at DOUBLE width, then
+  // clip by the fill region (or its complement): the clipped half is exactly
+  // `width` deep and its path-edge side keeps the crisp fill-coverage AA.
+  const bool centered = stroke.alignment == VectorStrokeAlignment::Center;
+  const double geometry_width = centered ? stroke.width : stroke.width * 2.0;
+  const double half = geometry_width / 2.0;
+  // Doubling the band must not double dash caps: that fills the gaps of the
+  // {0,2}/{2,2} presets and clips round dots into oversized semicircles.
+  const double cap_half_width = !centered && !stroke.dashes.empty() ? stroke.width / 2.0 : half;
+
+  // Resolve dash entries (stroke-width multiples) to pixels.
+  std::vector<double> dashes_px;
+  dashes_px.reserve(stroke.dashes.size());
+  for (const auto dash : stroke.dashes) {
+    dashes_px.push_back(dash * stroke.width);
+  }
+  const double offset_px = stroke.dash_offset * stroke.width;
+
+  // Build the outline first at origin (0,0), then size the band from the
+  // emitted edges' true hull: miter tips reach up to miter_limit x half-width
+  // past the path hull, so any up-front padding guess either wastes memory or
+  // crops spikes into artifacts at the buffer edge (the pre-July-2026
+  // half*2+2 guess did the latter). Every loop's interior lies inside its own
+  // vertex hull, so the edge hull is exact.
+  std::vector<Edge> edges;
+  // Off-center open contours: the centered band moved sideways, never clipped.
+  std::vector<Edge> open_edges;
+  // Outline pieces reach at most a miter (or a square cap's corner) from the polyline.
+  // Dashes measure arc length and Align Edges tests every segment: both keep every curve.
+  std::optional<FixedCullBox> cull;
+  std::optional<OutlineKeep> keep;
+  if (!options.reference_geometry) {
+    keep = OutlineKeep{options.clip.x - 2.0, options.clip.y - 2.0,
+                       static_cast<double>(options.clip.x) + options.clip.width + 2.0,
+                       static_cast<double>(options.clip.y) + options.clip.height + 2.0};
+  }
+  if (stroke.dashes.empty() && !options.align_stroke_edges && !options.reference_geometry) {
+    const double reach = half * std::max(stroke.miter_limit, 1.5) + 4.0;
+    if (std::isfinite(reach) && reach < 1'000'000.0) {
+      const auto pad = static_cast<std::int64_t>(std::ceil(reach)) * kSub;
+      cull = FixedCullBox{static_cast<std::int64_t>(options.clip.x) * kSub - pad,
+                          static_cast<std::int64_t>(options.clip.y) * kSub - pad,
+                          (static_cast<std::int64_t>(options.clip.x) + options.clip.width) * kSub + pad,
+                          (static_cast<std::int64_t>(options.clip.y) + options.clip.height) * kSub + pad};
+    }
+  }
+  for (const auto& contour : combined_stroke_contours(path, cull ? &*cull : nullptr, centered,
+                                                             options.reference_geometry)) {
+    if (contour.points.size() < 2) {
+      continue;
+    }
+    if (!centered && !contour.closed) {
+      // Photoshop spaces dashes along the path itself and then moves each dash
+      // sideways, so dashes past a corner keep the centered stroke's phase
+      // (issue 558: offsetting first put them about 8 px off on a 10 px line).
+      const double side = stroke.alignment == VectorStrokeAlignment::Inside ? 1.0 : -1.0;
+      for (auto run : apply_dashes(contour.points, false, dashes_px, offset_px)) {
+        run.points = offset_open_polyline(run.points, side * stroke.width / 2.0, run.dot_direction);
+        append_run_outline(run, stroke.width / 2.0, stroke.width / 2.0, stroke.cap, stroke.join,
+                           stroke.miter_limit, 0, 0, open_edges, keep ? &*keep : nullptr);
+      }
+      continue;
+    }
+    const auto runs = apply_dashes(contour.points, contour.closed, dashes_px, offset_px);
+    // Align Edges rounds the expanded band's width, then snaps its boundaries.
+    // Thus a centered 1 px stroke on integer coordinates moves its half-pixel
+    // boundaries toward +infinity (PS 2026 COM probes, widths 1..3). Keep
+    // curved/oblique contours and round joins on the continuous raster path.
+    bool rectilinear = options.align_stroke_edges && contour.closed && stroke.dashes.empty() &&
+                       stroke.join == VectorStrokeJoin::Miter;
+    for (std::size_t i = 0; rectilinear && i < contour.points.size(); ++i) {
+      const auto& a = contour.points[i];
+      const auto& b = contour.points[(i + 1) % contour.points.size()];
+      rectilinear = a.x == b.x || a.y == b.y;
+    }
+    const auto first_edge = edges.size();
+    const auto aligned_half = rectilinear ? snap_to_pixel_grid(geometry_width) * 0.5 : half;
+    for (const auto& run : runs) {
+      append_run_outline(run, aligned_half, rectilinear ? aligned_half : cap_half_width,
+                         stroke.cap, stroke.join, stroke.miter_limit, 0, 0, edges, keep ? &*keep : nullptr);
+    }
+    if (rectilinear) {
+      const auto aligned = [](FixedPoint point) {
+        return FixedPoint{to_fixed(snap_to_pixel_grid(static_cast<double>(point.x) / kSub)),
+                          to_fixed(snap_to_pixel_grid(static_cast<double>(point.y) / kSub))};
+      };
+      for (auto i = first_edge; i < edges.size(); ++i) {
+        edges[i].from = aligned(edges[i].from);
+        edges[i].to = aligned(edges[i].to);
+      }
+    }
+  }
+  if (edges.empty() && open_edges.empty()) {
+    return StrokeBand{};
+  }
+  const auto& seed_edge = edges.empty() ? open_edges.front() : edges.front();
+  std::int32_t min_fx = seed_edge.from.x;
+  std::int32_t max_fx = min_fx;
+  std::int32_t min_fy = seed_edge.from.y;
+  std::int32_t max_fy = min_fy;
+  for (const auto* list : {&edges, &open_edges}) {
+    for (const auto& edge : *list) {
+      min_fx = std::min({min_fx, edge.from.x, edge.to.x});
+      max_fx = std::max({max_fx, edge.from.x, edge.to.x});
+      min_fy = std::min({min_fy, edge.from.y, edge.to.y});
+      max_fy = std::max({max_fy, edge.from.y, edge.to.y});
+    }
+  }
+  const auto fixed_floor_div = [](std::int32_t v) {
+    return v >= 0 ? v / kSub : -((-v + kSub - 1) / kSub);
+  };
+  Rect band_bounds{fixed_floor_div(min_fx), fixed_floor_div(min_fy), 0, 0};
+  band_bounds.width = fixed_floor_div(max_fx) + 1 - band_bounds.x;
+  band_bounds.height = fixed_floor_div(max_fy) + 1 - band_bounds.y;
+  band_bounds = intersect_rects(band_bounds, options.clip);
+  if (band_bounds.empty()) {
+    return StrokeBand{};
+  }
+  const std::int32_t shift_x = band_bounds.x * kSub;
+  const std::int32_t shift_y = band_bounds.y * kSub;
+  for (auto* list : {&edges, &open_edges}) {
+    for (auto& edge : *list) {
+      edge.from.x -= shift_x;
+      edge.from.y -= shift_y;
+      edge.to.x -= shift_x;
+      edge.to.y -= shift_y;
+    }
+  }
+  CoverageBuffer band;
+  band.bounds = band_bounds;
+  band.pixels = PixelBuffer(band_bounds.width, band_bounds.height, PixelFormat::gray8());
+  if (!edges.empty()) {
+    rasterize_edges(edges, band_bounds.width, band_bounds.height, WindingRule::NonZero, band.pixels);
+  }
+
+  const bool cut_by_path = !centered && !edges.empty();
+  if (cut_by_path) {
+    CoverageBuffer own_region;
+    if (path_coverage == nullptr) {
+      VectorRasterOptions region_options;
+      region_options.clip = options.clip;
+      region_options.reference_geometry = options.reference_geometry;
+      own_region = rasterize_vector_path(path, region_options);
+      path_coverage = &own_region;
+    }
+    const auto& region = *path_coverage;
+    auto* bytes = band.pixels.data().data();
+    const auto stride = band.pixels.stride_bytes();
+    const bool inside = stroke.alignment == VectorStrokeAlignment::Inside;
+    for (std::int32_t y = 0; y < band_bounds.height; ++y) {
+      auto* row = bytes + static_cast<std::size_t>(y) * stride;
+      for (std::int32_t x = 0; x < band_bounds.width; ++x) {
+        const auto region_coverage = coverage_at(region, band_bounds.x + x, band_bounds.y + y);
+        const auto clip_value = inside ? region_coverage : 255 - region_coverage;
+        row[x] = static_cast<std::uint8_t>((row[x] * clip_value + 127) / 255);
+      }
+    }
+  }
+  if (!open_edges.empty()) {
+    if (edges.empty()) {
+      rasterize_edges(open_edges, band_bounds.width, band_bounds.height, WindingRule::NonZero, band.pixels);
+    } else {
+      PixelBuffer open_band(band_bounds.width, band_bounds.height, PixelFormat::gray8());
+      rasterize_edges(open_edges, band_bounds.width, band_bounds.height, WindingRule::NonZero, open_band);
+      auto* bytes = band.pixels.data().data();
+      const auto* open_bytes = std::as_const(open_band).data().data();
+      const auto stride = band.pixels.stride_bytes();
+      const auto open_stride = open_band.stride_bytes();
+      for (std::int32_t y = 0; y < band_bounds.height; ++y) {
+        auto* row = bytes + static_cast<std::size_t>(y) * stride;
+        const auto* open_row = open_bytes + static_cast<std::size_t>(y) * open_stride;
+        for (std::int32_t x = 0; x < band_bounds.width; ++x) {
+          row[x] = std::max(row[x], open_row[x]);
+        }
+      }
+    }
+  }
+  trim_coverage(band);
+  // An open contour's band is moved sideways, not cut: with one in the path the stroke as a
+  // whole no longer lies on one side of the fill's edge.
+  return StrokeBand{std::move(band), cut_by_path && open_edges.empty()};
+}
+
+}  // namespace
+
+CoverageBuffer rasterize_vector_stroke(const VectorPath& path, const VectorStroke& stroke,
+                                       const VectorRasterOptions& options) {
+  return rasterize_stroke_band(path, stroke, options, nullptr).coverage;
+}
+
+namespace {
+
+// The document bake covers the whole shape wherever it sits, the way a pixel
+// layer keeps its pixels past the canvas edge. Clipped to the canvas, a shape
+// transformed fully onto the pasteboard baked to nothing (the Move tool then
+// had nothing to grab, and the shape was gone), and a half-off shape moved
+// back in showed only its clipped half until something re-baked it. Coverage
+// buffers are sized to the shape, not the domain, so a far-off shape costs
+// its own size. Shapes whose coverage fills the whole clip (a disabled or
+// inverted path, a subtract-first combine) and oversized paths keep the
+// canvas.
+Rect shape_bake_domain(const VectorShapeContent& content, Rect canvas) {
+  if (content.path_disabled || content.path_inverted || content.path.empty() ||
+      content.path.subpaths.front().op == PathCombineOp::Subtract) {
+    return canvas;
+  }
+  const auto hull = content.path.bounds();
+  if (!hull.has_value()) {
+    return canvas;
+  }
+  // Stroke reach (outside alignment, square caps, modest miters) plus the
+  // antialiasing pixel; anything past it only loses off-canvas pixels.
+  const double pad = (content.stroke.enabled ? content.stroke.width * 4.0 : 0.0) + 2.0;
+  const auto left = static_cast<std::int64_t>(std::floor(hull->left - pad));
+  const auto top = static_cast<std::int64_t>(std::floor(hull->top - pad));
+  const auto right = static_cast<std::int64_t>(std::ceil(hull->right + pad));
+  const auto bottom = static_cast<std::int64_t>(std::ceil(hull->bottom + pad));
+  const auto area = (right - left) * (bottom - top);
+  const auto canvas_area = static_cast<std::int64_t>(canvas.width) * canvas.height;
+  constexpr std::int64_t kMinBudget = 16LL * 1024 * 1024;
+  constexpr std::int64_t kCoordinateLimit = 1LL << 29;
+  if (area <= 0 || area > std::max(kMinBudget, 4 * canvas_area) || left < -kCoordinateLimit ||
+      top < -kCoordinateLimit || right > kCoordinateLimit || bottom > kCoordinateLimit) {
+    return canvas;
+  }
+  const auto x0 = std::min<std::int64_t>(canvas.x, left);
+  const auto y0 = std::min<std::int64_t>(canvas.y, top);
+  const auto x1 = std::max<std::int64_t>(static_cast<std::int64_t>(canvas.x) + canvas.width, right);
+  const auto y1 = std::max<std::int64_t>(static_cast<std::int64_t>(canvas.y) + canvas.height, bottom);
+  return Rect{static_cast<std::int32_t>(x0), static_cast<std::int32_t>(y0), static_cast<std::int32_t>(x1 - x0),
+              static_cast<std::int32_t>(y1 - y0)};
+}
+
+// A fill layer without a vector mask aligns its gradient to the layer's bounds, which in
+// Photoshop are its user mask's visible samples: gradient-fill.psd's 32-bit layer spans
+// the mask's 44,6..60,100, not the canvas (Testy, October 2026). Nullopt when the layer
+// has a path, no enabled mask, or a mask that shows the layer outside its rectangle.
+[[nodiscard]] std::optional<Rect> fill_layer_mask_bounds(const Layer& layer, const VectorShapeContent& shape, Rect canvas) {
+  const auto& mask = layer.mask();
+  if ((!shape.path.empty() && !shape.path_disabled) || !mask.has_value() || mask->disabled ||
+      mask->default_color != 0 || mask->pixels.empty()) {
+    return std::nullopt;
+  }
+  std::int32_t min_x = mask->pixels.width();
+  std::int32_t min_y = mask->pixels.height();
+  std::int32_t max_x = -1;
+  std::int32_t max_y = -1;
+  for (std::int32_t y = 0; y < mask->pixels.height(); ++y) {
+    for (std::int32_t x = 0; x < mask->pixels.width(); ++x) {
+      if (coverage_at(mask->pixels, x, y) > 0.0F) {
+        min_x = std::min(min_x, x);
+        max_x = std::max(max_x, x);
+        min_y = std::min(min_y, y);
+        max_y = std::max(max_y, y);
+      }
+    }
+  }
+  if (max_x < min_x) {
+    return std::nullopt;
+  }
+  const auto visible = intersect_rect(
+      Rect{mask->bounds.x + min_x, mask->bounds.y + min_y, max_x - min_x + 1, max_y - min_y + 1}, canvas);
+  return visible.empty() ? std::nullopt : std::optional<Rect>(visible);
+}
+
+}  // namespace
+
+Rect vector_shape_coverage_domain(const VectorShapeContent& content, Rect canvas) {
+  const auto domain = shape_bake_domain(content, canvas);
+  if (!(content.feather > 0.05)) {
+    return domain;
+  }
+  // rasterize_vector_shape's raster_domain.
+  const auto radii = mask_feather_box_radii(content.feather);
+  const std::int32_t reach = radii[0] + radii[1] + radii[2];
+  return Rect{domain.x - reach, domain.y - reach, domain.width + 2 * reach, domain.height + 2 * reach};
+}
+
+void update_vector_shape_raster(Layer& layer, Rect canvas, const PatternStore* patterns) {
+  const auto* shape = layer.vector_shape();
+  if (shape == nullptr) {
+    return;
+  }
+  const auto domain = shape_bake_domain(*shape, canvas);
+  // Paint geometry (unaligned gradients, pattern phase) stays on the canvas.
+  const auto mask_bounds = shape->fill.kind == VectorFillKind::Gradient && shape->fill.gradient.align_with_layer
+                               ? fill_layer_mask_bounds(layer, *shape, canvas)
+                               : std::nullopt;
+  const VectorPaintBounds paint_bounds{canvas, mask_bounds, std::nullopt};
+  const bool extended = domain.x != canvas.x || domain.y != canvas.y || domain.width != canvas.width ||
+                        domain.height != canvas.height;
+  auto raster = rasterize_vector_shape(*shape, domain, patterns, &layer,
+                                       extended || mask_bounds.has_value() ? &paint_bounds : nullptr);
+  layer.set_pixels(std::move(raster.pixels));
+  layer.set_bounds(raster.bounds);
+  // The split planes ride the content so the compositor can apply interior
+  // overlays under the vector stroke; they stay in lockstep with pixels().
+  // Content is shared immutably (undo snapshots hold the same object), so the
+  // caches land through set_vector_shape on a copy, never in place.
+  auto updated = *shape;
+  updated.fill_cache = std::move(raster.fill_pixels);
+  updated.stroke_cache = std::move(raster.stroke_pixels);
+  updated.effect_matte_cache = std::move(raster.matte_pixels);
+  layer.set_vector_shape(std::move(updated));
+  layer.metadata()[kLayerMetadataVectorRasterStatus] = kVectorRasterStatusPatchy;
+}
+
+bool gradient_fill_draft_supported(const Layer& layer, Rect canvas) {
+  const auto* shape = layer.vector_shape();
+  constexpr std::int64_t kExactBelowPixels = 1024 * 1024;
+  return shape != nullptr && shape->parts.empty() && shape->fill.kind == VectorFillKind::Gradient &&
+         (shape->path.empty() || shape->path_disabled) && !shape->path_inverted && !(shape->feather > 0.05) &&
+         shape->density == 255 && shape->stroke.fill_enabled && canvas.width > 0 && canvas.height > 0 &&
+         static_cast<std::int64_t>(canvas.width) * canvas.height >= kExactBelowPixels;
+}
+
+bool update_gradient_fill_draft_raster(Layer& layer, Rect canvas, Rect gradient_bounds) {
+  if (!gradient_fill_draft_supported(std::as_const(layer), canvas)) {
+    return false;
+  }
+  PixelBuffer pixels;
+  render_gradient_fill_draft(std::as_const(layer).vector_shape()->fill.gradient, gradient_bounds, canvas.x, canvas.y,
+                             1, canvas.width, canvas.height, pixels);
+  layer.set_pixels(std::move(pixels));
+  layer.set_bounds(canvas);
+  return true;
+}
+
+void render_gradient_fill_draft(const LayerStyleGradient& gradient, Rect gradient_bounds, std::int32_t origin_x,
+                                std::int32_t origin_y, std::int32_t step, std::int32_t width, std::int32_t height,
+                                PixelBuffer& out) {
+  if (width <= 0 || height <= 0) {
+    out = PixelBuffer();
+    return;
+  }
+  step = std::max<std::int32_t>(step, 1);
+  constexpr int kTable = 4096;
+  // The color table depends on the ramp alone, not on where it is placed: a drag of an end
+  // or of the line changes only the placement, so its previews share one table (building
+  // it was most of a view-sized preview, GitHub #714). Keyed on the gradient with its
+  // placement fields set aside; one entry per thread.
+  struct DraftTable {
+    LayerStyleGradient ramp;
+    std::vector<std::array<std::uint8_t, 4>> colors;
+  };
+  thread_local DraftTable cached;
+  auto ramp = gradient;
+  ramp.angle_degrees = 0.0F;
+  ramp.scale = 1.0F;
+  ramp.offset_x_percent = 0.0F;
+  ramp.offset_y_percent = 0.0F;
+  ramp.align_with_layer = false;
+  if (cached.colors.size() != static_cast<std::size_t>(kTable) || !(cached.ramp == ramp)) {
+    cached.colors.resize(static_cast<std::size_t>(kTable));
+    for (int index = 0; index < kTable; ++index) {
+      const auto position = static_cast<float>(index) / static_cast<float>(kTable - 1);
+      const auto color = gradient_color(gradient, position, true);
+      const auto opacity = gradient_stop_opacity(gradient, position, true);
+      cached.colors[static_cast<std::size_t>(index)] = {
+          color.red, color.green, color.blue,
+          static_cast<std::uint8_t>(std::clamp<long>(std::lround(255.0 * static_cast<double>(opacity)), 0L, 255L))};
+    }
+    cached.ramp = std::move(ramp);
+  }
+  // The strips read it from other threads, which have their own thread_local.
+  const auto& table = cached.colors;
+  constexpr std::int32_t kStep = 4;
+  const auto grid_width = width / kStep + 2;
+  const auto grid_height = height / kStep + 2;
+  std::vector<float> grid(static_cast<std::size_t>(grid_width) * static_cast<std::size_t>(grid_height));
+  // Output pixel (x, y) is the document pixel in the middle of its step x step block.
+  const auto half_step = step / 2;
+  const auto exact = [&](std::int32_t x, std::int32_t y) {
+    return gradient_position(gradient, gradient_bounds, origin_x + x * step + half_step,
+                             origin_y + y * step + half_step, GradientSpanBasis::CenterChord);
+  };
+  // A strip is worth a thread only with enough work in it: a view-sized preview (GitHub
+  // #714) takes a few strips, where sixteen cost more to start than to run. A grid point
+  // (an exact ramp position) costs about what forty interpolated pixels do.
+  const auto run_rows = [](std::int32_t rows, std::int64_t work_units,
+                           const std::function<void(std::int32_t, std::int32_t)>& work) {
+    const int workers = std::min({max_blocking_fanout_workers(std::clamp(hardware_worker_threads(), 1, 16)),
+                                  std::max(1, rows / 16),
+                                  static_cast<int>(std::clamp<std::int64_t>(work_units / 65536, 1, 16))});
+    if (workers < 2) {
+      work(0, rows);
+      return;
+    }
+    const auto strip = (rows + workers - 1) / workers;
+    std::vector<std::future<void>> strips;
+    for (std::int32_t start = strip; start < rows; start += strip) {
+      strips.push_back(std::async(std::launch::async, work, start, std::min(rows, start + strip)));
+    }
+    work(0, std::min(rows, strip));
+    for (auto& future : strips) {
+      future.get();
+    }
+  };
+  const auto grid_work = static_cast<std::int64_t>(grid_width) * grid_height * 40;
+  run_rows(grid_height, grid_work, [&](std::int32_t begin, std::int32_t end) {
+    for (std::int32_t gy = begin; gy < end; ++gy) {
+      for (std::int32_t gx = 0; gx < grid_width; ++gx) {
+        grid[static_cast<std::size_t>(gy) * static_cast<std::size_t>(grid_width) + static_cast<std::size_t>(gx)] =
+            exact(gx * kStep, gy * kStep);
+      }
+    }
+  });
+  if (out.width() != width || out.height() != height || out.format() != PixelFormat::rgba8()) {
+    out = PixelBuffer(width, height, PixelFormat::rgba8());
+  }
+  // Detached here, on the launching thread; the strips only write their rows.
+  auto* bytes = out.data().data();
+  const auto stride = out.stride_bytes();
+  constexpr float kScale = static_cast<float>(kTable - 1);
+  run_rows(height, static_cast<std::int64_t>(width) * height, [&](std::int32_t begin, std::int32_t end) {
+    for (std::int32_t y = begin; y < end; ++y) {
+      auto* row = bytes + static_cast<std::size_t>(y) * stride;
+      const auto gy = y / kStep;
+      const auto fy = static_cast<float>(y - gy * kStep) / static_cast<float>(kStep);
+      const auto* top = grid.data() + static_cast<std::size_t>(gy) * static_cast<std::size_t>(grid_width);
+      const auto* bottom = top + grid_width;
+      for (std::int32_t cell_x = 0; cell_x < width; cell_x += kStep) {
+        const auto gx = cell_x / kStep;
+        const auto a = top[gx];
+        const auto b = top[gx + 1];
+        const auto c = bottom[gx];
+        const auto d = bottom[gx + 1];
+        const auto cell_end = std::min(width, cell_x + kStep);
+        // A cell across an Angle seam (0 next to 1) or a sharp turn would interpolate
+        // through the middle of the ramp: evaluate those pixels exactly.
+        const bool exact_cell = std::max(std::max(a, b), std::max(c, d)) - std::min(std::min(a, b), std::min(c, d)) > 0.25F;
+        const auto left = a + (c - a) * fy;
+        const auto step = ((b + (d - b) * fy) - left) / static_cast<float>(kStep);
+        for (std::int32_t x = cell_x; x < cell_end; ++x) {
+          const auto position =
+              exact_cell ? exact(x, y) : left + step * static_cast<float>(x - cell_x);
+          const auto index = std::clamp(static_cast<int>(position * kScale + 0.5F), 0, kTable - 1);
+          std::memcpy(row + static_cast<std::size_t>(x) * 4U, table[static_cast<std::size_t>(index)].data(), 4U);
+        }
+      }
+    }
+  });
+}
+
+Rect gradient_fill_alignment_bounds(const Layer& layer, Rect canvas) {
+  const auto* shape = layer.vector_shape();
+  if (shape == nullptr || shape->fill.kind != VectorFillKind::Gradient || !shape->fill.gradient.align_with_layer) {
+    return canvas;
+  }
+  if (const auto mask_bounds = fill_layer_mask_bounds(layer, *shape, canvas); mask_bounds.has_value()) {
+    return *mask_bounds;
+  }
+  // A pathless, disabled or inverted path covers the whole bake domain, which is the canvas.
+  if (shape->path_disabled || shape->path_inverted || shape->path.empty()) {
+    return canvas;
+  }
+  VectorRasterOptions options;
+  options.clip = shape_bake_domain(*shape, canvas);
+  const auto coverage = rasterize_vector_path(shape->path, options);
+  return coverage.bounds.empty() ? canvas : coverage.bounds;
+}
+
+std::shared_ptr<const PixelBuffer> deep_gradient_fill_raster(const Layer& layer, BitDepth depth) {
+  const auto* shape = layer.vector_shape();
+  const auto bounds = layer.bounds();
+  if (shape == nullptr || depth == BitDepth::UInt8 || bounds.empty() || !shape->parts.empty() ||
+      shape->fill.kind != VectorFillKind::Gradient || !shape->stroke.fill_enabled || shape->feather > 0.05 ||
+      shape->density != 255 || shape->path_inverted ||
+      (shape->stroke.enabled && shape->stroke.width > 0.0 && shape->stroke.opacity > 0.0 &&
+       shape->stroke.content.kind != VectorFillKind::None && !shape->path.empty() && !shape->path_disabled)) {
+    return nullptr;
+  }
+  const bool full_canvas = shape->path.empty() || shape->path_disabled;
+  if (!shape->fill.gradient.align_with_layer && !full_canvas) {
+    return nullptr;
+  }
+  // Keyed like the other render caches: the content revision changes with every edit of
+  // the shape or its pixels, the bounds with a move.
+  using Key = std::tuple<std::uint64_t, std::int32_t, std::int32_t, std::int32_t, std::int32_t, int>;
+  static std::mutex mutex;
+  static std::map<Key, std::shared_ptr<const PixelBuffer>> cache;
+  const Key key{layer.content_revision(), bounds.x, bounds.y, bounds.width, bounds.height, static_cast<int>(depth)};
+  {
+    const std::lock_guard lock(mutex);
+    if (const auto found = cache.find(key); found != cache.end()) {
+      return found->second;
+    }
+  }
+  VectorRasterOptions options;
+  options.clip = bounds;
+  const auto coverage = full_canvas ? rasterize_vector_path(VectorPath{}, options)
+                                    : rasterize_vector_path(shape->path, options);
+  if (coverage.bounds.x != bounds.x || coverage.bounds.y != bounds.y || coverage.bounds.width != bounds.width ||
+      coverage.bounds.height != bounds.height) {
+    return nullptr;  // not the geometry the 8-bit raster baked
+  }
+  const auto linear = depth == BitDepth::Float32;
+  const auto domain = deep_domain_for(depth);
+  // The 8-bit bake's alignment (fill_layer_mask_bounds above).
+  const auto gradient_bounds = fill_layer_mask_bounds(layer, *shape, bounds).value_or(bounds);
+  PixelBuffer pixels(bounds.width, bounds.height, with_bit_depth(PixelFormat::rgba8(), depth));
+  std::vector<float> row(static_cast<std::size_t>(bounds.width) * 4U);
+  for (std::int32_t y = 0; y < bounds.height; ++y) {
+    const auto* cov_row = coverage.pixels.row(y).data();
+    for (std::int32_t x = 0; x < bounds.width; ++x) {
+      const auto document_x = bounds.x + x;
+      const auto document_y = bounds.y + y;
+      const auto position = gradient_position(shape->fill.gradient, gradient_bounds, document_x, document_y,
+                                              GradientSpanBasis::CenterChord);
+      const auto color = gradient_color_precise(shape->fill.gradient, position, true, linear);
+      const auto opacity = gradient_stop_opacity(shape->fill.gradient, position, true);
+      auto* px = row.data() + static_cast<std::size_t>(x) * 4U;
+      px[0] = static_cast<float>(color[0]);
+      px[1] = static_cast<float>(color[1]);
+      px[2] = static_cast<float>(color[2]);
+      px[3] = static_cast<float>(cov_row[x]) * opacity;
+    }
+    store_rgba_row(pixels, y, 0, bounds.width, domain, row);
+  }
+  auto result = std::make_shared<const PixelBuffer>(std::move(pixels));
+  const std::lock_guard lock(mutex);
+  if (cache.size() >= 64U) {
+    cache.clear();
+  }
+  cache.emplace(key, result);
+  return result;
+}
+
+void refresh_vector_shape_effect_matte(Layer& layer, Rect canvas, const PatternStore* patterns) {
+  const auto* shape = std::as_const(layer).vector_shape();
+  if (shape == nullptr) {
+    return;
+  }
+  const auto& pixels = std::as_const(layer).pixels();
+  const auto bounds = layer.bounds();
+  PixelBuffer matte;
+  // Only a gradient or pattern fill can be transparent inside its own coverage.
+  const auto paints_unevenly = [](const VectorFill& fill) {
+    return fill.kind == VectorFillKind::Gradient || fill.kind == VectorFillKind::Pattern;
+  };
+  const bool candidate_shape = shape->parts.empty() && paints_unevenly(shape->fill);
+  if (candidate_shape && !pixels.empty() && pixels.format() == PixelFormat::rgba8()) {
+    const auto domain = shape_bake_domain(*shape, canvas);
+    const VectorPaintBounds paint_bounds{canvas, std::nullopt, std::nullopt};
+    const bool extended = domain.x != canvas.x || domain.y != canvas.y || domain.width != canvas.width ||
+                          domain.height != canvas.height;
+    const auto raster = rasterize_vector_shape(*shape, domain, patterns, &layer, extended ? &paint_bounds : nullptr);
+    const auto overlap = intersect_rects(raster.bounds, bounds);
+    if (!raster.matte_pixels.empty() && !overlap.empty()) {
+      // The kept pixels supply the colors and their own alpha; the bake supplies the
+      // coverage wherever the two rasters overlap.
+      PixelBuffer candidate = pixels;
+      bool differs = false;
+      for (std::int32_t y = overlap.y; y < overlap.y + overlap.height; ++y) {
+        const auto* source = std::as_const(raster.matte_pixels).pixel(overlap.x - raster.bounds.x, y - raster.bounds.y);
+        auto* target = candidate.pixel(overlap.x - bounds.x, y - bounds.y);
+        for (std::int32_t x = 0; x < overlap.width; ++x, source += 4, target += 4) {
+          if (source[3] > target[3]) {
+            target[3] = source[3];
+            differs = true;
+          }
+        }
+      }
+      if (differs) {
+        matte = std::move(candidate);
+      }
+    }
+  }
+  if (matte.empty() && shape->effect_matte_cache.empty()) {
+    return;
+  }
+  auto updated = *shape;
+  updated.effect_matte_cache = std::move(matte);
+  layer.set_vector_shape(std::move(updated));
+}
+
+namespace {
+
+// Photoshop's vector-mask feather: a gaussian of sigma = feather pixels over
+// the path coverage (PS 27.9 calibration, photoshop-vector-mask-feather.psd),
+// approximated by the deterministic three-box blur the raster mask feather
+// uses. `coverage` must already span `reach` pixels beyond the area of
+// interest; the blur grows it by `reach` within `domain`, which is where the
+// passes edge-clamp.
+void feather_coverage(CoverageBuffer& coverage, const std::array<std::int32_t, 3>& radii, Rect domain) {
+  const std::int32_t reach = radii[0] + radii[1] + radii[2];
+  if (reach <= 0 || coverage.bounds.empty()) {
+    return;
+  }
+  Rect expanded{coverage.bounds.x - reach, coverage.bounds.y - reach,
+                coverage.bounds.width + 2 * reach, coverage.bounds.height + 2 * reach};
+  expanded = intersect_rects(expanded, domain);
+  if (expanded.empty()) {
+    return;
+  }
+  const auto width = static_cast<std::size_t>(expanded.width);
+  std::vector<std::uint16_t> plane(width * static_cast<std::size_t>(expanded.height));
+  for (std::int32_t y = 0; y < expanded.height; ++y) {
+    auto* row = plane.data() + static_cast<std::size_t>(y) * width;
+    for (std::int32_t x = 0; x < expanded.width; ++x) {
+      row[x] = static_cast<std::uint16_t>(coverage_at(coverage, expanded.x + x, expanded.y + y) * 257U);
+    }
+  }
+  mask_feather_blur(plane, expanded.width, expanded.height, radii);
+  PixelBuffer blurred(expanded.width, expanded.height, PixelFormat::gray8());
+  for (std::int32_t y = 0; y < expanded.height; ++y) {
+    auto* out = blurred.row(y).data();
+    const auto* in = plane.data() + static_cast<std::size_t>(y) * width;
+    for (std::int32_t x = 0; x < expanded.width; ++x) {
+      out[x] = static_cast<std::uint8_t>((in[x] + 128U) / 257U);
+    }
+  }
+  coverage.bounds = expanded;
+  coverage.pixels = std::move(blurred);
+}
+
+CoverageBuffer crop_coverage(const CoverageBuffer& coverage, Rect clip) {
+  CoverageBuffer cropped;
+  cropped.bounds = intersect_rects(coverage.bounds, clip);
+  if (cropped.bounds.empty()) {
+    cropped.bounds = {};
+    return cropped;
+  }
+  cropped.pixels = PixelBuffer(cropped.bounds.width, cropped.bounds.height, PixelFormat::gray8());
+  for (std::int32_t y = 0; y < cropped.bounds.height; ++y) {
+    const auto source = coverage.pixels.row(cropped.bounds.y - coverage.bounds.y + y)
+                            .subspan(static_cast<std::size_t>(cropped.bounds.x - coverage.bounds.x),
+                                     static_cast<std::size_t>(cropped.bounds.width));
+    std::copy(source.begin(), source.end(), cropped.pixels.row(y).begin());
+  }
+  return cropped;
+}
+
+// Shape-layer density (photoshop-shape-feather.psd, the density-60 layer
+// tinted the whole canvas): the fill shows everywhere at (255 - density)/255,
+// the vector-mask rule applied to the shape's own coverage over `domain`.
+CoverageBuffer apply_shape_density(const CoverageBuffer& coverage, std::uint8_t density, Rect domain) {
+  CoverageBuffer result;
+  if (domain.empty()) {
+    return result;
+  }
+  result.bounds = domain;
+  result.pixels = PixelBuffer(domain.width, domain.height, PixelFormat::gray8());
+  const auto floor_value = static_cast<unsigned>(255U - density);
+  for (std::int32_t y = 0; y < domain.height; ++y) {
+    auto* row = result.pixels.row(y).data();
+    for (std::int32_t x = 0; x < domain.width; ++x) {
+      const auto value = coverage_at(coverage, domain.x + x, domain.y + y);
+      row[x] = static_cast<std::uint8_t>((value * density + floor_value * 255U + 127U) / 255U);
+    }
+  }
+  return result;
+}
+
+// Shape-layer feather: Photoshop blurs the whole rendered shape, fill AND
+// stroke (the probe's dark inside stroke became a soft smear), with the
+// vector-mask gaussian, unclamped at the canvas. Straight-alpha RGBA planes
+// blur premultiplied, then the result is cropped back to the canvas.
+PixelBuffer feather_rgba_plane(const PixelBuffer& pixels, Rect bounds, Rect expanded,
+                               const std::array<std::int32_t, 3>& radii) {
+  const auto width = static_cast<std::size_t>(expanded.width);
+  const auto count = width * static_cast<std::size_t>(expanded.height);
+  std::array<std::vector<std::uint16_t>, 4> planes;
+  for (auto& plane : planes) {
+    plane.assign(count, 0);
+  }
+  for (std::int32_t y = 0; y < bounds.height; ++y) {
+    const auto* row = pixels.data().data() + static_cast<std::size_t>(y) * pixels.stride_bytes();
+    const auto target_y = bounds.y - expanded.y + y;
+    if (target_y < 0 || target_y >= expanded.height) {
+      continue;
+    }
+    for (std::int32_t x = 0; x < bounds.width; ++x) {
+      const auto target_x = bounds.x - expanded.x + x;
+      if (target_x < 0 || target_x >= expanded.width) {
+        continue;
+      }
+      const auto index = static_cast<std::size_t>(target_y) * width + static_cast<std::size_t>(target_x);
+      const unsigned alpha = row[x * 4 + 3];
+      planes[3][index] = static_cast<std::uint16_t>(alpha * 257U);
+      for (int channel = 0; channel < 3; ++channel) {
+        planes[static_cast<std::size_t>(channel)][index] =
+            static_cast<std::uint16_t>((row[x * 4 + channel] * alpha * 257U + 127U) / 255U);
+      }
+    }
+  }
+  for (auto& plane : planes) {
+    mask_feather_blur(plane, expanded.width, expanded.height, radii);
+  }
+  PixelBuffer blurred(expanded.width, expanded.height, PixelFormat::rgba8());
+  for (std::int32_t y = 0; y < expanded.height; ++y) {
+    auto* out = blurred.data().data() + static_cast<std::size_t>(y) * blurred.stride_bytes();
+    for (std::int32_t x = 0; x < expanded.width; ++x) {
+      const auto index = static_cast<std::size_t>(y) * width + static_cast<std::size_t>(x);
+      const unsigned alpha16 = planes[3][index];
+      const auto alpha = static_cast<std::uint8_t>((alpha16 + 128U) / 257U);
+      for (int channel = 0; channel < 3; ++channel) {
+        const unsigned value16 = planes[static_cast<std::size_t>(channel)][index];
+        out[x * 4 + channel] = alpha16 > 0 ? static_cast<std::uint8_t>(std::min<unsigned>(255U, (value16 * 255U + alpha16 / 2U) / alpha16)) : 0;
+      }
+      out[x * 4 + 3] = alpha;
+    }
+  }
+  return blurred;
+}
+
+PixelBuffer crop_rgba(const PixelBuffer& pixels, Rect bounds, Rect clip) {
+  PixelBuffer cropped(clip.width, clip.height, PixelFormat::rgba8());
+  for (std::int32_t y = 0; y < clip.height; ++y) {
+    const auto* source = pixels.data().data() +
+                         static_cast<std::size_t>(clip.y - bounds.y + y) * pixels.stride_bytes() +
+                         static_cast<std::size_t>(clip.x - bounds.x) * 4;
+    std::memcpy(cropped.data().data() + static_cast<std::size_t>(y) * cropped.stride_bytes(), source,
+                static_cast<std::size_t>(clip.width) * 4);
+  }
+  return cropped;
+}
+
+void feather_shape_raster(ShapeRasterResult& result, const std::array<std::int32_t, 3>& radii, Rect domain,
+                          Rect canvas) {
+  const std::int32_t reach = radii[0] + radii[1] + radii[2];
+  if (reach <= 0 || result.bounds.empty()) {
+    return;
+  }
+  Rect expanded{result.bounds.x - reach, result.bounds.y - reach, result.bounds.width + 2 * reach,
+                result.bounds.height + 2 * reach};
+  expanded = intersect_rects(expanded, domain);
+  const auto clip = intersect_rects(expanded, canvas);
+  if (expanded.empty() || clip.empty()) {
+    result.bounds = {};
+    result.pixels = PixelBuffer();
+    result.fill_pixels = PixelBuffer();
+    result.stroke_pixels = PixelBuffer();
+    result.matte_pixels = PixelBuffer();
+    return;
+  }
+  const auto process = [&](PixelBuffer& pixels) {
+    if (pixels.empty()) {
+      return;
+    }
+    pixels = crop_rgba(feather_rgba_plane(pixels, result.bounds, expanded, radii), expanded, clip);
+  };
+  process(result.pixels);
+  process(result.fill_pixels);
+  process(result.stroke_pixels);
+  process(result.matte_pixels);
+  result.bounds = clip;
+}
+
+}  // namespace
+
+void update_vector_mask_raster(Layer& layer, Rect canvas) {
+  const auto* mask = layer.vector_mask();
+  if (mask == nullptr) {
+    return;
+  }
+  auto updated = *mask;
+  const auto radii = updated.feather > 0.05 ? mask_feather_box_radii(updated.feather)
+                                            : std::array<std::int32_t, 3>{};
+  const auto reach = radii[0] + radii[1] + radii[2];
+  CoverageBuffer coverage;
+  if (reach > 0 && !canvas.empty()) {
+    // Unlike the raster mask's, this feather does NOT clamp at the canvas:
+    // coverage beyond the edge is whatever the path says (a path ending on the
+    // canvas edge fades there). Rasterize `reach` pixels past the canvas so
+    // every in-canvas pixel blurs real coverage, then crop back.
+    const Rect domain{canvas.x - reach, canvas.y - reach, canvas.width + 2 * reach, canvas.height + 2 * reach};
+    coverage = rasterize_vector_mask_coverage(updated, domain);
+    feather_coverage(coverage, radii, domain);
+    coverage = crop_coverage(coverage, canvas);
+  } else {
+    coverage = rasterize_vector_mask_coverage(updated, canvas);
+  }
+  updated.cache_bounds = coverage.bounds;
+  updated.cache = std::move(coverage.pixels);
+  layer.set_vector_mask(std::move(updated));
+}
+
+void update_vector_mask_raster_region(Layer& layer, Rect canvas, std::span<const Rect> dirty) {
+  const auto* mask = std::as_const(layer).vector_mask();
+  if (mask == nullptr) {
+    return;
+  }
+  std::vector<Rect> regions;
+  Rect region;  // their union
+  for (const auto& rect : dirty) {
+    if (const auto clipped = intersect_rect(rect, canvas); !clipped.empty()) {
+      regions.push_back(clipped);
+      region = unite_rect(region, clipped);
+    }
+  }
+  if (regions.empty()) {
+    return;
+  }
+  if (mask->feather > 0.05 || mask->path.empty() || mask->cache.empty() || mask->cache_bounds.empty() ||
+      mask->cache.format() != PixelFormat::gray8()) {
+    update_vector_mask_raster(layer, canvas);
+    return;
+  }
+  // An inverted mask's full update covers the whole canvas; a plain one covers the
+  // path, so the old cache plus the dirty rect still holds every covered pixel.
+  const auto bounds = mask->inverted ? canvas : intersect_rect(unite_rect(mask->cache_bounds, region), canvas);
+  auto updated = *mask;
+  if (bounds != mask->cache_bounds) {
+    PixelBuffer grown(bounds.width, bounds.height, PixelFormat::gray8());
+    const auto keep = intersect_rect(mask->cache_bounds, bounds);
+    for (std::int32_t y = keep.y; y < keep.y + keep.height; ++y) {
+      std::memcpy(grown.pixel(keep.x - bounds.x, y - bounds.y),
+                  mask->cache.pixel(keep.x - mask->cache_bounds.x, y - mask->cache_bounds.y),
+                  static_cast<std::size_t>(keep.width));
+    }
+    updated.cache = std::move(grown);
+    updated.cache_bounds = bounds;
+  }
+  auto* cache_bytes = updated.cache.data().data();  // one detach, before the row writes
+  const auto stride = updated.cache.stride_bytes();
+  for (const auto& rect : regions) {
+    const auto coverage = rasterize_vector_mask_coverage(updated, rect);
+    const auto patch = intersect_rect(rect, bounds);
+    for (std::int32_t y = patch.y; y < patch.y + patch.height; ++y) {
+      auto* row = cache_bytes + static_cast<std::size_t>(y - bounds.y) * stride;
+      std::memset(row + (patch.x - bounds.x), 0, static_cast<std::size_t>(patch.width));
+      if (coverage.bounds.empty() || y < coverage.bounds.y || y >= coverage.bounds.y + coverage.bounds.height) {
+        continue;
+      }
+      const auto from = std::max(patch.x, coverage.bounds.x);
+      const auto to = std::min(patch.x + patch.width, coverage.bounds.x + coverage.bounds.width);
+      if (from < to) {
+        std::memcpy(row + (from - bounds.x), coverage.pixels.pixel(from - coverage.bounds.x, y - coverage.bounds.y),
+                    static_cast<std::size_t>(to - from));
+      }
+    }
+  }
+  layer.set_vector_mask(std::move(updated));
+}
+
+CoverageBuffer rasterize_vector_mask_coverage(const LayerVectorMask& mask, Rect clip) {
+  VectorRasterOptions options;
+  options.clip = clip;
+  auto coverage = rasterize_vector_path(mask.path, options);
+  if (!mask.inverted) {
+    return coverage;
+  }
+  auto inverted = full_coverage(clip);
+  if (inverted.bounds.empty()) {
+    return inverted;
+  }
+  auto* out = inverted.pixels.data().data();
+  const auto stride = inverted.pixels.stride_bytes();
+  for (std::int32_t y = 0; y < clip.height; ++y) {
+    auto* row = out + static_cast<std::size_t>(y) * stride;
+    for (std::int32_t x = 0; x < clip.width; ++x) {
+      row[x] = static_cast<std::uint8_t>(255 - coverage_at(coverage, clip.x + x, clip.y + y));
+    }
+  }
+  return inverted;
+}
+
+namespace {
+
+// Paints a coverage buffer with a VectorFill into straight-alpha RGBA8. aligned_bounds is
+// the box an aligned gradient spans, null for the coverage's own bounds. A pointer, not an
+// optional: GCC 12 reports -Wmaybe-uninitialized when a possibly empty optional<Rect> is
+// copied into a parameter.
+PixelBuffer paint_coverage(const CoverageBuffer& coverage, const VectorFill& fill, Rect canvas,
+                           const PatternStore* patterns, const Layer* layer_for_pattern_anchor,
+                           const Rect* aligned_bounds) {
+  PixelBuffer pixels(coverage.bounds.width, coverage.bounds.height, PixelFormat::rgba8());
+  auto* out = pixels.data().data();
+  const auto out_stride = pixels.stride_bytes();
+  const auto* cov = coverage.pixels.data().data();
+  const auto cov_stride = coverage.pixels.stride_bytes();
+
+  if (fill.kind == VectorFillKind::Solid) {
+    for (std::int32_t y = 0; y < coverage.bounds.height; ++y) {
+      auto* row = out + static_cast<std::size_t>(y) * out_stride;
+      const auto* cov_row = cov + static_cast<std::size_t>(y) * cov_stride;
+      for (std::int32_t x = 0; x < coverage.bounds.width; ++x) {
+        row[x * 4 + 0] = fill.color.red;
+        row[x * 4 + 1] = fill.color.green;
+        row[x * 4 + 2] = fill.color.blue;
+        row[x * 4 + 3] = cov_row[x];
+      }
+    }
+    return pixels;
+  }
+
+  if (fill.kind == VectorFillKind::Gradient) {
+    // align_with_layer follows the painted region's bounds (the layer's
+    // transparency bounds once baked); otherwise the canvas.
+    // Fill layers render Photoshop's GdFl geometry: the linear span is the
+    // center chord of the aligned bounds and a Classic 2-stop ramp eases by
+    // the clamped catmull-rom scaled by smoothness (probe5c/5d, PS 27.8).
+    const Rect layer_bounds = aligned_bounds != nullptr ? *aligned_bounds : coverage.bounds;
+    const Rect gradient_bounds = fill.gradient.align_with_layer ? layer_bounds : canvas;
+    const auto paint_rows = [&](std::int32_t row_begin, std::int32_t row_end) {
+      for (std::int32_t y = row_begin; y < row_end; ++y) {
+        auto* row = out + static_cast<std::size_t>(y) * out_stride;
+        const auto* cov_row = cov + static_cast<std::size_t>(y) * cov_stride;
+        const auto document_y = coverage.bounds.y + y;
+        for (std::int32_t x = 0; x < coverage.bounds.width; ++x) {
+          const auto document_x = coverage.bounds.x + x;
+          const auto position = gradient_position(fill.gradient, gradient_bounds, document_x,
+                                                  document_y, GradientSpanBasis::CenterChord);
+          const auto color =
+              gradient_color_dithered(fill.gradient, position, document_x, document_y, true);
+          const auto opacity = gradient_stop_opacity(fill.gradient, position, true);
+          row[x * 4 + 0] = color.red;
+          row[x * 4 + 1] = color.green;
+          row[x * 4 + 2] = color.blue;
+          row[x * 4 + 3] = static_cast<std::uint8_t>(
+              std::clamp<long>(std::lround(static_cast<double>(cov_row[x]) * opacity), 0L, 255L));
+        }
+      }
+    };
+    // Every pixel is a pure function of its position, so row strips on workers write the
+    // same bytes. A shape edit re-bakes on each Path Select or Direct Select drag step,
+    // and one thread took about 10 ms for a 280 px square (GitHub #314).
+    constexpr std::int64_t kParallelGradientPixels = 32 * 1024;
+    const auto height = coverage.bounds.height;
+    const int workers = static_cast<std::int64_t>(coverage.bounds.width) * height >= kParallelGradientPixels
+                            ? std::min(max_blocking_fanout_workers(std::clamp(hardware_worker_threads(), 1, 16)),
+                                       std::max(1, height / 16))
+                            : 1;
+    if (workers < 2) {
+      paint_rows(0, height);
+      return pixels;
+    }
+    const auto strip_rows = (height + workers - 1) / workers;
+    std::vector<std::future<void>> strips;
+    for (std::int32_t start = strip_rows; start < height; start += strip_rows) {
+      strips.push_back(std::async(std::launch::async, paint_rows, start, std::min(height, start + strip_rows)));
+    }
+    paint_rows(0, std::min(height, strip_rows));
+    for (auto& strip : strips) {
+      strip.get();
+    }
+    return pixels;
+  }
+
+  if (fill.kind == VectorFillKind::Pattern) {
+    const PatternResource* resource = patterns != nullptr ? patterns->find(fill.pattern_id) : nullptr;
+    if (resource == nullptr || resource->tile.width() <= 0 || resource->tile.height() <= 0) {
+      return pixels;  // transparent (missing tiles)
+    }
+    const Layer anchor_fallback;
+    const Layer& anchor_layer =
+        layer_for_pattern_anchor != nullptr ? *layer_for_pattern_anchor : anchor_fallback;
+    const PatternTileSampler sampler(resource->tile, anchor_layer, static_cast<float>(fill.pattern_scale),
+                                     static_cast<float>(fill.pattern_angle_degrees), fill.pattern_linked,
+                                     static_cast<float>(fill.pattern_phase_x),
+                                     static_cast<float>(fill.pattern_phase_y));
+    for (std::int32_t y = 0; y < coverage.bounds.height; ++y) {
+      auto* row = out + static_cast<std::size_t>(y) * out_stride;
+      const auto* cov_row = cov + static_cast<std::size_t>(y) * cov_stride;
+      const auto document_y = coverage.bounds.y + y;
+      for (std::int32_t x = 0; x < coverage.bounds.width; ++x) {
+        const auto sample = sampler.sample(coverage.bounds.x + x, document_y);
+        row[x * 4 + 0] = sample.color.red;
+        row[x * 4 + 1] = sample.color.green;
+        row[x * 4 + 2] = sample.color.blue;
+        row[x * 4 + 3] = static_cast<std::uint8_t>(
+            std::clamp<long>(std::lround(static_cast<double>(cov_row[x]) * sample.alpha), 0L, 255L));
+      }
+    }
+  }
+  return pixels;
+}
+
+Rect union_rects(Rect a, Rect b) noexcept {
+  if (a.empty()) {
+    return b;
+  }
+  if (b.empty()) {
+    return a;
+  }
+  const auto x0 = std::min(a.x, b.x);
+  const auto y0 = std::min(a.y, b.y);
+  const auto x1 = std::max(a.x + a.width, b.x + b.width);
+  const auto y1 = std::max(a.y + a.height, b.y + b.height);
+  return Rect{x0, y0, x1 - x0, y1 - y0};
+}
+
+// Whether the shape's stroke draws at all.
+bool shape_stroke_draws(const VectorShapeContent& content) {
+  return content.stroke.enabled && content.stroke.width > 0.0 && content.stroke.opacity > 0.0 &&
+         content.stroke.content.kind != VectorFillKind::None && !content.path.empty() && !content.path_disabled;
+}
+
+// `a_share` of `a` plus `b_share` of `b` (straight-alpha RGBA), mixed premultiplied.
+std::array<std::uint8_t, 4> mix_premultiplied(const std::uint8_t* a, double a_share, const std::uint8_t* b,
+                                              double b_share) {
+  const double a_alpha = a_share * a[3];
+  const double b_alpha = b_share * b[3];
+  const double alpha = a_alpha + b_alpha;  // 0..255
+  std::array<std::uint8_t, 4> out{};
+  if (alpha <= 0.0) {
+    return out;
+  }
+  for (int channel = 0; channel < 3; ++channel) {
+    out[static_cast<std::size_t>(channel)] = static_cast<std::uint8_t>(
+        std::clamp<long>(std::lround((a_alpha * a[channel] + b_alpha * b[channel]) / alpha), 0L, 255L));
+  }
+  out[3] = static_cast<std::uint8_t>(std::clamp<long>(std::lround(alpha), 0L, 255L));
+  return out;
+}
+
+// Density under 100% on a shape whose stroke draws. Photoshop 27.11 (25 probes at Density
+// 98%, 50% and 0%, docs/vector-tools-appearance.md, "Density with a stroke") shows
+//   density * the shape as drawn at 100% + (1 - density) * the stroke's paint alone,
+// premultiplied, with the stroke's paint spread over the whole clip: a solid wash, not the
+// stroke's band or its dashes, with a gradient on the stroke's own bounds. So the canvas is
+// tinted with the stroke's color and the fill sits under a wash of it; without a stroke the
+// fill's paint is what spreads (apply_shape_density). `result` is the shape at Density 100%
+// (feathered already: the wash is not blurred); `wash` is the stroke's paint over `clip` at
+// the stroke's own opacity.
+//
+// The split planes follow, for the compositor's overlay pass (interior overlays cover the
+// fill plane, then the stroke plane is stamped over them): the fill plane stays the fill at
+// 100%, and the stroke plane gains the wash where the fill is, which is where an overlay has
+// just covered it. Outside the fill the base pass already holds the wash.
+void spread_stroke_paint(ShapeRasterResult& result, std::uint8_t density, Rect clip, const PixelBuffer& wash) {
+  if (clip.empty()) {
+    return;
+  }
+  const double kept = static_cast<double>(density) / 255.0;
+  const double spread = static_cast<double>(255 - density) / 255.0;
+  static constexpr std::array<std::uint8_t, 4> kClear{};
+  const bool planes = !result.fill_pixels.empty() && !result.stroke_pixels.empty();
+  const bool matte = !result.matte_pixels.empty();
+  PixelBuffer pixels(clip.width, clip.height, PixelFormat::rgba8());
+  PixelBuffer fill_plane;
+  PixelBuffer stroke_plane;
+  PixelBuffer matte_plane;
+  if (planes) {
+    fill_plane = PixelBuffer(clip.width, clip.height, PixelFormat::rgba8());
+    stroke_plane = PixelBuffer(clip.width, clip.height, PixelFormat::rgba8());
+  }
+  if (matte) {
+    matte_plane = PixelBuffer(clip.width, clip.height, PixelFormat::rgba8());
+  }
+  const auto& shape = std::as_const(result);
+  for (std::int32_t y = 0; y < clip.height; ++y) {
+    const auto document_y = clip.y + y;
+    const bool row_inside = !shape.bounds.empty() && document_y >= shape.bounds.y &&
+                            document_y < shape.bounds.y + shape.bounds.height;
+    for (std::int32_t x = 0; x < clip.width; ++x) {
+      const auto document_x = clip.x + x;
+      const bool inside = row_inside && document_x >= shape.bounds.x && document_x < shape.bounds.x + shape.bounds.width;
+      const auto sx = document_x - shape.bounds.x;
+      const auto sy = document_y - shape.bounds.y;
+      const auto* drawn = inside ? shape.pixels.pixel(sx, sy) : kClear.data();
+      const auto* paint = wash.pixel(x, y);
+      const auto mixed = mix_premultiplied(drawn, kept, paint, spread);
+      std::memcpy(pixels.pixel(x, y), mixed.data(), 4);
+      if (planes) {
+        const auto* fill = inside ? shape.fill_pixels.pixel(sx, sy) : kClear.data();
+        const auto* stroke = inside ? shape.stroke_pixels.pixel(sx, sy) : kClear.data();
+        std::memcpy(fill_plane.pixel(x, y), fill, 4);
+        const auto stamped = mix_premultiplied(stroke, kept, paint, spread * static_cast<double>(fill[3]) / 255.0);
+        std::memcpy(stroke_plane.pixel(x, y), stamped.data(), 4);
+      }
+      if (matte) {
+        auto* out = matte_plane.pixel(x, y);
+        std::memcpy(out, mixed.data(), 4);
+        if (inside) {
+          out[3] = std::max(out[3], shape.matte_pixels.pixel(sx, sy)[3]);
+        }
+      }
+    }
+  }
+  result.bounds = clip;
+  result.pixels = std::move(pixels);
+  result.fill_pixels = std::move(fill_plane);
+  result.stroke_pixels = std::move(stroke_plane);
+  result.matte_pixels = std::move(matte_plane);
+}
+
+}  // namespace
+
+// Native layer flags already travel with edits, undo, duplication and PSD saves. Like fxrp
+// (the paint anchor), sn2P belongs to the owning layer, rather than to the reusable
+// stroke-style descriptor.
+[[nodiscard]] static bool layer_aligns_stroke_edges(const Layer* layer) {
+  if (layer == nullptr) {
+    return false;
+  }
+  for (const auto& block : layer->unknown_psd_blocks()) {
+    if (block.key == "sn2P" && block.payload.size() >= 4U) {
+      return std::any_of(block.payload.begin(), block.payload.begin() + 4,
+                         [](std::uint8_t byte) { return byte != 0; });
+    }
+  }
+  return false;
+}
+
+Rect gradient_stroke_alignment_bounds(const Layer& layer, Rect canvas) {
+  const auto* shape = layer.vector_shape();
+  if (shape == nullptr || !shape->parts.empty() || !shape_stroke_draws(*shape) ||
+      shape->stroke.content.kind != VectorFillKind::Gradient || !shape->stroke.content.gradient.align_with_layer) {
+    return canvas;
+  }
+  // rasterize_vector_shape's stroke band, in update_vector_shape_raster's clip. The band cuts
+  // itself by the path's coverage whether or not the caller hands that coverage in.
+  VectorRasterOptions options;
+  options.clip = vector_shape_coverage_domain(*shape, canvas);
+  options.align_stroke_edges = layer_aligns_stroke_edges(&layer);
+  const auto coverage = rasterize_vector_stroke(shape->path, shape->stroke, options);
+  return coverage.bounds.empty() ? canvas : coverage.bounds;
+}
+
+bool vector_shape_density_spreads(const VectorShapeContent& content) {
+  return content.density != 255 &&
+         (shape_stroke_draws(content) || (content.stroke.fill_enabled && content.fill.kind != VectorFillKind::None));
+}
+
+ShapeRasterResult rasterize_vector_shape(const VectorShapeContent& content, Rect canvas,
+                                         const PatternStore* patterns,
+                                         const Layer* layer_for_pattern_anchor,
+                                         const VectorPaintBounds* paint_bounds) {
+  ShapeRasterResult result;
+  if (!content.parts.empty()) {
+    struct PaintedPart { ShapeRasterResult raster; double opacity; };
+    std::vector<PaintedPart> painted;
+    painted.reserve(content.parts.size());
+    // Each part aligns to its own coverage, but keeps the caller's canvas.
+    std::optional<VectorPaintBounds> part_paint_bounds;
+    if (paint_bounds != nullptr) {
+      part_paint_bounds = VectorPaintBounds{paint_bounds->canvas, std::nullopt, std::nullopt};
+    }
+    for (const auto& part : content.parts) {
+      if (part.opacity <= 0.0F || part.fill_opacity <= 0.0F) { continue; }
+      Layer anchor(0, {}, LayerKind::Pixel);
+      set_layer_effects_reference_point(anchor, part.pattern_anchor[0], part.pattern_anchor[1]);
+      auto raster = rasterize_vector_shape(vector_shape_part_content(content, part), canvas, patterns, &anchor,
+                                           part_paint_bounds.has_value() ? &*part_paint_bounds : nullptr);
+      result.bounds = union_rects(result.bounds, raster.bounds);
+      painted.push_back({std::move(raster), static_cast<double>(part.opacity) * part.fill_opacity});
+    }
+    if (result.bounds.empty()) { return result; }
+    result.pixels = PixelBuffer(result.bounds.width, result.bounds.height, PixelFormat::rgba8());
+    for (const auto& part : painted) {
+      const auto& raster = part.raster;
+      for (int y = 0; y < raster.bounds.height; ++y) {
+        const auto* source = raster.pixels.data().data() + static_cast<std::size_t>(y) * raster.pixels.stride_bytes();
+        auto* target = result.pixels.pixel(raster.bounds.x - result.bounds.x, raster.bounds.y - result.bounds.y + y);
+        for (int x = 0; x < raster.bounds.width; ++x, source += 4, target += 4) {
+          const double alpha = source[3] / 255.0 * part.opacity;
+          if (alpha <= 0.0) { continue; }
+          const double retained = target[3] / 255.0 * (1.0 - alpha);
+          const double combined = alpha + retained;
+          for (int c = 0; c < 3; ++c) {
+            target[c] = static_cast<std::uint8_t>(std::clamp(std::lround((source[c] * alpha + target[c] * retained) / combined), 0L, 255L));
+          }
+          target[3] = static_cast<std::uint8_t>(std::clamp(std::lround(combined * 255.0), 0L, 255L));
+        }
+      }
+    }
+    // A compound (merged, Patchy-only) shape keeps its painted alpha as the effect
+    // silhouette: its parts carry their own opacities, Photoshop has no such layer
+    // to calibrate against, and the vector preview composes it from those parts.
+    return result;
+  }
+  VectorRasterOptions options;
+  // Feather rasterizes `reach` pixels past the canvas so every in-canvas pixel
+  // blurs real coverage (unclamped, the vector-mask recipe), then crops back.
+  const auto feather_radii = content.feather > 0.05 ? mask_feather_box_radii(content.feather)
+                                                    : std::array<std::int32_t, 3>{};
+  const std::int32_t feather_reach = feather_radii[0] + feather_radii[1] + feather_radii[2];
+  const Rect raster_domain =
+      feather_reach > 0 ? Rect{canvas.x - feather_reach, canvas.y - feather_reach,
+                               canvas.width + 2 * feather_reach, canvas.height + 2 * feather_reach}
+                        : canvas;
+  options.clip = raster_domain;
+
+  const bool fill_on = content.stroke.fill_enabled && content.fill.kind != VectorFillKind::None;
+  const bool stroke_on = shape_stroke_draws(content);
+  // With a stroke, Density spreads the stroke's paint, after everything else is drawn
+  // (spread_stroke_paint); without one it lifts the fill's coverage here.
+  const bool stroke_wash = stroke_on && content.density != 255;
+  CoverageBuffer fill_coverage;
+  // The path's own coverage (no Density, no inversion), kept for an Inside or Outside stroke.
+  const VectorRasterOptions path_options = options;
+  std::optional<CoverageBuffer> path_coverage;
+  // A layer-aligned gradient spans the shape whatever its Density: Photoshop 27.11 keeps the
+  // ramp on the shape's bounds at Density 98% and 50% and shows its end colors over the rest
+  // of the canvas (docs/vector-tools-appearance.md, "Gradient fill and Density").
+  Rect fill_alignment_bounds;
+  if (fill_on) {
+    if (content.path_disabled) {
+      // Disabled shape path: the fill covers the whole canvas (mask off).
+      VectorPath everything;
+      fill_coverage = rasterize_vector_path(everything, options);
+    } else if (content.path_inverted) {
+      LayerVectorMask inverter;
+      inverter.path = content.path;
+      inverter.inverted = true;
+      fill_coverage = rasterize_vector_mask_coverage(inverter, raster_domain);
+    } else {
+      fill_coverage = rasterize_vector_path(content.path, options);
+      path_coverage = fill_coverage;
+    }
+    if (content.density != 255 && !stroke_wash) {
+      fill_alignment_bounds = fill_coverage.bounds;
+      fill_coverage = apply_shape_density(fill_coverage, content.density, raster_domain);
+    }
+  }
+  CoverageBuffer stroke_coverage;
+  // True when the stroke lies wholly inside or wholly outside the path and there is a fill
+  // for it to meet (the compositing below).
+  bool stroke_beside_fill = false;
+  if (stroke_on) {
+    options.align_stroke_edges = layer_aligns_stroke_edges(layer_for_pattern_anchor);
+    if (!path_coverage.has_value() && !fill_coverage.bounds.empty() &&
+        content.stroke.alignment != VectorStrokeAlignment::Center) {
+      path_coverage = rasterize_vector_path(content.path, path_options);
+    }
+    auto band = rasterize_stroke_band(content.path, content.stroke, options,
+                                      path_coverage.has_value() ? &*path_coverage : nullptr);
+    stroke_coverage = std::move(band.coverage);
+    stroke_beside_fill = band.cut_by_path && path_coverage.has_value() && !fill_coverage.bounds.empty();
+  }
+
+  // The stroke's paint over the whole clip, for Density with a stroke. A gradient keeps the
+  // box it has on the stroke itself.
+  const auto spread_wash = [&] {
+    if (canvas.empty()) {
+      return;
+    }
+    const Rect* alignment = paint_bounds && paint_bounds->stroke.has_value() ? &*paint_bounds->stroke : nullptr;
+    if (alignment == nullptr && !stroke_coverage.bounds.empty()) {
+      alignment = &stroke_coverage.bounds;
+    }
+    auto wash = paint_coverage(full_coverage(canvas), content.stroke.content, paint_bounds ? paint_bounds->canvas : canvas,
+                               patterns, layer_for_pattern_anchor, alignment);
+    if (content.stroke.opacity < 1.0) {
+      auto* bytes = wash.data().data();
+      const auto count = static_cast<std::size_t>(wash.width()) * static_cast<std::size_t>(wash.height());
+      for (std::size_t i = 0; i < count; ++i) {
+        bytes[i * 4 + 3] = static_cast<std::uint8_t>(
+            std::clamp<long>(std::lround(static_cast<double>(bytes[i * 4 + 3]) * content.stroke.opacity), 0L, 255L));
+      }
+    }
+    spread_stroke_paint(result, content.density, canvas, wash);
+  };
+  const Rect bounds = union_rects(fill_coverage.bounds, stroke_coverage.bounds);
+  if (bounds.empty()) {
+    if (stroke_wash) {
+      spread_wash();
+    }
+    return result;
+  }
+  result.bounds = bounds;
+  result.pixels = PixelBuffer(bounds.width, bounds.height, PixelFormat::rgba8());
+  auto* out = result.pixels.data().data();
+  const auto out_stride = result.pixels.stride_bytes();
+  // Interior overlay effects need the fill and stroke as separate planes
+  // (stroke composites above the overlays); a non-Normal stroke blend folds
+  // against the fill during the bake and cannot be re-stamped standalone.
+  const bool split_planes = !fill_coverage.bounds.empty() && !stroke_coverage.bounds.empty() &&
+                            content.stroke.blend_mode == BlendMode::Normal;
+
+  if (!fill_coverage.bounds.empty()) {
+    const Rect* fill_alignment = paint_bounds && paint_bounds->fill.has_value() ? &*paint_bounds->fill : nullptr;
+    if (fill_alignment == nullptr && !fill_alignment_bounds.empty()) {
+      fill_alignment = &fill_alignment_bounds;
+    }
+    const auto fill_pixels =
+        paint_coverage(fill_coverage, content.fill, paint_bounds ? paint_bounds->canvas : canvas, patterns,
+                       layer_for_pattern_anchor, fill_alignment);
+    const auto* src = fill_pixels.data().data();
+    const auto src_stride = fill_pixels.stride_bytes();
+    if (split_planes) {
+      result.fill_pixels = PixelBuffer(bounds.width, bounds.height, PixelFormat::rgba8());
+    }
+    for (std::int32_t y = 0; y < fill_coverage.bounds.height; ++y) {
+      const auto row_offset =
+          static_cast<std::size_t>(fill_coverage.bounds.y - bounds.y + y) * out_stride +
+          static_cast<std::size_t>(fill_coverage.bounds.x - bounds.x) * 4;
+      std::memcpy(out + row_offset, src + static_cast<std::size_t>(y) * src_stride,
+                  static_cast<std::size_t>(fill_coverage.bounds.width) * 4);
+      if (split_planes) {
+        std::memcpy(result.fill_pixels.data().data() + row_offset,
+                    src + static_cast<std::size_t>(y) * src_stride,
+                    static_cast<std::size_t>(fill_coverage.bounds.width) * 4);
+      }
+    }
+  }
+
+  if (!stroke_coverage.bounds.empty()) {
+    // The stroke paints over the fill within the same raster. Blend mode and
+    // opacity apply against the fill where it exists; Photoshop composites
+    // live shape strokes against the full backdrop, so non-Normal stroke
+    // modes against content BELOW the layer are approximated by this baked
+    // result.
+    const auto stroke_pixels =
+        paint_coverage(stroke_coverage, content.stroke.content, paint_bounds ? paint_bounds->canvas : canvas, patterns,
+                       layer_for_pattern_anchor,
+                       paint_bounds && paint_bounds->stroke.has_value() ? &*paint_bounds->stroke : nullptr);
+    const auto* src = stroke_pixels.data().data();
+    const auto src_stride = stroke_pixels.stride_bytes();
+    if (split_planes) {
+      // Standalone stroke plane: paint color with coverage x stroke opacity
+      // (quantized separately so the combined bake below stays byte-stable).
+      result.stroke_pixels = PixelBuffer(bounds.width, bounds.height, PixelFormat::rgba8());
+      auto* plane = result.stroke_pixels.data().data();
+      const auto plane_stride = result.stroke_pixels.stride_bytes();
+      for (std::int32_t y = 0; y < stroke_coverage.bounds.height; ++y) {
+        auto* plane_row = plane +
+                          static_cast<std::size_t>(stroke_coverage.bounds.y - bounds.y + y) * plane_stride +
+                          static_cast<std::size_t>(stroke_coverage.bounds.x - bounds.x) * 4;
+        const auto* stroke_row = src + static_cast<std::size_t>(y) * src_stride;
+        for (std::int32_t x = 0; x < stroke_coverage.bounds.width; ++x) {
+          const auto alpha =
+              (static_cast<double>(stroke_row[x * 4 + 3]) / 255.0) * content.stroke.opacity;
+          plane_row[x * 4 + 0] = stroke_row[x * 4 + 0];
+          plane_row[x * 4 + 1] = stroke_row[x * 4 + 1];
+          plane_row[x * 4 + 2] = stroke_row[x * 4 + 2];
+          plane_row[x * 4 + 3] =
+              static_cast<std::uint8_t>(std::clamp<long>(std::lround(alpha * 255.0), 0L, 255L));
+        }
+      }
+    }
+    // On a pixel the path's edge crosses, an Inside or Outside stroke and the fill are not two
+    // independent coverages to stack with "over": the stroke lies in the part of the pixel
+    // inside the path (Inside) or in the part outside it (Outside). So the fill alpha UNDER
+    // the stroke is the fill's alpha in that part, not the pixel's average: the fill paint's
+    // own opacity where the fill is (an Inside stroke replaces fill, never adds to it), and
+    // nothing where it is not (an Outside stroke sits beside the fill and the two fill the
+    // pixel; Density never lifts the fill under a stroke). Stacked as independent coverages
+    // an Outside edge pixel was only 1 - f + f*f covered (75% at f = 0.5: a pale seam) and
+    // fill color showed outside an Inside stroke. Photoshop 27.11 probes: docs/vector-tools-appearance.md, "Fill and stroke
+    // on shared edge pixels". Pixels wholly inside or outside the path, Center strokes and
+    // open contours keep the plain "over", byte for byte.
+    const bool stroke_in_path = content.stroke.alignment == VectorStrokeAlignment::Inside;
+    for (std::int32_t y = 0; y < stroke_coverage.bounds.height; ++y) {
+      auto* row = out + static_cast<std::size_t>(stroke_coverage.bounds.y - bounds.y + y) * out_stride +
+                  static_cast<std::size_t>(stroke_coverage.bounds.x - bounds.x) * 4;
+      const auto* stroke_row = src + static_cast<std::size_t>(y) * src_stride;
+      const auto document_y = stroke_coverage.bounds.y + y;
+      for (std::int32_t x = 0; x < stroke_coverage.bounds.width; ++x) {
+        const double source_alpha =
+            (static_cast<double>(stroke_row[x * 4 + 3]) / 255.0) * content.stroke.opacity;
+        if (source_alpha <= 0.0) {
+          continue;
+        }
+        auto* dest = row + static_cast<std::size_t>(x) * 4;
+        const double dest_alpha = static_cast<double>(dest[3]) / 255.0;
+        double under_alpha = dest_alpha;
+        bool edge_pixel = false;
+        if (stroke_beside_fill) {
+          const auto document_x = stroke_coverage.bounds.x + x;
+          const auto path_value = coverage_at(*path_coverage, document_x, document_y);
+          if (path_value != 0 && path_value != 255) {
+            edge_pixel = true;
+            const auto fill_value = coverage_at(fill_coverage, document_x, document_y);
+            const double paint_alpha =
+                fill_value > 0 ? std::min(1.0, static_cast<double>(dest[3]) / static_cast<double>(fill_value))
+                               : 0.0;
+            // The fill is whole on the path's side, or on the other one when inverted.
+            under_alpha = stroke_in_path != content.path_inverted ? paint_alpha : 0.0;
+          }
+        }
+        std::array<std::uint8_t, 3> source_rgb{stroke_row[x * 4 + 0], stroke_row[x * 4 + 1],
+                                               stroke_row[x * 4 + 2]};
+        if (content.stroke.blend_mode != BlendMode::Normal && under_alpha > 0.0) {
+          source_rgb = composite_blended_rgb(source_rgb, {dest[0], dest[1], dest[2]},
+                                             content.stroke.blend_mode, 1.0F,
+                                             static_cast<float>(under_alpha));
+        }
+        // The fill's share of the result: what the stroke leaves showing.
+        const double fill_share =
+            edge_pixel ? std::clamp(dest_alpha - source_alpha * under_alpha, 0.0, 1.0 - source_alpha)
+                       : dest_alpha * (1.0 - source_alpha);
+        const double out_alpha = source_alpha + fill_share;
+        if (out_alpha <= 0.0) {
+          dest[0] = dest[1] = dest[2] = dest[3] = 0;
+          continue;
+        }
+        for (int channel = 0; channel < 3; ++channel) {
+          const double fill_term = edge_pixel ? dest[channel] * fill_share
+                                              : dest[channel] * dest_alpha * (1.0 - source_alpha);
+          const double blended =
+              (source_rgb[static_cast<std::size_t>(channel)] * source_alpha + fill_term) / out_alpha;
+          dest[channel] = static_cast<std::uint8_t>(std::clamp<long>(std::lround(blended), 0L, 255L));
+        }
+        dest[3] = static_cast<std::uint8_t>(std::clamp<long>(std::lround(out_alpha * 255.0), 0L, 255L));
+      }
+    }
+  }
+  // The effect silhouette: coverage in place of painted alpha, kept only where a
+  // gradient or pattern fill made the two differ (ShapeRasterResult::matte_pixels).
+  if (fill_on && (content.fill.kind == VectorFillKind::Gradient || content.fill.kind == VectorFillKind::Pattern)) {
+    PixelBuffer matte = result.pixels;
+    auto* matte_bytes = matte.data().data();
+    const auto matte_stride = matte.stride_bytes();
+    bool differs = false;
+    const auto raise_to = [&](const CoverageBuffer& coverage) {
+      if (coverage.bounds.empty()) {
+        return;
+      }
+      const auto* cover_bytes = std::as_const(coverage.pixels).data().data();
+      const auto cover_stride = coverage.pixels.stride_bytes();
+      for (std::int32_t y = 0; y < coverage.bounds.height; ++y) {
+        const auto* cover_row = cover_bytes + static_cast<std::size_t>(y) * cover_stride;
+        auto* row = matte_bytes + static_cast<std::size_t>(coverage.bounds.y - bounds.y + y) * matte_stride +
+                    static_cast<std::size_t>(coverage.bounds.x - bounds.x) * 4;
+        for (std::int32_t x = 0; x < coverage.bounds.width; ++x) {
+          if (cover_row[x] > row[static_cast<std::size_t>(x) * 4 + 3]) {
+            row[static_cast<std::size_t>(x) * 4 + 3] = cover_row[x];
+            differs = true;
+          }
+        }
+      }
+    };
+    raise_to(fill_coverage);
+    const bool fill_differs = differs;
+    raise_to(stroke_coverage);
+    if (differs) {
+      result.matte_pixels = std::move(matte);
+    }
+    // The split fill plane is what interior overlays cover; they cover the fill's
+    // whole coverage too, so its alpha becomes that coverage.
+    if (fill_differs && !result.fill_pixels.empty() && !fill_coverage.bounds.empty()) {
+      auto* fill_bytes = result.fill_pixels.data().data();
+      const auto fill_stride = result.fill_pixels.stride_bytes();
+      const auto* cover_bytes = std::as_const(fill_coverage.pixels).data().data();
+      const auto cover_stride = fill_coverage.pixels.stride_bytes();
+      for (std::int32_t y = 0; y < fill_coverage.bounds.height; ++y) {
+        const auto* cover_row = cover_bytes + static_cast<std::size_t>(y) * cover_stride;
+        auto* row = fill_bytes + static_cast<std::size_t>(fill_coverage.bounds.y - bounds.y + y) * fill_stride +
+                    static_cast<std::size_t>(fill_coverage.bounds.x - bounds.x) * 4;
+        for (std::int32_t x = 0; x < fill_coverage.bounds.width; ++x) {
+          row[static_cast<std::size_t>(x) * 4 + 3] = std::max(row[static_cast<std::size_t>(x) * 4 + 3], cover_row[x]);
+        }
+      }
+    }
+  }
+  if (feather_reach > 0) {
+    feather_shape_raster(result, feather_radii, raster_domain, canvas);
+  }
+  if (stroke_wash) {
+    spread_wash();
+  }
+  return result;
+}
+
+}  // namespace patchy

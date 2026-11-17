@@ -1,0 +1,4284 @@
+#pragma once
+
+#include "core/adjustment_deep.hpp"
+#include "core/adjustment_layer.hpp"
+#include "core/artboard.hpp"
+#include "core/blend_math.hpp"
+#include "core/layer_render_utils.hpp"
+#include "core/pattern_resource.hpp"
+#include "core/pattern_sampler.hpp"
+#include "core/style_contour.hpp"
+#include "core/vector_raster.hpp"
+
+#include "render/composite_color.hpp"
+#include "render/layer_knockout.hpp"
+#include "render/layer_render_facade.hpp"
+#include "render/style_mask_cache.hpp"
+#include "render/layer_style_mask_ops.hpp"
+#include "render/raster_view_context.hpp"
+#include "support/translate_noop.hpp"
+
+#include <algorithm>
+#include <array>
+#include <chrono>
+#include <cmath>
+#include <cstdint>
+#include <memory>
+#include <optional>
+#include <stdexcept>
+#include <utility>
+#include <vector>
+
+namespace patchy::render_detail {
+
+// Counts adjustment-layer passes on this thread. A deep target caches the DeepAdjuster
+// it builds for a pass; the settings object's address alone cannot key that cache,
+// because consecutive layers' settings reuse the same stack slot.
+inline thread_local std::uint64_t adjustment_pass_serial = 0;
+
+Rect paint_bounds_for_render(const Layer& layer, const PixelBuffer& pixels, Rect bounds,
+                             bool aligned, int effect_padding = 0);
+
+// A clipping run's merged content for the base layer's effect pipeline: the
+// base's own source pixels with its clipped members already composited over
+// them, straight RGBA over `rect` (a sub-rectangle of the base's render
+// bounds that covers the pipeline's draw rectangle). composite_pixel_layer
+// reads the base's COLOR from it and keeps every effect mask on the real
+// source, whose alpha the members cannot widen, so the base's overlays, satin,
+// inner glow/shadow, bevel and stroke land over the members the way Photoshop
+// draws them (docs/ps-compat.md "Clipping masks").
+struct ClipRunContent {
+  const PixelBuffer* pixels{nullptr};
+  Rect rect{};
+  // The interior overlays and satin were folded into the content colors
+  // BEFORE the members landed ("Blend Clipped Layers as Group" off with
+  // "Blend Interior Effects as Group" on), so the pipeline must not apply
+  // them again.
+  bool interiors_prefolded{false};
+};
+
+[[nodiscard]] inline bool layer_has_rendered_blend_if(const Layer& layer) noexcept {
+  return layer.blend_if_payload_status() == BlendIfPayloadStatus::Supported &&
+         !blend_if_is_identity(layer.blend_if());
+}
+
+// Photoshop's Advanced Blending "Channels" restriction, as rendered: zero when
+// the imported payload is preserved but not modeled (non-RGB indices).
+[[nodiscard]] inline std::uint8_t layer_rendered_channel_restriction(const Layer& layer) noexcept {
+  return layer.channel_restriction_supported() ? layer.restricted_channels() : std::uint8_t{0};
+}
+
+[[nodiscard]] inline bool blend_if_has_underlying_ranges(const LayerBlendIf& settings) noexcept {
+  const BlendIfThresholds identity;
+  return std::any_of(settings.channels.begin(), settings.channels.end(), [&](const BlendIfChannelRanges& channel) {
+    return channel.underlying_layer != identity;
+  });
+}
+
+[[nodiscard]] inline bool layer_has_rendered_underlying_blend_if(const Layer& layer) noexcept {
+  return layer_has_rendered_blend_if(layer) && blend_if_has_underlying_ranges(layer.blend_if());
+}
+
+[[nodiscard]] inline bool layers_have_rendered_blend_if(const std::vector<Layer>& layers) noexcept {
+  for (const auto& layer : layers) {
+    if (layer_has_rendered_blend_if(layer) ||
+        (layer.kind() == LayerKind::Group && layers_have_rendered_blend_if(layer.children()))) {
+      return true;
+    }
+  }
+  return false;
+}
+
+[[nodiscard]] inline bool layers_have_rendered_underlying_blend_if(const std::vector<Layer>& layers) noexcept {
+  for (const auto& layer : layers) {
+    if (layer_has_rendered_underlying_blend_if(layer) ||
+        (layer.kind() == LayerKind::Group && layers_have_rendered_underlying_blend_if(layer.children()))) {
+      return true;
+    }
+  }
+  return false;
+}
+
+[[nodiscard]] inline float blend_if_underlying_alpha_factor(const LayerBlendIf& settings,
+                                                             CompositeSample underlying) noexcept {
+  // Photoshop treats the transparent part of a partially covered backdrop as
+  // passing the Underlying Layer test. Only the covered fraction is tested
+  // against the destination color.
+  const auto destination_alpha = clamp_unit(underlying.alpha);
+  return (1.0F - destination_alpha) +
+         destination_alpha *
+             (static_cast<float>(blend_if_underlying_alpha_byte(settings, underlying.color)) / 255.0F);
+}
+
+// Either color type; the RgbColor instantiation is the function above.
+template <typename Color>
+[[nodiscard]] inline float blend_if_underlying_alpha_factor(const LayerBlendIf& settings,
+                                                             CompositeSampleT<Color> underlying,
+                                                             DeepDomain domain) noexcept {
+  if constexpr (std::is_same_v<Color, RgbColor>) {
+    (void)domain;
+    return blend_if_underlying_alpha_factor(settings, underlying);
+  } else {
+    const auto destination_alpha = clamp_unit(underlying.alpha);
+    return (1.0F - destination_alpha) +
+           destination_alpha * blend_if_underlying_factor_for(settings, underlying.color, domain);
+  }
+}
+
+[[nodiscard]] inline float blend_if_source_alpha_factor(const LayerBlendIf& settings,
+                                                        RgbColor source) noexcept {
+  return static_cast<float>(blend_if_source_alpha_byte(settings, source)) / 255.0F;
+}
+
+// Blend If must inspect the layer stack as it stood before any effect from the
+// current layer was drawn. Capturing the touched rectangle also keeps the
+// result stable while the current layer composites pixel by pixel.
+template <typename Color>
+class CompositeSnapshotT {
+public:
+  CompositeSnapshotT() = default;
+
+  template <typename Target>
+  CompositeSnapshotT(const Target& source, Rect rect)
+      : rect_(rect),
+        rgb_(static_cast<std::size_t>(std::max(0, rect.width)) *
+                 static_cast<std::size_t>(std::max(0, rect.height)) * 3U,
+             color_channel_t<Color>{0}),
+        alpha_(static_cast<std::size_t>(std::max(0, rect.width)) *
+                   static_cast<std::size_t>(std::max(0, rect.height)),
+               0.0F) {
+    for (std::int32_t y = 0; y < rect_.height; ++y) {
+      for (std::int32_t x = 0; x < rect_.width; ++x) {
+        const auto index =
+            static_cast<std::size_t>(y) * static_cast<std::size_t>(rect_.width) + static_cast<std::size_t>(x);
+        const auto sample = source.sample_color(rect_.x + x, rect_.y + y);
+        rgb_[index * 3U + 0U] = sample.color.red;
+        rgb_[index * 3U + 1U] = sample.color.green;
+        rgb_[index * 3U + 2U] = sample.color.blue;
+        alpha_[index] = clamp_unit(sample.alpha);
+      }
+    }
+  }
+
+  [[nodiscard]] CompositeSampleT<Color> sample_color(std::int32_t x, std::int32_t y) const noexcept {
+    x -= rect_.x;
+    y -= rect_.y;
+    if (x < 0 || y < 0 || x >= rect_.width || y >= rect_.height) {
+      return {};
+    }
+    const auto index =
+        static_cast<std::size_t>(y) * static_cast<std::size_t>(rect_.width) + static_cast<std::size_t>(x);
+    const auto* rgb = rgb_.data() + index * 3U;
+    return CompositeSampleT<Color>{Color{rgb[0], rgb[1], rgb[2]}, alpha_[index]};
+  }
+
+private:
+  Rect rect_{};
+  std::vector<color_channel_t<Color>> rgb_;
+  std::vector<float> alpha_;
+};
+
+using CompositeSnapshot = CompositeSnapshotT<RgbColor>;
+// The snapshot type a target's backdrops are kept in.
+template <typename Target>
+using target_snapshot_t = CompositeSnapshotT<target_color_t<Target>>;
+
+template <typename Color>
+struct KnockoutBackdropT {
+  // A null snapshot is transparent. Isolation resets both floors; Pass Through
+  // replaces the shallow floor with its entry backdrop and inherits the deep one.
+  const CompositeSnapshotT<Color>* shallow{nullptr};
+  const CompositeSnapshotT<Color>* deep{nullptr};
+};
+
+template <typename Target>
+using target_knockout_t = KnockoutBackdropT<target_color_t<Target>>;
+
+// Photoshop's Opacity on a pass-through group is a post-composite fade: the
+// children first meet the backdrop exactly as at 100% (child blend modes and
+// interior adjustments included), then the whole result interpolates back
+// toward the pre-group backdrop — the PDF non-isolated-group alpha formula.
+// One fade applies to the composite, so overlapping children never
+// double-fade. Per-pixel independence keeps this strip-parallel and
+// dirty-patch safe. Untouched pixels are skipped so their bytes never
+// round-trip through the premultiplied lerp.
+template <typename Target>
+void fade_toward_snapshot(Target& destination, const target_snapshot_t<Target>& before, Rect rect, float opacity) {
+  using Color = target_color_t<Target>;
+  opacity = clamp_unit(opacity);
+  for (std::int32_t y = rect.y; y < rect.y + rect.height; ++y) {
+    for (std::int32_t x = rect.x; x < rect.x + rect.width; ++x) {
+      const auto previous = before.sample_color(x, y);
+      const auto current = destination.sample_color(x, y);
+      if (previous.color == current.color && previous.alpha == current.alpha) {
+        continue;
+      }
+      const auto output_alpha = previous.alpha + (current.alpha - previous.alpha) * opacity;
+      if (output_alpha <= 0.0F) {
+        continue;
+      }
+      const auto previous_weight = previous.alpha * (1.0F - opacity) / output_alpha;
+      const auto current_weight = current.alpha * opacity / output_alpha;
+      const auto color = color_from_floats<Color>(
+          static_cast<float>(previous.color.red) * previous_weight +
+              static_cast<float>(current.color.red) * current_weight,
+          static_cast<float>(previous.color.green) * previous_weight +
+              static_cast<float>(current.color.green) * current_weight,
+          static_cast<float>(previous.color.blue) * previous_weight +
+              static_cast<float>(current.color.blue) * current_weight);
+      destination.store_color(x, y, color, output_alpha);
+    }
+  }
+}
+
+inline const LayerBoundsOverride* layer_override_for_render(const Layer& layer,
+                                                            const std::vector<LayerBoundsOverride>* overrides) {
+  if (overrides == nullptr) {
+    return nullptr;
+  }
+  const auto found = std::find_if(overrides->begin(), overrides->end(), [&layer](const LayerBoundsOverride& override) {
+    return override.layer_id == layer.id();
+  });
+  return found == overrides->end() ? nullptr : &*found;
+}
+
+// Fill applies to a GROUP's content exactly as it does to a pixel layer's: the
+// content fades, the group's own effects do not (Photoshop 2026 flattens of
+// psd-tools' knockout-none-*.psd and passthrough_fill_*.psd, October 2026;
+// docs/ps-compat.md). The July 2026 reading "folder Fill is ignored" came from a
+// probe whose full-strength overlay hid the faded content.
+[[nodiscard]] inline float layer_fill_opacity_for_render(const Layer& layer) noexcept {
+  return layer.fill_opacity();
+}
+
+// The Fill factor of a group. A style-less group's isolated merge has no effect
+// pipeline to carry it, so there Fill is one more opacity multiplier; any Fill
+// below 100% also makes a pass-through group isolate (composite_layer).
+[[nodiscard]] inline float group_fill_factor_for_render(const Layer& layer) noexcept {
+  return layer.kind() == LayerKind::Group ? std::clamp(layer.fill_opacity(), 0.0F, 1.0F) : 1.0F;
+}
+
+inline bool layer_visible_for_render(const Layer& layer,
+                                     const std::vector<LayerBoundsOverride>* overrides) {
+  if (const auto* override = layer_override_for_render(layer, overrides);
+      override != nullptr && override->visible.has_value()) {
+    return *override->visible;
+  }
+  return layer.visible();
+}
+
+inline Rect layer_bounds_for_render(const Layer& layer, const std::vector<LayerBoundsOverride>* overrides) {
+  if (const auto* override = layer_override_for_render(layer, overrides); override != nullptr) {
+    return override->bounds;
+  }
+  return layer_pixel_bounds(layer);
+}
+
+// The buffer whose alpha is the layer's silhouette for layer effects. For almost every
+// layer that is its own pixels. A shape or fill layer whose gradient or pattern fill is
+// transparent inside the shape carries a separate plane (coverage in place of painted
+// alpha, VectorShapeContent::effect_matte_cache): Photoshop draws every effect around the
+// shape and at full strength inside it, wherever the fill itself is transparent.
+// Overrides (transform previews, group silhouettes) keep their own pixels.
+inline const PixelBuffer& effect_matte_source_for_render(const Layer& layer, const PixelBuffer& source) {
+  if (&source != &layer.pixels()) {
+    return source;
+  }
+  const auto* shape = layer.vector_shape();
+  if (shape == nullptr || shape->effect_matte_cache.empty() ||
+      shape->effect_matte_cache.width() != source.width() ||
+      shape->effect_matte_cache.height() != source.height() ||
+      shape->effect_matte_cache.format() != source.format()) {
+    return source;
+  }
+  return shape->effect_matte_cache;
+}
+
+inline const PixelBuffer& layer_pixels_for_render(const Layer& layer,
+                                                  const std::vector<LayerBoundsOverride>* overrides) {
+  if (const auto* override = layer_override_for_render(layer, overrides);
+      override != nullptr && override->pixels != nullptr) {
+    return *override->pixels;
+  }
+  return layer.pixels();
+}
+
+inline Rect adjustment_bounds_for_render(const Layer& layer, const std::vector<LayerBoundsOverride>* overrides) {
+  if (const auto* override = layer_override_for_render(layer, overrides); override != nullptr) {
+    return override->bounds;
+  }
+  return layer.bounds();
+}
+
+inline std::optional<Rect> layer_mask_bounds_for_render(const Layer& layer,
+                                                        const std::vector<LayerBoundsOverride>* overrides) {
+  if (const auto* override = layer_override_for_render(layer, overrides); override != nullptr) {
+    return override->mask_bounds;
+  }
+  return std::nullopt;
+}
+
+// Overrides-aware twin of layer_render_bounds: unions in any
+// LayerBoundsOverride rect (move/transform previews substitute bounds and
+// pixels), so isolated groups can bound their buffers while a preview
+// override is active instead of falling back to the full clip. The result is
+// a SUPERSET of anywhere the subtree can paint - an overridden layer
+// contributes both its historical rect and the override rect, each padded by
+// its effects - which is all the isolation merge needs (coverage can only
+// exist where pixel children painted).
+Rect layer_render_bounds_for_render(const Layer& layer, const std::vector<LayerBoundsOverride>* overrides);
+
+// A styled group's flattened children without the group's own effect
+// padding. The group's effects read this buffer and paint straight into the
+// destination, exactly like a pixel layer's unpadded source, so padding it
+// only allocated transparency (60000 px of it around a 30000 px drop shadow).
+// The children's own effects stay inside, since they are group content.
+Rect group_content_bounds_for_render(const Layer& group, const std::vector<LayerBoundsOverride>* overrides);
+
+// Photoshop's "Layer Mask Hides Effects" ('lmgm') and "Vector Mask Hides Effects"
+// ('vmgm') blending options: a mask with its option on stops shaping the effects
+// and hides their output where it lands instead (effect_output_mask_alpha_for_render
+// multiplies only those masks in). Each mask switches on its own.
+bool layer_mask_clips_effect_output(const Layer& layer);
+
+// Coverage an exterior effect (drop shadow, outer glow) must be painted with so
+// that the base pass compositing over it leaves Photoshop's contribution.
+//
+// Photoshop's probes (COM, July 2026, exterior-knockout series) show the layer
+// and its exterior effects contributing ADDITIVELY against the layer's original
+// backdrop: a 50%-alpha square over gray with a full outer glow renders the glow
+// at its own coverage AND the square at 50%, never the glow attenuated a second
+// time by the square on top of it. Painting the effect first and letting the
+// base pass composite over it costs exactly one (1 - paint) factor, so the
+// pre-multiplied knockout has to divide that factor back out.
+//
+// `shape` is the layer's transparency coverage (source alpha x layer mask) and
+// `paint` is the coverage the base pass will use for the layer's own pixels
+// (shape x Fill x Opacity). `conceals` marks the effects Photoshop knocks out
+// with the layer's SHAPE regardless of whether those pixels paint - every outer
+// glow, and drop shadows with "Layer Knocks Out Drop Shadow" on: a Fill-0 layer
+// shows the pure backdrop inside its shape, never the effect. Without it the
+// only knockout is the layer's own coverage, which the base pass already
+// applies, so the factor is 1.
+[[nodiscard]] inline float exterior_effect_knockout(float shape, float paint, bool conceals) {
+  if (!conceals) {
+    return 1.0F;
+  }
+  const auto remaining = 1.0F - clamp_unit(paint);
+  if (remaining <= 0.0F) {
+    return 0.0F;
+  }
+  return std::min(1.0F, (1.0F - clamp_unit(shape)) / remaining);
+}
+
+// Per-pixel content attenuation from Stroke effects whose Overprint option is
+// off (the Photoshop default): the stroke band knocks the layer's own content
+// — fill, interior effects, and clipped members — out and blends against the
+// layers below (Photoshop 2026 COM probes, July 2026; docs/ps-compat.md).
+// Values are the combined factor over the base draw rect; anything outside
+// the rect reads 1 (no attenuation).
+struct StrokeKnockoutPlane {
+  Rect rect{};
+  std::vector<float> factor;
+
+  [[nodiscard]] float at(std::int32_t x, std::int32_t y) const {
+    if (x < rect.x || y < rect.y || x >= rect.x + rect.width || y >= rect.y + rect.height) {
+      return 1.0F;
+    }
+    return factor[static_cast<std::size_t>(y - rect.y) * static_cast<std::size_t>(rect.width) +
+                  static_cast<std::size_t>(x - rect.x)];
+  }
+};
+
+template <typename Target, typename Callback>
+inline void profile_compositor_step(Target& destination, const Layer& layer, const char* step, Rect rect,
+                                    Callback&& callback) {
+  if constexpr (requires(Target& target, const char* name, const Layer& profiled_layer, Rect profiled_rect,
+                         double elapsed_ms) {
+                  target.profile_compositor_step(name, profiled_layer, profiled_rect, elapsed_ms);
+                }) {
+    const auto started = std::chrono::steady_clock::now();
+    callback();
+    const auto elapsed = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count();
+    destination.profile_compositor_step(step, layer, rect, elapsed);
+  } else {
+    callback();
+  }
+}
+
+// A Shape Burst stroke gradient's per-pixel band position (from
+// stroke_alpha_mask) with the gradient's Reverse applied. Photoshop ignores
+// the angle, scale, offset, and alignment controls for this style (COM
+// probes, July 2026, photoshop-stroke-shapeburst fixtures).
+inline float shape_burst_gradient_position(const LayerStyleGradient& gradient, float band_position) {
+  return clamp_unit(gradient.reverse ? 1.0F - band_position : band_position);
+}
+
+// The ramp's full span in pixels: size plus the same +1 px reach as the
+// coverage band on each side that is a band limit rather than the contour.
+inline float shape_burst_ramp_span(float size, LayerStrokePosition position) {
+  return position == LayerStrokePosition::Center ? size + 2.0F * kStrokeContourOffset
+                                                 : size + kStrokeContourOffset;
+}
+
+// Photoshop supersamples the Shape Burst ramp across each pixel's footprint:
+// a 1-2-1 tent of the sharp per-center colors reproduces both the title.psd
+// silver band's reduced amplitude and the probe fixtures' clamped tail bytes
+// (a symmetric filter is invisible on the probes' interior linear ramp, which
+// is why the sharp model also matched them mid-band).
+RgbColor shape_burst_stroke_color(const LayerStyleGradient& gradient, float band_position,
+                                  float ramp_span, std::int32_t x, std::int32_t y);
+
+float shape_burst_stroke_opacity(const LayerStyleGradient& gradient, float band_position,
+                                 float ramp_span);
+
+// Photoshop composites layer-effect planes with the effect's alpha FOLDED into
+// the source color toward the mode's neutral, then blends at full coverage:
+// toward white for the burn modes (COM-probed July 2026 over a gray backdrop: a
+// 50%-opacity black linearBurn shadow subtracts an absolute 255 x alpha from
+// every channel and colorBurn matches the folded curve exactly, both refuting
+// the plain lerp(b, blend(b, color), alpha) model) and toward BLACK for
+// colorDodge (the July 2026 inner-glow repro probe: a pale-blue 77% colorDodge
+// glow matches blend(b, color x alpha) within 2/255 while the plain model
+// overshoots by ~15). Normal, Multiply, and Darken keep the plain model, and
+// the affine modes — Multiply, Screen, LinearDodge — are algebraically
+// identical either way. Every effect draw goes through here; layer PIXEL
+// compositing keeps the standard model.
+// Dissolve takes its own branch first: it is a coverage decision, not a colour
+// function, so the effect's alpha becomes the probability that the pixel is
+// painted at all and the surviving pixels composite at full strength through
+// Normal. Each effect passes its own DissolveField so a dissolved shadow and a
+// dissolved glow on one layer do not dither onto the same pixels.
+template <typename Target>
+inline void composite_effect_color(Target& destination, std::int32_t x, std::int32_t y, RgbColor color,
+                                   float alpha, BlendMode mode, DissolveField field) {
+  if (mode == BlendMode::Dissolve) {
+    if (dissolve_coverage(x, y, alpha, field) <= 0.0F) {
+      return;
+    }
+    destination.composite_color(x, y, color, 1.0F, BlendMode::Normal);
+    return;
+  }
+  if ((mode == BlendMode::LinearBurn || mode == BlendMode::ColorBurn || mode == BlendMode::ColorDodge) &&
+      destination.sample_color(x, y).alpha < 1.0F) {
+    // The folded color describes the overlap with the backdrop. Uncovered
+    // ground still receives the original color at the effect's real alpha.
+    destination.composite_special_fill_color(x, y, color, 1.0F, alpha, 1.0F, mode);
+    return;
+  }
+  if (mode == BlendMode::LinearBurn || mode == BlendMode::ColorBurn) {
+    const auto fold = [alpha](std::uint8_t channel) {
+      return static_cast<std::uint8_t>(
+          std::clamp<long>(std::lround(255.0F - (255.0F - static_cast<float>(channel)) * alpha), 0L, 255L));
+    };
+    destination.composite_color(x, y, RgbColor{fold(color.red), fold(color.green), fold(color.blue)},
+                                alpha > 0.0F ? 1.0F : 0.0F, mode);
+    return;
+  }
+  if (mode == BlendMode::ColorDodge) {
+    const auto fold = [alpha](std::uint8_t channel) {
+      return static_cast<std::uint8_t>(
+          std::clamp<long>(std::lround(static_cast<float>(channel) * alpha), 0L, 255L));
+    };
+    destination.composite_color(x, y, RgbColor{fold(color.red), fold(color.green), fold(color.blue)},
+                                alpha > 0.0F ? 1.0F : 0.0F, mode);
+    return;
+  }
+  destination.composite_color(x, y, color, alpha, mode);
+}
+
+// RGB-space twin of composite_effect_color, for interior effects that fold into
+// the layer's own straight color instead of compositing onto the destination.
+// The LinearBurn/ColorBurn/ColorDodge opacity pre-fold has to come along or
+// those modes lose their Photoshop calibration.
+[[nodiscard]] std::array<std::uint8_t, 3> fold_effect_color(std::array<std::uint8_t, 3> destination,
+                                                            RgbColor color, float alpha, BlendMode mode,
+                                                            std::int32_t x, std::int32_t y,
+                                                            DissolveField field);
+
+// Deep twin of fold_effect_color (docs/high-bit-depth-compositor.md): the effect color is an 8-bit
+// parameter converted into the domain; the burn/dodge pre-folds keep their 8-bit form.
+[[nodiscard]] DeepChannels fold_effect_color(DeepChannels destination, RgbColor color, float alpha,
+                                             BlendMode mode, std::int32_t x, std::int32_t y,
+                                             DissolveField field, DeepDomain domain);
+
+// One resolved interior overlay (Pattern, Gradient or Color), ready to fold into
+// a layer's straight RGB per pixel. Kept in Photoshop's interior order: pattern
+// under gradient under color.
+struct PreparedInteriorOverlay {
+  enum class Kind : std::uint8_t { Pattern, Gradient, Color };
+
+  Kind kind{Kind::Color};
+  BlendMode blend_mode{BlendMode::Normal};
+  float opacity{1.0F};
+  RgbColor color{};                                 // Color overlay
+  std::optional<PatternTileSampler> pattern{};      // Pattern overlay
+  const LayerStyleGradient* gradient{nullptr};      // Gradient overlay
+  Rect gradient_bounds{};
+};
+
+// Resolves the interior overlays a layer will fold into its own color. An
+// unresolvable pattern is dropped here, which renders nothing - the same
+// outcome render_pattern_overlay gives it.
+[[nodiscard]] std::vector<PreparedInteriorOverlay> prepare_interior_overlays(
+    const Layer& layer, const LayerStyle& style, const PixelBuffer& source, Rect bounds,
+    const PatternStore* patterns);
+
+// Folds the prepared overlays into one styled color. Source alpha, the layer
+// mask, Fill/layer opacity and the backdrop are deliberately absent: the base
+// pass applies each of them once to the folded result, which is what makes a
+// 100%/Normal overlay cover the layer's own pixels the way Photoshop does.
+[[nodiscard]] std::array<std::uint8_t, 3> fold_interior_overlays(
+    std::array<std::uint8_t, 3> styled, const std::vector<PreparedInteriorOverlay>& overlays, std::int32_t x,
+    std::int32_t y);
+
+[[nodiscard]] DeepChannels fold_interior_overlays(DeepChannels styled,
+                                                  const std::vector<PreparedInteriorOverlay>& overlays,
+                                                  std::int32_t x, std::int32_t y, DeepDomain domain);
+
+// Folds the prepared satins into one styled color, after the overlays
+// (Photoshop's interior stack puts Satin above them). Deliberately not routed
+// through fold_effect_color: this fold keeps the plain model for the
+// burn/dodge modes, and changing that would move pinned satin bytes. Dissolve
+// is handled here for the same reason.
+[[nodiscard]] std::array<std::uint8_t, 3> fold_prepared_satins(std::array<std::uint8_t, 3> color,
+                                                               const std::vector<PreparedSatin>& satins,
+                                                               std::int32_t x, std::int32_t y);
+
+[[nodiscard]] DeepChannels fold_prepared_satins(DeepChannels color, const std::vector<PreparedSatin>& satins,
+                                                std::int32_t x, std::int32_t y, DeepDomain domain);
+
+template <typename Target>
+void render_drop_shadow(Target& destination, const Layer& layer, const PixelBuffer& source, Rect clip, Rect bounds,
+                        const LayerDropShadow& shadow, std::optional<Rect> layer_mask_bounds,
+                        StyleMaskProvider* masks = nullptr, std::uint32_t effect_index = 0) {
+  if (!shadow.enabled || shadow.opacity <= 0.0F) {
+    return;
+  }
+  constexpr float kPi = 3.14159265358979323846F;
+  const auto radians = (180.0F - shadow.angle_degrees) * kPi / 180.0F;
+  const auto offset_x = static_cast<int>(std::lround(std::cos(radians) * shadow.distance));
+  const auto offset_y = static_cast<int>(std::lround(std::sin(radians) * shadow.distance));
+  const auto source_bounds = layer_visible_alpha_bounds(layer, source, bounds);
+  if (!source_bounds.has_value()) {
+    return;
+  }
+  const auto radius = layer_style_falloff_radius(shadow.size);
+  const auto shifted_bounds =
+      Rect{source_bounds->x + offset_x, source_bounds->y + offset_y, source_bounds->width, source_bounds->height};
+  // Patchy's continuous (long) shadow extrudes the matte from the layer out to
+  // the offset, so it spans both rectangles; a zero offset degenerates to the
+  // plain shadow and keeps that exact path.
+  const bool continuous = shadow.continuous && (offset_x != 0 || offset_y != 0);
+  const auto effect_bounds =
+      outset_rect(continuous ? unite_rect(*source_bounds, shifted_bounds) : shifted_bounds, radius + 2);
+  const auto draw_rect = intersect_rect(clip, effect_bounds);
+  if (draw_rect.empty()) {
+    return;
+  }
+
+  // radius + 2 apron: spread expansion (spread_radius + 1px ramp) plus the remaining
+  // blur reach size + 2 at most, so a clipped window renders identically to a full one.
+  // The sweep reads the matte up to the full offset behind every pixel, so the
+  // continuous apron adds that reach as well.
+  const auto sweep_reach = continuous ? std::max(std::abs(offset_x), std::abs(offset_y)) : 0;
+  auto legacy_mask_bounds = clipped_mask_bounds(effect_bounds, draw_rect, radius + 2 + sweep_reach);
+  if (continuous) {
+    // The sweep only carries matte from the source, so the window plus the
+    // source bound every sample it can reach; without this a 30000 px long
+    // shadow would size the mask by the full offset around the window.
+    legacy_mask_bounds = intersect_rect(
+        legacy_mask_bounds, unite_rect(outset_rect(draw_rect, radius + 2), outset_rect(*source_bounds, radius + 2)));
+  }
+  const auto [entry, mask_bounds] = style_mask_for_render(
+      masks, layer, StyleMaskKind::DropShadow, effect_index, effect_bounds, effect_bounds, legacy_mask_bounds,
+      bounds, layer_mask_bounds, [&](Rect domain) {
+        StyleMaskEntry computed;
+        if (continuous) {
+          computed.primary = layer_alpha_mask(source, layer, bounds, domain, 0, 0, layer_mask_bounds);
+          sweep_layer_style_mask_in_place(computed.primary, domain.width, domain.height, offset_x, offset_y,
+                                          shadow.fade);
+        } else {
+          computed.primary =
+              layer_alpha_mask(source, layer, bounds, domain, -offset_x, -offset_y, layer_mask_bounds);
+        }
+        prepare_layer_style_soft_mask(computed.primary, domain.width, domain.height, shadow.size, shadow.spread);
+        return computed;
+      });
+  const auto width = mask_bounds.width;
+  const auto& mask = entry->primary;
+
+  // "Layer Knocks Out Drop Shadow" (layerConceals, PS default on): the layer's
+  // transparency shape punches a hole in its own shadow — independent of fill
+  // opacity, master opacity, and any stroke knockout (COM probes July 2026:
+  // a fill-0 or knocked-out interior shows the pure backdrop, never the
+  // shadow). Invisible under fully opaque content, which simply covers the
+  // shadow either way. See exterior_effect_knockout for why the shape factor is
+  // divided by the coverage the base pass will paint with.
+  std::vector<float> conceal_mask;
+  if (shadow.layer_conceals) {
+    conceal_mask = layer_alpha_mask(source, layer, bounds, draw_rect, 0, 0, layer_mask_bounds);
+  }
+  const auto paint_scale = layer_fill_opacity_for_render(layer) * layer.opacity();
+  const auto clip_to_mask = layer_mask_clips_effect_output(layer);
+  // Quality > Contour maps the blurred mask before Opacity (DrSh TrnS).
+  const bool contoured = !style_contour_is_linear(shadow.contour);
+  const auto contour_lut = contoured ? build_style_contour_lut(shadow.contour) : std::array<std::uint8_t, 256>{};
+  for (std::int32_t y = draw_rect.y; y < draw_rect.y + draw_rect.height; ++y) {
+    for (std::int32_t x = draw_rect.x; x < draw_rect.x + draw_rect.width; ++x) {
+      auto coverage = mask[static_cast<std::size_t>((y - mask_bounds.y) * width + (x - mask_bounds.x))];
+      if (contoured) {
+        coverage = sample_style_contour_lut(contour_lut, coverage, shadow.anti_aliased);
+      }
+      auto alpha = coverage * shadow.opacity * layer.opacity();
+      if (clip_to_mask) {
+        alpha *= effect_output_mask_alpha_for_render(layer, x, y, layer_mask_bounds);
+      }
+      if (!conceal_mask.empty()) {
+        const auto shape = conceal_mask[static_cast<std::size_t>((y - draw_rect.y) * draw_rect.width +
+                                                                 (x - draw_rect.x))];
+        alpha *= exterior_effect_knockout(shape, shape * paint_scale, true);
+      }
+      composite_effect_color(destination, x, y, shadow.color, alpha, shadow.blend_mode,
+                             DissolveField::DropShadow);
+    }
+  }
+}
+
+template <typename Target>
+void render_outer_glow(Target& destination, const Layer& layer, const PixelBuffer& source, Rect clip, Rect bounds,
+                       const LayerOuterGlow& glow, std::optional<Rect> layer_mask_bounds,
+                       StyleMaskProvider* masks = nullptr, std::uint32_t effect_index = 0) {
+  if (!glow.enabled || glow.opacity <= 0.0F || glow.size <= 0.0F) {
+    return;
+  }
+  const auto source_bounds = layer_visible_alpha_bounds(layer, source, bounds);
+  if (!source_bounds.has_value()) {
+    return;
+  }
+  const auto radius = layer_style_falloff_radius(glow.size);
+  const auto effect_bounds = outset_rect(*source_bounds, radius + 2);
+  const auto draw_rect = intersect_rect(clip, effect_bounds);
+  if (draw_rect.empty()) {
+    return;
+  }
+
+  // Softer (Photoshop's default technique) expands by the integer spread radius
+  // and blurs with Satin's exact tent kernel (COM-calibrated; see
+  // prepare_outer_glow_softer_mask), so a thin stroke's glow peaks well below
+  // full opacity. Precise keeps the distance-field falloff.
+  const auto softer = glow.technique == LayerGlowTechnique::Softer;
+  const auto legacy_mask_bounds = clipped_mask_bounds(effect_bounds, draw_rect, radius + (softer ? 2 : 1));
+  const auto [entry, mask_bounds] = style_mask_for_render(
+      masks, layer, StyleMaskKind::OuterGlow, effect_index, effect_bounds, effect_bounds, legacy_mask_bounds,
+      bounds, layer_mask_bounds, [&](Rect domain) {
+        StyleMaskEntry computed;
+        auto base = layer_alpha_mask(source, layer, bounds, domain, 0, 0, layer_mask_bounds);
+        if (softer) {
+          prepare_outer_glow_softer_mask(base, domain.width, domain.height, glow.size, glow.spread, glow.range);
+          computed.primary = std::move(base);
+        } else {
+          computed.primary = distance_falloff_mask(base, domain.width, domain.height, glow.size, glow.spread);
+        }
+        return computed;
+      });
+  const auto width = mask_bounds.width;
+  const auto& mask = entry->primary;
+  const auto source_mask = layer_alpha_mask(source, layer, bounds, draw_rect, 0, 0, layer_mask_bounds);
+  const auto source_mask_width = draw_rect.width;
+
+  // The glow always concedes the layer's shape (a Fill-0 layer shows the pure
+  // backdrop inside it, never the glow), but the base pass compositing over the
+  // glow supplies part of that knockout already — see exterior_effect_knockout.
+  const auto paint_scale = layer_fill_opacity_for_render(layer) * layer.opacity();
+  const auto clip_to_mask = layer_mask_clips_effect_output(layer);
+  for (std::int32_t y = draw_rect.y; y < draw_rect.y + draw_rect.height; ++y) {
+    for (std::int32_t x = draw_rect.x; x < draw_rect.x + draw_rect.width; ++x) {
+      const auto source_alpha =
+          source_mask[static_cast<std::size_t>((y - draw_rect.y) * source_mask_width + (x - draw_rect.x))];
+      auto glow_alpha = mask[static_cast<std::size_t>((y - mask_bounds.y) * width + (x - mask_bounds.x))] *
+                        exterior_effect_knockout(source_alpha, source_alpha * paint_scale, true) *
+                        glow.opacity * layer.opacity();
+      if (clip_to_mask) {
+        glow_alpha *= effect_output_mask_alpha_for_render(layer, x, y, layer_mask_bounds);
+      }
+      composite_effect_color(destination, x, y, glow.color, glow_alpha, glow.blend_mode,
+                             DissolveField::OuterGlow);
+    }
+  }
+}
+
+template <typename Target>
+void render_inner_shadow(Target& destination, const Layer& layer, const PixelBuffer& source, Rect clip, Rect bounds,
+                         const LayerInnerShadow& shadow, std::optional<Rect> layer_mask_bounds,
+                         StyleMaskProvider* masks = nullptr, std::uint32_t effect_index = 0,
+                         const StrokeKnockoutPlane* knockout = nullptr) {
+  // Size 0 still renders: Photoshop draws the inverse matte offset by the
+  // rounded distance vector as a hard band (7 px at distance 10 / angle 135,
+  // whatever the choke; photoshop-size-zero-effects.psd, September 2026), which
+  // is exactly what the interior soft mask degenerates to without a blur.
+  if (!shadow.enabled || shadow.opacity <= 0.0F) {
+    return;
+  }
+  const auto draw_rect = intersect_rect(clip, bounds);
+  if (draw_rect.empty()) {
+    return;
+  }
+
+  constexpr float kPi = 3.14159265358979323846F;
+  const auto radians = (180.0F - shadow.angle_degrees) * kPi / 180.0F;
+  // Past the layer's extent plus the blur reach every interior sample reads
+  // outside the layer (fully shadowed), so a farther offset renders
+  // identically; clamping keeps a 30000 px distance from sizing the domain.
+  const auto interior_reach = static_cast<int>(std::lround(std::max(0.0F, shadow.size))) + 2;
+  const auto reach_x = bounds.width + interior_reach;
+  const auto reach_y = bounds.height + interior_reach;
+  const auto offset_x =
+      std::clamp(static_cast<int>(std::lround(std::cos(radians) * shadow.distance)), -reach_x, reach_x);
+  const auto offset_y =
+      std::clamp(static_cast<int>(std::lround(std::sin(radians) * shadow.distance)), -reach_y, reach_y);
+  // The COM-calibrated interior pipeline (July 2026, distance-0 probes at sizes
+  // 5-40 and chokes 0-50 matched byte-for-byte): choke dilation of the inverse
+  // matte, then the tent blur. Padding covers choke reach + tent reach + offset.
+  const auto sample_padding = static_cast<int>(std::lround(std::max(0.0F, shadow.size))) +
+                              std::max(std::abs(offset_x), std::abs(offset_y)) + 2;
+  const auto full_domain = outset_rect(bounds, sample_padding);
+  const auto legacy_mask_bounds = clipped_mask_bounds(full_domain, draw_rect, sample_padding);
+  const auto [entry, mask_bounds] = style_mask_for_render(
+      masks, layer, StyleMaskKind::InnerShadow, effect_index, full_domain, bounds, legacy_mask_bounds, bounds,
+      layer_mask_bounds, [&](Rect domain) {
+        StyleMaskEntry computed;
+        computed.primary =
+            layer_alpha_mask(source, layer, bounds, domain, -offset_x, -offset_y, layer_mask_bounds);
+        prepare_photoshop_interior_soft_mask(computed.primary, domain.width, domain.height, shadow.size,
+                                             shadow.choke);
+        return computed;
+      });
+  const auto width = mask_bounds.width;
+  const auto& shifted_mask = entry->primary;
+
+  const auto source_mask = layer_alpha_mask(source, layer, bounds, draw_rect, 0, 0, layer_mask_bounds);
+  const auto source_mask_width = draw_rect.width;
+  for (std::int32_t y = draw_rect.y; y < draw_rect.y + draw_rect.height; ++y) {
+    for (std::int32_t x = draw_rect.x; x < draw_rect.x + draw_rect.width; ++x) {
+      const auto source_alpha =
+          source_mask[static_cast<std::size_t>((y - draw_rect.y) * source_mask_width + (x - draw_rect.x))];
+      if (source_alpha <= 0.0F) {
+        continue;
+      }
+      const auto falloff_alpha =
+          shifted_mask[static_cast<std::size_t>((y - mask_bounds.y) * width + (x - mask_bounds.x))];
+      auto shadow_alpha = source_alpha * falloff_alpha * shadow.opacity * layer.opacity();
+      if (knockout != nullptr) {
+        shadow_alpha *= knockout->at(x, y);
+      }
+      composite_effect_color(destination, x, y, shadow.color, shadow_alpha, shadow.blend_mode,
+                             DissolveField::InnerShadow);
+    }
+  }
+}
+
+template <typename Target>
+void render_inner_glow(Target& destination, const Layer& layer, const PixelBuffer& source, Rect clip, Rect bounds,
+                       const LayerInnerGlow& glow, std::optional<Rect> layer_mask_bounds,
+                       StyleMaskProvider* masks = nullptr, std::uint32_t effect_index = 0,
+                       const StrokeKnockoutPlane* knockout = nullptr) {
+  // Size 0: an Edge glow has no reach and renders nothing; a Center glow is the
+  // complement of that empty edge field, so it fills the whole shape
+  // (photoshop-size-zero-effects.psd, September 2026). The Softer and the
+  // historical Center paths both produce that from the unblurred matte.
+  if (!glow.enabled || glow.opacity <= 0.0F ||
+      (glow.size <= 0.0F && glow.source != LayerInnerGlowSource::Center)) {
+    return;
+  }
+  const auto draw_rect = intersect_rect(clip, bounds);
+  if (draw_rect.empty()) {
+    return;
+  }
+
+  // Softer (Photoshop's default technique) is the COM-calibrated interior
+  // pipeline: inverse matte -> integer choke dilation -> tent blur -> Range
+  // gain, with Center as the complement (see prepare_inner_glow_softer_mask).
+  // Precise keeps the historical box-blur falloff verbatim (uncalibrated, like
+  // the outer glow's Precise; Range is not applied there).
+  const auto softer = glow.technique == LayerGlowTechnique::Softer;
+  const auto choke_unit = clamp_unit(glow.choke / 100.0F);
+  const auto blur_radius = interior_style_blur_radius(glow.size * (1.0F - choke_unit));
+  int sample_padding = 0;
+  if (softer) {
+    // Covers the choke dilation reach plus the tent reach for every choke split.
+    sample_padding = static_cast<int>(std::lround(std::max(0.0F, glow.size))) + 2;
+  } else {
+    // The choke = 0 padding must stay exactly the historical one: a wider window
+    // shifts the box blur's running-sum rounding, and choke 0 is pinned bit for bit.
+    sample_padding = blur_radius * 3 + 1;
+    if (choke_unit > 0.0F) {
+      sample_padding += static_cast<int>(std::ceil(std::max(0.0F, glow.size) * choke_unit)) + 1;
+    }
+  }
+  const auto full_domain = outset_rect(bounds, sample_padding);
+  const auto legacy_mask_bounds = clipped_mask_bounds(full_domain, draw_rect, sample_padding);
+  const auto [entry, mask_bounds] = style_mask_for_render(
+      masks, layer, StyleMaskKind::InnerGlow, effect_index, full_domain, bounds, legacy_mask_bounds, bounds,
+      layer_mask_bounds, [&](Rect domain) {
+        StyleMaskEntry computed;
+        computed.primary = layer_alpha_mask(source, layer, bounds, domain, 0, 0, layer_mask_bounds);
+        if (softer) {
+          prepare_inner_glow_softer_mask(computed.primary, domain.width, domain.height, glow.size,
+                                         glow.choke, glow.range,
+                                         glow.source == LayerInnerGlowSource::Center);
+        } else if (glow.source == LayerInnerGlowSource::Center && choke_unit <= 0.0F) {
+          // The historical Center-source path: the blurred matte itself is the glow field.
+          blur_mask_in_place(computed.primary, domain.width, domain.height, blur_radius, 3);
+        } else {
+          prepare_layer_style_interior_falloff_mask(computed.primary, domain.width, domain.height, glow.size,
+                                                    glow.choke);
+          if (glow.source == LayerInnerGlowSource::Center) {
+            // Center source with choke: the glow retreats to the choked core (choke 100
+            // leaves a hard Euclidean erosion by the full size).
+            for (auto& value : computed.primary) {
+              value = clamp_unit(1.0F - value);
+            }
+          }
+        }
+        return computed;
+      });
+  const auto width = mask_bounds.width;
+  const auto& falloff_mask = entry->primary;
+
+  const auto source_mask = layer_alpha_mask(source, layer, bounds, draw_rect, 0, 0, layer_mask_bounds);
+  const auto source_mask_width = draw_rect.width;
+  for (std::int32_t y = draw_rect.y; y < draw_rect.y + draw_rect.height; ++y) {
+    for (std::int32_t x = draw_rect.x; x < draw_rect.x + draw_rect.width; ++x) {
+      const auto source_alpha =
+          source_mask[static_cast<std::size_t>((y - draw_rect.y) * source_mask_width + (x - draw_rect.x))];
+      if (source_alpha <= 0.0F) {
+        continue;
+      }
+      const auto source_factor =
+          falloff_mask[static_cast<std::size_t>((y - mask_bounds.y) * width + (x - mask_bounds.x))];
+      auto glow_alpha = source_alpha * source_factor * glow.opacity * layer.opacity();
+      if (knockout != nullptr) {
+        glow_alpha *= knockout->at(x, y);
+      }
+      composite_effect_color(destination, x, y, glow.color, glow_alpha, glow.blend_mode,
+                             DissolveField::InnerGlow);
+    }
+  }
+}
+
+template <typename Target>
+void render_color_overlay(Target& destination, const Layer& layer, const PixelBuffer& source, Rect clip, Rect bounds,
+                          const LayerColorOverlay& overlay, std::optional<Rect> layer_mask_bounds,
+                          const StrokeKnockoutPlane* knockout = nullptr) {
+  if (!overlay.enabled || overlay.opacity <= 0.0F) {
+    return;
+  }
+  const auto draw_rect = intersect_rect(clip, bounds);
+  if (draw_rect.empty()) {
+    return;
+  }
+  const auto source_mask = layer_alpha_mask(source, layer, bounds, draw_rect, 0, 0, layer_mask_bounds);
+  const auto source_mask_width = draw_rect.width;
+  for (std::int32_t y = draw_rect.y; y < draw_rect.y + draw_rect.height; ++y) {
+    for (std::int32_t x = draw_rect.x; x < draw_rect.x + draw_rect.width; ++x) {
+      const auto source_alpha =
+          source_mask[static_cast<std::size_t>((y - draw_rect.y) * source_mask_width + (x - draw_rect.x))];
+      if (source_alpha <= 0.0F) {
+        continue;
+      }
+      auto alpha = source_alpha * overlay.opacity * layer.opacity();
+      if (knockout != nullptr) {
+        alpha *= knockout->at(x, y);
+      }
+      composite_effect_color(destination, x, y, overlay.color, alpha, overlay.blend_mode,
+                             DissolveField::ColorOverlay);
+    }
+  }
+}
+
+template <typename Target>
+void render_gradient_fill(Target& destination, const Layer& layer, const PixelBuffer& source, Rect clip, Rect bounds,
+                          const LayerGradientFill& fill, std::optional<Rect> layer_mask_bounds,
+                          const StrokeKnockoutPlane* knockout = nullptr) {
+  if (!fill.enabled || fill.opacity <= 0.0F) {
+    return;
+  }
+  const auto draw_rect = intersect_rect(clip, bounds);
+  if (draw_rect.empty()) {
+    return;
+  }
+  const auto source_mask = layer_alpha_mask(source, layer, bounds, draw_rect, 0, 0, layer_mask_bounds);
+  const auto source_mask_width = draw_rect.width;
+  const auto gradient_bounds = paint_bounds_for_render(layer, source, bounds, fill.gradient.align_with_layer);
+  for (std::int32_t y = draw_rect.y; y < draw_rect.y + draw_rect.height; ++y) {
+    for (std::int32_t x = draw_rect.x; x < draw_rect.x + draw_rect.width; ++x) {
+      const auto source_alpha =
+          source_mask[static_cast<std::size_t>((y - draw_rect.y) * source_mask_width + (x - draw_rect.x))];
+      if (source_alpha <= 0.0F) {
+        continue;
+      }
+      const auto position = gradient_position(fill.gradient, gradient_bounds, x, y);
+      auto alpha = source_alpha * fill.opacity * layer.opacity() * gradient_stop_opacity(fill.gradient, position);
+      if (knockout != nullptr) {
+        alpha *= knockout->at(x, y);
+      }
+      composite_effect_color(destination, x, y, gradient_color_dithered(fill.gradient, position, x, y), alpha,
+                             fill.blend_mode, DissolveField::GradientOverlay);
+    }
+  }
+}
+
+// PatternSampleRgba and PatternTileSampler moved (verbatim) to
+// core/pattern_sampler.hpp so the vector shape rasterizer shares the
+// PS-calibrated sampling rules; patchy:: is found through the enclosing
+// namespace.
+
+template <typename Target>
+void render_pattern_overlay(Target& destination, const Layer& layer, const PixelBuffer& source, Rect clip,
+                            Rect bounds, const LayerPatternOverlay& overlay,
+                            std::optional<Rect> layer_mask_bounds, const PatternStore* patterns,
+                            const StrokeKnockoutPlane* knockout = nullptr) {
+  if (!overlay.enabled || overlay.opacity <= 0.0F || patterns == nullptr) {
+    return;
+  }
+  const auto* resource = patterns->find(overlay.pattern_id);
+  if (resource == nullptr || resource->tile.empty()) {
+    return;  // unresolvable pattern renders nothing, like Photoshop
+  }
+  const auto draw_rect = intersect_rect(clip, bounds);
+  if (draw_rect.empty()) {
+    return;
+  }
+  const PatternTileSampler sampler(resource->tile, layer, overlay.scale, overlay.angle_degrees,
+                                   overlay.link_with_layer, overlay.phase_x, overlay.phase_y);
+  const auto source_mask = layer_alpha_mask(source, layer, bounds, draw_rect, 0, 0, layer_mask_bounds);
+  const auto source_mask_width = draw_rect.width;
+  for (std::int32_t y = draw_rect.y; y < draw_rect.y + draw_rect.height; ++y) {
+    for (std::int32_t x = draw_rect.x; x < draw_rect.x + draw_rect.width; ++x) {
+      const auto source_alpha =
+          source_mask[static_cast<std::size_t>((y - draw_rect.y) * source_mask_width + (x - draw_rect.x))];
+      if (source_alpha <= 0.0F) {
+        continue;
+      }
+      const auto sample = sampler.sample(x, y);
+      auto alpha = source_alpha * sample.alpha * overlay.opacity * layer.opacity();
+      if (knockout != nullptr) {
+        alpha *= knockout->at(x, y);
+      }
+      if (alpha <= 0.0F) {
+        continue;
+      }
+      composite_effect_color(destination, x, y, sample.color, alpha, overlay.blend_mode,
+                             DissolveField::PatternOverlay);
+    }
+  }
+}
+
+template <typename Target>
+void render_bevel_emboss(Target& destination, const Layer& layer, const PixelBuffer& source, Rect clip, Rect bounds,
+                         const LayerBevelEmboss& bevel, std::optional<Rect> layer_mask_bounds,
+                         StyleMaskProvider* masks = nullptr, std::uint32_t effect_index = 0,
+                         const PatternStore* patterns = nullptr,
+                         const std::vector<LayerStroke>* strokes = nullptr) {
+  if (!bevel.enabled || bevel.size <= 0.0F ||
+      (bevel.highlight_opacity <= 0.0F && bevel.shadow_opacity <= 0.0F)) {
+    return;
+  }
+  const auto stroke_emboss = bevel.style == BevelEmbossStyleKind::StrokeEmboss;
+  if (stroke_emboss &&
+      (strokes == nullptr || std::none_of(strokes->begin(), strokes->end(), [](const LayerStroke& stroke) {
+         return stroke.enabled && stroke.opacity > 0.0F && stroke.size > 0.0F;
+       }))) {
+    return;
+  }
+
+  auto stroke_padding = 0;
+  if (stroke_emboss) {
+    for (const auto& stroke : *strokes) {
+      if (stroke.enabled && stroke.opacity > 0.0F && stroke.size > 0.0F) {
+        stroke_padding = std::max(stroke_padding, static_cast<int>(std::ceil(stroke.size)) + 1);
+      }
+    }
+  }
+  const auto exterior_style = bevel.style == BevelEmbossStyleKind::OuterBevel ||
+                              bevel.style == BevelEmbossStyleKind::Emboss ||
+                              bevel.style == BevelEmbossStyleKind::PillowEmboss;
+  const auto effect_padding = layer_style_falloff_radius(bevel.size + bevel.soften) + stroke_padding + 2;
+  const auto effect_bounds = (exterior_style || stroke_emboss) ? outset_rect(bounds, effect_padding) : bounds;
+  const auto draw_rect = intersect_rect(clip, effect_bounds);
+  if (draw_rect.empty()) {
+    return;
+  }
+
+  constexpr float kPi = 3.14159265358979323846F;
+  const auto sample_padding = effect_padding + 1;
+  const auto angle = (180.0F - bevel.angle_degrees) * kPi / 180.0F;
+  const auto altitude = std::clamp(bevel.altitude_degrees, 0.0F, 90.0F) * kPi / 180.0F;
+  const auto horizontal = std::cos(altitude);
+  const auto light_x = -std::cos(angle) * horizontal;
+  const auto light_y = -std::sin(angle) * horizontal;
+  const auto light_z = std::sin(altitude);
+  // COM-calibrated smooth-bevel surface (July 2026, photoshop-bevel-smooth
+  // fixtures): the normalized height field is `size` pixels deep, so the
+  // per-axis central difference (a 2px span) scales by size/2 x Depth. A
+  // LINEAR Contour sub-option at Range r multiplies the slope by 100/r — the
+  // recovered slope profiles at Range 50 are exactly twice the Range-100 ones,
+  // interior included, refuting any height-domain windowing for the linear
+  // curve (non-linear curves keep the height remap below).
+  auto slope_gain = 1.0F;
+  if (bevel.contour.enabled && style_contour_is_linear(bevel.contour.contour)) {
+    slope_gain = 1.0F / std::clamp(bevel.contour.range, 0.01F, 1.0F);
+  }
+  const auto pillow = bevel.style == BevelEmbossStyleKind::PillowEmboss;
+  // Pillow and plain Emboss share one calibrated model (COM depth sweeps,
+  // photoshop-pillow-emboss and photoshop-emboss-styles fixtures, July 2026):
+  // the slope factor is 0.5 x Depth x the HALF-size tent peak, and Depth is
+  // FLOORED at 25% — depths 1 through 25 all render identically in Photoshop
+  // (title.psd stores 1% and still shades at quarter strength). The existing
+  // 10x ceiling matched the depth-1000 probe as-is. Emboss is the same field
+  // with one global sign (no interior flip: its square profiles are the
+  // pillow interior's, mirrored across the contour on both sides).
+  const auto pillow_family =
+      pillow || bevel.style == BevelEmbossStyleKind::Emboss;
+  const auto normal_scale =
+      pillow_family ? 0.5F * std::clamp(bevel.depth, 0.25F, 10.0F) *
+                          static_cast<float>(satin_tent_peak(bevel.size * 0.5F)) * slope_gain
+                    : 0.5F * std::clamp(bevel.depth, 0.01F, 10.0F) * std::max(1.0F, bevel.size) * slope_gain;
+  const auto direction = bevel.direction_up ? 1.0F : -1.0F;
+  const auto full_domain = outset_rect(bounds, sample_padding);
+  const auto legacy_mask_bounds = clipped_mask_bounds(full_domain, draw_rect, sample_padding);
+  // Contour/texture parameters fold INTO the cached height mask. That is safe
+  // because style edits go through the revision-bumping mutable layer_style()
+  // accessor, so the provider's content_revision-keyed entries can never serve
+  // a stale sub-option state.
+  const auto [entry, mask_bounds] = style_mask_for_render(
+      masks, layer, StyleMaskKind::BevelHeight, effect_index, full_domain, effect_bounds, legacy_mask_bounds, bounds,
+      layer_mask_bounds, [&](Rect domain) {
+        StyleMaskEntry computed;
+        if (stroke_emboss) {
+          computed.secondary.assign(static_cast<std::size_t>(domain.width) * domain.height, 0.0F);
+          // The contour leaves out any mask whose "Hides Effects" option is
+          // on (effect_source_mask_alpha_for_render); those hide the output.
+          const auto mask_shapes_source = true;
+          const auto clip_to_mask = layer_mask_clips_effect_output(layer);
+          const auto has_aligned_gradient =
+              std::any_of(strokes->begin(), strokes->end(), [](const LayerStroke& stroke) {
+                return stroke.enabled && stroke.opacity > 0.0F && stroke.size > 0.0F && stroke.uses_gradient &&
+                       stroke.gradient.align_with_layer;
+              });
+          const auto aligned_gradient_bounds = paint_bounds_for_render(layer, source, bounds, has_aligned_gradient);
+          for (const auto& stroke : *strokes) {
+            if (!stroke.enabled || stroke.opacity <= 0.0F || stroke.size <= 0.0F) {
+              continue;
+            }
+            const auto stroke_shape_burst =
+                stroke.uses_gradient && stroke.gradient.type == LayerStyleGradientType::ShapeBurst;
+            std::vector<float> stroke_band_positions;
+            const auto stroke_mask = stroke_alpha_mask(source, layer, bounds, domain, stroke.size, stroke.position,
+                                                       layer_mask_bounds, mask_shapes_source,
+                                                       stroke_shape_burst ? &stroke_band_positions : nullptr);
+            const auto stroke_radius = std::max(1, static_cast<int>(std::ceil(stroke.size)));
+            const auto stroke_effect_bounds = stroke.position == LayerStrokePosition::Inside
+                                                  ? bounds
+                                                  : outset_rect(bounds, stroke_radius + 1);
+            const auto stroke_gradient_bounds = stroke.uses_gradient && stroke.gradient.align_with_layer
+                                                    ? aligned_gradient_bounds
+                                                    : paint_bounds_for_render(layer, source, stroke_effect_bounds, false,
+                                                        stroke.position == LayerStrokePosition::Inside ? 0 : stroke_radius + 1);
+            for (std::int32_t local_y = 0; local_y < domain.height; ++local_y) {
+              for (std::int32_t local_x = 0; local_x < domain.width; ++local_x) {
+                const auto index = static_cast<std::size_t>(local_y) * domain.width + local_x;
+                auto alpha = stroke_mask[index] * clamp_unit(stroke.opacity);
+                if (alpha > 0.0F && stroke.uses_gradient) {
+                  if (stroke_shape_burst) {
+                    alpha *= shape_burst_stroke_opacity(
+                        stroke.gradient, stroke_band_positions[index],
+                        shape_burst_ramp_span(stroke.size, stroke.position));
+                  } else {
+                    alpha *= gradient_stop_opacity(
+                        stroke.gradient, gradient_position(stroke.gradient, stroke_gradient_bounds,
+                                                           domain.x + local_x, domain.y + local_y));
+                  }
+                }
+                if (alpha > 0.0F && clip_to_mask) {
+                  // "Layer Mask Hides Effects": hide the embossed stroke where it
+                  // lands instead of reshaping its contour.
+                  alpha *= effect_output_mask_alpha_for_render(layer, domain.x + local_x, domain.y + local_y,
+                                                               layer_mask_bounds);
+                }
+                computed.secondary[index] = alpha + computed.secondary[index] * (1.0F - alpha);
+              }
+            }
+          }
+        } else {
+          computed.secondary = layer_alpha_mask(source, layer, bounds, domain, 0, 0, layer_mask_bounds);
+        }
+        // Pillow Emboss and plain Emboss light the smooth HALF-size ramp
+        // directly (the interior lighting handling happens at composite
+        // time). The old |2h-1| pillow fold creased the field at the contour,
+        // cancelling the central difference exactly where Photoshop's shading
+        // peaks, and spread the bands twice as wide as PS's
+        // (photoshop-pillow-emboss probes: shading reach is size/2 per side,
+        // profile peaks at the contour-adjacent pixels).
+        auto height_bevel = bevel;
+        if (bevel.style == BevelEmbossStyleKind::PillowEmboss ||
+            bevel.style == BevelEmbossStyleKind::Emboss) {
+          height_bevel.size = bevel.size * 0.5F;
+        }
+        computed.primary =
+            bevel_technique_height_mask(computed.secondary, domain.width, domain.height, height_bevel);
+        if (bevel.contour.enabled && !style_contour_is_linear(bevel.contour.contour)) {
+          // The Contour sub-option reshapes the bevel's cross-section: the
+          // normalized edge profile (0 at the contour, 1 on the interior
+          // plateau) remaps through the curve, windowed by Range (smaller
+          // ranges compress the curve into the fraction of the profile nearest
+          // the edge). Linear stays bit-identical to the plain bevel.
+          const auto contour_lut = build_style_contour_lut(bevel.contour.contour);
+          const auto range = std::clamp(bevel.contour.range, 0.01F, 1.0F);
+          for (std::size_t index = 0; index < computed.primary.size(); ++index) {
+            const auto remapped = sample_style_contour_lut(
+                contour_lut, clamp_unit(computed.primary[index] / range), bevel.contour.anti_aliased);
+            computed.primary[index] = remapped;
+          }
+        }
+        if (bevel.texture.enabled && patterns != nullptr) {
+          if (const auto* resource = patterns->find(bevel.texture.pattern_id);
+              resource != nullptr && !resource->tile.empty()) {
+            // Texture embosses the whole face: pattern luminance perturbs the
+            // height field before normals. PS calibration (checker probes):
+            // DARK texels are raised by default (Invert flips), and the bump
+            // plane is smoothed so texel plateaus become domes/pits whose
+            // slopes shade the whole cell, not just its edges. The gain was
+            // recalibrated in the LINEAR regime July 2026 with triangle-wave
+            // ramp probes byte-patched into tree_world_a.psd's texture (the
+            // old checker probes only exercised saturated hard edges, where
+            // clamped shading let a ~5x-too-hot gain still fit): the bump
+            // plane feeds the height field with NO extra amplitude, and the
+            // size/bevel-depth/texture-depth couplings through normal_scale
+            // reproduce PS's measured ratios (size 10 and depth 200% both
+            // scale PS's stripe modulation by the same 1.79x they scale
+            // ours). Pinned by photoshop-bevel-texture-ramp.psd/bmp.
+            constexpr float kTextureAmplitude = 1.0F;
+            const PatternTileSampler sampler(resource->tile, layer, bevel.texture.scale, 0.0F,
+                                             bevel.texture.link_with_layer, bevel.texture.phase_x,
+                                             bevel.texture.phase_y);
+            const auto plane_size = computed.primary.size();
+            std::vector<float> bump(plane_size, 0.0F);
+            for (std::int32_t local_y = 0; local_y < domain.height; ++local_y) {
+              for (std::int32_t local_x = 0; local_x < domain.width; ++local_x) {
+                const auto index = static_cast<std::size_t>(local_y) * static_cast<std::size_t>(domain.width) +
+                                   static_cast<std::size_t>(local_x);
+                const auto luminance = sampler.sample_luminance(domain.x + local_x, domain.y + local_y);
+                bump[index] = bevel.texture.invert ? luminance - 0.5F : 0.5F - luminance;
+              }
+            }
+            // Separable box blur (deterministic fixed-order float sums).
+            const auto box_pass = [&](bool horizontal) {
+              constexpr std::int32_t blur_radius = 1;
+              std::vector<float> blurred(plane_size, 0.0F);
+              const auto limit = horizontal ? domain.width : domain.height;
+              const auto lines = horizontal ? domain.height : domain.width;
+              for (std::int32_t line = 0; line < lines; ++line) {
+                for (std::int32_t position = 0; position < limit; ++position) {
+                  float sum = 0.0F;
+                  std::int32_t count = 0;
+                  for (std::int32_t offset = -blur_radius; offset <= blur_radius; ++offset) {
+                    const auto sample = position + offset;
+                    if (sample < 0 || sample >= limit) {
+                      continue;
+                    }
+                    const auto index = horizontal
+                                           ? static_cast<std::size_t>(line) * domain.width + sample
+                                           : static_cast<std::size_t>(sample) * domain.width + line;
+                    sum += bump[index];
+                    ++count;
+                  }
+                  const auto index = horizontal
+                                         ? static_cast<std::size_t>(line) * domain.width + position
+                                         : static_cast<std::size_t>(position) * domain.width + line;
+                  blurred[index] = count > 0 ? sum / static_cast<float>(count) : 0.0F;
+                }
+              }
+              bump.swap(blurred);
+            };
+            box_pass(true);
+            box_pass(false);
+            for (std::size_t index = 0; index < plane_size; ++index) {
+              float texture_coverage = 0.0F;
+              if (bevel.style == BevelEmbossStyleKind::InnerBevel ||
+                  bevel.style == BevelEmbossStyleKind::StrokeEmboss) {
+                texture_coverage = computed.secondary[index];
+              } else {
+                texture_coverage = 1.0F - std::abs(clamp_unit(computed.primary[index]) * 2.0F - 1.0F);
+              }
+              computed.primary[index] +=
+                  bump[index] * bevel.texture.depth * kTextureAmplitude * clamp_unit(texture_coverage);
+            }
+          }
+        }
+        return computed;
+      });
+  const auto& alpha_mask = entry->secondary;
+  const auto& height_mask = entry->primary;
+  const auto mask_width = mask_bounds.width;
+  const auto mask_height = mask_bounds.height;
+  const auto gloss_is_linear = style_contour_is_linear(bevel.gloss_contour);
+  std::array<std::uint8_t, 256> gloss_lut{};
+  if (!gloss_is_linear) {
+    gloss_lut = build_style_contour_lut(bevel.gloss_contour);
+  }
+
+  for (std::int32_t y = draw_rect.y; y < draw_rect.y + draw_rect.height; ++y) {
+    for (std::int32_t x = draw_rect.x; x < draw_rect.x + draw_rect.width; ++x) {
+      const auto local_x = x - mask_bounds.x;
+      const auto local_y = y - mask_bounds.y;
+      const auto mask_index = static_cast<std::size_t>(local_y) * static_cast<std::size_t>(mask_width) +
+                              static_cast<std::size_t>(local_x);
+      const auto matte_alpha = clamp_unit(alpha_mask[mask_index]);
+      float effect_alpha = 0.0F;
+      switch (bevel.style) {
+        case BevelEmbossStyleKind::InnerBevel:
+        case BevelEmbossStyleKind::StrokeEmboss:
+          effect_alpha = matte_alpha;
+          break;
+        case BevelEmbossStyleKind::OuterBevel:
+          effect_alpha = 1.0F - matte_alpha;
+          break;
+        case BevelEmbossStyleKind::Emboss:
+        case BevelEmbossStyleKind::PillowEmboss:
+          effect_alpha = 1.0F;
+          break;
+      }
+      if (effect_alpha <= 0.0F) {
+        continue;
+      }
+      const auto left = mask_sample_or_zero(height_mask, mask_width, mask_height, local_x - 1, local_y);
+      const auto right = mask_sample_or_zero(height_mask, mask_width, mask_height, local_x + 1, local_y);
+      const auto top = mask_sample_or_zero(height_mask, mask_width, mask_height, local_x, local_y - 1);
+      const auto bottom = mask_sample_or_zero(height_mask, mask_width, mask_height, local_x, local_y + 1);
+      const auto base_gradient_x = (left - right) * normal_scale;
+      const auto base_gradient_y = (top - bottom) * normal_scale;
+      if (layer_mask_clips_effect_output(layer)) {
+        effect_alpha *= effect_output_mask_alpha_for_render(layer, x, y, layer_mask_bounds);
+        if (effect_alpha <= 0.0F) {
+          continue;
+        }
+      }
+      // COM-calibrated Lambert shading (July 2026, photoshop-bevel-smooth
+      // fixtures): the surface lighting L = N dot Light with a properly
+      // normalized normal, then the HIGHLIGHT is the excess over the flat-face
+      // value normalized to the headroom, (L - sin(alt)) / (1 - sin(alt)), and
+      // the SHADOW is the deficit normalized to the floor,
+      // (sin(alt) - L) / sin(alt). This reproduces both the full-strength
+      // shadow edge under a low light and the non-monotone highlight band under
+      // a high light (slopes steeper than 90 - altitude tip past the light),
+      // within ~0.4/255 on the altitude 30 and 60 probes. Pillow/Emboss
+      // shadows instead follow the UNNORMALIZED deficit — linear in slope,
+      // saturating early (the probes pin the shadow gain to the highlight's
+      // small-signal gain at every depth, and the shadow side clamps long
+      // before the normalized Lambert would; the lit side's tip-past regime
+      // stays on the normalized value, depth-1000 probe).
+      // Locally flat surface: the tent/EDT plateaus far from any contour are
+      // exact float constants, so exact-zero differences identify them.
+      const auto surface_is_flat = left == right && top == bottom;
+      const auto shade = [&](float sign, float weight) {
+        if (weight <= 0.0F) {
+          return;
+        }
+        const auto gradient_x = base_gradient_x * sign;
+        const auto gradient_y = base_gradient_y * sign;
+        const auto length = std::sqrt(gradient_x * gradient_x + gradient_y * gradient_y + 1.0F);
+        const auto raw_light = gradient_x * light_x + gradient_y * light_y + light_z;
+        const auto surface_light = raw_light / std::max(0.0001F, length);
+        auto lighting = surface_light >= light_z
+                            ? (surface_light - light_z) / std::max(0.01F, 1.0F - light_z)
+                            : -((light_z - surface_light) / std::max(0.01F, light_z));
+        if (pillow_family && raw_light < light_z) {
+          lighting = -((light_z - raw_light) / std::max(0.01F, light_z));
+        }
+        if (!gloss_is_linear) {
+          // Gloss Contour remaps the Lambert LIGHT VALUE, not the split
+          // shading: L' = LUT(clamp(L, 0, 1)), and the highlight/shadow split
+          // then runs on L' against the flat-face sin(altitude) (COM-calibrated
+          // July 2026, photoshop-gloss-contour fixtures). Flat INTERIOR
+          // plateaus genuinely carry the constant LUT(sin alt) wash (Ring
+          // at altitude 30 brightens the whole fill by 6/255; the altitude-60
+          // arm DARKENS it, pinning the input as L itself, refuting every
+          // signed-lighting mapping), while flat EXTERIOR ground stays clean -
+          // the shading weight of a locally flat pixel is the matte alpha.
+          // Without that gate the flat remap painted constant fog across the
+          // whole padded effect rect outside the shape (the
+          // pinball_from_photoshop garbage). The pillow shadow keeps its
+          // calibrated unnormalized deficit, fed by the remapped raw light.
+          // Linear short-circuits so plain bevels stay bit-identical to the
+          // historical render.
+          if (surface_is_flat) {
+            weight *= matte_alpha;
+            if (weight <= 0.0F) {
+              return;
+            }
+          }
+          const auto remapped_surface = sample_style_contour_lut(
+              gloss_lut, clamp_unit(surface_light), bevel.gloss_anti_aliased);
+          lighting = remapped_surface >= light_z
+                         ? (remapped_surface - light_z) / std::max(0.01F, 1.0F - light_z)
+                         : -((light_z - remapped_surface) / std::max(0.01F, light_z));
+          if (pillow_family && remapped_surface < light_z) {
+            const auto remapped_raw = sample_style_contour_lut(
+                gloss_lut, clamp_unit(raw_light), bevel.gloss_anti_aliased);
+            if (remapped_raw < light_z) {
+              lighting = -((light_z - remapped_raw) / std::max(0.01F, light_z));
+            }
+          }
+        }
+        if (lighting > 0.0F) {
+          composite_effect_color(destination, x, y, bevel.highlight_color,
+                                 clamp_unit(lighting) * weight * bevel.highlight_opacity * layer.opacity(),
+                                 bevel.highlight_blend_mode, DissolveField::Bevel);
+        } else if (lighting < 0.0F) {
+          composite_effect_color(destination, x, y, bevel.shadow_color,
+                                 clamp_unit(-lighting) * weight * bevel.shadow_opacity * layer.opacity(),
+                                 bevel.shadow_blend_mode, DissolveField::Bevel);
+        }
+      };
+      if (pillow) {
+        // The valley mirrors the rim, and Photoshop composites BOTH sides at
+        // an anti-aliased edge: the exterior-signed shading over the pixel's
+        // backdrop fraction and the flipped interior shading over its content
+        // fraction (pillow-ellipse fringe pixels carry a highlight AND a
+        // shadow simultaneously — photoshop-emboss-styles probes). A hard
+        // 0.5 flip instead speckles curved AA contours with wrong-side
+        // shading. Direction Down ("Out ", title.psd and the probes) is the
+        // calibrated orientation; Direction Up mirrors it.
+        const auto base_sign = bevel.direction_up ? -1.0F : 1.0F;
+        shade(base_sign, effect_alpha * (1.0F - matte_alpha));
+        shade(-base_sign, effect_alpha * matte_alpha);
+      } else {
+        shade(direction, effect_alpha);
+      }
+    }
+  }
+}
+
+// A stroke whose band mask has been resolved (cache hit or computed): enough
+// to draw the stroke and to evaluate its Overprint knockout of the base
+// content without recomputing the distance fields.
+struct PreparedStroke {
+  const LayerStroke* stroke{nullptr};
+  std::uint32_t effect_index{0};
+  std::shared_ptr<const StyleMaskEntry> entry;
+  Rect mask_bounds{};
+  Rect draw_rect{};
+  Rect gradient_bounds{};
+  bool clip_to_mask{false};
+  bool shape_burst{false};
+  // The stroke draw adds the under-content plane to its mask when the base pass
+  // could not fold it (see composite_pixel_layer); the knockout mirrors the draw.
+  bool draw_includes_underlay{false};
+};
+
+std::optional<PreparedStroke> prepare_stroke_render(const Layer& layer, const PixelBuffer& source, Rect clip,
+                                                    Rect bounds, const LayerStroke& stroke,
+                                                    std::optional<Rect> layer_mask_bounds,
+                                                    StyleMaskProvider* masks, std::uint32_t effect_index);
+
+// The band coverage the draw loop actually paints with at (x, y): the cached
+// mask value times the "Layer Mask Hides Effects" output clip.
+float prepared_stroke_coverage(const PreparedStroke& prepared, const Layer& layer, std::int32_t x,
+                               std::int32_t y, std::optional<Rect> layer_mask_bounds);
+
+// The folded part of a stroke at (x, y): the share beneath the layer's own pixels
+// plus the share replacing them (zero outside the planes or for opaque content).
+float prepared_stroke_underlay(const PreparedStroke& prepared, const Layer& layer, std::int32_t x,
+                               std::int32_t y, std::optional<Rect> layer_mask_bounds);
+
+// The band membership that knocks the content out at (x, y): the over-draw coverage,
+// except where the content is semi-transparent and the band replaces it outright.
+float prepared_stroke_knockout_coverage(const PreparedStroke& prepared, const Layer& layer, std::int32_t x,
+                                        std::int32_t y, std::optional<Rect> layer_mask_bounds,
+                                        float coverage);
+
+// Mirrors render_prepared_stroke's per-pixel alpha (same expressions in the
+// same order) so the Normal-mode knockout divisor cancels the later stroke
+// draw exactly.
+float prepared_stroke_draw_alpha(const PreparedStroke& prepared, const Layer& layer, std::int32_t x,
+                                 std::int32_t y, float coverage);
+
+// Overprint-off knockout factor for the base content under this stroke.
+// Normal mode uses the compensated divisor (1 - C) / (1 - s): the later
+// source-over stroke draw scales the destination by (1 - s), so the band's
+// content term lands at exactly a x (1 - C) — Photoshop's full knockout —
+// and the opaque solid case (s = C) is a structural no-op. Non-Normal modes
+// use plain (1 - C): the divisor degenerates there (an opaque stroke keeps
+// s = C, f = 1 for every C < 1), and P3 pins the band interior (C = 1,
+// content fully gone, blend against the backdrop), which both forms satisfy;
+// only the 1 px AA fringe stays approximate. COM probes July 2026.
+float stroke_knockout_factor(const PreparedStroke& prepared, const Layer& layer, std::int32_t x,
+                             std::int32_t y, std::optional<Rect> layer_mask_bounds);
+
+// The factor a stroke stacked ABOVE a lower stroke's draw applies to it (GitHub
+// issue 265): the upper band's own over-draw coverage knocks the lower stroke
+// out exactly as it knocks out content, with the same Normal-mode compensation
+// for the upper draw that follows. The content plane cannot serve here: on a
+// layer with anti-aliased pixels it holds the inner band membership, which is
+// zero across an Outside band.
+float stroke_stack_knockout_factor(const PreparedStroke& upper, const Layer& layer, std::int32_t x,
+                                   std::int32_t y, std::optional<Rect> layer_mask_bounds);
+
+// Overprint-off knockout is invisible for an opaque Normal stroke at full
+// layer opacity: the stroke covers exactly what it would have knocked out.
+// Skipping it keeps the base pass's fast row path and the pinned opaque
+// fixtures on their historical byte-exact path.
+bool stroke_knockout_is_identity(const LayerStroke& stroke, const Layer& layer);
+
+// `above`: the prepared non-identity strokes listed BEFORE this one in the
+// style. Photoshop stacks several Stroke instances like layers: the first
+// listed instance paints on top, and with Overprint off each band knocks the
+// strokes beneath it out as it does the content (ag-psd's strokes fixture,
+// GitHub issue 265: a 7 px Multiply stroke listed before an 18 px Normal one
+// multiplies the backdrop inside its band, never the stroke under it). Each
+// upper stroke's knockout factor attenuates this draw exactly as it attenuates
+// the base content; an opaque Normal stroke above needs none (its own draw
+// covers the band).
+template <typename Target>
+void render_prepared_stroke(Target& destination, const Layer& layer, const PreparedStroke& prepared,
+                            std::optional<Rect> layer_mask_bounds,
+                            const std::vector<const PreparedStroke*>& above = {}) {
+  const auto& stroke = *prepared.stroke;
+  if (stroke.opacity <= 0.0F) {
+    return;  // the knockout already happened in the base pass; nothing to draw
+  }
+  const auto& mask = prepared.entry->primary;
+  const auto& entry = prepared.entry;
+  const auto mask_bounds = prepared.mask_bounds;
+  const auto draw_rect = prepared.draw_rect;
+  const auto mask_width = mask_bounds.width;
+  const auto clip_to_mask = prepared.clip_to_mask;
+  const auto shape_burst = prepared.shape_burst;
+  const auto gradient_bounds = prepared.gradient_bounds;
+  const auto* underlay = prepared.draw_includes_underlay && !entry->underlay.empty() ? &entry->underlay : nullptr;
+  for (std::int32_t y = draw_rect.y; y < draw_rect.y + draw_rect.height; ++y) {
+    for (std::int32_t x = draw_rect.x; x < draw_rect.x + draw_rect.width; ++x) {
+      const auto mask_index = static_cast<std::size_t>((y - mask_bounds.y) * mask_width + (x - mask_bounds.x));
+      auto mask_alpha = mask[mask_index];
+      if (underlay != nullptr) {
+        mask_alpha = clamp_unit(mask_alpha + (*underlay)[mask_index] + entry->inside[mask_index]);
+      }
+      if (clip_to_mask && mask_alpha > 0.0F) {
+        // "Layer Mask Hides Effects": the mask hides the stroke where it lands
+        // instead of reshaping its contour.
+        mask_alpha *= effect_output_mask_alpha_for_render(layer, x, y, layer_mask_bounds);
+      }
+      if (mask_alpha <= 0.0F) {
+        continue;
+      }
+      auto color = stroke.color;
+      auto alpha = mask_alpha * stroke.opacity * layer.opacity();
+      for (const auto* upper : above) {
+        alpha *= stroke_stack_knockout_factor(*upper, layer, x, y, layer_mask_bounds);
+      }
+      if (alpha <= 0.0F) {
+        continue;
+      }
+      if (stroke.uses_gradient) {
+        // Shape Burst samples with endpoint smoothing (the probes show the
+        // Intr ease applied even to a two-stop ramp, unlike the pinned linear
+        // 2-stop overlays) and tent-averages across the pixel footprint.
+        if (shape_burst) {
+          const auto band = entry->secondary[mask_index];
+          const auto span = shape_burst_ramp_span(stroke.size, stroke.position);
+          color = shape_burst_stroke_color(stroke.gradient, band, span, x, y);
+          alpha *= shape_burst_stroke_opacity(stroke.gradient, band, span);
+        } else {
+          const auto position = gradient_position(stroke.gradient, gradient_bounds, x, y);
+          color = gradient_color_dithered(stroke.gradient, position, x, y);
+          alpha *= gradient_stop_opacity(stroke.gradient, position);
+        }
+      }
+      composite_effect_color(destination, x, y, color, alpha, stroke.blend_mode, DissolveField::Stroke);
+    }
+  }
+}
+
+template <typename Target>
+void render_stroke(Target& destination, const Layer& layer, const PixelBuffer& source, Rect clip, Rect bounds,
+                   const LayerStroke& stroke, std::optional<Rect> layer_mask_bounds,
+                   StyleMaskProvider* masks = nullptr, std::uint32_t effect_index = 0) {
+  if (stroke.opacity <= 0.0F) {
+    return;  // nothing to draw; any Overprint-off knockout is the caller's pass
+  }
+  const auto prepared =
+      prepare_stroke_render(layer, source, clip, bounds, stroke, layer_mask_bounds, masks, effect_index);
+  if (!prepared.has_value()) {
+    return;
+  }
+  render_prepared_stroke(destination, layer, *prepared, layer_mask_bounds);
+}
+
+// A styled group's strokes on its semi-transparent silhouette pixels (GitHub
+// issue 265). composite_pixel_layer folds each outer band's share UNDER such a
+// pixel into its base pass; a group's children are no single paint, and the
+// over-draw mask is zero there, so the edge showed the backdrop. This paints
+// that share behind the children instead, after the exterior effects, at the
+// band's coverage (the plane holds (1 - a) x coverage); the children then
+// cover it at their own alpha, which is the fold's result. The stack matches
+// the fold: the first listed instance takes its share first, and a Multiply
+// stroke blends against the backdrop.
+template <typename Target>
+void render_group_stroke_underlay(Target& destination, const Layer& layer, const PixelBuffer& silhouette,
+                                  Rect silhouette_rect, const std::vector<PreparedStroke>& strokes,
+                                  std::optional<Rect> layer_mask_bounds) {
+  Rect area{};
+  for (const auto& prepared : strokes) {
+    if (!prepared.entry->underlay.empty() && prepared.stroke->opacity > 0.0F) {
+      area = unite_rect(area, prepared.draw_rect);
+    }
+  }
+  area = intersect_rect(area, silhouette_rect);
+  for (std::int32_t y = area.y; y < area.y + area.height; ++y) {
+    for (std::int32_t x = area.x; x < area.x + area.width; ++x) {
+      auto content_alpha = pixel_alpha_at(silhouette, x - silhouette_rect.x, y - silhouette_rect.y);
+      if (content_alpha > 0.0F) {
+        content_alpha *= clamp_unit(effect_source_mask_alpha_for_render(layer, x, y, layer_mask_bounds));
+      }
+      if (content_alpha <= 0.0F || content_alpha >= 1.0F) {
+        continue;
+      }
+      auto remaining = 1.0F;
+      float underlay_alpha = 0.0F;
+      std::array<float, 3> underlay_sum{0.0F, 0.0F, 0.0F};
+      for (const auto& prepared : strokes) {
+        const auto& bounds = prepared.mask_bounds;
+        if (prepared.entry->underlay.empty() || prepared.stroke->opacity <= 0.0F || x < bounds.x ||
+            y < bounds.y || x >= bounds.x + bounds.width || y >= bounds.y + bounds.height) {
+          continue;
+        }
+        const auto mask_index = static_cast<std::size_t>((y - bounds.y) * bounds.width + (x - bounds.x));
+        auto plane = prepared.entry->underlay[mask_index];
+        if (prepared.clip_to_mask && plane > 0.0F) {
+          plane *= effect_output_mask_alpha_for_render(layer, x, y, layer_mask_bounds);
+        }
+        if (plane <= 0.0F) {
+          continue;
+        }
+        const auto& stroke = *prepared.stroke;
+        auto color = stroke.color;
+        auto strength = stroke.opacity;
+        if (stroke.uses_gradient) {
+          if (prepared.shape_burst) {
+            const auto band = prepared.entry->secondary[mask_index];
+            const auto span = shape_burst_ramp_span(stroke.size, stroke.position);
+            color = shape_burst_stroke_color(stroke.gradient, band, span, x, y);
+            strength *= shape_burst_stroke_opacity(stroke.gradient, band, span);
+          } else {
+            const auto position = gradient_position(stroke.gradient, prepared.gradient_bounds, x, y);
+            color = gradient_color_dithered(stroke.gradient, position, x, y);
+            strength *= gradient_stop_opacity(stroke.gradient, position);
+          }
+        }
+        // In the target's channel units: bytes, or the deep domain.
+        std::array<float, 3> rgb{static_cast<float>(color.red), static_cast<float>(color.green),
+                                 static_cast<float>(color.blue)};
+        if constexpr (is_deep_target_v<Target>) {
+          const auto domain = target_domain(destination);
+          rgb = deep_channels(deep_from_byte(color, domain));
+          if (stroke.blend_mode != BlendMode::Normal) {
+            const auto backdrop = destination.sample_color(x, y);
+            rgb = composite_blended_rgb_deep(rgb, deep_channels(backdrop.color), stroke.blend_mode, 1.0F,
+                                             backdrop.alpha, domain);
+          }
+        } else if (stroke.blend_mode != BlendMode::Normal) {
+          const auto backdrop = destination.sample_color(x, y);
+          const auto blended = composite_blended_rgb(
+              {color.red, color.green, color.blue},
+              {backdrop.color.red, backdrop.color.green, backdrop.color.blue}, stroke.blend_mode, 1.0F,
+              backdrop.alpha);
+          rgb = {static_cast<float>(blended[0]), static_cast<float>(blended[1]), static_cast<float>(blended[2])};
+        }
+        const auto take = plane * strength * remaining;
+        remaining *= 1.0F - strength;
+        underlay_alpha += take;
+        for (std::size_t channel = 0; channel < 3U; ++channel) {
+          underlay_sum[channel] += take * rgb[channel];
+        }
+      }
+      if (underlay_alpha <= 0.0F) {
+        continue;
+      }
+      const auto behind_alpha = clamp_unit(underlay_alpha / (1.0F - content_alpha)) * layer.opacity();
+      if constexpr (is_deep_target_v<Target>) {
+        destination.composite_color(
+            x, y,
+            deep_rgb({underlay_sum[0] / underlay_alpha, underlay_sum[1] / underlay_alpha,
+                      underlay_sum[2] / underlay_alpha}),
+            behind_alpha, BlendMode::Normal);
+      } else {
+        const auto channel_value = [&](std::size_t channel) {
+          return static_cast<std::uint8_t>(
+              std::clamp(std::lround(underlay_sum[channel] / underlay_alpha), 0L, 255L));
+        };
+        destination.composite_color(x, y, RgbColor{channel_value(0), channel_value(1), channel_value(2)},
+                                    behind_alpha, BlendMode::Normal);
+      }
+    }
+  }
+}
+
+// Applies Photoshop's Advanced Blending "Channels" restriction to everything a
+// layer (or group) composites through it: a restricted channel keeps the
+// backdrop's PREMULTIPLIED value while the other channels and alpha composite
+// normally. COM calibration (July 2026): over a half-alpha gray-60 backdrop the
+// excluded channel reads 60 * 0.5 / out_alpha, and over an alpha-zero backdrop
+// it reads 0, refuting a straight-value keep. Nested restrictions push onto the
+// same adapter (the chain ORs), which caps template-instantiation depth exactly
+// like GroupMaskedTarget. composite_source_row is deliberately not forwarded so
+// restricted layers always take the per-pixel path.
+template <typename Base>
+class ChannelRestrictedTarget {
+public:
+  using color_type = target_color_t<Base>;
+
+  ChannelRestrictedTarget(Base& base, std::uint8_t restriction) : base_(base) {
+    push_channel_restriction(restriction);
+  }
+
+  [[nodiscard]] DeepDomain deep_domain() const noexcept { return target_domain(base_); }
+
+  [[nodiscard]] float knockout_clip_gate(std::int32_t x, std::int32_t y) const noexcept {
+    if constexpr (requires { base_.knockout_clip_gate(x, y); }) {
+      return base_.knockout_clip_gate(x, y);
+    } else {
+      return 1.0F;
+    }
+  }
+
+  void push_channel_restriction(std::uint8_t mask) {
+    masks_.push_back(mask);
+    combined_ |= mask;
+  }
+  void pop_channel_restriction() {
+    masks_.pop_back();
+    combined_ = 0;
+    for (const auto mask : masks_) {
+      combined_ |= mask;
+    }
+  }
+
+  template <typename C>
+  void composite_color(std::int32_t x, std::int32_t y, C color, float alpha, BlendMode mode) {
+    const auto pre = base_.sample_color(x, y);
+    base_.composite_color(x, y, color, alpha, mode);
+    restore_restricted(x, y, pre);
+  }
+
+  template <typename C>
+  void composite_special_fill_color(std::int32_t x, std::int32_t y, C color, float source_coverage,
+                                    float fill_opacity, float layer_opacity, BlendMode mode)
+    requires requires(Base& base) {
+      base.composite_special_fill_color(std::int32_t{}, std::int32_t{}, color, 0.0F, 0.0F, 0.0F,
+                                        BlendMode::Normal);
+    }
+  {
+    const auto pre = base_.sample_color(x, y);
+    base_.composite_special_fill_color(x, y, color, source_coverage, fill_opacity, layer_opacity, mode);
+    restore_restricted(x, y, pre);
+  }
+
+  void adjust_color(std::int32_t x, std::int32_t y, const AdjustmentSettings& settings, float amount)
+    requires requires(Base& base) {
+      base.adjust_color(std::int32_t{}, std::int32_t{}, std::declval<const AdjustmentSettings&>(), 0.0F);
+    }
+  {
+    const auto pre = base_.sample_color(x, y);
+    base_.adjust_color(x, y, settings, amount);
+    restore_restricted(x, y, pre);
+  }
+
+  void adjust_color(std::int32_t x, std::int32_t y, const AdjustmentLut& lut, float amount)
+    requires requires(Base& base) {
+      base.adjust_color(std::int32_t{}, std::int32_t{}, std::declval<const AdjustmentLut&>(), 0.0F);
+    }
+  {
+    const auto pre = base_.sample_color(x, y);
+    base_.adjust_color(x, y, lut, amount);
+    restore_restricted(x, y, pre);
+  }
+
+  [[nodiscard]] CompositeSampleT<color_type> sample_color(std::int32_t x, std::int32_t y) const {
+    return base_.sample_color(x, y);
+  }
+
+  // Deliberately unrestricted: fade_toward_snapshot lerps two destination
+  // states that were both composited through this adapter already.
+  void store_color(std::int32_t x, std::int32_t y, color_type color, float alpha) {
+    base_.store_color(x, y, color, alpha);
+  }
+
+  void record_clip_coverage(std::int32_t x, std::int32_t y, float alpha)
+    requires requires(Base& base) { base.record_clip_coverage(std::int32_t{}, std::int32_t{}, 0.0F); }
+  {
+    base_.record_clip_coverage(x, y, alpha);
+  }
+
+  void profile_compositor_step(const char* step, const Layer& layer, Rect rect, double elapsed_ms)
+    requires requires(Base& base) {
+      base.profile_compositor_step(std::declval<const char*>(), std::declval<const Layer&>(), Rect{}, 0.0);
+    }
+  {
+    base_.profile_compositor_step(step, layer, rect, elapsed_ms);
+  }
+
+private:
+  void restore_restricted(std::int32_t x, std::int32_t y, const CompositeSampleT<color_type>& pre) {
+    auto post = base_.sample_color(x, y);
+    if (post.alpha <= 0.0F) {
+      return;  // nothing visible; the premultiplied keep is vacuous at zero coverage
+    }
+    auto color = post.color;
+    bool changed = false;
+    using Channel = color_channel_t<color_type>;
+    const auto restore_channel = [&](std::uint8_t bit, Channel& post_value, Channel pre_value) {
+      if ((combined_ & bit) == 0U) {
+        return;
+      }
+      // Keeping the PREMULTIPLIED backdrop value: pre straight * pre alpha,
+      // re-straightened against the advanced alpha. Equal alphas restore the
+      // exact byte so alpha-neutral writes (adjustments) cannot drift.
+      Channel kept{};
+      if constexpr (std::is_same_v<Channel, float>) {
+        kept = pre.alpha == post.alpha ? pre_value : pre_value * pre.alpha / post.alpha;
+      } else {
+        kept = pre.alpha == post.alpha
+                   ? pre_value
+                   : static_cast<std::uint8_t>(std::clamp<long>(
+                         std::lround(static_cast<float>(pre_value) * pre.alpha / post.alpha), 0L, 255L));
+      }
+      if (post_value != kept) {
+        post_value = kept;
+        changed = true;
+      }
+    };
+    restore_channel(kRestrictRed, color.red, pre.color.red);
+    restore_channel(kRestrictGreen, color.green, pre.color.green);
+    restore_channel(kRestrictBlue, color.blue, pre.color.blue);
+    if (changed) {
+      base_.store_color(x, y, color, post.alpha);
+    }
+  }
+
+  Base& base_;
+  std::vector<std::uint8_t> masks_;
+  std::uint8_t combined_{0};
+};
+
+// Runs fn against a destination that applies the given channel restriction on
+// top of whatever the destination already restricts. A zero mask runs fn on the
+// destination unchanged; an adapter anywhere in the chain absorbs the push so
+// wrapper types cannot nest unboundedly.
+template <typename Target, typename Fn>
+void with_channel_restriction(Target& destination, std::uint8_t restriction, Fn&& fn) {
+  if (restriction == 0U) {
+    fn(destination);
+    return;
+  }
+  if constexpr (requires {
+                  destination.push_channel_restriction(std::uint8_t{});
+                  destination.pop_channel_restriction();
+                }) {
+    destination.push_channel_restriction(restriction);
+    fn(destination);
+    destination.pop_channel_restriction();
+  } else {
+    ChannelRestrictedTarget<Target> restricted(destination, restriction);
+    fn(restricted);
+  }
+}
+
+template <typename Target>
+void composite_layer(Target& destination, const Layer& layer, Rect clip,
+                     const std::vector<LayerBoundsOverride>* overrides = nullptr,
+                     bool throw_on_unsupported_pixel_format = false, StyleMaskProvider* masks = nullptr,
+                     const target_snapshot_t<Target>* blend_if_backdrop = nullptr,
+                     const PatternStore* patterns = nullptr, bool suppress_channel_restriction = false,
+                     const target_knockout_t<Target>* knockout_backdrops = nullptr);
+
+template <typename Target>
+void composite_pass_through_group(Target& destination, const Layer& layer, Rect clip,
+                                  const std::vector<LayerBoundsOverride>* overrides,
+                                  bool throw_on_unsupported_pixel_format, StyleMaskProvider* masks,
+                                  const PatternStore* patterns, bool styled,
+                                  const target_knockout_t<Target>* knockout_backdrops);
+
+template <typename Color = RgbColor>
+PixelBuffer group_silhouette_for_render(const Layer& layer, Rect bounds,
+                                        const std::vector<LayerBoundsOverride>* overrides,
+                                        bool throw_on_unsupported_pixel_format, StyleMaskProvider* masks,
+                                        const PatternStore* patterns, DeepDomain domain = DeepDomain::Encoded);
+
+template <typename Target>
+void composite_adjustment_layer(Target& destination, const Layer& layer, Rect clip,
+                                const std::vector<LayerBoundsOverride>* overrides,
+                                bool suppress_channel_restriction = false) {
+  constexpr bool kDeep = is_deep_target_v<Target>;
+  if (!layer_visible_for_render(layer, overrides) || layer.opacity() <= 0.0F) {
+    return;
+  }
+  const auto channel_restriction = layer_rendered_channel_restriction(layer);
+  if (channel_restriction == kRestrictAllChannels) {
+    return;  // Photoshop removes an all-channels-restricted layer entirely
+  }
+  if (channel_restriction != 0U && !suppress_channel_restriction) {
+    with_channel_restriction(destination, channel_restriction, [&](auto& restricted) {
+      composite_adjustment_layer(restricted, layer, clip, overrides, true);
+    });
+    return;
+  }
+  const auto settings = adjustment_settings_from_layer(layer);
+  if (!settings.has_value() || !adjustment_has_effect(*settings)) {
+    return;
+  }
+
+  auto draw_rect = clip;
+  const auto bounds = adjustment_bounds_for_render(layer, overrides);
+  if (!bounds.empty()) {
+    draw_rect = intersect_rect(draw_rect, bounds);
+  }
+  if (draw_rect.empty()) {
+    return;
+  }
+
+  const auto layer_mask_bounds = layer_mask_bounds_for_render(layer, overrides);
+  // Channel-separable adjustments collapse to an exact per-channel LUT; the
+  // per-pixel settings math (pow() for Levels gamma, per pixel, per channel)
+  // dominated patch renders under adjustment stacks before this.
+  const auto lut = build_adjustment_lut(*settings);
+  const auto has_blend_if = layer_has_rendered_blend_if(layer);
+  const auto blend_if = has_blend_if ? layer.blend_if() : LayerBlendIf{};
+  // Adjustment layers otherwise ignore their blend mode entirely (a known
+  // approximation). Dissolve is the one mode that has to be honored here,
+  // because it is a coverage decision rather than a colour function: the
+  // adjustment then lands whole on a dithered subset of the pixels.
+  const auto dissolve = layer.blend_mode() == BlendMode::Dissolve;
+  const auto domain = target_domain(destination);
+  ++adjustment_pass_serial;
+  std::optional<DeepAdjuster> deep_adjuster;
+  if constexpr (kDeep) {
+    if (has_blend_if) {
+      deep_adjuster.emplace(*settings, domain);
+    }
+  }
+  for (std::int32_t y = draw_rect.y; y < draw_rect.y + draw_rect.height; ++y) {
+    for (std::int32_t x = draw_rect.x; x < draw_rect.x + draw_rect.width; ++x) {
+      auto amount = layer_mask_alpha_for_render(layer, x, y, layer_mask_bounds) * layer.opacity() *
+                    layer_fill_opacity_for_render(layer);
+      if (amount <= 0.0F) {
+        continue;
+      }
+      if (has_blend_if) {
+        const auto underlying = destination.sample_color(x, y);
+        if constexpr (kDeep) {
+          const auto adjusted = deep_rgb(deep_adjuster->apply(deep_channels(underlying.color)));
+          amount *= blend_if_source_factor_for(blend_if, adjusted, domain) *
+                    blend_if_underlying_alpha_factor(blend_if, underlying, domain);
+        } else {
+          auto adjusted = apply_adjustment_to_color(underlying.color, *settings);
+          if (lut.has_value()) {
+            adjusted = RgbColor{lut->red[underlying.color.red], lut->green[underlying.color.green],
+                                lut->blue[underlying.color.blue]};
+          }
+          amount *= blend_if_source_alpha_factor(blend_if, adjusted) *
+                    blend_if_underlying_alpha_factor(blend_if, underlying);
+        }
+        if (amount <= 0.0F) {
+          continue;
+        }
+      }
+      if (dissolve) {
+        amount = dissolve_coverage(x, y, amount, DissolveField::Layer);
+        if (amount <= 0.0F) {
+          continue;
+        }
+      }
+      if constexpr (requires { destination.adjust_color(x, y, *lut, amount); }) {
+        if (lut.has_value()) {
+          destination.adjust_color(x, y, *lut, amount);
+          continue;
+        }
+      }
+      destination.adjust_color(x, y, *settings, amount);
+    }
+  }
+}
+
+template <typename Target>
+void composite_pixel_layer(Target& destination, const Layer& layer, Rect clip,
+                           const std::vector<LayerBoundsOverride>* overrides,
+                           bool throw_on_unsupported_pixel_format, StyleMaskProvider* masks = nullptr,
+                           const target_snapshot_t<Target>* blend_if_backdrop_override = nullptr,
+                           const PatternStore* patterns = nullptr,
+                           bool suppress_channel_restriction = false,
+                           const ClipRunContent* clip_content = nullptr,
+                           const target_snapshot_t<Target>* knockout_backdrop = nullptr,
+                           bool applies_knockout = false) {
+  // Styled groups and group clipping bases route through this pipeline: the group's
+  // flattened children arrive as an override pixel buffer and the group plays
+  // the layer's role. Other plain groups use composite_layer's group branch.
+  if (!layer_visible_for_render(layer, overrides) || layer.opacity() <= 0.0F ||
+      (layer.kind() != LayerKind::Pixel && layer.kind() != LayerKind::Group)) {
+    return;
+  }
+  const auto channel_restriction = layer_rendered_channel_restriction(layer);
+  if (channel_restriction == kRestrictAllChannels) {
+    // All channels excluded: the layer, effects included, does not composite
+    // at all (the P4b probe: even its drop shadow vanishes).
+    return;
+  }
+  if (channel_restriction != 0U && !suppress_channel_restriction) {
+    // Wrapping here makes the layer's content AND its effects inherit the
+    // restriction uniformly (the P4 probe: a drop shadow and a color overlay
+    // both keep the backdrop's excluded channel). The clip-run base pass
+    // suppresses this and restricts at merge_into instead, because inside the
+    // isolated buffer the base's backdrop is transparent black.
+    with_channel_restriction(destination, channel_restriction, [&](auto& restricted) {
+      composite_pixel_layer(restricted, layer, clip, overrides, throw_on_unsupported_pixel_format, masks,
+                            blend_if_backdrop_override, patterns, true, clip_content,
+                            knockout_backdrop, applies_knockout);
+    });
+    return;
+  }
+  const float fill_opacity = layer_fill_opacity_for_render(layer);
+
+  const auto& layer_source = layer_pixels_for_render(layer, overrides);
+  // A deep target repaints gradient fills at its depth instead of reading their 8-bit
+  // raster (docs/high-bit-depth-compositor.md).
+  std::shared_ptr<const PixelBuffer> deep_fill;
+  if constexpr (is_deep_target_v<Target>) {
+    if (&layer_source == &layer.pixels() && layer.vector_shape() != nullptr) {
+      deep_fill = deep_gradient_fill_raster(
+          layer, target_domain(destination) == DeepDomain::Linear ? BitDepth::Float32 : BitDepth::UInt16);
+    }
+  }
+  const auto& source = deep_fill != nullptr ? *deep_fill : layer_source;
+  if (source.empty()) {
+    return;
+  }
+  // A deep target reads sources of any depth (load_rgba_row converts); an 8-bit one
+  // keeps its 8-bit gate.
+  if ((!is_deep_target_v<Target> && source.format().bit_depth != BitDepth::UInt8) || source.format().channels < 3) {
+    if (throw_on_unsupported_pixel_format) {
+      throw std::invalid_argument(PATCHY_TRANSLATE_NOOP("QObject", "The starter compositor currently supports RGB/RGBA 8-bit layers only"));
+    }
+    return;
+  }
+
+  const auto bounds = layer_bounds_for_render(layer, overrides);
+  const auto layer_mask_bounds = layer_mask_bounds_for_render(layer, overrides);
+  const auto& style = layer.layer_style();
+  const auto draw_rect = intersect_rect(clip, bounds);
+  // Every effect below takes its silhouette from here; the base pass keeps `source`.
+  const PixelBuffer& effect_source = effect_matte_source_for_render(layer, source);
+  const bool has_effect_matte = &effect_source != &source;
+  // A clipping run hands the base pass its merged content (base plus clipped
+  // members) in place of the source's colors; every effect below keeps
+  // reading the source, whose alpha the members cannot widen.
+  const PixelBuffer& content = clip_content != nullptr ? *clip_content->pixels : source;
+  const Rect content_origin = clip_content != nullptr ? clip_content->rect : bounds;
+  const bool interiors_prefolded = clip_content != nullptr && clip_content->interiors_prefolded;
+  const auto has_blend_if = layer_has_rendered_blend_if(layer);
+  const auto blend_if = has_blend_if ? layer.blend_if() : LayerBlendIf{};
+  const auto has_underlying_blend_if = has_blend_if && blend_if_has_underlying_ranges(blend_if);
+  std::optional<target_snapshot_t<Target>> owned_blend_if_backdrop;
+  const target_snapshot_t<Target>* blend_if_backdrop = blend_if_backdrop_override;
+  if (has_underlying_blend_if && blend_if_backdrop == nullptr && !draw_rect.empty()) {
+    owned_blend_if_backdrop.emplace(destination, draw_rect);
+    blend_if_backdrop = &*owned_blend_if_backdrop;
+  }
+  // A non-Normal layer blend mode blends against the backdrop the layer met, not
+  // against its own exterior effects (Photoshop COM probes, July 2026: a
+  // 50%-alpha Multiply square over a drop shadow keeps the backdrop's blue, which
+  // no shadow-then-blend order produces). The base pass therefore reads the
+  // pre-effect composite here, and only when an exterior effect can actually
+  // reach a pixel the layer also paints.
+  const auto has_exterior_effects =
+      style.effects_visible &&
+      (std::any_of(style.drop_shadows.begin(), style.drop_shadows.end(),
+                   [](const LayerDropShadow& shadow) { return shadow.enabled && shadow.opacity > 0.0F; }) ||
+       std::any_of(style.outer_glows.begin(), style.outer_glows.end(),
+                   [](const LayerOuterGlow& glow) { return glow.enabled && glow.opacity > 0.0F; }));
+  std::optional<target_snapshot_t<Target>> pre_effect_backdrop;
+  if (has_exterior_effects && layer.blend_mode() != BlendMode::Normal && !has_blend_if &&
+      fill_opacity == 1.0F && !draw_rect.empty()) {
+    pre_effect_backdrop.emplace(destination, draw_rect);
+  }
+
+  if (style.effects_visible) {
+    for (std::uint32_t index = 0; index < style.drop_shadows.size(); ++index) {
+      const auto& shadow = style.drop_shadows[index];
+      profile_compositor_step(destination, layer, "drop_shadow", clip, [&] {
+        render_drop_shadow(destination, layer, effect_source, clip, bounds, shadow, layer_mask_bounds, masks,
+                           index);
+      });
+    }
+    for (std::uint32_t index = 0; index < style.outer_glows.size(); ++index) {
+      const auto& glow = style.outer_glows[index];
+      profile_compositor_step(destination, layer, "outer_glow", clip, [&] {
+        render_outer_glow(destination, layer, effect_source, clip, bounds, glow, layer_mask_bounds, masks, index);
+      });
+    }
+  }
+
+  std::vector<PreparedSatin> prepared_satins;
+  if (!draw_rect.empty() && style.effects_visible && !interiors_prefolded) {
+    prepared_satins.reserve(style.satins.size());
+    for (std::uint32_t index = 0; index < style.satins.size(); ++index) {
+      const auto& satin = style.satins[index];
+      if (!satin.enabled || satin.opacity <= 0.0F) {
+        continue;
+      }
+      profile_compositor_step(destination, layer, "satin", clip, [&] {
+        prepared_satins.push_back(
+            prepare_satin(layer, effect_source, draw_rect, bounds, satin, layer_mask_bounds, masks, index));
+      });
+    }
+  }
+
+  // Strokes without Overprint knock the layer's own content (fill, interior
+  // effects, clipped members) out of their band and blend against the layers
+  // below (COM probes July 2026, docs/ps-compat.md). Resolve those strokes'
+  // band masks up front — the stroke draw below reuses the same prepared
+  // entries — and fold the combined per-pixel factor into one plane the base
+  // pass and every interior effect multiply in. Opaque solid Normal strokes
+  // skip all of this: their knockout is a structural no-op.
+  // Semi-transparent content inside the contour changes the picture (the probes
+  // above stroke_alpha_mask): there the outer band is a second paint UNDER the
+  // content, folded into the base pass (`underlay_strokes`), and the inner band
+  // replaces the content at its own alpha, so the knockout runs even for an
+  // opaque solid stroke and even with Overprint on. The fold rides the layer's own
+  // blend (Normal, or any mode when nothing else gates the pixel); otherwise the
+  // draw adds the plane back on top, as before.
+  std::vector<PreparedStroke> knockout_strokes;
+  std::vector<PreparedStroke> underlay_strokes;
+  StrokeKnockoutPlane knockout_plane;
+  const bool fold_underlay = layer.blend_mode() == BlendMode::Normal || (fill_opacity == 1.0F && !has_blend_if);
+  if (!draw_rect.empty() && style.effects_visible) {
+    for (std::uint32_t index = 0; index < style.strokes.size(); ++index) {
+      const auto& stroke = style.strokes[index];
+      const bool opaque_identity = stroke.overprint || stroke_knockout_is_identity(stroke, layer);
+      auto prepared =
+          prepare_stroke_render(layer, effect_source, clip, bounds, stroke, layer_mask_bounds, masks, index);
+      if (!prepared.has_value()) {
+        continue;
+      }
+      const bool partial = prepared->entry->partial_content;
+      prepared->draw_includes_underlay = partial && !fold_underlay;
+      if (partial && fold_underlay && stroke.opacity > 0.0F) {
+        underlay_strokes.push_back(*prepared);
+      }
+      if (!opaque_identity || partial) {
+        knockout_strokes.push_back(std::move(*prepared));
+      }
+    }
+    if (!knockout_strokes.empty()) {
+      profile_compositor_step(destination, layer, "stroke_knockout", draw_rect, [&] {
+        knockout_plane.rect = draw_rect;
+        knockout_plane.factor.assign(
+            static_cast<std::size_t>(draw_rect.width) * static_cast<std::size_t>(draw_rect.height), 1.0F);
+        for (const auto& prepared : knockout_strokes) {
+          auto* factor = knockout_plane.factor.data();
+          for (std::int32_t y = draw_rect.y; y < draw_rect.y + draw_rect.height; ++y) {
+            for (std::int32_t x = draw_rect.x; x < draw_rect.x + draw_rect.width; ++x) {
+              *factor++ *= stroke_knockout_factor(prepared, layer, x, y, layer_mask_bounds);
+            }
+          }
+        }
+      });
+    }
+  }
+  const auto* knockout = knockout_strokes.empty() ? nullptr : &knockout_plane;
+  const bool has_underlay = !underlay_strokes.empty();
+
+  // Interior overlays on a stroked shape layer apply to the FILL plane and the
+  // vector stroke re-composites above them (PS 2026 probes fx-sofi-center /
+  // outside, docs/layer-effects-render.md). A stroke-only shape's overlay covers the
+  // stroke, which the legacy combined path already renders. The split planes
+  // come from the shape bake; when absent or mismatched (no stroke, non-Normal
+  // stroke blend, transform-preview override, preserved import raster) the
+  // legacy behavior stands. Blend-If layers keep the legacy path too - the
+  // re-stamp cannot reproduce the per-pixel gate.
+  // (The fill plane's alpha is the fill's coverage, so on a layer with its own
+  // effect silhouette the overlays still cover the whole fill.)
+  const PixelBuffer* interior_source = &effect_source;
+  const PixelBuffer* stroke_restamp = nullptr;
+  if (style.effects_visible && !has_blend_if && clip_content == nullptr) {
+    if (const auto* shape = layer.vector_shape();
+        shape != nullptr && !shape->stroke_cache.empty() && !shape->fill_cache.empty() &&
+        &source == &layer.pixels() && shape->fill_cache.width() == source.width() &&
+        shape->fill_cache.height() == source.height() && shape->stroke_cache.width() == source.width() &&
+        shape->stroke_cache.height() == source.height()) {
+      // Gate on an overlay that will actually paint: a needless re-stamp would
+      // double-composite the stroke's AA edges.
+      const auto overlay_paints = [](const auto& overlays) {
+        return std::any_of(overlays.begin(), overlays.end(), [](const auto& overlay) {
+          return overlay.enabled && overlay.opacity > 0.0F;
+        });
+      };
+      if (overlay_paints(style.pattern_overlays) || overlay_paints(style.gradient_fills) ||
+          overlay_paints(style.color_overlays)) {
+        interior_source = &shape->fill_cache;
+        stroke_restamp = &shape->stroke_cache;
+      }
+    }
+  }
+
+  // Photoshop resolves the interior overlays INTO one styled color and applies
+  // Fill/layer Opacity and the backdrop once to that result, so a 100%/Normal
+  // overlay hides the layer's own pixels outright. Folding them into the base
+  // pass is the only way to reproduce that: compositing each overlay as its own
+  // pass scaled by layer.opacity() leaves (1 - opacity) of the layer's own color
+  // showing through an opaque overlay, and over-composites semi-transparent
+  // interiors instead of knocking them out. Same treatment Satin already gets,
+  // and the same escapes: Blend If (Photoshop does not gate effects with it),
+  // Fill Opacity (which scales the layer's pixels but not its effects, so the
+  // overlay cannot ride the base alpha) and the vector fill/stroke split
+  // (folding would tint the stroke) keep the legacy passes.
+  // A fourth escape: a layer whose effect silhouette is wider than its pixels' alpha.
+  // The fold rides the base alpha, and there the overlays and Satin have to paint at
+  // full strength where the fill is transparent, so they run as destination passes
+  // over the effect silhouette.
+  const bool fold_interior_overlays_into_base = style.effects_visible && !has_blend_if && fill_opacity == 1.0F &&
+                                                stroke_restamp == nullptr && !interiors_prefolded &&
+                                                !has_effect_matte;
+  std::vector<PreparedInteriorOverlay> folded_overlays;
+  if (fold_interior_overlays_into_base && !draw_rect.empty()) {
+    profile_compositor_step(destination, layer, "interior_overlays", draw_rect, [&] {
+      folded_overlays = prepare_interior_overlays(layer, style, source, bounds, patterns);
+    });
+  }
+
+  // WHAT the fold lands on is Photoshop's "Blend Interior Effects as Group"
+  // blending option ('infx'), off by default. Off, the layer's blend mode
+  // carries its own pixels only and the interior effects blend over that result
+  // with their own modes; on, they fold into the layer's color first and the
+  // layer's blend mode carries everything (COM probes July 2026: a Saturation
+  // layer with a Linear Dodge Gradient Overlay renders the gradient at full
+  // strength with infx off and desaturated through the layer's mode with it on).
+  // Both readings agree whenever the layer's blend mode is Normal, which is why
+  // that path keeps the cheaper source-color fold and its pinned bytes.
+  const bool fold_after_layer_blend = !style.blend_interior_elements;
+  const bool has_interior_folds = !folded_overlays.empty() || !prepared_satins.empty();
+  const bool blend_against_backdrop =
+      layer.blend_mode() != BlendMode::Normal && !has_blend_if && fill_opacity == 1.0F &&
+      ((has_interior_folds && fold_after_layer_blend) || has_exterior_effects || has_underlay);
+
+  // Knockout replaces the lower stack by its floor before the content blends.
+  // Restore the uncovered part afterwards in premultiplied space. Erasing by
+  // shape then painting by shape would apply antialiasing/Opacity twice. Fill
+  // scales only the new paint, so Fill 0 still cuts the full masked shape.
+  std::optional<target_snapshot_t<Target>> before_knockout;
+  std::vector<float> knockout_shape;
+  if (applies_knockout && !draw_rect.empty()) {
+    before_knockout.emplace(destination, draw_rect);
+    knockout_shape.resize(static_cast<std::size_t>(draw_rect.width) * draw_rect.height);
+    const auto domain = target_domain(destination);
+    std::vector<float> row(static_cast<std::size_t>(draw_rect.width) * 4U);
+    for (auto y = draw_rect.y; y < draw_rect.y + draw_rect.height; ++y) {
+      load_rgba_row(source, y - bounds.y, draw_rect.x - bounds.x, draw_rect.width, domain, row);
+      for (auto x = draw_rect.x; x < draw_rect.x + draw_rect.width; ++x) {
+        const auto* px = row.data() + static_cast<std::size_t>(x - draw_rect.x) * 4U;
+        auto shape = (px[3] / 255.0F) * layer_mask_alpha_for_render(layer, x, y, layer_mask_bounds) *
+                     layer.opacity();
+        if constexpr (requires { destination.mask_alpha(x, y); }) {
+          shape *= destination.mask_alpha(x, y);
+        }
+        if constexpr (requires { destination.knockout_clip_gate(x, y); }) {
+          shape *= destination.knockout_clip_gate(x, y);
+        }
+        if (has_blend_if) {
+          const auto color = color_from_floats<target_color_t<Target>>(px[0], px[1], px[2]);
+          shape *= blend_if_source_factor_for(blend_if, color, domain);
+          if (has_underlying_blend_if) {
+            shape *= blend_if_underlying_alpha_factor(blend_if, blend_if_backdrop->sample_color(x, y), domain);
+          }
+        }
+        const auto index = static_cast<std::size_t>(y - draw_rect.y) * draw_rect.width + x - draw_rect.x;
+        knockout_shape[index] = clamp_unit(shape);
+        if (shape > 0.0F) {
+          const auto floor = knockout_backdrop != nullptr ? knockout_backdrop->sample_color(x, y)
+                                                         : CompositeSampleT<target_color_t<Target>>{};
+          destination.store_color(x, y, floor.color, floor.alpha);
+        }
+      }
+    }
+    if (pre_effect_backdrop.has_value()) {
+      pre_effect_backdrop.emplace(destination, draw_rect);
+    }
+  }
+
+  if (!draw_rect.empty()) {
+    profile_compositor_step(destination, layer, "base_pixels", draw_rect, [&] {
+      if constexpr (is_deep_target_v<Target>) {
+          // 16/32-bit documents (docs/high-bit-depth-compositor.md): the general loop below on
+          // float rows in the target's domain. No fast paths; every gate, fold and
+          // blend is the 8-bit loop's, with the deep math in place of the byte math.
+          const auto domain = target_domain(destination);
+          const auto has_enabled_mask = (layer.mask().has_value() && !layer.mask()->disabled) ||
+                                        layer_has_enabled_vector_mask(layer);
+          const auto has_folded_overlays = !folded_overlays.empty();
+          const auto mask_plane =
+              has_enabled_mask ? build_mask_coverage_plane(layer, draw_rect, layer_mask_bounds) : std::vector<float>{};
+          const auto special_fill = fill_opacity != 1.0F && blend_mode_has_special_fill(layer.blend_mode());
+          const auto deep_color = [domain](RgbColor color) { return deep_channels(deep_from_byte(color, domain)); };
+          std::vector<float> row(static_cast<std::size_t>(draw_rect.width) * 4U);
+          for (std::int32_t y = draw_rect.y; y < draw_rect.y + draw_rect.height; ++y) {
+            load_rgba_row(content, y - content_origin.y, draw_rect.x - content_origin.x, draw_rect.width, domain, row);
+            const auto* mask_row = mask_plane.empty()
+                                       ? nullptr
+                                       : mask_plane.data() + static_cast<std::size_t>(y - draw_rect.y) *
+                                                                 static_cast<std::size_t>(draw_rect.width);
+            for (std::int32_t x = draw_rect.x; x < draw_rect.x + draw_rect.width; ++x) {
+              const auto* src = row.data() + static_cast<std::size_t>(x - draw_rect.x) * 4U;
+              const auto source_alpha = src[3] / 255.0F;
+              auto source_coverage = mask_row != nullptr ? source_alpha * mask_row[x - draw_rect.x] : source_alpha;
+              float underlay_alpha = 0.0F;
+              std::array<float, 3> underlay_sum{0.0F, 0.0F, 0.0F};
+              if (has_underlay && source_coverage > 0.0F && source_coverage < 1.0F) {
+                auto remaining = 1.0F;
+                for (auto it = underlay_strokes.begin(); it != underlay_strokes.end(); ++it) {
+                  const auto& prepared = *it;
+                  const auto plane = prepared_stroke_underlay(prepared, layer, x, y, layer_mask_bounds);
+                  if (plane <= 0.0F) {
+                    continue;
+                  }
+                  const auto& stroke = *prepared.stroke;
+                  auto color = stroke.color;
+                  auto strength = stroke.opacity;
+                  if (stroke.uses_gradient) {
+                    const auto mask_index = static_cast<std::size_t>((y - prepared.mask_bounds.y) *
+                                                                         prepared.mask_bounds.width +
+                                                                     (x - prepared.mask_bounds.x));
+                    if (prepared.shape_burst) {
+                      const auto band = prepared.entry->secondary[mask_index];
+                      const auto span = shape_burst_ramp_span(stroke.size, stroke.position);
+                      color = shape_burst_stroke_color(stroke.gradient, band, span, x, y);
+                      strength *= shape_burst_stroke_opacity(stroke.gradient, band, span);
+                    } else {
+                      const auto position = gradient_position(stroke.gradient, prepared.gradient_bounds, x, y);
+                      color = gradient_color(stroke.gradient, position);
+                      strength *= gradient_stop_opacity(stroke.gradient, position);
+                    }
+                  }
+                  auto rgb = deep_color(color);
+                  if (stroke.blend_mode != BlendMode::Normal) {
+                    const auto backdrop = destination.sample_color(x, y);
+                    rgb = composite_blended_rgb_deep(rgb, deep_channels(backdrop.color), stroke.blend_mode, 1.0F,
+                                                     backdrop.alpha, domain);
+                  }
+                  const auto take = plane * strength * remaining;
+                  remaining *= 1.0F - strength;
+                  underlay_alpha += take;
+                  for (std::size_t channel = 0; channel < 3U; ++channel) {
+                    underlay_sum[channel] += take * rgb[channel];
+                  }
+                }
+              }
+              if (knockout != nullptr) {
+                source_coverage *= knockout->at(x, y);
+              }
+              auto alpha = source_coverage * layer.opacity();
+              if (fill_opacity != 1.0F) {
+                alpha *= fill_opacity;
+              }
+              if (alpha <= 0.0F && underlay_alpha <= 0.0F) {
+                continue;
+              }
+              if constexpr (requires { destination.record_clip_coverage(x, y, alpha); }) {
+                destination.record_clip_coverage(x, y, alpha);
+              }
+              const DeepRgb source_color{src[0], src[1], src[2]};
+              auto blend_if_factor = 1.0F;
+              if (has_blend_if) {
+                blend_if_factor *= blend_if_source_factor_for(blend_if, source_color, domain);
+                if (has_underlying_blend_if) {
+                  blend_if_factor *=
+                      blend_if_underlying_alpha_factor(blend_if, blend_if_backdrop->sample_color(x, y), domain);
+                }
+                alpha *= blend_if_factor;
+                if (alpha <= 0.0F) {
+                  continue;
+                }
+              }
+              DeepChannels styled_color{src[0], src[1], src[2]};
+              const auto fold_interiors = [&](DeepChannels color) {
+                if (has_folded_overlays) {
+                  color = fold_interior_overlays(color, folded_overlays, x, y, domain);
+                }
+                if (!has_blend_if && fill_opacity == 1.0F && !has_effect_matte) {
+                  color = fold_prepared_satins(color, prepared_satins, x, y, domain);
+                }
+                return color;
+              };
+              if (!fold_after_layer_blend) {
+                styled_color = fold_interiors(styled_color);
+              }
+              if (blend_against_backdrop) {
+                const auto backdrop = pre_effect_backdrop.has_value() ? pre_effect_backdrop->sample_color(x, y)
+                                                                      : destination.sample_color(x, y);
+                styled_color = composite_blended_rgb_deep(styled_color, deep_channels(backdrop.color),
+                                                          layer.blend_mode(), 1.0F, backdrop.alpha, domain);
+              }
+              if (fold_after_layer_blend) {
+                styled_color = fold_interiors(styled_color);
+              }
+              if (underlay_alpha > 0.0F) {
+                const auto content_alpha = layer.opacity() > 0.0F ? alpha / layer.opacity() : 0.0F;
+                const auto total = content_alpha + underlay_alpha;
+                for (std::size_t channel = 0; channel < 3U; ++channel) {
+                  styled_color[channel] = (content_alpha * styled_color[channel] + underlay_sum[channel]) / total;
+                }
+                alpha = std::min(1.0F, total) * layer.opacity();
+              }
+              if (special_fill) {
+                destination.composite_special_fill_color(x, y, deep_rgb(styled_color),
+                                                         source_coverage * blend_if_factor, fill_opacity,
+                                                         layer.opacity(), layer.blend_mode());
+              } else {
+                auto composite_mode = blend_against_backdrop ? BlendMode::Normal : layer.blend_mode();
+                if (layer.blend_mode() == BlendMode::Dissolve) {
+                  alpha = dissolve_coverage(x, y, alpha, DissolveField::Layer);
+                  if (alpha <= 0.0F) {
+                    continue;
+                  }
+                  composite_mode = BlendMode::Normal;
+                }
+                destination.composite_color(x, y, deep_rgb(styled_color), alpha, composite_mode);
+              }
+            }
+          }
+      } else {
+        const auto format = content.format();
+        const auto channels = format.channels;
+        const auto* source_bytes = content.data().data();
+        const auto source_stride = content.stride_bytes();
+        const auto has_enabled_mask = (layer.mask().has_value() && !layer.mask()->disabled) ||
+                                      layer_has_enabled_vector_mask(layer);
+        const auto has_folded_overlays = !folded_overlays.empty();
+        // One row-walked pass instead of a per-pixel mask call chain; values are
+        // bit-identical to layer_mask_alpha_for_render (see the builder's note).
+        const auto mask_plane =
+            has_enabled_mask ? build_mask_coverage_plane(layer, draw_rect, layer_mask_bounds) : std::vector<float>{};
+        bool composited_by_target = false;
+        if (!has_blend_if && !has_enabled_mask && prepared_satins.empty() && folded_overlays.empty() &&
+            knockout == nullptr && !has_underlay && fill_opacity == 1.0F && layer.blend_mode() == BlendMode::Normal) {
+          if constexpr (requires(Target& target, std::int32_t x, std::int32_t y, const std::uint8_t* row,
+                                  std::int32_t width, std::uint16_t channel_count, float opacity) {
+                          target.composite_source_row(x, y, row, width, channel_count, opacity);
+                        }) {
+            for (std::int32_t y = draw_rect.y; y < draw_rect.y + draw_rect.height; ++y) {
+              const auto sy = y - content_origin.y;
+              const auto sx = draw_rect.x - content_origin.x;
+              const auto* source_row =
+                  source_bytes + static_cast<std::size_t>(sy) * source_stride + static_cast<std::size_t>(sx) * channels;
+              destination.composite_source_row(draw_rect.x, y, source_row, draw_rect.width, channels, layer.opacity());
+            }
+            composited_by_target = true;
+          }
+        }
+        // Row-kernel fast path: once no per-pixel gate beyond coverage remains
+        // (no blend-if, satins, folded overlays, knockout, special fill, or
+        // backdrop pre-blend), targets exposing composite_blended_row take a
+        // row walk - with the mask plane when a mask exists - instead of the
+        // per-pixel general loop. The kernel is a float-exact replica of
+        // composite_color (mode dispatch through the real blend_rgb), so bytes
+        // match the general loop bit for bit. Dissolve stays per-pixel: its
+        // coverage is a stochastic paint decision, not a colour function.
+        if (!composited_by_target && !has_blend_if && prepared_satins.empty() && !has_folded_overlays &&
+            knockout == nullptr && !has_underlay && fill_opacity == 1.0F && !blend_against_backdrop &&
+            layer.blend_mode() != BlendMode::Dissolve) {
+          if constexpr (requires(Target& target, std::int32_t x, std::int32_t y, const std::uint8_t* row,
+                                  const float* mask_row, std::int32_t width, std::uint16_t channel_count,
+                                  float opacity, BlendMode mode) {
+                          target.composite_blended_row(x, y, row, mask_row, width, channel_count, opacity, mode);
+                        }) {
+            for (std::int32_t y = draw_rect.y; y < draw_rect.y + draw_rect.height; ++y) {
+              const auto sy = y - content_origin.y;
+              const auto sx = draw_rect.x - content_origin.x;
+              const auto* source_row =
+                  source_bytes + static_cast<std::size_t>(sy) * source_stride + static_cast<std::size_t>(sx) * channels;
+              const auto* mask_row = mask_plane.empty()
+                                         ? nullptr
+                                         : mask_plane.data() + static_cast<std::size_t>(y - draw_rect.y) *
+                                                                   static_cast<std::size_t>(draw_rect.width);
+              destination.composite_blended_row(draw_rect.x, y, source_row, mask_row, draw_rect.width, channels,
+                                                layer.opacity(), layer.blend_mode());
+            }
+            composited_by_target = true;
+          }
+        }
+        if (!composited_by_target) {
+          const auto special_fill = fill_opacity != 1.0F && blend_mode_has_special_fill(layer.blend_mode());
+          for (std::int32_t y = draw_rect.y; y < draw_rect.y + draw_rect.height; ++y) {
+            const auto sy = y - content_origin.y;
+            const auto* source_row = source_bytes + static_cast<std::size_t>(sy) * source_stride;
+            const auto* mask_row = mask_plane.empty()
+                                       ? nullptr
+                                       : mask_plane.data() + static_cast<std::size_t>(y - draw_rect.y) *
+                                                                 static_cast<std::size_t>(draw_rect.width);
+            for (std::int32_t x = draw_rect.x; x < draw_rect.x + draw_rect.width; ++x) {
+              const auto sx = x - content_origin.x;
+              const auto* src = source_row + static_cast<std::size_t>(sx) * channels;
+              const auto source_alpha = channels >= 4 ? static_cast<float>(src[3]) / 255.0F : 1.0F;
+              // Without a mask the chain returns 1.0F and multiplying by it is
+              // exact, so skipping the multiply keeps the same bytes.
+              auto source_coverage =
+                  mask_row != nullptr ? source_alpha * mask_row[x - draw_rect.x] : source_alpha;
+              // The stroke paint beneath semi-transparent content: each stroke, top
+              // first (the FIRST listed instance, GitHub issue 265), takes its share
+              // of the pixel's missing alpha (the probes:
+              // (1 - a) at full stroke opacity, Fill Opacity scaling the content only,
+              // a Multiply stroke blended against the backdrop). Zero for opaque pixels.
+              float underlay_alpha = 0.0F;
+              std::array<float, 3> underlay_sum{0.0F, 0.0F, 0.0F};
+              if (has_underlay && source_coverage > 0.0F && source_coverage < 1.0F) {
+                auto remaining = 1.0F;
+                for (auto it = underlay_strokes.begin(); it != underlay_strokes.end(); ++it) {
+                  const auto& prepared = *it;
+                  const auto plane = prepared_stroke_underlay(prepared, layer, x, y, layer_mask_bounds);
+                  if (plane <= 0.0F) {
+                    continue;
+                  }
+                  const auto& stroke = *prepared.stroke;
+                  auto color = stroke.color;
+                  auto strength = stroke.opacity;
+                  if (stroke.uses_gradient) {
+                    const auto mask_index = static_cast<std::size_t>((y - prepared.mask_bounds.y) * prepared.mask_bounds.width +
+                                                                     (x - prepared.mask_bounds.x));
+                    if (prepared.shape_burst) {
+                      const auto band = prepared.entry->secondary[mask_index];
+                      const auto span = shape_burst_ramp_span(stroke.size, stroke.position);
+                      color = shape_burst_stroke_color(stroke.gradient, band, span, x, y);
+                      strength *= shape_burst_stroke_opacity(stroke.gradient, band, span);
+                    } else {
+                      const auto position = gradient_position(stroke.gradient, prepared.gradient_bounds, x, y);
+                      color = gradient_color_dithered(stroke.gradient, position, x, y);
+                      strength *= gradient_stop_opacity(stroke.gradient, position);
+                    }
+                  }
+                  std::array<float, 3> rgb{static_cast<float>(color.red), static_cast<float>(color.green),
+                                           static_cast<float>(color.blue)};
+                  if (stroke.blend_mode != BlendMode::Normal) {
+                    const auto backdrop = destination.sample_color(x, y);
+                    const auto blended = composite_blended_rgb(
+                        {color.red, color.green, color.blue},
+                        {backdrop.color.red, backdrop.color.green, backdrop.color.blue}, stroke.blend_mode, 1.0F,
+                        backdrop.alpha);
+                    rgb = {static_cast<float>(blended[0]), static_cast<float>(blended[1]),
+                           static_cast<float>(blended[2])};
+                  }
+                  // The plane already carries the mask (it is built from the masked
+                  // alpha); the mask does not hide the stroke's share.
+                  const auto take = plane * strength * remaining;
+                  remaining *= 1.0F - strength;
+                  underlay_alpha += take;
+                  for (int channel = 0; channel < 3; ++channel) {
+                    underlay_sum[static_cast<std::size_t>(channel)] += take * rgb[static_cast<std::size_t>(channel)];
+                  }
+                }
+              }
+              if (knockout != nullptr) {
+                source_coverage *= knockout->at(x, y);
+              }
+              auto alpha = source_coverage * layer.opacity();
+              if (fill_opacity != 1.0F) {
+                alpha *= fill_opacity;
+              }
+              if (alpha <= 0.0F && underlay_alpha <= 0.0F) {
+                continue;
+              }
+
+              if constexpr (requires { destination.record_clip_coverage(x, y, alpha); }) {
+                destination.record_clip_coverage(x, y, alpha);
+              }
+
+              const auto source_color = RgbColor{src[0], src[1], src[2]};
+              auto blend_if_factor = 1.0F;
+              if (has_blend_if) {
+                blend_if_factor *= blend_if_source_alpha_factor(blend_if, source_color);
+                if (has_underlying_blend_if) {
+                  blend_if_factor *=
+                      blend_if_underlying_alpha_factor(blend_if, blend_if_backdrop->sample_color(x, y));
+                }
+                alpha *= blend_if_factor;
+                if (alpha <= 0.0F) {
+                  continue;
+                }
+              }
+
+              std::array<std::uint8_t, 3> styled_color{src[0], src[1], src[2]};
+              // Overlays sit under Satin in Photoshop's interior stack, so they
+              // fold first.
+              const auto fold_interiors = [&](std::array<std::uint8_t, 3> color) {
+                if (has_folded_overlays) {
+                  color = fold_interior_overlays(color, folded_overlays, x, y);
+                }
+                if (!has_blend_if && fill_opacity == 1.0F && !has_effect_matte) {
+                  color = fold_prepared_satins(color, prepared_satins, x, y);
+                }
+                return color;
+              };
+              if (!fold_after_layer_blend) {
+                styled_color = fold_interiors(styled_color);
+              }
+              if (blend_against_backdrop) {
+                const auto backdrop = pre_effect_backdrop.has_value() ? pre_effect_backdrop->sample_color(x, y)
+                                                                      : destination.sample_color(x, y);
+                styled_color = composite_blended_rgb(
+                    styled_color, {backdrop.color.red, backdrop.color.green, backdrop.color.blue},
+                    layer.blend_mode(), 1.0F, backdrop.alpha);
+              }
+              if (fold_after_layer_blend) {
+                styled_color = fold_interiors(styled_color);
+              }
+              if (underlay_alpha > 0.0F) {
+                // Two disjoint paints in one pixel: the content at its coverage and the
+                // stroke beneath at its take; layer opacity then scales the pair.
+                const auto content_alpha = layer.opacity() > 0.0F ? alpha / layer.opacity() : 0.0F;
+                const auto total = content_alpha + underlay_alpha;
+                for (std::size_t channel = 0; channel < 3; ++channel) {
+                  const auto mixed = (content_alpha * static_cast<float>(styled_color[channel]) + underlay_sum[channel]) / total;
+                  styled_color[channel] = static_cast<std::uint8_t>(std::clamp(std::lround(mixed), 0L, 255L));
+                }
+                alpha = std::min(1.0F, total) * layer.opacity();
+              }
+              if (special_fill) {
+                destination.composite_special_fill_color(
+                    x, y, RgbColor{styled_color[0], styled_color[1], styled_color[2]},
+                    source_coverage * blend_if_factor, fill_opacity, layer.opacity(), layer.blend_mode());
+              } else {
+                // The blend already happened against the pre-effect backdrop on
+                // that path, so the composite is a plain source-over.
+                auto composite_mode = blend_against_backdrop ? BlendMode::Normal : layer.blend_mode();
+                // Keyed on the LAYER's mode, not composite_mode: the
+                // blend-against-backdrop path above already rewrote the latter to
+                // Normal, and for Dissolve that pre-blend is an identity pass
+                // because Dissolve's colour function is the source.
+                if (layer.blend_mode() == BlendMode::Dissolve) {
+                  // Coverage is the paint probability; the pixels that survive
+                  // land at full strength through Normal. This runs AFTER
+                  // record_clip_coverage above, because a clipping run is masked
+                  // by the base's transparency and not by what it painted.
+                  alpha = dissolve_coverage(x, y, alpha, DissolveField::Layer);
+                  if (alpha <= 0.0F) {
+                    continue;
+                  }
+                  composite_mode = BlendMode::Normal;
+                }
+                destination.composite_color(x, y, RgbColor{styled_color[0], styled_color[1], styled_color[2]}, alpha,
+                                            composite_mode);
+              }
+            }
+          }
+        }
+      }
+    });
+  }
+
+  if (before_knockout.has_value()) {
+    using Color = target_color_t<Target>;
+    for (auto y = draw_rect.y; y < draw_rect.y + draw_rect.height; ++y) {
+      for (auto x = draw_rect.x; x < draw_rect.x + draw_rect.width; ++x) {
+        const auto index = static_cast<std::size_t>(y - draw_rect.y) * draw_rect.width + x - draw_rect.x;
+        const auto shape = knockout_shape[index];
+        if (shape <= 0.0F || shape >= 1.0F) {
+          continue;
+        }
+        const auto before = before_knockout->sample_color(x, y);
+        const auto floor = knockout_backdrop != nullptr ? knockout_backdrop->sample_color(x, y)
+                                                       : CompositeSampleT<Color>{};
+        const auto painted = destination.sample_color(x, y);
+        const auto keep = 1.0F - shape;
+        const auto alpha = clamp_unit(painted.alpha + (before.alpha - floor.alpha) * keep);
+        const auto channel = [&](auto value, auto old_value, auto floor_value) {
+          return alpha > 0.0F ? (static_cast<float>(value) * painted.alpha +
+                                   (static_cast<float>(old_value) * before.alpha -
+                                    static_cast<float>(floor_value) * floor.alpha) * keep) / alpha
+                              : 0.0F;
+        };
+        destination.store_color(x, y,
+            color_from_floats<Color>(channel(painted.color.red, before.color.red, floor.color.red),
+                                    channel(painted.color.green, before.color.green, floor.color.green),
+                                    channel(painted.color.blue, before.color.blue, floor.color.blue)), alpha);
+      }
+    }
+  }
+
+  // Satin is normally folded into the base color to preserve Patchy's
+  // established identity-path bytes. Photoshop does not gate layer effects
+  // with Blend If, however, so a Blend-If layer renders Satin as its own
+  // interior effect using the original (ungated) layer matte.
+  if ((has_blend_if || fill_opacity != 1.0F || has_effect_matte) && !draw_rect.empty() &&
+      !prepared_satins.empty()) {
+    profile_compositor_step(destination, layer, "satin_effect", draw_rect, [&] {
+      if constexpr (is_deep_target_v<Target>) {
+          for (std::int32_t y = draw_rect.y; y < draw_rect.y + draw_rect.height; ++y) {
+            for (std::int32_t x = draw_rect.x; x < draw_rect.x + draw_rect.width; ++x) {
+              auto source_alpha = pixel_alpha_at(effect_source, x - bounds.x, y - bounds.y) *
+                                  layer_mask_alpha_for_render(layer, x, y, layer_mask_bounds) * layer.opacity();
+              if (knockout != nullptr) {
+                source_alpha *= knockout->at(x, y);
+              }
+              if (source_alpha <= 0.0F) {
+                continue;
+              }
+              for (const auto& prepared : prepared_satins) {
+                const auto mask_index =
+                    static_cast<std::size_t>(y - prepared.mask_bounds.y) *
+                        static_cast<std::size_t>(prepared.mask_bounds.width) +
+                    static_cast<std::size_t>(x - prepared.mask_bounds.x);
+                const auto alpha =
+                    source_alpha * prepared.entry->primary[mask_index] * clamp_unit(prepared.effect->opacity);
+                if (alpha > 0.0F) {
+                  composite_effect_color(destination, x, y, prepared.effect->color, alpha,
+                                         prepared.effect->blend_mode, DissolveField::Satin);
+                }
+              }
+            }
+          }
+      } else {
+        const auto format = effect_source.format();
+        const auto channels = format.channels;
+        const auto* source_bytes = effect_source.data().data();
+        const auto source_stride = effect_source.stride_bytes();
+        for (std::int32_t y = draw_rect.y; y < draw_rect.y + draw_rect.height; ++y) {
+          const auto sy = y - bounds.y;
+          const auto* source_row = source_bytes + static_cast<std::size_t>(sy) * source_stride;
+          for (std::int32_t x = draw_rect.x; x < draw_rect.x + draw_rect.width; ++x) {
+            const auto sx = x - bounds.x;
+            const auto* src = source_row + static_cast<std::size_t>(sx) * channels;
+            auto source_alpha =
+                (channels >= 4 ? static_cast<float>(src[3]) / 255.0F : 1.0F) *
+                layer_mask_alpha_for_render(layer, x, y, layer_mask_bounds) * layer.opacity();
+            if (knockout != nullptr) {
+              source_alpha *= knockout->at(x, y);
+            }
+            if (source_alpha <= 0.0F) {
+              continue;
+            }
+            for (const auto& prepared : prepared_satins) {
+              const auto mask_index =
+                  static_cast<std::size_t>(y - prepared.mask_bounds.y) *
+                      static_cast<std::size_t>(prepared.mask_bounds.width) +
+                  static_cast<std::size_t>(x - prepared.mask_bounds.x);
+              const auto alpha =
+                  source_alpha * prepared.entry->primary[mask_index] * clamp_unit(prepared.effect->opacity);
+              if (alpha > 0.0F) {
+                composite_effect_color(destination, x, y, prepared.effect->color, alpha, prepared.effect->blend_mode,
+                                       DissolveField::Satin);
+              }
+            }
+          }
+        }
+      }
+    });
+  }
+
+  if (style.effects_visible) {
+    // Overlay stacking pinned against Photoshop 2026 (pairwise 100%-opacity
+    // probes): pattern under gradient under color, i.e. Color Overlay paints
+    // last. The historical color-then-gradient order was inverted vs PS. These
+    // destination passes only run for the cases the base-pass fold above cannot
+    // take (Blend If, Fill Opacity, the vector fill/stroke split).
+    if (!fold_interior_overlays_into_base && !interiors_prefolded) {
+      for (const auto& overlay : style.pattern_overlays) {
+        profile_compositor_step(destination, layer, "pattern_overlay", clip, [&] {
+          render_pattern_overlay(destination, layer, *interior_source, clip, bounds, overlay,
+                                 layer_mask_bounds, patterns, knockout);
+        });
+      }
+      for (const auto& fill : style.gradient_fills) {
+        profile_compositor_step(destination, layer, "gradient_fill", clip, [&] {
+          render_gradient_fill(destination, layer, *interior_source, clip, bounds, fill, layer_mask_bounds,
+                               knockout);
+        });
+      }
+      for (const auto& overlay : style.color_overlays) {
+        profile_compositor_step(destination, layer, "color_overlay", clip, [&] {
+          render_color_overlay(destination, layer, *interior_source, clip, bounds, overlay, layer_mask_bounds,
+                               knockout);
+        });
+      }
+    }
+    if (stroke_restamp != nullptr && !draw_rect.empty()) {
+      // The vector stroke re-composites above the interior overlays with the
+      // base pass's factors (mask, opacity, fill opacity, layer blend); satin
+      // folding and clip-coverage recording stay with the base pass.
+      profile_compositor_step(destination, layer, "vector_stroke_over_overlays", draw_rect, [&] {
+        if constexpr (is_deep_target_v<Target>) {
+            const auto domain = target_domain(destination);
+            std::vector<float> row(static_cast<std::size_t>(draw_rect.width) * 4U);
+            for (std::int32_t y = draw_rect.y; y < draw_rect.y + draw_rect.height; ++y) {
+              load_rgba_row(*stroke_restamp, y - bounds.y, draw_rect.x - bounds.x, draw_rect.width, domain, row);
+              for (std::int32_t x = draw_rect.x; x < draw_rect.x + draw_rect.width; ++x) {
+                const auto* px = row.data() + static_cast<std::size_t>(x - draw_rect.x) * 4U;
+                const auto source_alpha = px[3] / 255.0F;
+                if (source_alpha <= 0.0F) {
+                  continue;
+                }
+                auto source_coverage = source_alpha * layer_mask_alpha_for_render(layer, x, y, layer_mask_bounds);
+                if (knockout != nullptr) {
+                  source_coverage *= knockout->at(x, y);
+                }
+                const auto special_fill = fill_opacity != 1.0F && blend_mode_has_special_fill(layer.blend_mode());
+                auto alpha = source_coverage * layer.opacity();
+                if (fill_opacity != 1.0F) {
+                  alpha *= fill_opacity;
+                }
+                if (alpha <= 0.0F) {
+                  continue;
+                }
+                const DeepRgb color{px[0], px[1], px[2]};
+                if (special_fill) {
+                  destination.composite_special_fill_color(x, y, color, source_coverage, fill_opacity,
+                                                           layer.opacity(), layer.blend_mode());
+                } else if (layer.blend_mode() == BlendMode::Dissolve) {
+                  if (dissolve_coverage(x, y, alpha, DissolveField::Layer) > 0.0F) {
+                    destination.composite_color(x, y, color, 1.0F, BlendMode::Normal);
+                  }
+                } else {
+                  destination.composite_color(x, y, color, alpha, layer.blend_mode());
+                }
+              }
+            }
+        } else {
+          const auto* stroke_bytes = stroke_restamp->data().data();
+          const auto stroke_stride = stroke_restamp->stride_bytes();
+          for (std::int32_t y = draw_rect.y; y < draw_rect.y + draw_rect.height; ++y) {
+            const auto sy = y - bounds.y;
+            const auto* stroke_row = stroke_bytes + static_cast<std::size_t>(sy) * stroke_stride;
+            for (std::int32_t x = draw_rect.x; x < draw_rect.x + draw_rect.width; ++x) {
+              const auto sx = x - bounds.x;
+              const auto* px = stroke_row + static_cast<std::size_t>(sx) * 4;
+              const auto source_alpha = static_cast<float>(px[3]) / 255.0F;
+              if (source_alpha <= 0.0F) {
+                continue;
+              }
+              auto source_coverage =
+                  source_alpha * layer_mask_alpha_for_render(layer, x, y, layer_mask_bounds);
+              if (knockout != nullptr) {
+                source_coverage *= knockout->at(x, y);
+              }
+              const auto special_fill = fill_opacity != 1.0F &&
+                                        blend_mode_has_special_fill(layer.blend_mode());
+              auto alpha = source_coverage * layer.opacity();
+              if (fill_opacity != 1.0F) {
+                alpha *= fill_opacity;
+              }
+              if (alpha <= 0.0F) {
+                continue;
+              }
+              const auto color = RgbColor{px[0], px[1], px[2]};
+              if (special_fill) {
+                destination.composite_special_fill_color(x, y, color, source_coverage,
+                                                         fill_opacity, layer.opacity(),
+                                                         layer.blend_mode());
+              } else if (layer.blend_mode() == BlendMode::Dissolve) {
+                // The stroke shares the layer's blend mode, so it dithers on the
+                // same field as the base pass and lands on the same pixels.
+                if (dissolve_coverage(x, y, alpha, DissolveField::Layer) > 0.0F) {
+                  destination.composite_color(x, y, color, 1.0F, BlendMode::Normal);
+                }
+              } else {
+                destination.composite_color(x, y, color, alpha, layer.blend_mode());
+              }
+            }
+          }
+        }
+      });
+    }
+    // Interior effects paint ABOVE the overlays, glow below shadow (Photoshop's
+    // interior stack bottom-to-top: pattern/gradient/color overlay, satin,
+    // inner glow, inner shadow - the Layer Style dialog's list order mirrored).
+    // COM-pinned July 2026 on capsule_v_top.psd: its ColorDodge inner glow
+    // brightens the gradient-overlay-lightened content (blend reads the
+    // destination AFTER overlays), where the historical effects-then-overlays
+    // order dodged the raw dark pixels and the 15% overlay then washed the rim
+    // out entirely.
+    for (std::uint32_t index = 0; index < style.inner_glows.size(); ++index) {
+      const auto& glow = style.inner_glows[index];
+      profile_compositor_step(destination, layer, "inner_glow", clip, [&] {
+        render_inner_glow(destination, layer, effect_source, clip, bounds, glow, layer_mask_bounds, masks, index,
+                          knockout);
+      });
+    }
+    for (std::uint32_t index = 0; index < style.inner_shadows.size(); ++index) {
+      const auto& shadow = style.inner_shadows[index];
+      profile_compositor_step(destination, layer, "inner_shadow", clip, [&] {
+        render_inner_shadow(destination, layer, effect_source, clip, bounds, shadow, layer_mask_bounds, masks,
+                            index,
+                            knockout);
+      });
+    }
+    // Several Stroke instances stack like layers, the first listed on top
+    // (see render_prepared_stroke): draw from the last to the first, each
+    // knocked out by the non-identity strokes listed before it.
+    for (std::uint32_t index = static_cast<std::uint32_t>(style.strokes.size()); index-- > 0;) {
+      const auto& stroke = style.strokes[index];
+      profile_compositor_step(destination, layer, "stroke", clip, [&] {
+        std::vector<const PreparedStroke*> above;
+        for (const auto& candidate : knockout_strokes) {
+          if (candidate.effect_index < index && !candidate.stroke->overprint) {
+            above.push_back(&candidate);
+          }
+        }
+        const auto prepared =
+            std::find_if(knockout_strokes.begin(), knockout_strokes.end(),
+                         [index](const PreparedStroke& candidate) { return candidate.effect_index == index; });
+        if (prepared != knockout_strokes.end()) {
+          // Reuse the band mask the knockout pass already resolved.
+          render_prepared_stroke(destination, layer, *prepared, layer_mask_bounds, above);
+        } else if (stroke.opacity > 0.0F) {
+          if (auto fresh = prepare_stroke_render(layer, effect_source, clip, bounds, stroke, layer_mask_bounds, masks,
+                                                 index)) {
+            fresh->draw_includes_underlay = fresh->entry->partial_content && !fold_underlay;
+            render_prepared_stroke(destination, layer, *fresh, layer_mask_bounds, above);
+          }
+        }
+      });
+    }
+    // Bevel shading derives from the layer matte but composites OVER the
+    // Stroke effect's band: the pillow probes show identical shading alphas
+    // painted on top of the band with and without a stroke (July 2026,
+    // photoshop-pillow-emboss fixtures), so strokes render first.
+    for (std::uint32_t index = 0; index < style.bevels.size(); ++index) {
+      const auto& bevel = style.bevels[index];
+      if (bevel.style == BevelEmbossStyleKind::StrokeEmboss) {
+        continue;
+      }
+      profile_compositor_step(destination, layer, "bevel_emboss", clip, [&] {
+        render_bevel_emboss(destination, layer, effect_source, clip, bounds, bevel, layer_mask_bounds, masks, index,
+                            patterns, &style.strokes);
+      });
+    }
+    // Stroke Emboss shades the rendered Stroke effect itself, so it must paint
+    // after the stroke base instead of being covered by it.
+    for (std::uint32_t index = 0; index < style.bevels.size(); ++index) {
+      const auto& bevel = style.bevels[index];
+      if (bevel.style != BevelEmbossStyleKind::StrokeEmboss) {
+        continue;
+      }
+      profile_compositor_step(destination, layer, "stroke_emboss", clip, [&] {
+        render_bevel_emboss(destination, layer, effect_source, clip, bounds, bevel, layer_mask_bounds, masks, index,
+                            patterns, &style.strokes);
+      });
+    }
+  }
+}
+
+[[nodiscard]] inline bool layer_clipped_for_render(const Layer& layer) noexcept {
+  // Groups can never be clipped (Photoshop's rule); defensive against stray flags.
+  return layer.clipped() && layer.kind() != LayerKind::Group;
+}
+
+[[nodiscard]] inline bool layer_is_clip_base(const Layer& layer) noexcept {
+  // A folder's merged children can host clipped layers, including adjustments.
+  // Adjustment layers themselves have no content to define a clipping shape.
+  return layer.kind() == LayerKind::Pixel || layer.kind() == LayerKind::Group;
+}
+
+// Isolated buffer for one Photoshop clipping group. The base layer composites
+// in normally, then freeze_clip() locks the clipping shape to the base's own
+// CONTENT coverage - source alpha x layer/vector mask x opacity - recorded
+// through record_clip_coverage() as the base paints. Photoshop clips members
+// to the base's transparency alone, so the base's layer STYLES must not widen
+// it: they still composite into the buffer and merge normally, they just do
+// not license a clipped member to paint where the base itself is absent.
+// Clipped members blend against the base's COLOR at full strength
+// (destination alpha 1 - Photoshop's default "Blend Clipped Layers as Group"
+// semantics) without growing coverage, and a clipped adjustment layer's
+// adjust_color touches only masked pixels. merge_into() then lays the ensemble
+// into the real destination with the base's blend mode; the base's own opacity
+// is already folded into the frozen alpha, so the group fades as a unit.
+//
+// records_clip_coverage is set only for instances that will freeze (real clip
+// runs); isolated non-pass-through groups reuse this buffer without a clip
+// shape and skip the per-pixel bookkeeping.
+template <typename Color>
+class IsolatedClipGroupTargetT {
+public:
+  // Deep instantiations (16/32-bit documents) declare their color type and domain; the
+  // 8-bit one is the historical byte target (docs/high-bit-depth-compositor.md).
+  using color_type = Color;
+  using channel_type = color_channel_t<Color>;
+  static constexpr bool kDeep = std::is_same_v<Color, DeepRgb>;
+
+  explicit IsolatedClipGroupTargetT(Rect rect, bool records_clip_coverage = false,
+                                    DeepDomain domain = DeepDomain::Encoded)
+      : rect_(rect),
+        rgb_(static_cast<std::size_t>(std::max(0, rect.width)) * static_cast<std::size_t>(std::max(0, rect.height)) *
+                 3U,
+             channel_type{0}),
+        alpha_(static_cast<std::size_t>(std::max(0, rect.width)) * static_cast<std::size_t>(std::max(0, rect.height)),
+               0.0F),
+        clip_alpha_(alpha_.size(), 0.0F),
+        records_clip_coverage_(records_clip_coverage),
+        domain_(domain) {}
+
+  [[nodiscard]] DeepDomain deep_domain() const noexcept { return domain_; }
+  [[nodiscard]] Rect rect() const noexcept { return rect_; }
+
+  [[nodiscard]] float knockout_clip_gate(std::int32_t x, std::int32_t y) const noexcept {
+    if (!frozen_) {
+      return 1.0F;
+    }
+    if (!rect_.contains(x, y)) {
+      return 0.0F;
+    }
+    const auto index = static_cast<std::size_t>(y - rect_.y) * rect_.width + x - rect_.x;
+    return clip_alpha_[index] > 0.0F ? 1.0F : 0.0F;
+  }
+
+  void composite_color(std::int32_t x, std::int32_t y, Color color, float alpha, BlendMode mode) {
+    alpha = clamp_unit(alpha);
+    x -= rect_.x;
+    y -= rect_.y;
+    if (alpha <= 0.0F || x < 0 || y < 0 || x >= rect_.width || y >= rect_.height) {
+      return;
+    }
+    const auto index =
+        static_cast<std::size_t>(y) * static_cast<std::size_t>(rect_.width) + static_cast<std::size_t>(x);
+    auto& destination_alpha = alpha_[index];
+    const auto clip_alpha = clip_alpha_[index];
+    if (frozen_ && clip_alpha <= 0.0F) {
+      return;  // outside the clip mask
+    }
+    auto* dst = rgb_.data() + index * 3U;
+    const color_array_t<Color> src_rgb{color.red, color.green, color.blue};
+    const color_array_t<Color> dst_rgb{dst[0], dst[1], dst[2]};
+    const auto blended =
+        blend_composite(src_rgb, dst_rgb, mode, alpha, frozen_ ? 1.0F : destination_alpha, domain_);
+    for (int channel = 0; channel < 3; ++channel) {
+      dst[channel] = store_channel(blended[static_cast<std::size_t>(channel)]);
+    }
+    if (frozen_) {
+      // Clipped members paint at full color strength inside the original base
+      // matte, but can restore output coverage that the base's Blend If hid.
+      const auto normalized_destination_alpha =
+          clip_alpha > 0.0F ? std::min(destination_alpha, clip_alpha) / clip_alpha : 0.0F;
+      const auto clipped_output_alpha =
+          clip_alpha * (alpha + normalized_destination_alpha * (1.0F - alpha));
+      destination_alpha = std::max(destination_alpha, clipped_output_alpha);
+    } else {
+      destination_alpha = alpha + destination_alpha * (1.0F - alpha);
+    }
+  }
+
+  // A deep target also takes 8-bit colors: layer-style, effect and gradient colors
+  // stay 8-bit parameters and convert into the target's domain here.
+  void composite_color(std::int32_t x, std::int32_t y, RgbColor color, float alpha, BlendMode mode)
+    requires kDeep
+  {
+    composite_color(x, y, deep_from_byte(color, domain_), alpha, mode);
+  }
+
+  void composite_special_fill_color(std::int32_t x, std::int32_t y, Color color,
+                                    float source_coverage, float fill_opacity, float layer_opacity,
+                                    BlendMode mode) {
+    source_coverage = clamp_unit(source_coverage);
+    const auto effective_alpha = source_coverage * clamp_unit(fill_opacity) * clamp_unit(layer_opacity);
+    x -= rect_.x;
+    y -= rect_.y;
+    if (effective_alpha <= 0.0F || x < 0 || y < 0 || x >= rect_.width || y >= rect_.height) {
+      return;
+    }
+    const auto index =
+        static_cast<std::size_t>(y) * static_cast<std::size_t>(rect_.width) + static_cast<std::size_t>(x);
+    auto& destination_alpha = alpha_[index];
+    const auto clip_alpha = clip_alpha_[index];
+    if (frozen_ && clip_alpha <= 0.0F) {
+      return;
+    }
+    auto* dst = rgb_.data() + index * 3U;
+    float result_alpha = 0.0F;
+    if constexpr (kDeep) {
+      const auto result = composite_special_fill_rgb_deep(
+          {color.red, color.green, color.blue}, {dst[0], dst[1], dst[2]}, mode, source_coverage, fill_opacity,
+          layer_opacity, frozen_ ? 1.0F : destination_alpha, domain_);
+      for (int channel = 0; channel < 3; ++channel) {
+        dst[channel] = store_channel(result.color[static_cast<std::size_t>(channel)]);
+      }
+      result_alpha = result.alpha;
+    } else {
+      const auto result = composite_special_fill_rgb(
+          {color.red, color.green, color.blue}, {dst[0], dst[1], dst[2]}, mode, source_coverage,
+          fill_opacity, layer_opacity, frozen_ ? 1.0F : destination_alpha);
+      dst[0] = result.color[0];
+      dst[1] = result.color[1];
+      dst[2] = result.color[2];
+      result_alpha = result.alpha;
+    }
+    if (frozen_) {
+      const auto normalized_destination_alpha =
+          clip_alpha > 0.0F ? std::min(destination_alpha, clip_alpha) / clip_alpha : 0.0F;
+      destination_alpha = std::max(
+          destination_alpha,
+          clip_alpha * (effective_alpha + normalized_destination_alpha * (1.0F - effective_alpha)));
+    } else {
+      destination_alpha = result_alpha;
+    }
+  }
+
+  void composite_special_fill_color(std::int32_t x, std::int32_t y, RgbColor color, float source_coverage,
+                                    float fill_opacity, float layer_opacity, BlendMode mode)
+    requires kDeep
+  {
+    composite_special_fill_color(x, y, deep_from_byte(color, domain_), source_coverage, fill_opacity,
+                                 layer_opacity, mode);
+  }
+
+  [[nodiscard]] CompositeSampleT<Color> sample_color(std::int32_t x, std::int32_t y) const noexcept {
+    x -= rect_.x;
+    y -= rect_.y;
+    if (x < 0 || y < 0 || x >= rect_.width || y >= rect_.height) {
+      return {};
+    }
+    const auto index =
+        static_cast<std::size_t>(y) * static_cast<std::size_t>(rect_.width) + static_cast<std::size_t>(x);
+    const auto* rgb = rgb_.data() + index * 3U;
+    return CompositeSampleT<Color>{Color{rgb[0], rgb[1], rgb[2]}, alpha_[index]};
+  }
+
+  // The flattened straight-RGBA content, for routing a styled group's merged
+  // children through the layer-effect pipeline (July 2026; the colors are
+  // stored straight, so this is a plain re-pack). A deep target packs at the depth
+  // whose meaning matches its domain: 16-bit for Encoded, 32-bit float for Linear.
+  [[nodiscard]] PixelBuffer to_pixel_buffer() const {
+    if constexpr (kDeep) {
+      const auto depth = domain_ == DeepDomain::Linear ? BitDepth::Float32 : BitDepth::UInt16;
+      PixelBuffer buffer(rect_.width, rect_.height, with_bit_depth(PixelFormat::rgba8(), depth));
+      std::vector<float> row(static_cast<std::size_t>(std::max(0, rect_.width)) * 4U);
+      for (std::int32_t y = 0; y < rect_.height; ++y) {
+        const auto* rgb = rgb_.data() + static_cast<std::size_t>(y) * static_cast<std::size_t>(rect_.width) * 3U;
+        const auto* alpha = alpha_.data() + static_cast<std::size_t>(y) * static_cast<std::size_t>(rect_.width);
+        for (std::int32_t x = 0; x < rect_.width; ++x) {
+          auto* px = row.data() + static_cast<std::size_t>(x) * 4U;
+          px[0] = rgb[static_cast<std::size_t>(x) * 3U];
+          px[1] = rgb[static_cast<std::size_t>(x) * 3U + 1U];
+          px[2] = rgb[static_cast<std::size_t>(x) * 3U + 2U];
+          px[3] = clamp_unit(alpha[static_cast<std::size_t>(x)]) * 255.0F;
+        }
+        if (rect_.width > 0) {
+          store_rgba_row(buffer, y, 0, rect_.width, domain_, row);
+        }
+      }
+      return buffer;
+    } else {
+      PixelBuffer buffer(rect_.width, rect_.height, PixelFormat::rgba8());
+      for (std::int32_t y = 0; y < rect_.height; ++y) {
+        auto row = buffer.row(y);
+        const auto* rgb =
+            rgb_.data() + static_cast<std::size_t>(y) * static_cast<std::size_t>(rect_.width) * 3U;
+        const auto* alpha = alpha_.data() + static_cast<std::size_t>(y) * static_cast<std::size_t>(rect_.width);
+        for (std::int32_t x = 0; x < rect_.width; ++x) {
+          auto* px = row.data() + static_cast<std::size_t>(x) * 4U;
+          px[0] = rgb[static_cast<std::size_t>(x) * 3U];
+          px[1] = rgb[static_cast<std::size_t>(x) * 3U + 1U];
+          px[2] = rgb[static_cast<std::size_t>(x) * 3U + 2U];
+          px[3] = static_cast<std::uint8_t>(std::lround(clamp_unit(alpha[static_cast<std::size_t>(x)]) * 255.0F));
+        }
+      }
+      return buffer;
+    }
+  }
+
+  // Direct overwrite for fade_toward_snapshot (a faded pass-through group
+  // nested inside an isolated group). Groups are never composited into a
+  // frozen instance (layer_clipped_for_render excludes groups from clip runs),
+  // and the lerped alpha lies between two states that both respected any clip
+  // cap, so no clip_alpha interaction is needed.
+  void store_color(std::int32_t x, std::int32_t y, Color color, float alpha) {
+    x -= rect_.x;
+    y -= rect_.y;
+    if (x < 0 || y < 0 || x >= rect_.width || y >= rect_.height) {
+      return;
+    }
+    const auto index =
+        static_cast<std::size_t>(y) * static_cast<std::size_t>(rect_.width) + static_cast<std::size_t>(x);
+    auto* dst = rgb_.data() + index * 3U;
+    dst[0] = store_channel(color.red);
+    dst[1] = store_channel(color.green);
+    dst[2] = store_channel(color.blue);
+    alpha_[index] = clamp_unit(alpha);
+  }
+
+  void record_clip_coverage(std::int32_t x, std::int32_t y, float alpha) noexcept {
+    if (frozen_ || !records_clip_coverage_) {
+      return;
+    }
+    x -= rect_.x;
+    y -= rect_.y;
+    if (x < 0 || y < 0 || x >= rect_.width || y >= rect_.height) {
+      return;
+    }
+    const auto index =
+        static_cast<std::size_t>(y) * static_cast<std::size_t>(rect_.width) + static_cast<std::size_t>(x);
+    clip_alpha_[index] = std::max(clip_alpha_[index], clamp_unit(alpha));
+  }
+
+  // Blended row: the general per-pixel loop's semantics for a layer with no
+  // per-pixel gates beyond coverage (no blend-if, satin, folded overlays,
+  // knockout, special fill, or backdrop pre-blend) hoisted to a row walk over
+  // this target's straight-RGB bytes and float alpha/clip planes. This is a
+  // float-exact transcription of the loop's record_clip_coverage +
+  // composite_color call pair - the tier-2 dispatch never calls
+  // record_clip_coverage itself, so the kernel must, or clip-run bases stop
+  // recording their matte. The mode dispatch goes through the real blend_rgb,
+  // the mix keeps composite_blended_rgb's exact expression tree, the blend
+  // reads the CLAMPED destination alpha while the plane updates read the
+  // stored value (matching composite_color), and the frozen branch replicates
+  // the clip-matte gate and max-alpha formula verbatim. The one deviation: a
+  // division by an output alpha of exactly 1.0F is skipped, which IEEE
+  // division makes byte-neutral. Do NOT substitute composite_source_row-style
+  // integer math here: the integer and float paths round differently by
+  // design, and this target deliberately has no tier-1 kernel so Normal-mode
+  // layers fall through to this float replica. (8-bit only: a deep target takes
+  // the per-pixel loop.)
+  void composite_blended_row(std::int32_t x, std::int32_t y, const std::uint8_t* source_row, const float* mask_row,
+                             std::int32_t width, std::uint16_t channels, float opacity, BlendMode mode)
+    requires(!kDeep)
+  {
+    if (source_row == nullptr || width <= 0 || channels < 3) {
+      return;
+    }
+
+    auto local_x = x - rect_.x;
+    const auto local_y = y - rect_.y;
+    if (local_y < 0 || local_y >= rect_.height || local_x >= rect_.width) {
+      return;
+    }
+    if (local_x < 0) {
+      const auto skip = -local_x;
+      if (skip >= width) {
+        return;
+      }
+      source_row += static_cast<std::size_t>(skip) * channels;
+      if (mask_row != nullptr) {
+        mask_row += skip;
+      }
+      width -= skip;
+      local_x = 0;
+    }
+    width = std::min(width, rect_.width - local_x);
+    if (width <= 0) {
+      return;
+    }
+
+    auto index = static_cast<std::size_t>(local_y) * static_cast<std::size_t>(rect_.width) +
+                 static_cast<std::size_t>(local_x);
+    const bool record = records_clip_coverage_ && !frozen_;
+    for (std::int32_t offset = 0; offset < width; ++offset, ++index) {
+      const auto* src = source_row + static_cast<std::size_t>(offset) * channels;
+      const auto source_alpha = channels >= 4 ? static_cast<float>(src[3]) / 255.0F : 1.0F;
+      auto alpha = mask_row != nullptr ? source_alpha * mask_row[offset] * opacity : source_alpha * opacity;
+      if (alpha <= 0.0F) {
+        continue;
+      }
+      if (record) {
+        clip_alpha_[index] = std::max(clip_alpha_[index], clamp_unit(alpha));
+      }
+      alpha = clamp_unit(alpha);
+      auto& destination_alpha = alpha_[index];
+      const auto clip_alpha = clip_alpha_[index];
+      if (frozen_ && clip_alpha <= 0.0F) {
+        continue;  // outside the clip mask
+      }
+      auto* dst = rgb_.data() + index * 3U;
+      const std::array<std::uint8_t, 3> src_rgb{src[0], src[1], src[2]};
+      const std::array<std::uint8_t, 3> dst_rgb{dst[0], dst[1], dst[2]};
+      const auto da = clamp_unit(frozen_ ? 1.0F : destination_alpha);
+      const auto output_alpha = alpha + da * (1.0F - alpha);
+      if (output_alpha <= 0.0F) {
+        // Unreachable with alpha > 0; kept so the replica stays complete
+        // (composite_blended_rgb returns black here).
+        dst[0] = 0;
+        dst[1] = 0;
+        dst[2] = 0;
+      } else {
+        const auto blended = blend_rgb(src_rgb, dst_rgb, mode);
+        const bool unit_output = output_alpha == 1.0F;
+        for (std::size_t channel = 0; channel < 3U; ++channel) {
+          const auto source_value = static_cast<float>(src_rgb[channel]);
+          const auto destination_value = static_cast<float>(dst_rgb[channel]);
+          const auto blended_value = static_cast<float>(blended[channel]);
+          const auto numerator = source_value * alpha * (1.0F - da) + blended_value * alpha * da +
+                                 destination_value * da * (1.0F - alpha);
+          dst[channel] = clamp_byte(unit_output ? numerator : numerator / output_alpha);
+        }
+      }
+      if (frozen_) {
+        // Clipped members paint at full color strength inside the original
+        // base matte, but can restore output coverage that the base's Blend If
+        // hid.
+        const auto normalized_destination_alpha =
+            clip_alpha > 0.0F ? std::min(destination_alpha, clip_alpha) / clip_alpha : 0.0F;
+        const auto clipped_output_alpha = clip_alpha * (alpha + normalized_destination_alpha * (1.0F - alpha));
+        destination_alpha = std::max(destination_alpha, clipped_output_alpha);
+      } else {
+        destination_alpha = alpha + destination_alpha * (1.0F - alpha);
+      }
+    }
+  }
+
+  void adjust_color(std::int32_t x, std::int32_t y, const AdjustmentSettings& settings, float amount) {
+    amount = clamp_unit(amount);
+    x -= rect_.x;
+    y -= rect_.y;
+    if (amount <= 0.0F || x < 0 || y < 0 || x >= rect_.width || y >= rect_.height) {
+      return;
+    }
+    const auto index =
+        static_cast<std::size_t>(y) * static_cast<std::size_t>(rect_.width) + static_cast<std::size_t>(x);
+    if (alpha_[index] <= 0.0F) {
+      return;
+    }
+    auto* dst = rgb_.data() + index * 3U;
+    if constexpr (kDeep) {
+      const auto adjusted = deep_adjuster(settings).apply({dst[0], dst[1], dst[2]});
+      for (int channel = 0; channel < 3; ++channel) {
+        dst[channel] = store_channel(adjusted[static_cast<std::size_t>(channel)] * amount +
+                                     dst[channel] * (1.0F - amount));
+      }
+    } else {
+      const auto adjusted = apply_adjustment_to_color(RgbColor{dst[0], dst[1], dst[2]}, settings);
+      dst[0] = clamp_byte(static_cast<float>(adjusted.red) * amount + static_cast<float>(dst[0]) * (1.0F - amount));
+      dst[1] =
+          clamp_byte(static_cast<float>(adjusted.green) * amount + static_cast<float>(dst[1]) * (1.0F - amount));
+      dst[2] = clamp_byte(static_cast<float>(adjusted.blue) * amount + static_cast<float>(dst[2]) * (1.0F - amount));
+    }
+  }
+
+  void adjust_color(std::int32_t x, std::int32_t y, const AdjustmentLut& lut, float amount)
+    requires(!kDeep)
+  {
+    amount = clamp_unit(amount);
+    x -= rect_.x;
+    y -= rect_.y;
+    if (amount <= 0.0F || x < 0 || y < 0 || x >= rect_.width || y >= rect_.height) {
+      return;
+    }
+    const auto index =
+        static_cast<std::size_t>(y) * static_cast<std::size_t>(rect_.width) + static_cast<std::size_t>(x);
+    if (alpha_[index] <= 0.0F) {
+      return;
+    }
+    auto* dst = rgb_.data() + index * 3U;
+    dst[0] = clamp_byte(static_cast<float>(lut.red[dst[0]]) * amount + static_cast<float>(dst[0]) * (1.0F - amount));
+    dst[1] =
+        clamp_byte(static_cast<float>(lut.green[dst[1]]) * amount + static_cast<float>(dst[1]) * (1.0F - amount));
+    dst[2] = clamp_byte(static_cast<float>(lut.blue[dst[2]]) * amount + static_cast<float>(dst[2]) * (1.0F - amount));
+  }
+
+  // Locks the clipping shape. clip_alpha_ already holds exactly the base's
+  // content coverage; the accumulated alpha_ must NOT be substituted, because
+  // by now it also carries the base's drop shadow, glow, and stroke output.
+  void freeze_clip() noexcept { frozen_ = true; }
+
+  template <typename Target>
+  void merge_into(Target& destination, BlendMode mode) const {
+    // Route through the destination's row kernel when it has one; Dissolve
+    // keeps the per-pixel walk (its coverage is a stochastic paint decision).
+    // With channels == 3 the kernel's source_alpha is exactly 1.0F and its
+    // per-pixel alpha collapses to (1.0F * alpha_[i]) * 1.0F == alpha_[i]
+    // (IEEE multiplication by one is exact), so the kernel runs the same
+    // composite_color arithmetic the loop below drives, row-hoisted.
+    if constexpr (!kDeep && requires(Target& target, std::int32_t x, std::int32_t y, const std::uint8_t* row,
+                                     const float* mask_row, std::int32_t width, std::uint16_t channel_count,
+                                     float opacity, BlendMode blend) {
+                    target.composite_blended_row(x, y, row, mask_row, width, channel_count, opacity, blend);
+                  }) {
+      if (mode != BlendMode::Dissolve) {
+        for (std::int32_t y = 0; y < rect_.height; ++y) {
+          const auto* rgb_row =
+              rgb_.data() + static_cast<std::size_t>(y) * static_cast<std::size_t>(rect_.width) * 3U;
+          const auto* alpha_row = alpha_.data() + static_cast<std::size_t>(y) * static_cast<std::size_t>(rect_.width);
+          destination.composite_blended_row(rect_.x, rect_.y + y, rgb_row, alpha_row, rect_.width, 3U, 1.0F, mode);
+        }
+        return;
+      }
+    }
+    for (std::int32_t y = 0; y < rect_.height; ++y) {
+      for (std::int32_t x = 0; x < rect_.width; ++x) {
+        const auto index =
+            static_cast<std::size_t>(y) * static_cast<std::size_t>(rect_.width) + static_cast<std::size_t>(x);
+        const auto alpha = alpha_[index];
+        if (alpha <= 0.0F) {
+          continue;
+        }
+        const auto* px = rgb_.data() + index * 3U;
+        const auto color = Color{px[0], px[1], px[2]};
+        if (mode == BlendMode::Dissolve) {
+          if (dissolve_coverage(rect_.x + x, rect_.y + y, alpha, DissolveField::Layer) > 0.0F) {
+            destination.composite_color(rect_.x + x, rect_.y + y, color, 1.0F, BlendMode::Normal);
+          }
+          continue;
+        }
+        destination.composite_color(rect_.x + x, rect_.y + y, color, alpha, mode);
+      }
+    }
+  }
+
+  template <typename Target>
+  void merge_layer_into(Target& destination, const Layer& layer, const LayerBlendIf& blend_if,
+                        const CompositeSnapshotT<Color>* backdrop, std::optional<Rect> layer_mask_bounds) const {
+    const auto mode = layer.blend_mode() == BlendMode::PassThrough ? BlendMode::Normal : layer.blend_mode();
+    const auto has_underlying_blend_if = blend_if_has_underlying_ranges(blend_if);
+    for (std::int32_t y = 0; y < rect_.height; ++y) {
+      for (std::int32_t x = 0; x < rect_.width; ++x) {
+        const auto index =
+            static_cast<std::size_t>(y) * static_cast<std::size_t>(rect_.width) + static_cast<std::size_t>(x);
+        auto alpha = alpha_[index] * layer.opacity() * group_fill_factor_for_render(layer) *
+                     layer_mask_alpha_for_render(layer, rect_.x + x, rect_.y + y, layer_mask_bounds);
+        if (alpha <= 0.0F) {
+          continue;
+        }
+        const auto* px = rgb_.data() + index * 3U;
+        const auto color = Color{px[0], px[1], px[2]};
+        alpha *= blend_if_source_factor_for(blend_if, color, domain_);
+        if (has_underlying_blend_if) {
+          alpha *= blend_if_underlying_alpha_factor(
+              blend_if, backdrop->sample_color(rect_.x + x, rect_.y + y), domain_);
+        }
+        if (alpha <= 0.0F) {
+          continue;
+        }
+        // A Dissolve group dithers its MERGED result, so the children keep
+        // compositing against each other at full strength first.
+        if (mode == BlendMode::Dissolve) {
+          if (dissolve_coverage(rect_.x + x, rect_.y + y, alpha, DissolveField::Layer) > 0.0F) {
+            destination.composite_color(rect_.x + x, rect_.y + y, color, 1.0F, BlendMode::Normal);
+          }
+          continue;
+        }
+        destination.composite_color(rect_.x + x, rect_.y + y, color, alpha, mode);
+      }
+    }
+  }
+
+private:
+  // Encoded deep values clamp to the deep scale; Linear ones keep any finite value, as
+  // Photoshop's 32-bit data does (Levels below the black point, Luminosity go negative).
+  [[nodiscard]] channel_type store_channel(channel_type value) const noexcept {
+    if constexpr (kDeep) {
+      if (std::isnan(value)) {
+        return 0.0F;
+      }
+      return domain_ == DeepDomain::Encoded ? std::clamp(value, 0.0F, 255.0F) : value;
+    } else {
+      return value;
+    }
+  }
+
+  const DeepAdjuster& deep_adjuster(const AdjustmentSettings& settings) {
+    // Adjustment layers hand the same settings object for every pixel of one pass.
+    if (adjuster_settings_ != &settings || adjuster_pass_ != adjustment_pass_serial || !adjuster_.has_value()) {
+      adjuster_.emplace(settings, domain_);
+      adjuster_settings_ = &settings;
+      adjuster_pass_ = adjustment_pass_serial;
+    }
+    return *adjuster_;
+  }
+
+  Rect rect_{};
+  std::vector<channel_type> rgb_;
+  std::vector<float> alpha_;
+  std::vector<float> clip_alpha_;
+  bool records_clip_coverage_{false};
+  bool frozen_{false};
+  DeepDomain domain_{DeepDomain::Encoded};
+  const AdjustmentSettings* adjuster_settings_{nullptr};
+  std::uint64_t adjuster_pass_{0};
+  std::optional<DeepAdjuster> adjuster_{};
+};
+
+using IsolatedClipGroupTarget = IsolatedClipGroupTargetT<RgbColor>;
+using DeepCompositeTarget = IsolatedClipGroupTargetT<DeepRgb>;
+
+// The isolated buffer a target's groups and clip runs composite into: same color type
+// and domain as the target.
+template <typename Target>
+[[nodiscard]] IsolatedClipGroupTargetT<target_color_t<Target>> make_isolated_target(const Target& target, Rect rect,
+                                                                                     bool records_clip_coverage = false) {
+  return IsolatedClipGroupTargetT<target_color_t<Target>>(rect, records_clip_coverage, target_domain(target));
+}
+
+// Applies a group's raster/vector mask to everything its children composite,
+// WITHOUT isolating them: Photoshop's default pass-through group keeps child
+// blend modes and interior adjustments interacting with the backdrop below the
+// group, so the mask must attenuate each contribution in place rather than
+// clip a merged buffer. A nested masked group pushes onto the same adapter
+// (the chain multiplies), which also caps template-instantiation depth at one
+// wrapper per underlying target type. composite_source_row and
+// composite_blended_row are deliberately not forwarded so masked groups always
+// take the per-pixel path: fusing the group mask into a kernel's mask row
+// would change the float association order (the wrapper multiplies AFTER the
+// loop's (source_alpha * mask) * opacity product) and move pinned bytes.
+template <typename Base>
+class GroupMaskedTarget {
+public:
+  using color_type = target_color_t<Base>;
+
+  explicit GroupMaskedTarget(Base& base) : base_(base) {}
+
+  [[nodiscard]] DeepDomain deep_domain() const noexcept { return target_domain(base_); }
+
+  void push_mask(const Layer& group, std::optional<Rect> mask_bounds) {
+    masks_.push_back(MaskEntry{&group, mask_bounds});
+  }
+  void pop_mask() { masks_.pop_back(); }
+
+  [[nodiscard]] float mask_alpha(std::int32_t x, std::int32_t y) const {
+    auto alpha = 1.0F;
+    for (const auto& entry : masks_) {
+      alpha *= layer_mask_alpha_for_render(*entry.group, x, y, entry.mask_bounds);
+      if (alpha <= 0.0F) {
+        return 0.0F;
+      }
+    }
+    return alpha;
+  }
+
+  template <typename C>
+  void composite_color(std::int32_t x, std::int32_t y, C color, float alpha, BlendMode mode) {
+    alpha *= mask_alpha(x, y);
+    if (alpha > 0.0F) {
+      base_.composite_color(x, y, color, alpha, mode);
+    }
+  }
+
+  template <typename C>
+  void composite_special_fill_color(std::int32_t x, std::int32_t y, C color, float source_coverage,
+                                    float fill_opacity, float layer_opacity, BlendMode mode)
+    requires requires(Base& base) {
+      base.composite_special_fill_color(std::int32_t{}, std::int32_t{}, color, 0.0F, 0.0F, 0.0F,
+                                        BlendMode::Normal);
+    }
+  {
+    source_coverage *= mask_alpha(x, y);
+    if (source_coverage > 0.0F) {
+      base_.composite_special_fill_color(x, y, color, source_coverage, fill_opacity, layer_opacity, mode);
+    }
+  }
+
+  void adjust_color(std::int32_t x, std::int32_t y, const AdjustmentSettings& settings, float amount)
+    requires requires(Base& base) {
+      base.adjust_color(std::int32_t{}, std::int32_t{}, std::declval<const AdjustmentSettings&>(), 0.0F);
+    }
+  {
+    amount *= mask_alpha(x, y);
+    if (amount > 0.0F) {
+      base_.adjust_color(x, y, settings, amount);
+    }
+  }
+
+  void adjust_color(std::int32_t x, std::int32_t y, const AdjustmentLut& lut, float amount)
+    requires requires(Base& base) {
+      base.adjust_color(std::int32_t{}, std::int32_t{}, std::declval<const AdjustmentLut&>(), 0.0F);
+    }
+  {
+    amount *= mask_alpha(x, y);
+    if (amount > 0.0F) {
+      base_.adjust_color(x, y, lut, amount);
+    }
+  }
+
+  [[nodiscard]] auto sample_color(std::int32_t x, std::int32_t y) const
+    requires requires(const Base& base) { base.sample_color(std::int32_t{}, std::int32_t{}); }
+  {
+    return base_.sample_color(x, y);
+  }
+
+  // Deliberately NOT attenuated by mask_alpha: fade_toward_snapshot lerps two
+  // destination states that already include this chain's mask attenuation, so
+  // masking the store would double-apply the masks.
+  void store_color(std::int32_t x, std::int32_t y, color_type color, float alpha)
+    requires requires(Base& base) { base.store_color(std::int32_t{}, std::int32_t{}, color_type{}, 0.0F); }
+  {
+    base_.store_color(x, y, color, alpha);
+  }
+
+  void record_clip_coverage(std::int32_t x, std::int32_t y, float alpha)
+    requires requires(Base& base) { base.record_clip_coverage(std::int32_t{}, std::int32_t{}, 0.0F); }
+  {
+    base_.record_clip_coverage(x, y, alpha * mask_alpha(x, y));
+  }
+
+  // Channel restrictions push through the mask chain onto an inner
+  // ChannelRestrictedTarget, keeping the wrapper set {plain, restricted,
+  // masked-restricted} closed under nesting instead of growing new template
+  // instantiations.
+  void push_channel_restriction(std::uint8_t mask)
+    requires requires(Base& base) { base.push_channel_restriction(std::uint8_t{}); }
+  {
+    base_.push_channel_restriction(mask);
+  }
+
+  void pop_channel_restriction()
+    requires requires(Base& base) { base.pop_channel_restriction(); }
+  {
+    base_.pop_channel_restriction();
+  }
+
+  void profile_compositor_step(const char* step, const Layer& layer, Rect rect, double elapsed_ms)
+    requires requires(Base& base) {
+      base.profile_compositor_step(std::declval<const char*>(), std::declval<const Layer&>(), Rect{}, 0.0);
+    }
+  {
+    base_.profile_compositor_step(step, layer, rect, elapsed_ms);
+  }
+
+private:
+  struct MaskEntry {
+    const Layer* group;
+    std::optional<Rect> mask_bounds;
+  };
+
+  Base& base_;
+  std::vector<MaskEntry> masks_;
+};
+
+template <typename T>
+struct is_group_masked_target : std::false_type {};
+template <typename T>
+struct is_group_masked_target<GroupMaskedTarget<T>> : std::true_type {};
+
+// The base's own content for a clipping run whose effects render over its
+// members: the raw source pixels over `rect` (no mask, opacity, Fill, Blend If
+// or effects; the pipeline applies each of them once to the merged result),
+// recorded as the clip matte. With prefold_interiors the interior overlays and
+// satin fold into the colors first, exactly as the base pass folds them with
+// "Blend Interior Effects as Group" on, so the members composited afterwards
+// cover them (Photoshop's clbl-off + infx-on ordering).
+template <typename Color>
+void composite_clip_base_content(IsolatedClipGroupTargetT<Color>& fill, const Layer& layer,
+                                 const PixelBuffer& source, Rect bounds, Rect rect, bool prefold_interiors,
+                                 std::optional<Rect> layer_mask_bounds, StyleMaskProvider* masks,
+                                 const PatternStore* patterns) {
+  const auto draw_rect = intersect_rect(rect, bounds);
+  if constexpr (std::is_same_v<Color, DeepRgb>) {
+    // 16/32-bit documents (docs/high-bit-depth-compositor.md): the same base content on float rows.
+    if (draw_rect.empty() || source.empty() || source.format().channels < 3) {
+      return;
+    }
+    const auto domain = fill.deep_domain();
+    std::vector<PreparedInteriorOverlay> folded_overlays;
+    std::vector<PreparedSatin> prepared_satins;
+    if (prefold_interiors) {
+      const auto& style = layer.layer_style();
+      folded_overlays = prepare_interior_overlays(layer, style, source, bounds, patterns);
+      for (std::uint32_t index = 0; index < style.satins.size(); ++index) {
+        const auto& satin = style.satins[index];
+        if (satin.enabled && satin.opacity > 0.0F) {
+          prepared_satins.push_back(
+              prepare_satin(layer, source, draw_rect, bounds, satin, layer_mask_bounds, masks, index));
+        }
+      }
+    }
+    std::vector<float> row(static_cast<std::size_t>(draw_rect.width) * 4U);
+    for (std::int32_t y = draw_rect.y; y < draw_rect.y + draw_rect.height; ++y) {
+      load_rgba_row(source, y - bounds.y, draw_rect.x - bounds.x, draw_rect.width, domain, row);
+      for (std::int32_t x = draw_rect.x; x < draw_rect.x + draw_rect.width; ++x) {
+        const auto* src = row.data() + static_cast<std::size_t>(x - draw_rect.x) * 4U;
+        const auto alpha = src[3] / 255.0F;
+        if (alpha <= 0.0F) {
+          continue;
+        }
+        DeepChannels color{src[0], src[1], src[2]};
+        if (prefold_interiors) {
+          color = fold_interior_overlays(color, folded_overlays, x, y, domain);
+          color = fold_prepared_satins(color, prepared_satins, x, y, domain);
+        }
+        fill.record_clip_coverage(x, y, alpha);
+        fill.composite_color(x, y, deep_rgb(color), alpha, BlendMode::Normal);
+      }
+    }
+    return;
+  } else {
+    if (draw_rect.empty() || source.empty() || source.format().bit_depth != BitDepth::UInt8 ||
+        source.format().channels < 3) {
+      return;
+    }
+    const auto channels = source.format().channels;
+    const auto* source_bytes = source.data().data();
+    const auto source_stride = source.stride_bytes();
+    if (!prefold_interiors) {
+      for (std::int32_t y = draw_rect.y; y < draw_rect.y + draw_rect.height; ++y) {
+        const auto* source_row = source_bytes + static_cast<std::size_t>(y - bounds.y) * source_stride +
+                                 static_cast<std::size_t>(draw_rect.x - bounds.x) * channels;
+        fill.composite_blended_row(draw_rect.x, y, source_row, nullptr, draw_rect.width, channels, 1.0F,
+                                   BlendMode::Normal);
+      }
+      return;
+    }
+    const auto& style = layer.layer_style();
+    const auto folded_overlays = prepare_interior_overlays(layer, style, source, bounds, patterns);
+    std::vector<PreparedSatin> prepared_satins;
+    for (std::uint32_t index = 0; index < style.satins.size(); ++index) {
+      const auto& satin = style.satins[index];
+      if (satin.enabled && satin.opacity > 0.0F) {
+        prepared_satins.push_back(
+            prepare_satin(layer, source, draw_rect, bounds, satin, layer_mask_bounds, masks, index));
+      }
+    }
+    for (std::int32_t y = draw_rect.y; y < draw_rect.y + draw_rect.height; ++y) {
+      const auto* source_row = source_bytes + static_cast<std::size_t>(y - bounds.y) * source_stride;
+      for (std::int32_t x = draw_rect.x; x < draw_rect.x + draw_rect.width; ++x) {
+        const auto* src = source_row + static_cast<std::size_t>(x - bounds.x) * channels;
+        const auto alpha = channels >= 4 ? static_cast<float>(src[3]) / 255.0F : 1.0F;
+        if (alpha <= 0.0F) {
+          continue;
+        }
+        auto color = fold_interior_overlays({src[0], src[1], src[2]}, folded_overlays, x, y);
+        color = fold_prepared_satins(color, prepared_satins, x, y);
+        fill.record_clip_coverage(x, y, alpha);
+        fill.composite_color(x, y, RgbColor{color[0], color[1], color[2]}, alpha, BlendMode::Normal);
+      }
+    }
+  }
+}
+
+// Composite one sibling list, folding Photoshop clipping groups: a base layer
+// plus the consecutive clipped() siblings above it composite into an isolated
+// buffer (or, when the base has layer effects, into one merged content source
+// for the base's effect pipeline) and merge with the base's blend mode.
+// composite_one renders a single non-run layer, so the UI path keeps its
+// cached-style fast path for the common unclipped case.
+template <typename Target, typename CompositeOne>
+void composite_sibling_layers(Target& destination, const std::vector<Layer>& siblings, Rect clip,
+                              const std::vector<LayerBoundsOverride>* overrides,
+                              bool throw_on_unsupported_pixel_format, StyleMaskProvider* masks,
+                              CompositeOne&& composite_one, const PatternStore* patterns = nullptr,
+                              const target_knockout_t<Target>* knockout_backdrops = nullptr) {
+  std::size_t index = 0;
+  std::optional<target_snapshot_t<Target>> root_floor;
+  target_knockout_t<Target> root_backdrops;
+  if (knockout_backdrops == nullptr &&
+      std::any_of(siblings.begin(), siblings.end(), layer_tree_has_knockout)) {
+    // Photoshop's real Background has no transparency channel. An opaque RGBA
+    // layer (even one named Background) is not a knockout floor.
+    if (!siblings.empty() && siblings.front().kind() == LayerKind::Pixel &&
+        siblings.front().pixels().format().channels == 3 && !siblings.front().clipped()) {
+      composite_one(destination, siblings.front());
+      // A clipping run still has to render as a unit. The opaque Background
+      // is painted again by that run, while its unclipped color remains the floor.
+      index = siblings.size() > 1 && layer_clipped_for_render(siblings[1]) ? 0U : 1U;
+    }
+    root_floor.emplace(destination, clip);
+    root_backdrops = {&*root_floor, &*root_floor};
+    knockout_backdrops = &root_backdrops;
+  }
+  while (index < siblings.size()) {
+    const Layer& layer = siblings[index];
+    std::size_t run_end = index + 1;
+    if (!layer_clipped_for_render(layer)) {
+      // Only an unclipped layer can start a run; an orphaned clipped layer at
+      // the bottom of a sibling list falls through and renders unclipped.
+      while (run_end < siblings.size() && layer_clipped_for_render(siblings[run_end])) {
+        ++run_end;
+      }
+    }
+    if (run_end == index + 1 || !layer_is_clip_base(layer)) {
+      if (knockout_backdrops != nullptr && layer_tree_has_knockout(layer)) {
+        composite_layer(destination, layer, clip, overrides, throw_on_unsupported_pixel_format,
+                        masks, nullptr, patterns, false, knockout_backdrops);
+      } else {
+        composite_one(destination, layer);
+      }
+      ++index;
+      continue;
+    }
+    // Photoshop: a hidden or zero-opacity base hides the whole clipping group.
+    if (!layer_visible_for_render(layer, overrides) || layer.opacity() <= 0.0F) {
+      index = run_end;
+      continue;
+    }
+    const auto base_bounds = layer.kind() == LayerKind::Group
+                                 ? layer_render_bounds_for_render(layer, overrides)
+                                 : layer_bounds_with_effects(layer, layer_bounds_for_render(layer, overrides));
+    const auto group_rect = intersect_rect(clip, base_bounds);
+    if (group_rect.empty()) {
+      index = run_end;
+      continue;
+    }
+    // Photoshop draws a clipping base's layer effects OVER its clipped members
+    // (COM probes September 2026, GitHub issue 41; docs/ps-compat.md "Clipping
+    // masks"): the members are part of the base's fill, so its overlays,
+    // satin, inner glow/shadow, bevel and stroke all land on top of them. The
+    // one exception is "Blend Clipped Layers as Group" off together with
+    // "Blend Interior Effects as Group" on, where the interior overlays and
+    // satin fold into the base first and the members cover them; inner shadow
+    // and stroke still paint over the members even then. Rendering the base's
+    // content plus its members as ONE source through the ordinary effect
+    // pipeline gives that ordering; the base's mask, opacity, Fill, blend
+    // mode and channel restriction then apply to the merged result exactly as
+    // the isolated buffer's merge did. Blend If bases keep the isolated path:
+    // its per-pixel gate is calibrated on the base's own colors.
+    const auto& base_style = layer.layer_style();
+    const bool knockout_members = base_style.blend_clipped_elements &&
+        std::any_of(siblings.begin() + static_cast<std::ptrdiff_t>(index + 1),
+                    siblings.begin() + static_cast<std::ptrdiff_t>(run_end), layer_tree_has_knockout);
+    if (base_style.effects_visible && !base_style.empty() && !layer_has_rendered_blend_if(layer)) {
+      const bool prefold_interiors = !base_style.blend_clipped_elements && base_style.blend_interior_elements;
+      std::optional<PixelBuffer> flattened;
+      std::vector<LayerBoundsOverride> base_override;
+      const std::vector<LayerBoundsOverride>* base_overrides = overrides;
+      if (layer.kind() == LayerKind::Group) {
+        // A folder base supplies its merged children (see the isolated path
+        // below for the override's role).
+        flattened.emplace(group_silhouette_for_render<target_color_t<Target>>(
+            layer, base_bounds, overrides, throw_on_unsupported_pixel_format, masks, patterns,
+            target_domain(destination)));
+        const auto* outer_override = layer_override_for_render(layer, overrides);
+        base_override.push_back(LayerBoundsOverride{
+            layer.id(), base_bounds, &*flattened,
+            outer_override != nullptr ? outer_override->mask_bounds : std::nullopt, std::optional<bool>{}});
+        base_overrides = &base_override;
+      }
+      auto fill = make_isolated_target(destination, group_rect, /*records_clip_coverage=*/true);
+      composite_clip_base_content(fill, layer, layer_pixels_for_render(layer, base_overrides),
+                                  layer_bounds_for_render(layer, base_overrides), group_rect, prefold_interiors,
+                                  layer_mask_bounds_for_render(layer, base_overrides), masks, patterns);
+      fill.freeze_clip();
+      std::optional<target_snapshot_t<Target>> clip_floor;
+      if (knockout_members) {
+        clip_floor.emplace(fill, group_rect);
+      }
+      const auto* floor = clip_floor.has_value() ? &*clip_floor : nullptr;
+      const target_knockout_t<Target> clip_backdrops{floor, floor};
+      for (std::size_t member = index + 1; member < run_end; ++member) {
+        composite_layer(fill, siblings[member], group_rect, overrides, throw_on_unsupported_pixel_format, masks,
+                        nullptr, patterns, false, knockout_members ? &clip_backdrops : nullptr);
+      }
+      const auto content = fill.to_pixel_buffer();
+      const ClipRunContent clip_content{&content, group_rect, prefold_interiors};
+      composite_pixel_layer(destination, layer, group_rect, base_overrides, throw_on_unsupported_pixel_format,
+                            masks, nullptr, patterns, /*suppress_channel_restriction=*/false, &clip_content);
+      index = run_end;
+      continue;
+    }
+    std::optional<target_snapshot_t<Target>> base_backdrop;
+    if (layer_has_rendered_underlying_blend_if(layer)) {
+      base_backdrop.emplace(destination, group_rect);
+    }
+    auto group = make_isolated_target(destination, group_rect, /*records_clip_coverage=*/true);
+    // A restricted clip BASE must not self-wrap inside the isolated buffer
+    // (its backdrop there is transparent black, so the kept channel would
+    // merge as black); the restriction instead rides the merge below, gating
+    // the whole clipped ensemble (the P7 probe: a member over a G-restricted
+    // base keeps the ORIGINAL backdrop's green). Restricted MEMBERS self-wrap
+    // normally: their backdrop is the base content (the P7b probe).
+    if (layer.kind() == LayerKind::Group) {
+      // A folder clipping base supplies its merged coverage. Render the children first, then apply the folder's mask, opacity,
+      // Blend If and effects once through the ordinary base-layer pipeline.
+      // This records the union alpha of overlapping/nested children and excludes
+      // the folder's own effects from the clipping shape. Keep the full bounds
+      // for stable effect geometry across partial renders and parallel strips.
+      const auto flattened = group_silhouette_for_render<target_color_t<Target>>(
+          layer, base_bounds, overrides, throw_on_unsupported_pixel_format, masks, patterns,
+          target_domain(destination));
+      const auto* outer_override = layer_override_for_render(layer, overrides);
+      const std::vector<LayerBoundsOverride> base_override{LayerBoundsOverride{
+          layer.id(), base_bounds, &flattened,
+          outer_override != nullptr ? outer_override->mask_bounds : std::nullopt,
+          std::optional<bool>{}}};
+      composite_pixel_layer(group, layer, group_rect, &base_override, throw_on_unsupported_pixel_format, masks,
+                            base_backdrop.has_value() ? &*base_backdrop : nullptr, patterns,
+                            /*suppress_channel_restriction=*/true);
+    } else {
+      composite_layer(group, layer, group_rect, overrides, throw_on_unsupported_pixel_format, masks,
+                      base_backdrop.has_value() ? &*base_backdrop : nullptr, patterns,
+                      /*suppress_channel_restriction=*/true);
+    }
+    if (layer.kind() == LayerKind::Group && layer.blend_mode() == BlendMode::PassThrough &&
+        !layer_has_rendered_blend_if(layer) && group_fill_factor_for_render(layer) >= 1.0F &&
+        !layer_tree_has_knockout(layer)) {
+      // A pass-through clipping base still blends its children with the outside
+      // backdrop. Recover the group's straight contribution from that composite
+      // before clipping the members to its union alpha. Isolating the children
+      // against transparency changed Linear Dodge even with an empty member.
+      auto passed = make_isolated_target(destination, group_rect);
+      for (int y = group_rect.y; y < group_rect.y + group_rect.height; ++y) {
+        for (int x = group_rect.x; x < group_rect.x + group_rect.width; ++x) {
+          const auto backdrop = destination.sample_color(x, y);
+          passed.store_color(x, y, backdrop.color, backdrop.alpha);
+        }
+      }
+      composite_layer(passed, layer, group_rect, overrides, throw_on_unsupported_pixel_format,
+                      masks, nullptr, patterns, /*suppress_channel_restriction=*/true);
+      for (int y = group_rect.y; y < group_rect.y + group_rect.height; ++y) {
+        for (int x = group_rect.x; x < group_rect.x + group_rect.width; ++x) {
+          const auto coverage = group.sample_color(x, y).alpha;
+          if (coverage <= 0.0F) continue;
+          const auto backdrop = destination.sample_color(x, y);
+          const auto result = passed.sample_color(x, y);
+          const auto remaining = backdrop.alpha * (1.0F - coverage);
+          const auto recover = [&](auto painted, auto behind) {
+            return (static_cast<float>(painted) * result.alpha -
+                    static_cast<float>(behind) * remaining) / coverage;
+          };
+          group.store_color(x, y, color_from_floats<target_color_t<Target>>(
+              recover(result.color.red, backdrop.color.red),
+              recover(result.color.green, backdrop.color.green),
+              recover(result.color.blue, backdrop.color.blue)), coverage);
+        }
+      }
+    }
+    group.freeze_clip();
+    std::optional<target_snapshot_t<Target>> clip_floor;
+    if (knockout_members) {
+      clip_floor.emplace(group, group_rect);
+    }
+    const auto* floor = clip_floor.has_value() ? &*clip_floor : nullptr;
+    const target_knockout_t<Target> clip_backdrops{floor, floor};
+    for (std::size_t member = index + 1; member < run_end; ++member) {
+      composite_layer(group, siblings[member], group_rect, overrides, throw_on_unsupported_pixel_format, masks,
+                      nullptr, patterns, false, knockout_members ? &clip_backdrops : nullptr);
+    }
+    with_channel_restriction(destination, layer_rendered_channel_restriction(layer),
+                             [&](auto& merge_destination) {
+                               group.merge_into(merge_destination, layer.blend_mode());
+                             });
+    index = run_end;
+  }
+}
+
+template <typename Target>
+void composite_layers(Target& destination, const std::vector<Layer>& layers, Rect clip,
+                      const std::vector<LayerBoundsOverride>* overrides = nullptr,
+                      bool throw_on_unsupported_pixel_format = false, StyleMaskProvider* masks = nullptr,
+                      const PatternStore* patterns = nullptr,
+                      const target_knockout_t<Target>* knockout_backdrops = nullptr) {
+  composite_sibling_layers(
+      destination, layers, clip, overrides, throw_on_unsupported_pixel_format, masks,
+      [&](Target& target, const Layer& layer) {
+        composite_layer(target, layer, clip, overrides, throw_on_unsupported_pixel_format, masks, nullptr,
+                        patterns, false, knockout_backdrops);
+      },
+      patterns, knockout_backdrops);
+}
+
+// An artboard's background over `rect` (docs/artboards.md): one opaque color under the
+// artboard's children. Every target takes an 8-bit color (layer-style colors do too).
+template <typename Target>
+void paint_artboard_paper(Target& target, Rect rect, const std::array<std::uint8_t, 4>& paper, float alpha) {
+  const RgbColor color{paper[0], paper[1], paper[2]};
+  for (std::int32_t y = rect.y; y < rect.y + rect.height; ++y) {
+    for (std::int32_t x = rect.x; x < rect.x + rect.width; ++x) {
+      target.composite_color(x, y, color, alpha, BlendMode::Normal);
+    }
+  }
+}
+
+template <typename Color>
+PixelBuffer group_silhouette_for_render(const Layer& layer, Rect bounds,
+                                        const std::vector<LayerBoundsOverride>* overrides,
+                                        bool throw_on_unsupported_pixel_format, StyleMaskProvider* masks,
+                                        const PatternStore* patterns, DeepDomain domain) {
+  // Full child coverage anchors every effect, independent of the caller's strip
+  // or dirty rectangle. Cache it alongside effect masks to avoid re-flattening
+  // all child pixels per repaint. Transient geometry never enters that cache.
+  auto* cache = overrides == nullptr || overrides->empty() ? masks : nullptr;
+  const auto prepared = style_mask_for_render(
+      cache, layer, StyleMaskKind::GroupSilhouette, 0, bounds, bounds, bounds, bounds, std::nullopt,
+      [&](Rect rect) {
+        IsolatedClipGroupTargetT<Color> isolated(rect, false, domain);
+        const KnockoutBackdropT<Color> isolated_backdrops;
+        auto child_clip = rect;
+        if (const auto& artboard = layer.artboard(); artboard.has_value()) {
+          // A styled artboard: its paper and clipped children are the styled content.
+          child_clip = intersect_rect(rect, artboard->rect);
+          if (const auto paper = artboard_background_rgba(*artboard); paper.has_value() && !child_clip.empty()) {
+            paint_artboard_paper(isolated, child_clip, *paper, 1.0F);
+          }
+        }
+        if (!child_clip.empty()) {
+          composite_layers(isolated, layer.children(), child_clip, overrides,
+                           throw_on_unsupported_pixel_format, masks, patterns, &isolated_backdrops);
+        }
+        StyleMaskEntry result;
+        result.group_pixels = std::make_shared<const PixelBuffer>(isolated.to_pixel_buffer());
+        return result;
+      });
+  return *prepared.first->group_pixels;
+}
+
+template <typename Target>
+void composite_layer(Target& destination, const Layer& layer, Rect clip,
+                     const std::vector<LayerBoundsOverride>* overrides,
+                     bool throw_on_unsupported_pixel_format, StyleMaskProvider* masks,
+                     const target_snapshot_t<Target>* blend_if_backdrop, const PatternStore* patterns,
+                     bool suppress_channel_restriction,
+                     const target_knockout_t<Target>* knockout_backdrops) {
+  if (!layer_visible_for_render(layer, overrides) || layer.opacity() <= 0.0F) {
+    return;
+  }
+
+  // Clip runs with Blend Clipped Layers as Group disabled retain the existing
+  // approximation; their cross-run knockout floor is not modeled yet.
+  const auto knockout_mode = layer_clipped_for_render(layer) && knockout_backdrops == nullptr
+                                 ? 0U : layer_knockout_mode(layer);
+  const auto* knockout_floor = knockout_backdrops == nullptr ? nullptr
+                            : knockout_mode == 1U ? knockout_backdrops->shallow : knockout_backdrops->deep;
+  if (layer.kind() == LayerKind::Group) {
+    if (layer_rendered_channel_restriction(layer) == kRestrictAllChannels) {
+      // All channels excluded removes the group and its effects entirely,
+      // mirroring the pixel-layer rule (the P4b probe).
+      return;
+    }
+    // An artboard (docs/artboards.md): its children clip to its rect and its background
+    // paints under them INSIDE the group, so the group's opacity and blend mode apply to
+    // both (Photoshop's flatten of photoshop-artboard-clip.psd: a 50% Multiply artboard
+    // shows its white paper at alpha 128 over transparency).
+    Rect group_clip = clip;
+    std::optional<std::array<std::uint8_t, 4>> paper;
+    if (const auto& artboard = layer.artboard(); artboard.has_value()) {
+      group_clip = intersect_rect(clip, artboard->rect);
+      if (group_clip.empty()) {
+        return;
+      }
+      paper = artboard_background_rgba(*artboard);
+    }
+    // A group whose own style renders (July 2026; COM-calibrated rules in
+    // docs/ps-compat.md): the flattened children become the pipeline's source
+    // buffer and the group plays the layer's role (blend mode, opacity, mask,
+    // blend-if, and Fill on the content only).
+    const bool styled = group_style_renders(layer);
+    // Blend-if groups and every non-pass-through group isolate: children
+    // composite against transparency and the merged result meets the backdrop
+    // with the group's blend mode, opacity, and mask (Photoshop's isolated
+    // transparency group). So does a pass-through group whose Fill is below
+    // 100%: Photoshop's flatten of psd-tools' passthrough_fill_adjustment.psd
+    // keeps the group's Exposure off the backdrop and matches the isolated
+    // merge within 1/255 (a plain fade is off by up to 69).
+    // An artboard always isolates, even one a PSD marks Pass Through: its paper needs a
+    // group buffer, and the merge then applies the group's masks and Blend If to both.
+    if (knockout_mode != 0U || layer_has_rendered_blend_if(layer) || layer.blend_mode() != BlendMode::PassThrough ||
+        group_fill_factor_for_render(layer) < 1.0F || layer.artboard().has_value()) {
+      // Blend-if groups keep the calibrated full-clip buffer; the plain
+      // isolated path bounds it by the children's render bounds instead,
+      // override-aware since August 2026 (move/transform previews used to
+      // fall back to the full clip, allocating and merging a canvas-sized
+      // isolation buffer per group per preview frame). Coverage can only
+      // exist where pixel children painted, so the bounded buffer merges
+      // identically.
+      const auto isolated_rect = styled || knockout_mode != 0U ? group_content_bounds_for_render(layer, overrides)
+                                 : !layer_has_rendered_blend_if(layer)
+                                     ? intersect_rect(group_clip, layer_render_bounds_for_render(layer, overrides))
+                                     : group_clip;
+      if (isolated_rect.empty()) {
+        return;
+      }
+      // Unsupported blend-if payloads are raw-preserved, never rendered: a
+      // non-pass-through group without a RENDERED blend-if merges with
+      // identity ranges.
+      const auto blend_if = layer_has_rendered_blend_if(layer) ? layer.blend_if() : LayerBlendIf{};
+      std::optional<target_snapshot_t<Target>> backdrop;
+      if (blend_if_has_underlying_ranges(blend_if) && !styled) {
+        backdrop.emplace(destination, isolated_rect);
+      }
+      if (styled || knockout_mode != 0U) {
+        // Route the merged content through the full styled pipeline. The
+        // group mask has NOT been applied yet (merge_layer_into is skipped),
+        // so the pipeline's own mask handling applies it exactly once, which
+        // also makes every effect derive from the masked silhouette (the
+        // photoshop-group-fx-mask-stroke probe).
+        const auto flattened = group_silhouette_for_render<target_color_t<Target>>(
+            layer, isolated_rect, overrides, throw_on_unsupported_pixel_format, masks, patterns,
+            target_domain(destination));
+        const auto* outer_override = layer_override_for_render(layer, overrides);
+        std::vector<LayerBoundsOverride> styled_override{LayerBoundsOverride{
+            layer.id(), isolated_rect, &flattened,
+            outer_override != nullptr ? outer_override->mask_bounds : std::nullopt,
+            std::optional<bool>{}}};
+        composite_pixel_layer(destination, layer, group_clip, &styled_override,
+                              throw_on_unsupported_pixel_format, masks, blend_if_backdrop, patterns,
+                              suppress_channel_restriction, nullptr, knockout_floor, knockout_mode != 0U);
+        return;
+      }
+      auto isolated = make_isolated_target(destination, isolated_rect);
+      if (paper.has_value()) {
+        paint_artboard_paper(isolated, isolated_rect, *paper, 1.0F);
+      }
+      const target_knockout_t<Target> isolated_backdrops;
+      composite_layers(isolated, layer.children(), isolated_rect, overrides, throw_on_unsupported_pixel_format,
+                       masks, patterns, &isolated_backdrops);
+      // A restricted isolated group applies its restriction where the merged
+      // result meets the backdrop (the P5 isolated arm: the group's excluded
+      // channel keeps the backdrop under Normal-mode children).
+      with_channel_restriction(destination, layer_rendered_channel_restriction(layer),
+                               [&](auto& merge_destination) {
+                                 isolated.merge_layer_into(merge_destination, layer, blend_if,
+                                                           backdrop.has_value() ? &*backdrop : nullptr,
+                                                           layer_mask_bounds_for_render(layer, overrides));
+                               });
+      return;
+    }
+    // The restriction survives pass-through (the P5 pass-through arm: a
+    // Multiply child keeps blending with the outside backdrop while the
+    // group's excluded channel holds it): no isolation, every write the
+    // children and the group's effects make is gated in place.
+    with_channel_restriction(destination, layer_rendered_channel_restriction(layer),
+                             [&](auto& pass_destination) {
+                               composite_pass_through_group(pass_destination, layer, group_clip, overrides,
+                                                            throw_on_unsupported_pixel_format, masks,
+                                                            patterns, styled, knockout_backdrops);
+                             });
+    return;
+  }
+
+  if (layer.kind() == LayerKind::Adjustment) {
+    composite_adjustment_layer(destination, layer, clip, overrides, suppress_channel_restriction);
+    return;
+  }
+
+  composite_pixel_layer(destination, layer, clip, overrides, throw_on_unsupported_pixel_format, masks,
+                        blend_if_backdrop, patterns, suppress_channel_restriction, nullptr,
+                        knockout_floor, knockout_mode != 0U);
+}
+
+// The pass-through tail of composite_layer: children composite against the
+// live backdrop (optionally through the group's mask), group styles derive
+// from the flattened silhouette, and group Opacity fades the result back
+// toward the pre-group snapshot.
+template <typename Target>
+void composite_pass_through_group(Target& destination, const Layer& layer, Rect clip,
+                                  const std::vector<LayerBoundsOverride>* overrides,
+                                  bool throw_on_unsupported_pixel_format, StyleMaskProvider* masks,
+                                  const PatternStore* patterns, bool styled,
+                                  const target_knockout_t<Target>* knockout_backdrops) {
+  // Pass-through group Opacity is a post-composite fade (fade_toward_snapshot):
+  // snapshot the backdrop, composite the children at full strength, then
+  // interpolate. The fade covers the full clip because an interior adjustment
+  // with unlimited bounds can touch backdrop pixels outside the children's
+  // render bounds.
+  std::optional<target_snapshot_t<Target>> before;
+  const bool has_knockout = layer_tree_has_knockout(layer);
+  if (layer.opacity() < 1.0F || has_knockout) {
+    before.emplace(destination, clip);
+  }
+  target_knockout_t<Target> child_backdrops;
+  if (has_knockout) {
+    child_backdrops = {&*before, knockout_backdrops != nullptr ? knockout_backdrops->deep : nullptr};
+    knockout_backdrops = &child_backdrops;
+  }
+  // Styled pass-through groups do NOT isolate (the
+  // photoshop-group-fx-passthrough probe: a Multiply child keeps blending
+  // with the outside backdrop under a group drop shadow). The effects
+  // derive from the flattened silhouette - with child opacities, after the
+  // group mask via the renderers' own mask folding - exterior effects paint
+  // BEHIND the children and interior effects above them.
+  std::optional<PixelBuffer> silhouette;
+  Rect silhouette_rect{};
+  std::vector<PreparedStroke> group_strokes;
+  if (styled) {
+    // Override-aware: the children composite below WITH overrides, so a
+    // preview-moved child outside the historical bounds must still land
+    // inside the silhouette buffer.
+    silhouette_rect = group_content_bounds_for_render(layer, overrides);
+    if (!silhouette_rect.empty()) {
+      silhouette = group_silhouette_for_render<target_color_t<Target>>(
+          layer, silhouette_rect, overrides, throw_on_unsupported_pixel_format, masks, patterns,
+          target_domain(destination));
+      const auto& style = layer.layer_style();
+      const auto mask_bounds = layer_mask_bounds_for_render(layer, overrides);
+      if (style.effects_visible) {
+        for (std::uint32_t index = 0; index < style.drop_shadows.size(); ++index) {
+          render_drop_shadow(destination, layer, *silhouette, clip, silhouette_rect,
+                             style.drop_shadows[index], mask_bounds, masks, index);
+        }
+        for (std::uint32_t index = 0; index < style.outer_glows.size(); ++index) {
+          render_outer_glow(destination, layer, *silhouette, clip, silhouette_rect,
+                            style.outer_glows[index], mask_bounds, masks, index);
+        }
+        for (std::uint32_t index = 0; index < style.strokes.size(); ++index) {
+          if (auto prepared = prepare_stroke_render(layer, *silhouette, clip, silhouette_rect, style.strokes[index],
+                                                    mask_bounds, masks, index)) {
+            group_strokes.push_back(std::move(*prepared));
+          }
+        }
+        render_group_stroke_underlay(destination, layer, *silhouette, silhouette_rect, group_strokes, mask_bounds);
+      }
+    }
+  }
+  // A group's raster/vector mask attenuates every child contribution in
+  // place. No isolation: the default group is pass-through, so child blend
+  // modes and interior adjustments must keep meeting the backdrop below the
+  // group, exactly as without a mask.
+  if ((layer.mask().has_value() && !layer.mask()->disabled) || layer_has_enabled_vector_mask(layer)) {
+    const auto mask_bounds = layer_mask_bounds_for_render(layer, overrides);
+    if constexpr (is_group_masked_target<Target>::value) {
+      destination.push_mask(layer, mask_bounds);
+      composite_layers(destination, layer.children(), clip, overrides, throw_on_unsupported_pixel_format,
+                       masks, patterns, knockout_backdrops);
+      destination.pop_mask();
+    } else {
+      GroupMaskedTarget<Target> masked(destination);
+      masked.push_mask(layer, mask_bounds);
+      composite_layers(masked, layer.children(), clip, overrides, throw_on_unsupported_pixel_format, masks,
+                       patterns, knockout_backdrops);
+    }
+  } else {
+    composite_layers(destination, layer.children(), clip, overrides, throw_on_unsupported_pixel_format, masks,
+                     patterns, knockout_backdrops);
+  }
+  // Interior effects paint ABOVE the pass-through content, masked by the
+  // silhouette, each with its OWN blend mode (the photoshop-group-fx-interior
+  // probe: a Normal overlay covers a Multiply child's composite at full
+  // strength). Stack order mirrors composite_pixel_layer's destination
+  // passes: overlays under satin under inner glow/shadow, stroke, bevel.
+  if (silhouette.has_value()) {
+    const auto& style = layer.layer_style();
+    const auto mask_bounds = layer_mask_bounds_for_render(layer, overrides);
+    const auto draw_rect = intersect_rect(clip, silhouette_rect);
+    if (style.effects_visible && !draw_rect.empty()) {
+      for (const auto& overlay : style.pattern_overlays) {
+        render_pattern_overlay(destination, layer, *silhouette, clip, silhouette_rect, overlay,
+                               mask_bounds, patterns, nullptr);
+      }
+      for (const auto& fill : style.gradient_fills) {
+        render_gradient_fill(destination, layer, *silhouette, clip, silhouette_rect, fill,
+                             mask_bounds, nullptr);
+      }
+      for (const auto& overlay : style.color_overlays) {
+        render_color_overlay(destination, layer, *silhouette, clip, silhouette_rect, overlay,
+                             mask_bounds, nullptr);
+      }
+      for (std::uint32_t index = 0; index < style.satins.size(); ++index) {
+        const auto& satin = style.satins[index];
+        if (!satin.enabled || satin.opacity <= 0.0F) {
+          continue;
+        }
+        const auto prepared = prepare_satin(layer, *silhouette, draw_rect, silhouette_rect, satin,
+                                            mask_bounds, masks, index);
+        const auto channels = silhouette->format().channels;
+        const auto* source_bytes = silhouette->data().data();
+        const auto source_stride = silhouette->stride_bytes();
+        for (std::int32_t y = draw_rect.y; y < draw_rect.y + draw_rect.height; ++y) {
+          const auto* source_row =
+              source_bytes + static_cast<std::size_t>(y - silhouette_rect.y) * source_stride;
+          for (std::int32_t x = draw_rect.x; x < draw_rect.x + draw_rect.width; ++x) {
+            const auto* src = source_row + static_cast<std::size_t>(x - silhouette_rect.x) * channels;
+            const auto pixel_alpha =
+                silhouette->format().bit_depth == BitDepth::UInt8
+                    ? (channels >= 4 ? static_cast<float>(src[3]) / 255.0F : 1.0F)
+                    : pixel_alpha_at(*silhouette, x - silhouette_rect.x, y - silhouette_rect.y);
+            const auto source_alpha = pixel_alpha * layer_mask_alpha_for_render(layer, x, y, mask_bounds) *
+                                      layer.opacity();
+            if (source_alpha <= 0.0F) {
+              continue;
+            }
+            const auto mask_index = static_cast<std::size_t>(y - prepared.mask_bounds.y) *
+                                        static_cast<std::size_t>(prepared.mask_bounds.width) +
+                                    static_cast<std::size_t>(x - prepared.mask_bounds.x);
+            const auto alpha =
+                source_alpha * prepared.entry->primary[mask_index] * clamp_unit(prepared.effect->opacity);
+            if (alpha > 0.0F) {
+              composite_effect_color(destination, x, y, prepared.effect->color, alpha,
+                                     prepared.effect->blend_mode, DissolveField::Satin);
+            }
+          }
+        }
+      }
+      for (std::uint32_t index = 0; index < style.inner_glows.size(); ++index) {
+        render_inner_glow(destination, layer, *silhouette, clip, silhouette_rect,
+                          style.inner_glows[index], mask_bounds, masks, index, nullptr);
+      }
+      for (std::uint32_t index = 0; index < style.inner_shadows.size(); ++index) {
+        render_inner_shadow(destination, layer, *silhouette, clip, silhouette_rect,
+                            style.inner_shadows[index], mask_bounds, masks, index, nullptr);
+      }
+      // Stroke instances stack first-on-top here too (render_prepared_stroke);
+      // their shares under the silhouette's soft pixels landed behind the children.
+      for (auto it = group_strokes.rbegin(); it != group_strokes.rend(); ++it) {
+        std::vector<const PreparedStroke*> above;
+        for (const auto& candidate : group_strokes) {
+          if (candidate.effect_index < it->effect_index && !candidate.stroke->overprint &&
+              !stroke_knockout_is_identity(*candidate.stroke, layer)) {
+            above.push_back(&candidate);
+          }
+        }
+        render_prepared_stroke(destination, layer, *it, mask_bounds, above);
+      }
+      for (std::uint32_t index = 0; index < style.bevels.size(); ++index) {
+        if (style.bevels[index].style == BevelEmbossStyleKind::StrokeEmboss) {
+          continue;
+        }
+        render_bevel_emboss(destination, layer, *silhouette, clip, silhouette_rect,
+                            style.bevels[index], mask_bounds, masks, index, patterns, &style.strokes);
+      }
+      for (std::uint32_t index = 0; index < style.bevels.size(); ++index) {
+        if (style.bevels[index].style != BevelEmbossStyleKind::StrokeEmboss) {
+          continue;
+        }
+        render_bevel_emboss(destination, layer, *silhouette, clip, silhouette_rect,
+                            style.bevels[index], mask_bounds, masks, index, patterns, &style.strokes);
+      }
+    }
+  }
+  if (before.has_value() && layer.opacity() < 1.0F) {
+    fade_toward_snapshot(destination, *before, clip, layer.opacity());
+  }
+}
+
+}  // namespace patchy::render_detail
+
+// Explicit instantiation of the compositor entry points, one Target at a time.
+//
+// composite_layer<Target> drags the whole render tree behind it (every effect renderer
+// and composite_pixel_layer for the target, its GroupMaskedTarget and
+// ChannelRestrictedTarget wrappers, and the isolated group buffers), which cost each
+// including translation unit 40 to 120 seconds of compile time before October 2026.
+// Each target is now instantiated ONCE: PATCHY_COMPOSITOR_TARGET_INSTANTIATIONS(extern,
+// T) right after T's definition in its header (an explicit instantiation declaration,
+// which suppresses the implicit instantiation in every includer) and
+// PATCHY_COMPOSITOR_TARGET_INSTANTIATIONS(, T) in T's own translation unit (the
+// definition; src/render/layer_compositor_*.cpp, src/ui/layer_compositor_qimage.cpp).
+// Both macros are used at global namespace scope with a fully qualified, complete type.
+// The per-pixel templates stay templates: nothing here is virtual or type-erased.
+#define PATCHY_COMPOSITOR_TARGET_INSTANTIATIONS(Keyword, Target)                                                  \
+  Keyword template void patchy::render_detail::fade_toward_snapshot<Target>(                                     \
+      Target&, const patchy::render_detail::target_snapshot_t<Target>&, patchy::Rect, float);                    \
+  Keyword template void patchy::render_detail::composite_layers<Target>(                                         \
+      Target&, const std::vector<patchy::Layer>&, patchy::Rect,                                                  \
+      const std::vector<patchy::render_detail::LayerBoundsOverride>*, bool,                                      \
+      patchy::render_detail::StyleMaskProvider*, const patchy::PatternStore*,                                     \
+      const patchy::render_detail::target_knockout_t<Target>*);                                                   \
+  Keyword template void patchy::render_detail::composite_layer<Target>(                                          \
+      Target&, const patchy::Layer&, patchy::Rect, const std::vector<patchy::render_detail::LayerBoundsOverride>*, \
+      bool, patchy::render_detail::StyleMaskProvider*, const patchy::render_detail::target_snapshot_t<Target>*,  \
+      const patchy::PatternStore*, bool, const patchy::render_detail::target_knockout_t<Target>*);                \
+  Keyword template void patchy::render_detail::composite_adjustment_layer<Target>(                               \
+      Target&, const patchy::Layer&, patchy::Rect, const std::vector<patchy::render_detail::LayerBoundsOverride>*, \
+      bool);                                                                                                      \
+  Keyword template void patchy::render_detail::composite_pixel_layer<Target>(                                    \
+      Target&, const patchy::Layer&, patchy::Rect, const std::vector<patchy::render_detail::LayerBoundsOverride>*, \
+      bool, patchy::render_detail::StyleMaskProvider*, const patchy::render_detail::target_snapshot_t<Target>*,  \
+      const patchy::PatternStore*, bool, const patchy::render_detail::ClipRunContent*,                            \
+      const patchy::render_detail::target_snapshot_t<Target>*, bool);
+
+// The per-color entry points every target of that color shares (group silhouettes and
+// clip-run content render into the isolated buffer of the target's color).
+#define PATCHY_COMPOSITOR_COLOR_INSTANTIATIONS(Keyword, Color)                                                    \
+  Keyword template patchy::PixelBuffer patchy::render_detail::group_silhouette_for_render<Color>(                \
+      const patchy::Layer&, patchy::Rect, const std::vector<patchy::render_detail::LayerBoundsOverride>*, bool,   \
+      patchy::render_detail::StyleMaskProvider*, const patchy::PatternStore*, patchy::DeepDomain);               \
+  Keyword template void patchy::render_detail::composite_clip_base_content<Color>(                               \
+      patchy::render_detail::IsolatedClipGroupTargetT<Color>&, const patchy::Layer&, const patchy::PixelBuffer&, \
+      patchy::Rect, patchy::Rect, bool, std::optional<patchy::Rect>, patchy::render_detail::StyleMaskProvider*,  \
+      const patchy::PatternStore*);
+
+// The isolated group buffers are targets in their own right (native_cmyk, native_duotone,
+// the 16/32-bit renders) and the buffers every other target's groups composite into:
+// layer_compositor_isolated.cpp and layer_compositor_deep.cpp define these.
+PATCHY_COMPOSITOR_COLOR_INSTANTIATIONS(extern, patchy::RgbColor)
+PATCHY_COMPOSITOR_COLOR_INSTANTIATIONS(extern, patchy::render_detail::DeepRgb)
+PATCHY_COMPOSITOR_TARGET_INSTANTIATIONS(extern, patchy::render_detail::IsolatedClipGroupTarget)
+PATCHY_COMPOSITOR_TARGET_INSTANTIATIONS(extern, patchy::render_detail::DeepCompositeTarget)

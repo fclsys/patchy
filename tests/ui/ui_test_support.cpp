@@ -1,0 +1,3057 @@
+#include "ui/curved_slider.hpp"
+#include "ui/dialog_utils.hpp"
+#include <QAbstractTextDocumentLayout>
+#include <QTextBlock>
+#include <QWindow>
+#include "ui/canvas_widget.hpp"
+#include "core/adjustment_layer.hpp"
+#include "core/layer_metadata.hpp"
+#include "core/smart_object.hpp"
+#include "ui/gradient_stops_editor.hpp"
+#include "formats/bmp_document_io.hpp"
+#include "formats/aseprite_document_io.hpp"
+#include "formats/ico_document_io.hpp"
+#include "formats/tga_document_io.hpp"
+#include "ui/image_document_io.hpp"
+#include "ui/layer_list_widget.hpp"
+#include "ui/localization.hpp"
+#include "ui/main_window.hpp"
+#include "ui/main_window_shared.hpp"
+#include "ui/new_document_dialog.hpp"
+#include "ui/app_settings.hpp"
+#include "psd/psd_document_io.hpp"
+#include "test_fonts.hpp"
+#include "test_harness.hpp"
+#include "local_psd_fixtures.hpp"
+#include <QAbstractSpinBox>
+#include <QAction>
+#include <QApplication>
+#include <QStyle>
+#include <QPalette>
+#include "ui/theme_palette.hpp"
+#include <QCheckBox>
+#include <QComboBox>
+#include <QContextMenuEvent>
+#include <QDialog>
+#include <QDialogButtonBox>
+#include <QDoubleSpinBox>
+#include <QDragEnterEvent>
+#include <QDragMoveEvent>
+#include <QDropEvent>
+#include <QElapsedTimer>
+#include <QEventLoop>
+#include <QFile>
+#include <QFileInfo>
+#include <QImage>
+#include <QInputDevice>
+#include <QKeyEvent>
+#include <QLineEdit>
+#include <QListWidget>
+#include <QMouseEvent>
+#include <QMenu>
+#include <QPointer>
+#include <QMimeData>
+#include <QMessageBox>
+#include <QIODevice>
+#include <QPainter>
+#include <QToolTip>
+#include <QPointingDevice>
+#include <QProgressDialog>
+#include <QPushButton>
+#include <QRadioButton>
+#include <QSpinBox>
+#include <QStackedWidget>
+#include <QSpontaneKeyEvent>
+#include <QStringList>
+#include <QSlider>
+#include <QTabBar>
+#include <QTabWidget>
+#include <QTabletEvent>
+#include <QTextEdit>
+#include <QFileDialog>
+#include <QTimer>
+#include <QToolButton>
+#include <QWheelEvent>
+#include <QWidget>
+#include <array>
+#include <cstdint>
+#include <cmath>
+#include <cstring>
+#include <filesystem>
+#include <iostream>
+#include <optional>
+#include <span>
+#include <stdexcept>
+#include <string>
+#include <string_view>
+#include <utility>
+#include <vector>
+#include "ui_test_support.hpp"
+#include "ui/recent_file_list.hpp"
+#include "ui/measurement_units.hpp"
+#include "ui/qt_paths.hpp"
+#include "test_scratch_remove.hpp"
+#include "ui_test_access.hpp"
+#include <QCoreApplication>
+#include <QDir>
+#include <QEvent>
+#include <QFont>
+#include <QLabel>
+#include <QFontDatabase>
+#include <QFontInfo>
+#include <QFontMetrics>
+#include <QScrollBar>
+#include <algorithm>
+#include <cstdio>
+#include <functional>
+#include <memory>
+
+namespace patchy::test::ui {
+
+patchy::PixelBuffer solid_pixels(std::int32_t width, std::int32_t height, patchy::PixelFormat format, QColor color) {
+  patchy::PixelBuffer pixels(width, height, format);
+  for (std::int32_t y = 0; y < pixels.height(); ++y) {
+    for (std::int32_t x = 0; x < pixels.width(); ++x) {
+      auto* px = pixels.pixel(x, y);
+      px[0] = static_cast<std::uint8_t>(color.red());
+      px[1] = static_cast<std::uint8_t>(color.green());
+      px[2] = static_cast<std::uint8_t>(color.blue());
+      if (format.channels >= 4) {
+        px[3] = static_cast<std::uint8_t>(color.alpha());
+      }
+    }
+  }
+  return pixels;
+}
+
+void fill_pixel_rect(patchy::PixelBuffer& pixels, QRect rect, QColor color) {
+  rect = rect.intersected(QRect(0, 0, pixels.width(), pixels.height()));
+  if (rect.isEmpty()) {
+    return;
+  }
+
+  for (int y = rect.top(); y <= rect.bottom(); ++y) {
+    for (int x = rect.left(); x <= rect.right(); ++x) {
+      auto* px = pixels.pixel(x, y);
+      px[0] = static_cast<std::uint8_t>(color.red());
+      px[1] = static_cast<std::uint8_t>(color.green());
+      px[2] = static_cast<std::uint8_t>(color.blue());
+      if (pixels.format().channels >= 4) {
+        px[3] = static_cast<std::uint8_t>(color.alpha());
+      }
+    }
+  }
+}
+
+void ensure_artifact_dir() {
+  std::filesystem::create_directories("test-artifacts");
+}
+
+bool remove_test_scratch_dir(const QString& path) {
+  if (path.isEmpty()) {
+    throw std::runtime_error("refusing to recursively delete a blank path");
+  }
+  return patchy::test::remove_test_scratch_tree(patchy::ui::to_filesystem_path(path));
+}
+
+double text_points_for_pixels(int pixels, double ppi) noexcept {
+  return static_cast<double>(pixels) * 72.0 / ppi;
+}
+
+std::pair<int, int> max_edge_ramp(const QImage& image) {
+  int best_row = -1;
+  int best_opaque = -1;
+  for (int y = 0; y < image.height(); ++y) {
+    int opaque = 0;
+    for (int x = 0; x < image.width(); ++x) {
+      if (qAlpha(image.pixel(x, y)) >= 235) {
+        ++opaque;
+      }
+    }
+    if (opaque > best_opaque) {
+      best_opaque = opaque;
+      best_row = y;
+    }
+  }
+  int max_ramp = 0;
+  int current_ramp = 0;
+  if (best_row >= 0) {
+    for (int x = 0; x < image.width(); ++x) {
+      const auto alpha = qAlpha(image.pixel(x, best_row));
+      if (alpha > 20 && alpha < 235) {
+        ++current_ramp;
+        max_ramp = std::max(max_ramp, current_ramp);
+      } else {
+        current_ramp = 0;
+      }
+    }
+  }
+  return std::pair<int, int>{best_opaque, max_ramp};
+}
+
+ThemedCaptureScope::ThemedCaptureScope(QWidget& widget) {
+  const auto app_sheet = patchy::ui::photoshop_style();
+  // The MainWindow and make_themed_dialog_parent() carry exactly the app sheet;
+  // a dialog owned by either inherits it. Walk the owner chain across windows.
+  for (QWidget* ancestor = &widget; ancestor != nullptr; ancestor = ancestor->parentWidget()) {
+    if (ancestor->styleSheet().startsWith(app_sheet)) {
+      return;
+    }
+  }
+  window_ = widget.window();
+  previous_sheet_ = window_->styleSheet();
+  // Prepend, so the window's own appended chrome sheet keeps winning ties.
+  window_->setStyleSheet(app_sheet + QStringLiteral("\n") + previous_sheet_);
+  window_->ensurePolished();
+  QApplication::processEvents();
+}
+
+ThemedCaptureScope::~ThemedCaptureScope() {
+  // The capture must leave the widget exactly as it found it: a bare CanvasWidget
+  // grabbed mid-test kept the theme sheet and behaved differently afterwards
+  // (ui_drag_size_readout_shows_dimensions, October 2026).
+  if (window_ != nullptr) {
+    window_->setStyleSheet(previous_sheet_);
+    window_->ensurePolished();
+    QApplication::processEvents();
+  }
+}
+
+void ensure_capture_themed(QWidget& widget) {
+  // Kept for callers that theme a window for the rest of a test on purpose.
+  ThemedCaptureScope scope(widget);
+  scope.release();
+}
+
+namespace {
+
+bool window_chain_carries_app_sheet(QWidget& widget) {
+  const auto app_sheet = patchy::ui::photoshop_style();
+  for (QWidget* ancestor = &widget; ancestor != nullptr; ancestor = ancestor->parentWidget()) {
+    if (ancestor->styleSheet().startsWith(app_sheet)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+bool palette_has_color(const patchy::ui::ThemePalette& palette, QColor color) {
+  for (const auto& role : patchy::ui::theme_palette_roles()) {
+    if ((palette.*role.second).rgb() == color.rgb()) {
+      return true;
+    }
+  }
+  return false;
+}
+
+QColor generic_role_value(const patchy::ui::ThemePalette& palette, QPalette::ColorRole role) {
+  switch (role) {
+    case QPalette::Base:
+      return palette.field_bg_large;
+    case QPalette::Button:
+      return palette.button_bg;
+    case QPalette::Window:
+      return palette.window_bg;
+    case QPalette::WindowText:
+    case QPalette::Text:
+    case QPalette::ButtonText:
+      return palette.text_primary;
+    default:
+      return {};
+  }
+}
+
+// Widgets that show document content or a user-chosen color rather than chrome:
+// their palette carries that content, so the theme rule does not apply to them or
+// to their children (docs/testing.md lists them).
+bool shows_content_not_chrome(const QWidget* widget) {
+  for (const QWidget* w = widget; w != nullptr; w = w->parentWidget()) {
+    const auto name = w->objectName();
+    if (name == QStringLiteral("inlineTextEditor") || name.endsWith(QStringLiteral("ColorButton")) ||
+        name.endsWith(QStringLiteral("ColorSwatch"))) {
+      return true;
+    }
+  }
+  return false;
+}
+
+QString describe_capture_offender(QWidget* widget, const char* what, QColor color) {
+  auto text = QString::fromLatin1(widget->metaObject()->className());
+  if (!widget->objectName().isEmpty()) {
+    text += QStringLiteral("#") + widget->objectName();
+  }
+  text += QStringLiteral(": ") + QString::fromLatin1(what);
+  if (color.isValid()) {
+    text += QStringLiteral(" ") + color.name();
+  }
+  return text;
+}
+
+}  // namespace
+
+QString capture_theme_mismatch(QWidget& root) {
+  // A tooltip (QTipLabel) has no owner on Windows and is themed through
+  // QToolTip's application palette, which the palette checks below verify.
+  if (!root.inherits("QTipLabel") && !window_chain_carries_app_sheet(root)) {
+    return describe_capture_offender(&root, "no window in its owner chain carries the app stylesheet", {});
+  }
+  const auto scheme = patchy::ui::active_color_scheme();
+  const auto& active = patchy::ui::theme();
+  const auto& other = patchy::ui::theme(scheme == patchy::ui::ColorScheme::Light ? patchy::ui::ColorScheme::Dark
+                                                                                   : patchy::ui::ColorScheme::Light);
+  const auto standard = QApplication::style()->standardPalette();
+  auto widgets = root.findChildren<QWidget*>();
+  widgets.prepend(&root);
+  for (auto* widget : widgets) {
+    if (!widget->isVisible() || widget->width() <= 0 || widget->height() <= 0 || shows_content_not_chrome(widget)) {
+      continue;
+    }
+    if (!widget->testAttribute(Qt::WA_WState_Polished)) {
+      return describe_capture_offender(widget, "is not polished", {});
+    }
+    const auto& palette = widget->palette();
+    for (const auto role : {widget->backgroundRole(), widget->foregroundRole()}) {
+      const auto color = palette.color(role);
+      if (color.alpha() == 0 || palette_has_color(active, color)) {
+        continue;  // transparent, or a legitimate color of the active theme
+      }
+      const auto other_value = generic_role_value(other, role);
+      const bool qt_default = color.rgb() == standard.color(role).rgb();
+      const bool other_scheme = other_value.isValid() && color.rgb() == other_value.rgb();
+      if (qt_default || other_scheme) {
+        return describe_capture_offender(
+            widget,
+            qt_default ? (role == widget->backgroundRole() ? "background is Qt's unthemed default"
+                                                           : "text is Qt's unthemed default")
+                       : (role == widget->backgroundRole() ? "background is the other scheme's"
+                                                           : "text is the other scheme's"),
+            color);
+      }
+    }
+  }
+  return {};
+}
+
+QImage capture_widget_artifact(const std::string& name, QWidget& widget) {
+  ensure_artifact_dir();
+  ThemedCaptureScope themed(widget);
+  const auto mismatch = capture_theme_mismatch(widget);
+  if (!mismatch.isEmpty()) {
+    // Never throw here: captures run inside Qt's event dispatch, where an
+    // exception aborts the process on macOS. The runner fails the test.
+    patchy::test::report_failure("capture '" + name + "' is not themed: " + mismatch.toStdString());
+    return {};
+  }
+  const auto path = QString::fromStdString((std::filesystem::path("test-artifacts") / (name + ".png")).string());
+  const auto pixmap = widget.grab();
+  if (pixmap.isNull() || !pixmap.save(path)) {
+    patchy::test::report_failure("capture '" + name + "' could not be saved");
+    return {};
+  }
+  return pixmap.toImage();
+}
+
+void save_widget_artifact(const std::string& name, QWidget& widget) {
+  (void)capture_widget_artifact(name, widget);
+}
+
+QImage render_widget_tooltip(QWidget& anchor) {
+  QToolTip::hideText();
+  QApplication::processEvents();
+  QToolTip::showText(anchor.mapToGlobal(QPoint(4, anchor.height())), anchor.toolTip(), &anchor);
+  QApplication::processEvents();
+  QImage image;
+  for (auto* top : QApplication::topLevelWidgets()) {
+    if (top->inherits("QTipLabel") && top->isVisible()) {
+      image = QImage(top->size(), QImage::Format_ARGB32_Premultiplied);
+      image.fill(Qt::transparent);
+      top->render(&image, QPoint(), QRegion(), QWidget::DrawChildren);
+    }
+  }
+  QToolTip::hideText();
+  QApplication::processEvents();
+  return image;
+}
+
+double unpainted_share(const QImage& tip) {
+  if (tip.isNull() || tip.width() <= 0 || tip.height() <= 0) {
+    return 1.0;
+  }
+  const auto pixels = tip.convertToFormat(QImage::Format_ARGB32);
+  qint64 clear = 0;
+  for (int y = 0; y < pixels.height(); ++y) {
+    for (int x = 0; x < pixels.width(); ++x) {
+      clear += qAlpha(pixels.pixel(x, y)) == 0 ? 1 : 0;
+    }
+  }
+  return static_cast<double>(clear) / (static_cast<double>(pixels.width()) * pixels.height());
+}
+
+void save_window_popup_artifact(const std::string& name, QWidget& window, QWidget& field, QWidget& popup) {
+  ensure_artifact_dir();
+  ThemedCaptureScope themed_window(window);
+  ThemedCaptureScope themed_popup(popup);
+  for (auto* captured : {&window, &popup}) {
+    const auto mismatch = capture_theme_mismatch(*captured);
+    if (!mismatch.isEmpty()) {
+      patchy::test::report_failure("capture '" + name + "' is not themed: " + mismatch.toStdString());
+      return;
+    }
+  }
+  auto shot = window.grab().toImage();
+  const auto window_origin = window.mapToGlobal(QPoint(0, 0));
+  const auto popup_position = popup.mapToGlobal(QPoint(0, 0)) - window_origin;
+  {
+    QPainter painter(&shot);
+    painter.drawPixmap(popup_position, popup.grab());
+  }
+  const auto field_position = field.mapToGlobal(QPoint(0, 0)) - window_origin;
+  const auto crop = QRect(field_position, field.size())
+                        .united(QRect(popup_position, popup.size()))
+                        .adjusted(-170, -14, 48, 14)
+                        .intersected(shot.rect());
+  const auto path = QString::fromStdString((std::filesystem::path("test-artifacts") / (name + ".png")).string());
+  CHECK(shot.copy(crop).save(path));
+}
+
+void save_stacked_artifact(const std::string& name, const QList<QImage>& strips) {
+  ensure_artifact_dir();
+  constexpr int kGap = 6;
+  int width = 0;
+  int height = 0;
+  for (const auto& strip : strips) {
+    width = std::max(width, strip.width());
+    height += strip.height() + (height > 0 ? kGap : 0);
+  }
+  CHECK(width > 0 && height > 0);
+  QImage sheet(std::max(width, 1), std::max(height, 1), QImage::Format_ARGB32_Premultiplied);
+  sheet.fill(QColor(128, 128, 128));
+  QPainter painter(&sheet);
+  int y = 0;
+  for (const auto& strip : strips) {
+    painter.drawImage(0, y, strip);
+    y += strip.height() + kGap;
+  }
+  painter.end();
+  const auto path = QString::fromStdString((std::filesystem::path("test-artifacts") / (name + ".png")).string());
+  CHECK(sheet.save(path));
+}
+
+void send_mouse(QWidget& widget, QEvent::Type type, QPoint position, Qt::MouseButton button, Qt::MouseButtons buttons, Qt::KeyboardModifiers modifiers) {
+  QMouseEvent event(type, position, widget.mapToGlobal(position), button, buttons, modifiers);
+  QApplication::sendEvent(&widget, &event);
+  QApplication::processEvents();
+}
+
+void click_widget_like_a_user(QWidget& widget, QPoint position, Qt::KeyboardModifiers modifiers) {
+  // Two things the window system does that QApplication::sendEvent to a parent does NOT.
+  //
+  // 1. The press goes to the deepest CHILD under the point, in that child's coordinates. Sending
+  //    to the canvas skips any child sitting on top of it, so a test cannot tell whether a real
+  //    click would ever reach the widget that is supposed to handle it.
+  // 2. Focus is given BEFORE the press, by walking up from the clicked widget to the first
+  //    ancestor whose focusPolicy accepts click focus (Qt's giveFocusAccordingToFocusPolicy). A
+  //    Qt::NoFocus widget therefore hands focus to whatever focusable widget is behind it, which
+  //    is how a click on an overlay can trip a focus-loss handler belonging to something else.
+  //
+  // Text-editor click tests must use this: the inline editor is a child of the canvas with an
+  // overlay above it, and both effects decide which of the three gets the click.
+  auto* target = widget.childAt(position);
+  QWidget& receiver = target == nullptr ? widget : *target;
+  const QPoint local = target == nullptr ? position : target->mapFrom(&widget, position);
+
+  QWidget* focus_target = &receiver;
+  while (focus_target != nullptr && (focus_target->focusPolicy() & Qt::ClickFocus) != Qt::ClickFocus) {
+    focus_target = focus_target->parentWidget();
+  }
+  if (focus_target != nullptr) {
+    focus_target->setFocus(Qt::MouseFocusReason);
+    QApplication::processEvents();
+  }
+
+  send_mouse(receiver, QEvent::MouseButtonPress, local, Qt::LeftButton, Qt::LeftButton, modifiers);
+  send_mouse(receiver, QEvent::MouseButtonRelease, local, Qt::LeftButton, Qt::NoButton, modifiers);
+}
+
+const QPointingDevice& tablet_test_device(QPointingDevice::PointerType pointer_type, QInputDevice::Capabilities capabilities) {
+  static QPointingDevice pen(QStringLiteral("Patchy test pen"), 1001, QInputDevice::DeviceType::Stylus,
+                             QPointingDevice::PointerType::Pen,
+                             QInputDevice::Capability::Position | QInputDevice::Capability::Pressure |
+                                 QInputDevice::Capability::XTilt | QInputDevice::Capability::YTilt |
+                                 QInputDevice::Capability::Rotation |
+                                 QInputDevice::Capability::TangentialPressure |
+                                 QInputDevice::Capability::ZPosition,
+                             1, 3);
+  static QPointingDevice eraser(QStringLiteral("Patchy test eraser"), 1002, QInputDevice::DeviceType::Stylus,
+                                QPointingDevice::PointerType::Eraser,
+                                QInputDevice::Capability::Position | QInputDevice::Capability::Pressure,
+                                1, 3);
+  static QPointingDevice no_pressure(QStringLiteral("Patchy no-pressure pen"), 1003,
+                                     QInputDevice::DeviceType::Stylus, QPointingDevice::PointerType::Pen,
+                                     QInputDevice::Capability::Position, 1, 3);
+
+  if (pointer_type == QPointingDevice::PointerType::Eraser) {
+    return eraser;
+  }
+  if (!capabilities.testFlag(QInputDevice::Capability::Pressure)) {
+    return no_pressure;
+  }
+  return pen;
+}
+
+void send_tablet(QWidget& widget, QEvent::Type type, QPoint position, qreal pressure, Qt::MouseButton button, Qt::MouseButtons buttons, Qt::KeyboardModifiers modifiers, QPointingDevice::PointerType pointer_type, QInputDevice::Capabilities capabilities, float x_tilt, float y_tilt, qreal rotation, float tangential_pressure, float z) {
+  const auto& device = tablet_test_device(pointer_type, capabilities);
+  QTabletEvent event(type, &device, QPointF(position), QPointF(widget.mapToGlobal(position)), pressure, x_tilt,
+                     y_tilt, tangential_pressure, rotation, z, modifiers, button, buttons);
+  QApplication::sendEvent(&widget, &event);
+  QApplication::processEvents();
+}
+
+void drag(QWidget& widget, QPoint from, QPoint to, Qt::KeyboardModifiers modifiers, Qt::MouseButton button) {
+  send_mouse(widget, QEvent::MouseButtonPress, from, button, button, modifiers);
+  send_mouse(widget, QEvent::MouseMove, to, Qt::NoButton, button, modifiers);
+  send_mouse(widget, QEvent::MouseButtonRelease, to, button, Qt::NoButton, modifiers);
+}
+
+namespace {
+
+void drag_document_path_through(patchy::ui::CanvasWidget& canvas, const std::vector<QPoint>& document_path,
+                                int steps_per_segment, Qt::KeyboardModifiers modifiers,
+                                const std::function<QPoint(QPoint)>& widget_point) {
+  if (document_path.size() < 2 || steps_per_segment < 1) {
+    return;
+  }
+  send_mouse(canvas, QEvent::MouseButtonPress, widget_point(document_path.front()), Qt::LeftButton,
+             Qt::LeftButton, modifiers);
+  for (std::size_t segment = 0; segment + 1 < document_path.size(); ++segment) {
+    const auto from = document_path[segment];
+    const auto to = document_path[segment + 1];
+    for (int i = 1; i <= steps_per_segment; ++i) {
+      const auto t = static_cast<double>(i) / steps_per_segment;
+      const QPoint point(from.x() + static_cast<int>(std::lround((to.x() - from.x()) * t)),
+                         from.y() + static_cast<int>(std::lround((to.y() - from.y()) * t)));
+      send_mouse(canvas, QEvent::MouseMove, widget_point(point), Qt::NoButton, Qt::LeftButton, modifiers);
+    }
+  }
+  send_mouse(canvas, QEvent::MouseButtonRelease, widget_point(document_path.back()), Qt::LeftButton,
+             Qt::NoButton, modifiers);
+}
+
+}  // namespace
+
+void drag_document_path(patchy::ui::CanvasWidget& canvas, const std::vector<QPoint>& document_path,
+                        int steps_per_segment, Qt::KeyboardModifiers modifiers) {
+  drag_document_path_through(canvas, document_path, steps_per_segment, modifiers, [&canvas](QPoint point) {
+    return canvas.widget_position_for_document_point(point);
+  });
+}
+
+QPoint widget_center_of_document_pixel(const patchy::ui::CanvasWidget& canvas, QPoint document_point) {
+  return canvas.widget_position_f(QPointF(document_point) + QPointF(0.5, 0.5)).toPoint();
+}
+
+void drag_document_pixel_centers(patchy::ui::CanvasWidget& canvas, const std::vector<QPoint>& document_path,
+                                 int steps_per_segment, Qt::KeyboardModifiers modifiers) {
+  drag_document_path_through(canvas, document_path, steps_per_segment, modifiers, [&canvas](QPoint point) {
+    return widget_center_of_document_pixel(canvas, point);
+  });
+}
+
+void save_image_artifact(const std::string& name, const QImage& image) {
+  ensure_artifact_dir();
+  const auto path = QString::fromStdString((std::filesystem::path("test-artifacts") / (name + ".png")).string());
+  CHECK(!image.isNull());
+  CHECK(image.save(path));
+}
+
+void send_double_click(QWidget& widget, QPoint position, Qt::KeyboardModifiers modifiers) {
+  QMouseEvent event(QEvent::MouseButtonDblClick, position, widget.mapToGlobal(position), Qt::LeftButton,
+                    Qt::LeftButton, modifiers);
+  QApplication::sendEvent(&widget, &event);
+  QApplication::processEvents();
+}
+
+void send_key(QWidget& widget, int key, Qt::KeyboardModifiers modifiers) {
+  QKeyEvent press(QEvent::KeyPress, key, modifiers);
+  QApplication::sendEvent(&widget, &press);
+  QKeyEvent release(QEvent::KeyRelease, key, modifiers);
+  QApplication::sendEvent(&widget, &release);
+  QApplication::processEvents();
+}
+
+void send_key_press(QWidget& widget, int key, Qt::KeyboardModifiers modifiers) {
+  QKeyEvent event(QEvent::KeyPress, key, modifiers);
+  QApplication::sendEvent(&widget, &event);
+  QApplication::processEvents();
+}
+
+void send_key_release(QWidget& widget, int key, Qt::KeyboardModifiers modifiers) {
+  QKeyEvent event(QEvent::KeyRelease, key, modifiers);
+  QApplication::sendEvent(&widget, &event);
+  QApplication::processEvents();
+}
+
+void send_wheel(QWidget& widget, QPoint position, int delta, Qt::KeyboardModifiers modifiers) {
+  QWheelEvent event(QPointF(position), QPointF(widget.mapToGlobal(position)), QPoint(), QPoint(0, delta),
+                    Qt::NoButton, modifiers, Qt::NoScrollPhase, false);
+  QApplication::sendEvent(&widget, &event);
+  QApplication::processEvents();
+}
+
+void send_scroll(QWidget& widget, QPoint position, QPoint pixel_delta, Qt::ScrollPhase phase,
+                 Qt::KeyboardModifiers modifiers) {
+  QWheelEvent event(QPointF(position), QPointF(widget.mapToGlobal(position)), pixel_delta, pixel_delta * 2,
+                    Qt::NoButton, modifiers, phase, false);
+  QApplication::sendEvent(&widget, &event);
+  QApplication::processEvents();
+}
+
+void send_pixel_wheel(QWidget& widget, QPoint position, int pixel_delta, Qt::KeyboardModifiers modifiers) {
+  QWheelEvent event(QPointF(position), QPointF(widget.mapToGlobal(position)), QPoint(0, pixel_delta),
+                    QPoint(0, pixel_delta), Qt::NoButton, modifiers, Qt::NoScrollPhase, false);
+  QApplication::sendEvent(&widget, &event);
+  QApplication::processEvents();
+}
+
+void send_layer_drag_enter(QListWidget& list, QPoint position, const std::vector<patchy::LayerId>& ids) {
+  QMimeData mime_data;
+  mime_data.setData(QString::fromLatin1(patchy::ui::kLayerDragMimeType), patchy::ui::layer_ids_to_mime_data(ids));
+  QDragEnterEvent event(position, Qt::MoveAction, &mime_data, Qt::LeftButton, Qt::NoModifier);
+  QApplication::sendEvent(list.viewport(), &event);
+  QApplication::processEvents();
+}
+
+void send_layer_drag_move(QListWidget& list, QPoint position, const std::vector<patchy::LayerId>& ids) {
+  QMimeData mime_data;
+  mime_data.setData(QString::fromLatin1(patchy::ui::kLayerDragMimeType), patchy::ui::layer_ids_to_mime_data(ids));
+  QDragMoveEvent event(position, Qt::MoveAction, &mime_data, Qt::LeftButton, Qt::NoModifier);
+  QApplication::sendEvent(list.viewport(), &event);
+  QApplication::processEvents();
+}
+
+void send_layer_drag_leave(QListWidget& list) {
+  QDragLeaveEvent event;
+  QApplication::sendEvent(list.viewport(), &event);
+  QApplication::processEvents();
+}
+
+void send_layer_drop(QListWidget& list, QPoint position, const std::vector<patchy::LayerId>& ids) {
+  QMimeData mime_data;
+  mime_data.setData(QString::fromLatin1(patchy::ui::kLayerDragMimeType), patchy::ui::layer_ids_to_mime_data(ids));
+  QDragEnterEvent enter(position, Qt::MoveAction, &mime_data, Qt::LeftButton, Qt::NoModifier);
+  QApplication::sendEvent(list.viewport(), &enter);
+  QDragMoveEvent move(position, Qt::MoveAction, &mime_data, Qt::LeftButton, Qt::NoModifier);
+  QApplication::sendEvent(list.viewport(), &move);
+  QDropEvent event(QPointF(position), Qt::MoveAction, &mime_data, Qt::LeftButton, Qt::NoModifier);
+  QApplication::sendEvent(list.viewport(), &event);
+  QApplication::processEvents();
+  QApplication::processEvents();
+}
+
+void send_layer_button_drop(QWidget& button, const std::vector<patchy::LayerId>& ids) {
+  QMimeData mime_data;
+  mime_data.setData(QString::fromLatin1(patchy::ui::kLayerDragMimeType), patchy::ui::layer_ids_to_mime_data(ids));
+  const auto position = button.rect().center();
+  QDragEnterEvent enter(position, Qt::MoveAction, &mime_data, Qt::LeftButton, Qt::NoModifier);
+  QApplication::sendEvent(&button, &enter);
+  QDragMoveEvent move(position, Qt::MoveAction, &mime_data, Qt::LeftButton, Qt::NoModifier);
+  QApplication::sendEvent(&button, &move);
+  QDropEvent drop(QPointF(position), Qt::MoveAction, &mime_data, Qt::LeftButton, Qt::NoModifier);
+  QApplication::sendEvent(&button, &drop);
+  QApplication::processEvents();
+  QApplication::processEvents();
+}
+
+void send_layer_drop_to_widget(QWidget& target, QPoint position, const std::vector<patchy::LayerId>& ids,
+                               std::optional<std::int64_t> source_session_id, Qt::KeyboardModifiers modifiers,
+                               bool* entered) {
+  QMimeData mime_data;
+  mime_data.setData(QString::fromLatin1(patchy::ui::kLayerDragMimeType), patchy::ui::layer_ids_to_mime_data(ids));
+  if (source_session_id.has_value()) {
+    mime_data.setData(QString::fromLatin1(patchy::ui::kLayerDragSourceSessionMimeType),
+                      patchy::ui::layer_drag_source_session_to_mime_data(*source_session_id));
+  }
+  const Qt::DropActions actions = Qt::CopyAction | Qt::MoveAction;
+  QDragEnterEvent enter(position, actions, &mime_data, Qt::LeftButton, modifiers);
+  QApplication::sendEvent(&target, &enter);
+  if (entered != nullptr) {
+    *entered = enter.isAccepted();
+  }
+  QDragMoveEvent move(position, actions, &mime_data, Qt::LeftButton, modifiers);
+  QApplication::sendEvent(&target, &move);
+  QDropEvent drop(QPointF(position), actions, &mime_data, Qt::LeftButton, modifiers);
+  QApplication::sendEvent(&target, &drop);
+  QApplication::processEvents();
+  QApplication::processEvents();
+}
+
+QAction* require_action(QWidget& root, const char* object_name) {
+  auto* action = root.findChild<QAction*>(QString::fromLatin1(object_name));
+  CHECK(action != nullptr);
+  return action;
+}
+
+int shown_text_anti_alias(QWidget& window) {
+  auto* type_menu = window.findChild<QMenu*>(QStringLiteral("typeMenu"));
+  auto* anti_alias_menu = window.findChild<QMenu*>(QStringLiteral("typeAntiAliasMenu"));
+  CHECK(type_menu != nullptr && anti_alias_menu != nullptr);
+  if (type_menu == nullptr || anti_alias_menu == nullptr) {
+    return -1;
+  }
+  emit type_menu->aboutToShow();
+  for (auto* action : anti_alias_menu->actions()) {
+    if (action->isCheckable() && action->isChecked()) {
+      return action->data().toInt();
+    }
+  }
+  return -1;
+}
+
+void choose_text_anti_alias(QWidget& window, int value) {
+  auto* anti_alias_menu = window.findChild<QMenu*>(QStringLiteral("typeAntiAliasMenu"));
+  CHECK(anti_alias_menu != nullptr);
+  if (anti_alias_menu == nullptr) {
+    return;
+  }
+  for (auto* action : anti_alias_menu->actions()) {
+    if (action->isCheckable() && action->data().toInt() == value) {
+      action->trigger();
+      QApplication::processEvents();
+      return;
+    }
+  }
+  CHECK(false);
+}
+
+QAction* require_hotkey_action(patchy::ui::MainWindow& window, const QString& id) {
+  const auto* command = window.hotkey_registry().find_command(id);
+  CHECK(command != nullptr);
+  CHECK(command->action != nullptr);
+  return command->action;
+}
+
+patchy::RgbColor filter_rgb(const QColor& color) {
+  return patchy::RgbColor{static_cast<std::uint8_t>(color.red()), static_cast<std::uint8_t>(color.green()),
+                         static_cast<std::uint8_t>(color.blue())};
+}
+
+bool filter_rgb_equal(patchy::RgbColor lhs, patchy::RgbColor rhs) {
+  return lhs.red == rhs.red && lhs.green == rhs.green && lhs.blue == rhs.blue;
+}
+
+bool filter_rect_equal(patchy::Rect lhs, patchy::Rect rhs) {
+  return lhs.x == rhs.x && lhs.y == rhs.y && lhs.width == rhs.width && lhs.height == rhs.height;
+}
+
+bool smart_object_placements_equal(const std::optional<patchy::SmartObjectPlacement>& lhs, const std::optional<patchy::SmartObjectPlacement>& rhs) {
+  if (!lhs.has_value() || !rhs.has_value()) {
+    return lhs.has_value() == rhs.has_value();
+  }
+  return lhs->uuid == rhs->uuid && lhs->transform == rhs->transform &&
+         lhs->width == rhs->width && lhs->height == rhs->height &&
+         lhs->resolution == rhs->resolution &&
+         lhs->placed_type == rhs->placed_type &&
+         lhs->anti_alias == rhs->anti_alias;
+}
+
+patchy::FilterInvocation filter_invocation(patchy::FilterRegistry& registry, std::string_view id, QColor foreground, QColor background) {
+  return registry.default_invocation(id, filter_rgb(foreground), filter_rgb(background));
+}
+
+void set_filter_integer(patchy::FilterInvocation& invocation, std::string key, int value) {
+  invocation.parameters.insert_or_assign(std::move(key), static_cast<std::int64_t>(value));
+}
+
+int filter_integer(const patchy::FilterInvocation& invocation, std::string_view key) {
+  const auto found = invocation.parameters.find(key);
+  CHECK(found != invocation.parameters.end());
+  const auto* value = std::get_if<std::int64_t>(&found->second);
+  CHECK(value != nullptr);
+  return static_cast<int>(*value);
+}
+
+QAction* find_action_by_text(QWidget& root, const QString& text) {
+  const auto actions = root.findChildren<QAction*>();
+  for (auto* action : actions) {
+    if (action->menu() != nullptr) {
+      continue;
+    }
+    if (action->text().remove('&') == text) {
+      return action;
+    }
+  }
+  return nullptr;
+}
+
+QAction* require_action_by_text(QWidget& root, const QString& text) {
+  auto* action = find_action_by_text(root, text);
+  CHECK(action != nullptr);
+  return action;
+}
+
+QImage image_from_pixels_for_visuals(const patchy::PixelBuffer& pixels) {
+  QImage image(pixels.width(), pixels.height(),
+               pixels.format().channels >= 4 ? QImage::Format_RGBA8888 : QImage::Format_RGB888);
+  image.fill(pixels.format().channels >= 4 ? Qt::transparent : Qt::black);
+  for (std::int32_t y = 0; y < pixels.height(); ++y) {
+    for (std::int32_t x = 0; x < pixels.width(); ++x) {
+      const auto* px = pixels.pixel(x, y);
+      image.setPixelColor(x, y, QColor(px[0], px[1], px[2], pixels.format().channels >= 4 ? px[3] : 255));
+    }
+  }
+  return image;
+}
+
+QImage flattened_on_white(const patchy::PixelBuffer& pixels) {
+  const auto source = image_from_pixels_for_visuals(pixels);
+  QImage flattened(source.size(), QImage::Format_RGB32);
+  flattened.fill(Qt::white);
+  QPainter painter(&flattened);
+  painter.drawImage(QPoint(0, 0), source);
+  painter.end();
+  return flattened;
+}
+
+patchy::PixelBuffer make_filter_stroke_source() {
+  QImage image(220, 160, QImage::Format_ARGB32);
+  image.fill(Qt::transparent);
+  QPainter painter(&image);
+  painter.setRenderHint(QPainter::Antialiasing);
+  QPen pen(QColor(220, 28, 24), 12, Qt::SolidLine, Qt::RoundCap, Qt::RoundJoin);
+  painter.setPen(pen);
+  painter.drawLine(QPoint(26, 132), QPoint(78, 28));
+  painter.drawLine(QPoint(70, 88), QPoint(156, 45));
+  painter.drawLine(QPoint(86, 118), QPoint(196, 122));
+  painter.drawArc(QRect(62, 28, 78, 82), 30 * 16, 290 * 16);
+  painter.drawArc(QRect(94, 72, 78, 52), 190 * 16, 250 * 16);
+  painter.end();
+  return patchy::ui::pixels_from_image_rgba(image);
+}
+
+patchy::Document make_filter_gallery_document(patchy::LayerId& layer_id, patchy::Rect& bounds, patchy::PixelBuffer& original_pixels) {
+  original_pixels = make_filter_stroke_source();
+  patchy::Document document(320, 240, patchy::PixelFormat::rgba8());
+  patchy::Layer layer(document.allocate_layer_id(), "Gallery Subject", original_pixels);
+  layer_id = layer.id();
+  bounds = patchy::Rect{48, 38, original_pixels.width(), original_pixels.height()};
+  layer.set_bounds(bounds);
+  document.add_layer(std::move(layer));
+  document.set_active_layer(layer_id);
+  return document;
+}
+
+// `offset_x/offset_y` map an `after` pixel back to `before`-space; they are
+// non-zero when the filter grew the layer (the grown buffer's (0,0) corresponds
+// to before-space (offset_x, offset_y), which is negative). Pixels that fall
+// outside `before` were transparent (nonexistent) before the filter ran.
+bool spatial_filter_spreads_clean_red_alpha(const patchy::PixelBuffer& before, const patchy::PixelBuffer& after, int offset_x, int offset_y) {
+  int spread_pixels = 0;
+  bool clean_red = false;
+  for (std::int32_t y = 0; y < after.height(); ++y) {
+    for (std::int32_t x = 0; x < after.width(); ++x) {
+      const auto bx = x + offset_x;
+      const auto by = y + offset_y;
+      const bool was_opaque = bx >= 0 && by >= 0 && bx < before.width() && by < before.height() &&
+                              before.pixel(bx, by)[3] != 0;
+      const auto* dst = after.pixel(x, y);
+      if (!was_opaque && dst[3] > 8) {
+        ++spread_pixels;
+        clean_red = clean_red || (dst[0] > 170 && dst[1] < 90 && dst[2] < 90);
+      }
+    }
+  }
+  return spread_pixels > 0 && clean_red;
+}
+
+namespace {
+
+// The Open Recent File (fileOpenRecentList) or Open Recent Folder (fileOpenRecentFolderList)
+// list inside `menu`, or nullptr.
+QListWidget* recent_menu_list(QMenu& menu) {
+  for (auto* list : menu.findChildren<QListWidget*>()) {
+    if (list->objectName() == QStringLiteral("fileOpenRecentList") ||
+        list->objectName() == QStringLiteral("fileOpenRecentFolderList")) {
+      return list;
+    }
+  }
+  return nullptr;
+}
+
+}  // namespace
+
+QStringList recent_menu_paths(QMenu& menu) {
+  QStringList paths;
+  if (auto* list = recent_menu_list(menu); list != nullptr) {
+    for (int row = 0; row < list->count(); ++row) {
+      const auto path = list->item(row)->data(patchy::ui::kRecentPathRole).toString();
+      if (!path.isEmpty()) {
+        paths << path;
+      }
+    }
+  }
+  for (auto* action : menu.actions()) {
+    if (action == nullptr || action->isSeparator()) {
+      continue;
+    }
+    if (const auto path = action->data().toString(); !path.isEmpty()) {
+      paths << path;
+    }
+    if (auto* submenu = action->menu(); submenu != nullptr) {
+      paths << recent_menu_paths(*submenu);
+    }
+  }
+  return paths;
+}
+
+QListWidgetItem* recent_menu_list_item(QMenu& menu, const QString& path) {
+  auto* list = recent_menu_list(menu);
+  if (list == nullptr) {
+    return nullptr;
+  }
+  for (int row = 0; row < list->count(); ++row) {
+    if (list->item(row)->data(patchy::ui::kRecentPathRole).toString() == path) {
+      return list->item(row);
+    }
+  }
+  return nullptr;
+}
+
+LayerRowPartMenu right_click_layer_row_widget(QListWidget& layers, const QString& row_name,
+                                              const QString& widget_name, const QString& pick,
+                                              const std::string& artifact) {
+  LayerRowPartMenu seen;
+  auto* row = layers.itemWidget(require_layer_item(layers, row_name));
+  CHECK(row != nullptr);
+  QPointer<QWidget> part = row != nullptr ? row->findChild<QWidget*>(widget_name) : nullptr;
+  CHECK(part != nullptr);
+  if (part == nullptr) {
+    return seen;
+  }
+  // Polled, not a single zero timer: the right press can pump events (the selection handler)
+  // before the menu opens, and a timer spent by then leaves the menu's loop running forever.
+  QTimer poll;
+  int polls_left = 500;
+  poll.setInterval(10);
+  QObject::connect(&poll, &QTimer::timeout, [&seen, &layers, &poll, &polls_left, part, pick, artifact] {
+    if (--polls_left <= 0) {
+      poll.stop();
+      return;
+    }
+    for (auto* widget : QApplication::topLevelWidgets()) {
+      auto* menu = qobject_cast<QMenu*>(widget);
+      if (menu == nullptr || !menu->isVisible()) {
+        continue;
+      }
+      seen.name = menu->objectName();
+      QAction* chosen = nullptr;
+      for (auto* action : menu->actions()) {
+        seen.actions.push_back(action->isSeparator() ? QStringLiteral("-") : action->objectName());
+        seen.texts.push_back(action->text());
+        seen.enabled.push_back(action->isEnabled());
+        seen.checked.push_back(action->isCheckable() && action->isChecked());
+        if (!pick.isEmpty() && action->objectName() == pick) {
+          chosen = action;
+        }
+      }
+      if (!artifact.empty() && part != nullptr) {
+        save_window_popup_artifact(artifact, *layers.window(), *part, *menu);
+      }
+      poll.stop();
+      // QMenu closes before it triggers a picked entry.
+      menu->close();
+      if (chosen != nullptr) {
+        chosen->trigger();
+      }
+      return;
+    }
+  });
+  poll.start();
+  const auto local = part->rect().center();
+  send_mouse(*part, QEvent::MouseButtonPress, local, Qt::RightButton, Qt::RightButton);
+  if (part != nullptr) {
+    send_mouse(*part, QEvent::MouseButtonRelease, local, Qt::RightButton, Qt::NoButton);
+  }
+  if (part != nullptr) {
+    QContextMenuEvent event(QContextMenuEvent::Mouse, local, part->mapToGlobal(local));
+    QApplication::sendEvent(part, &event);
+  }
+  poll.stop();
+  for (int pass = 0; pass < 4; ++pass) {
+    QApplication::processEvents();  // deferred menu commands run past the menu's loop
+  }
+  CHECK(!seen.name.isEmpty());  // a menu opened
+  return seen;
+}
+
+QAction* find_menu_action_by_text(QMenu& menu, const QString& text) {
+  for (auto* action : menu.actions()) {
+    auto action_text = action->text();
+    action_text.remove('&');
+    if (action_text == text) {
+      return action;
+    }
+    // The layer context menu groups related actions in submenus (July 2026).
+    if (auto* child_menu = action->menu(); child_menu != nullptr) {
+      if (auto* nested = find_menu_action_by_text(*child_menu, text); nested != nullptr) {
+        return nested;
+      }
+    }
+  }
+  return nullptr;
+}
+
+LayerStyleContextMenuState layer_style_context_menu_state(QListWidget& layer_list, QListWidgetItem& item) {
+  LayerStyleContextMenuState state;
+  QTimer::singleShot(0, guarded([&] {
+    for (auto* widget : QApplication::topLevelWidgets()) {
+      auto* menu = qobject_cast<QMenu*>(widget);
+      if (menu == nullptr || menu->objectName() != QStringLiteral("layerContextMenu")) {
+        continue;
+      }
+      if (auto* action = find_menu_action_by_text(*menu, QStringLiteral("Copy Layer Style")); action != nullptr) {
+        state.saw_copy = true;
+        state.copy_enabled = action->isEnabled();
+      }
+      if (auto* action = find_menu_action_by_text(*menu, QStringLiteral("Paste Layer Style")); action != nullptr) {
+        state.saw_paste = true;
+        state.paste_enabled = action->isEnabled();
+      }
+      if (auto* action = find_menu_action_by_text(*menu, QStringLiteral("Delete Layer Style")); action != nullptr) {
+        state.saw_delete = true;
+        state.delete_enabled = action->isEnabled();
+      }
+      menu->close();
+      return;
+    }
+    CHECK(false);
+  }));
+
+  const auto context_point = layer_list.visualItemRect(&item).center();
+  QContextMenuEvent context_event(QContextMenuEvent::Mouse, context_point,
+                                  layer_list.viewport()->mapToGlobal(context_point));
+  QApplication::sendEvent(layer_list.viewport(), &context_event);
+  QApplication::processEvents();
+  return state;
+}
+
+patchy::ui::CanvasWidget* require_canvas(patchy::ui::MainWindow& window) {
+  auto* canvas = dynamic_cast<patchy::ui::CanvasWidget*>(window.centralWidget());
+  if (canvas == nullptr) {
+    auto* tabs = window.findChild<QTabWidget*>(QStringLiteral("documentTabs"));
+    if (tabs != nullptr) {
+      canvas = dynamic_cast<patchy::ui::CanvasWidget*>(tabs->currentWidget());
+    }
+  }
+  CHECK(canvas != nullptr);
+  return canvas;
+}
+
+QStringList clipped_labels(QWidget& root) {
+  QStringList clipped;
+  for (auto* label : root.findChildren<QLabel*>()) {
+    if (!label->isVisible() || label->text().isEmpty()) {
+      continue;
+    }
+    // Pixmap labels and rich-text banners have their own sizing rules; only plain
+    // text laid out by the label itself is measured here.
+    if (!label->pixmap().isNull() || label->textFormat() == Qt::RichText) {
+      continue;
+    }
+    const auto identify = [label] {
+      return label->objectName().isEmpty() ? label->text().left(40) : label->objectName();
+    };
+    // A label laid out past the edge of its own window is clipped just as surely as one
+    // squeezed too short, and a window sized from a bad measurement produces exactly that.
+    if (auto* top = label->window(); top != nullptr) {
+      const QRect in_window(label->mapTo(top, QPoint(0, 0)), label->size());
+      if (!top->rect().contains(in_window)) {
+        clipped.append(QStringLiteral("%1 (extends outside its window: label %2x%3 at %4,%5, window %6x%7)")
+                           .arg(identify())
+                           .arg(in_window.width())
+                           .arg(in_window.height())
+                           .arg(in_window.x())
+                           .arg(in_window.y())
+                           .arg(top->width())
+                           .arg(top->height()));
+        continue;
+      }
+    }
+    if (label->wordWrap()) {
+      // heightForWidth is the height the wrapped text actually needs at this width.
+      const int needed = label->heightForWidth(label->width());
+      if (needed > label->height()) {
+        clipped.append(QStringLiteral("%1 (needs %2px height, has %3px)")
+                           .arg(identify())
+                           .arg(needed)
+                           .arg(label->height()));
+      }
+      continue;
+    }
+    const int needed = label->fontMetrics().horizontalAdvance(label->text()) + label->margin() * 2;
+    if (needed > label->width()) {
+      clipped.append(QStringLiteral("%1 (needs %2px width, has %3px)")
+                         .arg(identify())
+                         .arg(needed)
+                         .arg(label->width()));
+    }
+  }
+  return clipped;
+}
+
+void show_window(patchy::ui::MainWindow& window) {
+  window.resize(1180, 780);
+  window.show();
+  QApplication::processEvents();
+  // Startup no longer auto-creates a document; the suite's tests predate that and
+  // assume the historical 1024x768 canvas, so create it here for fresh windows.
+  // Windows that already hold documents (opened before show) are left alone; use
+  // show_window_empty to exercise the real empty-startup state.
+  if (auto* tabs = window.findChild<QTabWidget*>(QStringLiteral("documentTabs"));
+      tabs != nullptr && tabs->count() == 0 &&
+      patchy::ui::MainWindowTestAccess::session_count(window) == 0) {
+    patchy::ui::MainWindowTestAccess::create_default_document(window);
+    QApplication::processEvents();
+  }
+}
+
+void show_window_empty(patchy::ui::MainWindow& window) {
+  window.resize(1180, 780);
+  window.show();
+  QApplication::processEvents();
+}
+
+ShownWindowFixture::ShownWindowFixture() {
+  show_window(window);
+  canvas = require_canvas(window);
+}
+
+void process_events_for(int milliseconds) {
+  QEventLoop loop;
+  QTimer::singleShot(milliseconds, &loop, &QEventLoop::quit);
+  loop.exec(QEventLoop::AllEvents);
+  QApplication::processEvents();
+}
+
+bool process_events_until(const std::function<bool()>& condition, int timeout_ms) {
+  if (condition()) {
+    return true;
+  }
+  QElapsedTimer timer;
+  timer.start();
+  while (timer.elapsed() < timeout_ms) {
+    const auto remaining = std::max(1, timeout_ms - static_cast<int>(timer.elapsed()));
+    process_events_for(std::min(20, remaining));
+    if (condition()) {
+      return true;
+    }
+  }
+  return condition();
+}
+
+std::unique_ptr<QWidget> make_themed_dialog_parent() {
+  auto parent = std::make_unique<QWidget>();
+  parent->setObjectName(QStringLiteral("testThemedDialogParent"));
+  parent->setStyleSheet(patchy::ui::photoshop_style());
+  return parent;
+}
+
+QDialog* find_top_level_dialog(const QString& object_name) {
+  for (auto* widget : QApplication::topLevelWidgets()) {
+    auto* dialog = qobject_cast<QDialog*>(widget);
+    if (dialog != nullptr && dialog->objectName() == object_name) {
+      return dialog;
+    }
+  }
+  return nullptr;
+}
+
+void when_dialog_visible(const QString& object_name, std::function<void(QDialog&)> drive, int timeout_ms) {
+  auto* poll = new QTimer(qApp);
+  poll->setInterval(10);
+  auto elapsed = std::make_shared<QElapsedTimer>();
+  elapsed->start();
+  QObject::connect(poll, &QTimer::timeout, poll, [poll, elapsed, object_name, timeout_ms, drive = std::move(drive)] {
+    QPointer<QDialog> dialog = find_top_level_dialog(object_name);
+    if (dialog == nullptr || !dialog->isVisible()) {
+      if (elapsed->elapsed() > timeout_ms) {
+        poll->stop();
+        poll->deleteLater();
+        // A different modal dialog in its place would park the test until the watchdog.
+        std::string instead;
+        if (auto* modal = qobject_cast<QDialog*>(QApplication::activeModalWidget()); modal != nullptr) {
+          instead = " (" + modal->objectName().toStdString() + " was open instead and was rejected)";
+          modal->reject();
+        }
+        report_failure("dialog " + object_name.toStdString() + " did not appear within " +
+                       std::to_string(timeout_ms) + " ms" + instead);
+      }
+      return;
+    }
+    poll->stop();
+    poll->deleteLater();
+    // One more pass, so the dialog's own deferred setup (0 ms timers armed before its loop) runs first.
+    QTimer::singleShot(0, [dialog, object_name, drive] {
+      if (dialog == nullptr) {
+        report_failure("dialog " + object_name.toStdString() + " closed before it could be driven");
+        return;
+      }
+      std::string failure;
+      try {
+        drive(*dialog);
+      } catch (const std::exception& error) {
+        failure = error.what();
+      } catch (const patchy::test::TestSkipped& skipped) {
+        failure = "skip() inside a dialog driver cannot end the test: " + skipped.reason;
+      } catch (...) {
+        failure = "a dialog driver threw a non-standard exception";
+      }
+      if (!failure.empty()) {
+        report_failure(failure);
+        if (dialog != nullptr && dialog->isVisible()) {
+          dialog->reject();
+        }
+      }
+    });
+  });
+  poll->start();
+}
+
+void report_callback_failure(std::exception_ptr error) {
+  // A run_non_modal_dialog loop rethrows the error on its own frame, outside Qt's dispatch,
+  // so the test fails exactly as a throw in its own code would.
+  if (!patchy::ui::unwind_non_modal_dialog_loop(error)) {
+    std::string message = "a timer or slot threw a non-standard exception";
+    try {
+      std::rethrow_exception(error);
+    } catch (const std::exception& failure) {
+      message = failure.what();
+    } catch (...) {
+    }
+    std::cerr << "  failure inside a Qt callback (recorded; the test fails when it returns): " << message
+              << std::endl;
+    report_failure(message);
+  }
+  // Nobody drives the loop the failed callback was answering any more (a modal one would
+  // also keep an unwound run_non_modal_dialog loop below it from returning).
+  if (auto* popup = QApplication::activePopupWidget(); popup != nullptr) {
+    popup->close();
+  }
+  if (auto* modal = QApplication::activeModalWidget(); modal != nullptr) {
+    if (auto* dialog = qobject_cast<QDialog*>(modal); dialog != nullptr) {
+      dialog->reject();
+    } else {
+      modal->close();
+    }
+  }
+}
+
+void print_shape_drag_state(patchy::ui::MainWindow& window, patchy::ui::CanvasWidget& canvas, const char* label) {
+  const auto& document = std::as_const(patchy::ui::MainWindowTestAccess::document(window));
+  auto* current = dynamic_cast<patchy::ui::CanvasWidget*>(window.centralWidget());
+  if (current == nullptr) {
+    if (auto* tabs = window.findChild<QTabWidget*>(QStringLiteral("documentTabs")); tabs != nullptr) {
+      current = dynamic_cast<patchy::ui::CanvasWidget*>(tabs->currentWidget());
+    }
+  }
+  std::printf("  shape drag state (%s): canvas is current %d, tool %d, vector mode %d, style %d, edit target %d, "
+              "quick mask %d, zoom %.4f, %zu layers\n",
+              label, current == &canvas ? 1 : 0, static_cast<int>(canvas.tool()),
+              static_cast<int>(canvas.vector_tool_mode()), static_cast<int>(canvas.shape_style()),
+              static_cast<int>(canvas.layer_edit_target()), canvas.quick_mask_active() ? 1 : 0, canvas.zoom(),
+              document.layers().size());
+  for (const auto& layer : document.layers()) {
+    std::printf("    layer %llu '%s' kind %d%s\n", static_cast<unsigned long long>(layer.id()), layer.name().c_str(),
+                static_cast<int>(layer.kind()),
+                document.active_layer_id() == layer.id() ? " (active)" : "");
+  }
+  std::fflush(stdout);
+}
+
+QListWidget* preferences_page_list(QWidget& dialog) {
+  return dialog.findChild<QListWidget*>(QStringLiteral("preferencesPageList"));
+}
+
+QWidget* preferences_current_page(QWidget& dialog) {
+  auto* stack = dialog.findChild<QStackedWidget*>(QStringLiteral("preferencesPageStack"));
+  return stack != nullptr ? stack->currentWidget() : nullptr;
+}
+
+int preferences_page_row(QWidget& dialog, const QString& title) {
+  auto* list = preferences_page_list(dialog);
+  if (list == nullptr) {
+    return -1;
+  }
+  for (int row = 0; row < list->count(); ++row) {
+    if (list->item(row)->text() == title) {
+      return row;
+    }
+  }
+  return -1;
+}
+
+void wait_for_preferences_start_page(QWidget& dialog) {
+  // The note is hidden once its page is built, then deleted later.
+  const auto loading = [&dialog] {
+    const auto notes = dialog.findChildren<QLabel*>(QStringLiteral("preferencesLoadingNote"));
+    return std::any_of(notes.begin(), notes.end(), [](const QLabel* note) { return !note->isHidden(); });
+  };
+  QElapsedTimer timer;
+  timer.start();
+  QApplication::processEvents();
+  while (loading() && timer.elapsed() < 5000) {
+    QApplication::processEvents(QEventLoop::AllEvents, 20);
+  }
+  CHECK(!loading());
+  QApplication::processEvents();
+}
+
+bool select_preferences_page(QWidget& dialog, const QString& title) {
+  const int row = preferences_page_row(dialog, title);
+  if (row < 0) {
+    return false;
+  }
+  preferences_page_list(dialog)->setCurrentRow(row);
+  // The page the dialog opened on may still be filling in (wait_for_preferences_start_page).
+  wait_for_preferences_start_page(dialog);
+  return true;
+}
+
+QListWidget* preferences_theme_list(QWidget& dialog) {
+  if (!select_preferences_page(dialog, QStringLiteral("Colors and Themes"))) {
+    return nullptr;
+  }
+  return dialog.findChild<QListWidget*>(QStringLiteral("preferencesThemeList"));
+}
+
+int preferences_theme_row(QListWidget& list, const QString& token) {
+  for (int row = 0; row < list.count(); ++row) {
+    if (list.item(row)->data(Qt::UserRole).toString() == token) {
+      return row;
+    }
+  }
+  return -1;
+}
+
+bool select_preferences_theme(QWidget& dialog, const QString& token) {
+  auto* list = preferences_theme_list(dialog);
+  const int row = list != nullptr ? preferences_theme_row(*list, token) : -1;
+  if (row < 0) {
+    return false;
+  }
+  list->setCurrentRow(row);
+  QApplication::processEvents();
+  return true;
+}
+
+QString preferences_selected_theme(QWidget& dialog) {
+  auto* list = dialog.findChild<QListWidget*>(QStringLiteral("preferencesThemeList"));
+  return list != nullptr && list->currentItem() != nullptr ? list->currentItem()->data(Qt::UserRole).toString()
+                                                           : QString();
+}
+
+void select_save_dialog_type_for(QFileDialog& dialog, const QString& path) {
+  if (dialog.acceptMode() != QFileDialog::AcceptSave) {
+    return;
+  }
+  const auto filters = dialog.nameFilters();
+  const auto name = QFileInfo(path).fileName();
+  if (patchy::ui::save_name_for_picked_filter(name, dialog.selectedNameFilter(), filters) == name) {
+    return;
+  }
+  for (const auto& row : filters) {
+    if (patchy::ui::save_name_for_picked_filter(name, row, filters) == name) {
+      dialog.selectNameFilter(row);
+      return;
+    }
+  }
+}
+
+void accept_save_file_dialog_then(const QString& object_name, const QString& path, std::function<void()> next) {
+  QTimer::singleShot(0, guarded([object_name, path, next = std::move(next)] {
+    auto* save = qobject_cast<QFileDialog*>(find_top_level_dialog(object_name));
+    CHECK(save != nullptr);
+    if (save == nullptr) {
+      return;
+    }
+    QTimer::singleShot(0, guarded(next));  // runs inside the next dialog's event loop
+    select_save_dialog_type_for(*save, path);
+    save->selectFile(path);
+    static_cast<QDialog*>(save)->accept();  // QFileDialog::accept is protected
+  }));
+}
+
+void accept_missing_psd_text_font_warning_if_present() {
+  QTimer::singleShot(0, guarded([] {
+    auto* dialog = qobject_cast<QMessageBox*>(find_top_level_dialog(QStringLiteral("missingPsdTextFontMessageBox")));
+    if (dialog == nullptr) {
+      return;
+    }
+    for (auto* button : dialog->findChildren<QPushButton*>()) {
+      if (dialog->buttonRole(button) == QMessageBox::AcceptRole) {
+        button->click();
+        return;
+      }
+    }
+    CHECK(false);
+  }));
+}
+
+void accept_compatibility_report_when_present(const std::shared_ptr<bool>& done, int attempts) {
+  QTimer::singleShot(50, [done, attempts] {
+    if (done == nullptr || *done) {
+      return;
+    }
+    auto* dialog = qobject_cast<QDialog*>(find_top_level_dialog(QStringLiteral("patchyCompatibilityReportDialog")));
+    if (dialog != nullptr) {
+      dialog->accept();
+      *done = true;
+      return;
+    }
+    if (attempts > 0) {
+      accept_compatibility_report_when_present(done, attempts - 1);
+    }
+  });
+}
+
+QString write_psd_import_warning_fixture(const QString& file_name) {
+  ensure_artifact_dir();
+  const auto path = QFileInfo(QDir(QStringLiteral("test-artifacts")).filePath(file_name)).absoluteFilePath();
+  patchy::Document document(8, 6, patchy::PixelFormat::rgb8());
+  auto& layer = document.add_pixel_layer(
+      "Unknown PSD Block", solid_pixels(8, 6, patchy::PixelFormat::rgba8(), QColor(40, 90, 220, 255)));
+  layer.unknown_psd_blocks().push_back(patchy::UnknownPsdBlock{"zzzz", {1, 2, 3, 4}});
+  patchy::psd::DocumentIo::write_layered_rgb8_file(document, patchy::ui::to_filesystem_path(path));
+  return path;
+}
+
+void verify_open_progress_dialog(const QString& expected_file_name, bool& saw_dialog) {
+  auto* dialog = qobject_cast<QProgressDialog*>(find_top_level_dialog(QStringLiteral("openProgressDialog")));
+  CHECK(dialog != nullptr);
+  CHECK(dialog->isVisible());
+  const auto title = dialog->windowTitle();
+  CHECK(title.startsWith(QStringLiteral("Opening ")));
+  CHECK(title != QStringLiteral("Opening File"));
+  CHECK(!title.contains(QStringLiteral("Patchy")));
+  const auto title_file_name = title.mid(QStringLiteral("Opening ").size());
+  // The dialog is wide enough for its whole title beside the window manager's buttons,
+  // up to the cap; past it the name is elided in the middle (GitHub #704).
+  const int reserve = patchy::ui::progress_dialog_title_reserved_width(*dialog);
+  const int cap = patchy::ui::progress_dialog_title_width_cap(*dialog);
+  const int full_width =
+      patchy::ui::progress_dialog_title_text_width(*dialog, QStringLiteral("Opening ") + expected_file_name) + reserve;
+  if (title_file_name.contains(QChar(0x2026))) {
+    CHECK(full_width > cap);
+    CHECK(title_file_name.size() < expected_file_name.size());
+    CHECK(title_file_name.endsWith(QStringLiteral(".") + QFileInfo(expected_file_name).suffix()));
+    CHECK(title_file_name.startsWith(expected_file_name.left(3)));
+    CHECK(patchy::ui::progress_dialog_title_text_width(*dialog, title) + reserve <= cap);
+    CHECK(dialog->minimumWidth() >= cap);
+  } else {
+    CHECK(title_file_name == expected_file_name);
+    CHECK(full_width <= cap);
+    CHECK(dialog->minimumWidth() >= full_width);
+  }
+  CHECK(dialog->width() >= dialog->minimumWidth());
+  CHECK(dialog->windowModality() == Qt::WindowModal);
+  CHECK(dialog->minimum() == 0);
+  CHECK(dialog->maximum() == 0);
+  CHECK(dialog->labelText().contains(expected_file_name));
+  CHECK(dialog->findChildren<QPushButton*>().isEmpty());
+  saw_dialog = true;
+}
+
+void cleanup_after_visual_test() {
+  for (auto* widget : QApplication::topLevelWidgets()) {
+    if (qobject_cast<QDialog*>(widget) != nullptr || qobject_cast<QMenu*>(widget) != nullptr) {
+      widget->close();
+      widget->deleteLater();
+    }
+  }
+  QApplication::processEvents();
+  QApplication::sendPostedEvents(nullptr, QEvent::DeferredDelete);
+  QApplication::processEvents();
+  patchy::ui::LocalizationManager::instance().set_language(QStringLiteral("en"), false);
+  auto settings = patchy::ui::app_settings();
+  settings.remove(QStringLiteral("preferences/language"));
+  // The New Document dialog remembers its Recent row (Artboards included), unit and
+  // group across windows; a test that created an artboard document must not hand the
+  // next test a New that creates one too. Every test seeds what it asserts.
+  settings.remove(QStringLiteral("newDocument"));
+  // Each selection tool's Feather and Anti-alias persist as soon as a test touches the
+  // options bar; a soft edge left behind would reshape every later test's selections.
+  for (const char* key :
+       {"tools/marqueeFeather", "tools/marqueeAntiAlias", "tools/ellipticalMarqueeFeather",
+        "tools/ellipticalMarqueeAntiAlias", "tools/lassoFeather", "tools/lassoAntiAlias",
+        "tools/magneticLassoFeather", "tools/magneticLassoAntiAlias", "tools/wandFeather", "tools/wandAntiAlias",
+        "tools/quickSelectFeather", "tools/contentAwareMoveFeather", "tools/contentAwareMoveAntiAlias",
+        "tools/contentAwareMoveDestination",
+        // The active tool and the Brush bar persist too (GitHub issue 254); a test that
+        // switched tools or resized the brush must not start the next test's window there.
+        "tools/activeTool", "tools/brushSize", "tools/brushOpacity", "tools/brushFlow", "tools/brushSoftness",
+        "tools/brushMode",
+        "tools/brushAirbrush", "tools/brushTip", "tools/brushPreset", "tools/eraserSize", "tools/eraserOpacity",
+        "tools/eraserSoftness", "tools/marqueeCornerRadius", "tools/shapeFill",
+        // The Rectangle and Ellipse Pixels row (GitHub issue 716): a test that picked a draw
+        // mode, a color, dashes or an alignment must not start the next test's window with it.
+        "tools/shapeDrawMode", "tools/shapePixelFillColor", "tools/shapePixelStrokeColor",
+        "tools/shapePixelStrokeDashes", "tools/shapePixelStrokeAlign",
+        "tools/vectorFillFollowsForeground", "tools/vectorStrokeFollowsForeground", "tools/vectorStrokeAlign",
+        // The Pick tool's bar: a test that left Pick on Background or on Current Layer (the
+        // options bar tests open and step every list) made the next test's pick miss.
+        "tools/eyedropperPicksBackground", "tools/eyedropperSampleAllLayers", "tools/eyedropperSampleLayers",
+        "tools/eyedropperSampleSize", "tools/eyedropperShowSampleRing",
+        // The foreground/background pair (GitHub issue 339): a test that picked a color must
+        // not start the next test's window painting in it.
+        "tools/foregroundColor", "tools/backgroundColor",
+        // The Zoom bar's direction and Scrubby Zoom, and the Move bar's Transform Controls
+        // (GitHub issue 351): a test that left Zoom Out checked moved the Zoom bar's separator.
+        "tools/zoomToolZoomsOut", "tools/zoomScrubby", "tools/showTransformControls",
+        // Preferences reopens on the page it was closed on (GitHub issue 451); every test
+        // starts it on Application.
+        "preferences/lastPage"}) {
+    settings.remove(QLatin1StringView(key));
+  }
+  settings.sync();
+  // QTest input (spontaneous events) and, on macOS, plain sent key events leave their
+  // modifiers in QApplication::keyboardModifiers(), which the tool cursors read: an Alt
+  // click or a Ctrl+H must not hand the next test an eyedropper or Move cursor. A
+  // spontaneous key release without modifiers resets that state.
+  if (QApplication::keyboardModifiers() != Qt::NoModifier) {
+    QWidget sink;
+    QKeyEvent release(QEvent::KeyRelease, Qt::Key_unknown, Qt::NoModifier);
+    QSpontaneKeyEvent::setSpontaneous(&release);
+    QApplication::instance()->notify(&sink, &release);
+    if (QApplication::keyboardModifiers() != Qt::NoModifier) {
+      std::fprintf(stderr, "cleanup: keyboard modifiers %x survive the reset\n",
+                   static_cast<unsigned>(QApplication::keyboardModifiers().toInt()));
+    }
+  }
+}
+
+int run_bundled_web_fonts_probe() {
+  const QDir fonts_dir(QStringLiteral(PATCHY_SOURCE_DIR "/third_party/fonts-web"));
+  if (!fonts_dir.exists()) {
+    std::fprintf(stderr, "probe: missing directory %s\n", qPrintable(fonts_dir.absolutePath()));
+    return 1;
+  }
+  QStringList families;
+  bool failed = false;
+  std::function<void(const QDir&)> register_dir = [&](const QDir& dir) {
+    for (const auto& sub : dir.entryInfoList(QDir::Dirs | QDir::NoDotAndDotDot)) {
+      register_dir(QDir(sub.absoluteFilePath()));
+    }
+    const QStringList filters = {QStringLiteral("*.ttf"), QStringLiteral("*.otf"),
+                                 QStringLiteral("*.ttc")};
+    for (const auto& file : dir.entryInfoList(filters, QDir::Files, QDir::Name)) {
+      const auto font_id = QFontDatabase::addApplicationFont(file.absoluteFilePath());
+      if (font_id < 0) {
+        std::fprintf(stderr, "probe: addApplicationFont failed: %s\n",
+                     qPrintable(file.absoluteFilePath()));
+        failed = true;
+        continue;
+      }
+      for (const auto& family : QFontDatabase::applicationFontFamilies(font_id)) {
+        if (!families.contains(family)) {
+          families.push_back(family);
+        }
+      }
+    }
+  };
+  register_dir(fonts_dir);
+  for (const auto& family : families) {
+    QFont font(family);
+    font.setStyleStrategy(QFont::NoFontMerging);
+    const QFontMetrics metrics(font);
+    if (metrics.height() <= 0) {
+      std::fprintf(stderr, "probe: no engine for family: %s\n", qPrintable(family));
+      failed = true;
+      continue;
+    }
+    const QFontInfo info(font);
+    if (info.family().compare(family, Qt::CaseInsensitive) != 0) {
+      std::fprintf(stderr, "probe: engine fell back for family: %s -> %s\n", qPrintable(family),
+                   qPrintable(info.family()));
+      failed = true;
+      continue;
+    }
+    std::printf("family: %s\n", qPrintable(family));
+  }
+  std::fflush(stdout);
+  std::fflush(stderr);
+  return failed ? 1 : 0;
+}
+
+bool color_close(QColor actual, QColor expected, int tolerance) {
+  return std::abs(actual.red() - expected.red()) <= tolerance &&
+         std::abs(actual.green() - expected.green()) <= tolerance &&
+         std::abs(actual.blue() - expected.blue()) <= tolerance;
+}
+
+bool images_equal_rgba(const QImage& left, const QImage& right) {
+  if (left.size() != right.size()) {
+    return false;
+  }
+  const auto left_rgba = left.convertToFormat(QImage::Format_RGBA8888);
+  const auto right_rgba = right.convertToFormat(QImage::Format_RGBA8888);
+  const auto row_bytes = static_cast<std::size_t>(left_rgba.width()) * 4U;
+  for (int y = 0; y < left_rgba.height(); ++y) {
+    if (std::memcmp(left_rgba.constScanLine(y), right_rgba.constScanLine(y), row_bytes) != 0) {
+      return false;
+    }
+  }
+  return true;
+}
+
+std::optional<QRect> image_mismatch_bounds_rgba(const QImage& left, const QImage& right) {
+  if (left.size() != right.size()) {
+    return QRect(QPoint(0, 0), left.size().expandedTo(right.size()));
+  }
+  const auto left_rgba = left.convertToFormat(QImage::Format_RGBA8888);
+  const auto right_rgba = right.convertToFormat(QImage::Format_RGBA8888);
+  int min_x = left_rgba.width();
+  int min_y = left_rgba.height();
+  int max_x = -1;
+  int max_y = -1;
+  for (int y = 0; y < left_rgba.height(); ++y) {
+    const auto* left_row = left_rgba.constScanLine(y);
+    const auto* right_row = right_rgba.constScanLine(y);
+    for (int x = 0; x < left_rgba.width(); ++x) {
+      if (std::memcmp(left_row + static_cast<std::size_t>(x) * 4U,
+                      right_row + static_cast<std::size_t>(x) * 4U, 4U) == 0) {
+        continue;
+      }
+      min_x = std::min(min_x, x);
+      min_y = std::min(min_y, y);
+      max_x = std::max(max_x, x);
+      max_y = std::max(max_y, y);
+    }
+  }
+  if (max_x < min_x || max_y < min_y) {
+    return std::nullopt;
+  }
+  return QRect(QPoint(min_x, min_y), QPoint(max_x, max_y));
+}
+
+QImage render_widget_image(QWidget& widget, const QRegion& region) {
+  QImage image(widget.size(), QImage::Format_ARGB32_Premultiplied);
+  image.fill(Qt::transparent);
+  QPainter painter(&image);
+  if (region.isEmpty()) {
+    widget.render(&painter);
+  } else {
+    widget.render(&painter, QPoint(), region);
+  }
+  return image;
+}
+
+QRect canvas_content_rect(const QWidget& canvas) {
+  QRect content = canvas.rect();
+  for (const auto* bar : canvas.findChildren<QScrollBar*>()) {
+    if (bar->isHidden()) {
+      continue;
+    }
+    const auto geometry = bar->geometry();
+    if (geometry.isEmpty()) {
+      continue;
+    }
+    // The canvas lays each bar along a full edge, so orientation tells which side to trim.
+    if (bar->orientation() == Qt::Vertical) {
+      content.setRight(std::min(content.right(), geometry.left() - 1));
+    } else {
+      content.setBottom(std::min(content.bottom(), geometry.top() - 1));
+    }
+  }
+  return content;
+}
+
+QImage grab_widget_window_image(QWidget& widget) {
+  auto* screen = widget.windowHandle() != nullptr ? widget.windowHandle()->screen() : QApplication::primaryScreen();
+  CHECK(screen != nullptr);
+  const auto pixmap = screen->grabWindow(widget.winId());
+  CHECK(!pixmap.isNull());
+  return pixmap.toImage();
+}
+
+int count_pixels_close(const QImage& image, QRect region, QColor expected, int tolerance) {
+  region = region.intersected(image.rect());
+  int count = 0;
+  for (int y = region.top(); y <= region.bottom(); ++y) {
+    for (int x = region.left(); x <= region.right(); ++x) {
+      if (color_close(image.pixelColor(x, y), expected, tolerance)) {
+        ++count;
+      }
+    }
+  }
+  return count;
+}
+
+QColor canvas_pixel(patchy::ui::CanvasWidget& canvas, QPoint document_point) {
+  const auto widget_point = canvas.widget_position_for_document_point(document_point);
+  return canvas.grab().toImage().pixelColor(widget_point);
+}
+
+// The Fill command honors the dedicated Fill Opacity/Soft settings (default 100% / 0, so fills are
+// solid out of the box). Tests that lay down a solid setup color force those defaults here in case a
+// persisted setting differs.
+void use_solid_fill_settings(patchy::ui::CanvasWidget* canvas) {
+  if (canvas != nullptr) {
+    canvas->set_fill_opacity(100);
+    canvas->set_fill_softness(0);
+  }
+}
+
+int count_blended_document_pixels(patchy::ui::CanvasWidget& canvas, QRect document_rect, QColor foreground, QColor background, int tolerance) {
+  const auto image = canvas.grab().toImage();
+  int count = 0;
+  for (int y = document_rect.top(); y <= document_rect.bottom(); ++y) {
+    for (int x = document_rect.left(); x <= document_rect.right(); ++x) {
+      const auto widget_point = canvas.widget_position_for_document_point(QPoint(x, y));
+      if (!image.rect().contains(widget_point)) {
+        continue;
+      }
+      const auto color = image.pixelColor(widget_point);
+      if (!color_close(color, foreground, tolerance) && !color_close(color, background, tolerance)) {
+        ++count;
+      }
+    }
+  }
+  return count;
+}
+
+QColor canvas_pixel_center(patchy::ui::CanvasWidget& canvas, QPoint document_point) {
+  const auto top_left = canvas.widget_position_for_document_point(document_point);
+  const auto bottom_right = canvas.widget_position_for_document_point(document_point + QPoint(1, 1));
+  const QPoint center((top_left.x() + bottom_right.x()) / 2, (top_left.y() + bottom_right.y()) / 2);
+  return canvas.grab().toImage().pixelColor(center);
+}
+
+std::optional<QRect> dark_document_bounds(patchy::ui::CanvasWidget& canvas, QRect document_rect) {
+  const auto image = canvas.grab().toImage();
+  // The canvas scroll bars (and the corner square between them) overlay the far
+  // edges of the widget; document pixels underneath them are hidden, so keep
+  // the scan inside the L-shaped region the bars do not cover.
+  auto scan_limit = QPoint(image.width(), image.height());
+  if (const auto* vertical = canvas.findChild<QScrollBar*>(QStringLiteral("canvasVerticalScrollBar"));
+      vertical != nullptr && vertical->isVisible()) {
+    scan_limit.setX(std::min(scan_limit.x(), vertical->x()));
+  }
+  if (const auto* horizontal = canvas.findChild<QScrollBar*>(QStringLiteral("canvasHorizontalScrollBar"));
+      horizontal != nullptr && horizontal->isVisible()) {
+    scan_limit.setY(std::min(scan_limit.y(), horizontal->y()));
+  }
+  int min_x = document_rect.right() + 1;
+  int min_y = document_rect.bottom() + 1;
+  int max_x = document_rect.left() - 1;
+  int max_y = document_rect.top() - 1;
+  for (int y = document_rect.top(); y <= document_rect.bottom(); ++y) {
+    for (int x = document_rect.left(); x <= document_rect.right(); ++x) {
+      const auto widget_point = canvas.widget_position_for_document_point(QPoint(x, y));
+      if (!image.rect().contains(widget_point) || widget_point.x() >= scan_limit.x() ||
+          widget_point.y() >= scan_limit.y()) {
+        continue;
+      }
+      const auto color = image.pixelColor(widget_point);
+      if (color.red() < 80 && color.green() < 80 && color.blue() < 80) {
+        min_x = std::min(min_x, x);
+        min_y = std::min(min_y, y);
+        max_x = std::max(max_x, x);
+        max_y = std::max(max_y, y);
+      }
+    }
+  }
+  if (max_x < min_x || max_y < min_y) {
+    return std::nullopt;
+  }
+  return QRect(QPoint(min_x, min_y), QPoint(max_x, max_y));
+}
+
+// Visible-alpha extents (local pixel coordinates) restricted to the rows [top, bottom).
+std::optional<QRect> alpha_pixel_bounds_in_rows(const patchy::PixelBuffer& pixels, int top, int bottom) {
+  if (pixels.empty() || pixels.width() <= 0 || pixels.height() <= 0) {
+    return std::nullopt;
+  }
+  const auto channels = pixels.format().channels;
+  if (channels != 1U && channels < 4U) {
+    return std::nullopt;
+  }
+  const auto alpha_channel = channels == 1U ? 0U : 3U;
+  const auto stride = pixels.stride_bytes();
+  const auto bytes = pixels.data();
+  constexpr int kAlphaThreshold = 12;
+  int min_x = pixels.width();
+  int max_x = -1;
+  int min_y = pixels.height();
+  int max_y = -1;
+  for (int y = std::max(0, top); y < std::min(pixels.height(), bottom); ++y) {
+    const auto row_offset = static_cast<std::size_t>(y) * stride;
+    for (int x = 0; x < pixels.width(); ++x) {
+      const auto offset = row_offset + static_cast<std::size_t>(x) * channels + alpha_channel;
+      if (offset < bytes.size() && bytes[offset] >= kAlphaThreshold) {
+        min_x = std::min(min_x, x);
+        max_x = std::max(max_x, x);
+        min_y = std::min(min_y, y);
+        max_y = std::max(max_y, y);
+      }
+    }
+  }
+  if (max_x < min_x) {
+    return std::nullopt;
+  }
+  return QRect(QPoint(min_x, min_y), QPoint(max_x, max_y));
+}
+
+bool pixel_buffer_border_is_clear(const patchy::PixelBuffer& pixels, int threshold) {
+  if (pixels.empty() || pixels.width() <= 0 || pixels.height() <= 0) {
+    return false;
+  }
+  const auto channels = pixels.format().channels;
+  if (channels != 1U && channels < 4U) {
+    return false;
+  }
+  const auto alpha_channel = channels == 1U ? 0U : 3U;
+  const auto stride = pixels.stride_bytes();
+  const auto bytes = pixels.data();
+  const auto alpha_at = [&](int x, int y) {
+    const auto offset = static_cast<std::size_t>(y) * stride + static_cast<std::size_t>(x) * channels + alpha_channel;
+    return offset < bytes.size() ? static_cast<int>(bytes[offset]) : 0;
+  };
+  for (int x = 0; x < pixels.width(); ++x) {
+    if (alpha_at(x, 0) > threshold || alpha_at(x, pixels.height() - 1) > threshold) {
+      return false;
+    }
+  }
+  for (int y = 0; y < pixels.height(); ++y) {
+    if (alpha_at(0, y) > threshold || alpha_at(pixels.width() - 1, y) > threshold) {
+      return false;
+    }
+  }
+  return true;
+}
+
+std::vector<std::array<double, 6>> tysh_transforms_in_psd(const std::vector<std::uint8_t>& bytes) {
+  std::vector<std::array<double, 6>> transforms;
+  const std::string haystack(bytes.begin(), bytes.end());
+  std::size_t at = 0;
+  while ((at = haystack.find("8BIMTySh", at)) != std::string::npos) {
+    const auto payload = at + 12U;
+    if (payload + 2U + 48U > haystack.size()) {
+      break;
+    }
+    std::array<double, 6> transform{};
+    for (std::size_t index = 0; index < transform.size(); ++index) {
+      std::uint64_t bits = 0;
+      for (std::size_t byte = 0; byte < 8U; ++byte) {
+        bits = (bits << 8U) | static_cast<std::uint8_t>(haystack[payload + 2U + index * 8U + byte]);
+      }
+      std::memcpy(&transform[index], &bits, sizeof(double));
+    }
+    transforms.push_back(transform);
+    at = payload;
+  }
+  return transforms;
+}
+
+patchy::Layer* preview_layer_for_editor(patchy::Document& document, const QTextEdit& editor) {
+  if (!editor.property("patchy.textPreviewLayerId").isValid()) {
+    return nullptr;
+  }
+  return document.find_layer(static_cast<patchy::LayerId>(editor.property("patchy.textPreviewLayerId").toULongLong()));
+}
+
+int count_internal_text_preview_layers(const std::vector<patchy::Layer>& layers) {
+  int count = 0;
+  for (const auto& layer : layers) {
+    if (layer.metadata().contains("patchy.internal.text_preview")) {
+      ++count;
+    }
+    count += count_internal_text_preview_layers(layer.children());
+  }
+  return count;
+}
+
+int count_internal_text_preview_layers(const patchy::Document& document) {
+  return count_internal_text_preview_layers(document.layers());
+}
+
+std::optional<QRectF> editor_document_line_rect_containing(const QTextEdit& editor, const QString& needle) {
+  const auto* layout = editor.document()->documentLayout();
+  if (layout == nullptr || needle.isEmpty()) {
+    return std::nullopt;
+  }
+  const QPointF document_origin(editor.property("patchy.documentTextX").toDouble(),
+                                editor.property("patchy.documentTextY").toDouble());
+  for (auto block = editor.document()->begin(); block.isValid(); block = block.next()) {
+    const auto block_text = block.text();
+    const auto index = block_text.indexOf(needle);
+    if (index < 0) {
+      continue;
+    }
+    const auto* text_layout = block.layout();
+    if (text_layout == nullptr) {
+      return std::nullopt;
+    }
+    const auto block_rect = layout->blockBoundingRect(block);
+    for (int i = 0; i < text_layout->lineCount(); ++i) {
+      const auto line = text_layout->lineAt(i);
+      if (!line.isValid()) {
+        continue;
+      }
+      const auto line_start = line.textStart();
+      const auto line_end = line_start + line.textLength();
+      if (index < line_start || index >= line_end) {
+        continue;
+      }
+      return line.rect().translated(block_rect.topLeft()).translated(document_origin);
+    }
+  }
+  return std::nullopt;
+}
+
+std::optional<QRect> dark_bounds_in_editor_line_lower_half(patchy::ui::CanvasWidget& canvas, const QRectF& document_line_rect) {
+  const auto top = static_cast<int>(std::floor(document_line_rect.center().y())) - 2;
+  const auto bottom = static_cast<int>(std::ceil(document_line_rect.bottom())) + 8;
+  const QRect sample_rect(static_cast<int>(std::floor(document_line_rect.left())) - 4,
+                          top,
+                          static_cast<int>(std::ceil(document_line_rect.width())) + 8,
+                          std::max(1, bottom - top + 1));
+  return dark_document_bounds(canvas, sample_rect);
+}
+
+// The imported-PSD raster-preview text tests pin their fixture face as INSTALLED Arial;
+// on a machine that genuinely lacks Arial (stock Linux ships Liberation instead),
+// entering the editor correctly raises the Missing Font substitution prompt, which
+// nothing can answer under offscreen (the suite would hang in the nested dialog loop).
+// Skip honestly rather than auto-clicking through behavior the test doesn't model.
+void skip_without_arial_for_psd_text_preview() {
+  register_test_fonts(TestFontRole::UiDefault);
+  if (!QFontDatabase::families().contains(QStringLiteral("Arial"))) {
+    patchy::test::skip("Arial is not installed (imported-PSD text fixture face)");
+  }
+}
+
+// A GDI-style name such as "Arial Black" reaches the font database on some platforms only as
+// family "Arial" with style "Black" (the OpenType typographic family/subfamily split), which is
+// exactly what MainWindow's text-style matcher resolves through. Mirror that rule so a test
+// asking "can this machine render <face>?" gets the same answer the renderer would.
+static bool font_face_is_available(const QString& family) {
+  const auto requested = family.trimmed();
+  if (requested.isEmpty()) {
+    return false;
+  }
+  const auto families = QFontDatabase::families();
+  if (families.contains(requested, Qt::CaseInsensitive)) {
+    return true;
+  }
+  for (const auto& candidate : families) {
+    if (candidate.isEmpty() || requested.size() <= candidate.size() ||
+        !requested.startsWith(candidate, Qt::CaseInsensitive)) {
+      continue;
+    }
+    const auto separator = requested.at(candidate.size());
+    if (separator != QLatin1Char(' ') && separator != QLatin1Char('-')) {
+      continue;
+    }
+    const auto style = requested.mid(candidate.size() + 1).trimmed();
+    if (!style.isEmpty() && QFontDatabase::styles(candidate).contains(style, Qt::CaseInsensitive)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+// The imported-PSD text-geometry tests measure committed ink and band bounds against tolerances
+// taken from the fixture's REAL face on Windows, so a machine without that face is measuring a
+// substitute. Loosening the tolerance until the substitute fits would stop it catching the
+// Windows regression it exists for, and entering a text session without the face raises the
+// Missing Font prompt, which nothing can answer under offscreen. Skip honestly instead.
+std::optional<std::string> missing_font_face_reason(const QString& family, const char* fixture_role) {
+  register_test_fonts(TestFontRole::UiDefault);
+  if (font_face_is_available(family)) {
+    return std::nullopt;
+  }
+  return family.toStdString() + " is not installed (" + fixture_role + ")";
+}
+
+void skip_without_font_face(const QString& family, const char* fixture_role) {
+  if (auto reason = missing_font_face_reason(family, fixture_role)) {
+    patchy::test::skip(std::move(*reason));
+  }
+}
+
+// The same question asked of an imported layer, which adds the second way a machine lands off
+// the Windows baseline: the PSD's PostScript font name resolving to a different family. Windows
+// reads that name through DirectWrite; elsewhere it resolves against the font database (the
+// resolver installed by install_font_database_psd_font_resolver), so this fires only when the
+// face is not in the database at import time and the suffix heuristic flattened the name --
+// "Arial-Black" to family Arial plus the bold flag, which renders ~20% narrower than Arial
+// Black. The face must therefore be registered BEFORE the fixture is read.
+std::optional<std::string> missing_psd_text_face_reason(const patchy::Layer& layer, const QString& expected_family) {
+  const auto entry = layer.metadata().find(patchy::kLayerMetadataTextFont);
+  const auto resolved = entry == layer.metadata().end() ? QString()
+                                                        : QString::fromStdString(entry->second);
+  if (resolved.compare(expected_family, Qt::CaseInsensitive) != 0) {
+    return "the fixture's type resolves to \"" + resolved.toStdString() + "\" here, not \"" +
+           expected_family.toStdString() + "\" (the face was not in the font database when the PSD was read)";
+  }
+  return missing_font_face_reason(expected_family, "imported-PSD text fixture face");
+}
+
+void skip_without_psd_text_face(const patchy::Layer& layer, const QString& expected_family) {
+  if (auto reason = missing_psd_text_face_reason(layer, expected_family)) {
+    patchy::test::skip(std::move(*reason));
+  }
+}
+
+QString require_filter_foundry_fixtures() {
+  const auto source_dir = patchy::test::filter_foundry_fixture_dir();
+  patchy::test::skip_unless_exists(source_dir / "Greyscale64.8bf");
+  const auto staged = QDir(QCoreApplication::applicationDirPath()).filePath(
+      QStringLiteral("test-fixtures/photoshop-plugins"));
+  CHECK(QDir().mkpath(staged));
+  for (const char* name : {"Greyscale.8bf", "Greyscale64.8bf", "White to Transparent.8bf",
+                           "White to Transparent64.8bf"}) {
+    const auto source = patchy::ui::to_qstring(source_dir / name);
+    const auto target = staged + QLatin1Char('/') + QString::fromLatin1(name);
+    if (QFileInfo::exists(target) && QFileInfo(target).size() == QFileInfo(source).size()) {
+      continue;
+    }
+    QFile::remove(target);
+    CHECK(QFile::copy(source, target));
+  }
+  return staged;
+}
+
+void wait_for_legacy_plugin_scan(patchy::ui::MainWindow& window) {
+  // Startup schedules the scan from a zero-delay timer; deliver that first.
+  QCoreApplication::processEvents(QEventLoop::AllEvents, 20);
+  CHECK(process_events_until([&window] { return !window.legacy_plugin_scan_in_flight(); }, 60000));
+  QCoreApplication::sendPostedEvents(nullptr, QEvent::DeferredDelete);
+}
+
+QAction* require_legacy_plugin_action(QWidget& root, const QString& text) {
+  if (auto* window = qobject_cast<patchy::ui::MainWindow*>(&root); window != nullptr) {
+    wait_for_legacy_plugin_scan(*window);
+  }
+  for (auto* action : root.findChildren<QAction*>(QStringLiteral("legacyPluginAction"))) {
+    if (action->text().contains(text, Qt::CaseInsensitive)) {
+      return action;
+    }
+  }
+  CHECK(false);
+  return nullptr;
+}
+
+QListWidgetItem* find_layer_item(QListWidget& list, const QString& text) {
+  for (int row = 0; row < list.count(); ++row) {
+    if (list.item(row)->text() == text) {
+      return list.item(row);
+    }
+  }
+  return nullptr;
+}
+
+QListWidgetItem* require_layer_item(QListWidget& list, const QString& text) {
+  if (auto* item = find_layer_item(list, text); item != nullptr) {
+    return item;
+  }
+  CHECK(false);
+  return nullptr;
+}
+
+// A press on a layer-row thumbnail can retarget editing or toggle the mask,
+// which rebuilds the layer row and deletes the widget the press was sent to.
+// Fetch the thumbnail fresh for each event so the release never goes to a
+// deleted row (the real mouse path re-resolves its receiver the same way).
+void click_layer_row_thumbnail(QListWidget& layers, const QString& layer_name, const QString& thumbnail_name, Qt::KeyboardModifiers modifiers) {
+  const auto fetch_thumbnail = [&layers, &layer_name, &thumbnail_name]() -> QLabel* {
+    auto* item = require_layer_item(layers, layer_name);
+    auto* row = layers.itemWidget(item);
+    CHECK(row != nullptr);
+    auto* thumbnail = row->findChild<QLabel*>(thumbnail_name);
+    CHECK(thumbnail != nullptr);
+    return thumbnail;
+  };
+  auto* press_target = fetch_thumbnail();
+  send_mouse(*press_target, QEvent::MouseButtonPress, press_target->rect().center(), Qt::LeftButton, Qt::LeftButton,
+             modifiers);
+  auto* release_target = fetch_thumbnail();
+  send_mouse(*release_target, QEvent::MouseButtonRelease, release_target->rect().center(), Qt::LeftButton,
+             Qt::NoButton, modifiers);
+  QApplication::processEvents();
+}
+
+bool top_level_widget_exists(const QString& object_name) {
+  for (auto* widget : QApplication::topLevelWidgets()) {
+    if (widget->objectName() == object_name) {
+      return true;
+    }
+  }
+  return false;
+}
+
+patchy::LayerBlendIf blend_if_ui_test_settings() {
+  patchy::LayerBlendIf settings;
+  settings.channels[0].this_layer = patchy::BlendIfThresholds{10, 20, 200, 240};
+  settings.channels[0].underlying_layer = patchy::BlendIfThresholds{12, 24, 190, 230};
+  settings.channels[1].this_layer = patchy::BlendIfThresholds{30, 40, 180, 220};
+  settings.channels[1].underlying_layer = patchy::BlendIfThresholds{32, 42, 170, 210};
+  settings.channels[2].this_layer = patchy::BlendIfThresholds{50, 60, 160, 200};
+  settings.channels[2].underlying_layer = patchy::BlendIfThresholds{52, 62, 150, 190};
+  settings.channels[3].this_layer = patchy::BlendIfThresholds{70, 80, 140, 180};
+  settings.channels[3].underlying_layer = patchy::BlendIfThresholds{72, 82, 130, 170};
+  return settings;
+}
+
+QListWidgetItem* require_gallery_filter_item(QListWidget& looks, const QString& filter_id) {
+  for (int row = 0; row < looks.count(); ++row) {
+    auto* item = looks.item(row);
+    if (item != nullptr &&
+        item->data(Qt::UserRole + 1).toString() == filter_id) {
+      return item;
+    }
+  }
+  CHECK(false);
+  return nullptr;
+}
+
+void accept_new_document_dialog(int width_value, int height_value) {
+  QTimer::singleShot(0, guarded([width_value, height_value] {
+    for (auto* widget : QApplication::topLevelWidgets()) {
+      if (widget->objectName() != QStringLiteral("patchyNewDocumentDialog")) {
+        continue;
+      }
+      auto* dialog = qobject_cast<QDialog*>(widget);
+      auto* width = dialog->findChild<QDoubleSpinBox*>(QStringLiteral("newDocumentWidthSpin"));
+      auto* height = dialog->findChild<QDoubleSpinBox*>(QStringLiteral("newDocumentHeightSpin"));
+      auto* unit = dialog->findChild<QComboBox*>(QStringLiteral("newDocumentUnitCombo"));
+      CHECK(width != nullptr);
+      CHECK(height != nullptr);
+      CHECK(unit != nullptr);
+      CHECK(width->buttonSymbols() == QAbstractSpinBox::NoButtons);
+      CHECK(height->buttonSymbols() == QAbstractSpinBox::NoButtons);
+      // The sizes are pixels; the dialog remembers its last unit (issue 53), so
+      // an earlier test's mm pick must not scale them.
+      unit->setCurrentIndex(unit->findData(static_cast<int>(patchy::ui::MeasurementUnit::Pixels)));
+      QApplication::processEvents();
+      width->setValue(width_value);
+      height->setValue(height_value);
+      // A plain document: the Last Used card of an artboard document created earlier in
+      // the same test would otherwise tick Artboards and leave no Background row
+      // (ui_transparency_checkerboard_and_copy_paste_preserve_alpha in a full run).
+      if (auto* artboards = dialog->findChild<QCheckBox*>(QStringLiteral("newDocumentArtboardsCheck"));
+          artboards != nullptr) {
+        artboards->setChecked(false);
+      }
+      // RGB, whatever color mode an earlier create left on the Last Used card (GitHub issue 360).
+      if (auto* color_mode = dialog->findChild<QComboBox*>(QStringLiteral("newDocumentColorModeCombo"));
+          color_mode != nullptr) {
+        color_mode->setCurrentIndex(0);
+      }
+      widget->grab().save(QStringLiteral("test-artifacts/ui_new_document_dialog.png"));
+      dialog->accept();
+      return;
+    }
+  }));
+}
+
+void accept_clipboard_new_document_dialog(QSize clipboard_size) {
+  QTimer::singleShot(0, guarded([clipboard_size] {
+    for (auto* widget : QApplication::topLevelWidgets()) {
+      if (widget->objectName() != QStringLiteral("patchyNewDocumentDialog")) {
+        continue;
+      }
+      auto* dialog = qobject_cast<QDialog*>(widget);
+      auto* presets = dialog->findChild<QListWidget*>(QStringLiteral("newDocumentPresetList"));
+      auto* screen_chip = dialog->findChild<QToolButton*>(QStringLiteral("newDocumentScreenChip"));
+      auto* print_chip = dialog->findChild<QToolButton*>(QStringLiteral("newDocumentPrintChip"));
+      auto* width = dialog->findChild<QDoubleSpinBox*>(QStringLiteral("newDocumentWidthSpin"));
+      auto* height = dialog->findChild<QDoubleSpinBox*>(QStringLiteral("newDocumentHeightSpin"));
+      auto* resolution = dialog->findChild<QDoubleSpinBox*>(QStringLiteral("newDocumentResolutionSpin"));
+      auto* background = dialog->findChild<QComboBox*>(QStringLiteral("newDocumentBackgroundCombo"));
+      CHECK(dialog != nullptr);
+      CHECK(presets != nullptr);
+      CHECK(screen_chip != nullptr);
+      CHECK(print_chip != nullptr);
+      CHECK(width != nullptr);
+      CHECK(height != nullptr);
+      CHECK(resolution != nullptr);
+      CHECK(background != nullptr);
+
+      // Templates live in the group grid; Clipboard and the recent sizes in the Recent row.
+      auto* recent = dialog->findChild<QListWidget*>(QStringLiteral("newDocumentRecentList"));
+      CHECK(recent != nullptr);
+      const auto find_card = [presets, recent](const QString& id) -> QListWidgetItem* {
+        for (auto* list : {presets, recent}) {
+          for (int row = 0; list != nullptr && row < list->count(); ++row) {
+            if (list->item(row)->data(patchy::ui::kNewDocumentPresetIdRole).toString() == id) {
+              return list->item(row);
+            }
+          }
+        }
+        return nullptr;
+      };
+      const auto pick_card = [presets, recent](QListWidgetItem* card) {
+        if (card != nullptr) {
+          (card->listWidget() == recent ? recent : presets)->setCurrentItem(card);
+        }
+      };
+
+      // An image on the clipboard adds the Clipboard card without preselecting it;
+      // picking it locks the fields to the clipboard dimensions.
+      CHECK(screen_chip->isChecked());
+      auto* clipboard_card = find_card(QStringLiteral("clipboard"));
+      CHECK(clipboard_card != nullptr);
+      CHECK((clipboard_card->flags() & Qt::ItemIsEnabled) != 0);
+      CHECK(presets->currentItem() != nullptr);
+      CHECK(presets->currentItem() != clipboard_card);
+      CHECK(width->isEnabled());
+      pick_card(clipboard_card);
+      QApplication::processEvents();
+      CHECK(width->value() == clipboard_size.width());
+      CHECK(height->value() == clipboard_size.height());
+      CHECK(!width->isEnabled());
+      CHECK(!height->isEnabled());
+      CHECK(!resolution->isEnabled());
+      CHECK(!background->isEnabled());
+
+      // Preset cards carry a resolution: screen/web/video cards follow
+      // Photoshop's 72 PPI convention, physical print cards are 300 PPI. The first
+      // templates keep their ids in their new groups (GitHub issue 222). Paper and print
+      // cards switch the fields to their own unit (local-013).
+      auto* unit = dialog->findChild<QComboBox*>(QStringLiteral("newDocumentUnitCombo"));
+      CHECK(unit != nullptr);
+      struct ExpectedPreset {
+        QString id;
+        QSizeF shown;  // in `unit`
+        double ppi;
+        QString unit{QStringLiteral("Pixels")};
+      };
+      const auto mm = QStringLiteral("Millimeters");
+      const auto in = QStringLiteral("Inches");
+      const std::vector<ExpectedPreset> screen_presets = {
+          {QStringLiteral("screen-1024x768"), QSizeF(1024, 768), 72.0},
+          {QStringLiteral("screen-720p"), QSizeF(1280, 720), 72.0},
+          {QStringLiteral("screen-1080p"), QSizeF(1920, 1080), 72.0},
+          {QStringLiteral("screen-4k"), QSizeF(3840, 2160), 72.0},
+          {QStringLiteral("screen-square-2048"), QSizeF(2048, 2048), 72.0},
+      };
+      const std::vector<ExpectedPreset> social_presets = {
+          {QStringLiteral("social-square-1080"), QSizeF(1080, 1080), 72.0},
+          {QStringLiteral("phone-story-1080x1920"), QSizeF(1080, 1920), 72.0},
+      };
+      const std::vector<ExpectedPreset> print_presets = {
+          {QStringLiteral("print-a5"), QSizeF(148, 210), 300.0, mm},
+          {QStringLiteral("print-a4"), QSizeF(210, 297), 300.0, mm},
+          {QStringLiteral("print-a3"), QSizeF(297, 420), 300.0, mm},
+          {QStringLiteral("print-a3-plus"), QSizeF(329, 483), 300.0, mm},
+          {QStringLiteral("print-us-letter"), QSizeF(8.5, 11), 300.0, in},
+          {QStringLiteral("print-us-legal"), QSizeF(8.5, 14), 300.0, in},
+      };
+      const std::vector<ExpectedPreset> photo_presets = {
+          {QStringLiteral("print-5x7"), QSizeF(5, 7), 300.0, in},
+          {QStringLiteral("print-8x10"), QSizeF(8, 10), 300.0, in},
+          {QStringLiteral("photo-3x2-3000"), QSizeF(3000, 2000), 72.0},
+      };
+      const auto check_presets = [&](const std::vector<ExpectedPreset>& expected) {
+        for (const auto& preset : expected) {
+          auto* card = find_card(preset.id);
+          CHECK(card != nullptr);
+          presets->setCurrentItem(card);
+          QApplication::processEvents();
+          CHECK(width->isEnabled());
+          CHECK(unit != nullptr && unit->currentText() == preset.unit);
+          CHECK(std::abs(width->value() - preset.shown.width()) < 1e-6);
+          CHECK(std::abs(height->value() - preset.shown.height()) < 1e-6);
+          CHECK(std::abs(resolution->value() - preset.ppi) < 0.01);
+        }
+      };
+      check_presets(screen_presets);
+      const auto check_group = [&](const char* chip_name, const std::vector<ExpectedPreset>& expected) {
+        auto* chip = dialog->findChild<QToolButton*>(QLatin1String(chip_name));
+        CHECK(chip != nullptr);
+        if (chip != nullptr) {
+          chip->click();
+          QApplication::processEvents();
+          check_presets(expected);
+        }
+      };
+      check_group("newDocumentSocialChip", social_presets);
+      CHECK(print_chip != nullptr);
+      check_group("newDocumentPrintChip", print_presets);
+      check_group("newDocumentPhotoChip", photo_presets);
+
+      // Back to the Clipboard card; accepting creates the clipboard document.
+      screen_chip->click();
+      QApplication::processEvents();
+      clipboard_card = find_card(QStringLiteral("clipboard"));
+      CHECK(clipboard_card != nullptr);
+      pick_card(clipboard_card);
+      QApplication::processEvents();
+      CHECK(!width->isEnabled());
+      CHECK(!height->isEnabled());
+      CHECK(!resolution->isEnabled());
+      CHECK(!background->isEnabled());
+      widget->grab().save(QStringLiteral("test-artifacts/ui_new_document_dialog_clipboard.png"));
+      dialog->accept();
+      return;
+    }
+    CHECK(false);
+  }));
+}
+
+void accept_integer_dialog(const QString& object_name, int value) {
+  QTimer::singleShot(0, guarded([object_name, value] {
+    for (auto* widget : QApplication::topLevelWidgets()) {
+      if (widget->objectName() != object_name) {
+        continue;
+      }
+      auto* dialog = qobject_cast<QDialog*>(widget);
+      CHECK(dialog != nullptr);
+      auto* spin = dialog->findChild<QSpinBox*>(QStringLiteral("integerInputSpin"));
+      CHECK(spin != nullptr);
+      CHECK(spin->minimum() <= value);
+      CHECK(spin->maximum() >= value);
+      CHECK(spin->buttonSymbols() == QAbstractSpinBox::NoButtons);
+      // OK as wide as Cancel (#614 follow-up).
+      if (auto* box = dialog->findChild<QDialogButtonBox*>(); box != nullptr) {
+        auto* ok = box->button(QDialogButtonBox::Ok);
+        auto* cancel = box->button(QDialogButtonBox::Cancel);
+        CHECK(ok != nullptr && cancel != nullptr && ok->width() == cancel->width());
+      } else {
+        CHECK(false);
+      }
+      spin->setValue(value);
+      dialog->accept();
+      return;
+    }
+  }));
+}
+
+void accept_stroke_selection_dialog(int width, const QString& location, std::optional<QColor> color) {
+  // Retried rather than a single zero-delay shot: a context-menu click opens the dialog from
+  // the menu's mouse release, one pumped event after the press that would fire a one-shot.
+  auto* timer = new QTimer(QApplication::instance());
+  auto attempts = std::make_shared<int>(0);
+  timer->setInterval(5);
+  QObject::connect(timer, &QTimer::timeout, timer, [timer, attempts, width, location, color] {
+    for (auto* widget : QApplication::topLevelWidgets()) {
+      if (widget->objectName() != QStringLiteral("patchyStrokeSelectionDialog") || !widget->isVisible()) {
+        continue;
+      }
+      timer->stop();
+      timer->deleteLater();
+      auto* dialog = qobject_cast<QDialog*>(widget);
+      CHECK(dialog != nullptr);
+      auto* spin = dialog->findChild<QSpinBox*>(QStringLiteral("strokeSelectionWidthSpin"));
+      auto* combo = dialog->findChild<QComboBox*>(QStringLiteral("strokeSelectionLocationCombo"));
+      auto* swatch = dialog->findChild<QPushButton*>(QStringLiteral("strokeSelectionColorSwatch"));
+      CHECK(spin != nullptr);
+      CHECK(combo != nullptr);
+      CHECK(swatch != nullptr);
+      CHECK(spin->minimum() <= width);
+      CHECK(spin->maximum() >= width);
+      CHECK(spin->buttonSymbols() == QAbstractSpinBox::NoButtons);
+      spin->setValue(width);
+      const auto index = combo->findData(location);
+      CHECK(index >= 0);
+      combo->setCurrentIndex(index);
+      if (color.has_value()) {
+        swatch->setProperty("strokeColor", *color);
+      }
+      dialog->accept();
+      return;
+    }
+    if (++*attempts > 400) {
+      timer->stop();
+      timer->deleteLater();
+      CHECK(false);  // the Stroke Selection dialog never appeared
+    }
+  });
+  timer->start();
+}
+
+void accept_canvas_size_dialog(int width_value, int height_value) {
+  QTimer::singleShot(0, guarded([width_value, height_value] {
+    for (auto* widget : QApplication::topLevelWidgets()) {
+      if (widget->objectName() != QStringLiteral("patchyCanvasSizeDialog")) {
+        continue;
+      }
+      auto* dialog = qobject_cast<QDialog*>(widget);
+      auto* width = dialog->findChild<QDoubleSpinBox*>(QStringLiteral("canvasSizeWidthSpin"));
+      auto* height = dialog->findChild<QDoubleSpinBox*>(QStringLiteral("canvasSizeHeightSpin"));
+      auto* new_size = dialog->findChild<QLabel*>(QStringLiteral("canvasSizeNewSizeLabel"));
+      auto* relative = dialog->findChild<QCheckBox*>(QStringLiteral("canvasSizeRelativeCheck"));
+      auto* width_unit = dialog->findChild<QComboBox*>(QStringLiteral("canvasSizeWidthUnitCombo"));
+      auto* height_unit = dialog->findChild<QComboBox*>(QStringLiteral("canvasSizeHeightUnitCombo"));
+      auto* extension_color = dialog->findChild<QComboBox*>(QStringLiteral("canvasSizeExtensionColorCombo"));
+      auto* color_swatch = dialog->findChild<QPushButton*>(QStringLiteral("canvasSizeExtensionColorSwatch"));
+      const auto anchors = dialog->findChildren<QToolButton*>(QStringLiteral("canvasSizeAnchorButton"));
+      CHECK(width != nullptr);
+      CHECK(height != nullptr);
+      CHECK(new_size != nullptr);
+      CHECK(relative != nullptr);
+      CHECK(width_unit != nullptr);
+      CHECK(height_unit != nullptr);
+      CHECK(extension_color != nullptr);
+      CHECK(color_swatch != nullptr);
+      CHECK(anchors.size() == 9);
+      CHECK(color_swatch->toolTip() == QStringLiteral("Choose canvas extension color"));
+      CHECK(width->buttonSymbols() == QAbstractSpinBox::NoButtons);
+      CHECK(height->buttonSymbols() == QAbstractSpinBox::NoButtons);
+      CHECK(!relative->isChecked());
+      // The dialog remembers its last unit; the values below are pixels, so pick
+      // Pixels explicitly (the height combo follows the width combo).
+      width_unit->setCurrentIndex(width_unit->findText(QStringLiteral("Pixels")));
+      QApplication::processEvents();
+      CHECK(width_unit->currentText() == QStringLiteral("Pixels"));
+      CHECK(height_unit->currentText() == QStringLiteral("Pixels"));
+      CHECK(extension_color->currentText() == QStringLiteral("Other..."));
+      CHECK(std::any_of(anchors.begin(), anchors.end(), [](QToolButton* button) {
+        return button->isChecked() && button->toolTip() == QStringLiteral("Anchor center");
+      }));
+      width->setValue(width_value);
+      height->setValue(height_value);
+      CHECK(new_size->text().contains(QStringLiteral("New Size:")));
+      widget->grab().save(QStringLiteral("test-artifacts/ui_canvas_size_dialog.png"));
+      dialog->accept();
+      return;
+    }
+  }));
+}
+
+void accept_rotate_canvas_dialog(double degrees, bool clockwise) {
+  QTimer::singleShot(0, guarded([degrees, clockwise] {
+    for (auto* widget : QApplication::topLevelWidgets()) {
+      if (widget->objectName() != QStringLiteral("patchyRotateCanvasDialog")) {
+        continue;
+      }
+      auto* dialog = qobject_cast<QDialog*>(widget);
+      CHECK(dialog != nullptr);
+      auto* angle = dialog->findChild<QDoubleSpinBox*>(QStringLiteral("rotateCanvasAngleSpin"));
+      auto* clockwise_radio = dialog->findChild<QRadioButton*>(QStringLiteral("rotateCanvasClockwiseRadio"));
+      auto* counterclockwise_radio =
+          dialog->findChild<QRadioButton*>(QStringLiteral("rotateCanvasCounterclockwiseRadio"));
+      CHECK(angle != nullptr);
+      CHECK(clockwise_radio != nullptr);
+      CHECK(counterclockwise_radio != nullptr);
+      CHECK(angle->buttonSymbols() == QAbstractSpinBox::NoButtons);
+      CHECK(clockwise_radio->isChecked());
+      angle->setValue(degrees);
+      (clockwise ? clockwise_radio : counterclockwise_radio)->setChecked(true);
+      widget->grab().save(QStringLiteral("test-artifacts/ui_rotate_canvas_dialog.png"));
+      dialog->accept();
+      return;
+    }
+    CHECK(false);
+  }));
+}
+
+void accept_image_size_dialog(int width_value, int height_value) {
+  QTimer::singleShot(0, guarded([width_value, height_value] {
+    for (auto* widget : QApplication::topLevelWidgets()) {
+      if (widget->objectName() != QStringLiteral("patchyImageSizeDialog")) {
+        continue;
+      }
+      auto* dialog = qobject_cast<QDialog*>(widget);
+      auto* width = dialog->findChild<QDoubleSpinBox*>(QStringLiteral("imageSizeWidthSpin"));
+      auto* height = dialog->findChild<QDoubleSpinBox*>(QStringLiteral("imageSizeHeightSpin"));
+      auto* dimensions = dialog->findChild<QLabel*>(QStringLiteral("imageSizeDimensionsLabel"));
+      auto* preview = dialog->findChild<QLabel*>(QStringLiteral("imageSizePreview"));
+      auto* resample = dialog->findChild<QCheckBox*>(QStringLiteral("imageSizeResampleCheck"));
+      auto* method = dialog->findChild<QComboBox*>(QStringLiteral("imageSizeResampleCombo"));
+      auto* link = dialog->findChild<QToolButton*>(QStringLiteral("imageSizeLinkButton"));
+      auto* width_unit = dialog->findChild<QComboBox*>(QStringLiteral("imageSizeWidthUnitCombo"));
+      auto* hint = dialog->findChild<QLabel*>(QStringLiteral("imageSizeResampleHintLabel"));
+      CHECK(width != nullptr);
+      CHECK(height != nullptr);
+      CHECK(dimensions != nullptr);
+      CHECK(preview != nullptr);
+      CHECK(resample != nullptr);
+      CHECK(method != nullptr);
+      CHECK(link != nullptr);
+      CHECK(width_unit != nullptr);
+      CHECK(hint != nullptr);
+      // The dialog remembers its last unit (a Resample-off accept leaves Inches);
+      // the values below are pixels, so pick Pixels explicitly.
+      width_unit->setCurrentIndex(width_unit->findText(QStringLiteral("Pixels")));
+      QApplication::processEvents();
+      CHECK(width->buttonSymbols() == QAbstractSpinBox::NoButtons);
+      CHECK(height->buttonSymbols() == QAbstractSpinBox::NoButtons);
+      CHECK(dimensions->text().contains(QStringLiteral("px x")));
+      CHECK(resample->isChecked());
+      // Six real methods, remembered across openings; the Resample-off hint stays hidden
+      // while resampling is on, and the Photoshop "Generative Upscale" label is gone.
+      CHECK(method->count() == 6);
+      CHECK(!method->currentData().toString().isEmpty());
+      CHECK(hint != nullptr && !hint->isVisible());
+      CHECK(dialog->findChild<QLabel*>(QStringLiteral("imageSizeUpscaleLabel")) == nullptr);
+      CHECK(link->isChecked());
+      width->setValue(width_value);
+      height->setValue(height_value);
+      widget->grab().save(QStringLiteral("test-artifacts/ui_image_size_dialog.png"));
+      dialog->accept();
+      return;
+    }
+  }));
+}
+
+void accept_image_size_resolution_dialog(int resolution_value) {
+  QTimer::singleShot(0, guarded([resolution_value] {
+    for (auto* widget : QApplication::topLevelWidgets()) {
+      if (widget->objectName() != QStringLiteral("patchyImageSizeDialog")) {
+        continue;
+      }
+      auto* dialog = qobject_cast<QDialog*>(widget);
+      auto* resolution = dialog->findChild<QDoubleSpinBox*>(QStringLiteral("imageSizeResolutionSpin"));
+      auto* resample = dialog->findChild<QCheckBox*>(QStringLiteral("imageSizeResampleCheck"));
+      auto* width_unit = dialog->findChild<QComboBox*>(QStringLiteral("imageSizeWidthUnitCombo"));
+      CHECK(resolution != nullptr);
+      CHECK(resample != nullptr);
+      CHECK(width_unit != nullptr);
+      resample->setChecked(false);
+      // Unchecking Resample flips pixel/percent units to Inches (Photoshop behavior).
+      CHECK(width_unit->currentText() == QStringLiteral("Inches"));
+      resolution->setValue(resolution_value);
+      dialog->accept();
+      return;
+    }
+  }));
+}
+
+void accept_layer_style_dialog(bool stroke_enabled, bool gradient_enabled, bool shadow_enabled) {
+  QTimer::singleShot(0, guarded([stroke_enabled, gradient_enabled, shadow_enabled] {
+    for (auto* widget : QApplication::topLevelWidgets()) {
+      if (widget->objectName() != QStringLiteral("patchyLayerStyleDialog")) {
+        continue;
+      }
+      auto* dialog = qobject_cast<QDialog*>(widget);
+      auto* categories = dialog->findChild<QListWidget*>(QStringLiteral("layerStyleCategoryList"));
+      auto* blend = dialog->findChild<QComboBox*>(QStringLiteral("layerStyleBlendModeCombo"));
+      auto* opacity = dialog->findChild<QSpinBox*>(QStringLiteral("layerStyleOpacitySpin"));
+      auto* opacity_slider = dialog->findChild<QSlider*>(QStringLiteral("layerStyleOpacitySlider"));
+      auto* preview = dialog->findChild<QCheckBox*>(QStringLiteral("layerStylePreviewCheck"));
+      auto* options_stack = dialog->findChild<QWidget*>(QStringLiteral("layerStyleOptionsStack"));
+      auto* stroke_check = dialog->findChild<QCheckBox*>(QStringLiteral("layerStyleStrokeCategoryCheck"));
+      auto* gradient_check = dialog->findChild<QCheckBox*>(QStringLiteral("layerStyleGradientOverlayCategoryCheck"));
+      auto* outer_glow_check = dialog->findChild<QCheckBox*>(QStringLiteral("layerStyleOuterGlowCategoryCheck"));
+      auto* inner_glow_check = dialog->findChild<QCheckBox*>(QStringLiteral("layerStyleInnerGlowCategoryCheck"));
+      auto* shadow_check = dialog->findChild<QCheckBox*>(QStringLiteral("layerStyleDropShadowCategoryCheck"));
+      auto* inner_shadow_check = dialog->findChild<QCheckBox*>(QStringLiteral("layerStyleInnerShadowCategoryCheck"));
+      auto* bevel_check = dialog->findChild<QCheckBox*>(QStringLiteral("layerStyleBevelEmbossCategoryCheck"));
+      auto* stroke_size = dialog->findChild<QSpinBox*>(QStringLiteral("layerStyleStrokeSizeSpin"));
+      auto* stroke_size_slider = dialog->findChild<QSlider*>(QStringLiteral("layerStyleStrokeSizeSlider"));
+      auto* gradient_angle = dialog->findChild<QSpinBox*>(QStringLiteral("layerStyleGradientAngleSpin"));
+      auto* gradient_angle_slider = dialog->findChild<QSpinBox*>(QStringLiteral("layerStyleGradientAngleSpin"));
+      auto* gradient_editor =
+          dialog->findChild<patchy::ui::GradientStopsEditorWidget*>(QStringLiteral("layerStyleGradientStopsEditor"));
+      auto* gradient_blend = dialog->findChild<QComboBox*>(QStringLiteral("layerStyleGradientBlendModeCombo"));
+      auto* gradient_reverse = dialog->findChild<QCheckBox*>(QStringLiteral("layerStyleGradientReverseCheck"));
+      auto* gradient_style_combo = dialog->findChild<QComboBox*>(QStringLiteral("layerStyleGradientStyleCombo"));
+      auto* gradient_stop_location = dialog->findChild<QSpinBox*>(QStringLiteral("layerStyleGradientStopLocationSpin"));
+      auto* gradient_stop_hex = dialog->findChild<QLineEdit*>(QStringLiteral("layerStyleGradientStopHexEdit"));
+      auto* add_gradient_stop = dialog->findChild<QPushButton*>(QStringLiteral("layerStyleGradientAddStopButton"));
+      auto* outer_glow_size = dialog->findChild<QSpinBox*>(QStringLiteral("layerStyleOuterGlowSizeSpin"));
+      auto* outer_glow_size_slider = dialog->findChild<QSlider*>(QStringLiteral("layerStyleOuterGlowSizeSlider"));
+      auto* inner_glow_size = dialog->findChild<QSpinBox*>(QStringLiteral("layerStyleInnerGlowSizeSpin"));
+      auto* inner_glow_size_slider = dialog->findChild<QSlider*>(QStringLiteral("layerStyleInnerGlowSizeSlider"));
+      auto* add_inner_glow = dialog->findChild<QPushButton*>(QStringLiteral("layerStyleAddInnerGlowButton"));
+      auto* remove_inner_glow = dialog->findChild<QPushButton*>(QStringLiteral("layerStyleRemoveInnerGlowButton"));
+      auto* add_inner_glow_instance = dialog->findChild<QPushButton*>(QStringLiteral("layerStyleAddInnerGlowInstanceButton"));
+      auto* add_stroke_instance = dialog->findChild<QPushButton*>(QStringLiteral("layerStyleAddStrokeInstanceButton"));
+      auto* add_color_overlay_instance =
+          dialog->findChild<QPushButton*>(QStringLiteral("layerStyleAddColorOverlayInstanceButton"));
+      auto* add_gradient_instance =
+          dialog->findChild<QPushButton*>(QStringLiteral("layerStyleAddGradientOverlayInstanceButton"));
+      auto* add_outer_glow_instance =
+          dialog->findChild<QPushButton*>(QStringLiteral("layerStyleAddOuterGlowInstanceButton"));
+      auto* add_drop_shadow_instance =
+          dialog->findChild<QPushButton*>(QStringLiteral("layerStyleAddDropShadowInstanceButton"));
+      auto* remove_selected_instance =
+          dialog->findChild<QPushButton*>(QStringLiteral("layerStyleRemoveSelectedInstanceButton"));
+      auto* shadow_blend = dialog->findChild<QComboBox*>(QStringLiteral("layerStyleDropShadowBlendModeCombo"));
+      auto* shadow_distance = dialog->findChild<QSpinBox*>(QStringLiteral("layerStyleDropShadowDistanceSpin"));
+      auto* shadow_distance_slider = dialog->findChild<QSlider*>(QStringLiteral("layerStyleDropShadowDistanceSlider"));
+      auto* inner_shadow_distance = dialog->findChild<QSpinBox*>(QStringLiteral("layerStyleInnerShadowDistanceSpin"));
+      auto* inner_shadow_distance_slider = dialog->findChild<QSlider*>(QStringLiteral("layerStyleInnerShadowDistanceSlider"));
+      auto* add_inner_shadow = dialog->findChild<QPushButton*>(QStringLiteral("layerStyleAddInnerShadowButton"));
+      auto* remove_inner_shadow = dialog->findChild<QPushButton*>(QStringLiteral("layerStyleRemoveInnerShadowButton"));
+      auto* add_inner_shadow_instance =
+          dialog->findChild<QPushButton*>(QStringLiteral("layerStyleAddInnerShadowInstanceButton"));
+      auto* shadow_red = dialog->findChild<QSpinBox*>(QStringLiteral("layerStyleDropShadowRedSpin"));
+      auto* shadow_green = dialog->findChild<QSpinBox*>(QStringLiteral("layerStyleDropShadowGreenSpin"));
+      auto* shadow_blue = dialog->findChild<QSpinBox*>(QStringLiteral("layerStyleDropShadowBlueSpin"));
+      auto* bevel_size = dialog->findChild<QSpinBox*>(QStringLiteral("layerStyleBevelSizeSpin"));
+      auto* bevel_size_slider = dialog->findChild<QSlider*>(QStringLiteral("layerStyleBevelSizeSlider"));
+      auto* stroke_red = dialog->findChild<QSpinBox*>(QStringLiteral("layerStyleStrokeRedSpin"));
+      auto* outer_glow_blue = dialog->findChild<QSpinBox*>(QStringLiteral("layerStyleOuterGlowBlueSpin"));
+      CHECK(categories != nullptr);
+      CHECK(blend != nullptr);
+      CHECK(opacity != nullptr);
+      CHECK(opacity_slider != nullptr);
+      CHECK(preview != nullptr);
+      CHECK(options_stack != nullptr);
+      CHECK(stroke_check != nullptr);
+      CHECK(gradient_check != nullptr);
+      CHECK(outer_glow_check != nullptr);
+      CHECK(inner_glow_check != nullptr);
+      CHECK(shadow_check != nullptr);
+      CHECK(inner_shadow_check != nullptr);
+      CHECK(bevel_check != nullptr);
+      CHECK(stroke_size != nullptr);
+      CHECK(stroke_size_slider != nullptr);
+      CHECK(gradient_angle != nullptr);
+      CHECK(gradient_angle_slider != nullptr);
+      CHECK(gradient_editor != nullptr);
+      CHECK(gradient_blend != nullptr);
+      CHECK(gradient_reverse != nullptr);
+      CHECK(gradient_style_combo != nullptr);
+      CHECK(gradient_stop_location != nullptr);
+      CHECK(gradient_stop_hex != nullptr);
+      CHECK(add_gradient_stop != nullptr);
+      CHECK(outer_glow_size != nullptr);
+      CHECK(outer_glow_size_slider != nullptr);
+      CHECK(inner_glow_size != nullptr);
+      CHECK(inner_glow_size_slider != nullptr);
+      CHECK(add_inner_glow != nullptr);
+      CHECK(remove_inner_glow != nullptr);
+      CHECK(add_inner_glow_instance != nullptr);
+      CHECK(add_stroke_instance != nullptr);
+      CHECK(add_color_overlay_instance != nullptr);
+      CHECK(add_gradient_instance != nullptr);
+      CHECK(add_outer_glow_instance != nullptr);
+      CHECK(add_drop_shadow_instance != nullptr);
+      CHECK(remove_selected_instance != nullptr);
+      CHECK(shadow_blend != nullptr);
+      CHECK(shadow_distance != nullptr);
+      CHECK(shadow_distance_slider != nullptr);
+      CHECK(inner_shadow_distance != nullptr);
+      CHECK(inner_shadow_distance_slider != nullptr);
+      CHECK(add_inner_shadow != nullptr);
+      CHECK(remove_inner_shadow != nullptr);
+      CHECK(add_inner_shadow_instance != nullptr);
+      CHECK(shadow_red != nullptr);
+      CHECK(shadow_green != nullptr);
+      CHECK(shadow_blue != nullptr);
+      CHECK(bevel_size != nullptr);
+      CHECK(bevel_size_slider != nullptr);
+      CHECK(stroke_red != nullptr);
+      CHECK(outer_glow_blue != nullptr);
+      const auto check_compact_symbol_button = [](QPushButton* button) {
+        CHECK(button != nullptr);
+        CHECK(button->property("compactSymbolButton").toBool());
+        CHECK(button->width() >= 22);
+        CHECK(button->height() >= 22);
+        CHECK(button->text().isEmpty());
+        CHECK(!button->icon().isNull());
+        CHECK(button->iconSize() == QSize(16, 16));
+      };
+      const auto check_category_symbol_button = [&](QPushButton* button) {
+        check_compact_symbol_button(button);
+        CHECK(button->parentWidget() != nullptr);
+        CHECK(button->parentWidget()->height() >= button->height() + 6);
+        CHECK(button->geometry().top() >= 2);
+        CHECK(button->geometry().bottom() <= button->parentWidget()->height() - 3);
+      };
+      for (auto* button : {add_inner_glow, add_inner_shadow, remove_inner_shadow, remove_inner_glow}) {
+        check_compact_symbol_button(button);
+      }
+      for (auto* button : {add_inner_glow_instance,
+                           add_stroke_instance,
+                           add_color_overlay_instance,
+                           add_gradient_instance,
+                           add_outer_glow_instance,
+                           add_drop_shadow_instance,
+                           add_inner_shadow_instance}) {
+        check_category_symbol_button(button);
+      }
+      CHECK(!dialog->isModal());
+      CHECK(dialog->windowModality() == Qt::NonModal);
+      CHECK(preview->isChecked());
+      auto find_item = [categories](const QString& text) {
+        const auto items = categories->findItems(text, Qt::MatchExactly);
+        CHECK(!items.empty());
+        return items.front();
+      };
+      auto* blending_item = find_item(QStringLiteral("Blending Options"));
+      auto* bevel_item = find_item(QStringLiteral("Bevel & Emboss"));
+      auto* stroke_item = find_item(QStringLiteral("Stroke"));
+      auto* inner_shadow_item = find_item(QStringLiteral("Inner Shadow"));
+      auto* inner_glow_item = find_item(QStringLiteral("Inner Glow"));
+      auto* gradient_item = find_item(QStringLiteral("Gradient Overlay"));
+      auto* outer_glow_item = find_item(QStringLiteral("Outer Glow"));
+      auto* shadow_item = find_item(QStringLiteral("Drop Shadow"));
+      CHECK((bevel_item->flags() & Qt::ItemIsUserCheckable) != 0);
+      CHECK((stroke_item->flags() & Qt::ItemIsUserCheckable) != 0);
+      CHECK((inner_shadow_item->flags() & Qt::ItemIsUserCheckable) != 0);
+      CHECK((inner_glow_item->flags() & Qt::ItemIsUserCheckable) != 0);
+      CHECK((gradient_item->flags() & Qt::ItemIsUserCheckable) != 0);
+      CHECK((outer_glow_item->flags() & Qt::ItemIsUserCheckable) != 0);
+      CHECK((shadow_item->flags() & Qt::ItemIsUserCheckable) != 0);
+      CHECK((blending_item->flags() & Qt::ItemIsUserCheckable) == 0);
+      CHECK(blend->findText(QStringLiteral("Pin Light")) >= 0);
+      opacity_slider->setValue(92);
+      CHECK(opacity->value() == 92);
+      stroke_item->setCheckState(stroke_enabled ? Qt::Checked : Qt::Unchecked);
+      gradient_item->setCheckState(gradient_enabled ? Qt::Checked : Qt::Unchecked);
+      outer_glow_item->setCheckState(Qt::Checked);
+      inner_glow_item->setCheckState(Qt::Checked);
+      shadow_item->setCheckState(shadow_enabled ? Qt::Checked : Qt::Unchecked);
+      inner_shadow_item->setCheckState(Qt::Checked);
+      bevel_item->setCheckState(Qt::Checked);
+      categories->setCurrentItem(stroke_item);
+      stroke_size_slider->setValue(6);
+      CHECK(stroke_size->value() == 6);
+      stroke_red->setValue(32);
+      CHECK(stroke_red->value() == 32);
+      categories->setCurrentItem(bevel_item);
+      bevel_size_slider->setValue(7);
+      CHECK(bevel_size->value() == 7);
+      categories->setCurrentItem(outer_glow_item);
+      patchy::ui::set_slider_to_value(*outer_glow_size_slider, 8);
+      CHECK(outer_glow_size->value() == 8);
+      outer_glow_blue->setValue(210);
+      CHECK(outer_glow_blue->value() == 210);
+      categories->setCurrentItem(inner_glow_item);
+      patchy::ui::set_slider_to_value(*inner_glow_size_slider, 9);
+      CHECK(inner_glow_size->value() == 9);
+      categories->setCurrentItem(gradient_enabled ? gradient_item : blending_item);
+      gradient_angle_slider->setValue(0);
+      CHECK(gradient_angle->value() == 0);
+      categories->setCurrentItem(shadow_item);
+      shadow_blend->setCurrentIndex(std::max(0, shadow_blend->findData(static_cast<int>(patchy::BlendMode::Normal))));
+      CHECK(shadow_blend->currentData().toInt() == static_cast<int>(patchy::BlendMode::Normal));
+      shadow_red->setValue(245);
+      CHECK(shadow_red->value() == 245);
+      shadow_green->setValue(246);
+      shadow_blue->setValue(247);
+      patchy::ui::set_slider_to_value(*shadow_distance_slider, 10);
+      CHECK(shadow_distance->value() == 10);
+      categories->setCurrentItem(gradient_enabled ? gradient_item : blending_item);
+      CHECK(gradient_stop_location->value() == 0);
+      add_gradient_stop->click();
+      CHECK(gradient_stop_location->value() == 10);
+      gradient_stop_location->setValue(50);
+      gradient_stop_hex->setText(QStringLiteral("#FFA000"));
+      send_key(*gradient_stop_hex, Qt::Key_Return);
+      CHECK(gradient_stop_hex->text() == QStringLiteral("#FFA000"));
+      categories->setCurrentItem(inner_shadow_item);
+      patchy::ui::set_slider_to_value(*inner_shadow_distance_slider, 3);
+      CHECK(inner_shadow_distance->value() == 3);
+      categories->setCurrentItem(inner_glow_item);
+      add_inner_glow_instance->click();
+      QApplication::processEvents();
+      CHECK(categories->findItems(QStringLiteral("Inner Glow"), Qt::MatchExactly).size() == 2);
+      remove_selected_instance->click();
+      QApplication::processEvents();
+      CHECK(categories->findItems(QStringLiteral("Inner Glow"), Qt::MatchExactly).size() == 1);
+      inner_shadow_item = find_item(QStringLiteral("Inner Shadow"));
+      categories->setCurrentItem(inner_shadow_item);
+      add_inner_shadow_instance = dialog->findChild<QPushButton*>(QStringLiteral("layerStyleAddInnerShadowInstanceButton"));
+      CHECK(add_inner_shadow_instance != nullptr);
+      add_inner_shadow_instance->click();
+      QApplication::processEvents();
+      CHECK(categories->findItems(QStringLiteral("Inner Shadow"), Qt::MatchExactly).size() == 2);
+      // The selected category row must be highlighted across its full width, not just in a
+      // sliver of item padding peeking out around the opaque row widget.
+      const auto dialog_image = widget->grab().toImage();
+      auto category_row_probe_color = [&](QListWidgetItem* item, int x_offset) {
+        const auto rect = categories->visualItemRect(item);
+        const auto probe =
+            categories->viewport()->mapTo(widget, QPoint(rect.left() + x_offset, rect.center().y()));
+        return dialog_image.pixelColor(probe);
+      };
+      // Probe near the left edge and in the (glyph-free) label area right of the text, so an
+      // opaque child widget covering the middle of the row fails the check.
+      for (const auto x_offset : {5, categories->visualItemRect(categories->currentItem()).width() - 40}) {
+        CHECK(category_row_probe_color(categories->currentItem(), x_offset) == QColor(0x2d, 0x4c, 0x6d));
+        CHECK(category_row_probe_color(find_item(QStringLiteral("Bevel & Emboss")), x_offset) ==
+              QColor(0x2b, 0x2b, 0x2b));
+      }
+      dialog_image.save(QStringLiteral("test-artifacts/ui_layer_style_dialog.png"));
+      dialog->accept();
+      return;
+    }
+  }));
+}
+
+void accept_transform_dialog(int x_value, int y_value, int width_value, int height_value) {
+  QTimer::singleShot(0, guarded([x_value, y_value, width_value, height_value] {
+    for (auto* widget : QApplication::topLevelWidgets()) {
+      if (widget->objectName() != QStringLiteral("patchyTransformDialog")) {
+        continue;
+      }
+      auto* dialog = qobject_cast<QDialog*>(widget);
+      auto* x = dialog->findChild<QSpinBox*>(QStringLiteral("transformXSpin"));
+      auto* y = dialog->findChild<QSpinBox*>(QStringLiteral("transformYSpin"));
+      auto* width = dialog->findChild<QSpinBox*>(QStringLiteral("transformWidthSpin"));
+      auto* height = dialog->findChild<QSpinBox*>(QStringLiteral("transformHeightSpin"));
+      CHECK(x != nullptr);
+      CHECK(y != nullptr);
+      CHECK(width != nullptr);
+      CHECK(height != nullptr);
+      x->setValue(x_value);
+      y->setValue(y_value);
+      width->setValue(width_value);
+      height->setValue(height_value);
+      widget->grab().save(QStringLiteral("test-artifacts/ui_transform_dialog.png"));
+      dialog->accept();
+      return;
+    }
+  }));
+}
+
+void accept_hue_saturation_dialog(int hue_value, int saturation_value, int lightness_value) {
+  QTimer::singleShot(0, guarded([hue_value, saturation_value, lightness_value] {
+    for (auto* widget : QApplication::topLevelWidgets()) {
+      if (widget->objectName() != QStringLiteral("patchyHueSaturationDialog")) {
+        continue;
+      }
+      auto* dialog = qobject_cast<QDialog*>(widget);
+      auto* hue = dialog->findChild<QSpinBox*>(QStringLiteral("hueSaturationHueSpin"));
+      auto* saturation = dialog->findChild<QSpinBox*>(QStringLiteral("hueSaturationSaturationSpin"));
+      auto* lightness = dialog->findChild<QSpinBox*>(QStringLiteral("hueSaturationLightnessSpin"));
+      auto* preview = dialog->findChild<QCheckBox*>(QStringLiteral("hueSaturationPreviewCheck"));
+      CHECK(hue != nullptr);
+      CHECK(saturation != nullptr);
+      CHECK(lightness != nullptr);
+      CHECK(preview != nullptr);
+      CHECK(preview->isChecked());
+      hue->setValue(hue_value);
+      saturation->setValue(saturation_value);
+      lightness->setValue(lightness_value);
+      widget->grab().save(QStringLiteral("test-artifacts/ui_hue_saturation_dialog.png"));
+      dialog->accept();
+      return;
+    }
+  }));
+}
+
+void accept_levels_dialog(int black_value, int white_value, int gamma_value) {
+  QTimer::singleShot(0, guarded([black_value, white_value, gamma_value] {
+    for (auto* widget : QApplication::topLevelWidgets()) {
+      if (widget->objectName() != QStringLiteral("patchyLevelsDialog")) {
+        continue;
+      }
+      auto* dialog = qobject_cast<QDialog*>(widget);
+      auto* black = dialog->findChild<QSpinBox*>(QStringLiteral("levelsBlackInputSpin"));
+      auto* white = dialog->findChild<QSpinBox*>(QStringLiteral("levelsWhiteInputSpin"));
+      auto* gamma = dialog->findChild<QSpinBox*>(QStringLiteral("levelsGammaSpin"));
+      auto* black_output = dialog->findChild<QSpinBox*>(QStringLiteral("levelsBlackOutputSpin"));
+      auto* white_output = dialog->findChild<QSpinBox*>(QStringLiteral("levelsWhiteOutputSpin"));
+      auto* input_graph = dialog->findChild<QWidget*>(QStringLiteral("levelsInputGraph"));
+      auto* output_range = dialog->findChild<QWidget*>(QStringLiteral("levelsOutputRange"));
+      auto* channel = dialog->findChild<QTabBar*>(QStringLiteral("levelsChannelTabs"));
+      auto* preview = dialog->findChild<QCheckBox*>(QStringLiteral("levelsPreviewCheck"));
+      CHECK(black != nullptr);
+      CHECK(white != nullptr);
+      CHECK(gamma != nullptr);
+      CHECK(black_output != nullptr);
+      CHECK(white_output != nullptr);
+      CHECK(input_graph != nullptr);
+      CHECK(output_range != nullptr);
+      CHECK(channel != nullptr);
+      CHECK(preview != nullptr);
+      CHECK(preview->isChecked());
+      CHECK(channel->count() == 4);
+      CHECK(channel->tabText(0) == QStringLiteral("RGB"));
+      CHECK(channel->tabText(1) == QStringLiteral("Red"));
+      CHECK(channel->tabText(2) == QStringLiteral("Green"));
+      CHECK(channel->tabText(3) == QStringLiteral("Blue"));
+      black->setValue(black_value);
+      white->setValue(white_value);
+      gamma->setValue(gamma_value);
+      CHECK(black_output->value() == 0);
+      CHECK(white_output->value() == 255);
+      widget->grab().save(QStringLiteral("test-artifacts/ui_levels_dialog.png"));
+      dialog->accept();
+      return;
+    }
+  }));
+}
+
+QPoint curves_graph_position(QWidget& graph, int input, int output) {
+  const auto available = graph.rect().adjusted(31, 10, -10, -28);
+  const auto side = std::max(1, std::min(available.width(), available.height()));
+  const auto left = available.left() + (available.width() - side) / 2;
+  const auto top = available.top() + (available.height() - side) / 2;
+  const QRect graph_rect(left, top, side, side);
+  const auto x = graph_rect.left() +
+                 static_cast<int>(std::lround(static_cast<double>(std::clamp(input, 0, 255)) *
+                                              static_cast<double>(graph_rect.width() - 1) / 255.0));
+  const auto y = graph_rect.bottom() -
+                 static_cast<int>(std::lround(static_cast<double>(std::clamp(output, 0, 255)) *
+                                              static_cast<double>(graph_rect.height() - 1) / 255.0));
+  return QPoint(x, y);
+}
+
+void click_curves_graph(QWidget& graph, int input, int output) {
+  const auto position = curves_graph_position(graph, input, output);
+  send_mouse(graph, QEvent::MouseButtonPress, position, Qt::LeftButton, Qt::LeftButton);
+  send_mouse(graph, QEvent::MouseButtonRelease, position, Qt::LeftButton, Qt::NoButton);
+}
+
+void accept_curves_dialog(int shadow_value, int midtone_value, int highlight_value) {
+  QTimer::singleShot(0, guarded([shadow_value, midtone_value, highlight_value] {
+    for (auto* widget : QApplication::topLevelWidgets()) {
+      if (widget->objectName() != QStringLiteral("patchyCurvesDialog")) {
+        continue;
+      }
+      auto* dialog = qobject_cast<QDialog*>(widget);
+      auto* graph = dialog->findChild<QWidget*>(QStringLiteral("curvesGraph"));
+      auto* channel_tabs = dialog->findChild<QTabBar*>(QStringLiteral("curvesChannelTabs"));
+      auto* input = dialog->findChild<QSpinBox*>(QStringLiteral("curvesInputSpin"));
+      auto* output = dialog->findChild<QSpinBox*>(QStringLiteral("curvesOutputSpin"));
+      auto* auto_button = dialog->findChild<QPushButton*>(QStringLiteral("curvesAutoButton"));
+      auto* reset_button = dialog->findChild<QPushButton*>(QStringLiteral("curvesResetButton"));
+      auto* preview = dialog->findChild<QCheckBox*>(QStringLiteral("curvesPreviewCheck"));
+      CHECK(graph != nullptr);
+      CHECK(channel_tabs != nullptr);
+      CHECK(input != nullptr);
+      CHECK(output != nullptr);
+      CHECK(auto_button != nullptr);
+      CHECK(reset_button != nullptr);
+      CHECK(preview != nullptr);
+      CHECK(preview->isChecked());
+      CHECK(channel_tabs->count() == 4);
+      CHECK(channel_tabs->tabText(0) == QStringLiteral("RGB"));
+      CHECK(channel_tabs->tabText(1) == QStringLiteral("Red"));
+      CHECK(channel_tabs->tabText(2) == QStringLiteral("Green"));
+      CHECK(channel_tabs->tabText(3) == QStringLiteral("Blue"));
+      click_curves_graph(*graph, 0, 0);
+      output->setValue(shadow_value);
+      click_curves_graph(*graph, 128, midtone_value);
+      CHECK(std::abs(input->value() - 128) <= 1);
+      output->setValue(midtone_value);
+      click_curves_graph(*graph, 255, 255);
+      output->setValue(highlight_value);
+      widget->grab().save(QStringLiteral("test-artifacts/ui_curves_dialog.png"));
+      dialog->accept();
+      return;
+    }
+  }));
+}
+
+void accept_color_balance_dialog(int cyan_red_value, int magenta_green_value, int yellow_blue_value) {
+  QTimer::singleShot(0, guarded([cyan_red_value, magenta_green_value, yellow_blue_value] {
+    for (auto* widget : QApplication::topLevelWidgets()) {
+      if (widget->objectName() != QStringLiteral("patchyColorBalanceDialog")) {
+        continue;
+      }
+      auto* dialog = qobject_cast<QDialog*>(widget);
+      auto* cyan_red = dialog->findChild<QSpinBox*>(QStringLiteral("colorBalanceCyanRedSpin"));
+      auto* magenta_green = dialog->findChild<QSpinBox*>(QStringLiteral("colorBalanceMagentaGreenSpin"));
+      auto* yellow_blue = dialog->findChild<QSpinBox*>(QStringLiteral("colorBalanceYellowBlueSpin"));
+      auto* preview = dialog->findChild<QCheckBox*>(QStringLiteral("colorBalancePreviewCheck"));
+      CHECK(cyan_red != nullptr);
+      CHECK(magenta_green != nullptr);
+      CHECK(yellow_blue != nullptr);
+      CHECK(preview != nullptr);
+      CHECK(preview->isChecked());
+      cyan_red->setValue(cyan_red_value);
+      magenta_green->setValue(magenta_green_value);
+      yellow_blue->setValue(yellow_blue_value);
+      widget->grab().save(QStringLiteral("test-artifacts/ui_color_balance_dialog.png"));
+      dialog->accept();
+      return;
+    }
+  }));
+}
+
+void accept_filter_dialog(std::vector<std::pair<QString, int>> spin_values) {
+  when_dialog_visible(QStringLiteral("patchyFilterDialog"), [spin_values = std::move(spin_values)](QDialog& dialog) {
+    CHECK(dialog.findChild<QCheckBox*>(QStringLiteral("filterPreviewCheck")) != nullptr);
+    for (const auto& [object_name, value] : spin_values) {
+      auto* spin = dialog.findChild<QSpinBox*>(object_name);
+      CHECK(spin != nullptr);
+      spin->setValue(value);
+    }
+    QApplication::processEvents();
+    dialog.accept();
+  });
+}
+
+QString brush_tip_test_storage_dir() {
+  return QFileInfo(patchy::ui::app_settings().fileName()).absolutePath() + QStringLiteral("/brushes");
+}
+
+QString pattern_test_storage_dir() {
+  return QFileInfo(patchy::ui::app_settings().fileName()).absolutePath() + QStringLiteral("/patterns");
+}
+
+void clear_pattern_test_state() {
+  remove_test_scratch_dir(pattern_test_storage_dir());
+  auto settings = patchy::ui::app_settings();
+  // Keep unrelated MainWindow tests from changing their pattern library on disk.
+  // The dedicated default-seeding test explicitly resets this to zero.
+  settings.setValue(QStringLiteral("patterns/defaultPatternsVersion"), 999999);
+  settings.sync();
+}
+
+void clear_brush_tip_test_state() {
+  remove_test_scratch_dir(brush_tip_test_storage_dir());
+  auto settings = patchy::ui::app_settings();
+  settings.remove(QStringLiteral("tools/brushTip"));
+  // Suppress first-run default-tip seeding so library contents stay deterministic; the
+  // dedicated seeding test resets this to 0 explicitly.
+  settings.setValue(QStringLiteral("brushes/defaultTipsVersion"), 999999);
+  settings.sync();
+}
+
+// Opens the committed placed-smart-object fixture and activates its "small"
+// smart-object layer; returns that layer's id. Import notes stay in the status bar
+// (the popup only appears when imports/showPsdWarningsAndInfo is on).
+patchy::LayerId open_smart_object_fixture(patchy::ui::MainWindow& window) {
+  const auto path = QString::fromStdWString(
+      patchy::test::committed_psd_fixture_path("photoshop-place-embedded-png.psd").wstring());
+  CHECK(QFileInfo::exists(path));
+  patchy::ui::MainWindowTestAccess::open_document_path(window, path);
+  QApplication::processEvents();
+  auto& document = patchy::ui::MainWindowTestAccess::document(window);
+  const patchy::Layer* smart_layer = nullptr;
+  for (const auto& layer : std::as_const(document).layers()) {
+    if (layer.name() == "small") {
+      smart_layer = &layer;
+    }
+  }
+  CHECK(smart_layer != nullptr);
+  CHECK(patchy::layer_is_smart_object(*smart_layer));
+  const auto id = smart_layer->id();
+  document.set_active_layer(id);
+  QApplication::processEvents();
+  return id;
+}
+
+// Converts the opened fixture's embedded source into an ExternalFile reference
+// pointing at `linked_path` (writing the png there), stamping the stored date/size
+// from the file so staleness checks have a baseline.
+void convert_fixture_source_to_external(patchy::ui::MainWindow& window, patchy::LayerId layer_id,
+                                        const QString& linked_path) {
+  auto& document = patchy::ui::MainWindowTestAccess::document(window);
+  const auto uuid = patchy::smart_object_source_uuid(*document.find_layer(layer_id));
+  auto* source = document.metadata().smart_objects.find(uuid);
+  CHECK(source != nullptr && source->file_bytes != nullptr);
+  QFile out(linked_path);
+  CHECK(out.open(QIODevice::WriteOnly));
+  out.write(reinterpret_cast<const char*>(source->file_bytes->data()),
+            static_cast<qint64>(source->file_bytes->size()));
+  out.close();
+  const QFileInfo linked_info(linked_path);
+  const auto modified = linked_info.lastModified();
+  source->kind = patchy::SmartObjectSourceKind::ExternalFile;
+  source->file_bytes = nullptr;
+  source->original_element_bytes = nullptr;
+  source->filename = linked_info.fileName().toStdString();
+  source->external_original_path = QDir::toNativeSeparators(linked_info.absoluteFilePath()).toStdString();
+  source->external_rel_path = linked_info.fileName().toStdString();
+  source->external_mod_year = modified.date().year();
+  source->external_mod_month = static_cast<std::uint8_t>(modified.date().month());
+  source->external_mod_day = static_cast<std::uint8_t>(modified.date().day());
+  source->external_mod_hour = static_cast<std::uint8_t>(modified.time().hour());
+  source->external_mod_minute = static_cast<std::uint8_t>(modified.time().minute());
+  source->external_file_size = static_cast<std::uint64_t>(linked_info.size());
+  auto* layer = document.find_layer(layer_id);
+  CHECK(layer != nullptr);
+  layer->metadata()[patchy::kLayerMetadataSmartObjectLock] = "external";
+}
+
+}  // namespace patchy::test::ui

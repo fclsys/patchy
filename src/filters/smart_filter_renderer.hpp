@@ -1,0 +1,147 @@
+#pragma once
+
+#include "core/smart_filter.hpp"
+#include "filters/filter_registry.hpp"
+
+#include <cstdint>
+#include <vector>
+
+namespace patchy {
+
+// The calibrated separable line filters behind the Gaussian Blur, High Pass and
+// Unsharp Mask primitives below, for float pipelines (16/32-bit filters,
+// docs/high-bit-depth.md): filters every row and then every column of the
+// `plane` (width * height pixels of `channels` interleaved samples, each channel
+// filtered on its own) in place, repeating edge samples, without the byte
+// rounding the RGBA8 primitives apply between passes. Runs in parallel; the
+// result does not depend on the worker count or on `channels`.
+enum class PhotoshopLineKernel : std::uint8_t { Gaussian, HighPass, Unsharp };
+void filter_plane_with_photoshop_kernel(std::vector<float> &plane,
+                                        std::int32_t width,
+                                        std::int32_t height, double radius,
+                                        PhotoshopLineKernel kernel,
+                                        std::size_t channels = 1U);
+
+// Add Noise's position-hashed delta for one lane (0..2 per channel, 3 for
+// monochromatic noise) on the 0..255 scale, before the RGBA8 primitive rounds
+// it.
+[[nodiscard]] double add_noise_delta(std::int32_t x, std::int32_t y,
+                                     std::int32_t seed, std::uint32_t lane,
+                                     double amount_percent,
+                                     bool gaussian) noexcept;
+
+// Photoshop-calibrated primitives shared by destructive filters and native
+// Smart Filters. Inputs and outputs retain the supplied bounds and require
+// RGBA8 pixels.
+[[nodiscard]] FilterRenderResult render_photoshop_gaussian_blur(
+    const PixelBuffer &pixels, Rect bounds, double radius_pixels,
+    const FilterProgress *progress = nullptr);
+[[nodiscard]] FilterRenderResult render_photoshop_high_pass(
+    const PixelBuffer &pixels, Rect bounds, double radius_pixels,
+    const FilterProgress *progress = nullptr);
+[[nodiscard]] FilterRenderResult render_photoshop_median(
+    const PixelBuffer &pixels, Rect bounds, double radius_pixels,
+    const FilterProgress *progress = nullptr);
+[[nodiscard]] FilterRenderResult render_photoshop_dust_and_scratches(
+    const PixelBuffer &pixels, Rect bounds, std::int32_t radius_pixels,
+    std::int32_t threshold, const FilterProgress *progress = nullptr);
+[[nodiscard]] FilterRenderResult
+render_photoshop_surface_blur(const PixelBuffer &pixels, Rect bounds,
+                              double radius_pixels, std::int32_t threshold,
+                              const FilterProgress *progress = nullptr);
+[[nodiscard]] FilterRenderResult
+render_photoshop_unsharp_mask(const PixelBuffer &pixels, Rect bounds,
+                              double amount_percent, double radius_pixels,
+                              std::int32_t threshold,
+                              const FilterProgress *progress = nullptr);
+// Motion Blur kernels. Automatic is the product choice: axis angles use an
+// exact running sum, other angles the exact tap kernel through 64 px and the
+// O(1)-per-pixel sheared running sum above. Taps and RunningSum force one
+// kernel so tests can compare them (RunningSum still renders axis angles
+// with the exact axis sum).
+enum class MotionBlurKernel { Automatic, Taps, RunningSum };
+[[nodiscard]] FilterRenderResult render_photoshop_motion_blur(
+    const PixelBuffer &pixels, Rect bounds, std::int32_t angle_degrees,
+    std::int32_t distance_pixels, const FilterProgress *progress = nullptr,
+    MotionBlurKernel kernel = MotionBlurKernel::Automatic);
+[[nodiscard]] FilterRenderResult render_plastic_wrap(
+    const PixelBuffer &pixels, Rect bounds, std::int32_t highlight_strength,
+    std::int32_t detail, std::int32_t smoothness,
+    const FilterProgress *progress = nullptr);
+// Mosaic keeps the input bounds and block-averages alpha-weighted straight
+// RGB plus alpha over a cell grid anchored at the input's local origin (the
+// destructive Pixel Mosaic math). Like Plastic Wrap, the native descriptor
+// round-trips exactly while the pixels are Patchy's own compatible rendering.
+[[nodiscard]] FilterRenderResult render_mosaic(
+    const PixelBuffer &pixels, Rect bounds, std::int32_t cell_size_pixels,
+    const FilterProgress *progress = nullptr);
+// Emboss keeps the input bounds and alpha, replacing RGB with the
+// destructive filter's gray relief (bilinear luminance samples at +/- the
+// height offset along the angle). Like Plastic Wrap, the native descriptor
+// round-trips exactly while the pixels are Patchy's own compatible rendering.
+[[nodiscard]] FilterRenderResult render_emboss(
+    const PixelBuffer &pixels, Rect bounds, std::int32_t angle_degrees,
+    std::int32_t height_pixels, std::int32_t amount_percent,
+    const FilterProgress *progress = nullptr);
+// Box Blur keeps the supplied bounds (the stack embeds in the filter canvas
+// and alpha-trims, like Gaussian Blur). Radii through 12 px replicate the
+// destructive Box Blur's double math byte for byte; larger radii use an
+// exact integer sliding-window path with identical edge-clamped sampling.
+// The fractional stored radius is floored for rendering like Median.
+[[nodiscard]] FilterRenderResult render_box_blur(
+    const PixelBuffer &pixels, Rect bounds, double radius_pixels,
+    const FilterProgress *progress = nullptr);
+// Radial Blur (Photoshop's Spin method) rotationally sweeps bilinear
+// premultiplied samples about the supplied center, given in BUFFER
+// coordinates. It replicates the destructive patchy.filters.radial_blur math
+// byte for byte; the stack embeds in the filter canvas first so output can
+// grow inside it like Gaussian Blur. Quality maps Draft/Good/Best to
+// 8/16/32 samples. Native Zoom entries render through the stack with
+// radial_zoom_kernel (filters/filter_kernels.hpp).
+[[nodiscard]] FilterRenderResult render_radial_blur(
+    const PixelBuffer &pixels, Rect bounds, std::int32_t amount,
+    std::int32_t samples, double center_x, double center_y,
+    const FilterProgress *progress = nullptr);
+// Add Noise keeps the input bounds and alpha, adding deterministic
+// position-hashed noise to RGB: uniform, or a sum-of-four-uniforms gaussian
+// approximation; monochromatic applies one delta to all three channels. The
+// native FlRs seed feeds the hash so re-renders are reproducible; the pixels
+// are Patchy's own compatible rendering, not Photoshop's noise, and match the
+// destructive patchy.filters.add_noise byte for byte.
+[[nodiscard]] FilterRenderResult render_add_noise(
+    const PixelBuffer &pixels, Rect bounds, double amount_percent,
+    bool gaussian, bool monochromatic, std::int32_t seed,
+    const FilterProgress *progress = nullptr);
+
+// Photoshop's parameterless 3x3 filters (Blur, Blur More, Sharpen, Sharpen
+// More) as destructive kernels: the native Smart Filter math, with samples
+// past the buffer repeating its edge. Keeps the supplied bounds; callers pad
+// one transparent pixel where the blurs may grow.
+[[nodiscard]] FilterRenderResult render_photoshop_classic_filter(
+    const PixelBuffer &pixels, Rect bounds, SmartFilterKind kind,
+    const FilterProgress *progress = nullptr);
+// The destructive Average: every visible pixel takes the alpha-weighted mean
+// colour of the visible pixels (hidden colours never count, unlike
+// Photoshop's), rounded half up; alpha and bounds unchanged.
+[[nodiscard]] FilterRenderResult render_visible_average(
+    const PixelBuffer &pixels, Rect bounds,
+    const FilterProgress *progress = nullptr);
+
+// Renders a complete native Smart Filter stack from the immutable placed or
+// warped Smart Object preview. Unsupported semantics throw
+// std::invalid_argument; cancellation throws FilterCancelled.
+[[nodiscard]] FilterRenderResult
+render_smart_filter_stack(const PixelBuffer &placed_pixels, Rect placed_bounds,
+                          Rect filter_canvas_bounds,
+                          const SmartFilterStack &stack,
+                          const FilterProgress *progress = nullptr);
+
+// Compatibility/testing form: filters within the supplied placed raster.
+// Production native Smart Filters pass the document-space FEid cache bounds
+// through the overload above so blur output can grow inside that canvas.
+[[nodiscard]] FilterRenderResult
+render_smart_filter_stack(const PixelBuffer &placed_pixels, Rect placed_bounds,
+                          const SmartFilterStack &stack,
+                          const FilterProgress *progress = nullptr);
+
+} // namespace patchy

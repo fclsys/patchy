@@ -1,0 +1,273 @@
+# Merge Layers
+
+`layer.merge_down` (Ctrl+E, Layer > Merge > Merge Down and the layer context menu) merges
+selected layers, or the active layer with its lower sibling. A selected group
+includes its contents. Ancestor selections include descendants only once.
+A hidden folder that holds the whole merge (`layer_shared_ancestor_groups`) does
+not hide its members: Merge Down inside a hidden folder merges, as Photoshop 2026
+does (COM probe, #389). Hidden items and hidden folders below the shared ones still
+count as hidden. Tests: `ui_issue389_*`.
+
+Selections containing vectors use `src/ui/layer_merge.{hpp,cpp}`. Shapes that
+produce one vector output merge immediately; groups and mixed selections open
+**Merge Layers** with three appearance-preserving options:
+
+- **Keep vector layers editable** preserves editable vector objects and
+  merges bitmap runs separately (default on). Turn off to rasterize the merge.
+- **Merge within each group separately** keeps folders and merges each folder's
+  compatible children (default off). An ordinary all-vector folder in one paint
+  category gets one vector child.
+  Leave off to release selected ordinary Pass Through folders and merge across
+  their boundaries. Groups with opacity, masks, effects or isolation retain
+  their boundaries.
+- **Separate merges for different vector types** separates solid, gradient,
+  pattern and mixed-paint categories (default on). Colors, stroke widths,
+  caps, joins and dashes do not split a category. Turn off to merge categories
+  together while retaining every appearance.
+
+All three options work together. The readout reports output leaf counts and
+removed layers. Merge is disabled only when the choices cannot change anything.
+Cancel leaves revisions, saved bytes, dirty state and history unchanged.
+Bitmap-only Merge Down flattens without a dialog.
+When source layer effects require separate layers, the dialog lists those layers
+and explains that turning off vector preservation rasterizes merged artwork.
+The explanation also applies when every selected layer is a vector.
+
+**Merge into one vector layer** explicitly combines the selected vectors even
+when their layer effects or intervening unselected layers prevent a preserving
+merge. It overrides the group and paint-category options. Each shape keeps its
+fill, vector stroke, curves, live-shape annotations and paint placement.
+
+- **Remove layer effects** discards the individual effect stacks (default).
+- **Use effects from a layer** takes the complete stack from the selected source,
+  including disabled instances and preserved native settings. Those effects apply
+  once to the combined silhouette. It does not copy source opacity or blending.
+
+The result replaces the bottommost selected vector in the layer stack. Selected
+shapes keep their relative paint order; moving them past unselected layers can
+change overlap. The dialog identifies that placement and reports stacking changes.
+Its bounded preview shows the complete resulting artwork; unchecking **Preview**
+shows the original. Changing the policy updates the preview before Merge becomes
+available. Preview failure is reported; a preparation failure disables Merge.
+Cancel never alters the document, including when a render is still running.
+
+This mode requires at least two editable vectors and explains blockers by layer
+name. Hidden or locked sources (including inherited locks/visibility), non-vector
+content, separate masks, clipping relationships, Smart Filters, non-Normal blending,
+Blend If, channel restrictions, preserved uneditable vector data, vector feather or
+density, and compound outer opacity/Fill still require separate layers. A shared
+enclosing group's effects/isolation remain intact. Moving shapes across a group
+boundary requires an ordinary Pass Through group. Selected ordinary groups are
+released; unselected folders remain. No source is silently omitted or rasterized.
+
+**Merge Visible to New Layer (Copy)** (`layer.merge_visible`, Ctrl+Alt+Shift+E since #294) copies
+all effectively visible content, independent of selection. Visible vectors open
+the same dialog, including the explicit single-vector mode. Copy remains available even
+when its layers cannot be combined further. Multiple outputs form one new Normal
+group. Hidden folders and children are excluded, including clipped artwork whose
+base is hidden. Source locks protect the originals and do not block copying.
+**Hide original layers** defaults on for vector copies to avoid drawing transparent
+art twice; uncheck it to retain the originals' visibility. Originals retain their
+content, properties and ids. Copied layers receive fresh document/native ids and
+Smart Object instance/cache identities. One Undo restores the tree and visibility.
+Bitmap-only copies create an RGBA snapshot without a dialog, preserving fully
+transparent areas and partial coverage from pixels, masks and layer/group opacity.
+Visible opaque backgrounds remain opaque. Source layers retain their visibility.
+Copy rendering uses the same worker and delayed processing overlay as Merge Down;
+preparation and resource duplication finish before undo and document mutation.
+In 16/32-bit documents raster merges and bitmap copies render at the document's
+depth (`ScopedDocumentDepthRender`; [high-bit-depth.md](high-bit-depth.md)).
+
+## Merge Selected to New Layer
+
+**Merge Selected to New Layer (Copy)** (`layerMergeSelectedToNewAction`, hotkey id
+`layer.merge_selected_to_new`, Ctrl+Alt+E, Cmd+Option+E on macOS; #475) is Photoshop's
+Ctrl+Alt+E with layers selected. It is not in the Layer menu's Merge submenu (Merge Down, Merge Visible,
+Merge Visible to New Layer (Copy)): it sits in the layer context menu's Merge submenu and on the window for the hotkey.
+`MainWindow::merge_selected_to_new_layer` renders `selected_document_for_merge_copy` (layer_merge.cpp)
+on a worker at the document depth, like the bitmap copy above, and inserts one full-canvas
+pixel layer named "<top layer> (merged)" directly above the topmost selected layer (the first
+selected panel row), one undo step. It never opens the vector dialog; the originals keep
+their content, visibility and ids. One selected layer is copied merged (Photoshop does too).
+
+- A selected group keeps its visible subtree. An unselected group holding selected layers
+  dissolves into its parent for the render; the copy then lands inside that group, so its
+  opacity, mask and blending apply once.
+- Hidden layers and layers clipped to a hidden base drop, as in Merge Visible to New Layer.
+  A clipped layer whose base is not part of the merge is released for the render.
+- Locks never block it. With nothing selected that draws, the context-menu entry is off
+  and the hotkey reports "No visible selected layers to merge".
+
+Test: `ui_merge_selected_to_new_layer_keeps_originals_and_undoes`.
+
+## Merge Visible
+
+**Layer > Merge > Merge Visible** (`layerMergeVisibleLayersAction`, hotkey id
+`layer.merge_visible_in_place`, Ctrl+Shift+E; #294) is Photoshop's Merge Visible, in place:
+`MainWindow::merge_visible_layers` renders the document composite on a worker at the document
+depth (the copy command's `qimage_from_document` path, no second compositor) and puts it in one
+full-canvas pixel layer, one undo step. It never opens the vector dialog: text, shapes, Smart
+Objects, adjustments, masks and styles rasterize, as in Photoshop. The planning lives in
+`layer_merge.cpp` and matches Photoshop 2026, probed over COM in October 2026:
+
+- A layer *draws* when it and its ancestors are visible and it is not clipped to a hidden base.
+  `merge_visible_layer_count` counts the non-group layers that draw. `merge_visible_available`
+  enables the action (`refresh_merge_visible_action_state`, on every layer refresh, document
+  change and Layer or Merge menu show) for two or more, or for one that the merge changes (#519): a
+  mask, vector mask, style, Smart Filters, clipping, Blend If or channel restriction, a
+  non-pixel or procedural layer (text, shape, Smart Object, adjustment), a blend mode other
+  than Normal, opacity or Fill under 100%, or a visible group around it (it dissolves). One
+  plain pixel layer, a Background included, leaves it off and the command refuses, as
+  Photoshop's "not currently available".
+- `merge_visible_target`: a visible Background takes the merge and stays the Background (opaque
+  RGB via `composite_onto_white`, its position and transparency locks, its name). Otherwise the
+  active layer when it draws (group or layer, its id and name kept), else the topmost layer that
+  draws. Photoshop refuses a hidden active layer; Patchy uses the topmost visible one instead.
+- `merge_visible_layer_stack`: every layer that draws goes; the result takes the target's slot.
+  Visible groups and artboards dissolve, so their hidden members move out to the top level in
+  stack order; hidden layers and groups keep their subtrees, and a clipped layer over a hidden
+  base stays clipped to it. A kept clipped layer left at the bottom is released.
+- The result is Normal, 100%, unclipped and unlocked, and keeps the target's color label.
+  Locks never block it: Photoshop merges locked layers too, the active one included.
+
+Tests: `ui_merge_visible_merges_in_place_keeps_hidden_layers_and_undoes`,
+`ui_merge_visible_background_clipping_and_disabled_state`,
+`ui_merge_visible_menu_placement_and_captures`, `ui_merge_visible_single_layer_applies_mask_and_undoes`,
+and the hotkey move in
+`ui_new_layer_and_merge_visible_keys_moved_defaults_only`.
+
+## Flatten Image
+
+**Image > Flatten Image** (`imageFlattenAction`, hotkey id `image.flatten`, no default
+key; also in the Layers panel context menu) follows Photoshop. It lives in the Image menu
+(GIMP's place) because the Layer menu is at its row bound. Hidden layers (any layer in the
+tree with visibility off) prompt `flattenDiscardHiddenMessageBox` ("Discard hidden
+layers?"); Cancel changes nothing. The visible composite (`qimage_from_document`, so
+vectors, text, effects and Smart Objects rasterize) renders at the document depth on a
+worker, is composited onto white (`composite_onto_white`, linear light for 32-bit), and
+replaces every layer with one opaque RGB "Background" with position and transparency
+locked, like a File > New Background. Channels, paths and guides stay. One Undo restores
+the layers. A document that is already one plain opaque full-canvas bitmap reports "The
+image is already flat" and adds no history. Pinned by
+`ui_flatten_image_composites_onto_white_discards_hidden_and_undoes`.
+
+## Vector representation and editing
+
+`core/vector_compound.{hpp,cpp}` owns merged vector objects. They remain real
+Pixel-kind shape layers, with immutable `VectorShapeContent` and derived pixel
+caches. An ordinary shape has no `parts`; a merged shape has ordered
+`VectorShapePart` paints. Each part references group ids in the shared path and
+retains its fill, stroke, opacity, fill opacity, whole-canvas/inverted/disabled
+flags and pattern reference point. Holes and intersections execute independently
+inside each part. No tracing or bitmap-to-vector conversion occurs.
+
+Point editing continues to target the shared path. Deleting a part's last path
+removes that paint, except for an intentional whole-canvas fill. Move and document
+transforms update part anchors and stroke dimensions. Whole-layer appearance
+edits change only edited fields across parts; unrelated colors and strokes stay
+intact. Explicit Combine Shapes Boolean commands continue to use the bottom
+shape's appearance. New Add shapes append a paint; other shape-area operations
+apply the new path to each existing paint.
+
+The deterministic native rasterizer bakes each part then composites its pixels
+in paint order. Dynamic Vector Preview expands the parts into temporary native
+vector nodes, using the existing bounded tiles, culling and memory budget.
+Their tile composite becomes a temporary pixel layer before outer opacity,
+Fill, masks, clipping and effects apply.
+Unchanged canvas repaints do not rebuild this representation. Object-level styles
+apply to the combined object. Source layers with styles stay separate unless the
+explicit single-vector effect policy is chosen.
+
+## Preservation boundaries
+
+Adjacent selected vectors merge without changing paint order. Matching paint
+categories can cross other selected vector runs only when conservative geometry
+bounds, including stroke extents, do not overlap. Unselected layers, bitmaps and
+retained groups remain ordering barriers. Layer-aligned gradients and differently
+anchored patterns retain their own paint coordinates.
+
+Hidden and locked layers remain intact. Clip bases and clipped siblings stay
+separate, even when only part of a clipping stack is selected. Separate masks,
+effects, advanced blending and unsupported imported vectors retain their source
+layers. Text and Smart Objects stay editable. A merged vector object with a
+subsequently changed opacity remains an isolation boundary when merging again.
+Normal bitmap runs can merge; backdrop-dependent bitmap blending stays separate.
+The explicit raster option uses the CPU compositor and honors image/group locks;
+the Background's position and transparency locks permit merging as in ordinary Merge Down
+(a transparency lock blocks only layers that have alpha).
+
+## PSD, SVG and PDF
+
+A native PSD shape has one fill/stroke, so compound vector layers expand on save
+into a Normal group containing native shape records. Other PSD readers see editable
+vector children. Patchy restores one vector layer after native vectors/patterns load.
+PSD/PSB saves enforce Photoshop's 8000 native-record limit after expansion,
+including hidden originals and group boundaries. A merged vector copy plus its
+complete original artwork can exceed that limit even with few visible layers;
+the save fails without discarding either copy. Saving only the desired copy or
+explicitly rasterizing some artwork reduces the native record count.
+
+Associations use image resource **4211**, in Adobe's plug-in resource range, with
+big-endian payload `PtcV`, u16 version 1, u16 reserved 0, u32 count, then count pairs
+`{u32 native lyid, u32 role}`. Roles are 1 for compound content, 2 for the inner
+Fill-opacity boundary, and 3 for [open-stroke compatibility groups](open-path-strokes.md).
+The writer assigns missing or ambiguous native ids on its
+temporary document. The bounded reader validates the entire payload; duplicate ids,
+missing groups and unsupported versions cannot fold arbitrary layers. Other editors
+may preserve the resource without interpreting it. Ordinary PSD bytes remain unchanged.
+
+The old per-layer `pvcl` and `pvfi` tags (`PVCL` + big-endian u32 version 1) remain
+readable and serve as runtime annotations. They are **never emitted**: Photoshop
+warns about unknown per-layer keys. Saving a legacy merged file migrates its markers
+to resource 4211. A foreign editor's unrepresentable child changes preserve native
+groups rather than losing artwork. A changed Fill opacity uses an inner Normal
+group (role 2 above). Object-level styles follow native group semantics in other
+PSD readers.
+
+Native live-shape annotations follow remapped group ids. Unmodeled Custom live
+annotations cannot follow reassigned indices and are dropped during merging;
+the editable curves remain. The existing writer omits incomplete live annotation
+sets. Unparsed vector blocks remain on untouched layers. Pattern resources stay
+in the document and follow the existing PSD embedding rules.
+
+SVG and editable PDF exports expand compound parts into native vector groups
+before their existing format-specific support checks. Flat exports use the
+normal pixel composite. Serialization and exports never mutate the source.
+
+## Transaction, feedback and automation
+
+Planning reads const data and never bakes pixels. The non-modal dialog reads a
+copy-on-write snapshot under the edit lock. Output preparation completes before
+one Undo snapshot; any failed operation leaves the original document intact.
+Native vector and bitmap merging run expensive rendering on background workers.
+The existing delayed **Merging layers...** processing overlay animates during
+slow work, and disappears when it completes. Session identity is checked before
+applying the prepared result. Undo and Redo restore the complete tree.
+The single-vector dialog coalesces background work with generation checks and
+publishes only the latest completed document/preview pair. Closing invalidates
+pending results; tracked workers own immutable snapshots. Acceptance reuses the
+prepared document and raster caches instead of rendering the same merge again.
+
+`doc.mergeLayers(layers, options?)` exposes the same planner without a dialog.
+Boolean options `keepVectors`, `withinGroups`, `separateVectorTypes` default to
+true, false, true. It returns surviving selected leaf wrappers bottom-to-top.
+`singleVector: true` overrides those options and performs the explicit vector
+merge above. Omit `effectsFrom` to remove effects, or pass a selected vector's
+layer wrapper to use its stack. `effectsFrom` requires `singleVector`; a foreign,
+missing or unselected source throws. Any single-vector blocker throws before
+mutation, with the same reasons as the dialog.
+A single leaf does not imply its lower sibling. Invalid or foreign wrappers and
+invalid options throw before mutation. A no-op adds no history. Scripts use the
+host's existing progress and cancellation lifecycle. `getShape().parts` exposes
+read-only part appearances and group references. API version remains 1.
+
+Tests in `tests/ui/layer_merge_tests.cpp` cover the three-option combination,
+colors/strokes, holes/inversion, paint placement, ordering barriers, processing,
+transforms, PSD/PSB reopening, dialog cancellation, history and scripting. Explicit
+vector-mode cases cover heterogeneous paints, live geometry, effect-stack transfer
+and removal, nonadjacent placement, group boundaries, blocker diagnostics, latest
+preview publication, preview-off and cancellation during work. Bitmap-copy
+tests cover transparent and opaque backgrounds, masks, group opacity, an entirely
+transparent canvas, unchanged sources and Undo/Redo. The
+optional ignored Little-Everywhere fixture verifies one vector child per folder,
+normal and zoomed images, output counts, and large Shift-selection timing.

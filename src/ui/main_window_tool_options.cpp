@@ -1,0 +1,5075 @@
+// MainWindow's tool and options-bar state, split out of main_window.cpp: the
+// brush-tip/pattern/gradient/style preset-library accessors and brush-tip
+// import/define flows, the selected-layer id queries and per-layer
+// opacity/fill/blend/visibility/lock/clipping handlers, the color buttons and
+// gradient-stop controls, tool activation and tool-settings load/save, the
+// transform-session controls, register_option_action/refresh_options_bar, the
+// selection-mode buttons, and sync_brush_controls_from_canvas, plus the
+// anonymous-namespace gradient-stop dialog cluster only they use.
+// current_text_color and sync_text_options_from_active_editor stay in
+// main_window.cpp: they read the inline text editor's formats through the
+// internal text helpers there.
+// Pure function moves from main_window.cpp; behavior must stay identical.
+
+#include "core/gradient_fill_drag.hpp"
+#include "core/layer.hpp"
+#include "core/rect_utils.hpp"
+#include "core/palette.hpp"
+#include "ui/canvas_types.hpp"
+#include "core/vector_shape.hpp"
+#include "ui/main_window.hpp"
+#include "support/startup_trace.hpp"
+#include "ui/blend_mode_ui.hpp"
+#include "ui/script_api.hpp"
+#include <QAbstractItemView>
+#include <QListWidget>
+#include <QActionGroup>
+#include <QComboBox>
+#include <QStatusBar>
+#include "ui/canvas_widget.hpp"
+#include "ui/clone_source_panel.hpp"
+#include "ui/main_window_shared.hpp"
+#include "ui/options_flow_layout.hpp"
+
+#include "core/blend_math.hpp"
+#include "core/artboard.hpp"
+#include "core/layer_metadata.hpp"
+#include "core/smart_object.hpp"
+#include "core/layer_render_utils.hpp"
+#include "core/layer_tree.hpp"
+#include "core/pixel_tools.hpp"
+#include "ui/action_icons.hpp"
+#include "ui/app_settings.hpp"
+#include "ui/custom_shape_library.hpp"
+#include "ui/brush_dynamics_popup.hpp"
+#include "ui/canvas_widget_shared.hpp"
+#include "ui/measurement_units.hpp"
+#include "ui/brush_tool_window.hpp"
+#include "ui/brush_presets.hpp"
+#include "ui/background_workers.hpp"
+#include "ui/brush_tip_library.hpp"
+#include "ui/brush_tip_manager_dialog.hpp"
+#include "ui/brush_tip_picker.hpp"
+#include "ui/image_document_io.hpp"
+#include "ui/filter_workflows.hpp"
+#include "ui/gradient_stops_editor.hpp"
+#include "ui/contour_library.hpp"
+#include "ui/gradient_library.hpp"
+#include "ui/gradient_manager_dialog.hpp"
+#include "ui/pattern_manager_dialog.hpp"
+#include "ui/gradient_preset_popup.hpp"
+#include "ui/curved_slider.hpp"
+#include "ui/dialog_utils.hpp"
+#include "ui/document_float_window.hpp"
+#include "ui/edit_conversions.hpp"
+#include "ui/color_dock_panel.hpp"
+#include "ui/color_panel.hpp"
+#include "ui/hdr_color_controls.hpp"
+#include "ui/layer_style_dialog.hpp"
+#include "ui/layer_style_gradient_controls.hpp"
+#include "ui/layer_list_widget.hpp"
+#include "ui/layer_lock_dialog.hpp"
+#include "ui/pattern_library.hpp"
+#include "ui/shape_appearance_dialog.hpp"
+#include "ui/shape_pixel_options.hpp"
+#include "ui/style_library.hpp"
+#include "ui/style_manager_dialog.hpp"
+#include "ui/stroke_preset_manager_dialog.hpp"
+#include "ui/scanner_import.hpp"
+#include "ui/start_panel.hpp"
+#include "ui/tile_preview_window.hpp"
+#include "ui/ui_profile.hpp"
+#include "ui/warp_text_dialog.hpp"
+#include "ui/qt_geometry.hpp"
+#include "ui/update_checker.hpp"
+#include "ui/tool_palette_footer.hpp"
+#include "ui/theme_qss.hpp"
+
+#include <QAbstractItemView>
+#include <QAction>
+#include <QByteArray>
+#include <QAbstractButton>
+#include <QCheckBox>
+#include <QColor>
+#include <QDialog>
+#include <QDialogButtonBox>
+#include <QDoubleSpinBox>
+#include <QHBoxLayout>
+#include <QFormLayout>
+#include <QHeaderView>
+#include <QIcon>
+#include <QImage>
+#include <QInputDialog>
+#include <QItemSelectionModel>
+#include <QJsonArray>
+#include <QJsonDocument>
+#include <QJsonObject>
+#include <QJsonParseError>
+#include <QLabel>
+#include <QLatin1String>
+#include <QLatin1StringView>
+#include <QLineEdit>
+#include <QListWidgetItem>
+#include <QMessageBox>
+#include <QModelIndex>
+#include <QObject>
+#include <QEasingCurve>
+#include <QPaintEvent>
+#include <QPainter>
+#include <QPen>
+#include <QPoint>
+#include <QPointF>
+#include <QPointer>
+#include <QPushButton>
+#include <QRect>
+#include <QScopeGuard>
+#include <QVariantAnimation>
+#include <QSet>
+#include <QSettings>
+#include <QScopedValueRollback>
+#include <QSignalBlocker>
+#include <QSlider>
+#include <QSpinBox>
+#include <QString>
+#include <QStringList>
+#include <QStringLiteral>
+#include <QStyle>
+#include <QStyleOptionViewItem>
+#include <QStyledItemDelegate>
+#include <QTableWidget>
+#include <QTableWidgetItem>
+#include <QTextEdit>
+#include <QTimer>
+#include <QMenu>
+#include <QToolButton>
+#include <QVBoxLayout>
+#include <QWidget>
+#include <Qt>
+#include <QtGlobal>
+
+#include <algorithm>
+#include <iterator>
+#include <array>
+#include <cstddef>
+#include <cstdint>
+#include <cmath>
+#include <cstdlib>
+#include <initializer_list>
+#include <numeric>
+#include <functional>
+#include <exception>
+#include <condition_variable>
+#include <future>
+#include <memory>
+#include <mutex>
+#include <optional>
+#include <qlatin1stringview.h>
+#include <unordered_set>
+#include <string>
+#include <string_view>
+#include <utility>
+#include <vector>
+
+
+// Icon resources live in the static patchy_ui library; force registration before first use.
+int qInitResources_icons();
+
+namespace patchy::ui {
+
+namespace {
+
+QString gradient_css_stops(const std::vector<GradientStop>& stops, int opacity, bool reverse) {
+  QStringList css_stops;
+  // CSS interpolates straight: midpoints become stops of their own.
+  const auto normalized = gradient_stops_with_explicit_midpoints(normalized_gradient_stops(stops));
+  const auto global_opacity = static_cast<float>(std::clamp(opacity, 0, 100)) / 100.0F;
+  for (const auto& stop : normalized) {
+    auto color = stop.color;
+    color.a = static_cast<std::uint8_t>(
+        std::clamp(std::lround(static_cast<float>(color.a) * global_opacity), 0L, 255L));
+    css_stops << QStringLiteral("stop:%1 rgba(%2, %3, %4, %5)")
+                     .arg(reverse ? 1.0 - static_cast<double>(stop.location) : static_cast<double>(stop.location),
+                          0, 'f', 3)
+                     .arg(color.r)
+                     .arg(color.g)
+                     .arg(color.b)
+                     .arg(color.a);
+  }
+  return css_stops.join(QStringLiteral(", "));
+}
+
+QString gradient_preview_button_style(const std::vector<GradientStop>& stops, int opacity, bool reverse) {
+  return QStringLiteral(
+             "QPushButton { background: qlineargradient(spread:pad, x1:0, y1:0, x2:1, y2:0, %1); "
+             "border: 1px solid @swatch_border; border-radius: 2px; min-width: 78px; min-height: 22px; padding: 0; }"
+             "QPushButton:hover { border: 2px solid @accent_bright; }")
+      .arg(gradient_css_stops(stops, opacity, reverse));
+}
+
+// The Gradient tool's Edit Gradient Stops (GitHub issue 663, one gradient editor): the same
+// two-track editor as Layer Style and Gradient Map (layer_style_gradient_controls: Preset,
+// Solid or Noise, the color and opacity tracks, the selected stop's Location, Color, Opacity
+// and midpoint, smoothness), with placement left to the options bar, Reset to FG/BG, and in
+// 32-bit documents the selected color stop's Intensity. Cancel returns nullopt; an inner
+// nullopt is the default Foreground to Background. Opened and accepted without an edit, the
+// tool keeps its gradient as it was (live Foreground/Background stops included).
+std::optional<std::optional<GradientDefinition>> request_gradient_stops_dialog(
+    QWidget* parent, const std::optional<GradientDefinition>& current, const LayerStyleGradient& resolved,
+    const LayerStyleGradient& default_resolved, QColor foreground, QColor background,
+    GradientLibrary* gradient_library, bool linear_document) {
+  QDialog dialog(parent);
+  dialog.setObjectName(QStringLiteral("gradientStopsDialog"));
+  dialog.resize(560, 430);
+
+  auto* layout = install_dark_dialog_chrome(dialog, new QVBoxLayout(&dialog), QObject::tr("Edit Gradient Stops"));
+  auto* form = new QFormLayout();
+  layout->addLayout(form);
+  // The editor's callbacks hold references into its context, so everything it points at
+  // lives in this frame for the whole dialog. No batch edits here.
+  std::vector<std::string> explicit_fields;
+  std::function<void()> reset_batch_capture;
+  auto batch_edits = std::make_shared<AppearanceEdits<LayerStyleSettings>>();
+  const auto rgb = [](QColor color) {
+    return RgbColor{static_cast<std::uint8_t>(color.red()), static_cast<std::uint8_t>(color.green()),
+                    static_cast<std::uint8_t>(color.blue())};
+  };
+  layer_style_detail::LayerStyleGradientContext context{dialog,         gradient_library,     rgb(foreground),
+                                                        rgb(background), false,                batch_edits,
+                                                        explicit_fields, reset_batch_capture, [](bool) {
+                                                          return std::string();
+                                                        }};
+  auto initial = resolved;
+  initial.type = LayerStyleGradientType::Linear;
+  initial.reverse = false;
+  initial.dither = false;
+  initial.interpolation = GradientInterpolationMethod::Classic;
+  auto controls_owner = layer_style_detail::make_gradient_controls(context, form, &dialog, QStringLiteral("gradient"),
+                                                                   initial, QObject::tr("Gradient Stop Color"));
+  auto& controls = *controls_owner;
+  // Placement belongs to the drag and the options bar (Style, Reverse): its rows stay hidden.
+  const auto hide_row = [form](QWidget* widget) {
+    for (auto* candidate = widget; candidate != nullptr; candidate = candidate->parentWidget()) {
+      int row = -1;
+      QFormLayout::ItemRole role{};
+      form->getWidgetPosition(candidate, &row, &role);
+      if (row >= 0) {
+        form->setRowVisible(row, false);
+        return;
+      }
+    }
+  };
+  for (QWidget* widget : std::initializer_list<QWidget*>{controls.style_combo, controls.angle, controls.scale,
+                                                         controls.offset_x, controls.offset_y,
+                                                         controls.reset_alignment, controls.reverse,
+                                                         controls.interpolation}) {
+    if (widget != nullptr) {
+      hide_row(widget);
+    }
+  }
+
+  auto* hdr = new HdrColorControls(HdrColorControls::Form::Compact, &dialog);
+  hdr->setObjectName(QStringLiteral("gradientStopHdrControls"));
+  hdr->setVisible(linear_document);
+  layout->addWidget(hdr);
+
+  auto* button_row = new QWidget(&dialog);
+  auto* button_layout = new QHBoxLayout(button_row);
+  button_layout->setContentsMargins(0, 0, 0, 0);
+  button_layout->addStretch(1);
+  auto* reset_stops = new QPushButton(QObject::tr("Reset to FG/BG"), button_row);
+  reset_stops->setObjectName(QStringLiteral("gradientResetStopsButton"));
+  button_layout->addWidget(reset_stops);
+  layout->addWidget(button_row);
+
+  bool use_default = !current.has_value();
+  bool edited = false;
+  // The selected color stop's Intensity (32-bit documents only).
+  const auto sync_hdr = [&] {
+    const auto row = controls.selected_color_stop;
+    const bool on_color = row >= 0 && row < static_cast<int>(controls.color_stops.size());
+    hdr->setEnabled(on_color);
+    if (on_color) {
+      const auto& stop = controls.color_stops[static_cast<std::size_t>(row)];
+      const QSignalBlocker blocker(hdr);
+      hdr->set_color(QColor(stop.color.red, stop.color.green, stop.color.blue), stop.intensity_stops);
+    }
+  };
+  const auto update_previews = controls.update_previews;
+  controls.update_previews = [update_previews, sync_hdr] {
+    if (update_previews) {
+      update_previews();
+    }
+    sync_hdr();
+  };
+  controls.changed = [&](bool) {
+    edited = true;
+    use_default = false;
+  };
+  QObject::connect(hdr, &HdrColorControls::intensity_changed, &dialog, [&](double stops) {
+    const auto row = controls.selected_color_stop;
+    if (row < 0 || row >= static_cast<int>(controls.color_stops.size())) {
+      return;
+    }
+    controls.color_stops[static_cast<std::size_t>(row)].intensity_stops = static_cast<float>(stops);
+    edited = true;
+    use_default = false;
+    controls.update_previews();
+  });
+  QObject::connect(reset_stops, &QPushButton::clicked, &dialog, [&] {
+    auto value = default_resolved;
+    value.type = LayerStyleGradientType::Linear;
+    value.reverse = false;
+    controls.load(value);
+    edited = true;
+    use_default = true;
+  });
+  controls.load(initial);
+  sync_hdr();
+
+  auto* buttons = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel, &dialog);
+  layout->addWidget(buttons);
+  QObject::connect(buttons, &QDialogButtonBox::accepted, &dialog, &QDialog::accept);
+  QObject::connect(buttons, &QDialogButtonBox::rejected, &dialog, &QDialog::reject);
+  remember_dialog_position(dialog);
+  if (run_non_modal_dialog(dialog) != QDialog::Accepted) {
+    return std::nullopt;
+  }
+  if (use_default) {
+    return std::optional<GradientDefinition>{};
+  }
+  if (!edited && current.has_value()) {
+    return current;
+  }
+  GradientDefinition result = controls.value();
+  result.name = "Custom";
+  return std::optional<GradientDefinition>(std::move(result));
+}
+
+// tools/gradientDefinition (GitHub issue 663, one gradient editor): the Gradient tool's
+// two-track gradient as a versioned JSON object. Version 1 keys: name, form ("solid",
+// "noise"), smoothness (0..4096), colorStops [{location, r, g, b, midpoint, kind ("user",
+// "foreground", "background"), intensity}], alphaStops [{location, opacity, midpoint}], noise
+// {seed, roughness, transparency, restrict, model ("rgb", "hsb", "lab"), minimum[4],
+// maximum[4]}, and flatStops: the tools/gradientStops text saved beside it. A build that
+// predates this key rewrites tools/gradientStops only, so a mismatch there means the flat
+// stops are newer and win (gradient_definition_from_settings).
+constexpr int kGradientDefinitionVersion = 1;
+
+QByteArray serialize_gradient_definition(const GradientDefinition& definition, const QByteArray& flat_stops) {
+  QJsonObject object;
+  object.insert(QStringLiteral("version"), kGradientDefinitionVersion);
+  object.insert(QStringLiteral("name"), QString::fromStdString(definition.name));
+  object.insert(QStringLiteral("form"), definition.form == GradientDefinitionForm::Noise ? QStringLiteral("noise")
+                                                                                        : QStringLiteral("solid"));
+  object.insert(QStringLiteral("smoothness"), static_cast<int>(definition.smoothness));
+  QJsonArray colors;
+  for (const auto& stop : definition.color_stops) {
+    QJsonObject entry;
+    entry.insert(QStringLiteral("location"), static_cast<double>(stop.location));
+    entry.insert(QStringLiteral("r"), static_cast<int>(stop.color.red));
+    entry.insert(QStringLiteral("g"), static_cast<int>(stop.color.green));
+    entry.insert(QStringLiteral("b"), static_cast<int>(stop.color.blue));
+    entry.insert(QStringLiteral("midpoint"), static_cast<double>(stop.midpoint));
+    entry.insert(QStringLiteral("kind"), stop.kind == GradientColorStop::Kind::Foreground   ? QStringLiteral("foreground")
+                                         : stop.kind == GradientColorStop::Kind::Background ? QStringLiteral("background")
+                                                                                            : QStringLiteral("user"));
+    entry.insert(QStringLiteral("intensity"), static_cast<double>(stop.intensity_stops));
+    colors.push_back(entry);
+  }
+  object.insert(QStringLiteral("colorStops"), colors);
+  QJsonArray alphas;
+  for (const auto& stop : definition.alpha_stops) {
+    QJsonObject entry;
+    entry.insert(QStringLiteral("location"), static_cast<double>(stop.location));
+    entry.insert(QStringLiteral("opacity"), static_cast<double>(stop.opacity));
+    entry.insert(QStringLiteral("midpoint"), static_cast<double>(stop.midpoint));
+    alphas.push_back(entry);
+  }
+  object.insert(QStringLiteral("alphaStops"), alphas);
+  QJsonObject noise;
+  noise.insert(QStringLiteral("seed"), static_cast<double>(definition.noise.seed));
+  noise.insert(QStringLiteral("roughness"), static_cast<int>(definition.noise.roughness));
+  noise.insert(QStringLiteral("transparency"), definition.noise.add_transparency);
+  noise.insert(QStringLiteral("restrict"), definition.noise.restrict_colors);
+  noise.insert(QStringLiteral("model"), definition.noise.color_model == GradientNoiseColorModel::HSB ? QStringLiteral("hsb")
+                                        : definition.noise.color_model == GradientNoiseColorModel::Lab ? QStringLiteral("lab")
+                                                                                                       : QStringLiteral("rgb"));
+  QJsonArray minimum;
+  QJsonArray maximum;
+  for (std::size_t channel = 0; channel < 4U; ++channel) {
+    minimum.push_back(static_cast<int>(definition.noise.minimum[channel]));
+    maximum.push_back(static_cast<int>(definition.noise.maximum[channel]));
+  }
+  noise.insert(QStringLiteral("minimum"), minimum);
+  noise.insert(QStringLiteral("maximum"), maximum);
+  object.insert(QStringLiteral("noise"), noise);
+  object.insert(QStringLiteral("flatStops"), QString::fromUtf8(flat_stops));
+  return QJsonDocument(object).toJson(QJsonDocument::Compact);
+}
+
+// The definition in `json` when it is version 1, well formed, and was saved beside exactly
+// `flat_stops` (see above); otherwise nullopt and the caller reads the flat stops.
+std::optional<GradientDefinition> deserialize_gradient_definition(const QByteArray& json, const QByteArray& flat_stops) {
+  QJsonParseError error;
+  const auto document = QJsonDocument::fromJson(json, &error);
+  if (error.error != QJsonParseError::NoError || !document.isObject()) {
+    return std::nullopt;
+  }
+  const auto object = document.object();
+  if (object.value(QStringLiteral("version")).toInt() != kGradientDefinitionVersion ||
+      object.value(QStringLiteral("flatStops")).toString().toUtf8() != flat_stops) {
+    return std::nullopt;
+  }
+  GradientDefinition definition;
+  definition.name = object.value(QStringLiteral("name")).toString(QStringLiteral("Custom")).toStdString();
+  definition.form = object.value(QStringLiteral("form")).toString() == QStringLiteral("noise")
+                        ? GradientDefinitionForm::Noise
+                        : GradientDefinitionForm::Solid;
+  definition.smoothness = static_cast<std::uint16_t>(std::clamp(object.value(QStringLiteral("smoothness")).toInt(), 0, 4096));
+  const auto unit = [](const QJsonValue& value, double fallback) {
+    return static_cast<float>(std::clamp(value.toDouble(fallback), 0.0, 1.0));
+  };
+  const auto byte = [](const QJsonValue& value) {
+    return static_cast<std::uint8_t>(std::clamp(value.toInt(), 0, 255));
+  };
+  for (const auto& value : object.value(QStringLiteral("colorStops")).toArray()) {
+    const auto entry = value.toObject();
+    GradientColorStop stop;
+    stop.location = unit(entry.value(QStringLiteral("location")), 0.0);
+    stop.color = RgbColor{byte(entry.value(QStringLiteral("r"))), byte(entry.value(QStringLiteral("g"))),
+                          byte(entry.value(QStringLiteral("b")))};
+    stop.midpoint = static_cast<float>(std::clamp(entry.value(QStringLiteral("midpoint")).toDouble(0.5), 0.01, 0.99));
+    const auto kind = entry.value(QStringLiteral("kind")).toString();
+    stop.kind = kind == QStringLiteral("foreground")   ? GradientColorStop::Kind::Foreground
+                : kind == QStringLiteral("background") ? GradientColorStop::Kind::Background
+                                                       : GradientColorStop::Kind::User;
+    stop.intensity_stops =
+        static_cast<float>(clamp_color_intensity_stops(entry.value(QStringLiteral("intensity")).toDouble(0.0)));
+    definition.color_stops.push_back(stop);
+  }
+  for (const auto& value : object.value(QStringLiteral("alphaStops")).toArray()) {
+    const auto entry = value.toObject();
+    definition.alpha_stops.push_back(GradientAlphaStop{
+        unit(entry.value(QStringLiteral("location")), 0.0), unit(entry.value(QStringLiteral("opacity")), 1.0),
+        static_cast<float>(std::clamp(entry.value(QStringLiteral("midpoint")).toDouble(0.5), 0.01, 0.99))});
+  }
+  const auto noise = object.value(QStringLiteral("noise")).toObject();
+  definition.noise.seed = static_cast<std::uint32_t>(std::clamp(noise.value(QStringLiteral("seed")).toDouble(0.0), 0.0, 4294967295.0));
+  definition.noise.roughness =
+      static_cast<std::uint16_t>(std::clamp(noise.value(QStringLiteral("roughness")).toInt(2048), 0, 4096));
+  definition.noise.add_transparency = noise.value(QStringLiteral("transparency")).toBool(false);
+  definition.noise.restrict_colors = noise.value(QStringLiteral("restrict")).toBool(true);
+  const auto model = noise.value(QStringLiteral("model")).toString();
+  definition.noise.color_model = model == QStringLiteral("hsb")   ? GradientNoiseColorModel::HSB
+                                 : model == QStringLiteral("lab") ? GradientNoiseColorModel::Lab
+                                                                  : GradientNoiseColorModel::RGB;
+  const auto minimum = noise.value(QStringLiteral("minimum")).toArray();
+  const auto maximum = noise.value(QStringLiteral("maximum")).toArray();
+  for (std::size_t channel = 0; channel < 4U; ++channel) {
+    const auto index = static_cast<qsizetype>(channel);
+    definition.noise.minimum[channel] =
+        static_cast<std::uint16_t>(std::clamp(index < minimum.size() ? minimum.at(index).toInt(0) : 0, 0, 100));
+    definition.noise.maximum[channel] =
+        static_cast<std::uint16_t>(std::clamp(index < maximum.size() ? maximum.at(index).toInt(100) : 100, 0, 100));
+  }
+  if (definition.form == GradientDefinitionForm::Solid &&
+      (definition.color_stops.empty() || definition.alpha_stops.empty())) {
+    return std::nullopt;
+  }
+  return definition;
+}
+
+QByteArray serialize_gradient_stops(const std::vector<GradientStop>& stops) {
+  QJsonArray array;
+  for (const auto& stop : normalized_gradient_stops(stops)) {
+    QJsonObject object;
+    object.insert(QStringLiteral("location"), std::clamp(stop.location, 0.0F, 1.0F));
+    object.insert(QStringLiteral("r"), static_cast<int>(stop.color.r));
+    object.insert(QStringLiteral("g"), static_cast<int>(stop.color.g));
+    object.insert(QStringLiteral("b"), static_cast<int>(stop.color.b));
+    object.insert(QStringLiteral("a"), static_cast<int>(stop.color.a));
+    // Only when set: builds before preset midpoints (GitHub issue 663) ignore the key.
+    if (stop.midpoint != 0.5F) {
+      object.insert(QStringLiteral("midpoint"), static_cast<double>(stop.midpoint));
+    }
+    // Only when set: builds before the 32-bit Intensity ignore the key.
+    if (stop.intensity_stops != 0.0F) {
+      object.insert(QStringLiteral("intensity"), static_cast<double>(stop.intensity_stops));
+    }
+    array.push_back(object);
+  }
+  return QJsonDocument(array).toJson(QJsonDocument::Compact);
+}
+
+std::optional<std::vector<GradientStop>> deserialize_gradient_stops(const QByteArray& json) {
+  QJsonParseError error;
+  const auto document = QJsonDocument::fromJson(json, &error);
+  if (error.error != QJsonParseError::NoError || !document.isArray()) {
+    return std::nullopt;
+  }
+  std::vector<GradientStop> stops;
+  for (const auto& value : document.array()) {
+    if (!value.isObject()) {
+      return std::nullopt;
+    }
+    const auto object = value.toObject();
+    const auto location = object.value(QStringLiteral("location"));
+    const auto r = object.value(QStringLiteral("r"));
+    const auto g = object.value(QStringLiteral("g"));
+    const auto b = object.value(QStringLiteral("b"));
+    const auto a = object.value(QStringLiteral("a"));
+    if (!location.isDouble() || !r.isDouble() || !g.isDouble() || !b.isDouble() || !a.isDouble()) {
+      return std::nullopt;
+    }
+    stops.push_back(GradientStop{
+        std::clamp(static_cast<float>(location.toDouble()), 0.0F, 1.0F),
+        EditColor{static_cast<std::uint8_t>(std::clamp(r.toInt(), 0, 255)),
+                  static_cast<std::uint8_t>(std::clamp(g.toInt(), 0, 255)),
+                  static_cast<std::uint8_t>(std::clamp(b.toInt(), 0, 255)),
+                  static_cast<std::uint8_t>(std::clamp(a.toInt(), 0, 255))},
+        static_cast<float>(clamp_color_intensity_stops(object.value(QStringLiteral("intensity")).toDouble(0.0))),
+        static_cast<float>(std::clamp(object.value(QStringLiteral("midpoint")).toDouble(0.5), 0.01, 0.99))});
+  }
+  if (stops.size() < 2U) {
+    return std::nullopt;
+  }
+  return normalized_gradient_stops(stops);
+}
+
+// Reads a default-library seeding stamp (brushes/patterns/gradients/styles).
+// On wasm the stamps would persist in localStorage while the seeded library
+// files live in MEMFS and vanish on reload, so honoring a stored stamp there
+// would skip seeding into an empty store; every wasm session reads as
+// never-seeded and re-creates the defaults instead. (Deleted defaults
+// therefore return on reload; preset persistence itself is a later step.)
+int stored_default_asset_version(const QSettings& settings, const QString& key) {
+#ifdef Q_OS_WASM
+  Q_UNUSED(settings);
+  Q_UNUSED(key);
+  return 0;
+#else
+  return settings.value(key, 0).toInt();
+#endif
+}
+
+// v4 (July 2026): texture, dual, color, wet-edge tips. v5 (November 2026): no new tips; removes
+// the duplicate defaults two processes seeded before stable default ids (GitHub issue 636).
+constexpr int kDefaultTipsVersion = 5;
+constexpr int kDuplicateDefaultTipsCleanupVersion = 5;
+
+// Seed the built-in bitmap tips once. The version gate (not an emptiness check) means a
+// user who deletes some or all of them is respected — they never come back on their own;
+// the manager's "Restore Defaults" button brings them back on demand. On upgrade only tips
+// NEWER than the stored version are seeded, so a bump never resurrects deleted defaults.
+// Any thread: it only touches the library it is given.
+void seed_default_brush_tips(BrushTipLibrary& library, int stored_version) {
+  if (stored_version < kDefaultTipsVersion) {
+    if (stored_version < kDuplicateDefaultTipsCleanupVersion) {
+      // First, so the copies left are the ones the dynamics migration below upgrades.
+      library.remove_duplicate_default_tips();
+    }
+    library.restore_default_tips(stored_version);
+    if (stored_version < 2) {
+      // The v2 dynamics migration. Never re-run once applied: it cannot tell "user reset
+      // dynamics after v2" from "never migrated", so a later re-run would stomp the reset.
+      library.apply_default_tip_dynamics();
+    }
+  }
+}
+
+// Seed code-generated default patterns once. A user deletion stays deleted across
+// launches; the Pattern Manager's explicit restore command brings it back. Returns how many
+// were added. Any thread.
+int seed_default_patterns(PatternLibrary& library, int stored_version) {
+  if (stored_version >= kDefaultPatternsVersion) {
+    return 0;
+  }
+  if (stored_version < kDuplicateDefaultPatternsCleanupVersion) {
+    (void)library.remove_duplicate_default_pattern_files();
+  }
+  return library.restore_default_patterns(stored_version);
+}
+
+// Runs `work` on a tracked background worker; `done` runs on the worker after the result is
+// published.
+template <typename Load, typename Work>
+std::future<Load> start_preload(Work work, std::function<void()> done = {}) {
+  auto promise = std::make_shared<std::promise<Load>>();
+  auto future = promise->get_future();
+  run_tracked_background_worker([promise, work = std::move(work), done = std::move(done)] {
+    try {
+      promise->set_value(work());
+    } catch (...) {
+      promise->set_exception(std::current_exception());
+    }
+    if (done) {
+      done();
+    }
+  });
+  return future;
+}
+
+// A preload's result, waiting for the worker if it is still running. A failed preload
+// returns nothing and the caller reads the library itself.
+template <typename Load>
+std::optional<Load> take_preloaded(std::future<Load>& future) {
+  if (!future.valid()) {
+    return std::nullopt;
+  }
+  try {
+    return future.get();
+  } catch (...) {
+    return std::nullopt;
+  }
+}
+
+// MainWindow::hold_pattern_preload_for_tests: the pattern worker waits on this before it
+// publishes its result; the window releases it when it asks for the library.
+struct PatternPreloadHold {
+  std::mutex mutex;
+  std::condition_variable released_cv;
+  bool released{false};
+
+  void release() {
+    {
+      const std::lock_guard<std::mutex> lock(mutex);
+      released = true;
+    }
+    released_cv.notify_all();
+  }
+
+  void wait() {
+    std::unique_lock<std::mutex> lock(mutex);
+    released_cv.wait(lock, [this] { return released; });
+  }
+};
+
+std::shared_ptr<PatternPreloadHold> pattern_preload_hold_for_tests;  // GUI thread only
+
+}  // namespace
+
+struct StartupLibraryPreloads {
+  std::future<BrushTipLibraryLoad> brush_tips;
+  std::future<PatternLibraryLoad> patterns;
+  StartupLibraryPreloads() = default;
+  StartupLibraryPreloads(const StartupLibraryPreloads&) = delete;
+  StartupLibraryPreloads& operator=(const StartupLibraryPreloads&) = delete;
+  // A window destroyed before adopting must not leave a worker seeding its settings folder.
+  ~StartupLibraryPreloads() {
+    if (brush_tips.valid()) {
+      brush_tips.wait();
+    }
+    if (pattern_hold != nullptr) {
+      pattern_hold->release();
+    }
+    if (patterns.valid()) {
+      patterns.wait();
+    }
+  }
+
+  std::shared_ptr<PatternPreloadHold> pattern_hold;  // the test hold this worker waits on, if any
+};
+
+void MainWindow::hold_pattern_preload_for_tests(bool hold) {
+  if (pattern_preload_hold_for_tests != nullptr) {
+    pattern_preload_hold_for_tests->release();
+  }
+  pattern_preload_hold_for_tests = hold ? std::make_shared<PatternPreloadHold>() : nullptr;
+}
+
+// Called first in the constructor: the tips are needed by the options bar a few milliseconds
+// later, the patterns only when the Pattern Stamp list, a pattern fill, or a document needs
+// them, so the pattern worker also hands its result to the window as soon as it is ready.
+void MainWindow::start_library_preloads() {
+  library_preloads_ = std::make_shared<StartupLibraryPreloads>();
+  const auto tips_version =
+      stored_default_asset_version(brush_library_settings(), QStringLiteral("brushes/defaultTipsVersion"));
+  library_preloads_->brush_tips = start_preload<BrushTipLibraryLoad>(
+      [directory = BrushTipLibrary::resolved_storage_dir(), tips_version] {
+        return BrushTipLibrary::load_off_gui_thread(
+            directory, [tips_version](BrushTipLibrary& library) { seed_default_brush_tips(library, tips_version); });
+      });
+  const auto patterns_version =
+      stored_default_asset_version(app_settings(), QStringLiteral("patterns/defaultPatternsVersion"));
+  auto* app = QCoreApplication::instance();
+  QPointer<MainWindow> window(this);
+  library_preloads_->pattern_hold = pattern_preload_hold_for_tests;
+  library_preloads_->patterns = start_preload<PatternLibraryLoad>(
+      [directory = PatternLibrary::resolved_storage_dir(), patterns_version,
+       hold = library_preloads_->pattern_hold] {
+        auto load = PatternLibrary::load_off_gui_thread(directory, [patterns_version](PatternLibrary& library) {
+          return seed_default_patterns(library, patterns_version);
+        });
+        if (hold != nullptr) {
+          hold->wait();
+        }
+        return load;
+      },
+      [app, window] {
+        QMetaObject::invokeMethod(
+            app,
+            [window] {
+              if (window != nullptr) {
+                window->adopt_preloaded_pattern_library();
+              }
+            },
+            Qt::QueuedConnection);
+      });
+}
+
+void MainWindow::adopt_preloaded_pattern_library() {
+  (void)pattern_library();
+}
+
+BrushTipLibrary& MainWindow::brush_tip_library() {
+  if (brush_tip_library_ == nullptr) {
+    // Adopted from the startup preload (start_library_preloads), waiting for it if needed.
+    const startup_trace::Scope library_phase("mw.lib.brush_tips");
+    auto settings = brush_library_settings();
+    const auto stored_version =
+        stored_default_asset_version(settings, QStringLiteral("brushes/defaultTipsVersion"));
+    std::optional<BrushTipLibraryLoad> preloaded;
+    if (library_preloads_ != nullptr) {
+      preloaded = take_preloaded(library_preloads_->brush_tips);
+    }
+    if (preloaded.has_value()) {
+      brush_tip_library_ = BrushTipLibrary::from_load(std::move(*preloaded), this);
+    } else {
+      brush_tip_library_ = new BrushTipLibrary({}, this);
+      seed_default_brush_tips(*brush_tip_library_, stored_version);
+      brush_tip_library_->note_disk_state();
+    }
+    if (stored_version < kDefaultTipsVersion) {
+      settings.setValue(QStringLiteral("brushes/defaultTipsVersion"), kDefaultTipsVersion);
+    }
+  }
+  return *brush_tip_library_;
+}
+
+PatternLibrary& MainWindow::pattern_library() {
+  if (pattern_library_ == nullptr) {
+    // Adopted from the startup preload (start_library_preloads), waiting for it if needed.
+    const startup_trace::Scope library_phase("mw.lib.patterns");
+    auto settings = app_settings();
+    const auto stored_version =
+        stored_default_asset_version(settings, QStringLiteral("patterns/defaultPatternsVersion"));
+    std::optional<PatternLibraryLoad> preloaded;
+    if (library_preloads_ != nullptr) {
+      if (library_preloads_->pattern_hold != nullptr) {
+        library_preloads_->pattern_hold->release();
+      }
+      preloaded = take_preloaded(library_preloads_->patterns);
+    }
+    const int preseeded = preloaded.has_value() ? preloaded->prepared : 0;
+    pattern_library_ = preloaded.has_value() ? PatternLibrary::from_load(std::move(*preloaded), this)
+                                             : new PatternLibrary({}, this);
+    connect(pattern_library_, &PatternLibrary::changed, this, [this] {
+      refresh_pattern_stamp_pattern_combo();
+      apply_pattern_stamp_settings_to_canvas(canvas_);
+      schedule_save_tool_settings();
+    });
+    if (preseeded > 0) {
+      emit pattern_library_->changed();  // what the seeding below emits when it runs here
+    } else if (!preloaded.has_value()) {
+      (void)seed_default_patterns(*pattern_library_, stored_version);
+    }
+    if (stored_version < kDefaultPatternsVersion &&
+        pattern_library_->has_all_default_patterns_introduced_after(stored_version)) {
+      settings.setValue(QStringLiteral("patterns/defaultPatternsVersion"), kDefaultPatternsVersion);
+    }
+    // The Pattern Stamp list stays empty until the library exists (refresh_pattern_stamp_pattern_combo).
+    refresh_pattern_stamp_pattern_combo();
+  }
+  return *pattern_library_;
+}
+
+namespace {
+
+GradientPreviewColors gradient_preview_colors(QColor foreground, QColor background) {
+  const auto rgb = [](QColor color) {
+    return RgbColor{static_cast<std::uint8_t>(color.red()), static_cast<std::uint8_t>(color.green()),
+                    static_cast<std::uint8_t>(color.blue())};
+  };
+  return {rgb(foreground), rgb(background)};
+}
+
+}  // namespace
+
+GradientLibrary& MainWindow::gradient_library() {
+  if (gradient_library_ == nullptr) {
+    // Built on first use, which is startup (docs/startup-performance.md).
+    const startup_trace::Scope library_phase("mw.lib.gradients");
+    gradient_library_ = new GradientLibrary({}, this);
+    // Preset previews draw Foreground/Background stops in the current colors (GitHub #581).
+    gradient_library_->set_preview_colors(gradient_preview_colors(
+        canvas_ != nullptr ? canvas_->primary_color() : foreground_color_,
+        canvas_ != nullptr ? canvas_->secondary_color() : background_color_));
+    auto settings = app_settings();
+    const auto stored_version =
+        stored_default_asset_version(settings, QStringLiteral("gradients/defaultGradientsVersion"));
+    if (stored_version < kDefaultGradientsVersion) {
+      gradient_library_->restore_default_gradients(stored_version);
+      if (gradient_library_->has_all_default_gradients_introduced_after(stored_version))
+        settings.setValue(QStringLiteral("gradients/defaultGradientsVersion"), kDefaultGradientsVersion);
+    }
+  }
+  return *gradient_library_;
+}
+
+ContourLibrary& MainWindow::contour_library() {
+  // Built when the Layer Style dialog first opens, never at startup: the folder
+  // is empty until the user saves a contour.
+  if (contour_library_ == nullptr) {
+    contour_library_ = new ContourLibrary({}, this);
+  }
+  return *contour_library_;
+}
+
+StyleLibrary& MainWindow::style_library() {
+  if (style_library_ == nullptr) {
+    // Built on first use, which is startup (docs/startup-performance.md).
+    const startup_trace::Scope library_phase("mw.lib.styles");
+    style_library_ = new StyleLibrary({}, this);
+    // Seed code-generated defaults once. A user deletion stays deleted across
+    // launches; the Style Manager's explicit restore command brings it back.
+    auto settings = app_settings();
+    const auto stored_version =
+        stored_default_asset_version(settings, QStringLiteral("styles/defaultStylesVersion"));
+    if (stored_version < kDefaultStylesVersion) {
+      style_library_->restore_default_styles(stored_version);
+      if (style_library_->has_all_default_styles_introduced_after(stored_version)) {
+        settings.setValue(QStringLiteral("styles/defaultStylesVersion"),
+                          kDefaultStylesVersion);
+      }
+    }
+  }
+  return *style_library_;
+}
+
+void MainWindow::apply_brush_tip_to_canvas(CanvasWidget* canvas) {
+  if (canvas == nullptr) {
+    return;
+  }
+  if (active_preset_tip_ || active_brush_tip_id_.isEmpty() || is_builtin_brush_tip_id(active_brush_tip_id_)) {
+    canvas->set_brush_tip(active_preset_tip_, QString());
+    canvas->set_brush_shape(!active_preset_tip_ && active_brush_tip_id_ == builtin_square_brush_tip_id()
+                                ? patchy::BrushShape::Square
+                                : patchy::BrushShape::Round);
+    // The Round and Square brushes carry session-only dynamics (reset every launch); while
+    // active they stamp through a synthesized disc or square tip inside CanvasWidget.
+    canvas->set_brush_dynamics(round_brush_dynamics_);
+    canvas->set_brush_base_shape(round_brush_base_angle_degrees_,
+                                 static_cast<int>(std::lround(round_brush_base_roundness_)));
+    return;
+  }
+  auto tip = brush_tip_library().tip(active_brush_tip_id_);
+  canvas->set_brush_shape(patchy::BrushShape::Round);
+  if (tip == nullptr) {
+    canvas->set_brush_tip(nullptr, QString());
+    canvas->set_brush_dynamics({});
+    canvas->set_brush_base_shape(0.0, 100);
+    return;
+  }
+  canvas->set_brush_tip(std::move(tip), active_brush_tip_id_);
+  // Dynamics + static tip shape ride the tip: the library entry is the source of truth, so
+  // popup edits propagate through the library's changed() -> re-apply path.
+  if (const auto* entry = brush_tip_library().find_entry(active_brush_tip_id_); entry != nullptr) {
+    canvas->set_brush_dynamics(entry->dynamics);
+    // A turn by the keys that still waits on its save wins over the stored angle.
+    const auto angle = pending_brush_rotation_.has_value() && pending_brush_rotation_->tip_id == active_brush_tip_id_
+                           ? pending_brush_rotation_->angle_degrees
+                           : entry->base_angle_degrees;
+    canvas->set_brush_base_shape(angle, static_cast<int>(std::lround(entry->base_roundness)));
+  } else {
+    canvas->set_brush_dynamics({});
+    canvas->set_brush_base_shape(0.0, 100);
+  }
+}
+
+namespace {
+
+// A tip angle as the Brush Dynamics field shows it: (-180, 180].
+[[nodiscard]] double wrapped_brush_tip_angle(double degrees) {
+  auto wrapped = std::fmod(degrees, 360.0);
+  if (wrapped > 180.0) {
+    wrapped -= 360.0;
+  } else if (wrapped <= -180.0) {
+    wrapped += 360.0;
+  }
+  return wrapped;
+}
+
+}  // namespace
+
+bool MainWindow::rotate_brush_tip(int degrees) {
+  if (canvas_ == nullptr || degrees == 0 || !tool_stroke_uses_tip_shape(canvas_->tool()) ||
+      canvas_->pointer_gesture_active()) {
+    return false;
+  }
+  // The canvas holds the angle in use, a turn still waiting on its save included.
+  const auto angle = wrapped_brush_tip_angle(canvas_->brush_base_angle_degrees() + degrees);
+  const bool session_tip = active_preset_tip_ || active_automation_brush_ || active_brush_tip_id_.isEmpty() ||
+                           is_builtin_brush_tip_id(active_brush_tip_id_);
+  if (session_tip) {
+    // Round, Square and a preset's or a script's own tip: the session's values, as the
+    // Brush Dynamics popup edits them.
+    round_brush_base_angle_degrees_ = angle;
+  } else if (brush_tip_library().find_entry(active_brush_tip_id_) != nullptr) {
+    pending_brush_rotation_ = PendingBrushRotation{active_brush_tip_id_, angle};
+    if (brush_rotation_save_timer_ == nullptr) {
+      brush_rotation_save_timer_ = new QTimer(this);
+      brush_rotation_save_timer_->setSingleShot(true);
+      brush_rotation_save_timer_->setInterval(300);
+      connect(brush_rotation_save_timer_, &QTimer::timeout, this, [this] { flush_pending_brush_rotation(); });
+    }
+    brush_rotation_save_timer_->start();
+  } else {
+    return false;
+  }
+  canvas_->set_brush_base_shape(angle, canvas_->brush_base_roundness());
+  if (brush_dynamics_button_ != nullptr) {
+    brush_dynamics_button_->set_base_angle(angle);
+  }
+  statusBar()->showMessage(
+      tr("Brush angle: %1").arg(QString::number(static_cast<int>(std::lround(angle))) + degree_suffix()));
+  return true;
+}
+
+void MainWindow::flush_pending_brush_rotation() {
+  if (brush_rotation_save_timer_ != nullptr) {
+    brush_rotation_save_timer_->stop();
+  }
+  if (!pending_brush_rotation_.has_value()) {
+    return;
+  }
+  // Cleared first: the library's changed() re-applies the active tip from the stored entry.
+  const auto pending = *pending_brush_rotation_;
+  pending_brush_rotation_.reset();
+  const auto* entry = brush_tip_library().find_entry(pending.tip_id);
+  if (entry == nullptr || entry->base_angle_degrees == pending.angle_degrees) {
+    return;
+  }
+  const auto dynamics = entry->dynamics;
+  const auto roundness = entry->base_roundness;
+  (void)brush_tip_library().set_tip_dynamics(pending.tip_id, dynamics, pending.angle_degrees, roundness);
+}
+
+void MainWindow::set_active_brush_tip(const QString& tip_id, bool announce,
+                                      bool apply_tool_settings) {
+  // A turn of another tip that still waits on its save goes to the library before the switch.
+  if (pending_brush_rotation_.has_value() && pending_brush_rotation_->tip_id != tip_id) {
+    flush_pending_brush_rotation();
+  }
+  active_preset_tip_.reset();
+  active_automation_preset_id_.clear();
+  active_automation_brush_.reset();
+  if (canvas_) apply_pen_input_settings(canvas_);
+  auto effective = tip_id.isEmpty() ? builtin_round_brush_tip_id() : tip_id;
+  // A duplicate default removed at startup hands its selection to the copy that stayed.
+  if (const auto kept = brush_tip_library().merged_duplicate_tip(effective); !kept.isEmpty()) {
+    effective = kept;
+  }
+  const auto* entry = brush_tip_library().find_entry(effective);
+  if (!is_builtin_brush_tip_id(effective) && entry == nullptr) {
+    effective = builtin_round_brush_tip_id();
+    entry = nullptr;
+  }
+  active_brush_tip_id_ = effective;
+  apply_brush_tip_to_canvas(canvas_);
+  if (apply_tool_settings && entry != nullptr &&
+      (entry->tool_flow_percent.has_value() || entry->tool_airbrush.has_value())) {
+    if (entry->tool_flow_percent.has_value()) {
+      stored_paint_brush_settings_.flow = std::clamp(*entry->tool_flow_percent, 0, 100);
+    }
+    if (entry->tool_airbrush.has_value()) {
+      stored_paint_brush_settings_.airbrush = *entry->tool_airbrush;
+    }
+    if (!eraser_brush_settings_active_ && canvas_ != nullptr) {
+      canvas_->set_brush_flow(stored_paint_brush_settings_.flow);
+      canvas_->set_brush_build_up(stored_paint_brush_settings_.airbrush);
+      sync_brush_controls_from_canvas();
+      schedule_save_tool_settings();
+      refresh_document_info();
+    }
+  }
+  if (brush_tip_picker_ != nullptr) {
+    brush_tip_picker_->set_current_tip_id(effective);
+  }
+  if (brush_dynamics_button_ != nullptr) {
+    if (entry != nullptr) {
+      brush_dynamics_button_->set_active_entry(entry);
+      if (pending_brush_rotation_.has_value() && pending_brush_rotation_->tip_id == effective) {
+        brush_dynamics_button_->set_base_angle(pending_brush_rotation_->angle_degrees);
+      }
+    } else {
+      brush_dynamics_button_->set_round_session(effective, round_brush_dynamics_,
+                                                round_brush_base_angle_degrees_,
+                                                round_brush_base_roundness_);
+    }
+  }
+  schedule_save_tool_settings();
+  if (announce) {
+    statusBar()->showMessage(entry != nullptr                                  ? tr("Brush tip: %1").arg(entry->name)
+                             : effective == builtin_square_brush_tip_id() ? tr("Brush tip: Square")
+                                                                          : tr("Brush tip: Round"));
+  }
+}
+
+void MainWindow::import_brush_tips_from_abr() {
+  const auto path = get_abr_import_file_name(this, tr("Import Photoshop Brushes"), tr("Photoshop Brushes (*.abr)"),
+                                             QStringLiteral("brushTipImportFileDialog"));
+  if (path.isEmpty()) {
+    return;
+  }
+  const auto before = brush_tip_library().entries().size();
+  QString error;
+  QStringList warnings;
+  const auto first_id = brush_tip_library().import_abr(path, error, warnings);
+  if (first_id.isEmpty()) {
+    QMessageBox::warning(this, tr("Import Brushes"), error);
+    return;
+  }
+  const auto imported = static_cast<int>(brush_tip_library().entries().size() - before);
+  set_active_brush_tip(first_id, false);
+  QMessageBox message(QMessageBox::Information, tr("Import Brushes"),
+                      abr_import_summary(imported, warnings), QMessageBox::Ok, this);
+  if (!warnings.isEmpty()) {
+    message.setDetailedText(warnings.join(QStringLiteral("\n")));
+  }
+  message.exec();
+}
+
+const std::vector<MainWindow::PresetManagerEntry>& MainWindow::preset_manager_entries() {
+  static const std::vector<PresetManagerEntry> entries{
+      {QT_TR_NOOP("Styles Manager..."), QT_TR_NOOP("Rename, sort, import and export layer style presets."),
+       "editPresetsStylesAction", "preferencesPresetsStylesButton", "edit.presets_styles",
+       &MainWindow::open_style_manager, false},
+      {QT_TR_NOOP("Brush Tips..."), QT_TR_NOOP("Import .abr brushes, define tips and set their spacing."),
+       "editPresetsBrushTipsAction", "preferencesPresetsBrushTipsButton", "edit.presets_brush_tips",
+       &MainWindow::open_brush_tip_manager, true},
+      {QT_TR_NOOP("Saved Brushes..."), QT_TR_NOOP("Use, update or delete brushes saved with their settings."),
+       "editPresetsSavedBrushesAction", "preferencesPresetsSavedBrushesButton", "edit.presets_saved_brushes",
+       &MainWindow::manage_automation_brush_presets, false},
+      {QT_TR_NOOP("Gradient Manager..."), QT_TR_NOOP("Edit, sort and import gradient presets."),
+       "editPresetsGradientsAction", "preferencesPresetsGradientsButton", "edit.presets_gradients",
+       &MainWindow::open_gradient_manager, true},
+      {QT_TR_NOOP("Pattern Manager..."), QT_TR_NOOP("Import .pat patterns or images and sort them into folders."),
+       "editPresetsPatternsAction", "preferencesPresetsPatternsButton", "edit.presets_patterns",
+       &MainWindow::open_pattern_manager, false},
+      {QT_TR_NOOP("Shapes Manager..."), QT_TR_NOOP("Import .csh or SVG shapes for the Custom Shape tool."),
+       "editPresetsCustomShapesAction", "preferencesPresetsCustomShapesButton", "edit.presets_custom_shapes",
+       &MainWindow::open_custom_shape_manager, true},
+      {QT_TR_NOOP("Stroke Presets..."),
+       QT_TR_NOOP("Rename, sort and delete the stroke presets saved in Shape Appearance."),
+       "editPresetsStrokePresetsAction", "preferencesPresetsStrokePresetsButton", "edit.presets_stroke_presets",
+       &MainWindow::open_stroke_preset_manager, false},
+  };
+  return entries;
+}
+
+void MainWindow::open_style_manager(QWidget* parent) {
+  (void)request_style_manager(parent != nullptr ? parent : this, style_library(), {}, /*offer_use=*/false);
+}
+
+void MainWindow::open_stroke_preset_manager(QWidget* parent) {
+  // Preselect the entry the options bar's dash combo shows; edits are saved by the dialog.
+  QString shown;
+  if (vector_stroke_dash_combo_ != nullptr && vector_stroke_dash_combo_->currentData().toInt() >= 0) {
+    shown = vector_stroke_dash_combo_->currentText();
+  }
+  const auto chosen = request_stroke_preset_manager(parent != nullptr ? parent : this, shown);
+  rebuild_vector_stroke_dash_combo();
+  if (chosen.builtin.has_value()) {
+    set_vector_stroke_dash_preset_from_combo(*chosen.builtin);
+  } else if (chosen.saved.has_value()) {
+    apply_vector_stroke_style_preset(*chosen.saved);
+  }
+}
+
+void MainWindow::open_gradient_manager(QWidget* parent) {
+  const auto selected = request_gradient_manager(parent != nullptr ? parent : this, gradient_library(), {});
+  const auto* entry = gradient_library().find_entry(selected);
+  if (entry == nullptr || canvas_ == nullptr) {
+    return;
+  }
+  // The preset as it is: two tracks, midpoints, smoothness, Noise, live Foreground/Background.
+  canvas_->set_gradient_definition(entry->definition);
+  refresh_gradient_controls_from_canvas();
+  save_tool_settings();
+  refresh_document_info();
+  statusBar()->showMessage(tr("Gradient preset: %1").arg(gradient_library_entry_display_name(*entry)));
+}
+
+void MainWindow::open_pattern_manager(QWidget* parent) {
+  const auto selected_storage_id = request_pattern_manager(parent != nullptr ? parent : this, pattern_library(),
+                                                           current_pattern_stamp_pattern_id_);
+  if (selected_storage_id.isEmpty()) {
+    return;
+  }
+  if (const auto* entry = pattern_library().find_entry(selected_storage_id); entry != nullptr) {
+    current_pattern_stamp_pattern_id_ = entry->id;
+    refresh_pattern_stamp_pattern_combo();
+    apply_pattern_stamp_settings_to_canvas(canvas_);
+    save_tool_settings();
+  }
+}
+
+void MainWindow::open_brush_tip_manager(QWidget* parent) {
+  std::function<QImage()> capture;
+  if (canvas_ != nullptr) {
+    capture = [this] { return capture_brush_tip_define_source(); };
+  }
+  request_brush_tip_manager(parent != nullptr ? parent : this, brush_tip_library(), active_brush_tip_id_, capture,
+                            [this](const QString& id) { set_active_brush_tip(id, true); });
+}
+
+QImage MainWindow::capture_brush_tip_define_source() const {
+  if (canvas_ == nullptr) {
+    return {};
+  }
+  const auto& doc = document();
+  const auto canvas_rect = QRect(0, 0, doc.width(), doc.height());
+  auto capture_rect = canvas_rect;
+  const auto selected = canvas_->selected_document_rect();
+  if (selected.has_value()) {
+    capture_rect = selected->intersected(canvas_rect);
+  }
+  if (capture_rect.isEmpty() || capture_rect.width() > 4096 || capture_rect.height() > 4096) {
+    return {};
+  }
+
+  const auto composited =
+      qimage_from_document_rect(doc, capture_rect, true).convertToFormat(QImage::Format_ARGB32);
+  if (composited.isNull()) {
+    return {};
+  }
+  // Photoshop semantics: dark pixels paint, light pixels stay clear, transparency masks out.
+  // A soft or non-rectangular selection additionally shapes the tip.
+  return brush_coverage_from_image(composited, selected.has_value()
+      ? std::function<int(int,int)>([&](int x,int y) { return canvas_->selection_alpha_at(capture_rect.topLeft()+QPoint(x,y)); })
+      : std::function<int(int,int)>());
+}
+
+void MainWindow::define_brush_tip_from_selection() {
+  if (canvas_ == nullptr) {
+    return;
+  }
+  const auto mask = capture_brush_tip_define_source();
+  if (mask.isNull()) {
+    show_status_error(tr("The selection is empty or too large to use as a brush tip (max 4096px)"));
+    return;
+  }
+  bool accepted = false;
+  const auto name = QInputDialog::getText(this, tr("Define Brush Tip"), tr("Name:"), QLineEdit::Normal,
+                                          tr("Brush %1").arg(brush_tip_library().entries().size() + 1),
+                                          &accepted);
+  if (!accepted || name.trimmed().isEmpty()) {
+    return;
+  }
+  const auto id = brush_tip_library().add_tip(name.trimmed(), mask, 0.25);
+  if (id.isEmpty()) {
+    show_status_error(tr("The selection is empty or too large to use as a brush tip (max 4096px)"));
+    return;
+  }
+  set_active_brush_tip(id, false);
+  statusBar()->showMessage(tr("Defined brush tip: %1").arg(name.trimmed()));
+}
+
+std::vector<LayerId> MainWindow::selected_layer_ids() const {
+  std::vector<LayerId> ids;
+  if (layer_list_ == nullptr) {
+    return ids;
+  }
+  ids.reserve(static_cast<std::size_t>(layer_list_->selectedItems().size()));
+  for (int row = 0; row < layer_list_->count(); ++row) {
+    const auto* item = layer_list_->item(row);
+    if (item != nullptr && item->isSelected()) {
+      ids.push_back(static_cast<LayerId>(item->data(kLayerIdRole).toULongLong()));
+    }
+  }
+  return ids;
+}
+
+void MainWindow::report_layer_selection_count(const std::vector<LayerId>& selected_ids) {
+  const std::unordered_set<LayerId> selected(selected_ids.begin(), selected_ids.end());
+  // Count the document tree, not the panel rows. Descendants of a selected
+  // group count once even when they also have selected rows of their own.
+  const auto count_selected = [&](const auto& self, const std::vector<Layer>& layers,
+                                   bool ancestor_selected) -> std::size_t {
+    std::size_t count = 0;
+    for (const auto& layer : layers) {
+      const bool included = ancestor_selected || selected.contains(layer.id());
+      if (included) ++count;
+      count += self(self, layer.children(), included);
+    }
+    return count;
+  };
+  const auto count = has_active_document() && !selected.empty()
+      ? count_selected(count_selected, std::as_const(document()).layers(), false) : 0U;
+  statusBar()->showMessage(count == 1U ? tr("1 layer selected")
+                                      : tr("%1 layers selected").arg(count));
+}
+
+std::vector<LayerId> MainWindow::selected_or_active_layer_ids() const {
+  auto ids = selected_layer_ids();
+  const auto active = has_active_document() ? document().active_layer_id() : std::nullopt;
+  if (ids.empty() && active.has_value()) {
+    ids.push_back(*active);
+  }
+  return ids;
+}
+
+LayerLockFlags MainWindow::layer_id_effective_lock_flags(LayerId id) const {
+  return has_active_document() ? patchy::layer_effective_lock_flags(document().layers(), id) : kLayerLockNone;
+}
+
+LayerLockFlags MainWindow::layer_id_ancestor_lock_flags(LayerId id) const {
+  return has_active_document() ? patchy::layer_ancestor_lock_flags(document().layers(), id) : kLayerLockNone;
+}
+
+bool MainWindow::layer_id_locks_image_pixels(LayerId id) const {
+  return (layer_id_effective_lock_flags(id) & kLayerLockImagePixels) != kLayerLockNone;
+}
+
+bool MainWindow::layer_id_locks_position(LayerId id) const {
+  return (layer_id_effective_lock_flags(id) & kLayerLockPosition) != kLayerLockNone;
+}
+
+bool MainWindow::layer_id_locks_transparent_pixels(LayerId id) const {
+  return (layer_id_effective_lock_flags(id) & kLayerLockTransparentPixels) != kLayerLockNone;
+}
+
+std::vector<LayerId> MainWindow::layer_ids_without_image_pixel_lock(std::vector<LayerId> ids) const {
+  ids.erase(std::remove_if(ids.begin(), ids.end(), [this](LayerId id) { return layer_id_locks_image_pixels(id); }),
+            ids.end());
+  return ids;
+}
+
+bool MainWindow::show_pixel_lock_message_if_all_locked(const std::vector<LayerId>& requested_ids,
+                                                       const std::vector<LayerId>& editable_ids) {
+  if (!requested_ids.empty() && editable_ids.empty()) {
+    show_status_error(tr("Layer pixels are locked."));
+    return true;
+  }
+  return false;
+}
+
+void MainWindow::set_active_layer_from_selection() {
+  if (!updating_layer_controls_) finish_pending_shape_appearance_edit();
+  if (updating_layer_controls_) {
+    return;
+  }
+  if (canvas_ != nullptr && layer_list_ != nullptr &&
+      canvas_->findChild<QTextEdit*>(QStringLiteral("inlineTextEditor")) != nullptr) {
+    // Commit any in-progress text edit before honoring the new selection.
+    // Finishing the editor rebuilds the layer list and can reset the current
+    // item, so remember which layer the user clicked and restore it afterwards.
+    std::optional<LayerId> requested_id;
+    if (auto* item = layer_list_->currentItem(); item != nullptr) {
+      requested_id = static_cast<LayerId>(item->data(kLayerIdRole).toULongLong());
+    }
+    finish_active_text_editor();
+    if (requested_id.has_value() && document().find_layer(*requested_id) != nullptr) {
+      const QSignalBlocker blocker(layer_list_);
+      for (int row = 0; row < layer_list_->count(); ++row) {
+        auto* item = layer_list_->item(row);
+        if (item != nullptr && static_cast<LayerId>(item->data(kLayerIdRole).toULongLong()) == *requested_id) {
+          layer_list_->setCurrentItem(item, QItemSelectionModel::ClearAndSelect);
+          break;
+        }
+      }
+    }
+  }
+  if (preview_dialog_edit_locked()) {
+    show_preview_dialog_edit_lock_message();
+    // Restore the selection to the active layer, but defer the rebuild: clearing
+    // and repopulating the list from inside this itemSelectionChanged handler
+    // deletes the items Qt is still using and crashes.
+    QTimer::singleShot(0, this, [this] { refresh_layer_list(); });
+    return;
+  }
+  const UiProfileScope profile_scope("set_active_layer_from_selection");
+  const QPointer<CanvasWidget> selecting_canvas(canvas_);
+  if (selecting_canvas) { selecting_canvas->begin_processing_operation(tr("Selecting layers...")); }
+  const auto finish_selection = qScopeGuard([selecting_canvas] {
+    if (selecting_canvas) { selecting_canvas->end_processing_operation(); }
+  });
+  const auto selection_progress = [&] {
+    if (selecting_canvas) { selecting_canvas->tick_processing_operation(); }
+  };
+  selection_progress();
+  const auto selected_ids = selected_layer_ids();
+  // A click on the panel's blank area empties the selection while Qt keeps the
+  // current row; that is the user deselecting every layer, so the active layer
+  // goes too (the Move tool's transform box otherwise stayed on the old active
+  // layer, Seth, October 2026). Rebuilds run under a signal blocker and never
+  // get here; an empty list has nothing to deselect.
+  if (selected_ids.empty() && layer_list_->count() > 0 && has_active_document() &&
+      document().active_layer_id().has_value()) {
+    deselect_all_layers();
+    return;
+  }
+  if (canvas_ != nullptr) {
+    canvas_->set_selected_layer_ids(selected_ids);
+  }
+  report_layer_selection_count(selected_ids);
+  if (selected_ids.size() == 1U) {
+    if (const auto* layer = document().find_layer(selected_ids.front()); layer != nullptr && layer_is_artboard(*layer)) {
+      show_artboard_tool_hint_for_move_tool();
+    }
+  }
+  // A pure multi-selection change (same active layer) still decides whether
+  // Combine Shapes applies.
+  refresh_combine_shapes_action_states();
+  refresh_layer_alignment_action_states();
+  selection_progress();
+  if (layer_list_->currentItem() == nullptr) {
+    // Deselecting every layer drops the current row as well. Rows selected
+    // afterwards without one (setSelected from a script or a test) would leave
+    // a selection with no active layer, so the topmost selected row becomes it.
+    QListWidgetItem* topmost = nullptr;
+    const auto selected_items = layer_list_->selectedItems();
+    for (auto* item : selected_items) {
+      if (topmost == nullptr || layer_list_->row(item) < layer_list_->row(topmost)) {
+        topmost = item;
+      }
+    }
+    if (topmost == nullptr) {
+      return;
+    }
+    const QSignalBlocker blocker(layer_list_);
+    layer_list_->setCurrentItem(topmost, QItemSelectionModel::NoUpdate);
+  }
+
+  const auto id = static_cast<LayerId>(layer_list_->currentItem()->data(kLayerIdRole).toULongLong());
+  auto& doc = document();
+  if (doc.find_layer(id) != nullptr) {
+    const auto previous_active = doc.active_layer_id();
+    if (!previous_active.has_value() || *previous_active != id) {
+      doc.set_active_layer(id);
+      if (canvas_ != nullptr) {
+        canvas_->set_layer_edit_target(CanvasWidget::LayerEditTarget::Content);
+      }
+      // The Paths panel's transient layer-path row (and its Photoshop-style
+      // auto-targeting) follows the active layer.
+      refresh_paths_panel();
+    }
+    if (canvas_ != nullptr) {
+      update_layer_target_styles(layer_list_, doc.active_layer_id(), canvas_->layer_edit_target());
+    }
+    refresh_layer_controls();
+    selection_progress();
+    restyle_layer_rows(layer_list_);
+    selection_progress();
+  }
+}
+
+void MainWindow::set_active_layer_opacity(int value) {
+  if (updating_layer_controls_) {
+    return;
+  }
+  if (preview_dialog_edit_locked()) {
+    show_preview_dialog_edit_lock_message();
+    refresh_layer_controls();
+    return;
+  }
+
+  if (!pending_layer_opacity_edit_active_) {
+    if (!has_active_document()) {
+      return;
+    }
+    auto ids = selected_or_active_layer_ids();
+    auto& doc = document();
+    ids.erase(std::remove_if(ids.begin(), ids.end(), [&doc](LayerId id) { return doc.find_layer(id) == nullptr; }),
+              ids.end());
+    if (ids.empty()) {
+      return;
+    }
+    push_undo_snapshot(tr("Opacity"));
+    pending_layer_opacity_ids_ = std::move(ids);
+    pending_layer_opacity_edit_active_ = true;
+  }
+
+  pending_layer_opacity_value_ = std::clamp(value, 0, 100);
+  if (layer_opacity_apply_timer_ != nullptr) {
+    layer_opacity_apply_timer_->start();
+  } else {
+    apply_pending_layer_opacity();
+  }
+  if (layer_opacity_idle_timer_ != nullptr) {
+    layer_opacity_idle_timer_->start();
+  }
+}
+
+void MainWindow::apply_pending_layer_opacity() {
+  if (!pending_layer_opacity_value_.has_value()) {
+    return;
+  }
+  const auto value = *pending_layer_opacity_value_;
+  pending_layer_opacity_value_.reset();
+  if (!has_active_document()) {
+    return;
+  }
+
+  auto& doc = document();
+  bool changed = false;
+  for (const auto id : pending_layer_opacity_ids_) {
+    auto* layer = doc.find_layer(id);
+    if (layer == nullptr) {
+      continue;
+    }
+    layer->set_opacity(static_cast<float>(value) / 100.0F);
+    changed = true;
+  }
+  if (changed && canvas_ != nullptr) {
+    canvas_->document_changed_async_preview();
+  }
+}
+
+void MainWindow::finish_pending_layer_opacity_edit() {
+  if (layer_opacity_apply_timer_ != nullptr) {
+    layer_opacity_apply_timer_->stop();
+  }
+  if (layer_opacity_idle_timer_ != nullptr) {
+    layer_opacity_idle_timer_->stop();
+  }
+  apply_pending_layer_opacity();
+  reset_pending_layer_opacity_edit();
+}
+
+void MainWindow::reset_pending_layer_opacity_edit() {
+  if (layer_opacity_digit_finish_timer_ != nullptr) {
+    layer_opacity_digit_finish_timer_->stop();
+  }
+  pending_layer_opacity_ids_.clear();
+  pending_layer_opacity_value_.reset();
+  pending_layer_opacity_edit_active_ = false;
+}
+
+namespace {
+
+// A brief accent outline and tint over one options-bar control that fades out over about a
+// second: "this value just changed", without taking focus or needing a dismissal (local-035,
+// a bare digit setting Flow because Airbrush is on). One overlay per control, a sibling
+// stacked above it and transparent to the mouse; a repeat restarts the fade.
+constexpr int kOptionAttentionPulseMs = 1000;
+
+class OptionAttentionPulse final : public QWidget {
+public:
+  explicit OptionAttentionPulse(QWidget* target) : QWidget(target->parentWidget()), target_(target) {
+    setObjectName(target->objectName() + QStringLiteral("AttentionPulse"));
+    setAttribute(Qt::WA_TransparentForMouseEvents);
+    setAttribute(Qt::WA_NoSystemBackground);
+    setFocusPolicy(Qt::NoFocus);
+    setProperty("pulseActive", false);
+    fade_.setDuration(kOptionAttentionPulseMs);
+    fade_.setStartValue(1.0);
+    fade_.setEndValue(0.0);
+    fade_.setEasingCurve(QEasingCurve::InQuad);
+    connect(&fade_, &QVariantAnimation::valueChanged, this, [this](const QVariant& value) {
+      strength_ = value.toReal();
+      update();
+    });
+    connect(&fade_, &QVariantAnimation::finished, this, [this] {
+      setProperty("pulseActive", false);
+      hide();
+    });
+    hide();
+  }
+
+  void start() {
+    if (target_ == nullptr || !target_->isVisible()) {
+      return;
+    }
+    fade_.stop();
+    strength_ = 1.0;
+    setGeometry(target_->geometry().adjusted(-2, -2, 2, 2));
+    setProperty("pulseActive", true);
+    show();
+    raise();
+    update();
+    fade_.start();
+  }
+
+protected:
+  void paintEvent(QPaintEvent* event) override {
+    static_cast<void>(event);
+    QPainter painter(this);
+    painter.setRenderHint(QPainter::Antialiasing);
+    auto line = theme().accent_bright;
+    line.setAlphaF(static_cast<float>(strength_));
+    auto fill = theme().accent_bright;
+    fill.setAlphaF(static_cast<float>(0.18 * strength_));
+    painter.setPen(QPen(line, 2.0));
+    painter.setBrush(fill);
+    painter.drawRoundedRect(QRectF(rect()).adjusted(1.0, 1.0, -1.0, -1.0), 4.0, 4.0);
+  }
+
+private:
+  QPointer<QWidget> target_;
+  qreal strength_{0.0};
+  QVariantAnimation fade_;
+};
+
+void pulse_option_attention(QWidget* target) {
+  if (target == nullptr || target->parentWidget() == nullptr) {
+    return;
+  }
+  // No Q_OBJECT on the overlay, so look it up as a QWidget by name.
+  auto* pulse = dynamic_cast<OptionAttentionPulse*>(target->parentWidget()->findChild<QWidget*>(
+      target->objectName() + QStringLiteral("AttentionPulse"), Qt::FindDirectChildrenOnly));
+  if (pulse == nullptr) {
+    pulse = new OptionAttentionPulse(target);
+  }
+  pulse->start();
+}
+
+}  // namespace
+
+void MainWindow::show_airbrush_flow_digit_cue() {
+  // The status message names Airbrush too; with the options bar hidden it is the only cue.
+  for (const auto* name : {"brushFlowSpin", "brushAirbrushCheck"}) {
+    pulse_option_attention(findChild<QWidget*>(QLatin1String(name)));
+  }
+}
+
+void MainWindow::set_layer_opacity_from_digit_keys(int percent) {
+  if (!has_active_document() || opacity_spin_ == nullptr || !opacity_spin_->isEnabled()) {
+    return;
+  }
+  if (preview_dialog_edit_locked()) {
+    show_preview_dialog_edit_lock_message();
+    return;
+  }
+  const auto value = std::clamp(percent, 0, 100);
+  const auto ids = selected_or_active_layer_ids();
+  const auto& doc = std::as_const(document());
+  const bool unchanged = std::all_of(ids.begin(), ids.end(), [&doc, value](LayerId id) {
+    const auto* layer = doc.find_layer(id);
+    return layer == nullptr || static_cast<int>(std::lround(layer->opacity() * 100.0F)) == value;
+  });
+  if (!unchanged) {
+    // The field's own path: the panel shows the value and a run is one undo entry.
+    if (opacity_spin_->value() != value) {
+      opacity_spin_->setValue(value);
+    } else {
+      set_active_layer_opacity(value);  // the active layer has it; other selected layers do not
+    }
+    // The digit timer, not the field's short idle pause, ends the run.
+    if (layer_opacity_idle_timer_ != nullptr) {
+      layer_opacity_idle_timer_->stop();
+    }
+    if (pending_layer_opacity_edit_active_ && layer_opacity_digit_finish_timer_ != nullptr) {
+      layer_opacity_digit_finish_timer_->start();
+    }
+  }
+  statusBar()->showMessage(tr("Layer opacity: %1%").arg(value));
+}
+
+void MainWindow::set_active_layer_fill_opacity(int value) {
+  if (updating_layer_controls_) return;
+  if (preview_dialog_edit_locked()) {
+    show_preview_dialog_edit_lock_message();
+    refresh_layer_controls();
+    return;
+  }
+  if (!pending_layer_fill_opacity_edit_active_) {
+    if (!has_active_document()) return;
+    auto ids = selected_or_active_layer_ids();
+    auto& doc = document();
+    ids.erase(std::remove_if(ids.begin(), ids.end(), [&doc](LayerId id) {
+                const auto* layer = doc.find_layer(id);
+                return layer == nullptr || layer->kind() == LayerKind::Group;
+              }), ids.end());
+    if (ids.empty()) return;
+    push_undo_snapshot(tr("Fill Opacity"));
+    pending_layer_fill_opacity_ids_ = std::move(ids);
+    pending_layer_fill_opacity_edit_active_ = true;
+  }
+  pending_layer_fill_opacity_value_ = std::clamp(value, 0, 100);
+  if (layer_fill_opacity_apply_timer_ != nullptr) layer_fill_opacity_apply_timer_->start();
+  else apply_pending_layer_fill_opacity();
+  if (layer_fill_opacity_idle_timer_ != nullptr) layer_fill_opacity_idle_timer_->start();
+}
+
+void MainWindow::apply_pending_layer_fill_opacity() {
+  if (!pending_layer_fill_opacity_value_.has_value()) return;
+  const auto value = *pending_layer_fill_opacity_value_;
+  pending_layer_fill_opacity_value_.reset();
+  if (!has_active_document()) return;
+  bool changed = false;
+  for (const auto id : pending_layer_fill_opacity_ids_) {
+    if (auto* layer = document().find_layer(id); layer != nullptr && layer->kind() != LayerKind::Group) {
+      layer->set_fill_opacity(static_cast<float>(value) / 100.0F);
+      changed = true;
+    }
+  }
+  if (changed && canvas_ != nullptr) canvas_->document_changed_async_preview();
+}
+
+void MainWindow::finish_pending_layer_fill_opacity_edit() {
+  if (layer_fill_opacity_apply_timer_ != nullptr) layer_fill_opacity_apply_timer_->stop();
+  if (layer_fill_opacity_idle_timer_ != nullptr) layer_fill_opacity_idle_timer_->stop();
+  apply_pending_layer_fill_opacity();
+  reset_pending_layer_fill_opacity_edit();
+}
+
+void MainWindow::reset_pending_layer_fill_opacity_edit() {
+  pending_layer_fill_opacity_ids_.clear();
+  pending_layer_fill_opacity_value_.reset();
+  pending_layer_fill_opacity_edit_active_ = false;
+}
+
+void MainWindow::set_active_layer_blend(int index) {
+  if (updating_layer_controls_ || index < 0) {
+    return;
+  }
+  if (preview_dialog_edit_locked()) {
+    show_preview_dialog_edit_lock_message();
+    refresh_layer_controls();
+    return;
+  }
+  // Stepping through modes with the arrow keys or the wheel is one run and one
+  // undo entry, like an Opacity drag; the run ends after a pause or at the next
+  // history change or layer-control refresh.
+  if (!pending_layer_blend_edit_active_) {
+    if (!has_active_document()) {
+      return;
+    }
+    auto ids = selected_or_active_layer_ids();
+    if (ids.empty()) {
+      return;
+    }
+    push_undo_snapshot(tr("Blend mode"));
+    pending_layer_blend_ids_ = std::move(ids);
+    pending_layer_blend_edit_active_ = true;
+  }
+  if (layer_blend_idle_timer_ != nullptr) {
+    layer_blend_idle_timer_->start();
+  }
+  auto& doc = document();
+  const auto mode = static_cast<BlendMode>(blend_combo_->itemData(index).toInt());
+  Rect affected;
+  for (const auto id : pending_layer_blend_ids_) {
+    auto* layer = doc.find_layer(id);
+    // Only folders pass through; the other selected layers keep their mode.
+    if (layer == nullptr || (mode == BlendMode::PassThrough && layer->kind() != LayerKind::Group)) {
+      continue;
+    }
+    layer->set_blend_mode(mode);
+    affected = unite_rect(affected, layer_render_bounds(*layer));
+  }
+  // A step (arrow keys, wheel, Shift+Plus/Minus) renders on a worker, which keeps drawing the
+  // previous frame and renders only the newest mode once one render is in flight: a quick
+  // run of steps never waits on the compositor (#476). A choice from the list renders at once.
+  if (blend_mode_combo_stepping(blend_combo_)) {
+    canvas_->document_changed_async_preview();
+  } else {
+    canvas_->document_changed(to_qrect(affected));
+  }
+  // A Paint.NET mode no selected layer uses any more leaves the list (GitHub issue 379).
+  // Its rows sit after Photoshop's, so the rows the run steps through keep their places.
+  std::vector<BlendMode> in_use;
+  for (const auto id : selected_or_active_layer_ids()) {
+    if (const auto* layer = std::as_const(doc).find_layer(id); layer != nullptr) {
+      in_use.push_back(layer->blend_mode());
+    }
+  }
+  set_non_photoshop_blend_modes_offered(blend_combo_, in_use);
+}
+
+// Photoshop's Shift+Plus / Shift+Minus for the layer mode (GitHub issue 476): one step down or
+// up the Layers panel's list with the closed combo's rules (separators, modes the document's
+// depth cannot use and Paint.NET's modes skipped, wrapping around at either end), committed through
+// the combo, so a run of presses is one undo entry like a run of arrow-key steps. With a tool
+// whose options bar has a blend Mode list (Brush, Healing Brush) the keys step that list instead,
+// saved like a choice from it.
+QComboBox* MainWindow::blend_mode_shortcut_tool_combo() const {
+  if (canvas_ == nullptr) {
+    return nullptr;
+  }
+  switch (canvas_->tool()) {
+    case CanvasTool::Brush:
+      return brush_mode_combo_;
+    case CanvasTool::Healing:
+      return healing_mode_combo_;
+    default:
+      return nullptr;
+  }
+}
+
+void MainWindow::step_layer_blend_mode(int direction) {
+  if (auto* tool_mode_combo = blend_mode_shortcut_tool_combo(); tool_mode_combo != nullptr) {
+    if (!tool_mode_combo->isEnabled() || tool_mode_combo->view()->isVisible()) {
+      return;
+    }
+    const auto index = blend_mode_step_index(tool_mode_combo, direction);
+    if (index >= 0 && index != tool_mode_combo->currentIndex()) {
+      step_blend_mode_combo_to(tool_mode_combo, index);
+      statusBar()->showMessage(tr("Blend mode: %1").arg(tool_mode_combo->itemText(index)));
+    }
+    return;
+  }
+  if (!has_active_document() || blend_combo_ == nullptr || !blend_combo_->isEnabled() ||
+      blend_combo_->view()->isVisible()) {
+    return;
+  }
+  if (preview_dialog_edit_locked()) {
+    show_preview_dialog_edit_lock_message();
+    return;
+  }
+  if (selected_or_active_layer_ids().empty()) {
+    return;
+  }
+  const auto index = blend_mode_step_index(blend_combo_, direction);
+  if (index < 0 || index == blend_combo_->currentIndex()) {
+    return;
+  }
+  step_blend_mode_combo_to(blend_combo_, index);
+  statusBar()->showMessage(tr("Blend mode: %1").arg(blend_combo_->itemText(index)));
+}
+
+void MainWindow::set_blend_mode_from_shortcut(BlendMode mode) {
+  const auto row_enabled = [](const QComboBox* combo, int index) {
+    const auto* model = combo->model();
+    return index >= 0 && (model->flags(model->index(index, combo->modelColumn())) & Qt::ItemIsEnabled) != 0;
+  };
+  if (auto* tool_mode_combo = blend_mode_shortcut_tool_combo(); tool_mode_combo != nullptr) {
+    if (!tool_mode_combo->isEnabled() || tool_mode_combo->view()->isVisible()) {
+      return;
+    }
+    int index = -1;
+    if (tool_mode_combo == brush_mode_combo_) {
+      index = tool_mode_combo->findData(paint_mode_item_data(PaintMode::of(mode)));
+    } else {
+      // The Healing Brush lists a few modes, plus Replace, which is not a blend mode.
+      for (int row = 0; row < tool_mode_combo->count() && index < 0; ++row) {
+        const auto healing = static_cast<HealingMode>(tool_mode_combo->itemData(row).toInt());
+        if (healing != HealingMode::Replace && healing_mode_blend(healing) == mode) {
+          index = row;
+        }
+      }
+    }
+    if (!row_enabled(tool_mode_combo, index)) {
+      return;
+    }
+    if (index != tool_mode_combo->currentIndex()) {
+      step_blend_mode_combo_to(tool_mode_combo, index);
+    }
+    statusBar()->showMessage(tr("Blend mode: %1").arg(tool_mode_combo->itemText(index)));
+    return;
+  }
+  if (!has_active_document() || blend_combo_ == nullptr || blend_combo_->view()->isVisible()) {
+    return;
+  }
+  if (preview_dialog_edit_locked()) {
+    show_preview_dialog_edit_lock_message();
+    return;
+  }
+  // The layer blend combo is disabled with no layer selected: say why the shortcut did nothing.
+  if (selected_or_active_layer_ids().empty()) {
+    show_select_layer_first(tr("Blend Mode"));
+    return;
+  }
+  if (!blend_combo_->isEnabled()) {
+    return;
+  }
+  const auto ids = selected_or_active_layer_ids();
+  if (ids.empty()) {
+    return;
+  }
+  const auto index = blend_combo_->findData(static_cast<int>(mode));
+  if (!row_enabled(blend_combo_, index)) {
+    return;
+  }
+  if (index != blend_combo_->currentIndex()) {
+    step_blend_mode_combo_to(blend_combo_, index);
+  } else {
+    // The active layer already uses the mode; other selected layers may not.
+    const auto& doc = std::as_const(document());
+    const bool all_set = std::all_of(ids.begin(), ids.end(), [&doc, mode](LayerId id) {
+      const auto* layer = doc.find_layer(id);
+      return layer == nullptr || layer->blend_mode() == mode;
+    });
+    if (!all_set) {
+      set_active_layer_blend(index);
+    }
+  }
+  statusBar()->showMessage(tr("Blend mode: %1").arg(blend_combo_->itemText(index)));
+}
+
+void MainWindow::finish_pending_layer_blend_edit() {
+  if (layer_blend_idle_timer_ != nullptr) {
+    layer_blend_idle_timer_->stop();
+  }
+  pending_layer_blend_ids_.clear();
+  pending_layer_blend_edit_active_ = false;
+}
+
+// While the Layers panel's blend list is open, the highlighted mode shows on the canvas
+// (GitHub issue 367). Only the layers' modes change: no history entry and no session
+// revision, so the document is not marked modified. Closing the list puts every mode
+// back before Qt reports a chosen item, whose currentIndexChanged then commits through
+// set_active_layer_blend as one ordinary history entry.
+void MainWindow::begin_layer_blend_preview() {
+  end_layer_blend_preview();
+  if (updating_layer_controls_ || !has_active_document() || preview_dialog_edit_locked()) {
+    return;
+  }
+  auto ids = selected_or_active_layer_ids();
+  if (ids.empty()) {
+    return;
+  }
+  const auto& doc = std::as_const(document());
+  LayerBlendPreview preview;
+  preview.session_id = session().session_id;
+  for (const auto id : ids) {
+    if (const auto* layer = doc.find_layer(id); layer != nullptr) {
+      preview.originals.emplace_back(id, layer->blend_mode());
+    }
+  }
+  preview.selection = std::move(ids);
+  layer_blend_preview_ = std::move(preview);
+}
+
+void MainWindow::preview_layer_blend(int index) {
+  if (!layer_blend_preview_.has_value() || updating_layer_controls_ || index < 0 || blend_combo_ == nullptr) {
+    return;
+  }
+  const auto* model = blend_combo_->model();
+  if (!(model->flags(model->index(index, blend_combo_->modelColumn())) & Qt::ItemIsEnabled)) {
+    return;
+  }
+  // Coalesced: a sweep across the list renders only the mode it rests on.
+  layer_blend_preview_->pending_mode = static_cast<BlendMode>(blend_combo_->itemData(index).toInt());
+  if (layer_blend_preview_timer_ != nullptr) {
+    layer_blend_preview_timer_->start();
+  } else {
+    apply_pending_layer_blend_preview();
+  }
+}
+
+void MainWindow::apply_pending_layer_blend_preview() {
+  if (!layer_blend_preview_.has_value() || !layer_blend_preview_->pending_mode.has_value()) {
+    return;
+  }
+  const auto mode = *layer_blend_preview_->pending_mode;
+  layer_blend_preview_->pending_mode.reset();
+  auto* owner = sessions_.find_by_id(layer_blend_preview_->session_id);
+  if (owner == nullptr || owner != active_session()) {
+    return;
+  }
+  bool changed = false;
+  for (const auto& [id, original] : layer_blend_preview_->originals) {
+    const auto* layer = std::as_const(owner->document).find_layer(id);
+    if (layer == nullptr) {
+      continue;
+    }
+    // Only folders pass through, as in set_active_layer_blend.
+    const auto target = mode == BlendMode::PassThrough && layer->kind() != LayerKind::Group ? original : mode;
+    if (layer->blend_mode() == target) {
+      continue;
+    }
+    owner->document.find_layer(id)->set_blend_mode(target);
+    changed = true;
+  }
+  // The async path keeps the list responsive on large documents and renders only the
+  // newest mode when hovers outrun the compositor.
+  if (changed && owner->canvas != nullptr) {
+    owner->canvas->document_changed_async_preview();
+  }
+}
+
+void MainWindow::end_layer_blend_preview() {
+  if (layer_blend_preview_timer_ != nullptr) {
+    layer_blend_preview_timer_->stop();
+  }
+  if (!layer_blend_preview_.has_value()) {
+    return;
+  }
+  const auto preview = std::move(*layer_blend_preview_);
+  layer_blend_preview_.reset();
+  auto* owner = sessions_.find_by_id(preview.session_id);
+  if (owner == nullptr) {
+    return;
+  }
+  // The restored modes carry new revisions: a cache keyed on the old ones may hold
+  // the previewed render, so nothing is wound back.
+  Rect affected;
+  bool changed = false;
+  for (const auto& [id, original] : preview.originals) {
+    const auto* layer = std::as_const(owner->document).find_layer(id);
+    if (layer == nullptr || layer->blend_mode() == original) {
+      continue;
+    }
+    owner->document.find_layer(id)->set_blend_mode(original);
+    affected = unite_rect(affected, layer_render_bounds(*layer));
+    changed = true;
+  }
+  if (changed && owner->canvas != nullptr) {
+    owner->canvas->document_changed(to_qrect(affected));
+  }
+}
+
+void MainWindow::cancel_layer_blend_preview() {
+  if (!layer_blend_preview_.has_value()) {
+    return;
+  }
+  if (blend_combo_ != nullptr && blend_combo_->view()->isVisible()) {
+    blend_combo_->hidePopup();
+  }
+  end_layer_blend_preview();
+}
+
+bool MainWindow::layer_blend_preview_matches_active() const {
+  const auto* active = active_session();
+  return layer_blend_preview_.has_value() && active != nullptr &&
+         active->session_id == layer_blend_preview_->session_id &&
+         selected_or_active_layer_ids() == layer_blend_preview_->selection;
+}
+
+void MainWindow::set_layer_lock_flag_state(LayerId id, LayerLockFlags flag, bool locked) {
+  if (updating_layer_controls_ || !has_active_document()) {
+    return;
+  }
+  if (preview_dialog_edit_locked()) {
+    show_preview_dialog_edit_lock_message();
+    refresh_layer_controls();
+    return;
+  }
+  auto* layer = document().find_layer(id);
+  if (layer == nullptr || ((layer_lock_flags(*layer) & flag) != kLayerLockNone) == locked) {
+    refresh_layer_list();
+    refresh_layer_controls();
+    return;
+  }
+  push_undo_snapshot(tr("Lock layer"));
+  set_layer_lock_flag(*layer, flag, locked);
+  refresh_layer_list();
+  refresh_layer_controls();
+  statusBar()->showMessage(locked ? tr("Layer lock enabled") : tr("Layer lock disabled"));
+}
+
+void MainWindow::set_active_layer_lock_flag(LayerLockFlags flag, bool locked) {
+  if (updating_layer_controls_) {
+    return;
+  }
+  if (preview_dialog_edit_locked()) {
+    show_preview_dialog_edit_lock_message();
+    refresh_layer_controls();
+    return;
+  }
+  // The lock buttons don't take focus, so an open inline text edit would not auto-commit and
+  // the snapshot below would embed its provisional layer; settle the edit first like every
+  // other document-mutating action.
+  finish_active_text_editor();
+  const auto ids = selected_or_active_layer_ids();
+  if (ids.empty()) {
+    return;
+  }
+  auto& doc = document();
+  push_undo_snapshot(tr("Lock layer"));
+  for (const auto id : ids) {
+    auto* layer = doc.find_layer(id);
+    if (layer == nullptr) {
+      continue;
+    }
+    set_layer_lock_flag(*layer, flag, locked);
+  }
+  // The rebuild keeps only the active row; a multi-selection stays selected, so a second
+  // press of a lock (or of "/", GitHub issue 529) acts on the same layers.
+  const auto active = std::as_const(doc).active_layer_id();
+  refresh_layer_list();
+  if (ids.size() > 1) {
+    select_layers_in_layer_list(ids, active.value_or(ids.front()));
+  }
+  refresh_layer_controls();
+  if (flag == kLayerLockArtboardAutonest) {
+    statusBar()->showMessage(locked ? tr("Auto-nesting prevented") : tr("Auto-nesting allowed"));
+  } else {
+    statusBar()->showMessage(locked ? tr("Layer lock enabled") : tr("Layer lock disabled"));
+  }
+}
+
+void MainWindow::refresh_layer_clipping_action_state() {
+  if (layer_clipping_mask_action_ == nullptr) {
+    return;
+  }
+  bool enabled = false;
+  bool clipped = false;
+  if (canvas_ != nullptr && has_active_document()) {
+    const auto& doc = std::as_const(document());
+    if (const auto active = doc.active_layer_id(); active.has_value()) {
+      if (const auto location = find_layer_location(doc.layers(), *active);
+          location.has_value() && location->siblings != nullptr) {
+        const auto& layer = (*location->siblings)[location->index];
+        clipped = layer.clipped();
+        if (layer.kind() != LayerKind::Group) {
+          enabled = clipped || effective_clip_base(*location->siblings, location->index) != nullptr;
+        }
+      }
+    }
+  }
+  layer_clipping_mask_action_->setText(clipped ? tr("Release Clipping Mask") : tr("Create Clipping Mask"));
+  layer_clipping_mask_action_->setEnabled(enabled);
+}
+
+void MainWindow::toggle_active_layer_clipping() {
+  if (updating_layer_controls_) {
+    return;
+  }
+  if (preview_dialog_edit_locked()) {
+    show_preview_dialog_edit_lock_message();
+    return;
+  }
+  finish_active_text_editor();
+  auto& doc = document();
+  const auto active = doc.active_layer_id();
+  if (!active.has_value()) {
+    show_select_layer_first(tr("Create Clipping Mask"));
+    return;
+  }
+  const auto location = find_layer_location(std::as_const(doc).layers(), *active);
+  if (!location.has_value() || location->siblings == nullptr) {
+    return;
+  }
+  const auto& layer = (*location->siblings)[location->index];
+  const bool clipped = layer.clipped();
+  if (layer.kind() == LayerKind::Group) {
+    return;
+  }
+  if (!clipped && effective_clip_base(*location->siblings, location->index) == nullptr) {
+    show_status_error(tr("Create Clipping Mask needs a pixel layer or group below"));
+    return;
+  }
+
+  push_undo_snapshot(clipped ? tr("Release clipping mask") : tr("Create clipping mask"));
+  auto* mutable_layer = doc.find_layer(*active);
+  if (mutable_layer == nullptr) {
+    return;
+  }
+  mutable_layer->set_clipped(!clipped);
+  QRect affected = to_qrect(layer_render_bounds(*mutable_layer));
+  // The base's rendering changes too (the isolated group re-forms around it);
+  // bump its render revision so the undo diff repaints its footprint.
+  if (const auto base_location = find_layer_location(std::as_const(doc).layers(), *active);
+      base_location.has_value()) {
+    if (const auto* base = effective_clip_base(*base_location->siblings, base_location->index); base != nullptr) {
+      if (auto* mutable_base = doc.find_layer(base->id()); mutable_base != nullptr) {
+        mutable_base->mark_render_changed();
+        affected = affected.united(to_qrect(layer_render_bounds(*mutable_base)));
+      }
+    }
+  }
+  if (canvas_ != nullptr) {
+    canvas_->document_changed(affected);
+  }
+  refresh_layer_list();
+  refresh_layer_controls();
+  statusBar()->showMessage(clipped ? tr("Clipping mask released") : tr("Clipping mask created"));
+}
+
+void MainWindow::set_active_layer_lock_all(bool locked) {
+  if (updating_layer_controls_) {
+    return;
+  }
+  if (preview_dialog_edit_locked()) {
+    show_preview_dialog_edit_lock_message();
+    refresh_layer_controls();
+    return;
+  }
+  // See set_active_layer_lock_flag: settle an open inline text edit before snapshotting.
+  finish_active_text_editor();
+  const auto ids = selected_or_active_layer_ids();
+  if (ids.empty()) {
+    return;
+  }
+  auto& doc = document();
+  push_undo_snapshot(tr("Lock layer"));
+  for (const auto id : ids) {
+    auto* layer = doc.find_layer(id);
+    if (layer == nullptr) {
+      continue;
+    }
+    set_layer_locks_all(*layer, locked);
+  }
+  refresh_layer_list();
+  refresh_layer_controls();
+  statusBar()->showMessage(locked ? tr("Layer locked") : tr("Layer unlocked"));
+}
+
+// Layer > Lock Layers... (GitHub issue 544): every lock of the selected layers in one dialog,
+// applied as one undo step. A lock left partly checked keeps each layer's own state.
+void MainWindow::show_layer_locks_dialog() {
+  if (!has_active_document()) {
+    return;
+  }
+  if (preview_dialog_edit_locked()) {
+    show_preview_dialog_edit_lock_message();
+    return;
+  }
+  finish_active_text_editor();
+  const auto ids = selected_or_active_layer_ids();
+  std::vector<LayerLockFlags> flags;
+  flags.reserve(ids.size());
+  for (const auto id : ids) {
+    if (const auto* layer = std::as_const(document()).find_layer(id); layer != nullptr) {
+      flags.push_back(layer_lock_flags(*layer));
+    }
+  }
+  if (flags.empty()) {
+    statusBar()->showMessage(tr("No layers selected"));
+    return;
+  }
+  const auto initial = layer_lock_choices_for(flags);
+  const auto chosen = request_layer_locks(this, initial, static_cast<int>(flags.size()));
+  if (!chosen.has_value() || !has_active_document()) {
+    return;
+  }
+  // The dialog is modal, but a script or a closed document can still change the stack meanwhile.
+  auto& doc = document();
+  bool changes = false;
+  for (const auto id : ids) {
+    if (const auto* layer = std::as_const(doc).find_layer(id); layer != nullptr) {
+      const auto current = layer_lock_flags(*layer);
+      changes = changes || apply_layer_lock_choices(current, *chosen) != current;
+    }
+  }
+  if (!changes) {
+    return;
+  }
+  push_undo_snapshot(tr("Lock layer"));
+  for (const auto id : ids) {
+    if (auto* layer = doc.find_layer(id); layer != nullptr) {
+      set_layer_lock_flags(*layer, apply_layer_lock_choices(layer_lock_flags(*layer), *chosen));
+    }
+  }
+  const auto active = std::as_const(doc).active_layer_id();
+  refresh_layer_list();
+  if (ids.size() > 1) {
+    select_layers_in_layer_list(ids, active.value_or(ids.front()));
+  }
+  refresh_layer_controls();
+  statusBar()->showMessage(tr("Layer locks changed"));
+}
+
+void MainWindow::choose_primary_color() {
+  show_color_panel(true);
+}
+
+void MainWindow::choose_secondary_color() {
+  show_color_panel(false);
+}
+
+void MainWindow::choose_text_color() {
+  if (canvas_ == nullptr) {
+    return;
+  }
+  sync_text_options_from_active_editor();
+  if (color_dialog_ != nullptr) {
+    if (color_dialog_->property("patchy.colorTarget").toString() == QStringLiteral("text")) {
+      color_dialog_->show();
+      color_dialog_->raise();
+      color_dialog_->activateWindow();
+      return;
+    }
+    color_dialog_->close();
+  }
+
+  const bool opened_in_session = canvas_->findChild<QTextEdit*>(QStringLiteral("inlineTextEditor")) != nullptr;
+  auto* dialog = create_patchy_color_panel(
+      this, current_text_color(), tr("Text Color"),
+      [this, opened_in_session](QColor color) {
+        if (canvas_ == nullptr) {
+          return;
+        }
+        color.setAlpha(255);
+        // Each pick goes to the session open NOW and its current selection, never to the one
+        // the window was opened from: another word or another text layer selected while the
+        // window stays open takes the next pick (GitHub issue 371).
+        auto* editor = canvas_->findChild<QTextEdit*>(QStringLiteral("inlineTextEditor"));
+        if (editor != nullptr && !editor->property(kTextEditorFinishedProperty).toBool()) {
+          canvas_->set_primary_color(color);
+          editor->setProperty("patchy.documentTextColor", color);
+          apply_text_color_to_active_editor();
+        } else if (opened_in_session) {
+          // The session it was opened for is over: a pick is a foreground pick.
+          apply_foreground_color(color);
+        } else {
+          // No session when the panel opened: the selected text layers take the color (issue 31).
+          canvas_->set_primary_color(color);
+          apply_text_color_to_selected_layers_debounced(color);
+        }
+        refresh_color_buttons();
+        statusBar()->showMessage(tr("Text color changed"));
+      },
+      // Live like the Foreground Color window, but this window reads OK (GitHub issue 371).
+      QDialogButtonBox::Ok);
+  dialog->setProperty("patchy.colorTarget", QStringLiteral("text"));
+  track_color_window_drag(*dialog);
+  color_dialog_ = dialog;
+  connect(dialog, &QObject::destroyed, this, [this, dialog] {
+    if (color_dialog_ == dialog) {
+      color_dialog_ = nullptr;
+    }
+    // Back to the session's text with its selection intact, so the first keystroke replaces
+    // a still-selected "Type" placeholder in the new color (GitHub issue 175).
+    QTimer::singleShot(0, this, [this] { return_keyboard_to_text_editor(); });
+  });
+  dialog->show();
+  dialog->raise();
+  dialog->activateWindow();
+}
+
+void MainWindow::show_color_panel(bool foreground) {
+  if (canvas_ == nullptr) {
+    return;
+  }
+  const auto color_target = foreground ? QStringLiteral("foreground") : QStringLiteral("background");
+  if (color_dialog_ != nullptr) {
+    if (color_dialog_->property("patchy.colorTarget").toString() == color_target) {
+      color_dialog_->show();
+      color_dialog_->raise();
+      color_dialog_->activateWindow();
+      return;
+    }
+    color_dialog_->close();
+  }
+
+  auto* dialog = create_patchy_color_panel(
+      this, foreground ? canvas_->primary_color() : canvas_->secondary_color(),
+      foreground ? tr("Foreground Color") : tr("Background Color"),
+      [this, foreground](QColor color) {
+        // The panel is non-modal and outlives sessions: after Close All there is no canvas.
+        if (canvas_ == nullptr) {
+          return;
+        }
+        color.setAlpha(255);
+        // In a 32-bit document a new base color keeps the Intensity the window shows.
+        const auto* hdr = color_dialog_ != nullptr ? color_dialog_->findChild<HdrColorControls*>() : nullptr;
+        const auto kept = hdr != nullptr && hdr->isVisibleTo(color_dialog_) ? hdr->stops() : 0.0;
+        if (foreground) {
+          apply_foreground_color(color);
+          canvas_->paint_intensity().foreground = kept;
+          statusBar()->showMessage(tr("Foreground color changed"));
+        } else {
+          canvas_->set_secondary_color(color);
+          canvas_->paint_intensity().background = kept;
+          statusBar()->showMessage(tr("Background color changed"));
+        }
+        refresh_color_buttons();
+      });
+  dialog->setProperty("patchy.colorTarget", color_target);
+  track_color_window_drag(*dialog);
+  // The 32-bit controls (docs/high-bit-depth-color.md, "Color choice at 32 bits"), shown by
+  // refresh_hdr_exposure_control while the active document is 32-bit.
+  auto* hdr = add_hdr_color_controls(*dialog);
+  connect(hdr, &HdrColorControls::intensity_changed, this, [this, foreground](double stops) {
+    if (canvas_ == nullptr) {
+      return;
+    }
+    (foreground ? canvas_->paint_intensity().foreground : canvas_->paint_intensity().background) = stops;
+    refresh_color_buttons();
+    statusBar()->showMessage(foreground ? tr("Foreground color changed") : tr("Background color changed"));
+  });
+  connect(hdr, &HdrColorControls::linear_color_entered, this, [this, foreground, dialog](QColor base, double stops) {
+    if (canvas_ == nullptr) {
+      return;
+    }
+    if (foreground) {
+      apply_foreground_color(base);
+      canvas_->paint_intensity().foreground = stops;
+    } else {
+      canvas_->set_secondary_color(base);
+      canvas_->paint_intensity().background = stops;
+    }
+    if (auto* picker = dialog->findChild<PatchyColorPicker*>(QStringLiteral("patchyAdvancedColorPicker"))) {
+      const QSignalBlocker blocker(picker);
+      picker->setCurrentColor(base);
+    }
+    refresh_color_buttons();
+    statusBar()->showMessage(foreground ? tr("Foreground color changed") : tr("Background color changed"));
+  });
+  // The Foreground Color window's Alt pick sets the background, as the docked Color
+  // panel's does (GitHub issue 365). The Background Color window has none: it already
+  // edits the background, and Alt there keeps acting like a plain click.
+  if (foreground) {
+    if (auto* picker = dialog->findChild<PatchyColorPicker*>(QStringLiteral("patchyAdvancedColorPicker"))) {
+      picker->set_background_pick_handler([this](QColor color) { apply_color_panel_pick(color, true); });
+    }
+  }
+  color_dialog_ = dialog;
+  connect(dialog, &QObject::destroyed, this, [this, dialog] {
+    if (color_dialog_ == dialog) {
+      color_dialog_ = nullptr;
+    }
+  });
+  refresh_hdr_exposure_control();
+  dialog->show();
+  dialog->raise();
+  dialog->activateWindow();
+}
+
+void MainWindow::apply_foreground_color(QColor color) {
+  if (canvas_ == nullptr) {
+    return;
+  }
+  color.setAlpha(255);
+  canvas_->set_primary_color(color);
+  // What landed, which palette mode snaps to the document palette: the text and the shape
+  // paint take the foreground the user sees, not the raw pick.
+  const auto foreground = canvas_->primary_color();
+  apply_primary_color_to_active_text_editor(foreground);
+  apply_foreground_color_to_shape_paint(foreground);
+}
+
+// Swap and Default Colors recolor an open text session's selection like any foreground pick,
+// but leave the shape paint alone: X and D are pressed constantly while drawing, and a
+// selected shape must not change color with them.
+void MainWindow::swap_colors() {
+  if (canvas_ == nullptr) {
+    return;
+  }
+  const auto primary = canvas_->primary_color();
+  const auto intensity = canvas_->paint_intensity();
+  canvas_->set_primary_color(canvas_->secondary_color());
+  canvas_->set_secondary_color(primary);
+  canvas_->paint_intensity() = {intensity.background, intensity.foreground};
+  apply_primary_color_to_active_text_editor(canvas_->primary_color());
+  refresh_color_buttons();
+  statusBar()->showMessage(tr("Swapped foreground/background"));
+}
+
+void MainWindow::default_colors() {
+  if (canvas_ == nullptr) {
+    return;
+  }
+  canvas_->set_primary_color(Qt::black);
+  canvas_->set_secondary_color(Qt::white);
+  canvas_->paint_intensity() = {};
+  apply_primary_color_to_active_text_editor(canvas_->primary_color());
+  refresh_color_buttons();
+  statusBar()->showMessage(tr("Default colors"));
+}
+
+void MainWindow::refresh_color_buttons() {
+  // Every color change on the canvas ends here, so this is where the pair picks it up.
+  stash_active_colors();
+  const auto primary_color = canvas_ != nullptr ? canvas_->primary_color() : foreground_color_;
+  const auto secondary_color = canvas_ != nullptr ? canvas_->secondary_color() : background_color_;
+  if (gradient_library_ != nullptr) {
+    gradient_library_->set_preview_colors(gradient_preview_colors(primary_color, secondary_color));
+  }
+  const auto named_tooltip = [this](const QString& text, QColor color) {
+    if (!has_active_document()) { return text; }
+    const auto name = palette_color_name(std::as_const(document()),
+        {static_cast<std::uint8_t>(color.red()), static_cast<std::uint8_t>(color.green()), static_cast<std::uint8_t>(color.blue())});
+    if (name.empty()) { return text; }
+    return QStringLiteral("<qt>%1<br>%2</qt>")
+        .arg(QString::fromUtf8(name.data(), static_cast<qsizetype>(name.size())).toHtmlEscaped(), text.toHtmlEscaped());
+  };
+  if (primary_color_button_ != nullptr) {
+    primary_color_button_->setText(tr("FG"));
+    primary_color_button_->setToolTip(named_tooltip(tr("Foreground color %1").arg(primary_color.name(QColor::HexRgb).toUpper()), primary_color));
+    primary_color_button_->set_color(primary_color);
+  }
+  if (secondary_color_button_ != nullptr) {
+    secondary_color_button_->setText(tr("BG"));
+    secondary_color_button_->setToolTip(named_tooltip(tr("Background color %1").arg(secondary_color.name(QColor::HexRgb).toUpper()), secondary_color));
+    secondary_color_button_->set_color(secondary_color);
+  }
+  if (color_dock_panel_ != nullptr) {
+    color_dock_panel_->set_colors(primary_color, secondary_color);
+    color_dock_panel_->foreground_chip()->setToolTip(
+        named_tooltip(tr("Foreground color %1").arg(primary_color.name(QColor::HexRgb).toUpper()), primary_color));
+    color_dock_panel_->background_chip()->setToolTip(
+        named_tooltip(tr("Background color %1").arg(secondary_color.name(QColor::HexRgb).toUpper()), secondary_color));
+  }
+  refresh_hdr_exposure_control();
+  refresh_text_color_button();
+  if (color_drag_in_progress()) {
+    gradient_controls_refresh_pending_ = true;
+  } else {
+    refresh_gradient_controls_from_canvas();
+  }
+}
+
+void MainWindow::refresh_text_color_button() {
+  if (text_color_button_ == nullptr || canvas_ == nullptr) {
+    return;
+  }
+  const auto color = current_text_color();
+  text_color_button_->setToolTip(tr("Text color %1").arg(color.name(QColor::HexRgb).toUpper()));
+  patchy::VectorFill paint;
+  paint.color = {static_cast<std::uint8_t>(color.red()), static_cast<std::uint8_t>(color.green()),
+                 static_cast<std::uint8_t>(color.blue())};
+  text_color_button_->setIcon(options_bar_swatch_icon(paint, *text_color_button_));
+}
+
+void MainWindow::edit_gradient_stops() {
+  if (canvas_ == nullptr) {
+    return;
+  }
+  const bool linear_document =
+      has_active_document() && std::as_const(document()).color_state().bit_depth == BitDepth::Float32;
+  const auto result = request_gradient_stops_dialog(
+      this, canvas_->gradient_definition(), canvas_->resolved_gradient(), canvas_->default_resolved_gradient(),
+      canvas_->primary_color(), canvas_->secondary_color(), &gradient_library(), linear_document);
+  if (!result.has_value() || canvas_ == nullptr) {
+    return;  // cancelled, or the document was closed while the dialog was open
+  }
+  canvas_->set_gradient_definition(*result);
+  refresh_gradient_controls_from_canvas();
+  save_tool_settings();
+  refresh_document_info();
+}
+
+void MainWindow::apply_gradient_preset_entry(const GradientLibraryEntry& entry) {
+  if (canvas_ == nullptr) {
+    return;
+  }
+  gradient_preset_id_ = entry.storage_id;
+  // The preset as it is: two tracks, midpoints, smoothness, Noise, live Foreground/Background.
+  canvas_->set_gradient_definition(entry.definition);
+  refresh_gradient_controls_from_canvas();
+  save_tool_settings();
+  refresh_document_info();
+  statusBar()->showMessage(tr("Gradient preset: %1").arg(gradient_library_entry_display_name(entry)));
+}
+
+void MainWindow::choose_gradient_preset() {
+  if (canvas_ == nullptr || gradient_presets_button_ == nullptr) {
+    return;
+  }
+  const auto apply_entry = [this](const GradientLibraryEntry& entry) { apply_gradient_preset_entry(entry); };
+  show_gradient_preset_popup(gradient_presets_button_, gradient_library(), apply_entry,
+                             [this, apply_entry] {
+                               const auto selected = request_gradient_manager(this, gradient_library(), {});
+                               if (const auto* entry = gradient_library().find_entry(selected); entry != nullptr) {
+                                 apply_entry(*entry);
+                               }
+                             });
+}
+
+void MainWindow::activate_brush_preset_tool(const QString& preset_id) {
+  if (canvas_ == nullptr || brush_preset_combo_ == nullptr) {
+    return;
+  }
+  activate_tool(CanvasTool::Brush);
+  const int index = brush_preset_combo_->findData(preset_id);
+  if (index < 0) {
+    return;
+  }
+  if (brush_preset_combo_->currentIndex() != index) {
+    // Picking the entry runs the combo's own handler, exactly as choosing it in the list.
+    brush_preset_combo_->setCurrentIndex(index);
+  }
+  statusBar()->showMessage(tr("Brush preset: %1").arg(brush_preset_combo_->itemText(index)));
+}
+
+void MainWindow::step_active_tool_preset(int direction, bool to_end) {
+  if (canvas_ == nullptr) {
+    return;
+  }
+  // The next index after `current` in a list of `count`, wrapping; with no current entry
+  // Next starts at the first and Previous at the last. First and Last (to_end) go straight there.
+  const auto stepped = [direction, to_end](qsizetype current, qsizetype count) {
+    if (to_end) {
+      return direction > 0 ? count - 1 : qsizetype{0};
+    }
+    if (current < 0) {
+      return direction > 0 ? qsizetype{0} : count - 1;
+    }
+    return (current + (direction > 0 ? 1 : count - 1)) % count;
+  };
+  if (brush_preset_combo_ != nullptr && option_widget_serves_tool(brush_preset_combo_, current_tool_)) {
+    // The combo's own entries, skipping its separator and the "__" Save/Manage commands.
+    QList<int> presets;
+    for (int index = 0; index < brush_preset_combo_->count(); ++index) {
+      const auto id = brush_preset_combo_->itemData(index).toString();
+      if (!id.isEmpty() && !id.startsWith(QStringLiteral("__"))) {
+        presets << index;
+      }
+    }
+    if (presets.isEmpty()) {
+      return;
+    }
+    const auto target = presets[stepped(presets.indexOf(brush_preset_combo_->currentIndex()), presets.size())];
+    // Picking the entry runs the combo's own handler, exactly as choosing it in the list.
+    brush_preset_combo_->setCurrentIndex(target);
+    statusBar()->showMessage(tr("Brush preset: %1").arg(brush_preset_combo_->itemText(target)));
+    return;
+  }
+  if (gradient_presets_button_ != nullptr && option_widget_serves_tool(gradient_presets_button_, current_tool_)) {
+    auto& library = gradient_library();
+    const auto order = gradient_preset_popup_order(library);
+    if (order.isEmpty()) {
+      return;
+    }
+    auto current = order.indexOf(gradient_preset_id_);
+    if (current < 0 && canvas_->gradient_definition().has_value()) {
+      // After a restart only the gradient is known: find the preset it is (names aside).
+      auto stored = *canvas_->gradient_definition();
+      stored.name.clear();
+      for (qsizetype index = 0; index < order.size() && current < 0; ++index) {
+        if (const auto* entry = library.find_entry(order[index]); entry != nullptr) {
+          auto candidate = entry->definition;
+          candidate.name.clear();
+          if (candidate == stored) {
+            current = index;
+          }
+        }
+      }
+    }
+    if (const auto* entry = library.find_entry(order[stepped(current, order.size())]); entry != nullptr) {
+      apply_gradient_preset_entry(*entry);
+    }
+  }
+}
+
+void MainWindow::refresh_gradient_controls_from_canvas() {
+  gradient_controls_refresh_pending_ = false;
+  if (canvas_ == nullptr) {
+    return;
+  }
+  if (gradient_method_combo_ != nullptr) {
+    QSignalBlocker blocker(gradient_method_combo_);
+    const auto index = gradient_method_combo_->findData(static_cast<int>(canvas_->gradient_method()));
+    gradient_method_combo_->setCurrentIndex(std::max(0, index));
+  }
+  if (gradient_mode_combo_ != nullptr) {
+    QSignalBlocker blocker(gradient_mode_combo_);
+    const auto index = gradient_mode_combo_->findData(static_cast<int>(canvas_->gradient_tool_mode()));
+    gradient_mode_combo_->setCurrentIndex(std::max(0, index));
+  }
+  if (gradient_opacity_spin_ != nullptr) {
+    QSignalBlocker blocker(gradient_opacity_spin_);
+    gradient_opacity_spin_->setValue(canvas_->gradient_opacity());
+  }
+  if (gradient_opacity_slider_ != nullptr) {
+    QSignalBlocker blocker(gradient_opacity_slider_);
+    gradient_opacity_slider_->setValue(canvas_->gradient_opacity());
+  }
+  if (gradient_reverse_check_ != nullptr) {
+    QSignalBlocker blocker(gradient_reverse_check_);
+    gradient_reverse_check_->setChecked(canvas_->gradient_reverse());
+  }
+  if (gradient_preview_button_ != nullptr) {
+    set_themed_style(*gradient_preview_button_, gradient_preview_button_style(
+        canvas_->effective_gradient_stops(), canvas_->gradient_opacity(), canvas_->gradient_reverse()));
+    gradient_preview_button_->setToolTip(tr("Gradient preview"));
+  }
+}
+
+namespace {
+
+// Settings keys for each selection tool's Feather and Anti-alias. Permanent identifiers.
+// Quick Select has no Anti-alias control; the Patch tool has neither and keeps the defaults.
+struct SelectionEdgeSettingKeys {
+  CanvasTool tool;
+  const char* feather;
+  const char* anti_alias;
+};
+
+constexpr std::array<SelectionEdgeSettingKeys, 9> kSelectionEdgeSettingKeys{{
+    {CanvasTool::Marquee, "tools/marqueeFeather", "tools/marqueeAntiAlias"},
+    {CanvasTool::EllipticalMarquee, "tools/ellipticalMarqueeFeather", "tools/ellipticalMarqueeAntiAlias"},
+    {CanvasTool::Lasso, "tools/lassoFeather", "tools/lassoAntiAlias"},
+    {CanvasTool::MagneticLasso, "tools/magneticLassoFeather", "tools/magneticLassoAntiAlias"},
+    {CanvasTool::MagicWand, "tools/wandFeather", "tools/wandAntiAlias"},
+    {CanvasTool::QuickSelect, "tools/quickSelectFeather", nullptr},
+    {CanvasTool::ObjectSelect, "tools/objectSelectFeather", "tools/objectSelectAntiAlias"},
+    {CanvasTool::PolygonLasso, "tools/polygonalLassoFeather", "tools/polygonalLassoAntiAlias"},
+    {CanvasTool::ContentAwareMove, "tools/contentAwareMoveFeather", "tools/contentAwareMoveAntiAlias"},
+}};
+
+// A stored number, clamped to the control's range; a missing key or one that does not
+// parse as a number (a hand-edited ini) reads as the default (GitHub issue 254).
+int stored_int(const QSettings& settings, const char* key, int fallback, int minimum, int maximum) {
+  const auto value = settings.value(QLatin1String(key));
+  bool ok = false;
+  const int number = value.toInt(&ok);
+  return ok ? std::clamp(number, minimum, maximum) : fallback;
+}
+
+// A stored flag; only the forms QSettings writes (true/false, 1/0) count, anything else
+// reads as the default.
+bool stored_bool(const QSettings& settings, const char* key, bool fallback) {
+  const auto text = settings.value(QLatin1String(key)).toString().trimmed().toLower();
+  if (text == QLatin1String("true") || text == QLatin1String("1")) {
+    return true;
+  }
+  if (text == QLatin1String("false") || text == QLatin1String("0")) {
+    return false;
+  }
+  return fallback;
+}
+
+// Permanent identifier: the active tool on the next launch (docs/tool-options.md).
+constexpr auto kActiveToolSettingsKey = "tools/activeTool";
+
+}  // namespace
+
+void MainWindow::restore_startup_tool_selection() {
+  if (tool_action_group_ == nullptr) {
+    return;
+  }
+  const auto token = app_settings().value(QLatin1String(kActiveToolSettingsKey)).toString();
+  if (token.isEmpty()) {
+    return;
+  }
+  for (auto* action : tool_action_group_->actions()) {
+    const auto tool = static_cast<CanvasTool>(action->data().toInt());
+    if (tool_hotkey_id(tool) != token) {
+      continue;
+    }
+    if (tool == CanvasTool::Brush) {
+      return;  // the palette's built-in default
+    }
+    // Startup has no canvas yet and the stored tool settings load with the first one,
+    // so check the button and give the flyout the member's face by hand instead of
+    // running the group handler; the first canvas then activates the tool for real
+    // (Eraser values, status hint) through activate_tool.
+    action->setChecked(true);
+    current_tool_ = tool;
+    for (auto* button : findChildren<QToolButton*>()) {
+      auto* menu = button->menu();
+      if (!button->property("toolFlyout").toBool() || menu == nullptr || !menu->actions().contains(action)) {
+        continue;
+      }
+      button->setDefaultAction(action);
+      button->setMenu(menu);
+      button->setToolTip(action->toolTip());
+    }
+    refresh_options_bar();
+    return;
+  }
+}
+
+void MainWindow::activate_tool(CanvasTool tool) {
+  if (tool_action_group_ == nullptr) {
+    return;
+  }
+  for (auto* action : tool_action_group_->actions()) {
+    if (static_cast<CanvasTool>(action->data().toInt()) == tool) {
+      action->trigger();
+      return;
+    }
+  }
+}
+
+void MainWindow::load_tool_settings() {
+  if (canvas_ == nullptr) {
+    return;
+  }
+  auto settings = app_settings();
+  // The Brush bar comes back as it was left (GitHub issue 254, like Photoshop's tool
+  // options): size, opacity, flow, Airbrush, Soft, the tip and the preset row, with the
+  // Round startup preset as the default for every missing or malformed key. The Eraser
+  // keeps its own size, opacity and Soft. A stored tip the library no longer holds falls
+  // back to Round inside set_active_brush_tip; the tip's imported ABR flow and Airbrush
+  // are not re-applied over the stored values.
+  BrushToolSettings defaults{};
+  if (const auto* preset = find_brush_preset(default_startup_brush_preset_id()); preset != nullptr) {
+    defaults = BrushToolSettings{preset->size, preset->opacity, preset->flow, preset->softness, preset->build_up};
+  }
+  stored_paint_brush_settings_ = BrushToolSettings{
+      stored_int(settings, "tools/brushSize", defaults.size, 1, kMaxBrushSize),
+      stored_int(settings, "tools/brushOpacity", defaults.opacity, 0, 100),
+      stored_int(settings, "tools/brushFlow", defaults.flow, 0, 100),
+      stored_int(settings, "tools/brushSoftness", defaults.softness, 0, 100),
+      stored_bool(settings, "tools/brushAirbrush", defaults.airbrush)};
+  stored_eraser_brush_settings_ = defaults;
+  stored_eraser_brush_settings_.size = stored_int(settings, "tools/eraserSize", defaults.size, 1, kMaxBrushSize);
+  stored_eraser_brush_settings_.opacity = stored_int(settings, "tools/eraserOpacity", defaults.opacity, 0, 100);
+  stored_eraser_brush_settings_.softness =
+      stored_int(settings, "tools/eraserSoftness", defaults.softness, 0, 100);
+  set_active_brush_tip(settings.value(QStringLiteral("tools/brushTip")).toString(), false,
+                       /*apply_tool_settings=*/false);
+  if (brush_preset_combo_ != nullptr) {
+    // The preset row names the preset last picked; its values come from the keys above.
+    // A retired id ("round") lands on the preset that replaced it.
+    const auto preset_id = canonical_brush_preset_id(settings.value(QStringLiteral("tools/brushPreset")).toString());
+    if (const auto index = brush_preset_combo_->findData(preset_id);
+        index >= 0 && find_brush_preset(preset_id) != nullptr) {
+      const QSignalBlocker blocker(brush_preset_combo_);
+      brush_preset_combo_->setCurrentIndex(index);
+      brush_preset_combo_->setProperty("lastBrushPresetId", preset_id);
+    }
+  }
+  apply_active_brush_settings_to_canvas();
+  current_mixer_wet_ =
+      std::clamp(settings.value(QStringLiteral("tools/mixerWet"), current_mixer_wet_).toInt(), 0, 100);
+  current_mixer_load_ =
+      std::clamp(settings.value(QStringLiteral("tools/mixerLoad"), current_mixer_load_).toInt(), 1, 100);
+  current_mixer_mix_ =
+      std::clamp(settings.value(QStringLiteral("tools/mixerMix"), current_mixer_mix_).toInt(), 0, 100);
+  current_mixer_flow_ =
+      std::clamp(settings.value(QStringLiteral("tools/mixerFlow"), current_mixer_flow_).toInt(), 1, 100);
+  canvas_->set_mixer_wet(current_mixer_wet_);
+  canvas_->set_mixer_load(current_mixer_load_);
+  canvas_->set_mixer_mix(current_mixer_mix_);
+  canvas_->set_mixer_flow(current_mixer_flow_);
+  canvas_->set_mixer_sample_all_layers(
+      settings.value(QStringLiteral("tools/mixerSampleAllLayers"), canvas_->mixer_sample_all_layers())
+          .toBool());
+  current_brush_smoothing_ = std::clamp(
+      settings.value(QStringLiteral("tools/brushSmoothing"), current_brush_smoothing_).toInt(), 0, 100);
+  current_brush_smoothing_pulled_string_ =
+      settings.value(QStringLiteral("tools/brushSmoothingPulledString"), current_brush_smoothing_pulled_string_)
+          .toBool();
+  current_brush_smoothing_catch_up_ =
+      settings.value(QStringLiteral("tools/brushSmoothingCatchUp"), current_brush_smoothing_catch_up_).toBool();
+  current_brush_smoothing_catch_up_end_ =
+      settings.value(QStringLiteral("tools/brushSmoothingCatchUpEnd"), current_brush_smoothing_catch_up_end_)
+          .toBool();
+  current_brush_smoothing_zoom_adjust_ =
+      settings.value(QStringLiteral("tools/brushSmoothingZoomAdjust"), current_brush_smoothing_zoom_adjust_)
+          .toBool();
+  if (patchy::PaintMode stored_mode;
+      script_paint_mode_from_id(settings.value(QStringLiteral("tools/brushMode")).toString(), &stored_mode)) {
+    current_brush_paint_mode_ = stored_mode;
+  }
+  canvas_->set_brush_paint_mode(current_brush_paint_mode_);
+  if (brush_mode_combo_ != nullptr) {
+    const QSignalBlocker blocker(brush_mode_combo_);
+    brush_mode_combo_->setCurrentIndex(
+        std::max(0, brush_mode_combo_->findData(paint_mode_item_data(current_brush_paint_mode_))));
+  }
+  canvas_->set_brush_smoothing(current_brush_smoothing_);
+  canvas_->set_brush_smoothing_pulled_string(current_brush_smoothing_pulled_string_);
+  canvas_->set_brush_smoothing_catch_up(current_brush_smoothing_catch_up_);
+  canvas_->set_brush_smoothing_catch_up_end(current_brush_smoothing_catch_up_end_);
+  canvas_->set_brush_smoothing_zoom_adjust(current_brush_smoothing_zoom_adjust_);
+  canvas_->set_wand_tolerance(settings.value(QStringLiteral("tools/wandTolerance"), canvas_->wand_tolerance()).toInt());
+  canvas_->set_wand_contiguous(settings.value(QStringLiteral("tools/wandContiguous"), canvas_->wand_contiguous()).toBool());
+  canvas_->set_wand_sample_all_layers(
+      settings.value(QStringLiteral("tools/wandSampleAllLayers"), canvas_->wand_sample_all_layers()).toBool());
+  // Its own key, Point Sample when missing (GitHub issue 435); never the Pick tool's Size.
+  canvas_->set_wand_sample_size(settings.value(QStringLiteral("tools/wandSampleSize"), 1).toInt());
+  for (const auto& keys : kSelectionEdgeSettingKeys) {
+    const auto index = static_cast<std::size_t>(CanvasWidget::selection_tool_index(keys.tool));
+    selection_feather_by_tool_[index] =
+        std::clamp(settings.value(QLatin1StringView(keys.feather), selection_feather_by_tool_[index]).toInt(), 0,
+                   kMaxSelectionFeatherRadius);
+    if (keys.anti_alias != nullptr) {
+      selection_antialias_by_tool_[index] =
+          settings.value(QLatin1StringView(keys.anti_alias), selection_antialias_by_tool_[index]).toBool();
+    }
+  }
+  apply_selection_edge_settings_for_tool(current_tool_);
+  current_marquee_corner_radius_ =
+      stored_int(settings, "tools/marqueeCornerRadius", current_marquee_corner_radius_, 0, 512);
+  canvas_->set_marquee_corner_radius(current_marquee_corner_radius_);
+  if (auto* corner_radius = findChild<QSpinBox*>(QStringLiteral("selectionCornerRadiusSpin"));
+      corner_radius != nullptr) {
+    const QSignalBlocker blocker(corner_radius);
+    corner_radius->setValue(current_marquee_corner_radius_);
+  }
+  if (shape_pixel_options_ != nullptr) {
+    shape_pixel_options_->apply_to_canvas(*canvas_);  // the Pixels-mode Style and its size
+  }
+  canvas_->set_quick_select_size(
+      settings.value(QStringLiteral("tools/quickSelectSize"), canvas_->quick_select_size()).toInt());
+  canvas_->set_quick_select_sample_all_layers(
+      settings.value(QStringLiteral("tools/quickSelectSampleAllLayers"), canvas_->quick_select_sample_all_layers())
+          .toBool());
+  canvas_->set_quick_select_enhance_edge(
+      settings.value(QStringLiteral("tools/quickSelectEnhanceEdge"), canvas_->quick_select_enhance_edge()).toBool());
+  canvas_->set_object_select_sample_all_layers(
+      settings.value(QStringLiteral("tools/objectSelectSampleAllLayers"), canvas_->object_select_sample_all_layers())
+          .toBool());
+  canvas_->set_magnetic_lasso_width(
+      settings.value(QStringLiteral("tools/magneticLassoWidth"), canvas_->magnetic_lasso_width()).toInt());
+  canvas_->set_magnetic_lasso_edge_contrast(
+      settings.value(QStringLiteral("tools/magneticLassoEdgeContrast"), canvas_->magnetic_lasso_edge_contrast())
+          .toInt());
+  canvas_->set_magnetic_lasso_frequency(
+      settings.value(QStringLiteral("tools/magneticLassoFrequency"), canvas_->magnetic_lasso_frequency()).toInt());
+  canvas_->set_show_transform_controls(
+      settings.value(QStringLiteral("tools/showTransformControls"), true).toBool());
+  // Auto-Select is remembered across runs (GitHub issue 73).
+  canvas_->set_auto_select_layer(settings.value(QStringLiteral("tools/moveAutoSelect"), true).toBool());
+  canvas_->set_auto_select_target(move_auto_select_target_from_token(
+      settings.value(QLatin1String(kMoveAutoSelectTargetSettingsKey)).toString()));
+  const auto transform_interpolation =
+      settings.value(QStringLiteral("tools/transformInterpolation"),
+                     static_cast<int>(CanvasWidget::TransformInterpolation::Bicubic))
+          .toInt();
+  switch (static_cast<CanvasWidget::TransformInterpolation>(transform_interpolation)) {
+    case CanvasWidget::TransformInterpolation::NearestNeighbor:
+      canvas_->set_transform_interpolation(CanvasWidget::TransformInterpolation::NearestNeighbor);
+      break;
+    case CanvasWidget::TransformInterpolation::Bilinear:
+      canvas_->set_transform_interpolation(CanvasWidget::TransformInterpolation::Bilinear);
+      break;
+    case CanvasWidget::TransformInterpolation::BicubicSmoother:
+      canvas_->set_transform_interpolation(CanvasWidget::TransformInterpolation::BicubicSmoother);
+      break;
+    case CanvasWidget::TransformInterpolation::BicubicSharper:
+      canvas_->set_transform_interpolation(CanvasWidget::TransformInterpolation::BicubicSharper);
+      break;
+    case CanvasWidget::TransformInterpolation::Automatic:
+      canvas_->set_transform_interpolation(CanvasWidget::TransformInterpolation::Automatic);
+      break;
+    case CanvasWidget::TransformInterpolation::Bicubic:
+    default:
+      canvas_->set_transform_interpolation(CanvasWidget::TransformInterpolation::Bicubic);
+      break;
+  }
+  canvas_->set_clone_aligned(settings.value(QStringLiteral("tools/cloneAligned"), canvas_->clone_aligned()).toBool());
+  current_clone_overlay_shown_ =
+      settings.value(QStringLiteral("tools/cloneOverlay"), current_clone_overlay_shown_).toBool();
+  current_clone_overlay_opacity_ = std::clamp(
+      settings.value(QStringLiteral("tools/cloneOverlayOpacity"), current_clone_overlay_opacity_).toInt(), 1, 100);
+  canvas_->set_clone_overlay_shown(current_clone_overlay_shown_);
+  canvas_->set_clone_overlay_opacity(current_clone_overlay_opacity_);
+  current_brush_overlay_shown_ =
+      settings.value(QStringLiteral("tools/brushOverlay"), current_brush_overlay_shown_).toBool();
+  current_brush_overlay_opacity_ = std::clamp(
+      settings.value(QStringLiteral("tools/brushOverlayOpacity"), current_brush_overlay_opacity_).toInt(), 1, 100);
+  canvas_->set_brush_overlay_shown(current_brush_overlay_shown_);
+  canvas_->set_brush_overlay_opacity(current_brush_overlay_opacity_);
+  current_brush_outline_shown_ =
+      settings.value(QStringLiteral("tools/brushOutline"), current_brush_outline_shown_).toBool();
+  canvas_->set_brush_outline_shown(current_brush_outline_shown_);
+  sync_brush_overlay_menu();
+  {
+    // The retouch Sample choice (GitHub issue 382); before it, a bool that still maps on
+    // first read (true All Layers, false Current Layer).
+    std::optional<std::string> token;
+    if (settings.contains(QStringLiteral("tools/retouchSampleLayers"))) {
+      token = settings.value(QStringLiteral("tools/retouchSampleLayers")).toString().toStdString();
+    }
+    std::optional<bool> legacy_sample_all_layers;
+    if (settings.contains(QStringLiteral("tools/retouchSampleAllLayers"))) {
+      legacy_sample_all_layers = settings.value(QStringLiteral("tools/retouchSampleAllLayers")).toBool();
+    }
+    canvas_->set_retouch_sample_layers(sample_layers_from_settings(token, legacy_sample_all_layers));
+  }
+  canvas_->set_retouch_ignore_adjustments(
+      settings.value(QStringLiteral("tools/retouchIgnoreAdjustments"), canvas_->retouch_ignore_adjustments()).toBool());
+  canvas_->set_healing_mode(
+      healing_mode_from_token(settings.value(QStringLiteral("tools/healingMode")).toString().toStdString())
+          .value_or(HealingMode::Normal));
+  // Content-Aware Move's Destination: a token, Current Layer when missing or unknown.
+  canvas_->set_content_aware_move_destination(
+      settings.value(QStringLiteral("tools/contentAwareMoveDestination")).toString() == QLatin1String("newLayer")
+          ? ContentAwareMoveDestination::NewLayer
+          : ContentAwareMoveDestination::CurrentLayer);
+  if (content_aware_move_destination_combo_ != nullptr) {
+    const QSignalBlocker blocker(content_aware_move_destination_combo_);
+    content_aware_move_destination_combo_->setCurrentIndex(
+        std::max(0, content_aware_move_destination_combo_->findData(
+                        static_cast<int>(canvas_->content_aware_move_destination()))));
+  }
+  canvas_->set_content_aware_move_object_selection(
+      settings.value(QStringLiteral("tools/contentAwareMoveObjectSelection"), false).toBool());
+  if (content_aware_move_object_selection_check_ != nullptr) {
+    const QSignalBlocker blocker(content_aware_move_object_selection_check_);
+    content_aware_move_object_selection_check_->setChecked(canvas_->content_aware_move_object_selection());
+  }
+  current_crop_ratio_w_ =
+      std::clamp(settings.value(QStringLiteral("tools/cropRatioWidth"), 0.0).toDouble(), 0.0, 10000.0);
+  current_crop_ratio_h_ =
+      std::clamp(settings.value(QStringLiteral("tools/cropRatioHeight"), 0.0).toDouble(), 0.0, 10000.0);
+  current_crop_style_ = std::clamp(settings.value(QStringLiteral("tools/cropStyle"), 0).toInt(), 0, 1);
+  current_crop_delete_pixels_ = settings.value(QStringLiteral("tools/cropDeletePixels"), true).toBool();
+  current_crop_delete_layers_ = settings.value(QStringLiteral("tools/cropDeleteLayers"), false).toBool();
+  current_red_eye_pupil_size_ = stored_int(settings, "tools/redEyePupilSize", 50, 1, 100);
+  current_red_eye_darken_amount_ = stored_int(settings, "tools/redEyeDarkenAmount", 50, 1, 100);
+  canvas_->set_red_eye_pupil_size(current_red_eye_pupil_size_);
+  canvas_->set_red_eye_darken_amount(current_red_eye_darken_amount_);
+  sync_red_eye_controls();
+  // Color Replacement (GitHub issue 720): tokens, so an unknown one is the default.
+  {
+    const auto token = [&settings](const char* key) { return settings.value(QLatin1String(key)).toString().toStdString(); };
+    current_color_replace_options_.mode = patchy::color_replace_mode_from_token(token("tools/colorReplaceMode"))
+                                              .value_or(patchy::ColorReplaceMode::Color);
+    current_color_replace_options_.limits = patchy::color_replace_limits_from_token(token("tools/colorReplaceLimits"))
+                                                .value_or(patchy::ColorReplaceLimits::Contiguous);
+    current_color_replace_sampling_ = patchy::color_replace_sampling_from_token(token("tools/colorReplaceSampling"))
+                                          .value_or(patchy::ColorReplaceSampling::Continuous);
+    current_color_replace_options_.tolerance =
+        stored_int(settings, "tools/colorReplaceTolerance", patchy::kDefaultColorReplaceTolerance,
+                   patchy::kMinColorReplaceTolerance, patchy::kMaxColorReplaceTolerance);
+    current_color_replace_options_.anti_alias = stored_bool(settings, "tools/colorReplaceAntiAlias", true);
+  }
+  canvas_->set_color_replace_options(current_color_replace_options_);
+  canvas_->set_color_replace_sampling(current_color_replace_sampling_);
+  sync_color_replace_controls();
+  // Background Eraser and Magic Eraser (GitHub issue 727): tokens and plain values, so an
+  // unknown token or an unreadable number is the default.
+  {
+    const auto token = [&settings](const char* key) { return settings.value(QLatin1String(key)).toString().toStdString(); };
+    current_background_eraser_sampling_ =
+        patchy::color_match_sampling_from_token(token("tools/backgroundEraserSampling"))
+            .value_or(patchy::ColorMatchSampling::Continuous);
+    current_background_eraser_options_.limits =
+        patchy::color_match_limits_from_token(token("tools/backgroundEraserLimits"))
+            .value_or(patchy::ColorMatchLimits::Contiguous);
+    current_background_eraser_options_.tolerance =
+        stored_int(settings, "tools/backgroundEraserTolerance", patchy::kDefaultColorMatchTolerance,
+                   patchy::kMinColorMatchTolerance, patchy::kMaxColorMatchTolerance);
+    const MagicEraserOptions magic_defaults;
+    current_magic_eraser_options_.tolerance =
+        stored_int(settings, "tools/magicEraserTolerance", magic_defaults.tolerance, 0, 255);
+    current_magic_eraser_options_.anti_alias =
+        stored_bool(settings, "tools/magicEraserAntiAlias", magic_defaults.anti_alias);
+    current_magic_eraser_options_.contiguous =
+        stored_bool(settings, "tools/magicEraserContiguous", magic_defaults.contiguous);
+    current_magic_eraser_options_.sample_all_layers =
+        stored_bool(settings, "tools/magicEraserSampleAllLayers", magic_defaults.sample_all_layers);
+    current_magic_eraser_options_.opacity =
+        stored_int(settings, "tools/magicEraserOpacity", magic_defaults.opacity, 0, 100);
+  }
+  canvas_->set_background_eraser_options(current_background_eraser_options_);
+  canvas_->set_background_eraser_sampling(current_background_eraser_sampling_);
+  canvas_->set_magic_eraser_options(current_magic_eraser_options_);
+  sync_eraser_tool_controls();
+  current_perspective_crop_show_grid_ = stored_bool(settings, "tools/perspectiveCropShowGrid", true);
+  if (perspective_crop_grid_check_ != nullptr) {
+    const QSignalBlocker blocker(perspective_crop_grid_check_);
+    perspective_crop_grid_check_->setChecked(current_perspective_crop_show_grid_);
+  }
+  canvas_->set_perspective_crop_show_grid(current_perspective_crop_show_grid_);
+  for (const auto& [check, value] : {std::pair{crop_delete_pixels_check_, current_crop_delete_pixels_},
+                                     std::pair{crop_delete_layers_check_, current_crop_delete_layers_}}) {
+    if (check != nullptr) {
+      const QSignalBlocker blocker(check);
+      check->setChecked(value);
+    }
+  }
+  canvas_->set_crop_ratio(effective_crop_ratio_width(), effective_crop_ratio_height());
+  {
+    CropOverlayOptions overlay;
+    overlay.show_cropped_area = stored_bool(settings, "tools/cropShowCroppedArea", overlay.show_cropped_area);
+    overlay.shield_enabled = stored_bool(settings, "tools/cropShieldEnabled", overlay.shield_enabled);
+    if (const auto color = QColor::fromString(settings.value(QStringLiteral("tools/cropShieldColor")).toString());
+        color.isValid()) {
+      overlay.shield_color = color;
+    }
+    overlay.shield_opacity_percent =
+        stored_int(settings, "tools/cropShieldOpacity", overlay.shield_opacity_percent, 0, 100);
+    overlay.move_image = stored_bool(settings, "tools/cropMoveImageUnderBox", overlay.move_image);
+    current_crop_overlay_options_ = overlay;
+    for (const auto& target_session : sessions_) {
+      if (target_session != nullptr && target_session->canvas != nullptr) {
+        target_session->canvas->set_crop_overlay_options(overlay);
+      }
+    }
+    canvas_->set_crop_overlay_options(overlay);
+    sync_crop_overlay_controls();
+  }
+  canvas_->set_crop_keep_proportions(crop_size_link_active());
+  // The overlay is stored as its token; an unknown one is Rule of Thirds.
+  current_crop_overlay_ = 1;
+  if (crop_overlay_combo_ != nullptr) {
+    const auto overlay_index =
+        crop_overlay_combo_->findData(settings.value(QStringLiteral("tools/cropOverlay")).toString());
+    if (overlay_index >= 0) {
+      current_crop_overlay_ = overlay_index;
+    }
+  }
+  current_crop_overlay_orientation_ =
+      std::clamp(settings.value(QStringLiteral("tools/cropOverlayOrientation"), 0).toInt(), 0, 3);
+  current_crop_overlay_while_dragging_ =
+      settings.value(QStringLiteral("tools/cropOverlayShow")).toString() == QStringLiteral("dragging");
+  apply_crop_guide_options();
+  // Patch mode and Transparent are deliberately session-only: every startup
+  // begins at Source with Transparent off, because a persisted Destination or
+  // Transparent reads as "the tool is broken" a session later. The retired
+  // keys tools/patchMode and tools/patchTransparent must never be reused.
+  current_pattern_stamp_pattern_id_ =
+      settings.value(QStringLiteral("tools/patternStampPatternId")).toString();
+  const auto& patterns = pattern_library().entries();
+  if (pattern_library().find_entry_by_pattern_id(current_pattern_stamp_pattern_id_) == nullptr) {
+    current_pattern_stamp_pattern_id_ = patterns.empty() ? QString() : patterns.front().id;
+  }
+  current_pattern_stamp_aligned_ =
+      settings.value(QStringLiteral("tools/patternStampAligned"), true).toBool();
+  apply_pattern_stamp_settings_to_canvas(canvas_);
+  current_healing_diffusion_ =
+      std::clamp(settings.value(QStringLiteral("tools/healingDiffusion"), current_healing_diffusion_).toInt(), 1, 7);
+  canvas_->set_healing_diffusion(current_healing_diffusion_);
+  current_local_adjustment_strength_ =
+      std::clamp(settings.value(QStringLiteral("tools/localAdjustmentStrength"),
+                                current_local_adjustment_strength_).toInt(),
+                 1, 100);
+  // A key of its own (GitHub issue 675): before, Smudge used the shared brush Opacity.
+  current_smudge_strength_ =
+      std::clamp(settings.value(QStringLiteral("tools/smudgeStrength"), current_smudge_strength_).toInt(), 0, 100);
+  const auto local_tone_range =
+      settings.value(QStringLiteral("tools/localToneRange"), QStringLiteral("midtones")).toString();
+  current_local_tone_range_ = local_tone_range == QStringLiteral("shadows")
+                                  ? CanvasWidget::LocalToneRange::Shadows
+                              : local_tone_range == QStringLiteral("highlights")
+                                  ? CanvasWidget::LocalToneRange::Highlights
+                                  : CanvasWidget::LocalToneRange::Midtones;
+  current_local_protect_tones_ =
+      settings.value(QStringLiteral("tools/localProtectTones"), current_local_protect_tones_).toBool();
+  const auto sponge_mode =
+      settings.value(QStringLiteral("tools/spongeMode"), QStringLiteral("desaturate")).toString();
+  current_sponge_mode_ = sponge_mode == QStringLiteral("saturate")
+                             ? CanvasWidget::SpongeMode::Saturate
+                             : CanvasWidget::SpongeMode::Desaturate;
+  current_sponge_vibrance_ =
+      settings.value(QStringLiteral("tools/spongeVibrance"), current_sponge_vibrance_).toBool();
+  canvas_->set_local_adjustment_strength(current_local_adjustment_strength_);
+  canvas_->set_smudge_strength(current_smudge_strength_);
+  canvas_->set_local_tone_range(current_local_tone_range_);
+  canvas_->set_local_protect_tones(current_local_protect_tones_);
+  canvas_->set_sponge_mode(current_sponge_mode_);
+  canvas_->set_sponge_vibrance(current_sponge_vibrance_);
+  canvas_->set_eyedropper_sample_size(
+      settings.value(QStringLiteral("tools/eyedropperSampleSize"), current_eyedropper_sample_size_).toInt());
+  current_eyedropper_sample_size_ = canvas_->eyedropper_sample_size();  // clamped to an odd side
+  {
+    // The five-way Sample choice (GitHub issue 321); before it, a bool that still maps
+    // on first read (true All Layers, false Current Layer).
+    std::optional<std::string> token;
+    if (settings.contains(QStringLiteral("tools/eyedropperSampleLayers"))) {
+      token = settings.value(QStringLiteral("tools/eyedropperSampleLayers")).toString().toStdString();
+    }
+    std::optional<bool> legacy_sample_all_layers;
+    if (settings.contains(QStringLiteral("tools/eyedropperSampleAllLayers"))) {
+      legacy_sample_all_layers = settings.value(QStringLiteral("tools/eyedropperSampleAllLayers")).toBool();
+    }
+    current_eyedropper_sample_layers_ = sample_layers_from_settings(token, legacy_sample_all_layers);
+  }
+  canvas_->set_eyedropper_sample_layers(current_eyedropper_sample_layers_);
+  current_eyedropper_picks_background_ =
+      settings.value(QStringLiteral("tools/eyedropperPicksBackground"), current_eyedropper_picks_background_).toBool();
+  canvas_->set_eyedropper_picks_background(current_eyedropper_picks_background_);
+  current_eyedropper_show_sample_ring_ =
+      settings.value(QStringLiteral("tools/eyedropperShowSampleRing"), current_eyedropper_show_sample_ring_).toBool();
+  canvas_->set_eyedropper_show_sample_ring(current_eyedropper_show_sample_ring_);
+  canvas_->set_shape_corner_radius(
+      settings.value(QStringLiteral("tools/shapeCornerRadius"), canvas_->shape_corner_radius()).toInt());
+  // The spin resync below is signal-blocked, so mirror the loaded value by hand.
+  current_shape_corner_radius_ = canvas_->shape_corner_radius();
+  if (auto* shape_corner_radius = findChild<QSpinBox*>(QStringLiteral("shapeCornerRadiusSpin"));
+      shape_corner_radius != nullptr) {
+    QSignalBlocker blocker(shape_corner_radius);
+    shape_corner_radius->setValue(canvas_->shape_corner_radius());
+  }
+  const auto vector_mode_name =
+      settings.value(QStringLiteral("tools/vectorToolMode"), QStringLiteral("shape")).toString();
+  current_vector_tool_mode_ = vector_mode_name == QStringLiteral("path")     ? VectorToolMode::Path
+                              : vector_mode_name == QStringLiteral("pixels") ? VectorToolMode::Pixels
+                                                                             : VectorToolMode::Shape;
+  canvas_->set_vector_tool_mode(current_vector_tool_mode_);
+  current_pen_auto_add_delete_ =
+      settings.value(QStringLiteral("tools/penAutoAddDelete"), true).toBool();
+  canvas_->set_pen_auto_add_delete(current_pen_auto_add_delete_);
+  if (auto* pen_auto_add_delete = findChild<QCheckBox*>(QStringLiteral("penAutoAddDeleteCheck"));
+      pen_auto_add_delete != nullptr) {
+    QSignalBlocker blocker(pen_auto_add_delete);
+    pen_auto_add_delete->setChecked(current_pen_auto_add_delete_);
+  }
+  if (vector_mode_combo_ != nullptr) {
+    QSignalBlocker blocker(vector_mode_combo_);
+    vector_mode_combo_->setCurrentIndex(current_vector_tool_mode_ == VectorToolMode::Path     ? 1
+                                        : current_vector_tool_mode_ == VectorToolMode::Pixels ? 2
+                                                                                              : 0);
+  }
+  // Options-bar paint mirrors: solid colors keep the historical keys; the
+  // paint kind and pattern/gradient references are their own append-only keys.
+  // Gradient placement and pattern placement params deliberately reset to
+  // defaults each launch (the appearance dialog owns per-layer tuning).
+  const auto load_vector_paint = [this, &settings](patchy::VectorFill& paint,
+                                                   QString& gradient_id, const char* color_key,
+                                                   const char* kind_key, const char* pattern_key,
+                                                   const char* gradient_key) {
+    const QColor default_color(paint.color.red, paint.color.green, paint.color.blue);
+    if (const auto color = QColor(
+            settings.value(QLatin1String(color_key), default_color.name()).toString());
+        color.isValid()) {
+      paint.color = RgbColor{static_cast<std::uint8_t>(color.red()),
+                             static_cast<std::uint8_t>(color.green()),
+                             static_cast<std::uint8_t>(color.blue())};
+    }
+    const auto kind_name = settings.value(QLatin1String(kind_key), QStringLiteral("solid")).toString();
+    paint.kind = kind_name == QStringLiteral("none")       ? patchy::VectorFillKind::None
+                 : kind_name == QStringLiteral("gradient") ? patchy::VectorFillKind::Gradient
+                 : kind_name == QStringLiteral("pattern")  ? patchy::VectorFillKind::Pattern
+                                                           : patchy::VectorFillKind::Solid;
+    if (paint.kind == patchy::VectorFillKind::Pattern) {
+      const auto pattern_id = settings.value(QLatin1String(pattern_key)).toString();
+      if (const auto* entry = pattern_library().find_entry_by_pattern_id(pattern_id);
+          entry != nullptr) {
+        paint.pattern_id = pattern_id.toStdString();
+        paint.pattern_name = entry->name.toStdString();
+      } else {
+        paint.kind = patchy::VectorFillKind::Solid;  // unresolvable reference
+      }
+    }
+    if (paint.kind == patchy::VectorFillKind::Gradient) {
+      gradient_id = settings.value(QLatin1String(gradient_key)).toString();
+      const auto* entry = gradient_library().find_entry(gradient_id);
+      if (entry == nullptr && !gradient_library().entries().empty()) {
+        gradient_id = gradient_library().entries().front().storage_id;
+        entry = gradient_library().find_entry(gradient_id);
+      }
+      const auto foreground = canvas_ != nullptr ? canvas_->primary_color() : QColor(Qt::black);
+      const auto background = canvas_ != nullptr ? canvas_->secondary_color() : QColor(Qt::white);
+      const auto fg = RgbColor{static_cast<std::uint8_t>(foreground.red()),
+                               static_cast<std::uint8_t>(foreground.green()),
+                               static_cast<std::uint8_t>(foreground.blue())};
+      const auto bg = RgbColor{static_cast<std::uint8_t>(background.red()),
+                               static_cast<std::uint8_t>(background.green()),
+                               static_cast<std::uint8_t>(background.blue())};
+      if (entry != nullptr) {
+        static_cast<GradientDefinition&>(paint.gradient) =
+            resolve_gradient_definition(entry->definition, fg, bg);
+      } else {
+        paint.gradient.color_stops = {GradientColorStop{0.0F, fg, 0.5F},
+                                      GradientColorStop{1.0F, bg, 0.5F}};
+        paint.gradient.alpha_stops = {GradientAlphaStop{0.0F, 1.0F, 0.5F},
+                                      GradientAlphaStop{1.0F, 1.0F, 0.5F}};
+      }
+      paint.gradient.type = LayerStyleGradientType::Linear;
+      paint.gradient.angle_degrees = 90.0F;
+      paint.gradient.scale = 1.0F;
+      paint.gradient.reverse = false;
+    }
+  };
+  load_vector_paint(current_vector_fill_, current_vector_fill_gradient_id_,
+                    "tools/vectorFillColor", "tools/vectorFillKind", "tools/vectorFillPatternId",
+                    "tools/vectorFillGradientId");
+  load_vector_paint(current_vector_stroke_paint_, current_vector_stroke_gradient_id_,
+                    "tools/vectorStrokeColor", "tools/vectorStrokePaintKind",
+                    "tools/vectorStrokePatternId", "tools/vectorStrokeGradientId");
+  current_vector_stroke_enabled_ =
+      settings.value(QStringLiteral("tools/vectorStrokeEnabled"), current_vector_stroke_enabled_).toBool();
+  current_vector_stroke_width_ = std::clamp(
+      settings.value(QStringLiteral("tools/vectorStrokeWidth"), current_vector_stroke_width_).toDouble(),
+      0.1, 1000.0);
+  current_vector_line_weight_ = std::clamp(
+      settings.value(QStringLiteral("tools/vectorLineWeight"), current_vector_line_weight_).toDouble(), 1.0,
+      1000.0);
+  current_vector_stroke_dash_preset_ = stroke_dash_preset_from_token(
+      settings.value(QStringLiteral("tools/vectorStrokeDashes")).toString().toStdString());
+  current_vector_stroke_style_.reset();
+  if (const auto style = parse_stroke_style_presets_json(
+          settings.value(QStringLiteral("tools/vectorStrokeStyle")).toString());
+      !style.empty()) {
+    VectorStroke stroke;
+    apply_stroke_style_preset(stroke, style.front());
+    current_vector_stroke_style_ = stroke;
+  }
+  // What the shape tools keep beside those mirrors (GitHub issue 716): the alignment list's
+  // choice. Shape and Pixels modes share one fill paint and one stroke paint; settings from
+  // before that keep the look of the mode the tools were left in.
+  if (shape_pixel_options_ != nullptr) {
+    auto& options = *shape_pixel_options_;
+    const bool predates_shared_style = shape_settings_predate_shared_style(settings);
+    options.load(settings);
+    if (current_vector_fill_.kind != VectorFillKind::None) {
+      options.fill_restore_kind = current_vector_fill_.kind;
+    }
+    const auto solid = [](QColor color) {
+      VectorFill paint;
+      paint.kind = VectorFillKind::Solid;
+      paint.color = {static_cast<std::uint8_t>(color.red()), static_cast<std::uint8_t>(color.green()),
+                     static_cast<std::uint8_t>(color.blue())};
+      return paint;
+    };
+    const QColor foreground = canvas_->primary_color();
+    const bool left_in_pixels = current_vector_tool_mode_ == VectorToolMode::Pixels;
+    if (predates_shared_style && left_in_pixels) {
+      // 1.34, or the first build with the draw-mode buttons, left in Pixels mode: the next
+      // pixel shape looks as the last one did (the Fill checkbox or the draw mode; the
+      // foreground color, or a color of its own where one was picked; the brush size as the
+      // outline's width; the dashes; a centered stroke). The foreground color is taken once:
+      // it is the bar's paint from here on, in Shape mode too.
+      const auto legacy = legacy_shape_pixel_style(settings);
+      current_vector_fill_ = solid(legacy.fill_color.value_or(foreground));
+      current_vector_stroke_paint_ = solid(legacy.stroke_color.value_or(foreground));
+      options.fill_restore_kind = VectorFillKind::Solid;
+      if (legacy.mode == ShapeDrawMode::Stroke) {
+        current_vector_fill_.kind = VectorFillKind::None;
+      }
+      current_vector_stroke_enabled_ = legacy.mode != ShapeDrawMode::Fill;
+      current_vector_stroke_width_ = static_cast<double>(std::clamp(canvas_->brush_size(), 1, 1000));
+      current_vector_stroke_dash_preset_ = legacy.dashes;
+      current_vector_stroke_style_.reset();
+      options.alignment = legacy.alignment;
+    } else if (!predates_shared_style && left_in_pixels) {
+      // The build that let Pixels mode paint a part in the foreground color: left in Pixels
+      // mode, that part becomes the foreground color, once.
+      if (options.legacy_fill_foreground && current_vector_fill_.kind != VectorFillKind::None) {
+        current_vector_fill_ = solid(foreground);
+        options.fill_restore_kind = VectorFillKind::Solid;
+      }
+      if (options.legacy_stroke_foreground) {
+        current_vector_stroke_paint_ = solid(foreground);
+      }
+    }
+    options.legacy_fill_foreground = false;
+    options.legacy_stroke_foreground = false;
+  }
+  refresh_vector_stroke_dash_combo();
+  // tools/vectorStrokeEnabled keeps its key: a saved "off" shows as 0 in the width field
+  // (GitHub issue 311), and tools/vectorStrokeWidth keeps the last real width.
+  if (auto* stroke_width = findChild<QDoubleSpinBox*>(QStringLiteral("vectorStrokeWidthSpin"));
+      stroke_width != nullptr) {
+    QSignalBlocker blocker(stroke_width);
+    stroke_width->setValue(vector_stroke_field_value());
+  }
+  if (auto* line_weight = findChild<QDoubleSpinBox*>(QStringLiteral("vectorLineWeightSpin"));
+      line_weight != nullptr) {
+    QSignalBlocker blocker(line_weight);
+    line_weight->setValue(current_vector_line_weight_);
+  }
+  current_line_arrow_start_ =
+      settings.value(QStringLiteral("tools/lineArrowStart"), current_line_arrow_start_).toBool();
+  current_line_arrow_end_ =
+      settings.value(QStringLiteral("tools/lineArrowEnd"), current_line_arrow_end_).toBool();
+  if (auto* arrow_start = findChild<QAbstractButton*>(QStringLiteral("lineArrowStartButton"));
+      arrow_start != nullptr) {
+    QSignalBlocker blocker(arrow_start);
+    arrow_start->setChecked(current_line_arrow_start_);
+  }
+  if (auto* arrow_end = findChild<QAbstractButton*>(QStringLiteral("lineArrowEndButton"));
+      arrow_end != nullptr) {
+    QSignalBlocker blocker(arrow_end);
+    arrow_end->setChecked(current_line_arrow_end_);
+  }
+  if (auto* sides = findChild<QSpinBox*>(QStringLiteral("polygonSidesSpin")); sides != nullptr) {
+    QSignalBlocker blocker(sides);
+    sides->setValue(
+        std::clamp(settings.value(QStringLiteral("tools/polygonSides"), sides->value()).toInt(), 3, 100));
+    canvas_->set_polygon_sides(sides->value());
+  }
+  if (auto* inset = findChild<QSpinBox*>(QStringLiteral("polygonStarInsetSpin")); inset != nullptr) {
+    QSignalBlocker blocker(inset);
+    inset->setValue(std::clamp(
+        settings.value(QStringLiteral("tools/polygonStarInset"), inset->value()).toInt(), 0, 99));
+    canvas_->set_polygon_star_inset(inset->value());
+  }
+  if (custom_shape_combo_ != nullptr) {
+    const auto stored_shape = settings.value(QStringLiteral("tools/customShapeId")).toString();
+    if (is_bundled_custom_shape_id(stored_shape)) {
+      custom_shape_library_with_bundled();  // the remembered shape is in the pack
+    }
+    if (!stored_shape.isEmpty()) {
+      if (const auto index = custom_shape_combo_->findData(stored_shape); index >= 0) {
+        QSignalBlocker blocker(custom_shape_combo_);
+        custom_shape_combo_->setCurrentIndex(index);
+      }
+    }
+    apply_custom_shape_selection();
+  }
+  update_vector_swatch_icons();
+  canvas_->set_fill_opacity(settings.value(QStringLiteral("tools/fillOpacity"), canvas_->fill_opacity()).toInt());
+  canvas_->set_fill_softness(settings.value(QStringLiteral("tools/fillSoftness"), canvas_->fill_softness()).toInt());
+  canvas_->set_fill_tolerance(
+      settings.value(QStringLiteral("tools/fillTolerance"), canvas_->fill_tolerance()).toInt());
+  canvas_->set_fill_contiguous(
+      settings.value(QStringLiteral("tools/fillContiguous"), canvas_->fill_contiguous()).toBool());
+  canvas_->set_zoom_scrubby(settings.value(QStringLiteral("tools/zoomScrubby"), canvas_->zoom_scrubby()).toBool());
+  canvas_->set_zoom_tool_zooms_out(
+      settings.value(QStringLiteral("tools/zoomToolZoomsOut"), canvas_->zoom_tool_zooms_out()).toBool());
+  const auto sync_fill_widget = [this](const QString& spin_name, const QString& slider_name, int value) {
+    if (auto* spin = findChild<QSpinBox*>(spin_name); spin != nullptr) {
+      QSignalBlocker blocker(spin);
+      spin->setValue(value);
+    }
+    if (auto* slider = findChild<QSlider*>(slider_name); slider != nullptr) {
+      QSignalBlocker blocker(slider);
+      slider->setValue(value);
+    }
+  };
+  sync_fill_widget(QStringLiteral("fillOpacitySpin"), QStringLiteral("fillOpacitySlider"), canvas_->fill_opacity());
+  sync_fill_widget(QStringLiteral("fillSoftnessSpin"), QStringLiteral("fillSoftnessSlider"), canvas_->fill_softness());
+  if (auto* spin = findChild<QSpinBox*>(QStringLiteral("fillToleranceSpin")); spin != nullptr) {
+    QSignalBlocker blocker(spin);
+    spin->setValue(canvas_->fill_tolerance());
+  }
+  const auto gradient_method = settings.value(QStringLiteral("tools/gradientMethod"),
+                                              static_cast<int>(canvas_->gradient_method()))
+                                   .toInt();
+  // Saved as the GradientMethod value (append-only; Angle, Reflected and Diamond since issue 610).
+  // A value this build does not know falls back to Linear.
+  canvas_->set_gradient_method(gradient_method >= static_cast<int>(GradientMethod::Linear) &&
+                                       gradient_method <= static_cast<int>(GradientMethod::Diamond)
+                                   ? static_cast<GradientMethod>(gradient_method)
+                                   : GradientMethod::Linear);
+  canvas_->set_gradient_reverse(settings.value(QStringLiteral("tools/gradientReverse"), canvas_->gradient_reverse()).toBool());
+  // A token (GitHub issue 580): "pixels" (the default) or "fillLayer".
+  canvas_->set_gradient_tool_mode(
+      settings.value(QStringLiteral("tools/gradientMode"), QStringLiteral("pixels")).toString() ==
+              QStringLiteral("fillLayer")
+          ? GradientToolMode::FillLayer
+          : GradientToolMode::Pixels);
+  canvas_->set_gradient_opacity(settings.value(QStringLiteral("tools/gradientOpacity"), canvas_->gradient_opacity()).toInt());
+  if (settings.value(QStringLiteral("tools/gradientUseCustomStops"), false).toBool()) {
+    // tools/gradientDefinition (two tracks) when it was saved beside these exact flat stops;
+    // otherwise the flat stops, converted (an older build wrote them, or nothing else exists).
+    const auto flat = settings.value(QStringLiteral("tools/gradientStops")).toByteArray();
+    if (const auto definition =
+            deserialize_gradient_definition(settings.value(QStringLiteral("tools/gradientDefinition")).toByteArray(), flat);
+        definition.has_value()) {
+      canvas_->set_gradient_definition(*definition);
+    } else {
+      canvas_->set_gradient_stops(deserialize_gradient_stops(flat));
+    }
+  } else {
+    canvas_->set_gradient_definition(std::nullopt);
+  }
+  show_text_anti_alias(settings.value(QStringLiteral("tools/textSmoothing"), kDefaultTextAntiAlias).toInt());
+}
+
+void MainWindow::set_red_eye_pupil_size(int percent) {
+  current_red_eye_pupil_size_ = std::clamp(percent, 1, 100);
+  if (canvas_ != nullptr) {
+    canvas_->set_red_eye_pupil_size(current_red_eye_pupil_size_);
+  }
+  sync_red_eye_controls();
+  schedule_save_tool_settings();
+}
+
+void MainWindow::set_red_eye_darken_amount(int percent) {
+  current_red_eye_darken_amount_ = std::clamp(percent, 1, 100);
+  if (canvas_ != nullptr) {
+    canvas_->set_red_eye_darken_amount(current_red_eye_darken_amount_);
+  }
+  sync_red_eye_controls();
+  schedule_save_tool_settings();
+}
+
+void MainWindow::apply_color_replace_settings() {
+  if (canvas_ != nullptr) {
+    canvas_->set_color_replace_options(current_color_replace_options_);
+    canvas_->set_color_replace_sampling(current_color_replace_sampling_);
+  }
+  schedule_save_tool_settings();
+}
+
+void MainWindow::apply_eraser_tool_settings() {
+  if (canvas_ != nullptr) {
+    canvas_->set_background_eraser_options(current_background_eraser_options_);
+    canvas_->set_background_eraser_sampling(current_background_eraser_sampling_);
+    canvas_->set_magic_eraser_options(current_magic_eraser_options_);
+  }
+  schedule_save_tool_settings();
+}
+
+void MainWindow::sync_eraser_tool_controls() {
+  const auto select = [](QComboBox* combo, int value) {
+    if (combo != nullptr) {
+      const QSignalBlocker blocker(combo);
+      combo->setCurrentIndex(std::max(0, combo->findData(value)));
+    }
+  };
+  const auto set_value = [](auto* control, int value) {
+    if (control != nullptr) {
+      const QSignalBlocker blocker(control);
+      control->setValue(value);
+    }
+  };
+  const auto set_checked = [](QCheckBox* check, bool checked) {
+    if (check != nullptr) {
+      const QSignalBlocker blocker(check);
+      check->setChecked(checked);
+    }
+  };
+  select(background_eraser_sampling_combo_, static_cast<int>(current_background_eraser_sampling_));
+  select(background_eraser_limits_combo_, static_cast<int>(current_background_eraser_options_.limits));
+  set_value(background_eraser_tolerance_spin_, current_background_eraser_options_.tolerance);
+  set_value(magic_eraser_tolerance_spin_, current_magic_eraser_options_.tolerance);
+  set_checked(magic_eraser_anti_alias_check_, current_magic_eraser_options_.anti_alias);
+  set_checked(magic_eraser_contiguous_check_, current_magic_eraser_options_.contiguous);
+  set_checked(magic_eraser_sample_all_layers_check_, current_magic_eraser_options_.sample_all_layers);
+  set_value(magic_eraser_opacity_spin_, current_magic_eraser_options_.opacity);
+  set_value(magic_eraser_opacity_slider_, current_magic_eraser_options_.opacity);
+}
+
+void MainWindow::sync_color_replace_controls() {
+  const auto select = [](QComboBox* combo, int value) {
+    if (combo != nullptr) {
+      const QSignalBlocker blocker(combo);
+      combo->setCurrentIndex(std::max(0, combo->findData(value)));
+    }
+  };
+  select(color_replace_mode_combo_, static_cast<int>(current_color_replace_options_.mode));
+  select(color_replace_sampling_combo_, static_cast<int>(current_color_replace_sampling_));
+  select(color_replace_limits_combo_, static_cast<int>(current_color_replace_options_.limits));
+  if (color_replace_tolerance_spin_ != nullptr) {
+    const QSignalBlocker blocker(color_replace_tolerance_spin_);
+    color_replace_tolerance_spin_->setValue(current_color_replace_options_.tolerance);
+  }
+  if (color_replace_anti_alias_check_ != nullptr) {
+    const QSignalBlocker blocker(color_replace_anti_alias_check_);
+    color_replace_anti_alias_check_->setChecked(current_color_replace_options_.anti_alias);
+  }
+}
+
+void MainWindow::sync_red_eye_controls() {
+  for (const auto& [spin, slider, value] :
+       {std::tuple{red_eye_pupil_spin_, red_eye_pupil_slider_, current_red_eye_pupil_size_},
+        std::tuple{red_eye_darken_spin_, red_eye_darken_slider_, current_red_eye_darken_amount_}}) {
+    if (spin != nullptr && spin->value() != value) {
+      const QSignalBlocker blocker(spin);
+      spin->setValue(value);
+    }
+    if (slider != nullptr && slider->value() != value) {
+      const QSignalBlocker blocker(slider);
+      slider->setValue(value);
+    }
+  }
+}
+
+void MainWindow::schedule_save_tool_settings() {
+  if (tool_settings_save_timer_ != nullptr) {
+    tool_settings_save_timer_->start();
+  } else {
+    save_tool_settings();
+  }
+}
+
+void MainWindow::save_active_tool_setting() const {
+  app_settings().setValue(QLatin1String(kActiveToolSettingsKey), tool_hotkey_id(current_tool_));
+}
+
+void MainWindow::sync_retouch_sample_controls_from_canvas() {
+  if (canvas_ == nullptr) {
+    return;
+  }
+  if (retouch_sample_layers_combo_ != nullptr) {
+    const QSignalBlocker blocker(retouch_sample_layers_combo_);
+    retouch_sample_layers_combo_->setCurrentIndex(std::max(
+        0, retouch_sample_layers_combo_->findData(
+               QString::fromLatin1(sample_layers_token(canvas_->retouch_sample_layers())))));
+  }
+  if (healing_mode_combo_ != nullptr) {
+    const QSignalBlocker blocker(healing_mode_combo_);
+    healing_mode_combo_->setCurrentIndex(
+        std::max(0, healing_mode_combo_->findData(static_cast<int>(canvas_->healing_mode()))));
+  }
+  if (retouch_ignore_adjustments_check_ != nullptr) {
+    const QSignalBlocker blocker(retouch_ignore_adjustments_check_);
+    retouch_ignore_adjustments_check_->setChecked(canvas_->retouch_ignore_adjustments());
+    retouch_ignore_adjustments_check_->setEnabled(canvas_->retouch_sample_layers() != SampleLayers::CurrentLayer);
+  }
+}
+
+void MainWindow::apply_clone_overlay_settings(bool shown, int opacity) {
+  current_clone_overlay_shown_ = shown;
+  current_clone_overlay_opacity_ = std::clamp(opacity, 1, 100);
+  for (auto* canvas : findChildren<CanvasWidget*>()) {
+    canvas->set_clone_overlay_shown(current_clone_overlay_shown_);
+    canvas->set_clone_overlay_opacity(current_clone_overlay_opacity_);
+  }
+  schedule_save_tool_settings();
+  refresh_clone_source_panel();
+}
+
+void MainWindow::apply_brush_overlay_settings(bool shown, int opacity) {
+  current_brush_overlay_shown_ = shown;
+  current_brush_overlay_opacity_ = std::clamp(opacity, 1, 100);
+  for (auto* canvas : findChildren<CanvasWidget*>()) {
+    canvas->set_brush_overlay_shown(current_brush_overlay_shown_);
+    canvas->set_brush_overlay_opacity(current_brush_overlay_opacity_);
+  }
+  schedule_save_tool_settings();
+  sync_brush_overlay_menu();
+}
+
+void MainWindow::apply_brush_outline_shown(bool shown) {
+  current_brush_outline_shown_ = shown;
+  for (auto* canvas : findChildren<CanvasWidget*>()) {
+    canvas->set_brush_outline_shown(current_brush_outline_shown_);
+  }
+  schedule_save_tool_settings();
+  sync_brush_overlay_menu();
+}
+
+void MainWindow::sync_brush_overlay_menu() {
+  const bool brush = current_tool_ == CanvasTool::Brush;
+  for (auto* action :
+       {brush_overlay_separator_, brush_outline_action_, brush_overlay_action_, brush_overlay_opacity_action_}) {
+    if (action != nullptr) {
+      action->setVisible(brush);
+    }
+  }
+  if (brush_outline_action_ != nullptr) {
+    const QSignalBlocker blocker(brush_outline_action_);
+    brush_outline_action_->setChecked(current_brush_outline_shown_);
+  }
+  if (brush_overlay_action_ != nullptr) {
+    const QSignalBlocker blocker(brush_overlay_action_);
+    brush_overlay_action_->setChecked(current_brush_overlay_shown_);
+  }
+  // The Overlay Opacity label starts where the menu starts its item text (GitHub issue 517),
+  // measured from the menu's own style so themes, DPI and platform styles agree.
+  if (brush_overlay_opacity_row_ != nullptr && brush_overlay_action_ != nullptr &&
+      brush_overlay_opacity_row_->layout() != nullptr) {
+    if (auto* menu = qobject_cast<QMenu*>(brush_overlay_opacity_row_->parentWidget()); menu != nullptr) {
+      if (auto indent = menu_item_text_indent(*menu, *brush_overlay_action_); indent > 0) {
+        // Less whatever inset the label still draws its text at (a theme's label padding).
+        if (brush_overlay_opacity_label_ != nullptr) {
+          brush_overlay_opacity_label_->ensurePolished();
+          indent = std::max(0, indent - brush_overlay_opacity_label_->contentsRect().left());
+        }
+        auto margins = brush_overlay_opacity_row_->layout()->contentsMargins();
+        if (margins.left() != indent) {
+          margins.setLeft(indent);
+          brush_overlay_opacity_row_->layout()->setContentsMargins(margins);
+        }
+      }
+    }
+  }
+  if (brush_overlay_opacity_spin_ != nullptr) {
+    const QSignalBlocker blocker(brush_overlay_opacity_spin_);
+    brush_overlay_opacity_spin_->setValue(current_brush_overlay_opacity_);
+    brush_overlay_opacity_spin_->setEnabled(current_brush_overlay_shown_);
+  }
+}
+
+void MainWindow::refresh_clone_source_panel() {
+  if (clone_source_panel_ == nullptr) {
+    return;
+  }
+  CloneSourcePanel::State state;
+  state.overlay_shown = current_clone_overlay_shown_;
+  state.overlay_opacity = current_clone_overlay_opacity_;
+  if (canvas_ != nullptr && has_active_document()) {
+    state.has_document = true;
+    state.slot = canvas_->clone_source_slot();
+    for (int slot = 0; slot < CloneSourcePanel::kSlotCount; ++slot) {
+      const auto source = canvas_->clone_source_slot_state(slot);
+      state.slot_set[static_cast<std::size_t>(slot)] = source.set;
+      state.slot_point[static_cast<std::size_t>(slot)] = source.point;
+    }
+    const auto active = canvas_->clone_source_slot_state(state.slot);
+    state.offset = active.offset;
+    state.offset_set = active.offset_set;
+    state.transform = active.transform;
+    state.aligned = canvas_->clone_aligned();
+    state.transform_applies = canvas_->tool() != CanvasTool::Healing;
+  }
+  clone_source_panel_->set_state(state);
+}
+
+void MainWindow::show_brush_settings_window() {
+  if (brush_dynamics_button_ == nullptr || canvas_ == nullptr) {
+    return;
+  }
+  // Dynamics are the Brush tool's alone.
+  if (canvas_->tool() != CanvasTool::Brush) {
+    activate_tool(CanvasTool::Brush);
+  }
+  brush_dynamics_button_->open_window();
+}
+
+namespace {
+
+// The tools whose options bar carries the Tip picker (build_options_bar).
+[[nodiscard]] bool tool_takes_brush_tip(CanvasTool tool) {
+  return tool == CanvasTool::Brush || tool == CanvasTool::MixerBrush || tool == CanvasTool::PatternStamp ||
+         tool == CanvasTool::Eraser || tool == CanvasTool::ColorReplace || tool == CanvasTool::BackgroundEraser;
+}
+
+}  // namespace
+
+void MainWindow::show_brush_tips_window() {
+  if (brush_tip_picker_ == nullptr || canvas_ == nullptr) {
+    return;
+  }
+  if (!tool_takes_brush_tip(canvas_->tool())) {
+    activate_tool(CanvasTool::Brush);
+  }
+  brush_tip_picker_->open_window();
+}
+
+void MainWindow::refresh_brush_tool_windows(bool edit_allowed) {
+  const auto no_document = !has_active_document();
+  if (brush_tip_picker_ != nullptr) {
+    brush_tip_picker_->set_tool_supported(
+        edit_allowed && tool_takes_brush_tip(current_tool_),
+        no_document ? tr("Open a document to choose a brush tip.")
+                    : !edit_allowed ? tr("Brush tips can be changed again once the open dialog closes.")
+                                    : tr("The active tool has no brush tip."));
+  }
+  if (brush_dynamics_button_ != nullptr) {
+    brush_dynamics_button_->set_tool_supported(
+        edit_allowed && current_tool_ == CanvasTool::Brush,
+        no_document ? tr("Open a document to change the brush dynamics and effects.")
+                    : !edit_allowed ? tr("Brush dynamics and effects can be changed again once the open dialog closes.")
+                                    : tr("Brush dynamics and effects apply to the Brush tool."));
+  }
+}
+
+void MainWindow::restore_brush_tool_windows() {
+  if (brush_tool_windows_restored_) {
+    return;
+  }
+  brush_tool_windows_restored_ = true;
+  // Reopened without taking the keyboard from the main window.
+  if (brush_tip_picker_ != nullptr && BrushToolWindow::remembered_open(QStringLiteral("brushes/tipsWindow"))) {
+    brush_tip_picker_->open_window(std::nullopt, false);
+  }
+  if (brush_dynamics_button_ != nullptr &&
+      BrushToolWindow::remembered_open(QStringLiteral("brushes/settingsWindow"))) {
+    brush_dynamics_button_->open_window(std::nullopt, false);
+  }
+}
+
+QString MainWindow::retouch_sample_info_text() const {
+  if (canvas_ == nullptr) {
+    return {};
+  }
+  switch (canvas_->retouch_sample_layers()) {
+    case SampleLayers::CurrentLayer:
+      return tr("active layer");
+    case SampleLayers::CurrentAndBelow:
+    case SampleLayers::CurrentAndBelowNoAdjustments:
+      return tr("active layer and below");
+    case SampleLayers::AllLayers:
+    case SampleLayers::AllLayersNoAdjustments:
+      break;
+  }
+  return tr("sample all layers");
+}
+
+void MainWindow::save_tool_settings() const {
+  // Nothing to save before the stored values were read: a save here would write the
+  // defaults donor's values over them (startup_tool_settings_pending_).
+  if (canvas_ == nullptr || startup_tool_settings_pending_) {
+    return;
+  }
+  // An explicit save captures the current state, so drop any debounced one
+  // still pending; otherwise it would fire later and rewrite the same values.
+  if (tool_settings_save_timer_ != nullptr) {
+    tool_settings_save_timer_->stop();
+  }
+  auto settings = app_settings();
+  settings.setValue(QLatin1String(kActiveToolSettingsKey), tool_hotkey_id(current_tool_));
+  // The canvas holds the set the active tool uses; the other set is the stashed one.
+  const BrushToolSettings live{canvas_->brush_size(), canvas_->brush_opacity(), canvas_->brush_flow(),
+                               canvas_->brush_softness(), canvas_->brush_build_up()};
+  const auto& paint = eraser_brush_settings_active_ ? stored_paint_brush_settings_ : live;
+  const auto& eraser = eraser_brush_settings_active_ ? live : stored_eraser_brush_settings_;
+  settings.setValue(QStringLiteral("tools/brushSize"), paint.size);
+  settings.setValue(QStringLiteral("tools/brushOpacity"), paint.opacity);
+  settings.setValue(QStringLiteral("tools/brushFlow"), paint.flow);
+  settings.setValue(QStringLiteral("tools/brushSoftness"), paint.softness);
+  settings.setValue(QStringLiteral("tools/brushAirbrush"), paint.airbrush);
+  settings.setValue(QStringLiteral("tools/eraserSize"), eraser.size);
+  settings.setValue(QStringLiteral("tools/eraserOpacity"), eraser.opacity);
+  settings.setValue(QStringLiteral("tools/eraserSoftness"), eraser.softness);
+  settings.setValue(QStringLiteral("tools/brushTip"), active_brush_tip_id_);
+  if (brush_preset_combo_ != nullptr) {
+    // Built-in presets only: an automation brush is a library object of its own.
+    const auto preset_id = brush_preset_combo_->property("lastBrushPresetId").toString();
+    if (find_brush_preset(preset_id) != nullptr) {
+      settings.setValue(QStringLiteral("tools/brushPreset"), preset_id);
+    }
+  }
+  settings.setValue(QStringLiteral("tools/marqueeCornerRadius"), current_marquee_corner_radius_);
+  // tools/shapeFill, the Pixels-mode Fill checkbox of versions before the draw-mode buttons, is
+  // still written for them: checked while a fill is drawn.
+  settings.setValue(QStringLiteral("tools/shapeFill"), current_vector_fill_.kind != VectorFillKind::None);
+  if (shape_pixel_options_ != nullptr) {
+    shape_pixel_options_->save(settings);
+  }
+  settings.setValue(QStringLiteral("tools/mixerWet"), current_mixer_wet_);
+  settings.setValue(QStringLiteral("tools/mixerLoad"), current_mixer_load_);
+  settings.setValue(QStringLiteral("tools/mixerMix"), current_mixer_mix_);
+  settings.setValue(QStringLiteral("tools/mixerFlow"), current_mixer_flow_);
+  settings.setValue(QStringLiteral("tools/mixerSampleAllLayers"), canvas_->mixer_sample_all_layers());
+  settings.setValue(QStringLiteral("tools/brushMode"), script_paint_mode_id(current_brush_paint_mode_));
+  settings.setValue(QStringLiteral("tools/brushSmoothing"), current_brush_smoothing_);
+  settings.setValue(QStringLiteral("tools/brushSmoothingPulledString"), current_brush_smoothing_pulled_string_);
+  settings.setValue(QStringLiteral("tools/brushSmoothingCatchUp"), current_brush_smoothing_catch_up_);
+  settings.setValue(QStringLiteral("tools/brushSmoothingCatchUpEnd"), current_brush_smoothing_catch_up_end_);
+  settings.setValue(QStringLiteral("tools/brushSmoothingZoomAdjust"), current_brush_smoothing_zoom_adjust_);
+  settings.setValue(QStringLiteral("tools/wandTolerance"), canvas_->wand_tolerance());
+  settings.setValue(QStringLiteral("tools/wandContiguous"), canvas_->wand_contiguous());
+  settings.setValue(QStringLiteral("tools/wandSampleSize"), canvas_->wand_sample_size());
+  settings.setValue(QStringLiteral("tools/wandSampleAllLayers"), canvas_->wand_sample_all_layers());
+  for (const auto& keys : kSelectionEdgeSettingKeys) {
+    const auto index = static_cast<std::size_t>(CanvasWidget::selection_tool_index(keys.tool));
+    settings.setValue(QLatin1StringView(keys.feather), selection_feather_by_tool_[index]);
+    if (keys.anti_alias != nullptr) {
+      settings.setValue(QLatin1StringView(keys.anti_alias), selection_antialias_by_tool_[index]);
+    }
+  }
+  settings.setValue(QStringLiteral("tools/quickSelectSize"), canvas_->quick_select_size());
+  settings.setValue(QStringLiteral("tools/quickSelectSampleAllLayers"), canvas_->quick_select_sample_all_layers());
+  settings.setValue(QStringLiteral("tools/quickSelectEnhanceEdge"), canvas_->quick_select_enhance_edge());
+  settings.setValue(QStringLiteral("tools/objectSelectSampleAllLayers"), canvas_->object_select_sample_all_layers());
+  settings.setValue(QStringLiteral("tools/magneticLassoWidth"), canvas_->magnetic_lasso_width());
+  settings.setValue(QStringLiteral("tools/magneticLassoEdgeContrast"), canvas_->magnetic_lasso_edge_contrast());
+  settings.setValue(QStringLiteral("tools/magneticLassoFrequency"), canvas_->magnetic_lasso_frequency());
+  // tools/showTransformControls, tools/moveAutoSelect and tools/moveAutoSelectTarget
+  // are written by their options-bar controls, not here: tests flip the canvas flags
+  // directly and must not leak them into later windows.
+  settings.setValue(QStringLiteral("tools/transformInterpolation"), static_cast<int>(canvas_->transform_interpolation()));
+  settings.setValue(QStringLiteral("tools/cloneAligned"), canvas_->clone_aligned());
+  settings.setValue(QStringLiteral("tools/cloneOverlay"), current_clone_overlay_shown_);
+  settings.setValue(QStringLiteral("tools/cloneOverlayOpacity"), current_clone_overlay_opacity_);
+  settings.setValue(QStringLiteral("tools/brushOverlay"), current_brush_overlay_shown_);
+  settings.setValue(QStringLiteral("tools/brushOverlayOpacity"), current_brush_overlay_opacity_);
+  settings.setValue(QStringLiteral("tools/brushOutline"), current_brush_outline_shown_);
+  settings.setValue(QStringLiteral("tools/retouchSampleLayers"),
+                    QString::fromLatin1(sample_layers_token(canvas_->retouch_sample_layers())));
+  // Older builds read only the bool: Current & Below reads there as All Layers.
+  settings.setValue(QStringLiteral("tools/retouchSampleAllLayers"),
+                    canvas_->retouch_sample_layers() != SampleLayers::CurrentLayer);
+  settings.setValue(QStringLiteral("tools/retouchIgnoreAdjustments"), canvas_->retouch_ignore_adjustments());
+  settings.setValue(QStringLiteral("tools/healingMode"),
+                    QString::fromLatin1(healing_mode_token(canvas_->healing_mode())));
+  settings.setValue(QStringLiteral("tools/contentAwareMoveDestination"),
+                    canvas_->content_aware_move_destination() == ContentAwareMoveDestination::NewLayer
+                        ? QStringLiteral("newLayer")
+                        : QStringLiteral("currentLayer"));
+  settings.setValue(QStringLiteral("tools/contentAwareMoveObjectSelection"),
+                    canvas_->content_aware_move_object_selection());
+  // The remembered ratio, not the canvas's: Size mode runs the canvas unconstrained.
+  settings.setValue(QStringLiteral("tools/cropRatioWidth"), current_crop_ratio_w_);
+  settings.setValue(QStringLiteral("tools/cropRatioHeight"), current_crop_ratio_h_);
+  settings.setValue(QStringLiteral("tools/cropStyle"), current_crop_style_);
+  settings.setValue(QStringLiteral("tools/cropDeletePixels"), current_crop_delete_pixels_);
+  settings.setValue(QStringLiteral("tools/cropDeleteLayers"), current_crop_delete_layers_);
+  settings.setValue(QStringLiteral("tools/perspectiveCropShowGrid"), current_perspective_crop_show_grid_);
+  settings.setValue(QStringLiteral("tools/redEyePupilSize"), current_red_eye_pupil_size_);
+  settings.setValue(QStringLiteral("tools/redEyeDarkenAmount"), current_red_eye_darken_amount_);
+  const auto token_text = [](std::string_view token) {
+    return QString::fromLatin1(token.data(), static_cast<qsizetype>(token.size()));
+  };
+  settings.setValue(QStringLiteral("tools/colorReplaceMode"),
+                    token_text(patchy::color_replace_mode_token(current_color_replace_options_.mode)));
+  settings.setValue(QStringLiteral("tools/colorReplaceSampling"),
+                    token_text(patchy::color_replace_sampling_token(current_color_replace_sampling_)));
+  settings.setValue(QStringLiteral("tools/colorReplaceLimits"),
+                    token_text(patchy::color_replace_limits_token(current_color_replace_options_.limits)));
+  settings.setValue(QStringLiteral("tools/colorReplaceTolerance"), current_color_replace_options_.tolerance);
+  settings.setValue(QStringLiteral("tools/colorReplaceAntiAlias"), current_color_replace_options_.anti_alias);
+  settings.setValue(QStringLiteral("tools/backgroundEraserSampling"),
+                    token_text(patchy::color_match_sampling_token(current_background_eraser_sampling_)));
+  settings.setValue(QStringLiteral("tools/backgroundEraserLimits"),
+                    token_text(patchy::color_match_limits_token(current_background_eraser_options_.limits)));
+  settings.setValue(QStringLiteral("tools/backgroundEraserTolerance"), current_background_eraser_options_.tolerance);
+  settings.setValue(QStringLiteral("tools/magicEraserTolerance"), current_magic_eraser_options_.tolerance);
+  settings.setValue(QStringLiteral("tools/magicEraserAntiAlias"), current_magic_eraser_options_.anti_alias);
+  settings.setValue(QStringLiteral("tools/magicEraserContiguous"), current_magic_eraser_options_.contiguous);
+  settings.setValue(QStringLiteral("tools/magicEraserSampleAllLayers"),
+                    current_magic_eraser_options_.sample_all_layers);
+  settings.setValue(QStringLiteral("tools/magicEraserOpacity"), current_magic_eraser_options_.opacity);
+  if (crop_overlay_combo_ != nullptr && current_crop_overlay_ >= 0 &&
+      current_crop_overlay_ < crop_overlay_combo_->count()) {
+    settings.setValue(QStringLiteral("tools/cropOverlay"), crop_overlay_combo_->itemData(current_crop_overlay_));
+  }
+  settings.setValue(QStringLiteral("tools/cropOverlayOrientation"), current_crop_overlay_orientation_);
+  settings.setValue(QStringLiteral("tools/cropOverlayShow"), current_crop_overlay_while_dragging_
+                                                                 ? QStringLiteral("dragging")
+                                                                 : QStringLiteral("always"));
+  settings.setValue(QStringLiteral("tools/cropShowCroppedArea"), current_crop_overlay_options_.show_cropped_area);
+  settings.setValue(QStringLiteral("tools/cropShieldEnabled"), current_crop_overlay_options_.shield_enabled);
+  settings.setValue(QStringLiteral("tools/cropShieldColor"),
+                    current_crop_overlay_options_.shield_color.name(QColor::HexRgb));
+  settings.setValue(QStringLiteral("tools/cropShieldOpacity"), current_crop_overlay_options_.shield_opacity_percent);
+  settings.setValue(QStringLiteral("tools/cropMoveImageUnderBox"), current_crop_overlay_options_.move_image);
+  settings.setValue(QStringLiteral("tools/patternStampPatternId"), current_pattern_stamp_pattern_id_);
+  settings.setValue(QStringLiteral("tools/patternStampAligned"), current_pattern_stamp_aligned_);
+  settings.setValue(QStringLiteral("tools/healingDiffusion"), current_healing_diffusion_);
+  settings.setValue(QStringLiteral("tools/localAdjustmentStrength"), current_local_adjustment_strength_);
+  settings.setValue(QStringLiteral("tools/smudgeStrength"), current_smudge_strength_);
+  QString local_tone_range = QStringLiteral("midtones");
+  switch (current_local_tone_range_) {
+    case CanvasWidget::LocalToneRange::Shadows:
+      local_tone_range = QStringLiteral("shadows");
+      break;
+    case CanvasWidget::LocalToneRange::Midtones:
+      break;
+    case CanvasWidget::LocalToneRange::Highlights:
+      local_tone_range = QStringLiteral("highlights");
+      break;
+  }
+  settings.setValue(QStringLiteral("tools/localToneRange"), local_tone_range);
+  settings.setValue(QStringLiteral("tools/localProtectTones"), current_local_protect_tones_);
+  settings.setValue(QStringLiteral("tools/spongeMode"),
+                    current_sponge_mode_ == CanvasWidget::SpongeMode::Saturate
+                        ? QStringLiteral("saturate")
+                        : QStringLiteral("desaturate"));
+  settings.setValue(QStringLiteral("tools/spongeVibrance"), current_sponge_vibrance_);
+  settings.setValue(QStringLiteral("tools/eyedropperSampleSize"), current_eyedropper_sample_size_);
+  settings.setValue(QStringLiteral("tools/eyedropperSampleLayers"),
+                    QString::fromLatin1(sample_layers_token(current_eyedropper_sample_layers_)));
+  // Older builds read only the bool: anything but Current Layer reads there as All Layers.
+  settings.setValue(QStringLiteral("tools/eyedropperSampleAllLayers"),
+                    current_eyedropper_sample_layers_ != SampleLayers::CurrentLayer);
+  settings.setValue(QStringLiteral("tools/eyedropperPicksBackground"), current_eyedropper_picks_background_);
+  settings.setValue(QStringLiteral("tools/eyedropperShowSampleRing"), current_eyedropper_show_sample_ring_);
+  settings.setValue(QStringLiteral("tools/shapeCornerRadius"), canvas_->shape_corner_radius());
+  settings.setValue(QStringLiteral("tools/vectorToolMode"),
+                    current_vector_tool_mode_ == VectorToolMode::Path     ? QStringLiteral("path")
+                    : current_vector_tool_mode_ == VectorToolMode::Pixels ? QStringLiteral("pixels")
+                                                                          : QStringLiteral("shape"));
+  settings.setValue(QStringLiteral("tools/penAutoAddDelete"), current_pen_auto_add_delete_);
+  const auto save_vector_paint = [&settings](const patchy::VectorFill& paint,
+                                             const QString& gradient_id, const char* color_key,
+                                             const char* kind_key, const char* pattern_key,
+                                             const char* gradient_key) {
+    settings.setValue(QLatin1String(color_key),
+                      QColor(paint.color.red, paint.color.green, paint.color.blue)
+                          .name(QColor::HexRgb));
+    settings.setValue(QLatin1String(kind_key),
+                      paint.kind == patchy::VectorFillKind::None       ? QStringLiteral("none")
+                      : paint.kind == patchy::VectorFillKind::Gradient ? QStringLiteral("gradient")
+                      : paint.kind == patchy::VectorFillKind::Pattern  ? QStringLiteral("pattern")
+                                                                       : QStringLiteral("solid"));
+    settings.setValue(QLatin1String(pattern_key), QString::fromStdString(paint.pattern_id));
+    settings.setValue(QLatin1String(gradient_key), gradient_id);
+  };
+  save_vector_paint(current_vector_fill_, current_vector_fill_gradient_id_,
+                    "tools/vectorFillColor", "tools/vectorFillKind", "tools/vectorFillPatternId",
+                    "tools/vectorFillGradientId");
+  save_vector_paint(current_vector_stroke_paint_, current_vector_stroke_gradient_id_,
+                    "tools/vectorStrokeColor", "tools/vectorStrokePaintKind",
+                    "tools/vectorStrokePatternId", "tools/vectorStrokeGradientId");
+  settings.setValue(QStringLiteral("tools/vectorStrokeEnabled"), current_vector_stroke_enabled_);
+  settings.setValue(QStringLiteral("tools/vectorStrokeWidth"), current_vector_stroke_width_);
+  settings.setValue(QStringLiteral("tools/vectorLineWeight"), current_vector_line_weight_);
+  settings.setValue(QStringLiteral("tools/vectorStrokeDashes"),
+                    QString::fromUtf8(stroke_dash_preset_token(current_vector_stroke_dash_preset_)));
+  // A one-entry stroke preset array (the shapeAppearance/strokeStylePresets format).
+  if (current_vector_stroke_style_.has_value()) {
+    settings.setValue(QStringLiteral("tools/vectorStrokeStyle"),
+                      stroke_style_presets_json({stroke_style_preset_from(*current_vector_stroke_style_,
+                                                                          QStringLiteral("current"))}));
+  } else {
+    settings.remove(QStringLiteral("tools/vectorStrokeStyle"));
+  }
+  settings.setValue(QStringLiteral("tools/lineArrowStart"), current_line_arrow_start_);
+  settings.setValue(QStringLiteral("tools/lineArrowEnd"), current_line_arrow_end_);
+  if (auto* sides = findChild<QSpinBox*>(QStringLiteral("polygonSidesSpin")); sides != nullptr) {
+    settings.setValue(QStringLiteral("tools/polygonSides"), sides->value());
+  }
+  if (auto* inset = findChild<QSpinBox*>(QStringLiteral("polygonStarInsetSpin")); inset != nullptr) {
+    settings.setValue(QStringLiteral("tools/polygonStarInset"), inset->value());
+  }
+  if (custom_shape_combo_ != nullptr) {
+    settings.setValue(QStringLiteral("tools/customShapeId"),
+                      custom_shape_combo_->currentData().toString());
+  }
+  settings.setValue(QStringLiteral("tools/fillOpacity"), canvas_->fill_opacity());
+  settings.setValue(QStringLiteral("tools/fillSoftness"), canvas_->fill_softness());
+  settings.setValue(QStringLiteral("tools/fillTolerance"), canvas_->fill_tolerance());
+  settings.setValue(QStringLiteral("tools/fillContiguous"), canvas_->fill_contiguous());
+  settings.setValue(QStringLiteral("tools/zoomScrubby"), canvas_->zoom_scrubby());
+  settings.setValue(QStringLiteral("tools/zoomToolZoomsOut"), canvas_->zoom_tool_zooms_out());
+  settings.setValue(QStringLiteral("tools/gradientMethod"), static_cast<int>(canvas_->gradient_method()));
+  settings.setValue(QStringLiteral("tools/gradientReverse"), canvas_->gradient_reverse());
+  settings.setValue(QStringLiteral("tools/gradientMode"),
+                    canvas_->gradient_tool_mode() == GradientToolMode::FillLayer ? QStringLiteral("fillLayer")
+                                                                                  : QStringLiteral("pixels"));
+  settings.setValue(QStringLiteral("tools/gradientOpacity"), canvas_->gradient_opacity());
+  settings.setValue(QStringLiteral("tools/gradientUseCustomStops"), canvas_->gradient_definition().has_value());
+  if (const auto& definition = canvas_->gradient_definition(); definition.has_value()) {
+    // The flat stops stay written (their meaning unchanged) for builds that read only them.
+    const auto flat = serialize_gradient_stops(canvas_->effective_gradient_stops());
+    settings.setValue(QStringLiteral("tools/gradientStops"), flat);
+    settings.setValue(QStringLiteral("tools/gradientDefinition"), serialize_gradient_definition(*definition, flat));
+  } else {
+    settings.remove(QStringLiteral("tools/gradientStops"));
+    settings.remove(QStringLiteral("tools/gradientDefinition"));
+  }
+  settings.setValue(QStringLiteral("tools/textSmoothing"), text_anti_alias_);
+}
+
+MainWindow::BrushToolSettings& MainWindow::active_stored_brush_settings() {
+  return eraser_brush_settings_active_ ? stored_eraser_brush_settings_ : stored_paint_brush_settings_;
+}
+
+void MainWindow::stash_active_brush_settings() {
+  if (canvas_ == nullptr) {
+    return;
+  }
+  if (active_automation_brush_) {
+    active_automation_brush_ = canvas_->current_script_brush();
+    active_automation_brush_->preset_id = active_automation_preset_id_;
+  }
+  current_fill_opacity_ = canvas_->fill_opacity();
+  current_fill_softness_ = canvas_->fill_softness();
+  current_fill_tolerance_ = canvas_->fill_tolerance();
+  current_fill_contiguous_ = canvas_->fill_contiguous();
+  current_zoom_scrubby_ = canvas_->zoom_scrubby();
+  current_zoom_tool_zooms_out_ = canvas_->zoom_tool_zooms_out();
+  current_quick_select_size_ = canvas_->quick_select_size();
+  current_quick_select_sample_all_layers_ = canvas_->quick_select_sample_all_layers();
+  current_quick_select_enhance_edge_ = canvas_->quick_select_enhance_edge();
+  current_object_select_sample_all_layers_ = canvas_->object_select_sample_all_layers();
+  current_transform_interpolation_ = canvas_->transform_interpolation();
+  current_polygon_sides_ = canvas_->polygon_sides();
+  current_polygon_star_inset_ = canvas_->polygon_star_inset();
+  active_stored_brush_settings() =
+      BrushToolSettings{canvas_->brush_size(), canvas_->brush_opacity(), canvas_->brush_flow(),
+                        canvas_->brush_softness(), canvas_->brush_build_up()};
+}
+
+void MainWindow::apply_active_brush_settings_to_canvas() {
+  if (canvas_ == nullptr) {
+    return;
+  }
+  const auto values = active_stored_brush_settings();
+  canvas_->set_brush_size(values.size);
+  canvas_->set_brush_opacity(values.opacity);
+  canvas_->set_brush_flow(values.flow);
+  canvas_->set_brush_softness(values.softness);
+  canvas_->set_brush_build_up(values.airbrush);
+  // Brush tips are application-wide like the rest of the brush settings; an incoming canvas
+  // (new tab or tab switch) may hold a stale or empty tip.
+  apply_brush_tip_to_canvas(canvas_);
+  if (active_automation_brush_) {
+    auto settings = *active_automation_brush_;
+    const auto tool = canvas_->tool();
+    settings.color = canvas_->primary_color(); settings.background = canvas_->secondary_color();
+    settings.size = values.size; settings.opacity = values.opacity;
+    settings.flow = settings.mixer ? current_mixer_flow_ : values.flow;
+    settings.softness = values.softness; settings.airbrush = values.airbrush && !settings.mixer && !settings.erase;
+    settings.mode = current_brush_paint_mode_;
+    settings.dynamics = round_brush_dynamics_;
+    canvas_->apply_script_brush(settings); canvas_->set_tool(tool);
+  }
+}
+
+void MainWindow::stash_active_colors() {
+  // Quick Mask paints in black and white and restores the canvas's own colors on exit.
+  if (canvas_ == nullptr || canvas_->quick_mask_active()) {
+    return;
+  }
+  paint_intensity_ = canvas_->paint_intensity();
+  bool changed = false;
+  if (const auto foreground = canvas_->primary_color(); foreground != canvas_applied_foreground_) {
+    foreground_color_ = foreground;
+    canvas_applied_foreground_ = foreground;
+    changed = true;
+  }
+  if (const auto background = canvas_->secondary_color(); background != canvas_applied_background_) {
+    background_color_ = background;
+    canvas_applied_background_ = background;
+    changed = true;
+  }
+  if (!changed) {
+    return;
+  }
+  if (color_drag_in_progress()) {
+    color_settings_save_pending_ = true;
+  } else {
+    color_settings_save_pending_ = false;
+    save_color_settings();
+  }
+}
+
+void MainWindow::apply_active_colors_to_canvas() {
+  if (canvas_ == nullptr || canvas_->quick_mask_active()) {
+    return;
+  }
+  canvas_->set_primary_color(foreground_color_);
+  canvas_->set_secondary_color(background_color_);
+  canvas_->paint_intensity() = paint_intensity_;
+  canvas_applied_foreground_ = canvas_->primary_color();
+  canvas_applied_background_ = canvas_->secondary_color();
+}
+
+namespace {
+
+// Permanent identifiers: the foreground/background pair on the next launch (GitHub issue
+// 339, docs/tool-options.md). "#rrggbb": canvas colors are 8-bit (edit_color).
+constexpr auto kForegroundColorSettingsKey = "tools/foregroundColor";
+constexpr auto kBackgroundColorSettingsKey = "tools/backgroundColor";
+
+}  // namespace
+
+void MainWindow::load_color_settings() {
+  const auto settings = app_settings();
+  const auto stored = [&settings](const char* key, QColor fallback) {
+    auto color = QColor::fromString(settings.value(QLatin1String(key)).toString());
+    if (!color.isValid()) {
+      return fallback;
+    }
+    color.setAlpha(255);
+    return color;
+  };
+  foreground_color_ = stored(kForegroundColorSettingsKey, QColor(Qt::black));
+  background_color_ = stored(kBackgroundColorSettingsKey, QColor(Qt::white));
+}
+
+bool MainWindow::color_drag_in_progress() const {
+  // A drag through the Color panel's picker, a color window's field (GitHub #609) or a held
+  // canvas pick (GitHub #478) reports a color per move; the settings write (a file flush)
+  // and the gradient refresh wait for its end (finish_color_panel_drag).
+  return (color_dock_panel_ != nullptr && color_dock_panel_->picking()) || color_window_drag_active_ ||
+         (canvas_ != nullptr && canvas_->color_pick_active());
+}
+
+void MainWindow::track_color_window_drag(QDialog& dialog) {
+  auto* picker = dialog.findChild<PatchyColorPicker*>(QStringLiteral("patchyAdvancedColorPicker"));
+  if (picker == nullptr) {
+    return;
+  }
+  connect(picker, &PatchyColorPicker::color_drag_started, this, [this] { color_window_drag_active_ = true; });
+  connect(picker, &PatchyColorPicker::color_drag_finished, this, [this] {
+    color_window_drag_active_ = false;
+    finish_color_panel_drag();
+  });
+  connect(picker, &QObject::destroyed, this, [this] {
+    if (color_window_drag_active_) {
+      color_window_drag_active_ = false;
+      finish_color_panel_drag();
+    }
+  });
+}
+
+void MainWindow::save_color_settings() const {
+  auto settings = app_settings();
+  settings.setValue(QLatin1String(kForegroundColorSettingsKey), foreground_color_.name(QColor::HexRgb));
+  settings.setValue(QLatin1String(kBackgroundColorSettingsKey), background_color_.name(QColor::HexRgb));
+}
+
+void MainWindow::apply_pattern_stamp_settings_to_canvas(CanvasWidget* canvas) {
+  if (canvas == nullptr) {
+    return;
+  }
+  canvas->set_pattern_stamp_aligned(current_pattern_stamp_aligned_);
+  canvas->set_pattern_stamp_pattern(pattern_library().resource(current_pattern_stamp_pattern_id_));
+}
+
+void MainWindow::refresh_pattern_stamp_pattern_combo() {
+  // Before the startup preload lands there is nothing to list: pattern_library() fills the
+  // list when it adopts the preload, or at once when the list is used first.
+  if (pattern_stamp_pattern_combo_ == nullptr || pattern_library_ == nullptr) {
+    return;
+  }
+  const QSignalBlocker blocker(pattern_stamp_pattern_combo_);
+  pattern_stamp_pattern_combo_->clear();
+  for (const auto& entry : pattern_library().entries()) {
+    pattern_stamp_pattern_combo_->addItem(QIcon(entry.thumbnail),
+                                          pattern_library_entry_display_name(entry), entry.id);
+    const auto index = pattern_stamp_pattern_combo_->count() - 1;
+    auto detail = QStringLiteral("%1 x %2").arg(entry.size.width()).arg(entry.size.height());
+    if (!entry.folder.isEmpty()) {
+      detail = entry.folder + QStringLiteral(" - ") + detail;
+    }
+    pattern_stamp_pattern_combo_->setItemData(index, detail, Qt::ToolTipRole);
+  }
+  auto index = pattern_stamp_pattern_combo_->findData(current_pattern_stamp_pattern_id_);
+  if (index < 0 && pattern_stamp_pattern_combo_->count() > 0) {
+    index = 0;
+    current_pattern_stamp_pattern_id_ = pattern_stamp_pattern_combo_->itemData(0).toString();
+  }
+  pattern_stamp_pattern_combo_->setCurrentIndex(index);
+}
+
+void MainWindow::set_eraser_brush_settings_active(bool active) {
+  if (eraser_brush_settings_active_ == active) {
+    return;
+  }
+  stash_active_brush_settings();
+  eraser_brush_settings_active_ = active;
+  apply_active_brush_settings_to_canvas();
+  sync_brush_controls_from_canvas();
+  save_tool_settings();
+}
+
+void MainWindow::apply_transform_controls_from_ui() {
+  if (updating_transform_controls_ || canvas_ == nullptr || transform_x_spin_ == nullptr ||
+      transform_y_spin_ == nullptr || transform_scale_x_spin_ == nullptr || transform_scale_y_spin_ == nullptr ||
+      transform_rotation_spin_ == nullptr) {
+    return;
+  }
+  canvas_->set_transform_controls_state(QPointF(transform_x_spin_->value(), transform_y_spin_->value()),
+                                        transform_scale_x_spin_->value(), transform_scale_y_spin_->value(),
+                                        transform_rotation_spin_->value());
+}
+
+void MainWindow::sync_transform_controls_from_canvas() {
+  if (updating_transform_controls_) {
+    return;
+  }
+  const auto state = canvas_ != nullptr ? canvas_->transform_controls_state() : std::optional<CanvasWidget::TransformControlsState>{};
+  updating_transform_controls_ = true;
+  const auto clear_guard = qScopeGuard([this] { updating_transform_controls_ = false; });
+
+  const bool has_state = state.has_value();
+  const auto set_widget_enabled = [has_state](QWidget* widget) {
+    if (widget != nullptr) {
+      widget->setEnabled(has_state);
+    }
+  };
+  for (auto* widget : {static_cast<QWidget*>(transform_reference_combo_), static_cast<QWidget*>(transform_x_spin_),
+                       static_cast<QWidget*>(transform_y_spin_), static_cast<QWidget*>(transform_scale_x_spin_),
+                       static_cast<QWidget*>(transform_scale_y_spin_), static_cast<QWidget*>(transform_link_scale_button_),
+                       static_cast<QWidget*>(transform_rotation_spin_),
+                       static_cast<QWidget*>(transform_interpolation_combo_)}) {
+    set_widget_enabled(widget);
+  }
+  const bool warp_active = canvas_ != nullptr && canvas_->warp_transform_active();
+  const bool session_active = warp_active || (has_state && state->active);
+  // Warp works on one layer; a folder/multi-selection transform session cannot
+  // switch modes (same rule as refresh_options_bar's warp-toggle state).
+  // A transform of the selected pixels cannot switch either (Warp takes whole layers).
+  const bool multi_target_transform = canvas_ != nullptr && (canvas_->free_transform_is_multi_target() ||
+                                                             canvas_->free_transform_floats_selection() ||
+                                                             canvas_->free_transform_targets_selection());
+  for (auto* button : {transform_warp_mode_button_, transform_apply_button_, transform_cancel_button_}) {
+    if (button != nullptr) {
+      button->setEnabled(session_active &&
+                         !(button == transform_warp_mode_button_ && multi_target_transform));
+    }
+  }
+  for (auto* button : transform_type_buttons_) {
+    if (button != nullptr) {
+      button->setEnabled(session_active);
+    }
+  }
+  sync_transform_type_buttons();
+  if (!state.has_value()) {
+    return;
+  }
+
+  if (transform_reference_combo_ != nullptr) {
+    QSignalBlocker blocker(transform_reference_combo_);
+    const auto index = transform_reference_combo_->findData(static_cast<int>(state->reference_point));
+    if (index >= 0) {
+      transform_reference_combo_->setCurrentIndex(index);
+    }
+  }
+  if (transform_x_spin_ != nullptr) {
+    QSignalBlocker blocker(transform_x_spin_);
+    transform_x_spin_->setValue(state->reference_position.x());
+  }
+  if (transform_y_spin_ != nullptr) {
+    QSignalBlocker blocker(transform_y_spin_);
+    transform_y_spin_->setValue(state->reference_position.y());
+  }
+  if (transform_scale_x_spin_ != nullptr) {
+    QSignalBlocker blocker(transform_scale_x_spin_);
+    transform_scale_x_spin_->setValue(state->scale_x_percent);
+  }
+  if (transform_scale_y_spin_ != nullptr) {
+    QSignalBlocker blocker(transform_scale_y_spin_);
+    transform_scale_y_spin_->setValue(state->scale_y_percent);
+  }
+  if (transform_rotation_spin_ != nullptr) {
+    QSignalBlocker blocker(transform_rotation_spin_);
+    transform_rotation_spin_->setValue(state->rotation_degrees);
+  }
+  if (transform_interpolation_combo_ != nullptr) {
+    QSignalBlocker blocker(transform_interpolation_combo_);
+    const auto index = transform_interpolation_combo_->findData(static_cast<int>(state->interpolation));
+    if (index >= 0) {
+      transform_interpolation_combo_->setCurrentIndex(index);
+    }
+  }
+}
+
+double MainWindow::effective_crop_ratio_width() const noexcept {
+  return current_crop_style_ == 0 ? current_crop_ratio_w_ : 0.0;
+}
+
+double MainWindow::effective_crop_ratio_height() const noexcept {
+  return current_crop_style_ == 0 ? current_crop_ratio_h_ : 0.0;
+}
+
+void MainWindow::apply_crop_overlay_options(const CropOverlayOptions& options) {
+  current_crop_overlay_options_ = options;
+  current_crop_overlay_options_.shield_opacity_percent = std::clamp(options.shield_opacity_percent, 0, 100);
+  if (!current_crop_overlay_options_.shield_color.isValid()) {
+    current_crop_overlay_options_.shield_color = QColor(0, 0, 0);
+  }
+  current_crop_overlay_options_.shield_color.setAlpha(255);
+  for (const auto& target_session : sessions_) {
+    if (target_session != nullptr && target_session->canvas != nullptr) {
+      target_session->canvas->set_crop_overlay_options(current_crop_overlay_options_);
+    }
+  }
+  if (canvas_ != nullptr) {
+    canvas_->set_crop_overlay_options(current_crop_overlay_options_);
+  }
+  sync_crop_overlay_controls();
+  schedule_save_tool_settings();
+}
+
+void MainWindow::sync_crop_overlay_controls() {
+  const auto& options = current_crop_overlay_options_;
+  for (const auto& [action, checked] : {std::pair{crop_show_cropped_area_action_, options.show_cropped_area},
+                                        std::pair{crop_shield_action_, options.shield_enabled},
+                                        std::pair{crop_move_image_action_, options.move_image}}) {
+    if (action != nullptr) {
+      const QSignalBlocker blocker(action);
+      action->setChecked(checked);
+    }
+  }
+  if (crop_shield_color_button_ != nullptr) {
+    set_themed_style(*crop_shield_color_button_, color_button_style(options.shield_color));
+    crop_shield_color_button_->setEnabled(options.shield_enabled);
+  }
+  if (crop_shield_opacity_spin_ != nullptr) {
+    const QSignalBlocker blocker(crop_shield_opacity_spin_);
+    crop_shield_opacity_spin_->setValue(options.shield_opacity_percent);
+    crop_shield_opacity_spin_->setEnabled(options.shield_enabled);
+  }
+}
+
+void MainWindow::choose_crop_shield_color() {
+  // Live preview on the canvas; a cancel puts the previous color back.
+  const auto original = current_crop_overlay_options_.shield_color;
+  const auto apply = [this](QColor color) {
+    auto options = current_crop_overlay_options_;
+    options.shield_color = color;
+    apply_crop_overlay_options(options);
+  };
+  const auto chosen = request_patchy_color(this, original, tr("Crop Shield Color"), apply);
+  apply(chosen.value_or(original));
+}
+
+bool MainWindow::crop_size_link_active() const noexcept {
+  return current_crop_style_ == 1 && crop_link_size_button_ != nullptr && crop_link_size_button_->isChecked();
+}
+
+void MainWindow::handle_crop_size_value_changed(bool horizontal, int value) {
+  if (canvas_ == nullptr || value < 1) {
+    return;
+  }
+  const auto rect = canvas_->crop_session_rect();
+  if (!rect.has_value() || rect->isEmpty()) {
+    return;
+  }
+  auto size = rect->size();
+  const bool linked = crop_link_size_button_ != nullptr && crop_link_size_button_->isChecked();
+  if (horizontal) {
+    size.setWidth(value);
+    if (linked) {
+      size.setHeight(std::max(1, static_cast<int>(std::lround(static_cast<double>(value) * rect->height() /
+                                                              rect->width()))));
+    }
+  } else {
+    size.setHeight(value);
+    if (linked) {
+      size.setWidth(std::max(1, static_cast<int>(std::lround(static_cast<double>(value) * rect->width() /
+                                                             rect->height()))));
+    }
+  }
+  canvas_->set_crop_session_size(size);  // notifies, which re-syncs both fields
+}
+
+void MainWindow::sync_crop_guide_buttons_enabled(bool edit_allowed) {
+  // In the Crop options menu (GitHub issue 325): the turn only means something
+  // for the Triangle and the Golden Spiral, the show choice nothing under No
+  // Overlay. The menu's button itself follows the bar (the shield options).
+  const auto overlay = static_cast<CanvasWidget::CropOverlay>(current_crop_overlay_);
+  if (crop_overlay_next_action_ != nullptr) {
+    crop_overlay_next_action_->setEnabled(edit_allowed);
+  }
+  if (crop_overlay_turn_action_ != nullptr) {
+    crop_overlay_turn_action_->setEnabled(edit_allowed && (overlay == CanvasWidget::CropOverlay::Triangle ||
+                                                           overlay == CanvasWidget::CropOverlay::GoldenSpiral));
+  }
+  if (current_tool_ == CanvasTool::Crop) {
+    refresh_crop_key_hints();  // the hotkeys may have changed since the bar was last shown
+  }
+  for (auto* action : {crop_overlay_show_always_action_, crop_overlay_show_while_dragging_action_}) {
+    if (action != nullptr) {
+      action->setEnabled(edit_allowed && overlay != CanvasWidget::CropOverlay::None);
+    }
+  }
+}
+
+void MainWindow::apply_crop_guide_options() {
+  const auto overlay = static_cast<CanvasWidget::CropOverlay>(current_crop_overlay_);
+  if (canvas_ != nullptr) {
+    canvas_->set_crop_overlay(overlay, current_crop_overlay_orientation_, current_crop_overlay_while_dragging_);
+  }
+  if (crop_overlay_combo_ != nullptr) {
+    const QSignalBlocker blocker(crop_overlay_combo_);
+    crop_overlay_combo_->setCurrentIndex(current_crop_overlay_);
+  }
+  sync_crop_guide_buttons_enabled(has_active_document() && !preview_dialog_edit_locked());
+  for (const auto& [action, checked] :
+       {std::pair{crop_overlay_show_always_action_, !current_crop_overlay_while_dragging_},
+        std::pair{crop_overlay_show_while_dragging_action_, current_crop_overlay_while_dragging_}}) {
+    if (action != nullptr) {
+      const QSignalBlocker blocker(action);
+      action->setChecked(checked);
+    }
+  }
+}
+
+bool MainWindow::crop_option_widget_visible(QWidget* widget) const {
+  const auto in = [widget](const std::vector<QWidget*>& widgets) {
+    return std::find(widgets.begin(), widgets.end(), widget) != widgets.end();
+  };
+  if (in(crop_ratio_option_widgets_)) {
+    return current_crop_style_ == 0;
+  }
+  if (in(crop_size_option_widgets_)) {
+    return current_crop_style_ == 1;
+  }
+  return true;
+}
+
+bool MainWindow::marquee_option_widget_visible(QWidget* widget) const {
+  const auto in = [widget](const std::vector<QWidget*>& widgets) {
+    return std::find(widgets.begin(), widgets.end(), widget) != widgets.end();
+  };
+  // Normal shows neither pair (GitHub issue 602); the separator before them then has
+  // nothing after it and stray_option_separators drops it.
+  if (in(marquee_ratio_option_widgets_)) {
+    return current_marquee_style_ == CanvasWidget::MarqueeStyle::FixedRatio;
+  }
+  if (in(marquee_size_option_widgets_)) {
+    return current_marquee_style_ == CanvasWidget::MarqueeStyle::FixedSize;
+  }
+  return true;
+}
+
+QSize MainWindow::marquee_fixed_size_for_canvas() const {
+  if (current_marquee_style_ == CanvasWidget::MarqueeStyle::FixedRatio) {
+    return QSize(std::max(1, static_cast<int>(std::lround(current_marquee_ratio_w_ * 1000.0))),
+                 std::max(1, static_cast<int>(std::lround(current_marquee_ratio_h_ * 1000.0))));
+  }
+  return QSize(current_marquee_width_, current_marquee_height_);
+}
+
+void MainWindow::register_option_action(QWidget* widget, std::initializer_list<CanvasTool> tools) {
+  if (widget == nullptr) {
+    return;
+  }
+  option_actions_.emplace_back(widget, std::vector<CanvasTool>(tools.begin(), tools.end()));
+}
+
+bool MainWindow::option_widget_serves_tool(const QWidget* widget, CanvasTool tool) const {
+  return std::any_of(option_actions_.begin(), option_actions_.end(), [widget, tool](const auto& entry) {
+    return entry.first == widget && std::find(entry.second.begin(), entry.second.end(), tool) != entry.second.end();
+  });
+}
+
+namespace {
+
+// The options-bar separator rules (docs/options-bar.md, "Grouping rules"): a separator
+// shows only between two visible controls, so a group that a tool, mode or style hides
+// never leaves one first, last or right after another. `visible` is the bar's own
+// visibility decision; the widgets come in layout (registration) order.
+template <typename Visible>
+QSet<QWidget*> stray_option_separators(const std::vector<std::pair<QWidget*, std::vector<CanvasTool>>>& widgets,
+                                       const Visible& visible) {
+  QSet<QWidget*> stray;
+  QWidget* last_separator = nullptr;
+  bool control_since_separator = false;
+  for (const auto& [widget, tools] : widgets) {
+    if (widget == nullptr || !visible(widget, tools)) {
+      continue;
+    }
+    if (widget->objectName() != QLatin1String("optionSeparator")) {
+      control_since_separator = true;
+    } else if (!control_since_separator) {
+      stray.insert(widget);
+    } else {
+      last_separator = widget;
+      control_since_separator = false;
+    }
+  }
+  if (last_separator != nullptr && !control_since_separator) {
+    stray.insert(last_separator);
+  }
+  return stray;
+}
+
+}  // namespace
+
+void MainWindow::refresh_options_bar_rows(bool live_shape) {
+  if (options_flow_container_ == nullptr) {
+    return;
+  }
+  // The rows depend on the vector mode, the live shape layer, the crop, marquee and
+  // Pixels-mode shape styles and the registered widgets; the active tool does not change them.
+  const auto shape_size_style =
+      shape_pixel_options_ != nullptr ? shape_pixel_options_->size_style : MarqueeStyle::Normal;
+  // The shape bar's hidden groups and live size pair (GitHub issue 716) are part of the key.
+  const qint64 shape_bar_state =
+      shape_pixel_options_ == nullptr
+          ? 0
+          : (shape_pixel_options_->shown_fill ? 1 : 0) | (shape_pixel_options_->shown_stroke ? 2 : 0) |
+                (shape_pixel_options_->size_live ? 4 : 0);
+  const auto key = static_cast<qint64>(live_shape) | (static_cast<qint64>(current_vector_tool_mode_) << 1) |
+                   (static_cast<qint64>(current_crop_style_) << 4) |
+                   (static_cast<qint64>(current_marquee_style_) << 6) |
+                   (static_cast<qint64>(shape_size_style) << 8) | (shape_bar_state << 10) |
+                   (static_cast<qint64>(option_actions_.size()) << 13);
+  if (key == options_bar_rows_key_) {
+    return;
+  }
+  options_bar_rows_key_ = key;
+  options_bar_tool_rows_.clear();
+  std::vector<CanvasTool> tools;
+  for (const auto& [widget, widget_tools] : option_actions_) {
+    for (const auto tool : widget_tools) {
+      if (std::find(tools.begin(), tools.end(), tool) == tools.end()) {
+        tools.push_back(tool);
+      }
+    }
+  }
+  std::vector<QSet<QWidget*>> rows;
+  for (const auto tool : tools) {
+    const auto rules = vector_option_mode_rules(tool, live_shape);
+    const auto in_row = [&](QWidget* widget, const std::vector<CanvasTool>& widget_tools) {
+      const bool tool_matches =
+          widget_tools.empty() || std::find(widget_tools.begin(), widget_tools.end(), tool) != widget_tools.end();
+      return tool_matches && vector_option_widget_visible(rules, widget) && crop_option_widget_visible(widget) &&
+             marquee_option_widget_visible(widget) &&
+             (shape_pixel_options_ == nullptr || shape_pixel_options_->widget_visible(widget, tool));
+    };
+    const auto stray = stray_option_separators(option_actions_, in_row);
+    QSet<QWidget*> row;
+    for (const auto& [widget, widget_tools] : option_actions_) {
+      if (widget != nullptr && in_row(widget, widget_tools) && !stray.contains(widget)) {
+        row.insert(widget);
+      }
+    }
+    // Reserve room for the text session's apply/cancel pair, so opening an
+    // editor never grows the bar either.
+    if (is_type_tool(tool)) {
+      for (QWidget* button : {static_cast<QWidget*>(text_apply_button_), static_cast<QWidget*>(text_cancel_button_)}) {
+        if (button != nullptr) {
+          row.insert(button);
+        }
+      }
+    }
+    auto existing = std::find(rows.begin(), rows.end(), row);
+    if (existing == rows.end()) {
+      rows.push_back(std::move(row));
+      existing = std::prev(rows.end());
+    }
+    options_bar_tool_rows_.emplace_back(tool, static_cast<int>(std::distance(rows.begin(), existing)));
+  }
+  if (auto* flow = dynamic_cast<FlowLayout*>(options_flow_container_->layout()); flow != nullptr) {
+    flow->set_rows(std::move(rows));
+  }
+}
+
+void MainWindow::refresh_options_bar() {
+  if (panel_refresh_deferral_depth_ > 0) {
+    deferred_options_bar_refresh_ = true;
+    return;
+  }
+  // Runs on every passive transform-box change (each Move-tool press), so it
+  // reports under PATCHY_UI_PROFILE=1 like the other per-interaction refreshes.
+  const UiProfileScope profile_scope("refresh_options_bar");
+  // The sticky bar height must not learn from the half-swapped control set this
+  // pass goes through (options_flow_layout.hpp).
+  struct UpdatingScope {
+    OptionsFlowContainer* container;
+    ~UpdatingScope() {
+      if (container != nullptr) {
+        container->set_updating(false);
+      }
+    }
+  } updating_scope{options_flow_container_};
+  if (options_flow_container_ != nullptr) {
+    options_flow_container_->set_updating(true);
+  }
+  const bool has_document = has_active_document();
+  const bool edit_allowed = has_document && !preview_dialog_edit_locked();
+  const auto transform_state =
+      canvas_ != nullptr ? canvas_->transform_controls_state() : std::optional<CanvasWidget::TransformControlsState>{};
+  const bool free_transform_session = edit_allowed && transform_state.has_value() && transform_state->active;
+  const bool warp_session = edit_allowed && canvas_ != nullptr && canvas_->warp_transform_active();
+  const bool transform_session_active = free_transform_session || warp_session;
+  // Every widget gets ONE setVisible with its final state, hides before shows.
+  // Showing a child of a visible parent activates the parent layouts
+  // synchronously (Qt), so a show-then-hide pass (per-tool show, then the
+  // per-mode hide of the shape tools' raster-only controls) wrapped the bar
+  // onto a second row and pushed the canvas down for one painted frame.
+  const auto mode_rules = vector_option_mode_rules();
+  sync_shape_bar_state();  // which of the shape bar's groups show in this pass
+  const QScopedValueRollback<bool> shape_bar_guard(refreshing_shape_bar_, true);
+  // GitHub issue 91: the bar takes the height of the tallest tool row at this
+  // width, and the inline sliders that duplicate a spin box drop out first when
+  // the active tool's row would wrap with them (issue 458 follow-up: only its own row).
+  bool collapse_sliders = false;
+  if (options_flow_container_ != nullptr) {
+    refresh_options_bar_rows(mode_rules.live_shape);
+    if (auto* flow = dynamic_cast<FlowLayout*>(options_flow_container_->layout()); flow != nullptr) {
+      const auto active = std::find_if(options_bar_tool_rows_.begin(), options_bar_tool_rows_.end(),
+                                       [this](const auto& entry) { return entry.first == current_tool_; });
+      flow->set_active_row(active != options_bar_tool_rows_.end() ? active->second : -1);
+    }
+    collapse_sliders = options_flow_container_->wants_collapse();
+    options_flow_container_->set_collapse_applied(collapse_sliders);
+  }
+  const auto tool_visibility = [&](QWidget* widget, const std::vector<CanvasTool>& tools) {
+    // A transform/warp session owns the options bar (Photoshop behavior): the
+    // tool's own controls are unusable while one runs (the canvas consumes every
+    // click), so they hide instead of stacking next to the session controls and
+    // wrapping the bar onto a second row (which shifted the canvas down).
+    const auto tool_matches = tools.empty() || std::find(tools.begin(), tools.end(), current_tool_) != tools.end();
+    return tool_matches && !transform_session_active && vector_option_widget_visible(mode_rules, widget) &&
+           crop_option_widget_visible(widget) && marquee_option_widget_visible(widget) &&
+           (shape_pixel_options_ == nullptr || shape_pixel_options_->widget_visible(widget, current_tool_)) &&
+           !(collapse_sliders && widget->property(kOptionsBarCollapsibleProperty).toBool());
+  };
+  const auto stray_separators = stray_option_separators(option_actions_, tool_visibility);
+  const auto final_visibility = [&](QWidget* widget, const std::vector<CanvasTool>& tools) {
+    return tool_visibility(widget, tools) && !stray_separators.contains(widget);
+  };
+  // The session rows hide in this first pass too (GitHub issue 455): when a session
+  // ended, the tool's row showed while the transform row was still up, and the bar
+  // flashed two rows.
+  const auto hide_session_widgets = [](const std::vector<QWidget*>& widgets, bool keep) {
+    for (auto* widget : widgets) {
+      if (widget != nullptr && !keep && !widget->isHidden()) {
+        widget->setVisible(false);
+      }
+    }
+  };
+  hide_session_widgets(transform_option_actions_, free_transform_session);
+  hide_session_widgets(warp_option_actions_, warp_session);
+  hide_session_widgets(transform_session_actions_, transform_session_active);
+  for (const auto& [widget, tools] : option_actions_) {
+    if (widget != nullptr && !final_visibility(widget, tools) && !widget->isHidden()) {
+      widget->setVisible(false);
+      if (auto* button = qobject_cast<QToolButton*>(widget);
+          button != nullptr && button->defaultAction() != nullptr) {
+        button->defaultAction()->setVisible(false);
+      }
+    }
+  }
+  for (const auto& [widget, tools] : option_actions_) {
+    if (widget == nullptr) {
+      continue;
+    }
+    const auto visible = final_visibility(widget, tools);
+    if (visible != !widget->isHidden()) {
+      widget->setVisible(visible);
+    }
+    auto enabled = edit_allowed;
+    if (widget->objectName() == QStringLiteral("mixerMixSpin")) {
+      enabled = enabled && current_mixer_wet_ > 0;
+    }
+    if (widget->objectName() == QStringLiteral("selectionFixedWidthSpin") ||
+        widget->objectName() == QStringLiteral("selectionFixedHeightSpin")) {
+      enabled = enabled && current_marquee_style_ != CanvasWidget::MarqueeStyle::Normal;
+    }
+    // The Zoom tool stays usable while a preview dialog locks editing, so its
+    // options row does too (build_options_bar tags those widgets).
+    const bool allowed_while_locked = widget->property("optionsBarAllowedWhileLocked").toBool();
+    if (allowed_while_locked) {
+      enabled = has_document;
+    }
+    if (widget == brush_dynamics_button_ && brush_dynamics_button_ != nullptr) {
+      // Enabled once a model is loaded (bitmap tip or the Round session); only the brief
+      // pre-initialization state has neither.
+      enabled = enabled && brush_dynamics_button_->has_active_tip();
+    }
+    // Buttons that mirror a menu QAction (the Move tool's Align row) take their
+    // enabled state from that action's own refresh, never from the tool row.
+    if (!widget->property("optionsBarMirrorsAction").toBool()) {
+      widget->setEnabled(enabled);
+    }
+    // Buttons backed by a default action mirror that action's state, so keep the
+    // action in sync too (otherwise it can override the widget flags we just set).
+    if (auto* button = qobject_cast<QToolButton*>(widget);
+        button != nullptr && button->defaultAction() != nullptr) {
+      button->defaultAction()->setVisible(visible);
+      button->defaultAction()->setEnabled(allowed_while_locked ? has_document : edit_allowed);
+    }
+  }
+
+  refresh_brush_tool_windows(edit_allowed);
+  sync_shape_appearance_panel();  // a transform session or the edit lock greys it out
+  refresh_shape_draw_controls();  // the draw-mode buttons, the alignment list, the canvas's pixel style
+
+  // The numeric transform controls show only while a session is actually active
+  // (Photoshop): the Move tool's passive box swaps them in the instant a handle
+  // drag or Ctrl+T starts the session.
+  const bool show_transform_options = free_transform_session;
+  for (auto* widget : transform_option_actions_) {
+    if (widget != nullptr) {
+      widget->setVisible(show_transform_options);
+      widget->setEnabled(show_transform_options);
+    }
+  }
+  const bool show_warp_options = warp_session;
+  for (auto* widget : warp_option_actions_) {
+    if (widget != nullptr) {
+      widget->setVisible(show_warp_options);
+      widget->setEnabled(show_warp_options);
+    }
+  }
+  for (auto* widget : transform_session_actions_) {
+    if (widget != nullptr) {
+      widget->setVisible(transform_session_active);
+      widget->setEnabled(transform_session_active);
+    }
+  }
+  if (transform_warp_mode_button_ != nullptr) {
+    // setChecked never emits clicked, so no blocker is needed; this also restores
+    // the visual state after a refused switch (text layer, undecodable source).
+    transform_warp_mode_button_->setChecked(warp_session);
+    // Warp works on one layer; a folder/multi-selection transform session
+    // cannot switch modes, so gray the toggle instead of letting it refuse.
+    if (transform_session_active && canvas_ != nullptr &&
+        (canvas_->free_transform_is_multi_target() || canvas_->free_transform_floats_selection() ||
+         canvas_->free_transform_targets_selection())) {
+      transform_warp_mode_button_->setEnabled(false);
+    }
+  }
+  sync_transform_type_buttons();
+  // The text session's apply/cancel pair rides next to the text controls while an
+  // inline editor is open.  The finished-property check matters: commit teardown
+  // has a window between marking the editor finished and reparenting it away in
+  // which re-entrant refreshes (layer-list updates) still find the child.
+  auto* inline_text_editor =
+      canvas_ != nullptr ? canvas_->findChild<QTextEdit*>(QStringLiteral("inlineTextEditor")) : nullptr;
+  const bool text_session_active = !transform_session_active && inline_text_editor != nullptr &&
+                                   !inline_text_editor->property(kTextEditorFinishedProperty).toBool();
+  for (auto* button : {text_apply_button_, text_cancel_button_}) {
+    if (button != nullptr) {
+      button->setVisible(text_session_active);
+      button->setEnabled(text_session_active);
+    }
+  }
+  // The non-modal Character dialog grays out (and shows its click-in-text hint) whenever
+  // no live editor session exists; every session boundary funnels through this refresh.
+  sync_text_character_dialog_from_editor();
+  // With no session the font, size, face and smoothing controls mirror the active text layer.
+  sync_text_options_from_active_layer();
+  if (show_warp_options && warp_style_combo_ != nullptr && warp_bend_spin_ != nullptr) {
+    // Mirror the canvas state (a handle drag flips the style back to Custom).
+    QSignalBlocker combo_blocker(warp_style_combo_);
+    QSignalBlocker spin_blocker(warp_bend_spin_);
+    const auto index = warp_style_combo_->findData(canvas_->warp_style_preset());
+    if (index >= 0) {
+      warp_style_combo_->setCurrentIndex(index);
+    }
+    if (canvas_->warp_style_preset() != QStringLiteral("warpCustom")) {
+      warp_bend_spin_->setValue(canvas_->warp_style_preset_value());
+    }
+  }
+  refresh_vector_tool_options_visibility();
+  refresh_vector_stroke_controls();
+  if (options_flow_container_ != nullptr) {
+    // Visibility changes alter how many controls there are, so recompute the
+    // wrapped height and let the toolbar grow or shrink accordingly.
+    options_flow_container_->layout()->invalidate();
+    options_flow_container_->updateGeometry();
+  }
+  sync_transform_controls_from_canvas();
+
+  if (move_auto_select_check_ != nullptr && canvas_ != nullptr) {
+    QSignalBlocker blocker(move_auto_select_check_);
+    move_auto_select_check_->setChecked(canvas_->auto_select_layer());
+  }
+  if (move_auto_select_target_combo_ != nullptr && canvas_ != nullptr) {
+    QSignalBlocker blocker(move_auto_select_target_combo_);
+    move_auto_select_target_combo_->setCurrentIndex(
+        canvas_->auto_select_target() == MoveAutoSelectTarget::Group ? 1 : 0);
+  }
+  if (move_show_transform_controls_check_ != nullptr && canvas_ != nullptr) {
+    QSignalBlocker blocker(move_show_transform_controls_check_);
+    move_show_transform_controls_check_->setChecked(canvas_->show_transform_controls());
+  }
+  if (clone_aligned_check_ != nullptr && canvas_ != nullptr) {
+    QSignalBlocker blocker(clone_aligned_check_);
+    clone_aligned_check_->setChecked(canvas_->clone_aligned());
+  }
+  refresh_clone_source_panel();
+  sync_retouch_sample_controls_from_canvas();
+  if (mixer_sample_all_layers_check_ != nullptr && canvas_ != nullptr) {
+    QSignalBlocker blocker(mixer_sample_all_layers_check_);
+    mixer_sample_all_layers_check_->setChecked(canvas_->mixer_sample_all_layers());
+  }
+  if (crop_ratio_w_spin_ != nullptr && crop_ratio_h_spin_ != nullptr && canvas_ != nullptr) {
+    const QSignalBlocker w_blocker(crop_ratio_w_spin_);
+    const QSignalBlocker h_blocker(crop_ratio_h_spin_);
+    set_spin_value_unless_typing(crop_ratio_w_spin_, current_crop_ratio_w_);
+    set_spin_value_unless_typing(crop_ratio_h_spin_, current_crop_ratio_h_);
+  }
+  if (crop_ratio_swap_button_ != nullptr) {
+    // Nothing to swap until a ratio is set.
+    crop_ratio_swap_button_->setEnabled(edit_allowed && (current_crop_ratio_w_ > 0.0 || current_crop_ratio_h_ > 0.0));
+  }
+  sync_crop_preset_combo();
+  if (crop_width_spin_ != nullptr && crop_height_spin_ != nullptr) {
+    // Size mode mirrors the pending box; without a session the fields rest.
+    const auto crop_rect = canvas_ != nullptr ? canvas_->crop_session_rect() : std::optional<QRect>{};
+    const QSignalBlocker w_blocker(crop_width_spin_);
+    const QSignalBlocker h_blocker(crop_height_spin_);
+    if (crop_rect.has_value()) {
+      crop_width_spin_->setValue(crop_rect->width());
+      crop_height_spin_->setValue(crop_rect->height());
+    }
+    for (QWidget* widget : {static_cast<QWidget*>(crop_width_spin_), static_cast<QWidget*>(crop_height_spin_),
+                            static_cast<QWidget*>(crop_size_swap_button_),
+                            static_cast<QWidget*>(crop_link_size_button_)}) {
+      if (widget != nullptr) {
+        widget->setEnabled(edit_allowed && crop_rect.has_value());
+      }
+    }
+  }
+  // The canvas frame the tool starts with has nothing to apply or reset. With a
+  // ratio set, that frame is smaller than the canvas: Apply crops to it, but the
+  // X would put back the same box, so it stays off (GitHub issue 318).
+  if (crop_apply_button_ != nullptr) {
+    crop_apply_button_->setEnabled(edit_allowed && canvas_ != nullptr && canvas_->crop_session_has_changes());
+  }
+  if (crop_cancel_button_ != nullptr) {
+    crop_cancel_button_->setEnabled(edit_allowed && canvas_ != nullptr && canvas_->crop_session_can_reset());
+  }
+  if (crop_straighten_button_ != nullptr) {
+    // The canvas owns the state: one line turns it off, and so does any reset of the box.
+    const auto armed = canvas_ != nullptr && canvas_->crop_straighten_armed();
+    if (crop_straighten_button_->isChecked() != armed) {
+      const QSignalBlocker blocker(crop_straighten_button_);
+      crop_straighten_button_->setChecked(armed);
+      if (!armed && statusBar()->currentMessage() == tr("Drag along something that should be level or upright")) {
+        statusBar()->clearMessage();  // the hint goes with the button
+      }
+    }
+    crop_straighten_button_->setEnabled(edit_allowed && canvas_ != nullptr && canvas_->crop_session_active());
+  }
+  if (perspective_crop_turn_button_ != nullptr) {
+    perspective_crop_turn_button_->setEnabled(edit_allowed && canvas_ != nullptr &&
+                                              canvas_->perspective_crop_session_active());
+  }
+  refresh_ruler_readout();
+  if (perspective_crop_apply_button_ != nullptr) {
+    perspective_crop_apply_button_->setEnabled(edit_allowed && canvas_ != nullptr &&
+                                               canvas_->perspective_crop_session_active());
+  }
+  if (perspective_crop_cancel_button_ != nullptr) {
+    perspective_crop_cancel_button_->setEnabled(edit_allowed && canvas_ != nullptr &&
+                                                canvas_->perspective_crop_session_pending());
+  }
+  sync_crop_guide_buttons_enabled(edit_allowed);
+  if (patch_mode_combo_ != nullptr && canvas_ != nullptr) {
+    const QSignalBlocker blocker(patch_mode_combo_);
+    patch_mode_combo_->setCurrentIndex(
+        std::max(0, patch_mode_combo_->findData(static_cast<int>(canvas_->patch_tool_mode()))));
+  }
+  if (patch_transparent_check_ != nullptr && canvas_ != nullptr) {
+    QSignalBlocker blocker(patch_transparent_check_);
+    patch_transparent_check_->setChecked(canvas_->patch_tool_transparent());
+  }
+  if (content_aware_move_mode_combo_ != nullptr && canvas_ != nullptr) {
+    const QSignalBlocker blocker(content_aware_move_mode_combo_);
+    content_aware_move_mode_combo_->setCurrentIndex(std::max(
+        0, content_aware_move_mode_combo_->findData(static_cast<int>(canvas_->content_aware_move_mode()))));
+  }
+  if (content_aware_move_destination_combo_ != nullptr && canvas_ != nullptr) {
+    const QSignalBlocker blocker(content_aware_move_destination_combo_);
+    content_aware_move_destination_combo_->setCurrentIndex(
+        std::max(0, content_aware_move_destination_combo_->findData(
+                        static_cast<int>(canvas_->content_aware_move_destination()))));
+  }
+  if (pattern_stamp_pattern_combo_ != nullptr) {
+    const QSignalBlocker blocker(pattern_stamp_pattern_combo_);
+    pattern_stamp_pattern_combo_->setCurrentIndex(
+        pattern_stamp_pattern_combo_->findData(current_pattern_stamp_pattern_id_));
+  }
+  if (pattern_stamp_aligned_check_ != nullptr) {
+    const QSignalBlocker blocker(pattern_stamp_aligned_check_);
+    pattern_stamp_aligned_check_->setChecked(current_pattern_stamp_aligned_);
+  }
+  if (auto* healing_diffusion = findChild<QSpinBox*>(QStringLiteral("healingDiffusionSpin"));
+      healing_diffusion != nullptr) {
+    QSignalBlocker blocker(healing_diffusion);
+    healing_diffusion->setValue(current_healing_diffusion_);
+  }
+  if (local_adjustment_strength_spin_ != nullptr) {
+    QSignalBlocker blocker(local_adjustment_strength_spin_);
+    local_adjustment_strength_spin_->setValue(current_local_adjustment_strength_);
+  }
+  if (smudge_strength_spin_ != nullptr) {
+    QSignalBlocker blocker(smudge_strength_spin_);
+    smudge_strength_spin_->setValue(current_smudge_strength_);
+  }
+  if (local_tone_range_combo_ != nullptr) {
+    const auto index = local_tone_range_combo_->findData(static_cast<int>(current_local_tone_range_));
+    QSignalBlocker blocker(local_tone_range_combo_);
+    local_tone_range_combo_->setCurrentIndex(std::max(0, index));
+  }
+  if (local_protect_tones_check_ != nullptr) {
+    QSignalBlocker blocker(local_protect_tones_check_);
+    local_protect_tones_check_->setChecked(current_local_protect_tones_);
+  }
+  if (sponge_mode_combo_ != nullptr) {
+    const auto index = sponge_mode_combo_->findData(static_cast<int>(current_sponge_mode_));
+    QSignalBlocker blocker(sponge_mode_combo_);
+    sponge_mode_combo_->setCurrentIndex(std::max(0, index));
+  }
+  if (eyedropper_sample_size_combo_ != nullptr) {
+    QSignalBlocker blocker(eyedropper_sample_size_combo_);
+    eyedropper_sample_size_combo_->setCurrentIndex(
+        std::max(0, eyedropper_sample_size_combo_->findData(current_eyedropper_sample_size_)));
+  }
+  if (wand_sample_size_combo_ != nullptr && canvas_ != nullptr) {
+    QSignalBlocker blocker(wand_sample_size_combo_);
+    wand_sample_size_combo_->setCurrentIndex(
+        std::max(0, wand_sample_size_combo_->findData(canvas_->wand_sample_size())));
+  }
+  if (eyedropper_sample_layers_combo_ != nullptr) {
+    QSignalBlocker blocker(eyedropper_sample_layers_combo_);
+    eyedropper_sample_layers_combo_->setCurrentIndex(
+        std::max(0, eyedropper_sample_layers_combo_->findData(
+                        QString::fromLatin1(sample_layers_token(current_eyedropper_sample_layers_)))));
+  }
+  if (eyedropper_sets_foreground_button_ != nullptr && eyedropper_sets_background_button_ != nullptr) {
+    QSignalBlocker foreground_blocker(eyedropper_sets_foreground_button_);
+    QSignalBlocker background_blocker(eyedropper_sets_background_button_);
+    (current_eyedropper_picks_background_ ? eyedropper_sets_background_button_ : eyedropper_sets_foreground_button_)
+        ->setChecked(true);
+  }
+  if (eyedropper_show_sample_ring_check_ != nullptr) {
+    QSignalBlocker blocker(eyedropper_show_sample_ring_check_);
+    eyedropper_show_sample_ring_check_->setChecked(current_eyedropper_show_sample_ring_);
+  }
+  if (sponge_vibrance_check_ != nullptr) {
+    QSignalBlocker blocker(sponge_vibrance_check_);
+    sponge_vibrance_check_->setChecked(current_sponge_vibrance_);
+  }
+  if (wand_contiguous_check_ != nullptr && canvas_ != nullptr) {
+    QSignalBlocker blocker(wand_contiguous_check_);
+    wand_contiguous_check_->setChecked(canvas_->wand_contiguous());
+  }
+  if (fill_contiguous_check_ != nullptr && canvas_ != nullptr) {
+    QSignalBlocker blocker(fill_contiguous_check_);
+    fill_contiguous_check_->setChecked(canvas_->fill_contiguous());
+  }
+  if (zoom_scrubby_check_ != nullptr && canvas_ != nullptr) {
+    QSignalBlocker blocker(zoom_scrubby_check_);
+    zoom_scrubby_check_->setChecked(canvas_->zoom_scrubby());
+  }
+  if (zoom_in_mode_action_ != nullptr && zoom_out_mode_action_ != nullptr && canvas_ != nullptr) {
+    zoom_in_mode_action_->setChecked(!canvas_->zoom_tool_zooms_out());
+    zoom_out_mode_action_->setChecked(canvas_->zoom_tool_zooms_out());
+  }
+  if (wand_sample_all_layers_check_ != nullptr && canvas_ != nullptr) {
+    QSignalBlocker blocker(wand_sample_all_layers_check_);
+    wand_sample_all_layers_check_->setChecked(canvas_->wand_sample_all_layers());
+  }
+  if (quick_select_sample_all_layers_check_ != nullptr && canvas_ != nullptr) {
+    QSignalBlocker blocker(quick_select_sample_all_layers_check_);
+    quick_select_sample_all_layers_check_->setChecked(canvas_->quick_select_sample_all_layers());
+  }
+  if (object_select_sample_all_layers_check_ != nullptr && canvas_ != nullptr) {
+    QSignalBlocker blocker(object_select_sample_all_layers_check_);
+    object_select_sample_all_layers_check_->setChecked(canvas_->object_select_sample_all_layers());
+  }
+  if (quick_select_enhance_edge_check_ != nullptr && canvas_ != nullptr) {
+    QSignalBlocker blocker(quick_select_enhance_edge_check_);
+    quick_select_enhance_edge_check_->setChecked(canvas_->quick_select_enhance_edge());
+  }
+  if (canvas_ != nullptr) {
+    if (auto* spin = findChild<QSpinBox*>(QStringLiteral("quickSelectSizeSpin")); spin != nullptr) {
+      QSignalBlocker blocker(spin);
+      spin->setValue(canvas_->quick_select_size());
+    }
+    if (auto* slider = findChild<QSlider*>(QStringLiteral("quickSelectSizeSlider")); slider != nullptr) {
+      QSignalBlocker blocker(slider);
+      set_slider_to_value(*slider, canvas_->quick_select_size());
+    }
+    if (auto* spin = findChild<QSpinBox*>(QStringLiteral("magneticLassoWidthSpin")); spin != nullptr) {
+      QSignalBlocker blocker(spin);
+      spin->setValue(canvas_->magnetic_lasso_width());
+    }
+    if (auto* spin = findChild<QSpinBox*>(QStringLiteral("magneticLassoContrastSpin")); spin != nullptr) {
+      QSignalBlocker blocker(spin);
+      spin->setValue(canvas_->magnetic_lasso_edge_contrast());
+    }
+    if (auto* spin = findChild<QSpinBox*>(QStringLiteral("magneticLassoFrequencySpin")); spin != nullptr) {
+      QSignalBlocker blocker(spin);
+      spin->setValue(canvas_->magnetic_lasso_frequency());
+    }
+  }
+  refresh_gradient_controls_from_canvas();
+  if (canvas_ != nullptr) {
+    for (const auto& [name, value] : {
+             std::pair{"fillOpacitySpin", canvas_->fill_opacity()},
+             std::pair{"fillSoftnessSpin", canvas_->fill_softness()},
+             std::pair{"polygonSidesSpin", canvas_->polygon_sides()},
+             std::pair{"polygonStarInsetSpin", canvas_->polygon_star_inset()}}) {
+      if (auto* spin = findChild<QSpinBox*>(QString::fromLatin1(name)); spin != nullptr) {
+        const QSignalBlocker blocker(spin);
+        spin->setValue(value);
+      }
+    }
+    for (const auto& [name, value] : {
+             std::pair{"fillOpacitySlider", canvas_->fill_opacity()},
+             std::pair{"fillSoftnessSlider", canvas_->fill_softness()}}) {
+      if (auto* slider = findChild<QSlider*>(QString::fromLatin1(name)); slider != nullptr) {
+        const QSignalBlocker blocker(slider);
+        slider->setValue(value);
+      }
+    }
+  }
+  // Show the active tool's stored combine mode. The temporary Shift/Alt override
+  // is applied live from the canvas's key event filter (see
+  // set_selection_mode_changed_callback), so it is not folded in here where a
+  // stale global modifier state could mask an explicit choice.
+  update_selection_mode_buttons(canvas_ != nullptr ? canvas_->selection_mode()
+                                                   : CanvasWidget::SelectionMode::Replace);
+  sync_text_alignment_buttons_from_editor();
+}
+
+void MainWindow::update_selection_mode_buttons(CanvasWidget::SelectionMode mode) {
+  const auto set_checked = [](QAction* action, bool checked) {
+    if (action == nullptr) {
+      return;
+    }
+    QSignalBlocker blocker(action);
+    action->setChecked(checked);
+  };
+  set_checked(selection_new_mode_action_, mode == CanvasWidget::SelectionMode::Replace);
+  set_checked(selection_add_mode_action_, mode == CanvasWidget::SelectionMode::Add);
+  set_checked(selection_subtract_mode_action_, mode == CanvasWidget::SelectionMode::Subtract);
+  set_checked(selection_intersect_mode_action_, mode == CanvasWidget::SelectionMode::Intersect);
+}
+
+void MainWindow::apply_selection_modes_to_canvas(CanvasWidget* canvas) {
+  if (canvas == nullptr) {
+    return;
+  }
+  const std::array<CanvasTool, CanvasWidget::kSelectionToolCount> tools{
+      CanvasTool::Marquee, CanvasTool::EllipticalMarquee, CanvasTool::Lasso, CanvasTool::MagneticLasso,
+      CanvasTool::MagicWand, CanvasTool::QuickSelect, CanvasTool::PatchTool, CanvasTool::ObjectSelect,
+      CanvasTool::PolygonLasso, CanvasTool::ContentAwareMove};
+  for (const auto tool : tools) {
+    if (const auto index = CanvasWidget::selection_tool_index(tool); index >= 0) {
+      canvas->set_selection_mode_for_tool(tool, selection_modes_[static_cast<std::size_t>(index)]);
+    }
+  }
+}
+
+void MainWindow::apply_selection_edge_settings_for_tool(CanvasTool tool) {
+  const auto index = CanvasWidget::selection_tool_index(tool);
+  if (index < 0) {
+    return;
+  }
+  current_selection_feather_radius_ = selection_feather_by_tool_[static_cast<std::size_t>(index)];
+  current_selection_antialias_ = selection_antialias_by_tool_[static_cast<std::size_t>(index)];
+  if (canvas_ != nullptr) {
+    canvas_->set_selection_feather_radius(current_selection_feather_radius_);
+    canvas_->set_selection_antialias(current_selection_antialias_);
+  }
+  if (auto* feather = findChild<QSpinBox*>(QStringLiteral("selectionFeatherSpin")); feather != nullptr) {
+    const QSignalBlocker blocker(feather);
+    feather->setValue(current_selection_feather_radius_);
+  }
+  if (auto* anti_alias = findChild<QCheckBox*>(QStringLiteral("selectionAntiAliasCheck")); anti_alias != nullptr) {
+    const QSignalBlocker blocker(anti_alias);
+    anti_alias->setChecked(current_selection_antialias_);
+  }
+}
+
+MainWindow::PreviewDialogEditLock::PreviewDialogEditLock(MainWindow& window) noexcept : window_(&window) {
+  window_->begin_preview_dialog_edit_lock();
+}
+
+MainWindow::PreviewDialogEditLock::PreviewDialogEditLock(PreviewDialogEditLock&& other) noexcept
+    : window_(std::exchange(other.window_, nullptr)) {}
+
+MainWindow::PreviewDialogEditLock::~PreviewDialogEditLock() {
+  release();
+}
+
+void MainWindow::PreviewDialogEditLock::release() noexcept {
+  if (window_ == nullptr) {
+    return;
+  }
+  window_->end_preview_dialog_edit_lock();
+  window_ = nullptr;
+}
+
+void MainWindow::sync_brush_controls_from_canvas() {
+  if (canvas_ == nullptr) {
+    return;
+  }
+  if (brush_mode_combo_ != nullptr) {
+    const QSignalBlocker blocker(brush_mode_combo_);
+    brush_mode_combo_->setCurrentIndex(
+        std::max(0, brush_mode_combo_->findData(paint_mode_item_data(canvas_->brush_paint_mode()))));
+  }
+  if (auto* brush_size = findChild<QSpinBox*>(QStringLiteral("brushSizeSpin")); brush_size != nullptr) {
+    QSignalBlocker blocker(brush_size);
+    brush_size->setValue(canvas_->brush_size());
+  }
+  if (auto* brush_size_slider = findChild<QSlider*>(QStringLiteral("brushSizeSlider"));
+      brush_size_slider != nullptr) {
+    QSignalBlocker blocker(brush_size_slider);
+    set_slider_to_value(*brush_size_slider, canvas_->brush_size());
+  }
+  // The Alt+right-drag size gesture on Quick Select (GitHub issue 428).
+  if (auto* spin = findChild<QSpinBox*>(QStringLiteral("quickSelectSizeSpin")); spin != nullptr) {
+    QSignalBlocker blocker(spin);
+    spin->setValue(canvas_->quick_select_size());
+  }
+  if (auto* slider = findChild<QSlider*>(QStringLiteral("quickSelectSizeSlider")); slider != nullptr) {
+    QSignalBlocker blocker(slider);
+    set_slider_to_value(*slider, canvas_->quick_select_size());
+  }
+  if (auto* brush_opacity = findChild<QSpinBox*>(QStringLiteral("brushOpacitySpin")); brush_opacity != nullptr) {
+    QSignalBlocker blocker(brush_opacity);
+    brush_opacity->setValue(canvas_->brush_opacity());
+  }
+  if (auto* brush_flow = findChild<QSpinBox*>(QStringLiteral("brushFlowSpin")); brush_flow != nullptr) {
+    QSignalBlocker blocker(brush_flow);
+    brush_flow->setValue(canvas_->brush_flow());
+  }
+  current_smudge_strength_ = canvas_->smudge_strength();  // the digit keys set it (GitHub issue 675)
+  if (smudge_strength_spin_ != nullptr) {
+    QSignalBlocker blocker(smudge_strength_spin_);
+    smudge_strength_spin_->setValue(current_smudge_strength_);
+  }
+  if (auto* brush_airbrush = findChild<QCheckBox*>(QStringLiteral("brushAirbrushCheck"));
+      brush_airbrush != nullptr) {
+    QSignalBlocker blocker(brush_airbrush);
+    brush_airbrush->setChecked(canvas_->brush_build_up());
+  }
+  const auto sync_mixer_spin = [this](const char* object_name, int value) {
+    if (auto* spin = findChild<QSpinBox*>(QString::fromLatin1(object_name)); spin != nullptr) {
+      QSignalBlocker blocker(spin);
+      spin->setValue(value);
+    }
+  };
+  sync_mixer_spin("mixerWetSpin", current_mixer_wet_);
+  sync_mixer_spin("mixerLoadSpin", current_mixer_load_);
+  sync_mixer_spin("mixerMixSpin", current_mixer_mix_);
+  sync_mixer_spin("mixerFlowSpin", current_mixer_flow_);
+  // Blocked setValue skips the live wet->mix-enable and combo-derive
+  // connections; re-derive both here.
+  if (auto* mixer_mix = findChild<QSpinBox*>(QStringLiteral("mixerMixSpin")); mixer_mix != nullptr) {
+    mixer_mix->setEnabled(current_mixer_wet_ > 0);
+  }
+  sync_mixer_combination_combo();
+  if (auto* brush_softness = findChild<QSpinBox*>(QStringLiteral("brushSoftnessSpin")); brush_softness != nullptr) {
+    QSignalBlocker blocker(brush_softness);
+    brush_softness->setValue(canvas_->brush_softness());
+  }
+  // The Rectangle and Ellipse Pixels row mirrors the size, opacity and softness.
+  if (shape_pixel_options_ != nullptr) {
+    shape_pixel_options_->sync_brush_fields(*canvas_);
+  }
+  if (auto* brush_smoothing = findChild<QSpinBox*>(QStringLiteral("brushSmoothingSpin"));
+      brush_smoothing != nullptr) {
+    QSignalBlocker blocker(brush_smoothing);
+    brush_smoothing->setValue(canvas_->brush_smoothing());
+  }
+  const auto sync_smoothing_action = [](QAction* action, bool checked) {
+    if (action != nullptr) {
+      QSignalBlocker blocker(action);
+      action->setChecked(checked);
+    }
+  };
+  sync_smoothing_action(brush_smoothing_pulled_string_action_, canvas_->brush_smoothing_pulled_string());
+  sync_smoothing_action(brush_smoothing_catch_up_action_, canvas_->brush_smoothing_catch_up());
+  sync_smoothing_action(brush_smoothing_catch_up_end_action_, canvas_->brush_smoothing_catch_up_end());
+  sync_smoothing_action(brush_smoothing_zoom_adjust_action_, canvas_->brush_smoothing_zoom_adjust());
+}
+
+}  // namespace patchy::ui

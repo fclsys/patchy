@@ -1,0 +1,357 @@
+# Text on a path
+
+A type layer can run along a line instead of standing in a box: the Type tool clicked on an
+open path, or on the edge of a shape, sets the text along that contour (GitHub issue 717). The
+layer owns a copy of one open or closed Bézier contour and a start and end point on it; the
+story's first line is set between the two. Editing the source path or shape afterwards does not
+change the copy. Text that fills a closed shape is [area text](area-text.md); the session,
+commit and caret rules are in [text-tool.md](text-tool.md) and
+[text-tool-layout.md](text-tool-layout.md).
+
+## What Photoshop does (COM captures)
+
+`scripts/dev/capture-path-text.ps1` makes the reference files in Photoshop 2026 through the
+Action Manager: a point text layer whose `textShape[0]` gets `char = onACurve`, a `path` and a
+`tRange` (`Strt`, `End `). Documents are 660 by 520 px at 72 ppi, the text origin is (80, 60),
+type is black Arial, and each case saves the layered PSD and a flattened render made after it.
+The committed ones are `test-fixtures/psd/photoshop-path-*.psd` with a PNG of the flatten beside
+each; the script writes the whole matrix (36 cases) into `local-test-fixtures/psd/path-text/`.
+
+Contours of the matrix, in text-local coordinates (anchor, incoming handle, outgoing handle):
+
+- arc: `(0,300)` out `(120,0)`; `(500,300)` in `(380,0)`. Arc length 713.548 px.
+- wave: `(0,250)` out `(40,120)`; `(150,150)` in `(110,150)` out `(260,150)`; `(500,250)` in
+  `(400,380)`. Length 605.915 px.
+- ellipse (closed): the 500 by 400 ellipse of the area-text matrix. Length 1418.283 px.
+
+Findings, each from a capture:
+
+- **The range is in segment units.** The whole part of a range value names a cubic segment of
+  the contour and the fraction is the Bézier parameter inside it, not a share of the arc length:
+  on the wave, `0.5` is 128.98 px along and `1.5` is 411.50 px. An open contour of N segments
+  takes 0 to N. On a closed one the end may pass the seam (start 3.5, end 4.999 on the ellipse
+  ran past the first anchor); the Action Manager rewrites an end below the start to just under
+  N + 1 and swaps a reversed range on an open contour.
+- **Glyphs advance by arc length.** Rows of capital I at 48 px (advance 13.336 px): the bars'
+  centroids sit 13.3 px of arc apart on the arc, the wave and the ellipse alike, the first one
+  half an advance past the start point. Curvature does not change the spacing.
+- **Each glyph lies along the tangent at the middle of its advance**, with its baseline on the
+  contour (the bars' long axes are within 0.3 degrees of the normal there, and their centroids
+  half a cap height from the line). A baseline shift moves a glyph along the normal; mixed sizes
+  share the baseline.
+- **Alignment works inside the range.** Centered text is centered between the start and end
+  points; right-aligned text ends at the end point. Trailing spaces do not count.
+- **The line is justified and indented like a one-line box** (Photoshop 2027 over the Action
+  Manager, November 2026, GitHub issue 717; `scripts/dev/probe-path-text-paragraph.ps1`: a
+  straight 500 px path, Arial 48 px, `IIIII IIIII`).
+  A line that fits is its paragraph's last line: Justify (last line left) sets it at the start,
+  (last line centered) centers it, (last line right) ends it at the end point, and Justify all
+  spreads it over the range. A line that hides words is not the last line, so every justify
+  mode spreads it to both ends. The first line indent and the start indent push left-aligned
+  text along the path (and a centered line by half), the end indent pulls right-aligned text
+  back, and each shortens the room, so one more word can be hidden. A right-to-left paragraph
+  starts at the range's end point. Point text takes the indents too and ignores every justify
+  mode. Photoshop's own panel offers no justify mode for a line on a path; a file gets one from
+  the Paragraph panel's sticky settings (the issue 717 file: Justify, first line indent 20 pt,
+  end indent 40 pt, a right-to-left paragraph; its layer descriptor states no `directionType`,
+  yet Photoshop sets the text from the range's end point and its re-layout lands on the saved
+  pixels).
+- **Text that does not fit is hidden by whole words**, as if the range were a one-line box as
+  wide as its arc length: five groups of `IIIII` on a range that holds four and a half show
+  four. A single word longer than the range is cut by glyph. A second paragraph is hidden. The
+  hidden text stays in the story.
+- **A layer transform applies to the contour.** The rotated capture keeps the same frame and
+  carries the rotation in the TySh transform.
+- **Photoshop 2026 has no working flip.** The `flip` flag of the Action Manager descriptor
+  does nothing: a file saved with it set renders and stores exactly what the unflipped one does
+  (so do `pathTypeSpacing` and the other `pathType*` keys). Photoshop's own gesture gives the
+  same result (27.11.0, November 2026, done with real pointer input in its window): dragging the
+  text's start point across the path with the Path Selection tool, 60 px or more to the other
+  side, sets `flip` true in the live layer descriptor, but the text stays where it was during
+  the drag and after it, the saved file differs from the unflipped save only in the start point
+  the drag moved (no key for a flip in the frame, the text object or the TySh, the contour not
+  reversed), and reopening that file reads `flip` false. A drag of 20 px across does not set the
+  flag at all. The same on an open arc and on an ellipse, for text made over the Action Manager
+  and for text made in Photoshop's window (Type tool clicked on a saved path).
+  `photoshop-path-flip-drag.psd` is the window-made text saved after the gesture: plain path
+  text.
+- **Photoshop 2025 draws a flip and stores it as a frame key** (26.9.0, November 2026, over
+  the Action Manager; the same arc and ellipse as above). Setting `flip` true in the layer
+  descriptor redraws the text on the other side of the line, running back from the range's
+  END point: the stretch of path it covers is the same, walked the other way. The saved frame
+  differs from the unflipped save's only by `/0/2/11 << /0 true /22 .025 >>` (the contour and
+  the range are unchanged). The same dictionary holds the other path
+  options that version draws: the effect (`pathTypeEffect` Skew is `/11 << /1 1 /22 .025 >>`)
+  and the alignment to the path (center is `/11 << /2 2 /22 .025 >>`); `pathTypeSpacing` is
+  not stored and changes nothing. A frame with none of them set has no `/11`.
+  `photoshop-path-2025-flip-arc.psd`, `-flip-center.psd` (centered paragraph),
+  `-flip-cal.psd` (capital I bars), `-flip-ellipse.psd` and `photoshop-path-2025-skew.psd`
+  are these saves.
+- **Photoshop 2026 turns a 2025 flip into a reversed path when it opens the file**, with no
+  prompt: the flipped arc reads back with its first anchor at (500, 300) and the range
+  0.1..0.8, the flipped ellipse with the range 1.5..3.5 (0.5..2.5 counted from the other
+  end), `flip` false, and a re-layout draws the text where Photoshop 2025 drew it. So a
+  reversed contour is the one form both versions draw flipped.
+- **Vertical type on a path** stacks upright glyphs along the line and adds a frame key
+  (below). Patchy does not set vertical type on paths.
+
+## Records in a PSD
+
+The contour lives only in the document's `Txt2` block ([txt2.md](txt2.md)), in the frame the
+text object names. A path frame, key for key as Photoshop 2026 writes it:
+
+```
+<< /0 << /1 << /0 [ 0.0 300.0 120.0 0.0 380.0 0.0 500.0 300.0 ] >> /2 << /0 2 /6 [ .3 .9 ] >> >> >>
+```
+
+- `/0/1/0`: the contour, eight numbers per cubic segment (start anchor, outgoing handle, next
+  incoming handle, next anchor), in text-local coordinates. Consecutive segments share their end
+  points. There is no closed flag: a contour is closed when its last segment ends where its
+  first starts.
+- `/0/2/0 2`: the frame type. A point frame has no `/0` here and a box frame has `1`.
+- `/0/2/6`: the range, start then end (the key that holds `[-1 -1]`, `[-2 -2]` and `[-3 -3]` in
+  point, box and area frames; the named-key engine calls it `TextOnPathTRange`).
+- `/0/2/2`: an optional six-number affine from the stored coordinates to text-local space, as
+  in area frames. Photoshop writes it when the descriptor's shape transform is not identity:
+  text made in its window by clicking a path keeps that path's document coordinates and gets
+  `[ 1.0 0.0 0.0 1.0 -80.0 -135.0 ]` for a text origin at (80, 135), the corner of the path's
+  bounds. Its range starts at the clicked point and ends at the path's end.
+- `/0/2/1 2`: vertical type. A path frame has no baseline rule.
+- `/0/2/11`: the path options of Photoshop 2025 and earlier (above): `/0` the flip, `/1` the
+  effect, `/2` the alignment to the path, `/22 .025` always beside them. Photoshop 2026 never
+  writes this key for its own path text. Older versions fill it differently (below).
+- `/0/2/12 1`: written by older Photoshop CC versions (below).
+
+### Older Photoshop CC frames
+
+A file saved by an older "Adobe Photoshop CC" (GitHub issue 717, a reporter's file with two
+texts on curves; engine version `/98 << /0 7 >>`) writes every path frame as
+
+```
+/2 << /0 2 /2 [ 1.0 0.0 0.0 1.0 -25.0 -79.26834 ] /6 [ 0.0 .75545 ] /11 << /3 0 /5 0.0 /7 false >> /12 1 >>
+```
+
+What the keys are, from that file opened with each one changed (Photoshop 2025 26.9.0 and
+Photoshop 2026 27.11.0, over COM, November 2026):
+
+- `/11/3`: Photoshop 2025 reads it as `pathTypeAlignTo` in the layer descriptor: 0
+  `toPathTop`, 1 `toPathBottom`, 2 `toPathCenter` (also what a frame without the key reads).
+  Photoshop 2026 has no such descriptor key and drops `/3` when it saves.
+- `/11/5`: a number neither version shows in the descriptor. Photoshop 2025 keeps it on save
+  (20.0 stayed 20.0); Photoshop 2026 drops it.
+- `/11/7`: a flag both versions keep when true and drop when false. Versions up to about 24
+  write `/7 false` into the `/11` of every frame, point and box frames included.
+- `/12`: both versions keep 1 and drop 0, and neither names it in the descriptor. A layer of
+  this file whose frame lacks `/12 1` reads `textWarningLevel` 1 when the file opens (0 with
+  it), in both versions; a re-layout clears it.
+- **None of them moves the text.** Each version re-laid every variant (`/3` 1, 2 and 3, `/5`
+  20 and -20, `/7` true, `/12` 0, 2 and 3, the keys removed) to what it draws for the
+  unchanged file: identical pixels in Photoshop 2026, the same layer bounds and pixels within
+  one level (the flatten's dither) in Photoshop 2025, whose result differs from the raster
+  the older version saved only in anti-aliasing. So the frame is plain path text.
+
+Saved again, Photoshop 2025 writes the frame with `/11 << /3 0 /5 0.0 >> /12 1` and Photoshop
+2026 with `/12 1` alone. Patchy keeps an untouched layer's frame as it is and writes an edited
+one as its own plain path frame, without `/11` or `/12`. Acceptance (the issue 717 file saved
+by Patchy untouched, with one layer edited and with both edited; Photoshop 2026 through
+`scripts/dev/photoshop-open-check.ps1` and Photoshop 2025 over COM): no prompt, every layer
+`char onACurve` with its range, `textWarningLevel` 0 and no `oldText` (the authored frames
+too: the level 1 above needs the file's cached layout, which Patchy empties), and
+Photoshop 2026's re-layout of the edited text put the ink where Patchy drew it (ink bounds
+within 1 px).
+
+The layer's `TySh` records a box (`/ShapeType 1`) whose `/BoxBounds` are the contour's bounds
+in text-local coordinates, and its transform maps text-local space into the document.
+
+**Reading.** `TextEngineBlock::object_geometry` returns `Kind::Path` with the contour and the
+normalized range for a frame whose `/0/2` holds only the keys `0`, `2`, `6`, `11` and `12`,
+whose range is finite with the end past the start, and whose segments join. Of `/11` it accepts
+the flip, `/22`, and an effect and alignment of 0: a flip of true is read as the contour reversed
+with `reversed_text_path_range` of the stored range, which is what Photoshop 2026 makes of the
+same frame. The older keys are accepted only at the values an ordinary path text of those
+versions holds (`/11/3` 0, `/11/5` 0, `/11/7` false, `/12` 1), each optional, so the frame also
+reads after Photoshop 2025 or 2026 saved it again. Any other path frame (vertical type, a Skew
+or other effect, an alignment other than the baseline, another value of the older keys, a key
+not listed here, a reversed range) stays `Unsupported`: the layer
+keeps its saved pixels and native data and is protected from editing, as before. An untouched
+imported layer keeps its frame, flip key included, when the document is saved again, and
+keeps Photoshop's raster until it is edited. The named-key engine of Photoshop CS-era files is
+not read for path frames: those layers stay protected.
+
+**Writing.** `author_frame` writes exactly the frame above from `TextEngineInputs::path` and
+`path_range`; the TySh box gets the contour's bounds. A document whose preserved text engine
+cannot be authored into (a named-key engine, an untouched Photoshop 5.x type record) refuses
+PSD/PSB save with an explicit error when it holds path text, as for area text.
+
+Acceptance (Photoshop 2026 over COM, `scripts/dev/photoshop-open-check.ps1` and the readback in
+the capture script): Patchy-authored path text on an open curve, a ranged two-segment wave, a
+closed ellipse and a flipped arc opened with no prompt, read back `char onACurve`, the same
+contour and range, `textWarningLevel 0` and no `oldText`, and Photoshop's re-layout put the ink
+where Patchy drew it.
+
+## Model
+
+- `patchy.text.path` (`kLayerMetadataTextPath`): `serialize_vector_path` of one subpath, open
+  or closed, in text-local coordinates under the text transform.
+- `patchy.text.path_range` (`kLayerMetadataTextPathRange`): `start end` in Photoshop's segment
+  units, normalized by `normalized_text_path_range`: open contours hold 0 <= start < end <= N,
+  closed ones 0 <= start < N and start < end <= start + N.
+- `patchy.text.flow` stays `box`, and the box size is the contour's bounds, as for area text.
+  A layer has an area contour or a path, never both.
+
+`core/text_path.hpp` owns the rules: `valid_text_path`, the range helpers,
+`text_path_frame_for_layer`, and `TextPathCurve`, an arc-length table of 128 chords per cubic
+segment (plain doubles in a fixed order; the measured lengths above agree within 0.02 px).
+`sample(distance)` gives the point and unit tangent, wrapping on a closed contour and running
+straight on past the ends of an open one; `nearest(x, y)` gives the parameter, arc length, gap
+and side for a point.
+
+**Flip.** Patchy flips path text by reversing its copy of the contour
+(`reversed_text_path`, `reversed_text_path_range`): the text then runs back along the same
+stretch on the other side of the line. The file holds an ordinary path frame, so Photoshop
+shows the flipped text without needing a flag. This is also the only form Photoshop 2026 draws
+flipped: its own flip flag is neither drawn nor saved, and it rewrites Photoshop 2025's flip
+key into a reversed contour on open (see the captures above). Patchy therefore reads the 2025
+key and never writes it: an edited layer is saved with the reversed contour and no `/11`.
+
+## Layout and drawing
+
+`build_text_render_document` lays a path story out at the arc length of its range
+(`text_path_layout_width`) with word wrap that may break inside a word, so Qt's first line is
+what Photoshop shows. `text_path_line_plan` (ui/text_path_layout.hpp) takes that line into
+*straight space*: x is the arc length from the range's start point, y is 0 on the baseline and
+grows downward. The plan maps straight space onto the contour (`map`, `glyph_transform`,
+`strip`) and back (`unmap`).
+
+`build_text_render_plan` puts the plan in `TextRenderPlan::path_plan`; `draw_path_text_plan`
+draws each glyph through `glyph_transform` of the middle of its advance (a combining mark rides
+with the glyph before it), with the same faux bold, faux italic, stretched-face and Strong
+anti-alias handling as other lines. Underline and strikethrough bars are bent into strips. The
+raster's `local_rect` is the union of the placed glyph boxes, so the layer's bounds follow the
+curve. Nothing snaps to the pixel grid, and the transform's scale is never folded into the font
+size: the text always renders through the layer's full transform, like area text.
+
+Tolerance against the captures (`ui_text_path_glyphs_match_photoshop_placement_if_available`,
+`ui_text_path_photoshop_files_redraw_where_photoshop_drew_them_if_available`): every capital I
+centroid within 1 px of Photoshop's, and for the text fixtures at least 90 percent of each
+render's ink within a pixel of the other's, ink bounds within 2 px.
+
+**Justify modes and indents** follow the captures above. The document is laid out as a box
+as wide as the range, so Qt applies the indents and spreads a line that hides words;
+`text_path_line_plan` adds `justified_last_line_shift` for a line that fits (last line
+centered or right), and `build_text_render_document` forces Justify all on path documents as on
+boxes. The controls do not offer justify here: the options bar, Type > Alignment and the
+Paragraph panel show a stored mode as its plain alignment (`shown_paragraph_alignment_name`
+with `TextAlignmentFlow::Path`: last line left and Justify all show Left, centered Center, right
+Right, then the side for the paragraph's direction), the Justify button and the panel's justify
+entries are off, and a justify entry picked from the menu stores its plain alignment
+([text-tool-alignment.md](text-tool-alignment.md#justify-modes)). The stored mode stays through edits that leave
+the alignment alone, so a save gives Photoshop back what it wrote.
+
+Not modelled: vertical type on a path (switching path text to vertical makes it ordinary
+vertical text in the contour's bounds and drops the path), Warp Text on path text, and
+word-space justification of a right-to-left or cursive line on a path (Qt's own applies).
+
+## The Type tool
+
+- **Targeting** (`CanvasWidget::type_tool_target_at`, the one answer the press, the cursor
+  and `add_text_at` share): existing text first (`type_tool_hits_text_layer`), then a line
+  (`text_path_at`: the targeted path, then the topmost visible shape whose outline passes
+  within reach), then the inside of a closed shape, else new text. A hit on a line wins over
+  the inside of a closed shape, so the edge of a shape starts path text and its inside starts
+  area text. The range runs from the clicked point to the end of an open contour, or once
+  around a closed one.
+- **Reach** (`type_tool_path_reach`): six screen pixels either side of a line, never under a
+  pixel and a half of the document, for a path and for the line of existing path text alike.
+  The two must stay equal: with a shorter reach for the text, a strip beside its line fell
+  through to the path under it (the active text's own contour is the targeted path) and a
+  press there started a second text on a copy of the line (the issue 717 follow-up).
+- **What path text takes**: its line within the reach, bare parts included, and inside its
+  bounds the band its glyphs stand in (1.6 times the largest type size from the line, at least
+  12 px, scaled by the text transform; the size comes from the runs, since the layer's own
+  size key can hold a small default). The rest of its bounding box, the middle of a ring of text or
+  the corners around a slanted line, is free for other text (while a ring's text is the active
+  layer its closed line is the targeted path, so the middle starts text that fills it).
+- **Cursor**: it names the frame a press works in, new text and existing text alike. The
+  I-beam on a wavy stroke (`text_path_cursor`) over a line and over path text; the I-beam in a
+  ring (`text_area_cursor`) inside a closed shape and over text that fills one; the plain
+  I-beam (the one a theme may replace) over other text and on empty canvas; the Move cursor
+  with Ctrl over text. Each hover move sets it from that move's position, and
+  `refresh_type_tool_cursor` sets it again when the view scrolls or zooms, the document
+  changes or the targeted path changes, since each of those changes what lies under a resting
+  pointer.
+- **Session.** Path text edits on the transformed overlay, like area text
+  (`kTextEditorPathProperty`, `kTextEditorPathRangeProperty` on the editor). The caret is a bar
+  across the line and selections are strips, both bent from `TextLineGeometry` answers in
+  straight space; a click resolves from the nearest point of the contour. A press further from
+  the line than the type can reach clicks off, even inside the contour's bounds.
+- **Marks** (Patchy's own design): a round mark at the start of the range, a square one at its
+  end and a diamond at its middle, with a short tick at each end on the side the text stands
+  on. Dragging the start or end mark slides that end along the contour; dragging the diamond
+  slides the whole range, and dragging it across the line (past half the type size) flips the
+  text. During a drag only the overlay moves (the marks and the outline); the text is laid out
+  once, on release, like a box resize, so there is nothing to coalesce. The end mark carries
+  the overflow plus when the range hides text (issue 631). Published for tests as
+  `patchy.transformedTextPathHandleCenters` (start, end, middle, canvas coordinates).
+- **Flip Text on Path** (Type menu, the Layers panel's text-layer menu in place of the
+  orientation entry, the Move tool's canvas menu; hotkey id `type.flip_text_on_path`, no default
+  key): flips every selected committed path-text layer without a session, one undo step
+  (`MainWindow::flip_text_on_path`: the stored contour and range reversed, then
+  `rerender_text_layer_through_stored_transform`). Enabled only while the active layer is
+  editable text on a path (`refresh_flip_text_on_path_action_state`, from
+  `refresh_layer_controls`). Test: `ui_text_path_flip_command_flips_a_committed_layer`.
+- **Re-edit.** A click on the text, or within the reach of the bare part of its contour,
+  opens the layer. The whole session is one undo step.
+- **The caret of the opening click** is where a second click at the same spot puts it. Every
+  caret-from-a-point answer goes through `text_editor_position_at_local_point`
+  (main_window.cpp), which unbends the point with the plan's `unmap` first; the opening click
+  used to skip that and read a contour point as a straight one. Three more things keep the two
+  clicks equal: the canvas hands `add_text_at` the press's exact point
+  (`CanvasWidget::text_request_precise_point`, a whole document pixel is many screen pixels at
+  zoom); a session that edits through the overlay reads that point from the overlay's
+  whole-pixel origin, as the overlay will; and before the first letter or past the last one
+  (the bare line, the unused part of the range) the nearer end of the text wins, whatever the
+  paragraph direction (Qt names the far end for Latin text in a right-to-left paragraph, which
+  is how the issue 717 file reads). Point, box and area text open through the same code.
+- **The contour as a path.** With the path-text layer active, the Direct Selection and Path
+  Selection tools edit its contour like an area boundary (`text_area_edit_target_path`): the
+  text follows, the range stays where it was in segment units, and points cannot be added or
+  removed there. Its Paths panel row ("<name> Text Boundary") is the layer's content: Delete
+  Path, or Delete in the list, deletes the text layer ([vector-tools.md](vector-tools.md#paths-panel)).
+- Free Transform, Image Size and the other document operations compose onto the text
+  transform; the contour is text-local, so it follows.
+
+## Scripting
+
+- `doc.addTextLayer(text, {path, pathRange})`: `path` is a `PatchyVectorPath` of one open or
+  closed contour in document pixels (`closed: false` for an open one); `pathRange` is
+  `{start, end}` in segment units and defaults to the whole contour. `path` excludes `area` and
+  `box`, and the contour decides the position, so `x` and `y` do not move it.
+- `layer.textPath`: a detached snapshot of the contour in document pixels, or `null`. Assigning
+  a contour sets the text along it (the range stays when the new contour has as many segments);
+  assigning `null` leaves a rectangular text box.
+- `layer.textPathRange`: `{start, end}` or `null`; assignable on path text.
+- `layer.flipTextPath()`: reverses the contour.
+
+Each is one undoable step through the ordinary text session and throws before any change on a
+contour that is not exactly one subpath of at least two anchors, a range outside the contour,
+or a layer that is not editable text.
+
+## Tests
+
+`tests/core/text_path_tests.cpp` (arc lengths, range rules, reversal, Photoshop frames read and
+authored, the older CC keys, the legacy-engine refusal) and `tests/ui/text_path_tests.cpp` (the
+line plan, placement against the captures, scripting, the Type tool's targeting, the marks, the
+caret and clicks; the cursor and its agreement with the press in the
+`ui_text_path_type_tool_cursor_*` tests and
+`ui_text_path_type_tool_leaves_the_inside_of_a_ring_of_text_free`; the opening click's caret
+in the `ui_text_path_first_click_*` tests and
+`ui_text_first_click_on_point_and_area_text_puts_the_caret_at_the_click`). The issue 717 file is local
+(`local-test-fixtures/psd/issue-717/photoshop-cc-text-on-a-path.psd`, a reporter's file, not
+committed): `text_engine_path_frames_read_older_photoshop_cc_file_if_available` and the five
+`ui_text_path_older_photoshop_cc_file_*_if_available` tests (redraw against the saved raster,
+a Type tool edit of each layer, the cursor along each line, the opening click's caret, the
+alignment the controls show) skip without it; the committed
+`text_engine_path_frames_read_older_photoshop_cc_options` covers the key rules everywhere.
+`ui_text_path_justify_modes_draw_like_photoshop_and_show_plain_alignment` pins the justify
+modes against Photoshop's ink columns and the controls for path, point and box text.

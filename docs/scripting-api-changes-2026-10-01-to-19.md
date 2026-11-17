@@ -1,0 +1,328 @@
+# Scripting API changes: archive 2026-10-01 to 2026-10-19
+
+Entries of the permanent scripting API change log, moved here unchanged when
+[scripting-api-changes.md](scripting-api-changes.md) reached its size limit. Newer entries
+live there, older ones in
+[scripting-api-changes-through-2026-09-30.md](scripting-api-changes-through-2026-09-30.md).
+`app.apiVersion` stayed 1 throughout. Newest first.
+
+2026-10-19 (additive plus behavioral): `.tif`/`.tiff` saves take `layers` (layered TIFF,
+docs/tiff.md). `doc.saveAs` of a document with layers a flat file would lose now writes a
+layered TIFF by default (the same composite plus Photoshop's layer data in tag 37724) instead
+of a flattened copy; `layers: false` keeps the old flat file, and `exportAs`, `colorMode:
+"cmyk"` and `--export` stay flat. `layers: true` with `colorMode: "cmyk"` throws. Opening a
+TIFF with Photoshop layers (`app.open`) gives a layered document. Permanent identifier: the
+key. Pinned by `ui_script_save_as_tiff_layers_option`.
+2026-10-19 (additive): Brush Mode. `drawStrokes` strokes and `patchy.brushes` settings take
+`mode` (Brush only, default `"normal"`): every blend mode id except `"pass-through"`, plus
+`"behind"` and `"clear"`; Eraser and Mixer strokes reject any other value. `getCurrent`,
+`resolve` and saved presets report it for the Brush. Permanent identifiers: the key, the two
+new tokens, and the setting `tools/brushMode`. Pinned by
+`ui_brush_mode_combo_lists_paint_modes_and_persists` and `ui_script_brush_mode_*`.
+2026-10-19 (additive): right-column panels. `patchy.ui.expandPanel(name)` (the Window menu
+entry's show: reopen, front tab, expand), `collapsePanel(name)`, `closePanel(name)` and
+`panelState(name)` (`{open, front, expanded}`); unknown names throw. Permanent identifiers:
+the four names and the panel names `layers`, `channels`, `paths`, `history`, `properties`,
+`info`, `palette` (d.ts `PatchyPanelName`). Pinned by `ui_script_ui_side_panels_*` and
+`ui_script_ui_expand_panel_in_cli_capture`.
+2026-10-18 (behavioral): `patchy.ui.zoom` clamps to 0.01..12800 (was 5..12800), Photoshop's
+range, as the view now zooms out to 0.01%. Pinned by `ui_script_ui_view_zoom`.
+2026-10-18 (behavioral, Photoshop parity): `selection.selectAll()` selects the active
+layer's artboard when that layer is on one (the whole canvas otherwise), and pixel paste
+lands on the target artboard, centered on it (docs/artboards.md, "Feature interactions").
+Pinned by `ui_artboard_feature_interactions_match_photoshop`.
+2026-10-18 (additive plus behavioral): `.pdf` save options and `app.exportPdf` take `pages`
+(`"artboards"`, the default, `"groups"`, `"canvas"`); `artboardPages` stays as its true/false
+spelling. Exporting by groups now includes hidden top-level groups and crops a PDF import's
+page folders to their own page size. Permanent identifiers: the key and its tokens. Pinned
+by `ui_pdf_import_page_folders_export_back_by_groups`.
+2026-10-18 (additive): artboards (docs/artboards.md). Documents gain `artboards` (top of
+the stack first), `addArtboard(name, rect, {background, color})`, `artboardFromLayers(layers,
+name?)`, `fitCanvasToArtboards()` (returns the `{x, y}` coordinate shift) and
+`exportArtboards(folder, {format, prefix, artboards, overwrite})` (returns the written paths).
+Layers gain `isArtboard`, `artboard` (`{x, y, width, height, background, color}` or null) and
+`setArtboard(options | null)`. `app.exportPdf` and `.pdf` save options gain `artboardPages`
+(default true: one page per artboard). The MCP document state adds `isArtboard` and
+`artboard` (the rect) per layer. Permanent identifiers: every name above and the background
+tokens `white`, `black`, `transparent`, `color`. Pinned by `ui_script_artboards_*`.
+2026-10-18 (behavioral): on an artboard, `layer.bounds`, `x`, `y` and `moveTo` use the
+artboard's rect, and a move carries the rect with the content; the canvas then grows to
+hold every artboard. `doc.groupLayers` and `doc.moveLayers` refuse to put an artboard into
+a group. Pinned by `ui_script_artboards_*`.
+2026-10-16 (additive): AVIF. `app.open`, `doc.saveAs` and `doc.exportAs` handle `.avif`
+(docs/avif.md). `PatchySaveOptions` gains `speed` (0 to 10) for `.avif`, which also takes
+`quality` (0 to 100), `lossless` and `metadata`. Permanent identifiers: the `speed` key and
+the `saveOptions/avifQuality`, `avifLossless`, `avifSpeed` settings. Pinned by
+`ui_script_save_as_options_write_avif`.
+2026-10-15 (behavioral): `app.open` of a CMYK JPEG or TIFF converts through the file's CMYK
+profile (else the working one) instead of a profile-free conversion, and the document opens
+with `doc.cmykProof` true when the working space has a profile. Pinned by
+`ui_cmyk_files_open_in_cmyk_proof`.
+2026-10-15 (additive): `doc.cmykProof` reads and sets Image > Mode > CMYK Proof
+(docs/cmyk.md); setting true throws in palette mode or without a CMYK profile. Without a
+`colorMode` option, `doc.saveAs`/`doc.exportAs` of a CMYK Proof document write `.jpg`, `.tif`
+and flattened `.pdf` in CMYK. Command id `image.mode_cmyk_proof`. Permanent identifier: the
+property. Pinned by `ui_cmyk_proof_mode_saves_cmyk`.
+2026-10-15 (additive): JPEG XL. `app.open`, `doc.saveAs` and `doc.exportAs` handle `.jxl`
+(docs/jxl.md). `PatchySaveOptions` gains `effort` (1 to 9) and `loopCount` (0 to 65535) for
+`.jxl`, and `.jxl` also takes `quality` (1 to 100), `lossless`, `animate`, `frameDelayMs` and
+`metadata`. Pinned by `ui_script_save_as_options_write_jxl`.
+2026-10-15 (additive): `blackInkOnly: true` in `doc.saveAs`/`doc.exportAs` options, with
+`colorMode: "cmyk"` only (throws otherwise), separates black, grays and black-ink colors to the
+K plate alone. Permanent identifier: the key. Pinned by
+`ui_script_export_cmyk_writes_jpeg_tiff_and_pdf`.
+2026-10-14 (additive): CMYK export (docs/cmyk.md). `doc.saveAs`/`doc.exportAs` options take
+`colorMode: "rgb" | "cmyk"` for `.jpg`, `.tif`/`.tiff` and flattened `.pdf`; `"cmyk"` separates
+through the working CMYK profile and embeds it, and throws when the user chose no profile. `.tif`
+now accepts this one key. Permanent identifiers: the key and both tokens. Pinned by
+`ui_script_export_cmyk_writes_jpeg_tiff_and_pdf`.
+2026-10-14 (additive): soft proof and gamut warning (docs/cmyk.md). `patchy.ui.proofColors`
+and `patchy.ui.gamutWarning` read and set View > Proof Colors and View > Gamut Warning
+(application-wide canvas views, never saved, off without a CMYK profile);
+`app.colorInCmykGamut(color)` is the gamut test for one color. Command ids
+`view.proof_colors` and `view.gamut_warning`. Pinned by `ui_proof_colors_and_gamut_warning_change_only_the_view`.
+2026-10-14 (additive): the working CMYK space (docs/cmyk.md). `app.cmykProfile` reads
+`{name, hasProfile, intent, blackPointCompensation}`; `app.colorToCmyk(color)` returns
+`{c, m, y, k}` ink percentages and `app.cmykToColor(c, m, y, k)` the `"#rrggbb"` color, both
+through the profile chosen in Preferences (an approximate formula when `hasProfile` is false).
+Permanent identifiers: the intent tokens `perceptual`, `relative-colorimetric`, `saturation`
+and `absolute-colorimetric`. Pinned by `ui_script_cmyk_conversions_use_working_space`.
+2026-10-14 (behavioral, supersedes the entry below): `layer.applyGmic` changes every layer
+`inputLayers` chooses that it may change, in one undo step; locked, text, shape and Smart
+Object layers among them are only read. A filter made for one image (declared input
+`active`) runs on each chosen layer alone at its own size, as if applied to each in turn, and
+its further results become new layers below that layer in G'MIC's top-first order (above
+it, in the same order, when it is named Background), where they used to go above and cover
+it (Ball's sphere hidden under the original); it no longer sees the layers padded
+onto a document-sized image, which turned a small layer canvas-sized for filters that fill
+transparency. A filter made for several layers still gets them lined up on the document and,
+when it combines them, replaces the layer it was called on. With `hidden` on a visible layer,
+the hidden layers now change in place instead of arriving as new layers. It throws when none
+of the chosen layers can be changed. Filters now receive each layer's name the way G'MIC
+expects it, so a new layer is named after its source ("Layer 1 [green]", not "[unnamed]
+[green]"). Pinned by `ui_gmic_filter_changes_every_chosen_layer` (which replaces the test
+named below) and `ui_gmic_filter_adds_output_layers_in_one_undo_step`.
+2026-10-14 (behavioral): `layer.applyGmic` with several input layers. A filter that returns
+an image per layer it read now gives the layer its own result and drops the results for the
+layers that were only read (they used to arrive as duplicate layers, and the layer took the
+top layer's result). When the layer is not among the input (`hidden` on a visible layer) it
+keeps its pixels and every result is a new layer. `visible` and `hidden` follow enclosing
+folders. It now throws on text and shape layers, locked pixels, Quick Mask, an `inputLayers`
+value that matches no layer, and a run that would not fit in memory. A filter that runs
+longer than the inactivity limit is no longer stopped by it, and stopping the script now
+stops the filter. Pinned at the time by
+`ui_gmic_filter_changes_only_the_active_layer_whatever_it_reads` (since replaced, see 2026-10-15).
+2026-10-13 (additive): G'MIC filters. `patchy.gmic.available` and `patchy.gmic.version`
+describe the engine (absent from the web build and from builds with `PATCHY_ENABLE_GMIC` off), and
+`patchy.gmic.list()` returns every offered filter as `{id, name, folder, inputLayers,
+parameters}` with each parameter's `{name, type, default, minimum, maximum, choices}`.
+`layer.applyGmic(filterId, values, {inputLayers})` runs one inside the selection as part of
+the run's undo entry and returns the number of layers the filter added; `values` is an array
+in list() order or an object keyed by parameter name. Permanent identifiers: the filter ids,
+the parameter type tokens (`float`, `int`, `bool`, `choice`, `color`, `point`, `text`, `file`,
+`folder`, `button`, `value`) and the `inputLayers` tokens (`active`, `activeAndBelow`,
+`activeAndAbove`, `all`, `visible`, `hidden`). Pinned by `ui_gmic_script_api_lists_and_applies`.
+2026-10-12 (behavioral): `layer.applyFilter` honors the selection like the Filter menu: only
+selected pixels change and the layer keeps its bounds (it used to filter the whole layer).
+A soft selection (a feather, an Object Selection edge) now blends `applyFilter` and
+`layer.fill` by its coverage instead of applying at full strength wherever coverage is
+nonzero. Pinned by `ui_destructive_edits_blend_by_soft_selection_coverage`.
+
+2026-10-12 (additive, behavioral): Object Selection's High Quality model (EfficientViT-SAM
+XL0, a one-time 234 MB desktop download). `doc.selection.objectSelectionModel` reads
+`"standard"` or `"highQuality"` (permanent tokens): the model `objectSelect` runs, which is
+High Quality once downloaded unless the tool's Model setting says Standard.
+`app.downloadObjectSelectionModel()` downloads it when missing (status-bar progress, the
+call waits), returns true once it is present, and throws on failure or in the web build.
+`objectSelect({rect})` now encodes the box's surroundings at full resolution (zoom-to-box)
+when the box is small against the image, like the tool; results change slightly, prompts and
+options do not. Pinned by `ai_object_selection_zoomed_box_finds_the_disc`,
+`ui_object_select_model_option_and_zoomed_box` and
+`ui_select_subject_is_left_out_without_the_subject_model` (the model token).
+
+2026-10-12 (behavioral): the web build has Object Selection. `automaticSelectionAvailable`
+is true there and `objectSelect` works; the first call downloads the models (about 19 MB, then
+cached by the browser), and the call waits in an event loop meanwhile, so it throws "The
+document changed during automatic selection." if the document closed or changed size during
+the wait. `subjectSelectionAvailable` stays false on the web. No automated pin (the UI suite
+does not run on wasm); verified in Chrome, see [ai-selection.md](ai-selection.md).
+
+2026-10-12 (additive, behavioral): `doc.selection.subjectSelectionAvailable`. Builds with
+CMake's `PATCHY_ENABLE_SELECT_SUBJECT` off (the default; the subject model is held back pending
+patent review) report it false, and `selectSubject`, `selectBackground` and
+`layer.removeBackground` throw "Select Subject is not included in this build of Patchy";
+`objectSelect` and `automaticSelectionAvailable` are unchanged. Pinned by
+`ui_select_subject_is_left_out_without_the_subject_model`.
+
+2026-10-11 (additive): File Info. `doc.fileInfo` (Description and IPTC fields), `doc.xmp`,
+`doc.setFileInfo(fields)`, `doc.metadataEntries()`, `doc.stripMetadata({keepColorProfile})`,
+`doc.removeLocation()`, `doc.removeEditHistory()`, and the `metadata` save option (`"all"`,
+`"copyright"`, `"none"`) for `.jpg`, `.png`, `.tif`, `.webp` and `.gif` in `saveAs` and
+`exportAs`. Saves now write the document's metadata. See [file-info.md](file-info.md).
+Pinned by `ui_script_file_info_reads_edits_and_strips`.
+
+2026-10-11 (additive): `sampleAllLayers` (default `true`) on `doc.selection.selectSubject`,
+`selectBackground` and `layer.removeBackground(options?)`; `false` analyzes the active layer
+rendered alone (any layer kind). `objectSelect({sampleAllLayers: false})` now accepts shape,
+text and other non-pixel layers the same way instead of requiring a pixel layer. Pinned by
+`ui_select_subject_follows_sample_all_layers`.
+
+2026-10-11 (additive): `doc.selection.selectBackground({operation, feather, antialias})`
+(Select > Select Background, the inverse of `selectSubject`) and `layer.removeBackground()`
+(Layer > Layer Mask > Remove Background: the subject matte as the layer's mask, multiplied into
+an existing mask). Both throw when the build has no automatic selection. Pinned by
+`ui_script_select_background_and_remove_background`.
+
+2026-10-11 (additive): automatic selection on `doc.selection`:
+`selectSubject({operation, feather, antialias})` (Select > Subject),
+`objectSelect({rect} | {point}, operation, sampleAllLayers, feather, antialias)` (the Object
+Selection tool; exactly one of `rect` or `point`; `operation` has no `"intersect"`), and
+`automaticSelectionAvailable`. Both calls throw when the build has no automatic selection.
+See [ai-selection.md](ai-selection.md). Pinned by `ui_script_automatic_selection_selects_objects`.
+
+2026-10-10 (behavioral correction): `patchy.io.writeTextFile(path, text)` writes through
+a sibling temporary and a replacing rename (QSaveFile), so a failed write leaves the
+previous file intact instead of a truncated one, and a write that cannot be committed
+throws `Could not write <path>: <reason>` instead of returning silently. The Script
+Manager's Save and Save As take the same path and keep the editor modified on failure.
+
+2026-10-10 (behavioral correction): saving or exporting a 16/32-bit document to an
+8-bit-only format (BMP, TGA, DDS, GIF, PCX, ICO/CUR, IFF, RTTEX, JXR, SVG, Aseprite, or any
+export transform) writes an 8-bit copy instead of returning false; the document keeps its
+depth. Pinned by `ui_script_deep_documents_save_to_8_bit_formats`.
+
+2026-10-09 (additive): `patchy.scripts` (`PatchyScripts` in patchy.d.ts): `userFolder`,
+`bundledFolder`, `list()` / `rescan()` (every script with its effective `hotkey`,
+`defaultHotkey` and `commandId`), `install(relativePath, source, {hotkey})` (writes below the
+user folder, rescans, binds the Preferences override), `setHotkey` / `getHotkey`. The File >
+Scripts entries gain the Script Manager's right-click menu. Pinned by
+`ui_script_library_installs_and_binds_hotkey` and `ui_scripts_menu_context_menu_offers_script_actions`.
+
+2026-10-09 (additive): `doc.saveAs(path, options?)` and `doc.exportAs(path, options?)`
+take the format's save options (`PatchySaveOptions` in patchy.d.ts: JPEG/WebP/JXR/RTTEX
+`quality`, WebP/JXR/PDF `lossless`, DDS `compression` and `mipmaps`, ICO/CUR `sizes`,
+`resample` and `hotspot`, BMP `encoding`, `paletteMode` and `palettePath`, RTTEX `encoding`,
+`powerOfTwo`, `forceSquare`, `forceAlpha` and `compress`, the exportPdf keys, GIF `animate` and
+`frameDelayMs`). Unspecified keys follow the user's Save Options defaults; an unknown key, a
+wrong type, an out-of-range value, or a key for another extension throws before anything is
+written. A scripted save no longer rewrites the user's persisted saveOptions defaults, and
+scripted saves skip the saved-channels and Aseprite fill-opacity prompts (the script decided).
+Pinned by `ui_script_save_as_options_write_dds_and_jpeg` and `ui_script_save_as_options_are_strict`.
+
+2026-10-09 (behavioral correction): `doc.exportAs` is a copy export. It used to be
+identical to `saveAs`, so a flat document exported as .dds became the .dds session; now the
+document's path, title and modified state never change, whatever the format. Scripts that
+relied on exportAs retargeting the document should call saveAs.
+
+2026-10-09 (additive): per-script hotkeys. A `// @hotkey Ctrl+Alt+D` header line is a
+script's default shortcut; Preferences > Hotkeys lists scripts under "Scripts" and its
+override wins. The command id is `script.` plus the percent-encoded relative path
+(`script.Utilities%2Fquick-export-dds.js`), listed by `app.commandIds()`; `app.runCommand`
+refuses those ids because one script runs at a time. New bundled example
+`Utilities/quick-export-dds.js`. See [scripting.md](scripting.md) "Script hotkeys".
+
+2026-10-09 (additive): `addTextLayer(text, {area})` creates area text from one
+closed `PatchyVectorPath` in document coordinates. `area` and `box` are mutually
+exclusive. `layer.textArea` reads a detached boundary snapshot or `null`; assigning
+a boundary reflows through the text session, and assigning `null` converts it to
+box text. Source shapes remain independent. See [area-text.md](area-text.md).
+
+2026-10-09 (behavioral): 16 and 32-bit editing is on by default (`PATCHY_DEEP_EDITING=0`
+turns it off). A 16 or 32-bit file opened with `app.open` keeps its depth (`doc.bitDepth`
+reports it; with the gate off it still decodes to 8 bits) and `doc.convertBitDepth` works
+without opting in; `app.newDocument` stays 8-bit. `layer.applyPlugin` runs on 16-bit layers
+through an 8-bit copy whose change folds back at depth, and still throws for a 32-bit
+layer. On a 32-bit document the `layer.blendMode` setter throws for the modes Photoshop
+refuses at 32 bits (Color Burn, Linear Burn, Screen, Color Dodge, Overlay, the Light modes,
+Hard Mix, Exclusion), and `convertBitDepth(32)` sets layers in those modes to Normal. The
+web build throws for `convertBitDepth(32)`. See [high-bit-depth.md](high-bit-depth.md);
+pinned by `ui_script_bit_depth_and_deep_filters`.
+
+2026-10-09 (additive): `doc.bitDepth` (8, 16 or 32) and `doc.convertBitDepth(bits)`
+(Image > Mode's conversion; throws for other values, while 16 and 32-bit editing is off,
+or on an Indexed document). On 16 and 32-bit documents `getPixels` and `setPixels` stay
+RGBA8 and convert at the boundary, `fill` and `fillRect` write at the document's depth,
+and `applyFilter` runs at depth, throwing for a filter a 32-bit document does not offer.
+See [high-bit-depth.md](high-bit-depth.md); pinned by `ui_script_bit_depth_and_deep_filters`.
+
+2026-10-07 (additive plus behavioral correction): `doc.resizeImage(width, height, {method})`
+takes a resampling method id: `"automatic"` (default), `"nearest"`, `"bilinear"`, `"bicubic"`,
+`"bicubicSmoother"`, `"bicubicSharper"`; an unknown id throws. A resize without a method is
+Automatic (Bicubic Sharper for a reduction, Bicubic Smoother for an enlargement) instead of
+the old fixed bilinear, 16-bit and float documents are filtered instead of nearest-sampled,
+reductions average their footprint, and alpha interpolates premultiplied. The Image Size
+dialog now honors its method combo and remembers the choice. See
+[resampling.md](resampling.md); pinned by `ui_script_resize_image_method_option` and the
+`resample_*` core tests.
+
+2026-10-06 (behavioral): `ui.zoom` reads and writes the view zoom in percent, where
+100 is one document pixel per device pixel (the status-box number). On a HiDPI or scaled
+display the value therefore differs from the logical widget scale by the device pixel
+ratio; at ratio 1 nothing changes. Matches Photoshop's 100% (GitHub issue 75).
+
+2026-10-05 (additive): `layer.rerenderSmartObject()` renders an embedded smart
+object again from the file it stores, for every layer sharing that source, and returns
+the number of layers re-rendered. A smart object opened from a PSD shows the pixels
+saved in the file until it is transformed or its contents change. Throws for a linked
+smart object (`updateSmartObject()` is the call for those), a plain layer, a locked one,
+or contents that cannot be decoded. Pinned by `ui_script_rerender_smart_object_from_embedded_file`.
+
+2026-10-05 (additive): `layer.rerenderText()` renders a text layer again from its
+stored text, fonts and formatting, changing none of them. A type layer opened from a PSD
+shows the pixels saved in the file until it is edited; this replaces them with Patchy's
+own render (what Testy uses to score Patchy's text engine instead of Photoshop's cached
+pixels). Throws on a layer that is not text or is locked. Pinned by
+`ui_script_rerender_text_replaces_stored_pixels`.
+
+2026-10-03 (additive): `doc.mergeLayers(layers, {singleVector: true,
+effectsFrom?: layer})` explicitly combines selected vectors at the bottommost
+source's stack position. It removes individual layer effects unless `effectsFrom`
+selects one source stack to apply to the combined silhouette. Fills, vector strokes
+and curves remain editable. Protected or incompatible inputs throw before mutation.
+See [layer-merging.md](layer-merging.md); pinned by `ui_layer_merge_single_vector_*`.
+
+2026-10-02 (behavioral correction): text font warnings recognize compact family
+spellings such as `LiberationSans` as the same font as `Liberation Sans`. Creating or
+editing text with that spelling no longer reports a missing font when the requested
+face renders it. Pinned by `ui_text_name_table_names_resolve_to_the_registered_face`.
+
+2026-10-02 (additive): `doc.exportAnimatedWebp(path, options?)` writes visible
+top-level layers as animation, with millisecond timing, finite or infinite play counts,
+quality and lossless options. It preserves the source document path and dirty state.
+Defaults and validation are in `scripts/bundled/patchy.d.ts`; ordinary `saveAs` and
+`exportAs` WebP output stays flat. MCP uses the same method via `execute_script`.
+
+2026-10-01 (behavioral correction): `doc.resizeImage` re-renders every editable embedded
+and every resolvable linked smart object from its source (vector files at the new scale),
+matching Image > Image Size; before, the script and MCP resize kept the resampled
+previews, and linked placements stayed resampled in every path. A linked file that is
+missing or cannot be decoded keeps the resampled preview without throwing, and
+`getSmartObject().missing` still reports it. Pinned by
+`ui_script_smart_object_image_size_rerenders_linked_and_embedded`,
+`ui_script_smart_object_linked_raster_rerenders_from_full_resolution` and
+`ui_script_smart_object_missing_linked_file_keeps_preview_on_image_size`.
+
+2026-10-01 (behavioral correction): text font warnings name their cause, and the text
+setters log them too. A font that is installed but has no glyph for any character of the text
+(the bundled Noto Naskh Arabic asked for Latin text) now logs `addTextLayer: font has no
+glyphs for this text, rendered with a fallback: <family>`. It used to log `font not
+available`, which still appears for a font that is not installed. A layer with both problems
+logs both lines. `layer.text`, `setTextRuns`, `textAlign`, `textParagraph`, `textOrientation`
+and `textDirection` used to say nothing; they now log the same two lines under their own name
+(`layer.text: font not available, ...`). That includes the case where the edit replaced a
+missing font with a substitute, so `textFont` no longer names the font the layer was created
+with. Runs that give every character an installed font log nothing. These are console lines,
+never dialogs. Pinned by `ui_script_text_font_without_glyphs_warns_with_the_real_cause` and
+`ui_script_text_setters_warn_about_fonts`.
+
+2026-10-01 (behavioral correction): `layer.moveTo` and the `x` / `y` setters move a
+layer the way the Move tool does. They used to shift only the pixel bounds and the mask
+bounds, leaving the placement data behind: a shape kept its old path and geometry and
+snapped back at its next re-render, a smart object kept its old quad, and a text layer kept
+its old transform, so Photoshop laid it out again at the creation anchor on the first edit.
+Now the shape model, smart-object quads, text transform, preserved vector-mask data and a
+linked raster or vector mask travel with the layer and with every layer inside a moved
+group, and a smart object with Smart Filters re-renders at the new place. One visible
+difference: an unlinked mask now stays where it is (it used to move with the layer).
+Pinned by `ui_script_move_*`; the Photoshop check is
+`scripts\dev\photoshop-text-move-check.ps1`. See [scripting.md](scripting.md).

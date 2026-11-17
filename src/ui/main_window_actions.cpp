@@ -1,0 +1,521 @@
+// MainWindow's action/menu/tool-palette/options-bar construction, split out of
+// main_window.cpp: create_actions() orchestrates the build phases in their
+// historical order (menu bar, tool palette, Options bar, translation binding,
+// final refresh). The phase bodies are pure function moves into
+// main_window_actions_menus.cpp, main_window_actions_tool_palette.cpp and
+// main_window_actions_options_bar.cpp, threaded together by the
+// ActionBuildContext in main_window_actions_internal.hpp;
+// bind_action_translations() and the retranslation machinery those menus feed
+// stay here (register_retranslation, retranslate_ui,
+// retranslate_bound_children and the combo
+// retranslators). Behavior must stay identical to the pre-split single
+// function.
+
+#include <QPushButton>
+#include "ui/hotkey_registry.hpp"
+#include "core/layer.hpp"
+#include "ui/main_window.hpp"
+#include "support/startup_trace.hpp"
+#include "ui/tool_palette_footer.hpp"
+#include "ui/localization.hpp"
+#include "ui/ui_font.hpp"
+#include <QComboBox>
+#include <QMenu>
+#include <QMenuBar>
+#include <QStatusBar>
+#include <QToolBar>
+#include "ui/canvas_widget.hpp"
+#include "ui/main_window_shared.hpp"
+#include "ui/main_window_actions_internal.hpp"
+
+#include "ui/blend_mode_ui.hpp"
+#include "ui/brush_presets.hpp"
+#include "ui/curved_slider.hpp"
+#include "ui/dialog_utils.hpp"
+#include "ui/layer_list_widget.hpp"
+#include "ui/tile_preview_window.hpp"
+#include "ui/update_checker.hpp"
+
+#include <QAction>
+#include <QApplication>
+#include <QCheckBox>
+#include <QFontDatabase>
+#include <QObject>
+#include <QSignalBlocker>
+#include <QSlider>
+#include <QSpinBox>
+#include <QString>
+#include <QStringList>
+#include <QStringLiteral>
+#include <QtGlobal>
+
+#include <algorithm>
+#include <functional>
+#include <initializer_list>
+#include <utility>
+#include <vector>
+
+
+// Icon resources live in the static patchy_ui library; force registration before first use.
+int qInitResources_icons();
+
+namespace patchy::ui {
+
+void MainWindow::create_actions() {
+  // Startup builds the options bar before any document exists (canvas_ is null):
+  // a throwaway default-constructed canvas donates the initial control values,
+  // which are identical to a fresh session canvas's. Once the first document
+  // arrives, load_tool_settings() + sync_tool_option_controls_from_canvas()
+  // re-read the controls from the real canvas with the stored settings applied.
+  startup_trace::Scope canvas_phase("mw.actions.defaults_canvas");
+  CanvasWidget startup_defaults_canvas;
+  canvas_phase.end();
+  // Stack-only build context threading the cross-phase locals between the
+  // builders; it dies when create_actions() returns, so builder lambdas
+  // capture pointer values from it, never the context itself.
+  ActionBuildContext ctx;
+  ctx.canvas_defaults = canvas_ != nullptr ? canvas_ : &startup_defaults_canvas;
+
+  // Phase order is load-bearing (widget construction, hotkey registration and
+  // register_retranslation callbacks all follow it): menu bar, tool palette,
+  // Options bar, translation binding, final refresh.
+  startup_trace::Scope menu_phase("mw.actions.menu_bar");
+  build_menu_bar_actions(ctx);
+  menu_phase.end();
+  startup_trace::Scope palette_phase("mw.actions.tool_palette");
+  build_tool_palette(ctx);
+  palette_phase.end();
+  startup_trace::Scope options_phase("mw.actions.options_bar");
+  build_options_bar(ctx);
+  options_phase.end();
+  startup_trace::Scope finish_phase("mw.actions.translations_finish");
+  bind_action_translations(ctx);
+
+  retranslate_brush_preset_combo();
+  for (auto* action : menuBar()->actions()) {
+    reserve_menu_icon_column(action->menu());
+    hide_menu_action_icons(action->menu());
+  }
+  // Menu-bar commands that stayed enabled on the empty workspace and crashed or
+  // did nothing there (GitHub issue 162). ui_empty_workspace_disables_document_commands
+  // walks every menu and fails on any other command enabled without a document
+  // that command_works_without_document does not list.
+  for (const auto* name :
+       {"imageCropToSelectionAdvancedAction", "layerEditAdjustmentAction", "layerConvertSmartObjectAction",
+        "layerSmartObjectEditAction", "layerSmartObjectReplaceAction", "layerSmartObjectUpdateAction",
+        "layerSmartObjectRelinkAction", "layerSmartObjectEmbedAction", "layerSmartObjectExportAction",
+        "layerSmartObjectViaCopyAction", "layerSmartObjectToLayersAction", "layerSmartObjectToNormalAction",
+        "viewProofColorsAction", "viewGamutWarningAction", "viewToggleTargetPathAction", "viewTilePreviewAction"}) {
+    if (auto* document_action = findChild<QAction*>(QString::fromLatin1(name));
+        document_action != nullptr &&
+        std::find(document_actions_.begin(), document_actions_.end(), document_action) == document_actions_.end()) {
+      register_document_action(document_action);
+    }
+  }
+  refresh_options_bar();
+  refresh_color_buttons();
+
+  update_undo_redo_actions();
+}
+
+// The translation-binding pass of create_actions(): binds retranslatable text
+// sources to the actions and widgets the three build phases created (reaching
+// them through the ActionBuildContext) and prepares the toolbars'
+// toggle-view actions for the Window menu.
+void MainWindow::bind_action_translations(ActionBuildContext& ctx) {
+  // The toggles join the Window menu with the panels (install_window_panel_entries).
+  for (auto* toggle : {ctx.tool_palette->toggleViewAction(), ctx.options_toolbar->toggleViewAction()}) {
+    toggle->setProperty(kWorksWithoutDocumentProperty, true);
+  }
+  // The "Tool Options" toggle would otherwise be captured by macOS's menu-text heuristic
+  // (any menubar action containing "options" gets relocated as a Preferences item).
+  ctx.tool_palette->toggleViewAction()->setMenuRole(QAction::NoRole);
+  ctx.options_toolbar->toggleViewAction()->setMenuRole(QAction::NoRole);
+  // Names for the Search Commands descriptions (command_search.cpp).
+  ctx.tool_palette->toggleViewAction()->setObjectName(QStringLiteral("windowToolPaletteAction"));
+  ctx.options_toolbar->toggleViewAction()->setObjectName(QStringLiteral("windowToolOptionsAction"));
+  bind_widget_text(ctx.tool_palette, QT_TRANSLATE_NOOP("patchy::ui::MainWindow", "Tool Palette"));
+  bind_widget_text(ctx.options_toolbar, QT_TRANSLATE_NOOP("patchy::ui::MainWindow", "Tool Options"));
+  const std::vector<std::pair<QAction*, const char*>> translated_actions = {
+      {ctx.new_action, QT_TR_NOOP("&New")},
+      {ctx.open_action, QT_TR_NOOP("&Open...")},
+      {recent_files_menu_->menuAction(), QT_TR_NOOP("Open &Recent File")},
+      {recent_folders_menu_->menuAction(), QT_TR_NOOP("Open Recent &Folder")},
+      {ctx.save_action, QT_TR_NOOP("&Save")},
+      {ctx.save_as_action, QT_TR_NOOP("Save &As...")},
+      {ctx.export_flat_action, QT_TR_NOOP("&Flat Image...")},
+      {ctx.page_setup_action, QT_TR_NOOP("Page Set&up...")},
+      {ctx.print_action, QT_TR_NOOP("&Print...")},
+      {ctx.close_action, QT_TR_NOOP("&Close")},
+      {ctx.close_all_action, QT_TR_NOOP("Close &All")},
+      {ctx.preferences_action, QT_TR_NOOP("&Preferences...")},
+      {ctx.quit_action, QT_TR_NOOP("&Quit")},
+      {undo_action_, QT_TR_NOOP("&Undo")},
+      {redo_action_, QT_TR_NOOP("&Redo")},
+      {ctx.cut_action, QT_TR_NOOP("Cu&t")},
+      {ctx.copy_action, QT_TR_NOOP("&Copy")},
+      {ctx.copy_merged_action, QT_TR_NOOP("Copy Merged")},
+      {ctx.paste_action, QT_TR_NOOP("&Paste")},
+      {ctx.transform_action, QT_TR_NOOP("Free &Transform...")},
+      {ctx.select_all_action, QT_TR_NOOP("Select &All")},
+      {ctx.clear_selection_action, QT_TR_NOOP("&Clear Selection")},
+      {ctx.reselect_action, QT_TR_NOOP("&Reselect")},
+      {ctx.inverse_selection_action, QT_TR_NOOP("&Inverse")},
+      {quick_mask_action_, QT_TR_NOOP("Edit in &Quick Mask Mode")},
+      {ctx.grow_selection_action, QT_TR_NOOP("&Grow")},
+      {ctx.similar_selection_action, QT_TR_NOOP("Simi&lar")},
+      {ctx.expand_selection_action, QT_TR_NOOP("&Expand...")},
+      {ctx.contract_selection_action, QT_TR_NOOP("Con&tract...")},
+      {ctx.border_selection_action, QT_TR_NOOP("&Border...")},
+      {ctx.layer_transparency_action, QT_TR_NOOP("Load Layer &Transparency")},
+      {ctx.stroke_selection_action, QT_TR_NOOP("&Stroke Selection...")},
+      {ctx.remove_object_action, QT_TR_NOOP("Remove &Object...")},
+      {ctx.define_brush_tip_action, QT_TR_NOOP("Define Brush Tip from Selection")},
+      {ctx.layer_new_menu->menuAction(), QT_TR_NOOP("&New")},
+      {ctx.add_layer_action, QT_TR_NOOP("&New Layer")},
+      {ctx.add_folder_action, QT_TR_NOOP("New &Folder")},
+      {ctx.new_adjustment_layer_menu->menuAction(), QT_TR_NOOP("New &Adjustment Layer")},
+      {ctx.new_fill_layer_menu->menuAction(), QT_TR_NOOP("New F&ill Layer")},
+      {ctx.layer_mask_menu->menuAction(), QT_TR_NOOP("Layer Mask")},
+      {ctx.vector_mask_menu->menuAction(), QT_TR_NOOP("&Vector Mask")},
+      {ctx.layer_smart_objects_menu->menuAction(), QT_TR_NOOP("Smart Objects")},
+      {ctx.layer_arrange_menu->menuAction(), QT_TR_NOOP("Arran&ge")},
+      {ctx.layer_align_menu->menuAction(), QT_TR_NOOP("&Align")},
+      {ctx.layer_distribute_menu->menuAction(), QT_TR_NOOP("&Distribute")},
+      {ctx.layer_via_copy_action, QT_TR_NOOP("Layer Via &Copy")},
+      {ctx.layer_via_cut_action, QT_TR_NOOP("Layer Via Cu&t")},
+      {ctx.add_mask_action, QT_TR_NOOP("Add Layer &Mask")},
+      {edit_layer_mask_action_, QT_TR_NOOP("&Edit Layer Mask")},
+      {mask_overlay_action_, QT_TR_NOOP("Show Mask &Overlay")},
+      {view_layer_mask_action_, QT_TR_NOOP("View Layer Mask")},
+      {delete_layer_mask_action_, QT_TR_NOOP("&Delete Layer Mask")},
+      {link_layer_mask_action_, QT_TR_NOOP("Link Layer &Mask")},
+      {disable_layer_mask_action_, QT_TR_NOOP("&Disable Layer Mask")},
+      {invert_layer_mask_action_, QT_TR_NOOP("&Invert Layer Mask")},
+      {apply_layer_mask_action_, QT_TR_NOOP("&Apply Layer Mask")},
+      {ctx.edit_adjustment_action, QT_TR_NOOP("&Adjustment Layer Settings...")},
+      {layer_blending_options_action_, QT_TR_NOOP("Edit Layer &Styles...")},
+      {layer_copy_style_action_, QT_TR_NOOP("Copy Layer Style")},
+      {layer_paste_style_action_, QT_TR_NOOP("Paste Layer Style")},
+      {layer_delete_style_action_, QT_TR_NOOP("Delete Layer Style")},
+      {layer_rasterize_action_, QT_TR_NOOP("Rasterize")},
+      {layer_rasterize_layer_style_action_, QT_TR_NOOP("Rasterize (including layer style)")},
+      {ctx.duplicate_layer_action, QT_TR_NOOP("&Duplicate Layer")},
+      {duplicate_layer_to_document_action_, QT_TR_NOOP("Duplicate Layer to Document...")},
+      {ctx.merge_visible_action, QT_TR_NOOP("Merge &Visible to New Layer (Copy)")},
+      {ctx.merge_down_action, QT_TR_NOOP("Merge &Down")},
+      {ctx.rename_layer_action, QT_TR_NOOP("&Rename Layer...")},
+      {ctx.delete_layer_action, QT_TR_NOOP("Delete La&yer")},
+      {ctx.fill_layer_action, QT_TR_NOOP("&Fill Layer / Selection")},
+      {ctx.fill_background_action, QT_TR_NOOP("Fill With &Background Color")},
+      {ctx.clear_layer_action, QT_TR_NOOP("&Clear Layer / Selection")},
+      {ctx.flip_h_action, QT_TR_NOOP("Flip Layer &Horizontal")},
+      {ctx.flip_v_action, QT_TR_NOOP("Flip Layer &Vertical")},
+      {ctx.layer_up_action, QT_TR_NOOP("Move Layer &Up")},
+      {ctx.layer_down_action, QT_TR_NOOP("Move Layer &Down")},
+      {ctx.adjustments_menu->menuAction(), QT_TR_NOOP("&Adjustments")},
+      {ctx.levels_action, QT_TR_NOOP("&Levels...")},
+      {ctx.curves_action, QT_TR_NOOP("&Curves...")},
+      {ctx.hue_saturation_action, QT_TR_NOOP("&Hue/Saturation...")},
+      {ctx.color_balance_action, QT_TR_NOOP("Color &Balance...")},
+      {ctx.image_size_action, QT_TR_NOOP("&Image Size...")},
+      {ctx.canvas_size_action, QT_TR_NOOP("&Canvas Size...")},
+      {ctx.crop_action, QT_TR_NOOP("&Crop to Selection")},
+      {ctx.crop_advanced_action, QT_TR_NOOP("Crop to Selection (Advance&d)...")},
+      {ctx.rotate_cw_action, QT_TR_NOOP("Rotate &Right")},
+      {ctx.rotate_ccw_action, QT_TR_NOOP("Rotate &Left")},
+      {ctx.rotate_arbitrary_action, QT_TR_NOOP("Rotate &Arbitrary...")},
+      {ctx.shift_seams_action, QT_TR_NOOP("Shift &Seams to Center")},
+      {legacy_plugins_menu_->menuAction(), QT_TR_NOOP("Legacy Photoshop Plug-ins")},
+      {ctx.zoom_in, QT_TR_NOOP("Zoom &In")},
+      {ctx.zoom_out, QT_TR_NOOP("Zoom &Out")},
+      {ctx.fit_on_screen, QT_TR_NOOP("&Fit on Screen")},
+      {ctx.fill_screen, QT_TR_NOOP("Fi&ll Screen")},
+      {ctx.zoom_reset, QT_TR_NOOP("&Actual Pixels")},
+      {ctx.zoom_200, QT_TR_NOOP("200%")},
+      {ctx.extras_action, QT_TR_NOOP("&Extras")},
+      {ctx.show_menu->menuAction(), QT_TR_NOOP("S&how")},
+      {ctx.show_selection_edges_action, QT_TR_NOOP("&Selection Edges")},
+      {ctx.extras_options_action, QT_TR_NOOP("Show &Extras Options...")},
+      {ctx.target_path_action, QT_TR_NOOP("&Target Path")},
+      {ctx.tile_preview_action, QT_TR_NOOP("Seamless &Tile Preview")},
+      {tiling_mode_action_, QT_TR_NOOP("Seamless Tiling in &Window")},
+      {view_rulers_action_, QT_TR_NOOP("&Rulers")},
+      {view_vector_preview_action_, QT_TR_NOOP("Dynamic Vector Preview")},
+      {view_proof_colors_action_, QT_TR_NOOP("Proof Colors")},
+      {view_gamut_warning_action_, QT_TR_NOOP("Gamut Warning")},
+      {view_grid_action_, QT_TR_NOOP("&Grid")},
+      {view_pixel_grid_action_, QT_TR_NOOP("Pi&xel Grid")},
+      {view_guides_action_, QT_TR_NOOP("&Guides")},
+      {view_snap_action_, QT_TR_NOOP("&Snap")},
+      {view_lock_guides_action_, QT_TR_NOOP("Lock Guides")},
+      {ctx.snap_to_menu->menuAction(), QT_TR_NOOP("Snap &To")},
+      {view_snap_guides_action_, QT_TR_NOOP("Guides")},
+      {view_snap_grid_action_, QT_TR_NOOP("Grid")},
+      {view_snap_document_action_, QT_TR_NOOP("Document Bounds and Center")},
+      {view_snap_layers_action_, QT_TR_NOOP("Layer Bounds and Centers")},
+      {view_snap_selection_action_, QT_TR_NOOP("Selection Bounds and Center")},
+      {ctx.guides_menu->menuAction(), QT_TR_NOOP("Guide Operations")},
+      {ctx.new_guide_action, QT_TR_NOOP("New Guide...")},
+      {ctx.new_guide_layout_action, QT_TR_NOOP("New Guide Layout...")},
+      {ctx.clear_selected_guides_action, QT_TR_NOOP("Clear Selected Guides")},
+      {ctx.clear_guides_action, QT_TR_NOOP("Clear Guides")},
+      {ctx.screen_size_menu->menuAction(), QT_TR_NOOP("Set Screen Size")},
+      {ctx.force_refresh_action, QT_TR_NOOP("Force Refresh")},
+      {ctx.scripting_guide_action, QT_TR_NOOP("&Scripting Guide")},
+      {ctx.ai_setup_action, QT_TR_NOOP("Set &up AI Control...")},
+      {ctx.about_action, QT_TR_NOOP("&About Patchy")},
+      {ctx.default_colors_action, QT_TR_NOOP("Default Colors")},
+      {ctx.swap_colors_action, QT_TR_NOOP("Swap Colors")},
+      {ctx.brush_smaller_action, QT_TR_NOOP("Brush Smaller")},
+      {ctx.brush_larger_action, QT_TR_NOOP("Brush Larger")},
+      {ctx.brush_much_smaller_action, QT_TR_NOOP("Brush Much Smaller")},
+      {ctx.brush_much_larger_action, QT_TR_NOOP("Brush Much Larger")},
+  };
+  for (const auto& [action, source] : translated_actions) {
+    bind_action_text(action, source);
+    refresh_action_tooltip(action);
+  }
+  if (gegl_filters_menu_ != nullptr) {
+    bind_action_text(gegl_filters_menu_->menuAction(), QT_TR_NOOP("GEGL Filters"));
+  }
+  const std::vector<std::pair<QObject*, const char*>> translated_widgets = {
+      {primary_color_button_, QT_TR_NOOP("FG")},
+      {secondary_color_button_, QT_TR_NOOP("BG")},
+      {move_auto_select_check_, QT_TR_NOOP("Auto-Select")},
+      {move_show_transform_controls_check_, QT_TR_NOOP("Transform Controls")},
+      {move_snap_check_, QT_TR_NOOP("Snap")},
+      {clone_aligned_check_, QT_TR_NOOP("Aligned")},
+      {crop_delete_pixels_check_, QT_TR_NOOP("Delete Cropped Pixels")},
+      {crop_delete_layers_check_, QT_TR_NOOP("Delete Off-Canvas Layers")},
+      {perspective_crop_grid_check_, QT_TR_NOOP("Show Grid")},
+      {mixer_sample_all_layers_check_, QT_TR_NOOP("Sample All Layers")},
+      {patch_transparent_check_, QT_TR_NOOP("Transparent")},
+      {retouch_ignore_adjustments_check_, QT_TR_NOOP("Ignore Adjustment Layers")},
+      {gradient_reverse_check_, QT_TR_NOOP("Reverse")},
+      {gradient_edit_stops_button_, QT_TR_NOOP("Edit Stops...")},
+      {wand_contiguous_check_, QT_TR_NOOP("Contiguous")},
+      {eyedropper_show_sample_ring_check_, QT_TR_NOOP("Show Sample Ring")},
+      {fill_contiguous_check_, QT_TR_NOOP("Contiguous")},
+      {zoom_scrubby_check_, QT_TR_NOOP("Scrubby Zoom")},
+      {zoom_actual_pixels_button_, QT_TR_NOOP("100%")},
+      {zoom_fit_screen_button_, QT_TR_NOOP("Fit Screen")},
+      {zoom_fill_screen_button_, QT_TR_NOOP("Fill Screen")},
+      {wand_sample_all_layers_check_, QT_TR_NOOP("Sample All Layers")},
+      {quick_select_sample_all_layers_check_, QT_TR_NOOP("Sample All Layers")},
+      {quick_select_enhance_edge_check_, QT_TR_NOOP("Enhance Edge")},
+      {object_select_sample_all_layers_check_, QT_TR_NOOP("Sample All Layers")},
+      {content_aware_move_object_selection_check_, QT_TR_NOOP("Object Selection")},
+      {select_subject_button_, QT_TR_NOOP("Select Subject")},
+      {remove_background_button_, QT_TR_NOOP("Remove Background")},
+  };
+  for (const auto& [widget, source] : translated_widgets) {
+    bind_widget_text(widget, source);
+  }
+}
+
+void MainWindow::sync_tool_option_controls_from_canvas() {
+  if (canvas_ == nullptr) {
+    return;
+  }
+  // Re-reads the options-bar controls that create_actions initialized from the
+  // defaults-donor canvas. Runs after the deferred startup load_tool_settings()
+  // so the bar shows the stored settings the first document's canvas now holds.
+  const auto set_spin_value = [this](const QString& name, int value) {
+    if (auto* spin = findChild<QSpinBox*>(name); spin != nullptr) {
+      const QSignalBlocker blocker(spin);
+      spin->setValue(value);
+    }
+  };
+  const auto set_slider_value = [this](const QString& name, int value) {
+    if (auto* slider = findChild<QSlider*>(name); slider != nullptr) {
+      const QSignalBlocker blocker(slider);
+      set_slider_to_value(*slider, value);
+    }
+  };
+  const auto set_checked = [](QCheckBox* check, bool value) {
+    if (check != nullptr) {
+      const QSignalBlocker blocker(check);
+      check->setChecked(value);
+    }
+  };
+  set_checked(move_auto_select_check_, canvas_->auto_select_layer());
+  set_checked(move_show_transform_controls_check_, canvas_->show_transform_controls());
+  set_checked(clone_aligned_check_, canvas_->clone_aligned());
+  if (healing_mode_combo_ != nullptr) {
+    const QSignalBlocker blocker(healing_mode_combo_);
+    healing_mode_combo_->setCurrentIndex(
+        std::max(0, healing_mode_combo_->findData(static_cast<int>(canvas_->healing_mode()))));
+  }
+  sync_retouch_sample_controls_from_canvas();
+  set_checked(mixer_sample_all_layers_check_, canvas_->mixer_sample_all_layers());
+  set_checked(patch_transparent_check_, canvas_->patch_tool_transparent());
+  if (patch_mode_combo_ != nullptr) {
+    const QSignalBlocker blocker(patch_mode_combo_);
+    patch_mode_combo_->setCurrentIndex(
+        std::max(0, patch_mode_combo_->findData(static_cast<int>(canvas_->patch_tool_mode()))));
+  }
+  if (content_aware_move_mode_combo_ != nullptr) {
+    const QSignalBlocker blocker(content_aware_move_mode_combo_);
+    content_aware_move_mode_combo_->setCurrentIndex(std::max(
+        0, content_aware_move_mode_combo_->findData(static_cast<int>(canvas_->content_aware_move_mode()))));
+  }
+  if (content_aware_move_destination_combo_ != nullptr) {
+    const QSignalBlocker blocker(content_aware_move_destination_combo_);
+    content_aware_move_destination_combo_->setCurrentIndex(
+        std::max(0, content_aware_move_destination_combo_->findData(
+                        static_cast<int>(canvas_->content_aware_move_destination()))));
+  }
+  if (content_aware_move_object_selection_check_ != nullptr) {
+    const QSignalBlocker blocker(content_aware_move_object_selection_check_);
+    content_aware_move_object_selection_check_->setChecked(canvas_->content_aware_move_object_selection());
+  }
+  if (crop_ratio_w_spin_ != nullptr && crop_ratio_h_spin_ != nullptr) {
+    const QSignalBlocker w_blocker(crop_ratio_w_spin_);
+    const QSignalBlocker h_blocker(crop_ratio_h_spin_);
+    crop_ratio_w_spin_->setValue(canvas_->crop_ratio_width());
+    crop_ratio_h_spin_->setValue(canvas_->crop_ratio_height());
+  }
+  set_checked(wand_contiguous_check_, canvas_->wand_contiguous());
+  set_checked(fill_contiguous_check_, canvas_->fill_contiguous());
+  set_checked(zoom_scrubby_check_, canvas_->zoom_scrubby());
+  if (zoom_in_mode_action_ != nullptr && zoom_out_mode_action_ != nullptr) {
+    zoom_in_mode_action_->setChecked(!canvas_->zoom_tool_zooms_out());
+    zoom_out_mode_action_->setChecked(canvas_->zoom_tool_zooms_out());
+  }
+  set_checked(wand_sample_all_layers_check_, canvas_->wand_sample_all_layers());
+  if (wand_sample_size_combo_ != nullptr) {
+    const QSignalBlocker blocker(wand_sample_size_combo_);
+    wand_sample_size_combo_->setCurrentIndex(
+        std::max(0, wand_sample_size_combo_->findData(canvas_->wand_sample_size())));
+  }
+  set_checked(quick_select_sample_all_layers_check_, canvas_->quick_select_sample_all_layers());
+  set_checked(quick_select_enhance_edge_check_, canvas_->quick_select_enhance_edge());
+  set_checked(object_select_sample_all_layers_check_, canvas_->object_select_sample_all_layers());
+  set_spin_value(QStringLiteral("wandToleranceSpin"), canvas_->wand_tolerance());
+  set_spin_value(QStringLiteral("fillToleranceSpin"), canvas_->fill_tolerance());
+  set_spin_value(QStringLiteral("quickSelectSizeSpin"), canvas_->quick_select_size());
+  set_slider_value(QStringLiteral("quickSelectSizeSlider"), canvas_->quick_select_size());
+  set_spin_value(QStringLiteral("magneticLassoWidthSpin"), canvas_->magnetic_lasso_width());
+  set_spin_value(QStringLiteral("magneticLassoContrastSpin"), canvas_->magnetic_lasso_edge_contrast());
+  set_spin_value(QStringLiteral("magneticLassoFrequencySpin"), canvas_->magnetic_lasso_frequency());
+  set_spin_value(QStringLiteral("shapeCornerRadiusSpin"), canvas_->shape_corner_radius());
+  set_spin_value(QStringLiteral("fillOpacitySpin"), canvas_->fill_opacity());
+  set_slider_value(QStringLiteral("fillOpacitySlider"), canvas_->fill_opacity());
+  set_spin_value(QStringLiteral("fillSoftnessSpin"), canvas_->fill_softness());
+  set_slider_value(QStringLiteral("fillSoftnessSlider"), canvas_->fill_softness());
+  refresh_gradient_controls_from_canvas();
+  sync_brush_controls_from_canvas();
+}
+
+void MainWindow::register_retranslation(std::function<void()> callback) {
+  if (!callback) {
+    return;
+  }
+  callback();
+  retranslation_callbacks_.push_back(std::move(callback));
+}
+
+void MainWindow::retranslate_bound_children() {
+  apply_bound_translation(this);
+  const auto children = findChildren<QObject*>();
+  for (auto* child : children) {
+    apply_bound_translation(child);
+  }
+}
+
+void MainWindow::retranslate_blend_combo() {
+  if (blend_combo_ == nullptr) {
+    return;
+  }
+  QSignalBlocker blocker(blend_combo_);
+  retranslate_blend_mode_items(blend_combo_);
+}
+
+void MainWindow::retranslate_brush_preset_combo() {
+  if (brush_preset_combo_ == nullptr) {
+    return;
+  }
+  QSignalBlocker blocker(brush_preset_combo_);
+  for (int index = 0; index < brush_preset_combo_->count(); ++index) {
+    if (const auto* preset = find_brush_preset(brush_preset_combo_->itemData(index).toString()); preset != nullptr) {
+      brush_preset_combo_->setItemText(index, brush_preset_display_name(*preset));
+    }
+  }
+}
+
+void MainWindow::retranslate_ui() {
+  // The Pattern Stamp list is rebuilt below with translated names, so a language change
+  // adopts the startup preload first (waiting for the worker when it is still running);
+  // otherwise a switch made before the preload lands leaves the list empty until then
+  // (docs/startup-performance.md, "Preloaded libraries").
+  (void)pattern_library();
+  retranslate_bound_children();
+  if (menuBar() != nullptr) {
+    for (auto* action : menuBar()->actions()) {
+      apply_bound_translation(action);
+    }
+  }
+  for (const auto& callback : retranslation_callbacks_) {
+    callback();
+  }
+  retranslate_blend_combo();
+  retranslate_brush_preset_combo();
+  retranslate_mixer_combination_combo();
+  if (text_style_combo_ != nullptr && text_style_combo_->count() > 0) {
+    const QSignalBlocker blocker(text_style_combo_);
+    text_style_combo_->setItemText(0, tr("Regular"));
+  }
+  if (text_size_spin_ != nullptr) {
+    text_size_spin_->refresh_suffix();
+  }
+  if (text_character_leading_spin_ != nullptr) {
+    text_character_leading_spin_->refresh_suffix();
+  }
+  rebuild_recent_files_menu();
+  refresh_vector_preview_action();
+  rebuild_recent_folders_menu();
+  rebuild_legacy_plugins_menu();  // translated status tips and the empty-menu note
+#ifndef Q_OS_WASM
+  if (gegl_filters_ != nullptr || gegl_filter_scan_in_flight_) {
+    // GEGL's own labels come from the scan in the language it ran in: list them again.
+    start_gegl_filter_scan();
+  }
+#endif
+  refresh_layer_list();
+  refresh_layer_controls();
+  refresh_channel_panel();
+  refresh_document_info();
+  if (canvas_ != nullptr) {
+    canvas_->refresh_info_display();
+  }
+  refresh_color_buttons();
+  refresh_text_color_button();
+  update_undo_redo_actions();
+  update_document_action_state();
+  const auto actions = findChildren<QAction*>();
+  for (auto* action : actions) {
+    refresh_action_tooltip(action);
+  }
+  if (statusBar() != nullptr) {
+    statusBar()->showMessage(tr("Ready"));
+  }
+#ifdef Q_OS_WASM
+  // The bundled CJK families share most Han codepoints, so the fallback ORDER decides
+  // whose glyph shapes a switched-to language gets. Re-apply it here (only when it
+  // actually changed: setFont relayouts every widget) so a switch between Japanese and
+  // Chinese does not need a page reload. Every other platform has system fonts and
+  // leaves the choice to Qt.
+  if (QFontDatabase::families().contains(QStringLiteral("Noto Sans"))) {
+    QStringList families{QStringLiteral("Noto Sans")};
+    families += wasm_cjk_fallback_families(LocalizationManager::instance().current_language());
+    if (QApplication::font().families() != families) {
+      auto font = QApplication::font();
+      font.setFamilies(families);
+      QApplication::setFont(font);
+    }
+  }
+#endif
+}
+
+}  // namespace patchy::ui

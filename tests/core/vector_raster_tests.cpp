@@ -1,0 +1,3306 @@
+#include "core/blend_math.hpp"
+#include <bit>
+#include <cctype>
+#include <chrono>
+#include <cstring>
+#include <filesystem>
+#include <exception>
+#include <fstream>
+#include <functional>
+#include <iomanip>
+#include <iostream>
+#include <iterator>
+#include <limits>
+#include <numeric>
+#include <optional>
+#include <span>
+#include <sstream>
+#include <stdexcept>
+#include <string>
+#include <string_view>
+#include <tuple>
+#include <unordered_set>
+#include <utility>
+#include "core/document.hpp"
+#include "core/document_depth.hpp"
+#include "core/gradient_fill_drag.hpp"
+#include "core/gradient_presets.hpp"
+#include "core/pixel_tools.hpp"
+#include "core/layer.hpp"
+#include "core/layer_render_utils.hpp"
+#include "core/pattern_resource.hpp"
+#include "core/vector_compound.hpp"
+#include "core/vector_live_shapes.hpp"
+#include "core/layer_metadata.hpp"
+#include "core/pixel_depth.hpp"
+#include "core/shape_combine.hpp"
+#include "core/vector_raster.hpp"
+#include "core/vector_shape.hpp"
+#include "render/compositor.hpp"
+#include "core_test_support.hpp"
+#include "test_harness.hpp"
+#include <algorithm>
+#include <array>
+#include <cmath>
+#include <cstdint>
+#include <cstdio>
+#include <vector>
+
+namespace {
+
+using patchy::CoverageBuffer;
+using patchy::LiveShapeKind;
+using patchy::LiveShapeParams;
+using patchy::PathAnchor;
+using patchy::PathCombineOp;
+using patchy::PathSubpath;
+using patchy::Rect;
+using patchy::VectorPath;
+using patchy::VectorRasterOptions;
+using patchy::test::fnv1a_hash_bytes;
+using patchy::test::solid_rgba;
+
+PathAnchor corner(double x, double y) {
+  PathAnchor anchor;
+  anchor.anchor_x = anchor.in_x = anchor.out_x = x;
+  anchor.anchor_y = anchor.in_y = anchor.out_y = y;
+  return anchor;
+}
+
+PathSubpath rect_subpath(double left, double top, double right, double bottom, PathCombineOp op,
+                         std::int32_t group) {
+  PathSubpath subpath;
+  subpath.closed = true;
+  subpath.op = op;
+  subpath.shape_group = group;
+  subpath.anchors = {corner(left, top), corner(right, top), corner(right, bottom), corner(left, bottom)};
+  return subpath;
+}
+
+CoverageBuffer rasterize(const VectorPath& path, Rect clip) {
+  VectorRasterOptions options;
+  options.clip = clip;
+  return patchy::rasterize_vector_path(path, options);
+}
+
+std::uint8_t coverage_pixel(const CoverageBuffer& buffer, std::int32_t x, std::int32_t y) {
+  if (buffer.bounds.empty() || !buffer.bounds.contains(x, y)) {
+    return 0;
+  }
+  return buffer.pixels.data()[static_cast<std::size_t>(y - buffer.bounds.y) * buffer.pixels.stride_bytes() +
+                              static_cast<std::size_t>(x - buffer.bounds.x)];
+}
+
+void raster_axis_aligned_rect_coverage_is_exact() {
+  VectorPath path;
+  path.subpaths = {rect_subpath(2.0, 3.0, 3.0, 4.0, PathCombineOp::Add, 0)};
+  const auto unit = rasterize(path, Rect{0, 0, 16, 16});
+  CHECK(unit.bounds.x == 2 && unit.bounds.y == 3);
+  CHECK(unit.bounds.width == 1 && unit.bounds.height == 1);
+  CHECK(coverage_pixel(unit, 2, 3) == 255);
+
+  // Half-pixel-wide rect: exactly half coverage.
+  VectorPath half;
+  half.subpaths = {rect_subpath(2.0, 3.0, 2.5, 4.0, PathCombineOp::Add, 0)};
+  const auto half_coverage = rasterize(half, Rect{0, 0, 16, 16});
+  CHECK(coverage_pixel(half_coverage, 2, 3) == 128);
+
+  // Quarter coverage via a quarter-pixel area (0.5 x 0.5).
+  VectorPath quarter;
+  quarter.subpaths = {rect_subpath(2.25, 3.25, 2.75, 3.75, PathCombineOp::Add, 0)};
+  const auto quarter_coverage = rasterize(quarter, Rect{0, 0, 16, 16});
+  CHECK(coverage_pixel(quarter_coverage, 2, 3) == 64);
+}
+
+// A path that is one pixel-aligned rectangle skips the scan conversion (an artboard's paper
+// and clip are page-sized rectangles): same bounds and bytes as the reference rasterizer for
+// every corner order, direction, first op and clip, and anything that is not such a
+// rectangle still goes the long way.
+void raster_pixel_aligned_rect_shortcut_matches_reference() {
+  const auto same = [](const VectorPath& path, Rect clip) {
+    VectorRasterOptions fast;
+    fast.clip = clip;
+    VectorRasterOptions reference = fast;
+    reference.reference_geometry = true;
+    const auto a = patchy::rasterize_vector_path(path, fast);
+    const auto b = patchy::rasterize_vector_path(path, reference);
+    if (!(a.bounds == b.bounds) || a.pixels.width() != b.pixels.width() || a.pixels.height() != b.pixels.height()) {
+      return false;
+    }
+    for (std::int32_t y = 0; y < a.pixels.height(); ++y) {
+      const auto row_a = a.pixels.row(y);
+      const auto row_b = b.pixels.row(y);
+      if (!std::equal(row_a.begin(), row_a.end(), row_b.begin())) {
+        return false;
+      }
+    }
+    return true;
+  };
+  const Rect clip{0, 0, 40, 30};
+  for (const auto op : {PathCombineOp::Add, PathCombineOp::Xor, PathCombineOp::Intersect, PathCombineOp::Subtract}) {
+    VectorPath path;
+    path.subpaths = {rect_subpath(5.0, 4.0, 21.0, 17.0, op, 0)};
+    CHECK(same(path, clip));
+    // Every starting corner, both directions.
+    for (int turn = 0; turn < 4; ++turn) {
+      std::rotate(path.subpaths.front().anchors.begin(), path.subpaths.front().anchors.begin() + 1,
+                  path.subpaths.front().anchors.end());
+      CHECK(same(path, clip));
+      auto reversed = path;
+      std::reverse(reversed.subpaths.front().anchors.begin(), reversed.subpaths.front().anchors.end());
+      CHECK(same(reversed, clip));
+    }
+  }
+  // Partly and wholly outside the clip, the clip itself, a negative origin, one pixel.
+  for (const auto& rect : {std::array<double, 4>{-6.0, -3.0, 12.0, 9.0}, std::array<double, 4>{30.0, 20.0, 55.0, 44.0},
+                           std::array<double, 4>{50.0, 40.0, 60.0, 50.0}, std::array<double, 4>{0.0, 0.0, 40.0, 30.0},
+                           std::array<double, 4>{-100.0, -100.0, 200.0, 200.0},
+                           std::array<double, 4>{7.0, 7.0, 8.0, 8.0}}) {
+    VectorPath path;
+    path.subpaths = {rect_subpath(rect[0], rect[1], rect[2], rect[3], PathCombineOp::Add, 0)};
+    CHECK(same(path, clip));
+    CHECK(same(path, Rect{-8, -8, 30, 30}));
+  }
+  // The shortcut's own answer: full coverage over the clipped rectangle.
+  VectorPath page;
+  page.subpaths = {rect_subpath(-2.0, 3.0, 12.0, 50.0, PathCombineOp::Add, 0)};
+  const auto covered = rasterize(page, clip);
+  CHECK((covered.bounds == Rect{0, 3, 12, 27}));
+  CHECK(coverage_pixel(covered, 0, 3) == 255 && coverage_pixel(covered, 11, 29) == 255);
+  // Not such rectangles: off the pixel grid, an open subpath, a curve, a diamond, two subpaths.
+  VectorPath off_grid;
+  off_grid.subpaths = {rect_subpath(5.0, 4.0, 21.5, 17.0, PathCombineOp::Add, 0)};
+  CHECK(same(off_grid, clip));
+  CHECK(coverage_pixel(rasterize(off_grid, clip), 21, 10) == 128);
+  VectorPath open = page;
+  open.subpaths.front().closed = false;
+  CHECK(same(open, clip));
+  VectorPath curved;
+  curved.subpaths = {rect_subpath(5.0, 4.0, 21.0, 17.0, PathCombineOp::Add, 0)};
+  curved.subpaths.front().anchors[1].out_y = 9.0;
+  CHECK(same(curved, clip));
+  VectorPath diamond;
+  PathSubpath rhombus;
+  rhombus.anchors = {corner(20.0, 2.0), corner(34.0, 14.0), corner(20.0, 26.0), corner(6.0, 14.0)};
+  diamond.subpaths = {rhombus};
+  CHECK(same(diamond, clip));
+  CHECK(coverage_pixel(rasterize(diamond, clip), 7, 3) == 0);
+  VectorPath two;
+  two.subpaths = {rect_subpath(2.0, 2.0, 12.0, 12.0, PathCombineOp::Add, 0),
+                  rect_subpath(8.0, 8.0, 20.0, 20.0, PathCombineOp::Subtract, 1)};
+  CHECK(same(two, clip));
+  CHECK(coverage_pixel(rasterize(two, clip), 10, 10) == 0 && coverage_pixel(rasterize(two, clip), 4, 4) == 255);
+}
+
+void vector_stroke_aligned_edges_match_photoshop() {
+  VectorPath path;
+  path.subpaths = {rect_subpath(4, 3, 28, 27, PathCombineOp::Add, 0)};
+  patchy::VectorStroke stroke;
+  stroke.enabled = true;
+  stroke.alignment = patchy::VectorStrokeAlignment::Center;
+  stroke.join = patchy::VectorStrokeJoin::Miter;
+  VectorRasterOptions options{Rect{0, 0, 32, 32}, true};
+  // Photoshop COM captures with useAlignedRendering=true, including odd and
+  // fractional widths. These are the OUTER bounds of the expanded border.
+  struct Probe { double width; int left; int right; };
+  for (const auto probe : {Probe{1, 4, 29}, Probe{1.5, 3, 29}, Probe{2, 3, 29},
+                           Probe{2.5, 3, 30}, Probe{3, 3, 30}}) {
+    stroke.width = probe.width;
+    const auto band = patchy::rasterize_vector_stroke(path, stroke, options);
+    CHECK(band.bounds.x == probe.left);
+    CHECK(band.bounds.x + band.bounds.width == probe.right);
+    CHECK(coverage_pixel(band, probe.left, 10) == 255);
+    CHECK(coverage_pixel(band, probe.right - 1, 10) == 255);
+    CHECK(coverage_pixel(band, probe.left, band.bounds.y) == 255);
+  }
+  stroke.width = 1;
+  options.align_stroke_edges = false;
+  const auto continuous = patchy::rasterize_vector_stroke(path, stroke, options);
+  CHECK(coverage_pixel(continuous, 3, 10) == 128);
+  CHECK(coverage_pixel(continuous, 28, 10) == 128);
+
+  patchy::VectorShapeContent content;
+  content.path = path;
+  content.stroke = stroke;
+  content.stroke.content.kind = patchy::VectorFillKind::Solid;
+  content.fill.kind = patchy::VectorFillKind::Solid;
+  patchy::Layer owner(1, "Aligned shape", patchy::LayerKind::Pixel);
+  owner.unknown_psd_blocks().push_back({"sn2P", {0, 0, 0, 1}});
+  const auto shape = patchy::rasterize_vector_shape(content, options.clip, nullptr, &owner);
+  CHECK(shape.bounds.x == 4 && shape.bounds.y == 3);
+  CHECK(shape.bounds.width == 25 && shape.bounds.height == 25);
+
+  options.align_stroke_edges = true;
+  stroke.alignment = patchy::VectorStrokeAlignment::Outside;
+  for (const auto probe : {Probe{1, 3, 29}, Probe{1.5, 3, 30}, Probe{2.5, 2, 31}}) {
+    stroke.width = probe.width;
+    const auto band = patchy::rasterize_vector_stroke(path, stroke, options);
+    CHECK(band.bounds.x == probe.left);
+    CHECK(band.bounds.x + band.bounds.width == probe.right);
+  }
+  stroke.alignment = patchy::VectorStrokeAlignment::Center;
+  stroke.width = 1;
+
+  // Negative coordinates use the same half-pixel tie direction. Clipping a
+  // tile must not change where the document-space border was snapped.
+  patchy::transform_vector_path(path, {1, 0, 0, 1, -8, -8});
+  options = VectorRasterOptions{Rect{-16, -16, 48, 48}, true};
+  const auto moved = patchy::rasterize_vector_stroke(path, stroke, options);
+  CHECK(moved.bounds.x == -4 && moved.bounds.y == -5);
+  options.clip = Rect{-4, -5, 8, 8};
+  const auto clipped = patchy::rasterize_vector_stroke(path, stroke, options);
+  for (int y = -5; y < 3; ++y) {
+    for (int x = -4; x < 4; ++x) {
+      CHECK(coverage_pixel(clipped, x, y) == coverage_pixel(moved, x, y));
+    }
+  }
+}
+
+void raster_half_plane_diagonal_ramp() {
+  // Right triangle (0,0)-(8,0)-(0,8): the hypotenuse x+y=8 halves every
+  // diagonal pixel; pixels well inside are full, outside empty.
+  VectorPath path;
+  PathSubpath triangle;
+  triangle.closed = true;
+  triangle.op = PathCombineOp::Add;
+  triangle.anchors = {corner(0.0, 0.0), corner(8.0, 0.0), corner(0.0, 8.0)};
+  path.subpaths = {triangle};
+  const auto coverage = rasterize(path, Rect{0, 0, 16, 16});
+  CHECK(coverage_pixel(coverage, 0, 0) == 255);
+  CHECK(coverage_pixel(coverage, 3, 3) == 255);
+  for (std::int32_t i = 0; i < 8; ++i) {
+    const auto diagonal = coverage_pixel(coverage, i, 7 - i);
+    CHECK(diagonal >= 126 && diagonal <= 129);
+  }
+  CHECK(coverage_pixel(coverage, 7, 7) == 0);
+  CHECK(coverage_pixel(coverage, 8, 1) == 0);
+}
+
+void raster_area_sum_matches_analytic() {
+  // 10.25 x 7.5 rect at fractional offsets: total coverage equals the area.
+  VectorPath path;
+  path.subpaths = {rect_subpath(1.375, 2.25, 11.625, 9.75, PathCombineOp::Add, 0)};
+  const auto coverage = rasterize(path, Rect{0, 0, 20, 20});
+  double total = 0.0;
+  for (std::int32_t y = coverage.bounds.y; y < coverage.bounds.y + coverage.bounds.height; ++y) {
+    for (std::int32_t x = coverage.bounds.x; x < coverage.bounds.x + coverage.bounds.width; ++x) {
+      total += coverage_pixel(coverage, x, y);
+    }
+  }
+  const double analytic = 10.25 * 7.5 * 255.0;
+  CHECK(std::fabs(total - analytic) <= 40.0);  // sub-half-unit rounding per boundary pixel
+}
+
+void raster_combine_ops_match_photoshop_semantics() {
+  const Rect clip{0, 0, 64, 64};
+  // Two overlapping rects: A = (8,8)-(40,40), B = (24,24)-(56,56).
+  const auto build = [&](PathCombineOp second_op) {
+    VectorPath path;
+    path.subpaths = {rect_subpath(8, 8, 40, 40, PathCombineOp::Add, 0),
+                     rect_subpath(24, 24, 56, 56, second_op, 1)};
+    return rasterize(path, clip);
+  };
+
+  const auto added = build(PathCombineOp::Add);
+  CHECK(coverage_pixel(added, 16, 16) == 255);
+  CHECK(coverage_pixel(added, 32, 32) == 255);
+  CHECK(coverage_pixel(added, 48, 48) == 255);
+
+  const auto subtracted = build(PathCombineOp::Subtract);
+  CHECK(coverage_pixel(subtracted, 16, 16) == 255);
+  CHECK(coverage_pixel(subtracted, 32, 32) == 0);
+  CHECK(coverage_pixel(subtracted, 48, 48) == 0);
+
+  const auto intersected = build(PathCombineOp::Intersect);
+  CHECK(coverage_pixel(intersected, 16, 16) == 0);
+  CHECK(coverage_pixel(intersected, 32, 32) == 255);
+  CHECK(coverage_pixel(intersected, 48, 48) == 0);
+
+  const auto xored = build(PathCombineOp::Xor);
+  CHECK(coverage_pixel(xored, 16, 16) == 255);
+  CHECK(coverage_pixel(xored, 32, 32) == 0);
+  CHECK(coverage_pixel(xored, 48, 48) == 255);
+}
+
+void raster_first_op_initial_accumulator_semantics() {
+  const Rect clip{0, 0, 64, 64};
+  // Subtract-first: full canvas minus the rect (photoshop-shape-first-ops).
+  VectorPath subtract_first;
+  subtract_first.subpaths = {rect_subpath(4, 4, 20, 20, PathCombineOp::Subtract, 0)};
+  const auto subtracted = rasterize(subtract_first, clip);
+  CHECK(subtracted.bounds.width == 64 && subtracted.bounds.height == 64);
+  CHECK(coverage_pixel(subtracted, 12, 12) == 0);
+  CHECK(coverage_pixel(subtracted, 58, 6) == 255);
+  CHECK(coverage_pixel(subtracted, 2, 2) == 255);
+
+  // Intersect-first and xor-first: exactly the shape.
+  for (const auto op : {PathCombineOp::Intersect, PathCombineOp::Xor}) {
+    VectorPath path;
+    path.subpaths = {rect_subpath(24, 24, 40, 40, op, 0)};
+    const auto coverage = rasterize(path, clip);
+    CHECK(coverage_pixel(coverage, 32, 32) == 255);
+    CHECK(coverage_pixel(coverage, 6, 32) == 0);
+    CHECK(coverage.bounds.width <= 18);
+  }
+}
+
+void raster_even_odd_within_group_ops_between_groups() {
+  const Rect clip{0, 0, 64, 64};
+  // Same group: two overlapping Add rects cancel in the overlap (even-odd).
+  VectorPath same_group;
+  same_group.subpaths = {rect_subpath(8, 8, 40, 40, PathCombineOp::Add, 0),
+                         rect_subpath(24, 24, 56, 56, PathCombineOp::Add, 0)};
+  const auto folded = rasterize(same_group, clip);
+  CHECK(coverage_pixel(folded, 16, 16) == 255);
+  CHECK(coverage_pixel(folded, 32, 32) == 0);  // overlap folds out
+  CHECK(coverage_pixel(folded, 48, 48) == 255);
+
+  // Self-intersecting bowtie in one subpath: the wing regions fill, the
+  // crossing region follows even-odd.
+  VectorPath bowtie;
+  PathSubpath cross;
+  cross.closed = true;
+  cross.op = PathCombineOp::Add;
+  cross.anchors = {corner(8, 8), corner(56, 56), corner(56, 8), corner(8, 56)};
+  bowtie.subpaths = {cross};
+  const auto crossing = rasterize(bowtie, clip);
+  CHECK(coverage_pixel(crossing, 20, 32) == 255);
+  CHECK(coverage_pixel(crossing, 44, 32) == 255);
+  CHECK(coverage_pixel(crossing, 32, 20) == 0);
+  CHECK(coverage_pixel(crossing, 32, 44) == 0);
+}
+
+void raster_curves_donut_and_open_chord() {
+  const Rect clip{0, 0, 64, 64};
+  // Kappa-circle donut: outer r=24, inner r=10 subtracted.
+  LiveShapeParams outer;
+  outer.kind = LiveShapeKind::Ellipse;
+  outer.left = 8;
+  outer.top = 8;
+  outer.right = 56;
+  outer.bottom = 56;
+  LiveShapeParams inner = outer;
+  inner.left = 22;
+  inner.top = 22;
+  inner.right = 42;
+  inner.bottom = 42;
+  inner.index = 1;
+  VectorPath path;
+  path.subpaths = patchy::generate_live_shape_subpaths(outer);
+  auto hole = patchy::generate_live_shape_subpaths(inner);
+  hole[0].op = PathCombineOp::Subtract;
+  path.subpaths.push_back(hole[0]);
+  const auto donut = rasterize(path, clip);
+  CHECK(coverage_pixel(donut, 32, 32) == 0);
+  CHECK(coverage_pixel(donut, 32, 12) == 255);
+  CHECK(coverage_pixel(donut, 32, 45) == 255);
+  CHECK(coverage_pixel(donut, 2, 2) == 0);
+  // A pixel straddling the circle boundary near 45 degrees: partial coverage.
+  const auto edge = coverage_pixel(donut, 49, 15);
+  CHECK(edge > 0 && edge < 255);
+
+  // Open subpath: fills the implied closing chord.
+  VectorPath open;
+  PathSubpath arc;
+  arc.closed = false;
+  arc.op = PathCombineOp::Add;
+  arc.anchors = {corner(10, 50), corner(30, 10), corner(50, 50)};
+  open.subpaths = {arc};
+  const auto filled = rasterize(open, clip);
+  CHECK(coverage_pixel(filled, 30, 40) == 255);
+  CHECK(coverage_pixel(filled, 30, 55) == 0);
+}
+
+void raster_empty_path_fills_clip() {
+  VectorPath path;
+  const auto coverage = rasterize(path, Rect{0, 0, 32, 24});
+  CHECK(coverage.bounds.width == 32 && coverage.bounds.height == 24);
+  CHECK(coverage_pixel(coverage, 0, 0) == 255);
+  CHECK(coverage_pixel(coverage, 31, 23) == 255);
+}
+
+void raster_mask_inverted_coverage() {
+  patchy::LayerVectorMask mask;
+  mask.path.subpaths = {rect_subpath(4, 4, 12, 12, PathCombineOp::Add, 0)};
+  const auto normal = patchy::rasterize_vector_mask_coverage(mask, Rect{0, 0, 32, 32});
+  CHECK(coverage_pixel(normal, 8, 8) == 255);
+  CHECK(coverage_pixel(normal, 20, 20) == 0);
+
+  mask.inverted = true;
+  const auto inverted = patchy::rasterize_vector_mask_coverage(mask, Rect{0, 0, 32, 32});
+  CHECK(inverted.bounds.width == 32 && inverted.bounds.height == 32);
+  CHECK(coverage_pixel(inverted, 8, 8) == 0);
+  CHECK(coverage_pixel(inverted, 20, 20) == 255);
+}
+
+void raster_golden_digests_are_stable() {
+  // Cross-toolchain byte-stability canary for the coverage engine (all-integer
+  // core; safe to pin). The failure output prints the new hashes - re-pin only
+  // for deliberate rasterizer changes.
+  struct Golden {
+    const char* name;
+    VectorPath path;
+    std::uint64_t expected;
+  };
+  std::vector<Golden> goldens;
+
+  {
+    LiveShapeParams circle;
+    circle.kind = LiveShapeKind::Ellipse;
+    circle.left = 5.3;
+    circle.top = 7.9;
+    circle.right = 51.6;
+    circle.bottom = 44.2;
+    VectorPath path;
+    path.subpaths = patchy::generate_live_shape_subpaths(circle);
+    goldens.push_back({"ellipse", path, 0x0ULL});
+  }
+  {
+    VectorPath thin;
+    PathSubpath triangle;
+    triangle.closed = true;
+    triangle.op = PathCombineOp::Add;
+    triangle.anchors = {corner(3.21, 60.87), corner(33.4, 2.05), corner(35.9, 61.5)};
+    thin.subpaths = {triangle};
+    goldens.push_back({"triangle", thin, 0x0ULL});
+  }
+  {
+    VectorPath curves;
+    PathSubpath blob;
+    blob.closed = true;
+    blob.op = PathCombineOp::Add;
+    PathAnchor a = corner(6.0, 10.0);
+    a.smooth = true;
+    a.out_x = 22.0;
+    a.out_y = 14.0;
+    PathAnchor b = corner(34.0, 6.0);
+    b.smooth = true;
+    b.in_x = 46.0;
+    b.in_y = -2.0;
+    b.out_x = 30.0;
+    b.out_y = 30.0;
+    PathAnchor c = corner(58.0, 28.0);
+    c.smooth = true;
+    c.in_x = 44.0;
+    c.in_y = 44.0;
+    blob.anchors = {a, b, c};
+    curves.subpaths = {blob};
+    goldens.push_back({"curved-blob", curves, 0x0ULL});
+  }
+  {
+    VectorPath ops;
+    ops.subpaths = {rect_subpath(6.5, 6.25, 40.75, 40.5, PathCombineOp::Add, 0),
+                    rect_subpath(14.2, 14.4, 26.8, 26.6, PathCombineOp::Subtract, 1),
+                    rect_subpath(6.0, 6.0, 58.3, 30.1, PathCombineOp::Intersect, 2),
+                    rect_subpath(30.6, 18.9, 58.2, 50.7, PathCombineOp::Xor, 3)};
+    goldens.push_back({"boolean-chain", ops, 0x0ULL});
+  }
+
+  const std::array<std::uint64_t, 4> expected = {
+      0x4763d7d076abe813ULL,
+      0x458591696e73d268ULL,
+      0x77f42c3a9a574a5cULL,
+      0xbcdf266e1745427eULL,
+  };
+  bool all_match = true;
+  for (std::size_t i = 0; i < goldens.size(); ++i) {
+    const auto coverage = rasterize(goldens[i].path, Rect{0, 0, 64, 64});
+    CHECK(!coverage.bounds.empty());
+    const auto hash = fnv1a_hash_bytes(coverage.pixels.data());
+    if (hash != expected[i]) {
+      std::fprintf(stderr, "golden[%zu] %s: 0x%016llxULL (bounds %d,%d %dx%d)\n", i, goldens[i].name,
+                   static_cast<unsigned long long>(hash), coverage.bounds.x, coverage.bounds.y,
+                   coverage.bounds.width, coverage.bounds.height);
+      all_match = false;
+    }
+  }
+  CHECK(all_match);
+}
+
+void raster_shape_paints_solid_gradient_pattern() {
+  const Rect canvas{0, 0, 32, 32};
+  patchy::VectorShapeContent content;
+  content.path.subpaths = {rect_subpath(4, 4, 20, 20, PathCombineOp::Add, 0)};
+  content.fill.kind = patchy::VectorFillKind::Solid;
+  content.fill.color = patchy::RgbColor{214, 40, 40};
+
+  const auto solid = patchy::rasterize_vector_shape(content, canvas, nullptr, nullptr);
+  CHECK(solid.bounds.x == 4 && solid.bounds.y == 4);
+  const auto* pixel = solid.pixels.pixel(8 - solid.bounds.x, 8 - solid.bounds.y);
+  CHECK(pixel[0] == 214 && pixel[1] == 40 && pixel[2] == 40 && pixel[3] == 255);
+
+  // Fill disabled via the stroke's fillEnabled: nothing renders.
+  content.stroke.fill_enabled = false;
+  CHECK(patchy::rasterize_vector_shape(content, canvas, nullptr, nullptr).bounds.empty());
+  content.stroke.fill_enabled = true;
+
+  // Gradient fill: wiring matches the shared blend_math shading directly.
+  content.fill.kind = patchy::VectorFillKind::Gradient;
+  auto& gradient = content.fill.gradient;
+  gradient.color_stops = {{0.0F, patchy::RgbColor{255, 0, 0}, 0.5F},
+                          {1.0F, patchy::RgbColor{0, 0, 255}, 0.5F}};
+  gradient.alpha_stops = {{0.0F, 1.0F, 0.5F}, {1.0F, 1.0F, 0.5F}};
+  gradient.angle_degrees = 0.0F;
+  gradient.align_with_layer = true;
+  const auto shaded = patchy::rasterize_vector_shape(content, canvas, nullptr, nullptr);
+  CHECK(!shaded.bounds.empty());
+  // The fill painter renders the GdFl-calibrated geometry: center-chord span
+  // and the smoothness ease applied even to two-stop ramps.
+  const auto position = patchy::gradient_position(gradient, shaded.bounds, 10, 10,
+                                                  patchy::GradientSpanBasis::CenterChord);
+  const auto expected_color = patchy::gradient_color_dithered(gradient, position, 10, 10, true);
+  const auto* shaded_pixel = shaded.pixels.pixel(10 - shaded.bounds.x, 10 - shaded.bounds.y);
+  CHECK(shaded_pixel[0] == expected_color.red);
+  CHECK(shaded_pixel[1] == expected_color.green);
+  CHECK(shaded_pixel[2] == expected_color.blue);
+  CHECK(shaded_pixel[3] == 255);
+
+  // Pattern fill: 2x2 checker tile, unlinked (origin anchor).
+  content.fill = patchy::VectorFill{};
+  content.fill.kind = patchy::VectorFillKind::Pattern;
+  content.fill.pattern_id = "test-checker";
+  content.fill.pattern_linked = false;
+  patchy::PatternStore store;
+  patchy::PatternResource resource;
+  resource.id = "test-checker";
+  resource.name = "checker";
+  resource.tile = patchy::PixelBuffer(2, 2, patchy::PixelFormat::rgba8());
+  auto tile = resource.tile.data();
+  const auto set_texel = [&](int x, int y, std::uint8_t r, std::uint8_t g, std::uint8_t b) {
+    auto* t = resource.tile.pixel(x, y);
+    t[0] = r;
+    t[1] = g;
+    t[2] = b;
+    t[3] = 255;
+  };
+  (void)tile;
+  set_texel(0, 0, 10, 20, 30);
+  set_texel(1, 0, 200, 210, 220);
+  set_texel(0, 1, 200, 210, 220);
+  set_texel(1, 1, 10, 20, 30);
+  store.patterns.push_back(resource);
+  const auto patterned = patchy::rasterize_vector_shape(content, canvas, &store, nullptr);
+  CHECK(!patterned.bounds.empty());
+  const auto* texel_a = patterned.pixels.pixel(4 - patterned.bounds.x, 4 - patterned.bounds.y);
+  const auto* texel_b = patterned.pixels.pixel(5 - patterned.bounds.x, 4 - patterned.bounds.y);
+  CHECK(texel_a[0] == 10 && texel_a[1] == 20 && texel_a[2] == 30 && texel_a[3] == 255);
+  CHECK(texel_b[0] == 200 && texel_b[3] == 255);
+
+  // Unknown pattern id renders transparent but keeps coverage bounds.
+  content.fill.pattern_id = "missing";
+  const auto missing = patchy::rasterize_vector_shape(content, canvas, &store, nullptr);
+  CHECK(!missing.bounds.empty());
+  const auto* transparent = missing.pixels.pixel(8 - missing.bounds.x, 8 - missing.bounds.y);
+  CHECK(transparent[3] == 0);
+
+  // Fill kind None renders nothing (stroke-only shapes wait for the stroker).
+  content.fill.kind = patchy::VectorFillKind::None;
+  CHECK(patchy::rasterize_vector_shape(content, canvas, &store, nullptr).bounds.empty());
+}
+
+patchy::CoverageBuffer stroke_coverage(const VectorPath& path, const patchy::VectorStroke& stroke,
+                                       Rect clip) {
+  VectorRasterOptions options;
+  options.clip = clip;
+  return patchy::rasterize_vector_stroke(path, stroke, options);
+}
+
+PathSubpath open_line(double x0, double y0, double x1, double y1) {
+  PathSubpath subpath;
+  subpath.closed = false;
+  subpath.op = PathCombineOp::Add;
+  subpath.anchors = {corner(x0, y0), corner(x1, y1)};
+  return subpath;
+}
+
+PathSubpath circle_subpath(double cx, double cy, double r) {
+  constexpr double k = 0.5522847498307936;  // 4-cubic unit-circle handle length
+  const double h = k * r;
+  PathSubpath subpath;
+  subpath.closed = true;
+  subpath.op = PathCombineOp::Add;
+  subpath.anchors = {
+      PathAnchor{cx + r, cy, cx + r, cy - h, cx + r, cy + h, true},
+      PathAnchor{cx, cy + r, cx + h, cy + r, cx - h, cy + r, true},
+      PathAnchor{cx - r, cy, cx - r, cy + h, cx - r, cy - h, true},
+      PathAnchor{cx, cy - r, cx - h, cy - r, cx + h, cy - r, true},
+  };
+  return subpath;
+}
+
+void stroke_center_band_and_miter_corner() {
+  VectorPath path;
+  path.subpaths = {rect_subpath(8, 8, 24, 24, PathCombineOp::Add, 0)};
+  patchy::VectorStroke stroke;
+  stroke.enabled = true;
+  stroke.width = 4.0;
+  const auto band = stroke_coverage(path, stroke, Rect{0, 0, 40, 40});
+  CHECK(coverage_pixel(band, 6, 16) == 255);   // outer half of the band
+  CHECK(coverage_pixel(band, 9, 16) == 255);   // inner half
+  CHECK(coverage_pixel(band, 5, 16) == 0);     // outside the band
+  CHECK(coverage_pixel(band, 10, 16) == 0);    // interior past the band
+  CHECK(coverage_pixel(band, 16, 16) == 0);    // shape interior
+  CHECK(coverage_pixel(band, 6, 6) == 255);    // miter fills the outer corner
+}
+
+void stroke_combined_shapes_follow_boolean_boundary() {
+  patchy::VectorStroke stroke;
+  stroke.enabled = true;
+  stroke.width = 2.0;
+  stroke.alignment = patchy::VectorStrokeAlignment::Center;
+  const Rect clip{0, 0, 48, 40};
+  for (const auto op : {PathCombineOp::Add, PathCombineOp::Subtract,
+                        PathCombineOp::Intersect, PathCombineOp::Xor}) {
+    VectorPath path;
+    path.subpaths = {rect_subpath(8, 8, 28, 32, PathCombineOp::Add, 0),
+                     rect_subpath(20, 8, 40, 32, op, 1)};
+    const auto band = stroke_coverage(path, stroke, clip);
+    CHECK(coverage_pixel(band, 20, 20) == (op == PathCombineOp::Add ? 0 : 255));
+    CHECK(coverage_pixel(band, 28, 20) ==
+          (op == PathCombineOp::Intersect || op == PathCombineOp::Xor ? 255 : 0));
+    CHECK(coverage_pixel(band, 8, 20) == (op == PathCombineOp::Intersect ? 0 : 255));
+    CHECK(coverage_pixel(band, 40, 20) ==
+          (op == PathCombineOp::Add || op == PathCombineOp::Xor ? 255 : 0));
+  }
+  // Coincident operands must deduplicate their boundaries or cancel entirely.
+  VectorPath duplicate;
+  duplicate.subpaths = {rect_subpath(8, 8, 28, 32, PathCombineOp::Add, 0),
+                       rect_subpath(8, 8, 28, 32, PathCombineOp::Add, 1)};
+  CHECK(coverage_pixel(stroke_coverage(duplicate, stroke, clip), 8, 20) == 255);
+  duplicate.subpaths.back().op = PathCombineOp::Xor;
+  CHECK(stroke_coverage(duplicate, stroke, clip).bounds.empty());
+  // Curved operands retain their exterior, without an interior circle seam.
+  VectorPath circles;
+  circles.subpaths = {circle_subpath(18, 20, 12), circle_subpath(28, 20, 12)};
+  circles.subpaths.back().shape_group = 1;
+  const auto band = stroke_coverage(circles, stroke, clip);
+  CHECK(coverage_pixel(band, 29, 20) == 0);
+  CHECK(coverage_pixel(band, 16, 20) == 0);
+  CHECK(coverage_pixel(band, 6, 20) > 200);
+}
+
+void stroke_first_intersection_keeps_fill_without_outline() {
+  VectorPath path;
+  path.subpaths = {circle_subpath(24, 24, 16)};
+  path.subpaths.front().op = PathCombineOp::Intersect;
+  const Rect clip{0, 0, 48, 48};
+  CHECK(coverage_pixel(rasterize(path, clip), 24, 24) == 255);
+  patchy::VectorStroke stroke;
+  stroke.enabled = true;
+  stroke.width = 1.0;
+  stroke.alignment = patchy::VectorStrokeAlignment::Inside;
+  CHECK(stroke_coverage(path, stroke, clip).bounds.empty());
+  // The same geometry with Add still has its one-pixel outline.
+  path.subpaths.front().op = PathCombineOp::Add;
+  CHECK(!stroke_coverage(path, stroke, clip).bounds.empty());
+}
+
+void stroke_alignment_inside_outside() {
+  VectorPath path;
+  path.subpaths = {rect_subpath(8, 8, 24, 24, PathCombineOp::Add, 0)};
+  patchy::VectorStroke stroke;
+  stroke.enabled = true;
+  stroke.width = 4.0;
+  stroke.alignment = patchy::VectorStrokeAlignment::Inside;
+  const auto inside = stroke_coverage(path, stroke, Rect{0, 0, 40, 40});
+  CHECK(coverage_pixel(inside, 9, 16) == 255);
+  CHECK(coverage_pixel(inside, 11, 16) == 255);
+  CHECK(coverage_pixel(inside, 7, 16) == 0);
+  CHECK(coverage_pixel(inside, 12, 16) == 0);
+
+  stroke.alignment = patchy::VectorStrokeAlignment::Outside;
+  const auto outside = stroke_coverage(path, stroke, Rect{0, 0, 40, 40});
+  CHECK(coverage_pixel(outside, 4, 16) == 255);
+  CHECK(coverage_pixel(outside, 7, 16) == 255);
+  CHECK(coverage_pixel(outside, 3, 16) == 0);
+  CHECK(coverage_pixel(outside, 8, 16) == 0);
+}
+
+void stroke_arc_band_has_no_winding_notches() {
+  // Regression (July 2026, vectors_overlay_stroke.psd): join wedges were
+  // emitted with the opposite winding to the segment quads, so a wedge
+  // sweeping across the short quads of a densely flattened arc CANCELLED
+  // them under the nonzero rule - a wide inside stroke on a large-radius
+  // rounded corner showed a hatched notch near the arc-to-straight junction.
+  // The mid-band ring of the corner must be fully covered.
+  LiveShapeParams params;
+  params.kind = LiveShapeKind::RoundedRectangle;
+  params.left = 145.0;
+  params.top = 533.0;
+  params.right = 1088.0;
+  params.bottom = 1247.0;
+  params.corner_radii = {50.0, 100.0, 12.0, 12.0};  // TL, TR, BR, BL
+  VectorPath path;
+  path.subpaths = patchy::generate_live_shape_subpaths(params);
+  patchy::VectorStroke stroke;
+  stroke.enabled = true;
+  stroke.width = 29.9;
+  stroke.alignment = patchy::VectorStrokeAlignment::Inside;
+  const auto band = stroke_coverage(path, stroke, Rect{0, 0, 1200, 1799});
+  CHECK(!band.bounds.empty());
+  // Top-right corner arc: center (988, 633), radius 100; the inside band's
+  // midline sits at radius 100 - width/2. The notch lived around 65..90
+  // degrees and just below the junction on the straight right edge.
+  const double mid_radius = 100.0 - 29.9 / 2.0;
+  for (int degrees = 0; degrees <= 90; degrees += 2) {
+    const double radians = degrees * 3.14159265358979323846 / 180.0;
+    const auto x = static_cast<std::int32_t>(std::lround(988.0 + mid_radius * std::sin(radians)));
+    const auto y = static_cast<std::int32_t>(std::lround(633.0 - mid_radius * std::cos(radians)));
+    CHECK(coverage_pixel(band, x, y) == 255);
+  }
+  const auto edge_mid = static_cast<std::int32_t>(std::lround(1088.0 - 29.9 / 2.0));
+  for (std::int32_t y = 633; y <= 720; y += 4) {
+    CHECK(coverage_pixel(band, edge_mid, y) == 255);
+  }
+}
+
+void stroke_caps_butt_square_round() {
+  VectorPath path;
+  path.subpaths = {open_line(10, 10, 20, 10)};
+  patchy::VectorStroke stroke;
+  stroke.enabled = true;
+  stroke.width = 4.0;
+
+  stroke.cap = patchy::VectorStrokeCap::Butt;
+  const auto butt = stroke_coverage(path, stroke, Rect{0, 0, 32, 32});
+  CHECK(coverage_pixel(butt, 10, 10) == 255);
+  CHECK(coverage_pixel(butt, 9, 10) == 0);
+
+  stroke.cap = patchy::VectorStrokeCap::Square;
+  const auto square = stroke_coverage(path, stroke, Rect{0, 0, 32, 32});
+  CHECK(coverage_pixel(square, 8, 10) == 255);
+  CHECK(coverage_pixel(square, 8, 8) == 255);  // square corner
+  CHECK(coverage_pixel(square, 7, 10) == 0);
+
+  stroke.cap = patchy::VectorStrokeCap::Round;
+  const auto round_cap = stroke_coverage(path, stroke, Rect{0, 0, 32, 32});
+  CHECK(coverage_pixel(round_cap, 8, 10) > 200);
+  // The r=2 arc clips the corner pixel partially (square fills it fully).
+  const auto round_corner = coverage_pixel(round_cap, 8, 8);
+  CHECK(round_corner > 0 && round_corner < 200);
+  CHECK(coverage_pixel(round_cap, 7, 10) == 0);
+  CHECK(coverage_pixel(round_cap, 7, 7) == 0);
+}
+
+void stroke_joins_miter_bevel_round() {
+  VectorPath path;
+  PathSubpath bend;
+  bend.closed = false;
+  bend.op = PathCombineOp::Add;
+  bend.anchors = {corner(10, 30), corner(10, 10), corner(30, 10)};
+  path.subpaths = {bend};
+  patchy::VectorStroke stroke;
+  stroke.enabled = true;
+  stroke.width = 6.0;
+
+  stroke.join = patchy::VectorStrokeJoin::Miter;
+  const auto miter = stroke_coverage(path, stroke, Rect{0, 0, 40, 40});
+  CHECK(coverage_pixel(miter, 7, 7) == 255);  // outer corner filled
+
+  stroke.join = patchy::VectorStrokeJoin::Bevel;
+  const auto bevel = stroke_coverage(path, stroke, Rect{0, 0, 40, 40});
+  CHECK(coverage_pixel(bevel, 7, 7) < 40);  // corner cut by the bevel edge
+  CHECK(coverage_pixel(bevel, 7, 12) == 255);
+
+  stroke.join = patchy::VectorStrokeJoin::Round;
+  const auto round_join = stroke_coverage(path, stroke, Rect{0, 0, 40, 40});
+  const auto round_corner = coverage_pixel(round_join, 7, 7);
+  CHECK(round_corner > 0 && round_corner < 200);  // r=3 arc clips the corner
+  CHECK(coverage_pixel(round_join, 6, 6) == 0);
+  CHECK(coverage_pixel(round_join, 8, 8) > 200);
+
+  // Miter limit 1.0 forces the bevel fallback at a right angle (ratio ~1.41).
+  stroke.join = patchy::VectorStrokeJoin::Miter;
+  stroke.miter_limit = 1.0;
+  const auto limited = stroke_coverage(path, stroke, Rect{0, 0, 40, 40});
+  CHECK(coverage_pixel(limited, 7, 7) < 40);
+}
+
+void stroke_dashes_and_offset() {
+  VectorPath path;
+  path.subpaths = {open_line(10, 10, 26, 10)};
+  patchy::VectorStroke stroke;
+  stroke.enabled = true;
+  stroke.width = 2.0;
+  stroke.dashes = {2.0, 1.0};  // 4 px on, 2 px off
+  const auto dashed = stroke_coverage(path, stroke, Rect{0, 0, 40, 40});
+  CHECK(coverage_pixel(dashed, 12, 10) == 255);
+  CHECK(coverage_pixel(dashed, 15, 10) == 0);
+  CHECK(coverage_pixel(dashed, 17, 10) == 255);
+
+  stroke.dash_offset = 1.0;  // 2 px into the pattern
+  const auto shifted = stroke_coverage(path, stroke, Rect{0, 0, 40, 40});
+  CHECK(coverage_pixel(shifted, 11, 10) == 255);
+  CHECK(coverage_pixel(shifted, 13, 10) == 0);
+  CHECK(coverage_pixel(shifted, 16, 10) == 255);
+}
+
+void stroke_aligned_dashes_keep_cap_size_and_gaps() {
+  // Photoshop 27.10: a 12 px {0,2} square dot remains 12 px wide with
+  // inside/outside alignment. The old doubled cap filled its 12 px gap.
+  VectorPath path;
+  path.subpaths = {rect_subpath(32, 32, 224, 224, PathCombineOp::Add, 0)};
+  for (const auto alignment : {patchy::VectorStrokeAlignment::Center,
+                               patchy::VectorStrokeAlignment::Inside,
+                               patchy::VectorStrokeAlignment::Outside}) {
+    patchy::VectorStroke stroke;
+    stroke.width = 12;
+    stroke.alignment = alignment;
+    const int y = alignment == patchy::VectorStrokeAlignment::Inside ? 38
+                  : alignment == patchy::VectorStrokeAlignment::Outside ? 26 : 32;
+    for (const auto cap : {patchy::VectorStrokeCap::Square, patchy::VectorStrokeCap::Round}) {
+      stroke.cap = cap;
+      stroke.dashes = {0, 2};
+      const auto dotted = stroke_coverage(path, stroke, Rect{0, 0, 256, 256});
+      CHECK(coverage_pixel(dotted, 80, y) == 255);
+      CHECK(coverage_pixel(dotted, 84, y) == 255);
+      CHECK(coverage_pixel(dotted, 86, y) == 0);
+      CHECK(coverage_pixel(dotted, 92, y) == 0);
+      CHECK(coverage_pixel(dotted, 104, y) == 255);
+      // Round caps are whole circles on the chosen side, not clipped circles
+      // of twice the radius. Square dots still cover the same corner pixel.
+      CHECK(coverage_pixel(dotted, 85, y + 5) ==
+            (cap == patchy::VectorStrokeCap::Square ? 255 : 0));
+      stroke.dashes = {2, 2};
+      const auto dashed = stroke_coverage(path, stroke, Rect{0, 0, 256, 256});
+      CHECK(coverage_pixel(dashed, 59, y) == 255);
+      CHECK(coverage_pixel(dashed, 65, y) == 0);
+      CHECK(coverage_pixel(dashed, 68, y) == 0);
+      CHECK(coverage_pixel(dashed, 83, y) == 255);
+    }
+  }
+}
+
+void stroke_aligned_dots_follow_compound_fill_side() {
+  VectorPath path;
+  path.subpaths = {rect_subpath(32, 32, 224, 224, PathCombineOp::Add, 0),
+                   rect_subpath(80, 80, 176, 176, PathCombineOp::Add, 0)};
+  patchy::VectorStroke stroke;
+  stroke.width = 12;
+  stroke.dashes = {0, 2};
+  stroke.cap = patchy::VectorStrokeCap::Round;
+  for (int reverse = 0; reverse < 2; ++reverse) {
+    for (const auto alignment : {patchy::VectorStrokeAlignment::Inside,
+                                 patchy::VectorStrokeAlignment::Outside}) {
+      stroke.alignment = alignment;
+      const bool inside = alignment == patchy::VectorStrokeAlignment::Inside;
+      const auto dotted = stroke_coverage(path, stroke, Rect{0, 0, 256, 256});
+      // The hole's filled side is opposite the outer contour's filled side,
+      // even when both have the same winding. Reversing winding changes neither.
+      CHECK(coverage_pixel(dotted, 104, inside ? 74 : 86) == 255);
+      CHECK(coverage_pixel(dotted, 104, inside ? 86 : 74) == 0);
+      CHECK(coverage_pixel(dotted, 116, inside ? 74 : 86) == 0);
+      CHECK(coverage_pixel(dotted, 104, inside ? 38 : 26) == 255);
+    }
+    for (auto& subpath : path.subpaths) {
+      std::reverse(subpath.anchors.begin() + 1, subpath.anchors.end());
+    }
+  }
+}
+
+void stroke_zero_length_dots_keep_first_dot_and_tangent() {
+  VectorPath path;
+  path.subpaths = {open_line(40, 40, 40, 160)};
+  patchy::VectorStroke stroke;
+  stroke.width = 12;
+  stroke.dashes = {0, 2};
+  stroke.cap = patchy::VectorStrokeCap::Round;
+  auto dotted = stroke_coverage(path, stroke, Rect{0, 0, 192, 192});
+  CHECK(coverage_pixel(dotted, 40, 40) == 255);
+  CHECK(coverage_pixel(dotted, 40, 52) == 0);
+  CHECK(coverage_pixel(dotted, 40, 64) == 255);
+  // Dot direction must not depend on an artificial epsilon surviving addition
+  // to a large absolute coordinate. A translated crop is exactly the same ink.
+  auto translated = path;
+  for (auto& anchor : translated.subpaths[0].anchors) {
+    anchor.anchor_x += 90000; anchor.in_x += 90000; anchor.out_x += 90000;
+    anchor.anchor_y += 90000; anchor.in_y += 90000; anchor.out_y += 90000;
+  }
+  const auto moved = stroke_coverage(translated, stroke, Rect{90000, 90000, 192, 192});
+  for (int y = 30; y < 170; ++y) {
+    for (int x = 30; x < 50; ++x) {
+      CHECK(coverage_pixel(dotted, x, y) == coverage_pixel(moved, x + 90000, y + 90000));
+    }
+  }
+  stroke.cap = patchy::VectorStrokeCap::Butt;
+  CHECK(stroke_coverage(path, stroke, Rect{0, 0, 192, 192}).bounds.empty());
+}
+
+// GitHub #548 follow-up: Dotted on a Butt-capped stroke is one-width dashes,
+// the same square dots a Square cap draws from {0, 2}, on every alignment
+// (a {0, 2} Butt stroke draws nothing: stroke_zero_length_dots_keep_first_dot_and_tangent).
+void stroke_dotted_pattern_draws_on_butt_caps() {
+  CHECK((patchy::dotted_dash_pattern(patchy::VectorStrokeCap::Butt) == std::vector<double>{1.0, 1.0}));
+  CHECK((patchy::dotted_dash_pattern(patchy::VectorStrokeCap::Round) == std::vector<double>{0.0, 2.0}));
+  CHECK(patchy::is_dotted_dash_pattern({0.0, 2.0}, patchy::VectorStrokeCap::Butt));
+  CHECK(patchy::is_dotted_dash_pattern({1.0, 1.0}, patchy::VectorStrokeCap::Butt));
+  CHECK(!patchy::is_dotted_dash_pattern({1.0, 1.0}, patchy::VectorStrokeCap::Round));
+  VectorPath line;
+  line.subpaths = {open_line(20, 40, 180, 40)};
+  VectorPath box;
+  box.subpaths = {rect_subpath(32, 32, 224, 224, PathCombineOp::Add, 0)};
+  for (const auto alignment : {patchy::VectorStrokeAlignment::Center,
+                               patchy::VectorStrokeAlignment::Inside,
+                               patchy::VectorStrokeAlignment::Outside}) {
+    for (const auto* path : {&line, &box}) {
+      if (path == &line && alignment != patchy::VectorStrokeAlignment::Center) continue;
+      patchy::VectorStroke stroke;
+      stroke.width = 12;
+      stroke.alignment = alignment;
+      stroke.cap = patchy::VectorStrokeCap::Butt;
+      stroke.dashes = patchy::dotted_dash_pattern(stroke.cap);
+      const auto butt = stroke_coverage(*path, stroke, Rect{0, 0, 256, 256});
+      CHECK(!butt.bounds.empty());
+      stroke.cap = patchy::VectorStrokeCap::Square;
+      stroke.dashes = patchy::dotted_dash_pattern(stroke.cap);
+      const auto square = stroke_coverage(*path, stroke, Rect{0, 0, 256, 256});
+      // The dots sit half a width later along the path; their count and size match.
+      int butt_ink = 0;
+      int square_ink = 0;
+      for (int y = 0; y < 256; ++y) {
+        for (int x = 0; x < 256; ++x) {
+          butt_ink += coverage_pixel(butt, x, y) > 127 ? 1 : 0;
+          square_ink += coverage_pixel(square, x, y) > 127 ? 1 : 0;
+        }
+      }
+      CHECK(butt_ink > 7 * 12 * 12 - 24);
+      CHECK(std::abs(butt_ink - square_ink) * 10 <= square_ink);
+    }
+  }
+}
+
+// GitHub #548 follow-up (philipzae): picking a preset sets Butt caps for the
+// dash presets, Round caps and Round corners for every preset with dots, and
+// leaves both alone for Solid; the pattern matches the cap it set, and the
+// settings token round-trips.
+void stroke_dash_presets_set_caps_and_corners() {
+  using patchy::StrokeDashPreset;
+  using patchy::VectorStrokeCap;
+  using patchy::VectorStrokeJoin;
+  struct Expect {
+    StrokeDashPreset preset;
+    std::optional<VectorStrokeCap> cap;
+    std::optional<VectorStrokeJoin> join;
+  };
+  const std::array expected{
+      Expect{StrokeDashPreset::Solid, std::nullopt, std::nullopt},
+      Expect{StrokeDashPreset::Dashed, VectorStrokeCap::Butt, std::nullopt},
+      Expect{StrokeDashPreset::LongDashes, VectorStrokeCap::Butt, std::nullopt},
+      Expect{StrokeDashPreset::ShortDashes, VectorStrokeCap::Butt, std::nullopt},
+      Expect{StrokeDashPreset::Dotted, VectorStrokeCap::Round, VectorStrokeJoin::Round},
+      Expect{StrokeDashPreset::SparseDots, VectorStrokeCap::Round, VectorStrokeJoin::Round},
+      Expect{StrokeDashPreset::DashDot, VectorStrokeCap::Round, VectorStrokeJoin::Round},
+      Expect{StrokeDashPreset::DashDotDot, VectorStrokeCap::Round, VectorStrokeJoin::Round}};
+  CHECK(patchy::stroke_dash_presets_in_menu_order().size() == expected.size());
+  for (std::size_t i = 0; i < expected.size(); ++i) {
+    const auto& row = expected[i];
+    CHECK(patchy::stroke_dash_presets_in_menu_order()[i] == row.preset);
+    CHECK(patchy::stroke_dash_preset_cap(row.preset) == row.cap);
+    CHECK(patchy::stroke_dash_preset_join(row.preset) == row.join);
+    CHECK(patchy::stroke_dash_preset_from_token(patchy::stroke_dash_preset_token(row.preset)) == row.preset);
+    for (const auto start_cap : {VectorStrokeCap::Butt, VectorStrokeCap::Round, VectorStrokeCap::Square}) {
+      patchy::VectorStroke stroke;
+      stroke.cap = start_cap;
+      stroke.join = VectorStrokeJoin::Bevel;
+      stroke.dashes = {7.0, 3.0};
+      patchy::apply_stroke_dash_preset(stroke, row.preset);
+      CHECK(stroke.cap == row.cap.value_or(start_cap));
+      CHECK(stroke.join == row.join.value_or(VectorStrokeJoin::Bevel));
+      CHECK(stroke.dashes == patchy::stroke_dash_preset_pattern(row.preset, stroke.cap));
+      CHECK(patchy::stroke_dash_preset_for(stroke.dashes, stroke.cap) == row.preset);
+    }
+  }
+  CHECK(patchy::stroke_dash_preset_from_token("") == StrokeDashPreset::Solid);
+  CHECK(patchy::stroke_dash_preset_from_token("zigzag") == StrokeDashPreset::Solid);
+}
+
+// GitHub #548 follow-up: Shape Appearance's named dash presets. Each maps back
+// to itself on every cap, a repeated period maps like the period, and each
+// draws dashes and gaps on Butt and Round caps.
+void stroke_dash_presets_follow_caps_and_map_back() {
+  using patchy::StrokeDashPreset;
+  using patchy::VectorStrokeCap;
+  const std::array presets{StrokeDashPreset::Dashed,     StrokeDashPreset::Dotted,
+                           StrokeDashPreset::LongDashes, StrokeDashPreset::ShortDashes,
+                           StrokeDashPreset::SparseDots, StrokeDashPreset::DashDot,
+                           StrokeDashPreset::DashDotDot};
+  const std::array caps{VectorStrokeCap::Butt, VectorStrokeCap::Round, VectorStrokeCap::Square};
+  CHECK(patchy::stroke_dash_preset_for({}, VectorStrokeCap::Butt) == StrokeDashPreset::Solid);
+  CHECK((patchy::stroke_dash_preset_pattern(StrokeDashPreset::DashDot, VectorStrokeCap::Butt) ==
+         std::vector<double>{4.0, 2.0, 1.0, 2.0}));
+  CHECK((patchy::stroke_dash_preset_pattern(StrokeDashPreset::DashDot, VectorStrokeCap::Round) ==
+         std::vector<double>{3.0, 3.0, 0.0, 3.0}));
+  CHECK((patchy::stroke_dash_preset_pattern(StrokeDashPreset::Dashed, VectorStrokeCap::Round) ==
+         std::vector<double>{2.0, 2.0}));
+  VectorPath line;
+  line.subpaths = {open_line(10, 40, 250, 40)};
+  for (const auto preset : presets) {
+    for (const auto cap : caps) {
+      const auto dashes = patchy::stroke_dash_preset_pattern(preset, cap);
+      CHECK(!dashes.empty() && dashes.size() % 2 == 0);
+      CHECK(patchy::stroke_dash_preset_for(dashes, cap) == preset);
+      auto twice = dashes;
+      twice.insert(twice.end(), dashes.begin(), dashes.end());
+      CHECK(patchy::stroke_dash_preset_for(twice, cap) == preset);
+      if (cap == VectorStrokeCap::Square) continue;
+      patchy::VectorStroke stroke;
+      stroke.width = 8;
+      stroke.cap = cap;
+      stroke.dashes = dashes;
+      const auto coverage = stroke_coverage(line, stroke, Rect{0, 0, 260, 80});
+      int ink = 0;
+      int gaps = 0;
+      for (int x = 20; x < 240; ++x) {
+        if (coverage_pixel(coverage, x, 40) > 127) {
+          ++ink;
+        } else {
+          ++gaps;
+        }
+      }
+      CHECK(ink > 20);
+      CHECK(gaps > 20);
+    }
+  }
+  // Dot presets also match their zero-length form on a Butt cap (as Dotted did).
+  CHECK(patchy::stroke_dash_preset_for({0.0, 4.0}, VectorStrokeCap::Butt) == StrokeDashPreset::SparseDots);
+  CHECK(!patchy::stroke_dash_preset_for({5.0, 3.0}, VectorStrokeCap::Butt).has_value());
+  CHECK(!patchy::stroke_dash_preset_for({6.0, 2.0, 6.0}, VectorStrokeCap::Butt).has_value());
+
+  // GIMP 3.2's dash presets as philipzae's #548 file stores them (stroke widths,
+  // each repeated to fill GIMP's dash table): Line and Dense dots are Patchy
+  // presets; the rest have other lengths and open as Custom.
+  struct GimpDash {
+    std::vector<double> dashes;
+    VectorStrokeCap cap;
+    std::optional<StrokeDashPreset> preset;
+  };
+  const std::vector<GimpDash> gimp{
+      {{}, VectorStrokeCap::Butt, StrokeDashPreset::Solid},
+      {{9, 3}, VectorStrokeCap::Butt, std::nullopt},
+      {{6, 6}, VectorStrokeCap::Round, std::nullopt},
+      {{3, 9}, VectorStrokeCap::Butt, std::nullopt},
+      {{1, 5, 1, 5}, VectorStrokeCap::Round, std::nullopt},
+      {{1, 3, 1, 3, 1, 3}, VectorStrokeCap::Square, std::nullopt},
+      {std::vector<double>(12, 1.0), VectorStrokeCap::Butt, StrokeDashPreset::Dotted},
+      {std::vector<double>(24, 0.5), VectorStrokeCap::Butt, std::nullopt},
+      {{7, 2, 1, 2}, VectorStrokeCap::Square, std::nullopt},
+      {{7, 1, 1, 1, 1, 1}, VectorStrokeCap::Butt, std::nullopt},
+  };
+  for (const auto& entry : gimp) {
+    CHECK(patchy::stroke_dash_preset_for(entry.dashes, entry.cap) == entry.preset);
+  }
+}
+
+void stroke_open_path_alignment_moves_band_sideways() {
+  // Issue 553: an open two-point Pen path has no area, so an Inside stroke
+  // clipped to its fill drew nothing. Photoshop moves the centered stroke half
+  // a width to the right of the path direction (y down) for Inside, to the
+  // left for Outside (a PS file with a dotted and a dashed 2-point line).
+  VectorPath path;
+  path.subpaths = {open_line(20, 40, 80, 40)};
+  patchy::VectorStroke stroke;
+  stroke.enabled = true;
+  stroke.width = 10.0;
+  const Rect clip{0, 0, 100, 100};
+  stroke.alignment = patchy::VectorStrokeAlignment::Center;
+  const auto center = stroke_coverage(path, stroke, clip);
+  CHECK(coverage_pixel(center, 50, 36) == 255);
+  CHECK(coverage_pixel(center, 50, 43) == 255);
+  CHECK(coverage_pixel(center, 50, 46) == 0);
+  stroke.alignment = patchy::VectorStrokeAlignment::Inside;
+  const auto inside = stroke_coverage(path, stroke, clip);
+  CHECK(coverage_pixel(inside, 50, 40) == 255);
+  CHECK(coverage_pixel(inside, 50, 49) == 255);
+  CHECK(coverage_pixel(inside, 50, 39) == 0);
+  CHECK(coverage_pixel(inside, 50, 50) == 0);
+  CHECK(coverage_pixel(inside, 20, 45) == 255);  // butt ends stay at the anchors
+  CHECK(coverage_pixel(inside, 19, 45) == 0);
+  CHECK(coverage_pixel(inside, 80, 45) == 0);
+  stroke.alignment = patchy::VectorStrokeAlignment::Outside;
+  const auto outside = stroke_coverage(path, stroke, clip);
+  CHECK(coverage_pixel(outside, 50, 30) == 255);
+  CHECK(coverage_pixel(outside, 50, 39) == 255);
+  CHECK(coverage_pixel(outside, 50, 40) == 0);
+  CHECK(coverage_pixel(outside, 50, 29) == 0);
+  // Drawn the other way, the line keeps its side relative to its direction.
+  VectorPath reversed;
+  reversed.subpaths = {open_line(80, 40, 20, 40)};
+  stroke.alignment = patchy::VectorStrokeAlignment::Inside;
+  const auto back = stroke_coverage(reversed, stroke, clip);
+  CHECK(coverage_pixel(back, 50, 35) == 255);
+  CHECK(coverage_pixel(back, 50, 45) == 0);
+
+  // Dashes and round-cap dots keep their size on the shifted line.
+  stroke.dashes = {4, 2};  // 40 px on, 20 px off
+  const auto dashed = stroke_coverage(path, stroke, clip);
+  CHECK(coverage_pixel(dashed, 21, 45) == 255);
+  CHECK(coverage_pixel(dashed, 58, 45) == 255);
+  CHECK(coverage_pixel(dashed, 61, 45) == 0);
+  CHECK(coverage_pixel(dashed, 30, 39) == 0);
+  stroke.dashes = {0, 2};  // dots every 20 px; none at the far end (60 px is a whole gap)
+  stroke.cap = patchy::VectorStrokeCap::Round;
+  const auto dotted = stroke_coverage(path, stroke, clip);
+  for (const int x : {20, 40, 60}) {
+    CHECK(coverage_pixel(dotted, x, 45) == 255);
+    CHECK(coverage_pixel(dotted, x, 41) == 255);
+    CHECK(coverage_pixel(dotted, x, 38) == 0);  // whole circles of the stroke width
+  }
+  CHECK(coverage_pixel(dotted, 50, 45) == 0);
+  CHECK(coverage_pixel(dotted, 30, 45) == 0);
+
+  // The reporter's Photoshop file: a 18.53 px {4,2} butt line from (44,117)
+  // to (316,296). Photoshop's first dash centers on (69.8,145.1), below the path.
+  VectorPath diagonal;
+  diagonal.subpaths = {open_line(44, 117, 316, 296)};
+  stroke.width = 18.53;
+  stroke.dashes = {4, 2};
+  stroke.cap = patchy::VectorStrokeCap::Butt;
+  const auto ps_dashed = stroke_coverage(diagonal, stroke, Rect{0, 0, 376, 412});
+  CHECK(coverage_pixel(ps_dashed, 69, 145) == 255);
+  CHECK(coverage_pixel(ps_dashed, 162, 206) == 255);
+  CHECK(coverage_pixel(ps_dashed, 77, 132) == 0);  // left of the path: a centered stroke's half
+  CHECK(coverage_pixel(ps_dashed, 116, 175) == 0);  // the first gap
+
+  // A closed contour beside an open one keeps the fill clip; the line still draws.
+  VectorPath mixed;
+  mixed.subpaths = {rect_subpath(10, 60, 40, 90, PathCombineOp::Add, 0), open_line(50, 70, 90, 70)};
+  stroke.width = 4.0;
+  stroke.dashes.clear();
+  const auto both = stroke_coverage(mixed, stroke, clip);
+  CHECK(coverage_pixel(both, 11, 75) == 255);
+  CHECK(coverage_pixel(both, 8, 75) == 0);
+  CHECK(coverage_pixel(both, 70, 71) == 255);
+  CHECK(coverage_pixel(both, 70, 69) == 0);
+}
+
+// local-051 follow-up 2: an Inside or Outside stroke on an open curve stays beside the
+// curve at every scale. The curve's end anchors have no handles, so its flattened ends are
+// steps of a lattice unit or two; offsetting along those folded the moved line back and
+// its miter join drew a spike along the tangent to the canvas edge.
+void stroke_open_curve_alignment_stays_beside_the_curve() {
+  for (const double scale : {1.0, 2.0, 2.5, 4.0, 8.0}) {
+    PathSubpath curve;
+    curve.closed = false;
+    curve.op = PathCombineOp::Add;
+    auto peak = corner(80 * scale, 40 * scale);
+    peak.in_x = 54 * scale; peak.in_y = 50 * scale;
+    peak.out_x = 106 * scale; peak.out_y = 30 * scale;
+    peak.smooth = true;
+    curve.anchors = {corner(24 * scale, 84 * scale), peak, corner(138 * scale, 78 * scale)};
+    VectorPath path;
+    path.subpaths = {curve};
+    const Rect clip{0, 0, static_cast<std::int32_t>(160 * scale), static_cast<std::int32_t>(120 * scale)};
+    patchy::VectorStroke stroke;
+    stroke.enabled = true;
+    stroke.width = 5.0 * scale;
+    // The curve itself: two cubic segments, 145.5 px long at scale 1.
+    const auto hull = path.bounds();
+    CHECK(hull.has_value());
+    for (const auto alignment : {patchy::VectorStrokeAlignment::Inside, patchy::VectorStrokeAlignment::Outside}) {
+      for (const auto join : {patchy::VectorStrokeJoin::Miter, patchy::VectorStrokeJoin::Round}) {
+        stroke.alignment = alignment;
+        stroke.join = join;
+        stroke.cap = join == patchy::VectorStrokeJoin::Round ? patchy::VectorStrokeCap::Round
+                                                             : patchy::VectorStrokeCap::Butt;
+        const auto band = stroke_coverage(path, stroke, clip);
+        CHECK(!band.bounds.empty());
+        // Nothing drawn farther from the curve's box than the stroke is wide (plus a round cap).
+        std::int32_t left = clip.width;
+        std::int32_t top = clip.height;
+        std::int32_t right = -1;
+        std::int32_t bottom = -1;
+        double area = 0.0;
+        for (std::int32_t y = clip.y; y < clip.y + clip.height; ++y) {
+          for (std::int32_t x = clip.x; x < clip.x + clip.width; ++x) {
+            const auto value = coverage_pixel(band, x, y);
+            area += value / 255.0;
+            if (value >= 8) {
+              left = std::min(left, x);
+              top = std::min(top, y);
+              right = std::max(right, x);
+              bottom = std::max(bottom, y);
+            }
+          }
+        }
+        const double reach = stroke.width * 1.5 + 2.0;
+        // And the band's area is the curve's length times the width.
+        const double expected = 145.5 * scale * stroke.width;
+        const bool beside = left >= hull->left - reach && top >= hull->top - reach &&
+                            right <= hull->right + reach && bottom <= hull->bottom + reach;
+        const bool whole = std::abs(area - expected) < expected * 0.12;
+        if (!beside || !whole) {
+          std::printf("  open curve stroke: scale %.1f alignment %d join %d drawn %d,%d..%d,%d edges %d,%d %dx%d "
+                      "hull %.1f,%.1f..%.1f,%.1f area %.0f expected %.0f\n",
+                      scale, static_cast<int>(alignment), static_cast<int>(join), left, top, right, bottom,
+                      band.bounds.x, band.bounds.y, band.bounds.width, band.bounds.height,
+                      static_cast<double>(hull->left), static_cast<double>(hull->top),
+                      static_cast<double>(hull->right), static_cast<double>(hull->bottom), area, expected);
+        }
+        CHECK(beside);
+        CHECK(whole);
+      }
+    }
+  }
+  // Two curves meeting in a sharp corner (the anchor has no handles): on the corner's
+  // inner side the moved arms cross past the flattened steps next to it. Those steps came
+  // out reversed, and at some scales a miter join on one drew a spike to the canvas edge.
+  for (int quarter = 4; quarter <= 32; quarter += quarter < 16 ? 1 : 8) {
+    const double scale = quarter / 4.0;
+    const auto anchor = [scale](double x, double y, double in_x, double in_y, double out_x, double out_y) {
+      auto result = corner(x * scale, y * scale);
+      result.in_x = (x + in_x) * scale; result.in_y = (y + in_y) * scale;
+      result.out_x = (x + out_x) * scale; result.out_y = (y + out_y) * scale;
+      return result;
+    };
+    PathSubpath bend;
+    bend.closed = false;
+    bend.op = PathCombineOp::Add;
+    bend.anchors = {anchor(66, 132, 0, 0, 0, 0), anchor(100, 64, -18, 14, 18, -14), anchor(136, 110, 0, 0, 0, 0),
+                    anchor(174, 70, -14, 6, 10, -4)};
+    VectorPath path;
+    path.subpaths = {bend};
+    const Rect clip{0, 0, static_cast<std::int32_t>(240 * scale), static_cast<std::int32_t>(200 * scale)};
+    const auto hull = path.bounds();
+    CHECK(hull.has_value());
+    for (const double width : {4.0, 7.0}) {
+      for (const auto alignment : {patchy::VectorStrokeAlignment::Inside, patchy::VectorStrokeAlignment::Outside}) {
+        patchy::VectorStroke stroke;
+        stroke.enabled = true;
+        stroke.width = width * scale;
+        stroke.alignment = alignment;
+        stroke.join = patchy::VectorStrokeJoin::Miter;
+        stroke.cap = patchy::VectorStrokeCap::Butt;
+        const auto band = stroke_coverage(path, stroke, clip);
+        std::int32_t left = clip.width;
+        std::int32_t top = clip.height;
+        std::int32_t right = -1;
+        std::int32_t bottom = -1;
+        for (std::int32_t y = band.bounds.y; y < band.bounds.y + band.bounds.height; ++y) {
+          for (std::int32_t x = band.bounds.x; x < band.bounds.x + band.bounds.width; ++x) {
+            if (coverage_pixel(band, x, y) >= 8) {
+              left = std::min(left, x);
+              top = std::min(top, y);
+              right = std::max(right, x);
+              bottom = std::max(bottom, y);
+            }
+          }
+        }
+        // The corner's outer miter reaches 2.3 widths; nothing is drawn past that.
+        const double reach = stroke.width * 2.6 + 2.0;
+        const bool beside = right >= left && left >= hull->left - reach && top >= hull->top - reach &&
+                            right <= hull->right + reach && bottom <= hull->bottom + reach;
+        if (!beside) {
+          std::printf("  open corner stroke: scale %.2f width %.0f alignment %d drawn %d,%d..%d,%d hull %.1f,%.1f..%.1f,%.1f\n",
+                      scale, width, static_cast<int>(alignment), left, top, right, bottom,
+                      static_cast<double>(hull->left), static_cast<double>(hull->top),
+                      static_cast<double>(hull->right), static_cast<double>(hull->bottom));
+        }
+        CHECK(beside);
+      }
+    }
+  }
+}
+
+void stroke_open_path_alignment_dashes_follow_the_path() {
+  // Issue 558: Photoshop spaces an Inside or Outside open stroke's dashes along
+  // the path itself and then moves each dash sideways, so the dashes after a
+  // corner keep the centered stroke's phase. Offsetting first shortened the
+  // inner side and lengthened the outer side by the join's reach.
+  VectorPath path;
+  PathSubpath bend;
+  bend.closed = false;
+  bend.op = PathCombineOp::Add;
+  bend.anchors = {corner(20, 20), corner(80, 20), corner(80, 90)};  // east, then south
+  path.subpaths = {bend};
+  patchy::VectorStroke stroke;
+  stroke.enabled = true;
+  stroke.width = 10.0;
+  stroke.dashes = {2, 2};  // 20 px on, 20 px off: on again 20 to 40 px down the second leg
+  const Rect clip{0, 0, 120, 120};
+  stroke.alignment = patchy::VectorStrokeAlignment::Inside;  // right of a south leg: x 70..80
+  const auto inside = stroke_coverage(path, stroke, clip);
+  CHECK(coverage_pixel(inside, 75, 35) == 0);
+  CHECK(coverage_pixel(inside, 75, 45) == 255);
+  CHECK(coverage_pixel(inside, 75, 55) == 255);
+  CHECK(coverage_pixel(inside, 75, 65) == 0);
+  CHECK(coverage_pixel(inside, 85, 50) == 0);
+  stroke.alignment = patchy::VectorStrokeAlignment::Outside;  // x 80..90
+  const auto outside = stroke_coverage(path, stroke, clip);
+  CHECK(coverage_pixel(outside, 85, 35) == 0);
+  CHECK(coverage_pixel(outside, 85, 45) == 255);
+  CHECK(coverage_pixel(outside, 85, 55) == 255);
+  CHECK(coverage_pixel(outside, 85, 65) == 0);
+  CHECK(coverage_pixel(outside, 75, 50) == 0);
+
+  // Round-cap dots every 20 px along the path: the one 20 px down the second
+  // leg is a whole circle beside it.
+  stroke.alignment = patchy::VectorStrokeAlignment::Inside;
+  stroke.dashes = {0, 2};
+  stroke.cap = patchy::VectorStrokeCap::Round;
+  const auto dotted = stroke_coverage(path, stroke, clip);
+  CHECK(coverage_pixel(dotted, 75, 40) == 255);
+  CHECK(coverage_pixel(dotted, 75, 43) == 255);
+  CHECK(coverage_pixel(dotted, 75, 47) == 0);
+  CHECK(coverage_pixel(dotted, 75, 32) == 0);
+  CHECK(coverage_pixel(dotted, 81, 40) == 0);
+  CHECK(coverage_pixel(dotted, 40, 25) == 255);  // first leg: dots below the line
+  CHECK(coverage_pixel(dotted, 40, 15) == 0);
+
+  // The reporter's file (Photoshop render): a 10 px square-cap {2,2} Inside
+  // line (28,155) (142,165) (182,42). Photoshop's first dash on the second leg
+  // runs 0.6 to 30.1 px past the corner, the next from 40.6 px.
+  VectorPath reporter;
+  PathSubpath dashed;
+  dashed.closed = false;
+  dashed.op = PathCombineOp::Add;
+  dashed.anchors = {corner(28, 155), corner(142, 165), corner(182, 42)};
+  reporter.subpaths = {dashed};
+  stroke.dashes = {2, 2};
+  stroke.cap = patchy::VectorStrokeCap::Square;
+  stroke.join = patchy::VectorStrokeJoin::Bevel;
+  const auto ps_dashed = stroke_coverage(reporter, stroke, Rect{0, 0, 200, 200});
+  CHECK(coverage_pixel(ps_dashed, 155, 140) == 255);  // 27 px past the corner
+  CHECK(coverage_pixel(ps_dashed, 157, 133) == 0);  // 35 px: the gap
+  CHECK(coverage_pixel(ps_dashed, 160, 124) == 255);  // 45 px
+}
+
+void stroke_aligned_round_dots_keep_circles_on_curves() {
+  VectorPath path;
+  path.subpaths = {circle_subpath(96, 96, 64)};
+  patchy::VectorStroke stroke;
+  stroke.width = 12;
+  stroke.dashes = {0, 2};
+  stroke.cap = patchy::VectorStrokeCap::Round;
+  for (const auto op : {PathCombineOp::Add, PathCombineOp::Subtract}) {
+    path.subpaths.front().op = op;
+    for (const auto alignment : {patchy::VectorStrokeAlignment::Inside,
+                                 patchy::VectorStrokeAlignment::Outside}) {
+      stroke.alignment = alignment;
+      const bool inward = (alignment == patchy::VectorStrokeAlignment::Inside) ==
+                          (op == PathCombineOp::Add);
+      const int cx = inward ? 154 : 166;
+      const auto dotted = stroke_coverage(path, stroke, Rect{0, 0, 192, 192});
+      CHECK(coverage_pixel(dotted, cx, 96) == 255);
+      CHECK(coverage_pixel(dotted, cx, 99) == 255);
+      CHECK(coverage_pixel(dotted, cx, 103) == 0);
+      CHECK(coverage_pixel(dotted, cx + 5, 101) == 0);
+    }
+  }
+}
+
+void stroke_golden_digests_are_stable() {
+  struct Golden {
+    const char* name;
+    VectorPath path;
+    patchy::VectorStroke stroke;
+  };
+  std::vector<Golden> goldens;
+  {
+    VectorPath rect;
+    rect.subpaths = {rect_subpath(6.4, 8.7, 41.9, 30.2, PathCombineOp::Add, 0)};
+    patchy::VectorStroke stroke;
+    stroke.enabled = true;
+    stroke.width = 5.0;
+    goldens.push_back({"rect-miter", rect, stroke});
+  }
+  {
+    VectorPath diagonal;
+    diagonal.subpaths = {open_line(4.2, 40.6, 44.8, 6.3)};
+    patchy::VectorStroke stroke;
+    stroke.enabled = true;
+    stroke.width = 4.0;
+    stroke.cap = patchy::VectorStrokeCap::Round;
+    stroke.join = patchy::VectorStrokeJoin::Round;
+    stroke.dashes = {2.0, 1.5};
+    stroke.dash_offset = 0.5;
+    goldens.push_back({"dashed-round", diagonal, stroke});
+  }
+  {
+    VectorPath triangle;
+    PathSubpath tri;
+    tri.closed = true;
+    tri.op = PathCombineOp::Add;
+    tri.anchors = {corner(24.3, 6.8), corner(44.1, 40.5), corner(5.7, 40.5)};
+    triangle.subpaths = {tri};
+    patchy::VectorStroke stroke;
+    stroke.enabled = true;
+    stroke.width = 4.0;
+    stroke.join = patchy::VectorStrokeJoin::Bevel;
+    stroke.alignment = patchy::VectorStrokeAlignment::Outside;
+    goldens.push_back({"triangle-bevel-outside", triangle, stroke});
+  }
+  {
+    // Curved subpath at a non-lattice offset: exercises the curve flattener
+    // and the anchor lattice snap (the first three goldens are all straight
+    // segments, which is how the July 2026 micro-segment spikes went
+    // unpinned).
+    VectorPath circle;
+    circle.subpaths = {circle_subpath(24.37, 24.37, 12.0)};
+    patchy::VectorStroke stroke;
+    stroke.enabled = true;
+    stroke.width = 4.0;
+    goldens.push_back({"circle-nonlattice", circle, stroke});
+  }
+  // Goldens 1-2 re-pinned July 2026 (second time) for the polyline lattice
+  // snap + exact band bounds fixes: verified old-vs-new per-pixel before
+  // pinning - identical bounds, golden 0 byte-identical, golden 2 28 cells
+  // at +-1, golden 1 48 cells (one -2, two edge 255->254, all at dash-cap AA
+  // seams; coverage sum -0.016%). No structural change. The earlier re-pin
+  // was the outline-winding normalization (join wedges now share the segment
+  // quads' orientation; see stroke_arc_band_has_no_winding_notches). Golden 3
+  // (curved, non-lattice offset) pins the snap/bounds/adaptive-flatten fixes
+  // directly - the first three goldens are straight-segment-only.
+  const std::array<std::uint64_t, 4> expected = {
+      0x2612ef398d543549ULL,
+      0x783d270f0818f0faULL,
+      0x64ab25fc123a02f4ULL,
+      0xbf0b76ea9ecb55bdULL,
+  };
+  bool all_match = true;
+  for (std::size_t i = 0; i < goldens.size(); ++i) {
+    const auto band = stroke_coverage(goldens[i].path, goldens[i].stroke, Rect{0, 0, 48, 48});
+    CHECK(!band.bounds.empty());
+    const auto hash = fnv1a_hash_bytes(band.pixels.data());
+    if (hash != expected[i]) {
+      std::fprintf(stderr, "stroke golden[%zu] %s: 0x%016llxULL (bounds %d,%d %dx%d)\n", i,
+                   goldens[i].name, static_cast<unsigned long long>(hash), band.bounds.x, band.bounds.y,
+                   band.bounds.width, band.bounds.height);
+      all_match = false;
+    }
+  }
+  CHECK(all_match);
+}
+
+bool same_coverage(const CoverageBuffer& a, const CoverageBuffer& b) {
+  if (a.bounds != b.bounds) {
+    return false;
+  }
+  for (std::int32_t y = a.bounds.y; y < a.bounds.y + a.bounds.height; ++y) {
+    for (std::int32_t x = a.bounds.x; x < a.bounds.x + a.bounds.width; ++x) {
+      if (coverage_pixel(a, x, y) != coverage_pixel(b, x, y)) {
+        return false;
+      }
+    }
+  }
+  return true;
+}
+
+// A clip that sees a small part of a large curved shape (a zoomed shape in one
+// Dynamic Vector Preview tile) flattens the curves outside it to their chords, and a
+// combined path's stroke finds its crossings by a sweep. The coverage must be
+// byte-identical to the reference: every curve flattened, every segment pair tested.
+void raster_clipped_flattening_matches_full_flattening() {
+  const double radius = 600.0;
+  PathSubpath wave;
+  wave.closed = true;
+  wave.anchors = {
+      PathAnchor{-300, 100, -470, 300, -130, -100, true},
+      PathAnchor{230, -170, 30, -430, 430, 100, true},
+      PathAnchor{300, 300, 500, 200, 100, 400, false},
+  };
+  PathSubpath open_wave = wave;
+  open_wave.closed = false;
+  VectorPath circle;
+  circle.subpaths = {circle_subpath(0.0, 0.0, radius)};
+  VectorPath waves;
+  waves.subpaths = {wave};
+  VectorPath open_path;
+  open_path.subpaths = {open_wave};
+  // Combined paths (one shape group per subpath, as SVG import makes them): their
+  // stroke follows the Boolean outline.
+  VectorPath donut;
+  donut.subpaths = {circle_subpath(0.0, 0.0, 100.0), circle_subpath(15.0, -10.0, 60.0)};
+  donut.subpaths[1].op = PathCombineOp::Subtract;
+  donut.subpaths[1].shape_group = 1;
+  VectorPath trio;
+  trio.subpaths = {circle_subpath(0.0, 0.0, 100.0), circle_subpath(80.0, 25.0, 100.0),
+                   circle_subpath(25.0, 85.0, 100.0)};
+  trio.subpaths[1].shape_group = 1;
+  trio.subpaths[2].shape_group = 2;
+  trio.subpaths[2].op = PathCombineOp::Xor;
+
+  std::vector<Rect> ring_clips;
+  for (int degrees = 0; degrees < 360; degrees += 30) {
+    const double radians = degrees * 3.14159265358979323846 / 180.0;
+    for (const double distance : {-25.0, 0.0, 25.0}) {
+      const auto x = static_cast<std::int32_t>(std::lround((radius + distance) * std::cos(radians)));
+      const auto y = static_cast<std::int32_t>(std::lround((radius + distance) * std::sin(radians)));
+      ring_clips.push_back(Rect{x - 20, y - 17, 48, 40});
+    }
+  }
+  for (const auto& corner_clip : {Rect{-60, -60, 120, 120}, Rect{225, -185, 40, 40}, Rect{290, 290, 64, 64},
+                                  Rect{-320, 80, 60, 60}, Rect{1000, 1000, 32, 32}}) {
+    ring_clips.push_back(corner_clip);
+  }
+  std::vector<Rect> grid_clips;
+  for (int y = -125; y < 200; y += 55) {
+    for (int x = -125; x < 200; x += 55) {
+      grid_clips.push_back(Rect{x, y, 36, 30});
+    }
+  }
+
+  std::vector<patchy::VectorStroke> strokes;
+  for (const auto alignment : {patchy::VectorStrokeAlignment::Center, patchy::VectorStrokeAlignment::Inside,
+                               patchy::VectorStrokeAlignment::Outside}) {
+    for (const auto join : {patchy::VectorStrokeJoin::Miter, patchy::VectorStrokeJoin::Round,
+                            patchy::VectorStrokeJoin::Bevel}) {
+      patchy::VectorStroke stroke;
+      stroke.enabled = true;
+      stroke.width = join == patchy::VectorStrokeJoin::Round ? 13.0 : 5.5;
+      stroke.alignment = alignment;
+      stroke.join = join;
+      stroke.cap = join == patchy::VectorStrokeJoin::Miter ? patchy::VectorStrokeCap::Square
+                                                           : patchy::VectorStrokeCap::Round;
+      strokes.push_back(stroke);
+    }
+  }
+  auto dashed = strokes[1];
+  dashed.dashes = {2.0, 1.5};
+  strokes.push_back(dashed);
+
+  std::size_t compared = 0;
+  std::size_t nonempty = 0;
+  // The reference Boolean outline tests every segment pair per call, so the combined
+  // paths take three of the strokes.
+  const std::vector<patchy::VectorStroke> combined_strokes{strokes[0], strokes[4], strokes.back()};
+  const auto compare = [&](const VectorPath& path, const std::vector<Rect>& clips, bool fills,
+                           const std::vector<patchy::VectorStroke>& path_strokes) {
+    for (const auto& clip : clips) {
+      VectorRasterOptions fast{clip};
+      VectorRasterOptions full{clip};
+      full.reference_geometry = true;
+      if (fills) {
+        const auto culled = patchy::rasterize_vector_path(path, fast);
+        CHECK(same_coverage(culled, patchy::rasterize_vector_path(path, full)));
+        nonempty += culled.bounds.empty() ? 0U : 1U;
+        ++compared;
+      }
+      for (const auto& stroke : path_strokes) {
+        const auto culled = patchy::rasterize_vector_stroke(path, stroke, fast);
+        CHECK(same_coverage(culled, patchy::rasterize_vector_stroke(path, stroke, full)));
+        nonempty += culled.bounds.empty() ? 0U : 1U;
+        ++compared;
+      }
+    }
+  };
+  compare(circle, ring_clips, true, strokes);
+  compare(waves, ring_clips, true, strokes);
+  compare(open_path, ring_clips, false, strokes);
+  compare(donut, grid_clips, true, combined_strokes);
+  compare(trio, grid_clips, true, combined_strokes);
+  // Most clips straddle an edge, so the comparisons are not all of empty buffers.
+  CHECK(compared > 1400U);
+  CHECK(nonempty > compared / 4U);
+}
+
+void stroke_bezier_circle_is_translation_stable() {
+  // Regression (July 2026): anchors off the 1/256 flattener lattice left a
+  // sub-quantum micro-segment at each anchor whose direction was rounding
+  // noise; the default miter join (limit 100) amplified it into a spike that
+  // escaped the guessed coverage band and smeared a bar along the buffer
+  // edge, translation-dependently. Coverage must stay a clean ring for any
+  // sub-pixel placement.
+  patchy::VectorStroke stroke;
+  stroke.enabled = true;
+  stroke.width = 4.0;  // defaults otherwise: Center alignment, Miter, limit 100
+  const double radius = 12.0;
+  const std::array<double, 6> offsets = {0.0, 1.0 / 1024.0, 1.0 / 512.0, 3.0 / 1024.0, 0.3, 0.7};
+  for (const double offset : offsets) {
+    const double cx = 24.0 + offset;
+    const double cy = 24.0 + offset;
+    VectorPath path;
+    path.subpaths = {circle_subpath(cx, cy, radius)};
+    const auto band = stroke_coverage(path, stroke, Rect{0, 0, 64, 64});
+    CHECK(!band.bounds.empty());
+    // True extent is 2r + width; allow one AA pixel per side.
+    CHECK(band.bounds.width <= static_cast<std::int32_t>(2.0 * radius + stroke.width) + 2);
+    CHECK(band.bounds.height <= static_cast<std::int32_t>(2.0 * radius + stroke.width) + 2);
+    // Every covered pixel sits on the ring (no spikes, no edge bars).
+    for (std::int32_t y = band.bounds.y; y < band.bounds.y + band.bounds.height; ++y) {
+      for (std::int32_t x = band.bounds.x; x < band.bounds.x + band.bounds.width; ++x) {
+        if (coverage_pixel(band, x, y) == 0) {
+          continue;
+        }
+        const double dx = x + 0.5 - cx;
+        const double dy = y + 0.5 - cy;
+        const double off_ring = std::fabs(std::sqrt(dx * dx + dy * dy) - radius);
+        CHECK(off_ring <= stroke.width / 2.0 + 1.5);
+      }
+    }
+    // The band's midline is fully covered all the way around.
+    for (int degrees = 0; degrees < 360; degrees += 5) {
+      const double radians = degrees * 3.14159265358979323846 / 180.0;
+      const auto x = static_cast<std::int32_t>(std::lround(cx + radius * std::cos(radians)));
+      const auto y = static_cast<std::int32_t>(std::lround(cy + radius * std::sin(radians)));
+      CHECK(coverage_pixel(band, x, y) == 255);
+    }
+  }
+}
+
+void stroke_miter_spike_stays_in_bounds() {
+  // A legitimately sharp miter reaches ratio x half-width past the vertex
+  // (here ratio ~8.06, h = 3, tip at x ~64.2). The band must contain and draw
+  // the tip; the pre-July-2026 guessed padding cropped it at the buffer edge.
+  VectorPath path;
+  PathSubpath wedge;
+  wedge.closed = false;
+  wedge.op = PathCombineOp::Add;
+  wedge.anchors = {corner(8, 20), corner(40, 24), corner(8, 28)};
+  path.subpaths = {wedge};
+  patchy::VectorStroke stroke;
+  stroke.enabled = true;
+  stroke.width = 6.0;
+  const auto band = stroke_coverage(path, stroke, Rect{0, 0, 96, 64});
+  CHECK(!band.bounds.empty());
+  CHECK(band.bounds.contains(64, 24));            // tip pixel inside the band
+  CHECK(coverage_pixel(band, 63, 24) > 0);        // tip actually drawn
+  CHECK(coverage_pixel(band, 58, 24) > 100);      // wedge solidly covered
+  CHECK(band.bounds.x + band.bounds.width <= 66); // and bounds stay tight
+
+  // Limit 4 forces the bevel fallback at this ratio; the spike disappears.
+  stroke.miter_limit = 4.0;
+  const auto bevel = stroke_coverage(path, stroke, Rect{0, 0, 96, 64});
+  CHECK(coverage_pixel(bevel, 58, 24) == 0);
+  CHECK(bevel.bounds.x + bevel.bounds.width <= 44);
+}
+
+void stroke_curve_is_insensitive_to_sub_quantum_anchor_jitter() {
+  // Pins the lattice snap: moving every anchor by far less than the 1/256
+  // quantum must not change a single coverage byte (pre-snap it manufactured
+  // micro-segments whose miter wedges shifted bytes and bounds).
+  patchy::VectorStroke stroke;
+  stroke.enabled = true;
+  stroke.width = 4.0;
+  VectorPath base;
+  base.subpaths = {circle_subpath(24.0, 24.0, 12.0)};
+  const auto reference = stroke_coverage(base, stroke, Rect{0, 0, 64, 64});
+  const double jitter = 1.0 / 4096.0;
+  VectorPath moved;
+  moved.subpaths = {circle_subpath(24.0 + jitter, 24.0 + jitter, 12.0)};
+  const auto jittered = stroke_coverage(moved, stroke, Rect{0, 0, 64, 64});
+  CHECK(reference.bounds.x == jittered.bounds.x && reference.bounds.y == jittered.bounds.y);
+  CHECK(reference.bounds.width == jittered.bounds.width &&
+        reference.bounds.height == jittered.bounds.height);
+  CHECK(fnv1a_hash_bytes(reference.pixels.data()) == fnv1a_hash_bytes(jittered.pixels.data()));
+}
+
+void stroke_shape_composites_fill_and_stroke() {
+  const Rect canvas{0, 0, 40, 40};
+  patchy::VectorShapeContent content;
+  content.path.subpaths = {rect_subpath(10, 10, 26, 26, PathCombineOp::Add, 0)};
+  content.fill.kind = patchy::VectorFillKind::Solid;
+  content.fill.color = patchy::RgbColor{200, 30, 30};
+  content.stroke.enabled = true;
+  content.stroke.width = 4.0;
+  content.stroke.content.kind = patchy::VectorFillKind::Solid;
+  content.stroke.content.color = patchy::RgbColor{20, 40, 220};
+
+  const auto composed = patchy::rasterize_vector_shape(content, canvas, nullptr, nullptr);
+  CHECK(!composed.bounds.empty());
+  const auto pixel_at = [&](std::int32_t x, std::int32_t y) {
+    return composed.pixels.pixel(x - composed.bounds.x, y - composed.bounds.y);
+  };
+  const auto* interior = pixel_at(18, 18);
+  CHECK(interior[0] == 200 && interior[3] == 255);
+  const auto* band = pixel_at(9, 18);
+  CHECK(band[2] == 220 && band[3] == 255);
+  const auto* inner_band = pixel_at(11, 18);  // stroke covers the fill here
+  CHECK(inner_band[2] == 220 && inner_band[0] == 20);
+
+  // Stroke-only (fillEnabled false): interior transparent, band painted.
+  content.stroke.fill_enabled = false;
+  const auto stroke_only = patchy::rasterize_vector_shape(content, canvas, nullptr, nullptr);
+  const auto* hollow = stroke_only.pixels.pixel(18 - stroke_only.bounds.x, 18 - stroke_only.bounds.y);
+  CHECK(hollow[3] == 0);
+  const auto* ring = stroke_only.pixels.pixel(9 - stroke_only.bounds.x, 18 - stroke_only.bounds.y);
+  CHECK(ring[2] == 220 && ring[3] == 255);
+
+  // 50% stroke opacity blends over the fill's inner half.
+  content.stroke.fill_enabled = true;
+  content.stroke.opacity = 0.5;
+  const auto faded = patchy::rasterize_vector_shape(content, canvas, nullptr, nullptr);
+  const auto* mixed = faded.pixels.pixel(11 - faded.bounds.x, 18 - faded.bounds.y);
+  CHECK(mixed[3] == 255);
+  CHECK(mixed[0] > 90 && mixed[0] < 130);   // red shows through
+  CHECK(mixed[2] > 100 && mixed[2] < 140);  // half the stroke blue
+}
+
+// Photoshop 27.11 probes (docs/vector-tools-appearance.md, "Fill and stroke on shared edge
+// pixels"): an Outside stroke sits beside the fill and an Inside stroke inside it, so on a
+// pixel the path's edge crosses the two shares add up to the pixel (Outside) or to the fill's
+// coverage (Inside). Stacked as two independent coverages they left up to a quarter of the
+// backdrop showing between the fill and an Outside stroke, and fill color outside an Inside
+// one. Red fill, blue stroke: red times alpha is the fill's share of a pixel.
+void stroke_shape_fill_and_stroke_share_edge_pixels() {
+  const Rect canvas{0, 0, 96, 80};
+  VectorPath ellipse;
+  {
+    LiveShapeParams params;
+    params.kind = LiveShapeKind::Ellipse;
+    params.left = 20.0;
+    params.top = 14.0;
+    params.right = 76.0;
+    params.bottom = 66.0;
+    ellipse.subpaths = patchy::generate_live_shape_subpaths(params);
+  }
+  VectorPath slanted;
+  {
+    PathSubpath quad;
+    quad.closed = true;
+    quad.op = PathCombineOp::Add;
+    quad.anchors = {corner(22.3, 30.1), corner(66.8, 12.4), corner(75.2, 48.7), corner(30.9, 64.6)};
+    slanted.subpaths = {quad};
+  }
+  struct Worst {
+    int edge_pixels{0};
+    int alpha_error{0};       // against the expected alpha
+    int fill_share_error{0};  // against the expected fill share (red premultiplied)
+  };
+  // expected(g) gives the alpha and the fill's premultiplied share for path coverage g.
+  const auto measure = [&](const VectorPath& path, patchy::VectorShapeContent content, auto expected) {
+    content.path = path;
+    const auto coverage = rasterize(path, canvas);
+    const auto shape = patchy::rasterize_vector_shape(content, canvas, nullptr, nullptr);
+    Worst worst;
+    for (std::int32_t y = canvas.y; y < canvas.y + canvas.height; ++y) {
+      for (std::int32_t x = canvas.x; x < canvas.x + canvas.width; ++x) {
+        const int g = coverage_pixel(coverage, x, y);
+        if (g == 0 || g == 255 || !shape.bounds.contains(x, y)) {
+          continue;
+        }
+        ++worst.edge_pixels;
+        const auto* px = shape.pixels.pixel(x - shape.bounds.x, y - shape.bounds.y);
+        const std::array<double, 2> want = expected(static_cast<double>(g));
+        const double fill_share = px[0] * px[3] / 255.0;
+        worst.alpha_error = std::max(worst.alpha_error, static_cast<int>(std::ceil(std::abs(px[3] - want[0]) - 0.5)));
+        worst.fill_share_error =
+            std::max(worst.fill_share_error, static_cast<int>(std::ceil(std::abs(fill_share - want[1]) - 0.5)));
+      }
+    }
+    return worst;
+  };
+  const auto check = [](const char* what, const Worst& worst) {
+    if (worst.alpha_error > 2 || worst.fill_share_error > 2) {
+      std::fprintf(stderr, "  %s, %d edge pixels: alpha off by %d, fill share off by %d (of 255)\n", what,
+                   worst.edge_pixels, worst.alpha_error, worst.fill_share_error);
+    }
+    CHECK(worst.edge_pixels > 100);
+    CHECK(worst.alpha_error <= 2);
+    CHECK(worst.fill_share_error <= 2);
+  };
+  patchy::VectorShapeContent base;
+  base.fill.kind = patchy::VectorFillKind::Solid;
+  base.fill.color = patchy::RgbColor{255, 0, 0};
+  base.stroke.enabled = true;
+  base.stroke.width = 8.0;
+  base.stroke.content.kind = patchy::VectorFillKind::Solid;
+  base.stroke.content.color = patchy::RgbColor{0, 0, 255};
+  for (const auto* path : {&ellipse, &slanted}) {
+    // Outside: the fill's share g and the stroke's 255 - g fill the pixel, so over an opaque
+    // backdrop none of it shows between them.
+    auto outside = base;
+    outside.stroke.alignment = patchy::VectorStrokeAlignment::Outside;
+    check("outside", measure(*path, outside, [](double g) { return std::array<double, 2>{255.0, g}; }));
+    // A half-strength stroke: the fill's share is unchanged, the stroke adds half of its own.
+    outside.stroke.opacity = 0.5;
+    check("outside at half opacity",
+          measure(*path, outside, [](double g) { return std::array<double, 2>{g + (255.0 - g) * 0.5, g}; }));
+    // Density: the stroke's paint washes over the canvas and the fill
+    // (raster_shape_density_spreads_the_strokes_paint), so the pixel stays full and the fill
+    // keeps density / 255 of its share.
+    outside.stroke.opacity = 1.0;
+    outside.density = 128;
+    check("outside with Density",
+          measure(*path, outside, [](double g) { return std::array<double, 2>{255.0, g * 128.0 / 255.0}; }));
+
+    // Inside: the stroke covers the fill wherever the fill is, so the edge pixel is stroke
+    // color at the fill's coverage, with no fill color outside the stroke.
+    auto inside = base;
+    inside.stroke.alignment = patchy::VectorStrokeAlignment::Inside;
+    check("inside", measure(*path, inside, [](double g) { return std::array<double, 2>{g, 0.0}; }));
+    inside.stroke.opacity = 0.5;
+    check("inside at half opacity",
+          measure(*path, inside, [](double g) { return std::array<double, 2>{g, g * 0.5}; }));
+  }
+
+  // Pixels the edge does not cross keep the plain stacking: fill inside, stroke over the
+  // fill's inner band (Inside) or alone past the path (Outside).
+  auto inside = base;
+  inside.path = ellipse;
+  inside.stroke.alignment = patchy::VectorStrokeAlignment::Inside;
+  const auto shape = patchy::rasterize_vector_shape(inside, canvas, nullptr, nullptr);
+  const auto* center = shape.pixels.pixel(48 - shape.bounds.x, 40 - shape.bounds.y);
+  CHECK(center[0] == 255 && center[2] == 0 && center[3] == 255);
+  const auto* band = shape.pixels.pixel(24 - shape.bounds.x, 40 - shape.bounds.y);
+  CHECK(band[0] == 0 && band[2] == 255 && band[3] == 255);
+}
+
+
+patchy::LayerVectorMask baked_triangle_mask(Rect canvas) {
+  patchy::LayerVectorMask mask;
+  PathSubpath triangle;
+  triangle.closed = true;
+  triangle.op = PathCombineOp::Add;
+  triangle.anchors = {corner(16, 2), corner(30, 30), corner(2, 30)};
+  mask.path.subpaths = {triangle};
+  auto coverage = patchy::rasterize_vector_mask_coverage(mask, canvas);
+  mask.cache_bounds = coverage.bounds;
+  mask.cache = std::move(coverage.pixels);
+  return mask;
+}
+
+void vector_mask_composites_in_flatten() {
+  const Rect canvas{0, 0, 32, 32};
+  patchy::Document document(32, 32, patchy::PixelFormat::rgb8());
+  document.add_pixel_layer("bg", solid_rgba(32, 32, 255, 255, 255, 255));
+  patchy::Layer blue(2, "blue", solid_rgba(32, 32, 0, 0, 255, 255));
+  blue.set_vector_mask(baked_triangle_mask(canvas));
+  document.add_layer(std::move(blue));
+
+  const auto flattened = patchy::Compositor{}.flatten_rgb8(document);
+  const auto pixel = [&](std::int32_t x, std::int32_t y) {
+    const auto* px = flattened.pixel(x, y);
+    return std::array<std::uint8_t, 3>{px[0], px[1], px[2]};
+  };
+  CHECK(pixel(16, 20) == (std::array<std::uint8_t, 3>{0, 0, 255}));  // inside the triangle
+  CHECK(pixel(2, 4) == (std::array<std::uint8_t, 3>{255, 255, 255}));  // masked out
+  CHECK(pixel(30, 4) == (std::array<std::uint8_t, 3>{255, 255, 255}));
+
+  // Disabled vector mask reveals the whole layer.
+  auto* layer = document.find_layer(2);
+  auto disabled = *layer->vector_mask();
+  disabled.disabled = true;
+  layer->set_vector_mask(std::move(disabled));
+  const auto revealed = patchy::Compositor{}.flatten_rgb8(document);
+  const auto* corner_pixel = revealed.pixel(2, 4);
+  CHECK(corner_pixel[2] == 255 && corner_pixel[0] == 0);
+
+  // Density 128 lifts the hidden floor to about half coverage.
+  auto dense = *layer->vector_mask();
+  dense.disabled = false;
+  dense.density = 128;
+  layer->set_vector_mask(std::move(dense));
+  const auto lifted = patchy::Compositor{}.flatten_rgb8(document);
+  const auto* half = lifted.pixel(2, 4);
+  CHECK(half[2] >= 250);                  // blue channel saturated either way
+  CHECK(half[0] > 100 && half[0] < 160);  // red/green mid-blend = ~half coverage
+  CHECK(half[1] > 100 && half[1] < 160);
+}
+
+void vector_mask_multiplies_with_raster_mask() {
+  const Rect canvas{0, 0, 32, 32};
+  patchy::Document document(32, 32, patchy::PixelFormat::rgb8());
+  document.add_pixel_layer("bg", solid_rgba(32, 32, 255, 255, 255, 255));
+  patchy::Layer green(2, "green", solid_rgba(32, 32, 0, 200, 0, 255));
+
+  // Raster mask: top half revealed.
+  patchy::PixelBuffer mask_pixels(32, 32, patchy::PixelFormat::gray8());
+  for (std::int32_t y = 0; y < 32; ++y) {
+    for (std::int32_t x = 0; x < 32; ++x) {
+      *mask_pixels.pixel(x, y) = y < 16 ? 255 : 0;
+    }
+  }
+  patchy::LayerMask raster_mask;
+  raster_mask.bounds = canvas;
+  raster_mask.pixels = std::move(mask_pixels);
+  green.set_mask(std::move(raster_mask));
+
+  // Vector mask: left-half rect.
+  patchy::LayerVectorMask vector_mask;
+  vector_mask.path.subpaths = {rect_subpath(0, 0, 16, 32, PathCombineOp::Add, 0)};
+  auto coverage = patchy::rasterize_vector_mask_coverage(vector_mask, canvas);
+  vector_mask.cache_bounds = coverage.bounds;
+  vector_mask.cache = std::move(coverage.pixels);
+  green.set_vector_mask(std::move(vector_mask));
+  document.add_layer(std::move(green));
+
+  const auto flattened = patchy::Compositor{}.flatten_rgb8(document);
+  CHECK(flattened.pixel(8, 8)[1] == 200);     // top-left: both masks reveal
+  CHECK(flattened.pixel(24, 8)[1] == 255);    // top-right: vector hides
+  CHECK(flattened.pixel(8, 24)[1] == 255);    // bottom-left: raster hides
+  CHECK(flattened.pixel(24, 24)[1] == 255);   // both hide
+}
+
+void update_vector_shape_raster_bakes_pixels() {
+  const Rect canvas{0, 0, 40, 40};
+  patchy::Layer layer(9, "shape", patchy::PixelBuffer());
+  patchy::VectorShapeContent content;
+  content.path.subpaths = {rect_subpath(6, 8, 22, 20, PathCombineOp::Add, 0)};
+  content.fill.kind = patchy::VectorFillKind::Solid;
+  content.fill.color = patchy::RgbColor{10, 180, 90};
+  layer.set_vector_shape(std::move(content));
+
+  const auto revision_before = layer.content_revision();
+  patchy::update_vector_shape_raster(layer, canvas, nullptr);
+  CHECK(layer.content_revision() > revision_before);
+  CHECK(layer.bounds().x == 6 && layer.bounds().y == 8);
+  CHECK(layer.bounds().width == 16 && layer.bounds().height == 12);
+  const auto* px = std::as_const(layer).pixels().pixel(4, 4);
+  CHECK(px[0] == 10 && px[1] == 180 && px[2] == 90 && px[3] == 255);
+  CHECK(layer.metadata().at(patchy::kLayerMetadataVectorRasterStatus) ==
+        patchy::kVectorRasterStatusPatchy);
+
+  // Copies share the immutable content (undo snapshots stay cheap).
+  const patchy::Layer copy = layer;
+  CHECK(copy.vector_shape() == layer.vector_shape());
+  CHECK(patchy::layer_has_enabled_vector_mask(layer) == false);
+}
+
+// A copied group on a merged shape joins every part that paints its source, so
+// the copy paints in that part's color (GitHub issue 312); without parts it is a no-op.
+void vector_compound_copy_part_groups_paint_like_their_source() {
+  const Rect canvas{0, 0, 40, 40};
+  patchy::Layer layer(9, "merged", patchy::PixelBuffer());
+  patchy::VectorShapeContent content;
+  content.path.subpaths = {rect_subpath(2, 2, 10, 10, PathCombineOp::Add, 0),
+                           rect_subpath(20, 2, 28, 10, PathCombineOp::Add, 1),
+                           rect_subpath(20, 20, 28, 28, PathCombineOp::Add, 2)};  // copy of group 1
+  patchy::VectorShapePart green;
+  green.groups = {0};
+  green.fill.kind = patchy::VectorFillKind::Solid;
+  green.fill.color = patchy::RgbColor{10, 180, 90};
+  auto red = green;
+  red.groups = {1};
+  red.fill.color = patchy::RgbColor{200, 20, 30};
+  content.parts = {green, red};
+  patchy::copy_vector_part_groups(content, {{1, 2}});
+  CHECK(content.parts[0].groups == std::vector<std::int32_t>{0});
+  CHECK((content.parts[1].groups == std::vector<std::int32_t>{1, 2}));
+  layer.set_vector_shape(content);
+  patchy::update_vector_shape_raster(layer, canvas, nullptr);
+  const auto bounds = layer.bounds();
+  const auto* px = std::as_const(layer).pixels().pixel(24 - bounds.x, 24 - bounds.y);
+  CHECK(px[0] == 200 && px[1] == 20 && px[2] == 30 && px[3] == 255);
+
+  patchy::VectorShapeContent plain;
+  plain.path.subpaths = {rect_subpath(2, 2, 10, 10, PathCombineOp::Add, 0)};
+  patchy::copy_vector_part_groups(plain, {{0, 1}});
+  CHECK(plain.parts.empty());
+}
+
+// The document bake covers the whole shape, like a pixel layer keeps pixels
+// past the canvas edge: clipped to the canvas, a shape transformed onto the
+// pasteboard baked to nothing (the Move tool could no longer grab it) and a
+// half-off shape kept only its on-canvas half.
+void update_vector_shape_raster_keeps_off_canvas_shape() {
+  const Rect canvas{0, 0, 40, 40};
+  const auto bake = [&](patchy::VectorShapeContent content) {
+    patchy::Layer layer(9, "shape", patchy::PixelBuffer());
+    layer.set_vector_shape(std::move(content));
+    patchy::update_vector_shape_raster(layer, canvas, nullptr);
+    return layer;
+  };
+  patchy::VectorShapeContent content;
+  content.fill.kind = patchy::VectorFillKind::Solid;
+  content.fill.color = patchy::RgbColor{10, 180, 90};
+
+  // Wholly off the canvas: still baked, where the path is.
+  content.path.subpaths = {rect_subpath(-30, -25, -10, -5, PathCombineOp::Add, 0)};
+  auto off = bake(content);
+  CHECK(off.bounds().x == -30 && off.bounds().y == -25 && off.bounds().width == 20 && off.bounds().height == 20);
+  const auto* px = std::as_const(off).pixels().pixel(10, 10);
+  CHECK(px[1] == 180 && px[3] == 255);
+
+  // Crossing the left edge: both halves.
+  content.path.subpaths = {rect_subpath(-10, 8, 10, 20, PathCombineOp::Add, 0)};
+  auto crossing = bake(content);
+  CHECK(crossing.bounds().x == -10 && crossing.bounds().width == 20);
+
+  // An unaligned gradient keeps its canvas geometry, so the on-canvas pixels
+  // match a canvas-clipped render byte for byte.
+  content.fill.kind = patchy::VectorFillKind::Gradient;
+  auto& gradient = content.fill.gradient;
+  gradient.color_stops = {{0.0F, patchy::RgbColor{255, 0, 0}, 0.5F}, {1.0F, patchy::RgbColor{0, 0, 255}, 0.5F}};
+  gradient.alpha_stops = {{0.0F, 1.0F, 0.5F}, {1.0F, 1.0F, 0.5F}};
+  gradient.align_with_layer = false;
+  const auto baked = bake(content);
+  const auto clipped = patchy::rasterize_vector_shape(content, canvas, nullptr, nullptr);
+  CHECK(clipped.bounds.x == 0 && baked.bounds().x == -10);
+  bool same = true;
+  for (std::int32_t y = 0; y < clipped.bounds.height; ++y) {
+    for (std::int32_t x = 0; x < clipped.bounds.width; ++x) {
+      const auto* a = clipped.pixels.pixel(x, y);
+      const auto* b = std::as_const(baked).pixels().pixel(x + clipped.bounds.x - baked.bounds().x,
+                                                          y + clipped.bounds.y - baked.bounds().y);
+      same = same && std::equal(a, a + 4, b);
+    }
+  }
+  CHECK(same);
+
+  // Coverage that fills the whole clip (an inverted path) stays on the canvas.
+  content.fill.kind = patchy::VectorFillKind::Solid;
+  content.path_inverted = true;
+  auto inverted = bake(content);
+  CHECK(inverted.bounds().x >= 0 && inverted.bounds().y >= 0);
+  CHECK(inverted.bounds().x + inverted.bounds().width <= 40);
+}
+
+patchy::Layer make_shape_layer(patchy::Document& document, const char* name, patchy::PathSubpath subpath,
+                               patchy::RgbColor color) {
+  patchy::Layer layer(document.allocate_layer_id(), name, patchy::PixelBuffer());
+  layer.metadata()[patchy::kLayerMetadataVectorShape] = "1";
+  patchy::VectorShapeContent content;
+  content.path.subpaths = {std::move(subpath)};
+  content.fill.kind = patchy::VectorFillKind::Solid;
+  content.fill.color = color;
+  layer.set_vector_shape(std::move(content));
+  patchy::update_vector_shape_raster(layer, Rect::from_size(document.width(), document.height()), nullptr);
+  return layer;
+}
+
+void combine_shape_layers_truth_table() {
+  struct Expectation {
+    PathCombineOp op;
+    std::uint8_t only_a;
+    std::uint8_t overlap;
+    std::uint8_t only_b;
+  };
+  const Expectation table[] = {
+      {PathCombineOp::Add, 255, 255, 255},
+      {PathCombineOp::Subtract, 255, 0, 0},
+      {PathCombineOp::Intersect, 0, 255, 0},
+      {PathCombineOp::Xor, 255, 0, 255},
+  };
+  for (const auto& expected : table) {
+    patchy::Document document(64, 64, patchy::PixelFormat::rgba8());
+    auto a = make_shape_layer(document, "A", rect_subpath(8, 8, 40, 40, PathCombineOp::Add, 0),
+                              patchy::RgbColor{200, 30, 30});
+    auto b = make_shape_layer(document, "B", rect_subpath(24, 24, 56, 56, PathCombineOp::Add, 0),
+                              patchy::RgbColor{30, 30, 200});
+    const auto a_id = a.id();
+    const auto b_id = b.id();
+    document.add_layer(std::move(a));
+    document.add_layer(std::move(b));  // on top
+
+    const auto candidates = patchy::combine_shape_candidates(document.layers(), {b_id, a_id});
+    CHECK(candidates.refusal == patchy::ShapeCombineRefusal::None);
+    CHECK((candidates.bottom_to_top == std::vector<patchy::LayerId>{a_id, b_id}));
+    const auto result = patchy::combine_shape_layers(document, candidates.bottom_to_top, expected.op);
+    CHECK(result.has_value());
+    CHECK(result->layer_id == a_id && result->removed_layers == 1);
+    CHECK(document.layers().size() == 1);
+    const auto* merged = std::as_const(document).find_layer(a_id);
+    CHECK(merged != nullptr && merged->name() == "A");
+    CHECK(merged->vector_shape()->fill.color.red == 200);
+    const auto& subpaths = merged->vector_shape()->path.subpaths;
+    CHECK(subpaths.size() == 2);
+    CHECK(subpaths[0].op == PathCombineOp::Add && subpaths[0].shape_group == 0);
+    CHECK(subpaths[1].op == expected.op && subpaths[1].shape_group == 1);
+    const auto coverage = rasterize(merged->vector_shape()->path, Rect{0, 0, 64, 64});
+    CHECK(coverage_pixel(coverage, 12, 12) == expected.only_a);
+    CHECK(coverage_pixel(coverage, 32, 32) == expected.overlap);
+    CHECK(coverage_pixel(coverage, 50, 50) == expected.only_b);
+    // The bake followed the merge: the layer's pixels cover the same area.
+    const auto bounds = merged->bounds();
+    CHECK(bounds.contains(12, 12) == (expected.only_a == 255) || expected.only_a == 0);
+  }
+}
+
+void combine_shape_candidates_refuses_mixed_parents_locks_and_fill_layers() {
+  patchy::Document document(64, 64, patchy::PixelFormat::rgba8());
+  auto a = make_shape_layer(document, "A", rect_subpath(8, 8, 40, 40, PathCombineOp::Add, 0),
+                            patchy::RgbColor{200, 30, 30});
+  auto b = make_shape_layer(document, "B", rect_subpath(24, 24, 56, 56, PathCombineOp::Add, 0),
+                            patchy::RgbColor{30, 30, 200});
+  auto nested = make_shape_layer(document, "Nested", rect_subpath(4, 4, 12, 12, PathCombineOp::Add, 0),
+                                 patchy::RgbColor{30, 200, 30});
+  patchy::Layer fill(document.allocate_layer_id(), "Fill", patchy::PixelBuffer());
+  fill.metadata()[patchy::kLayerMetadataVectorShape] = "1";
+  patchy::VectorShapeContent whole_canvas;
+  whole_canvas.fill.kind = patchy::VectorFillKind::Solid;
+  fill.set_vector_shape(std::move(whole_canvas));
+  patchy::Layer pixel(document.allocate_layer_id(), "Pixel", patchy::PixelBuffer());
+  patchy::Layer group(document.allocate_layer_id(), "Group", patchy::LayerKind::Group);
+  const auto a_id = a.id();
+  const auto b_id = b.id();
+  const auto nested_id = nested.id();
+  const auto fill_id = fill.id();
+  const auto pixel_id = pixel.id();
+  group.add_child(std::move(nested));
+  document.add_layer(std::move(a));
+  document.add_layer(std::move(b));
+  document.add_layer(std::move(fill));
+  document.add_layer(std::move(pixel));
+  document.add_layer(std::move(group));
+
+  using patchy::ShapeCombineRefusal;
+  CHECK(patchy::combine_shape_candidates(document.layers(), {a_id}).refusal == ShapeCombineRefusal::NeedTwoLayers);
+  CHECK(patchy::combine_shape_candidates(document.layers(), {a_id, pixel_id}).refusal ==
+        ShapeCombineRefusal::NotShapeLayer);
+  CHECK(patchy::combine_shape_candidates(document.layers(), {a_id, fill_id}).refusal ==
+        ShapeCombineRefusal::EmptyPath);
+  CHECK(patchy::combine_shape_candidates(document.layers(), {a_id, nested_id}).refusal ==
+        ShapeCombineRefusal::DifferentParents);
+  CHECK(patchy::combine_shape_candidates(document.layers(), {b_id, a_id}).refusal == ShapeCombineRefusal::None);
+  patchy::set_layer_locks_all(*document.find_layer(b_id), true);
+  CHECK(patchy::combine_shape_candidates(document.layers(), {b_id, a_id}).refusal == ShapeCombineRefusal::Locked);
+}
+
+void document_paths_add_find_and_work_semantics() {
+  patchy::Document document(16, 16, patchy::PixelFormat::rgb8());
+  const auto id = document.allocate_path_id();
+  document.add_path(patchy::DocumentPath(id, "Alpha", patchy::DocumentPathKind::Saved, VectorPath{}));
+  const auto work_id = document.allocate_path_id();
+  document.add_path(patchy::DocumentPath(work_id, "Work Path", patchy::DocumentPathKind::Work, VectorPath{}));
+  CHECK(document.paths().size() == 2);
+  CHECK(document.find_path(id) != nullptr);
+  CHECK(document.work_path() != nullptr && document.work_path()->id() == work_id);
+
+  bool threw = false;
+  try {
+    document.add_path(
+        patchy::DocumentPath(document.allocate_path_id(), "second work", patchy::DocumentPathKind::Work,
+                             VectorPath{}));
+  } catch (const std::exception&) {
+    threw = true;
+  }
+  CHECK(threw);
+  CHECK(document.remove_path(work_id));
+  CHECK(document.work_path() == nullptr);
+  CHECK(!document.remove_path(9999));
+}
+
+}  // namespace
+
+
+void stroke_sub_lattice_dashes_are_bounded() {
+  VectorPath path;
+  path.subpaths = {open_line(0, 10, 15000, 10)};
+  patchy::VectorStroke stroke;
+  stroke.enabled = true;
+  stroke.width = 0.1;
+  stroke.dashes = {0.0001, 0.0001};
+  const auto tiny = stroke_coverage(path, stroke, Rect{0, 0, 32, 20});
+  stroke.dashes.clear();
+  const auto solid = stroke_coverage(path, stroke, Rect{0, 0, 32, 20});
+  CHECK(tiny.bounds.x == solid.bounds.x && tiny.bounds.y == solid.bounds.y);
+  CHECK(tiny.bounds.width == solid.bounds.width && tiny.bounds.height == solid.bounds.height);
+  CHECK(std::equal(tiny.pixels.data().begin(), tiny.pixels.data().end(),
+                   solid.pixels.data().begin(), solid.pixels.data().end()));
+}
+
+// Shape-layer Feather / Density (photoshop-shape-feather.psd): feather blurs
+// the whole rendered shape, stroke included, past the path; density shows the
+// fill everywhere at (255 - density)/255.
+void raster_shape_feather_softens_edge_and_density_floors_alpha() {
+  const Rect canvas{0, 0, 48, 48};
+  patchy::VectorShapeContent content;
+  content.path.subpaths = {rect_subpath(8, 8, 40, 40, PathCombineOp::Add, 0)};
+  content.fill.kind = patchy::VectorFillKind::Solid;
+  content.fill.color = patchy::RgbColor{214, 40, 40};
+  content.stroke.enabled = true;
+  content.stroke.width = 4.0;
+  content.stroke.alignment = patchy::VectorStrokeAlignment::Inside;
+  content.stroke.content.kind = patchy::VectorFillKind::Solid;
+  content.stroke.content.color = patchy::RgbColor{0, 0, 0};
+
+  const auto crisp = patchy::rasterize_vector_shape(content, canvas, nullptr, nullptr);
+  const auto crisp_stroke = crisp.pixels.pixel(10 - crisp.bounds.x, 24 - crisp.bounds.y);
+  CHECK(crisp_stroke[0] == 0 && crisp_stroke[3] == 255);
+
+  content.feather = 4.0;
+  const auto soft = patchy::rasterize_vector_shape(content, canvas, nullptr, nullptr);
+  CHECK(soft.bounds.x >= 0 && soft.bounds.x < 8);  // grows past the path, clipped to the canvas
+  CHECK(soft.bounds.x + soft.bounds.width <= 48);
+  const auto alpha_at = [&soft](int x, int y) {
+    return static_cast<int>(soft.pixels.pixel(x - soft.bounds.x, y - soft.bounds.y)[3]);
+  };
+  CHECK(alpha_at(24, 24) == 255);
+  const auto edge = alpha_at(8, 24);
+  CHECK(edge > 90 && edge < 170);  // ~half coverage on the path edge
+  const auto outside = alpha_at(4, 24);
+  CHECK(outside > 20 && outside < edge);
+  CHECK(alpha_at(0, 24) < 40);
+  // The stroke smears with the fill instead of staying a crisp black band.
+  const auto soft_stroke = soft.pixels.pixel(10 - soft.bounds.x, 24 - soft.bounds.y);
+  CHECK(soft_stroke[0] > 40);
+  // The split planes stay in lockstep with the baked pixels.
+  CHECK(soft.fill_pixels.empty() || soft.fill_pixels.width() == soft.pixels.width());
+
+  content.feather = 0.0;
+  content.stroke.enabled = false;
+  content.density = 153;  // 60%
+  const auto dense = patchy::rasterize_vector_shape(content, canvas, nullptr, nullptr);
+  CHECK(dense.bounds.x == 0 && dense.bounds.y == 0 && dense.bounds.width == 48 && dense.bounds.height == 48);
+  const auto far_alpha = static_cast<int>(dense.pixels.pixel(45, 45)[3]);
+  CHECK(far_alpha >= 98 && far_alpha <= 106);
+  CHECK(dense.pixels.pixel(24, 24)[3] == 255);
+}
+
+// Photoshop 27.11 (25 probes, docs/vector-tools-appearance.md, "Density with a stroke"): on a
+// shape whose stroke draws, Density under 100% gives
+//   density * the shape as drawn at 100% + (1 - density) * the stroke's paint alone,
+// premultiplied, with the stroke's paint spread over the whole clip. The canvas is tinted with
+// the stroke's color (not the fill's) and the fill sits under a wash of it. Green fill, red
+// stroke.
+void raster_shape_density_spreads_the_strokes_paint() {
+  const Rect canvas{0, 0, 96, 72};
+  using Pixel = std::array<int, 4>;
+  const auto pixel = [](const patchy::ShapeRasterResult& raster, int x, int y) -> Pixel {
+    if (raster.bounds.empty() || !raster.bounds.contains(x, y)) {
+      return {0, 0, 0, 0};
+    }
+    const auto* p = raster.pixels.pixel(x - raster.bounds.x, y - raster.bounds.y);
+    return {p[0], p[1], p[2], p[3]};
+  };
+  const auto plane_pixel = [](const patchy::PixelBuffer& plane, Rect bounds, int x, int y) -> Pixel {
+    if (plane.empty() || !bounds.contains(x, y)) {
+      return {0, 0, 0, 0};
+    }
+    const auto* p = plane.pixel(x - bounds.x, y - bounds.y);
+    return {p[0], p[1], p[2], p[3]};
+  };
+  // How far `drawn` is from density * `full` + (1 - density) * wash, premultiplied, over the
+  // whole canvas; wash(x, y) is the stroke's paint there.
+  const auto worst_error = [&](const patchy::ShapeRasterResult& full, const patchy::ShapeRasterResult& drawn,
+                               int density, const std::function<Pixel(int, int)>& wash) {
+    double worst = 0.0;
+    for (int y = canvas.y; y < canvas.y + canvas.height; ++y) {
+      for (int x = canvas.x; x < canvas.x + canvas.width; ++x) {
+        const auto a = pixel(full, x, y);
+        const auto u = wash(x, y);
+        const auto got = pixel(drawn, x, y);
+        const double alpha = (density * a[3] + (255 - density) * u[3]) / 255.0;
+        worst = std::max(worst, std::abs(got[3] - alpha));
+        for (std::size_t c = 0; c < 3; ++c) {
+          const double want = (density * a[3] * a[c] + (255 - density) * u[3] * u[c]) / (255.0 * 255.0);
+          worst = std::max(worst, std::abs(got[c] * got[3] / 255.0 - want));
+        }
+      }
+    }
+    return worst;
+  };
+  const auto red_wash = [](int, int) { return Pixel{255, 0, 0, 255}; };
+
+  patchy::VectorShapeContent base;
+  base.path.subpaths = {rect_subpath(28, 20, 68, 52, PathCombineOp::Add, 0)};
+  base.fill.kind = patchy::VectorFillKind::Solid;
+  base.fill.color = patchy::RgbColor{0, 255, 0};
+  base.stroke.enabled = true;
+  base.stroke.width = 6.0;
+  base.stroke.content.kind = patchy::VectorFillKind::Solid;
+  base.stroke.content.color = patchy::RgbColor{255, 0, 0};
+  CHECK(!patchy::vector_shape_density_spreads(base));
+
+  struct Side {
+    patchy::VectorStrokeAlignment alignment;
+    int stroke_x;  // a column inside the left side's band, on row 36
+  };
+  for (const auto side : {Side{patchy::VectorStrokeAlignment::Inside, 30}, Side{patchy::VectorStrokeAlignment::Center, 28},
+                          Side{patchy::VectorStrokeAlignment::Outside, 25}}) {
+    auto shape = base;
+    shape.stroke.alignment = side.alignment;
+    const auto full = patchy::rasterize_vector_shape(shape, canvas, nullptr, nullptr);
+    CHECK(pixel(full, 4, 4)[3] == 0);
+    for (const int density : {250, 128, 0}) {
+      shape.density = static_cast<std::uint8_t>(density);
+      CHECK(patchy::vector_shape_density_spreads(shape));
+      const auto drawn = patchy::rasterize_vector_shape(shape, canvas, nullptr, nullptr);
+      CHECK(drawn.bounds == canvas);
+      // Far from the shape: the stroke's red at the Density floor (5, 127 and 255 in Photoshop).
+      CHECK((pixel(drawn, 4, 4) == Pixel{255, 0, 0, 255 - density}));
+      CHECK((pixel(drawn, 92, 68) == Pixel{255, 0, 0, 255 - density}));
+      // Inside the fill: the fill under a wash of the stroke (5,250 and 127,128 in Photoshop).
+      CHECK((pixel(drawn, 48, 36) == Pixel{255 - density, density, 0, 255}));
+      // On the stroke: the stroke.
+      CHECK((pixel(drawn, side.stroke_x, 36) == Pixel{255, 0, 0, 255}));
+      CHECK(worst_error(full, drawn, density, red_wash) <= 1.0);
+    }
+  }
+
+  // Edge pixels keep the rule of stroke_shape_fill_and_stroke_share_edge_pixels under the
+  // wash, and the wash is solid whatever the stroke's dashes.
+  {
+    auto shape = base;
+    LiveShapeParams params;
+    params.kind = LiveShapeKind::Ellipse;
+    params.left = 22.3;
+    params.top = 14.6;
+    params.right = 74.2;
+    params.bottom = 58.9;
+    shape.path.subpaths = patchy::generate_live_shape_subpaths(params);
+    for (const bool dashed : {false, true}) {
+      for (const auto alignment : {patchy::VectorStrokeAlignment::Inside, patchy::VectorStrokeAlignment::Outside}) {
+        shape.density = 255;
+        shape.stroke.alignment = alignment;
+        shape.stroke.dashes = dashed ? std::vector<double>{2.0, 1.0} : std::vector<double>{};
+        const auto full = patchy::rasterize_vector_shape(shape, canvas, nullptr, nullptr);
+        shape.density = 128;
+        const auto drawn = patchy::rasterize_vector_shape(shape, canvas, nullptr, nullptr);
+        CHECK(worst_error(full, drawn, 128, red_wash) <= 1.0);
+      }
+    }
+  }
+
+  // No fill: the wash still covers the canvas and the shape's hollow inside.
+  {
+    auto shape = base;
+    shape.fill.kind = patchy::VectorFillKind::None;
+    shape.density = 128;
+    CHECK(patchy::vector_shape_density_spreads(shape));
+    const auto drawn = patchy::rasterize_vector_shape(shape, canvas, nullptr, nullptr);
+    CHECK((pixel(drawn, 48, 36) == Pixel{255, 0, 0, 127}));
+    CHECK((pixel(drawn, 4, 4) == Pixel{255, 0, 0, 127}));
+    CHECK((pixel(drawn, 28, 36) == Pixel{255, 0, 0, 255}));
+  }
+  // Stroke off: the fill's paint is what spreads, as before.
+  {
+    auto shape = base;
+    shape.stroke.enabled = false;
+    shape.density = 128;
+    CHECK(patchy::vector_shape_density_spreads(shape));
+    const auto drawn = patchy::rasterize_vector_shape(shape, canvas, nullptr, nullptr);
+    CHECK((pixel(drawn, 4, 4) == Pixel{0, 255, 0, 127}));
+    CHECK((pixel(drawn, 48, 36) == Pixel{0, 255, 0, 255}));
+  }
+  // The stroke's own opacity thins the wash with the stroke (Photoshop ignores that opacity
+  // altogether; Patchy applies it to both).
+  {
+    auto shape = base;
+    shape.stroke.opacity = 0.5;
+    shape.density = 128;
+    const auto drawn = patchy::rasterize_vector_shape(shape, canvas, nullptr, nullptr);
+    const auto away = pixel(drawn, 4, 4);
+    CHECK(away[0] == 255 && away[1] == 0 && away[3] >= 63 && away[3] <= 64);
+  }
+  // A gradient aligned with the layer keeps the box it has on the stroke: its ramp runs over
+  // the stroke's bounds (25..71 here) and the rest of the canvas shows its end colors.
+  {
+    auto shape = base;
+    shape.stroke.alignment = patchy::VectorStrokeAlignment::Center;
+    shape.stroke.content.kind = patchy::VectorFillKind::Gradient;
+    shape.stroke.content.gradient.align_with_layer = true;
+    shape.stroke.content.gradient.angle_degrees = 0.0F;
+    shape.stroke.content.gradient.dither = false;
+    shape.stroke.content.gradient.color_stops = {{0.0F, patchy::RgbColor{255, 0, 0}, 0.5F},
+                                                 {1.0F, patchy::RgbColor{0, 0, 255}, 0.5F}};
+    shape.stroke.content.gradient.alpha_stops = {{0.0F, 1.0F, 0.5F}, {1.0F, 1.0F, 0.5F}};
+    const auto full = patchy::rasterize_vector_shape(shape, canvas, nullptr, nullptr);
+    shape.density = 128;
+    const auto drawn = patchy::rasterize_vector_shape(shape, canvas, nullptr, nullptr);
+    const auto left = pixel(drawn, 3, 6);
+    const auto right = pixel(drawn, 92, 6);
+    const auto middle = pixel(drawn, 48, 6);
+    CHECK(left[0] >= 250 && left[2] <= 5 && left[3] == 127);
+    CHECK(right[2] >= 250 && right[0] <= 5 && right[3] == 127);
+    CHECK(std::abs(middle[0] - middle[2]) <= 24 && middle[3] == 127);
+    // On the stroke the wash and the stroke are the same paint, so the band is unchanged.
+    CHECK(pixel(drawn, 48, 20) == pixel(full, 48, 20));
+    CHECK(pixel(drawn, 28, 36) == pixel(full, 28, 36));
+  }
+  // Feather blurs the shape, not the wash.
+  {
+    auto shape = base;
+    shape.feather = 3.0;
+    const auto full = patchy::rasterize_vector_shape(shape, canvas, nullptr, nullptr);
+    shape.density = 128;
+    const auto drawn = patchy::rasterize_vector_shape(shape, canvas, nullptr, nullptr);
+    CHECK(drawn.bounds == canvas);
+    CHECK((pixel(drawn, 4, 4) == Pixel{255, 0, 0, 127}));
+    CHECK(worst_error(full, drawn, 128, red_wash) <= 1.0);
+  }
+  // The split planes for interior overlays: the fill plane stays the fill at 100%, and the
+  // stroke plane carries the wash where the fill is (an overlay covers it there), not outside
+  // the fill, where the layer's own pixels already hold it.
+  {
+    auto shape = base;
+    shape.stroke.alignment = patchy::VectorStrokeAlignment::Center;
+    const auto full = patchy::rasterize_vector_shape(shape, canvas, nullptr, nullptr);
+    shape.density = 128;
+    const auto drawn = patchy::rasterize_vector_shape(shape, canvas, nullptr, nullptr);
+    CHECK(!full.fill_pixels.empty() && !drawn.fill_pixels.empty() && !drawn.stroke_pixels.empty());
+    for (const auto& [x, y] : {std::pair{48, 36}, {4, 4}, {28, 36}, {31, 36}}) {
+      CHECK(plane_pixel(drawn.fill_pixels, drawn.bounds, x, y) == plane_pixel(full.fill_pixels, full.bounds, x, y));
+    }
+    CHECK((plane_pixel(drawn.stroke_pixels, drawn.bounds, 48, 36) == Pixel{255, 0, 0, 127}));
+    CHECK(plane_pixel(drawn.stroke_pixels, drawn.bounds, 4, 4)[3] == 0);
+    CHECK((plane_pixel(drawn.stroke_pixels, drawn.bounds, 29, 36) == Pixel{255, 0, 0, 255}));
+  }
+  // Density 100% is untouched by any of this.
+  {
+    auto shape = base;
+    const auto once = patchy::rasterize_vector_shape(shape, canvas, nullptr, nullptr);
+    CHECK(once.bounds.width < canvas.width && pixel(once, 48, 36) == (Pixel{0, 255, 0, 255}));
+  }
+}
+
+// Photoshop 2026 gradient fill probes (docs/gradients.md, "Gradient fill layer
+// geometry"): corner sampling and whole-pixel chord ends. Positions are read off
+// Photoshop's black-to-white renders through the eased ramp, so they are exact here.
+void gradient_fill_layer_geometry_matches_photoshop_probes() {
+  patchy::LayerStyleGradient gradient;
+  gradient.color_stops = {{0.0F, patchy::RgbColor{0, 0, 0}, 0.5F}, {1.0F, patchy::RgbColor{255, 255, 255}, 0.5F}};
+  gradient.alpha_stops = {{0.0F, 1.0F, 0.5F}, {1.0F, 1.0F, 0.5F}};
+  const auto position = [&gradient](patchy::Rect bounds, int x, int y) {
+    return patchy::gradient_position(gradient, bounds, x, y, patchy::GradientSpanBasis::CenterChord);
+  };
+  const auto close_to = [](float a, float b) { return std::abs(a - b) < 1e-4F; };
+  // Linear at 0 degrees on 4x4: x / 4 (pixel corners, not centers).
+  gradient.type = patchy::LayerStyleGradientType::Linear;
+  gradient.angle_degrees = 0.0F;
+  const auto box4 = patchy::Rect::from_size(4, 4);
+  for (int x = 0; x < 4; ++x) {
+    CHECK(close_to(position(box4, x, 2), static_cast<float>(x) / 4.0F));
+  }
+  // Reflected at 30 degrees on 4x4: the truncated far end makes it a 45-degree ramp,
+  // |x - y| / 4 (Photoshop's 0, 52, 128, 203 row).
+  gradient.type = patchy::LayerStyleGradientType::Reflected;
+  gradient.angle_degrees = 30.0F;
+  for (int y = 0; y < 4; ++y) {
+    for (int x = 0; x < 4; ++x) {
+      CHECK(close_to(position(box4, x, y), static_cast<float>(std::abs(x - y)) / 4.0F));
+    }
+  }
+  // 8x8: the far end (8, 1.69) truncates to (8, 1), so the zero line runs through
+  // (1, 0) and the center (4, 4), a 36.87-degree ramp.
+  const auto box8 = patchy::Rect::from_size(8, 8);
+  CHECK(close_to(position(box8, 1, 0), 0.0F));
+  CHECK(close_to(position(box8, 4, 4), 0.0F));
+  CHECK(position(box8, 0, 0) > 0.0F);
+  // Radial at 0 degrees on 8x8: distance from the corner-sampled center over 4.
+  gradient.type = patchy::LayerStyleGradientType::Radial;
+  gradient.angle_degrees = 0.0F;
+  CHECK(close_to(position(box8, 4, 4), 0.0F));
+  CHECK(close_to(position(box8, 6, 4), 0.5F));
+  CHECK(close_to(position(box8, 7, 0), 1.0F));
+  // Layer-style overlays keep their own (pixel-center, projected-span) geometry.
+  gradient.type = patchy::LayerStyleGradientType::Reflected;
+  gradient.angle_degrees = 30.0F;
+  CHECK(!close_to(patchy::gradient_position(gradient, box4, 0, 0, patchy::GradientSpanBasis::LayerProjection), 0.0F));
+}
+
+// A gradient fill layer without a vector mask aligns to the layer's bounds, which its
+// user mask decides when the mask hides the rest of the canvas: Photoshop's
+// gradient-fill.psd (32-bit) spans the mask's visible rows 6..100, not the canvas. The
+// 8-bit bake and the deep raster agree.
+void gradient_fill_layer_aligns_to_its_mask_bounds() {
+  constexpr int kSize = 40;
+  patchy::Layer layer(1, "Gradient Fill 1", patchy::PixelBuffer());
+  patchy::VectorShapeContent content;
+  content.fill.kind = patchy::VectorFillKind::Gradient;
+  content.fill.gradient.type = patchy::LayerStyleGradientType::Linear;
+  content.fill.gradient.angle_degrees = 90.0F;  // bottom (first stop) to top
+  content.fill.gradient.align_with_layer = true;
+  content.fill.gradient.color_stops = {{0.0F, patchy::RgbColor{0, 0, 0}, 0.5F},
+                                       {1.0F, patchy::RgbColor{255, 255, 255}, 0.5F}};
+  content.fill.gradient.alpha_stops = {{0.0F, 1.0F, 0.5F}, {1.0F, 1.0F, 0.5F}};
+  layer.set_vector_shape(content);
+  layer.metadata()[patchy::kLayerMetadataVectorShape] = "1";
+  patchy::PixelBuffer mask(kSize, kSize, patchy::PixelFormat::gray8());
+  mask.clear(0);
+  for (int y = 10; y < 30; ++y) {
+    for (int x = 15; x < 25; ++x) {
+      mask.pixel(x, y)[0] = 255;
+    }
+  }
+  layer.set_mask(patchy::LayerMask{patchy::Rect::from_size(kSize, kSize), mask, 0, false});
+  const auto canvas = patchy::Rect::from_size(kSize, kSize);
+  patchy::update_vector_shape_raster(layer, canvas, nullptr);
+  const auto& pixels = layer.pixels();
+  const auto value_at = [&](int y) {
+    return static_cast<int>(pixels.pixel(20 - layer.bounds().x, y - layer.bounds().y)[0]);
+  };
+  // The ramp runs over the mask's rows 10..29: nearly black at its bottom, nearly white
+  // at its top, where the canvas-wide ramp would sit near the middle.
+  CHECK(value_at(29) < 40);
+  CHECK(value_at(10) > 215);
+  CHECK(value_at(20) > 100 && value_at(20) < 160);
+
+  // A mask that shows the canvas outside it keeps the canvas alignment.
+  auto revealed = layer;
+  auto revealed_mask = *revealed.mask();
+  revealed_mask.default_color = 255;
+  revealed.set_mask(revealed_mask);
+  patchy::update_vector_shape_raster(revealed, canvas, nullptr);
+  const auto canvas_value = static_cast<int>(
+      revealed.pixels().pixel(20 - revealed.bounds().x, 29 - revealed.bounds().y)[0]);
+  CHECK(canvas_value > 40);
+
+  // The 16-bit raster spans the same rows.
+  const auto deep = patchy::deep_gradient_fill_raster(layer, patchy::BitDepth::UInt16);
+  CHECK(deep != nullptr);
+  if (deep != nullptr) {
+    const auto deep_at = [&](int y) {
+      return patchy::load_pixel(deep->format(), deep->pixel(20 - layer.bounds().x, y - layer.bounds().y))[0];
+    };
+    CHECK(std::abs(deep_at(29) - static_cast<float>(value_at(29))) < 2.0F);
+    CHECK(std::abs(deep_at(10) - static_cast<float>(value_at(10))) < 2.0F);
+  }
+}
+
+// The Gradient tool's Fill Layer mode (GitHub issue 580): the Gradient Fill built from a drag
+// renders what the tool paints for the same drag, every style (Angle, Reflected and Diamond since
+// GitHub issue 610), reversed, with transparent stops, and from drags that start or end off the
+// canvas. Angle skips its start pixel and the pixels next to its seam ray, where float and double
+// rounding can put a pixel at the start or the end of the sweep.
+void gradient_fill_from_drag_renders_the_gradient_tool_drag() {
+  constexpr int kWidth = 64;
+  constexpr int kHeight = 48;
+  const auto canvas = patchy::Rect::from_size(kWidth, kHeight);
+  struct DragCase {
+    patchy::GradientMethod method;
+    bool reverse;
+    std::vector<patchy::GradientStop> stops;
+    int x0, y0, x1, y1;
+  };
+  const std::vector<patchy::GradientStop> two_stops{patchy::GradientStop{0.0F, patchy::EditColor{230, 20, 10, 255}},
+                                                    patchy::GradientStop{1.0F, patchy::EditColor{10, 40, 240, 255}}};
+  const std::vector<patchy::GradientStop> faded{patchy::GradientStop{0.0F, patchy::EditColor{0, 0, 0, 255}},
+                                                patchy::GradientStop{0.4F, patchy::EditColor{255, 255, 0, 128}},
+                                                patchy::GradientStop{1.0F, patchy::EditColor{0, 128, 255, 0}}};
+  const std::vector<DragCase> cases{
+      {patchy::GradientMethod::Linear, false, two_stops, 5, 10, 50, 30},
+      {patchy::GradientMethod::Linear, true, faded, 60, 40, 10, 5},
+      {patchy::GradientMethod::Linear, false, two_stops, 32, 2, 32, 45},
+      {patchy::GradientMethod::Linear, false, faded, -20, 5, 90, 9},
+      {patchy::GradientMethod::Radial, false, two_stops, 20, 20, 35, 28},
+      {patchy::GradientMethod::Radial, true, faded, -10, 50, 30, 10},
+      {patchy::GradientMethod::Reflected, false, two_stops, 30, 20, 45, 30},
+      {patchy::GradientMethod::Reflected, true, faded, -5, 40, 20, 10},
+      {patchy::GradientMethod::Diamond, false, two_stops, 32, 24, 44, 30},
+      {patchy::GradientMethod::Diamond, true, faded, 10, 10, 30, 10},
+      {patchy::GradientMethod::Angle, false, two_stops, 30, 22, 50, 30},
+      {patchy::GradientMethod::Angle, true, faded, 20, 30, 20, 10},
+  };
+  for (const auto& drag : cases) {
+    patchy::Document painted(kWidth, kHeight, patchy::PixelFormat::rgba8());
+    painted.add_pixel_layer("Paint", patchy::PixelBuffer(kWidth, kHeight, patchy::PixelFormat::rgba8()));
+    patchy::GradientOptions options;
+    options.method = drag.method;
+    options.reverse = drag.reverse;
+    options.stops = drag.stops;
+    const auto paint_id = painted.layers().front().id();
+    CHECK(!patchy::draw_gradient(painted, paint_id, drag.x0, drag.y0, drag.x1, drag.y1, patchy::EditOptions{}, options)
+               .empty());
+    const auto& paint = std::as_const(painted).layers().front();
+
+    patchy::Layer fill(1, "Gradient Fill 1", patchy::PixelBuffer());
+    patchy::VectorShapeContent content;
+    content.fill.kind = patchy::VectorFillKind::Gradient;
+    content.fill.gradient = patchy::gradient_fill_from_drag(drag.stops, drag.method, drag.reverse, canvas, drag.x0,
+                                                            drag.y0, drag.x1, drag.y1);
+    content.stroke.enabled = false;
+    CHECK(!content.fill.gradient.align_with_layer);
+    fill.set_vector_shape(content);
+    fill.metadata()[patchy::kLayerMetadataVectorShape] = "1";
+    patchy::update_vector_shape_raster(fill, canvas, nullptr);
+    CHECK(fill.bounds().width == kWidth && fill.bounds().height == kHeight);
+    int worst_color = 0;
+    int worst_alpha = 0;
+    for (int y = 0; y < kHeight; ++y) {
+      for (int x = 0; x < kWidth; ++x) {
+        if (drag.method == patchy::GradientMethod::Angle) {
+          const auto t = patchy::gradient_tool_position(drag.method, x - drag.x0, y - drag.y0, drag.x1 - drag.x0,
+                                                        drag.y1 - drag.y0);
+          if ((x == drag.x0 && y == drag.y0) || t < 0.01 || t > 0.99) {
+            continue;
+          }
+        }
+        const auto* expected = paint.pixels().pixel(x - paint.bounds().x, y - paint.bounds().y);
+        const auto* actual = fill.pixels().pixel(x - fill.bounds().x, y - fill.bounds().y);
+        auto alpha = std::abs(static_cast<int>(expected[3]) - static_cast<int>(actual[3]));
+        int color = 0;
+        if (expected[3] >= 8) {
+          for (int channel = 0; channel < 3; ++channel) {
+            color = std::max(color, std::abs(static_cast<int>(expected[channel]) - static_cast<int>(actual[channel])));
+          }
+        }
+        worst_alpha = std::max(worst_alpha, alpha);
+        worst_color = std::max(worst_color, color);
+      }
+    }
+    if (worst_color > 2 || worst_alpha > 2) {
+      std::cerr << "drag " << drag.x0 << ',' << drag.y0 << " -> " << drag.x1 << ',' << drag.y1 << " differs by "
+                << worst_color << " (color) and " << worst_alpha << " (alpha)\n";
+    }
+    CHECK(worst_color <= 2);
+    CHECK(worst_alpha <= 2);
+  }
+  // A drag much longer than the canvas still fits the Gradient Fill dialog's Scale range.
+  const auto long_drag = patchy::gradient_fill_from_drag(two_stops, patchy::GradientMethod::Linear, false, canvas,
+                                                         -2000, 0, 2000, 0);
+  CHECK(long_drag.scale <= 10.0F);
+}
+
+// The Gradient tool's on-canvas handles (GitHub issue 663): gradient_fill_line inverts the
+// placement gradient_fill_from_drag stores, for every style, reversed or not, with drags that
+// start or end off a non-square canvas, and over aligned layer bounds placed by
+// place_gradient_fill_line.
+void gradient_fill_line_inverts_the_drag_placement() {
+  const std::vector<patchy::GradientStop> stops{patchy::GradientStop{0.0F, patchy::EditColor{230, 20, 10, 255}},
+                                                patchy::GradientStop{1.0F, patchy::EditColor{10, 40, 240, 255}}};
+  const std::array<patchy::GradientMethod, 5> methods{patchy::GradientMethod::Linear, patchy::GradientMethod::Radial,
+                                                      patchy::GradientMethod::Angle, patchy::GradientMethod::Reflected,
+                                                      patchy::GradientMethod::Diamond};
+  const std::array<patchy::Rect, 3> canvases{patchy::Rect::from_size(64, 48), patchy::Rect::from_size(30, 90),
+                                             patchy::Rect::from_size(500, 120)};
+  struct Drag {
+    int x0, y0, x1, y1;
+  };
+  const std::array<Drag, 6> drags{Drag{5, 10, 50, 30}, Drag{60, 40, 10, 5}, Drag{20, 2, 20, 45},
+                                  Drag{-20, 5, 90, 9}, Drag{3, 70, 28, 71}, Drag{40, 40, 41, 12}};
+  double worst = 0.0;
+  for (const auto canvas : canvases) {
+    for (const auto method : methods) {
+      for (const bool reverse : {false, true}) {
+        for (const auto& drag : drags) {
+          const auto gradient =
+              patchy::gradient_fill_from_drag(stops, method, reverse, canvas, drag.x0, drag.y0, drag.x1, drag.y1);
+          const auto line = patchy::gradient_fill_line(gradient, canvas);
+          worst = std::max({worst, std::abs(line.start_x - drag.x0), std::abs(line.start_y - drag.y0),
+                            std::abs(line.end_x - drag.x1), std::abs(line.end_y - drag.y1)});
+          // With Align with Layer the same line placed over a layer rectangle comes back too,
+          // and moving it keeps the angle and scale while the offsets change.
+          auto aligned = gradient;
+          aligned.align_with_layer = true;
+          const patchy::Rect layer_bounds{canvas.x + 7, canvas.y + 3, canvas.width / 2 + 1, canvas.height / 3 + 2};
+          patchy::place_gradient_fill_line(aligned, layer_bounds, line);
+          const auto aligned_line = patchy::gradient_fill_line(aligned, layer_bounds);
+          // A drag over ten times the layer's chord clamps to the 1000% Scale limit.
+          const bool clamped = aligned.scale >= 10.0F || aligned.scale <= 0.01F;
+          worst = clamped ? worst : std::max({worst, std::abs(aligned_line.start_x - drag.x0), std::abs(aligned_line.start_y - drag.y0),
+                            std::abs(aligned_line.end_x - drag.x1), std::abs(aligned_line.end_y - drag.y1)});
+          auto moved = aligned;
+          patchy::place_gradient_fill_line(moved, layer_bounds,
+                                           patchy::GradientFillLine{line.start_x + 9.0, line.start_y - 4.0,
+                                                                    line.end_x + 9.0, line.end_y - 4.0});
+          CHECK(std::abs(moved.angle_degrees - aligned.angle_degrees) < 1e-3F);
+          CHECK(std::abs(moved.scale - aligned.scale) < 1e-5F);
+          CHECK(moved.reverse == reverse);
+          CHECK(moved.type == gradient.type);
+        }
+      }
+    }
+  }
+  if (worst >= 0.01) {
+    std::cerr << "gradient_fill_line is off by " << worst << " px\n";
+  }
+  CHECK(worst < 0.01);
+
+  // Stop locations map onto the line from the start handle, mirrored when reversed.
+  const patchy::GradientFillLine line{10.0, 20.0, 110.0, 20.0};
+  CHECK(std::abs(patchy::gradient_fill_line_location(line, false, 35.0, 27.0) - 0.25) < 1e-9);
+  CHECK(std::abs(patchy::gradient_fill_line_location(line, true, 35.0, 27.0) - 0.75) < 1e-9);
+  const auto [px, py] = patchy::gradient_fill_line_point(line, true, 0.75);
+  CHECK(std::abs(px - 35.0) < 1e-9 && std::abs(py - 20.0) < 1e-9);
+  // A line of no length leaves the placement alone.
+  auto untouched = patchy::gradient_fill_from_drag(stops, patchy::GradientMethod::Linear, false, canvases[0], 1, 2, 30,
+                                                   20);
+  const auto before = untouched;
+  patchy::place_gradient_fill_line(untouched, canvases[0], patchy::GradientFillLine{5.0, 5.0, 5.0, 5.0});
+  CHECK(untouched == before);
+}
+
+// The Gradient Fill handles' draft (GitHub issues 663 and 714): the whole canvas at step 1 is
+// what update_gradient_fill_draft_raster bakes and stays within a few levels of the exact
+// bake, a part at a coarser step is the same fill at that scale, and a second render of
+// the same size writes into the same buffer.
+void gradient_fill_draft_renders_a_part_at_a_coarser_scale() {
+  const auto canvas = patchy::Rect::from_size(1600, 1200);
+  patchy::Layer layer(1, "Gradient Fill 1", patchy::PixelBuffer());
+  patchy::VectorShapeContent content;
+  content.fill.kind = patchy::VectorFillKind::Gradient;
+  content.fill.gradient.align_with_layer = false;
+  content.fill.gradient.angle_degrees = 30.0F;
+  content.fill.gradient.color_stops = {{0.0F, patchy::RgbColor{200, 30, 30}, 0.5F},
+                                       {1.0F, patchy::RgbColor{30, 40, 210}, 0.5F}};
+  content.fill.gradient.alpha_stops = {{0.0F, 1.0F, 0.5F}, {1.0F, 1.0F, 0.5F}};
+  content.stroke.enabled = false;
+  layer.set_vector_shape(content);
+  layer.metadata()[patchy::kLayerMetadataVectorShape] = "1";
+  CHECK(patchy::gradient_fill_draft_supported(std::as_const(layer), canvas));
+  // A small canvas bakes exactly.
+  CHECK(!patchy::gradient_fill_draft_supported(std::as_const(layer), patchy::Rect::from_size(400, 300)));
+
+  const auto same_bytes = [](const patchy::PixelBuffer& left, const patchy::PixelBuffer& right) {
+    return left.width() == right.width() && left.height() == right.height() &&
+           std::ranges::equal(left.data(), right.data());
+  };
+  const auto max_difference = [](const std::uint8_t* left, const std::uint8_t* right) {
+    int difference = 0;
+    for (int channel = 0; channel < 4; ++channel) {
+      difference = std::max(difference, std::abs(static_cast<int>(left[channel]) - static_cast<int>(right[channel])));
+    }
+    return difference;
+  };
+
+  auto drafted = layer;
+  CHECK(patchy::update_gradient_fill_draft_raster(drafted, canvas, canvas));
+  CHECK(std::as_const(drafted).bounds() == canvas);
+  patchy::PixelBuffer whole;
+  patchy::render_gradient_fill_draft(content.fill.gradient, canvas, 0, 0, 1, canvas.width, canvas.height, whole);
+  CHECK(same_bytes(std::as_const(whole), std::as_const(drafted).pixels()));
+
+  auto exact = layer;
+  patchy::update_vector_shape_raster(exact, canvas, nullptr);
+  CHECK(std::as_const(exact).bounds() == canvas);
+  int worst_against_exact = 0;
+  for (std::int32_t y = 0; y < canvas.height; y += 7) {
+    for (std::int32_t x = 0; x < canvas.width; x += 7) {
+      worst_against_exact = std::max(
+          worst_against_exact, max_difference(std::as_const(whole).pixel(x, y), std::as_const(exact).pixels().pixel(x, y)));
+    }
+  }
+  CHECK(worst_against_exact <= 4);
+
+  // A 800 x 600 part of the canvas at a quarter of its resolution: each pixel is the
+  // document pixel in the middle of its 4 x 4 block.
+  patchy::PixelBuffer part;
+  patchy::render_gradient_fill_draft(content.fill.gradient, canvas, 400, 300, 4, 200, 150, part);
+  CHECK(part.width() == 200 && part.height() == 150);
+  int worst_against_whole = 0;
+  for (std::int32_t y = 0; y < 150; ++y) {
+    for (std::int32_t x = 0; x < 200; ++x) {
+      worst_against_whole = std::max(worst_against_whole,
+                                     max_difference(std::as_const(part).pixel(x, y),
+                                                    std::as_const(whole).pixel(400 + x * 4 + 2, 300 + y * 4 + 2)));
+    }
+  }
+  CHECK(worst_against_whole <= 2);
+
+  // The next render of that size reuses the buffer.
+  const auto* storage = std::as_const(part).data().data();
+  auto turned = content.fill.gradient;
+  turned.angle_degrees = 120.0F;
+  const auto first_pixel = std::array<std::uint8_t, 4>{std::as_const(part).pixel(0, 0)[0], std::as_const(part).pixel(0, 0)[1],
+                                                       std::as_const(part).pixel(0, 0)[2], std::as_const(part).pixel(0, 0)[3]};
+  patchy::render_gradient_fill_draft(turned, canvas, 400, 300, 4, 200, 150, part);
+  CHECK(std::as_const(part).data().data() == storage);
+  CHECK(max_difference(std::as_const(part).pixel(0, 0), first_pixel.data()) > 8);
+  // Another size gets a buffer of that size.
+  patchy::render_gradient_fill_draft(turned, canvas, 0, 0, 8, 100, 75, part);
+  CHECK(part.width() == 100 && part.height() == 75);
+
+  // A fill with a path is not the draft's.
+  content.path.subpaths = {rect_subpath(10.0, 12.0, 50.0, 40.0, PathCombineOp::Add, 0)};
+  layer.set_vector_shape(content);
+  CHECK(!patchy::gradient_fill_draft_supported(std::as_const(layer), canvas));
+  CHECK(!patchy::update_gradient_fill_draft_raster(layer, canvas, canvas));
+}
+
+// The handles measure Align with Layer placements over the bounds the bake uses: the canvas
+// without alignment, a shape's coverage bounds with it.
+void gradient_fill_alignment_bounds_follow_the_bake() {
+  const auto canvas = patchy::Rect::from_size(80, 60);
+  patchy::Layer layer(1, "Gradient Fill 1", patchy::PixelBuffer());
+  patchy::VectorShapeContent content;
+  content.fill.kind = patchy::VectorFillKind::Gradient;
+  content.fill.gradient.align_with_layer = false;
+  content.fill.gradient.color_stops = {{0.0F, patchy::RgbColor{0, 0, 0}, 0.5F},
+                                       {1.0F, patchy::RgbColor{255, 255, 255}, 0.5F}};
+  content.fill.gradient.alpha_stops = {{0.0F, 1.0F, 0.5F}, {1.0F, 1.0F, 0.5F}};
+  content.stroke.enabled = false;
+  content.path.subpaths = {rect_subpath(10.0, 12.0, 50.0, 40.0, PathCombineOp::Add, 0)};
+  layer.set_vector_shape(content);
+  layer.metadata()[patchy::kLayerMetadataVectorShape] = "1";
+  CHECK(patchy::gradient_fill_alignment_bounds(std::as_const(layer), canvas) == canvas);
+  content.fill.gradient.align_with_layer = true;
+  content.fill.gradient.angle_degrees = 0.0F;
+  layer.set_vector_shape(content);
+  const auto shape_bounds = patchy::gradient_fill_alignment_bounds(std::as_const(layer), canvas);
+  CHECK(shape_bounds == (patchy::Rect{10, 12, 40, 28}));
+  // The bake measures the same rectangle: a 0-degree ramp runs from its left edge to its right.
+  patchy::update_vector_shape_raster(layer, canvas, nullptr);
+  const auto line = patchy::gradient_fill_line(content.fill.gradient, shape_bounds);
+  CHECK(std::abs(line.start_x - 10.0) < 1e-6 && std::abs(line.end_x - 50.0) < 1e-6);
+  const auto& pixels = std::as_const(layer).pixels();
+  const auto bounds = std::as_const(layer).bounds();
+  CHECK(pixels.pixel(10 - bounds.x, 20 - bounds.y)[0] < 12);
+  CHECK(pixels.pixel(49 - bounds.x, 20 - bounds.y)[0] > 240);
+
+  // Density under 100% spreads the fill over the canvas but leaves the gradient on the shape
+  // (Photoshop 27.11 at Density 98% and 50%: docs/vector-tools-appearance.md, "Gradient fill
+  // and Density"): inside the shape nothing changes, and the rest of the canvas shows the
+  // ramp's end colors at the Density floor.
+  const patchy::PixelBuffer full_pixels = pixels;
+  const auto full_bounds = bounds;
+  content.density = 128;
+  layer.set_vector_shape(content);
+  CHECK(patchy::gradient_fill_alignment_bounds(std::as_const(layer), canvas) == shape_bounds);
+  patchy::update_vector_shape_raster(layer, canvas, nullptr);
+  const auto& tinted = std::as_const(layer).pixels();
+  const auto tinted_bounds = std::as_const(layer).bounds();
+  CHECK(tinted_bounds == canvas);
+  bool inside_unchanged = true;
+  for (std::int32_t y = 12; y < 40; ++y) {
+    for (std::int32_t x = 10; x < 50; ++x) {
+      inside_unchanged = inside_unchanged &&
+                         std::memcmp(tinted.pixel(x - tinted_bounds.x, y - tinted_bounds.y),
+                                     full_pixels.pixel(x - full_bounds.x, y - full_bounds.y), 4) == 0;
+    }
+  }
+  CHECK(inside_unchanged);
+  const auto* left = tinted.pixel(2 - tinted_bounds.x, 20 - tinted_bounds.y);
+  CHECK(left[0] < 4 && left[3] == 127);
+  const auto* right = tinted.pixel(70 - tinted_bounds.x, 20 - tinted_bounds.y);
+  CHECK(right[0] > 251 && right[3] == 127);
+}
+
+// The box a stroke's gradient is measured over (GitHub issue 694, the handles on a stroke
+// gradient): rendering the shape with that box given outright must give the bake's bytes, for
+// each stroke alignment, with and without a fill, feathered, dashed and reaching off the canvas.
+void gradient_stroke_alignment_bounds_follow_the_bake() {
+  const auto canvas = patchy::Rect::from_size(120, 90);
+  patchy::VectorShapeContent base;
+  base.fill.kind = patchy::VectorFillKind::Solid;
+  base.fill.color = patchy::RgbColor{20, 60, 200};
+  base.stroke.enabled = true;
+  base.stroke.width = 9.0;
+  base.stroke.content.kind = patchy::VectorFillKind::Gradient;
+  base.stroke.content.gradient.align_with_layer = true;
+  base.stroke.content.gradient.angle_degrees = 25.0F;
+  base.stroke.content.gradient.color_stops = {{0.0F, patchy::RgbColor{0, 0, 0}, 0.5F},
+                                              {1.0F, patchy::RgbColor{255, 255, 255}, 0.5F}};
+  base.stroke.content.gradient.alpha_stops = {{0.0F, 1.0F, 0.5F}, {1.0F, 1.0F, 0.5F}};
+  base.path.subpaths = {rect_subpath(30.0, 22.0, 90.0, 64.0, PathCombineOp::Add, 0)};
+
+  struct Case {
+    const char* name;
+    std::function<void(patchy::VectorShapeContent&)> change;
+  };
+  const std::vector<Case> cases{
+      {"inside", [](auto& c) { c.stroke.alignment = patchy::VectorStrokeAlignment::Inside; }},
+      {"center", [](auto& c) { c.stroke.alignment = patchy::VectorStrokeAlignment::Center; }},
+      {"outside", [](auto& c) { c.stroke.alignment = patchy::VectorStrokeAlignment::Outside; }},
+      {"outside, no fill",
+       [](auto& c) {
+         c.stroke.alignment = patchy::VectorStrokeAlignment::Outside;
+         c.stroke.fill_enabled = false;
+       }},
+      {"inside, feathered",
+       [](auto& c) {
+         c.stroke.alignment = patchy::VectorStrokeAlignment::Inside;
+         c.feather = 3.0;
+       }},
+      {"center, dashed",
+       [](auto& c) {
+         c.stroke.alignment = patchy::VectorStrokeAlignment::Center;
+         c.stroke.dashes = {2.0, 1.0};
+       }},
+      {"outside, past the canvas",
+       [](auto& c) {
+         c.stroke.alignment = patchy::VectorStrokeAlignment::Outside;
+         c.path.subpaths = {rect_subpath(-14.0, 30.0, 60.0, 110.0, PathCombineOp::Add, 0)};
+       }},
+  };
+  for (const auto& entry : cases) {
+    auto content = base;
+    entry.change(content);
+    patchy::Layer layer(1, "Shape 1", patchy::PixelBuffer());
+    layer.set_vector_shape(content);
+    layer.metadata()[patchy::kLayerMetadataVectorShape] = "1";
+    const auto stroke_bounds = patchy::gradient_stroke_alignment_bounds(std::as_const(layer), canvas);
+    CHECK(!stroke_bounds.empty());
+    CHECK(!(stroke_bounds == canvas));
+    patchy::update_vector_shape_raster(layer, canvas, nullptr);
+    // The same render with the stroke's gradient box given outright.
+    // update_vector_shape_raster's domain: the coverage domain without the feather's reach.
+    patchy::VectorShapeContent unfeathered = content;
+    unfeathered.feather = 0.0;
+    const auto bake_domain = patchy::vector_shape_coverage_domain(unfeathered, canvas);
+    const patchy::VectorPaintBounds paint{canvas, std::nullopt, stroke_bounds};
+    const auto given = patchy::rasterize_vector_shape(content, bake_domain, nullptr, &layer, &paint);
+    const bool same_bounds = given.bounds == std::as_const(layer).bounds();
+    bool same_bytes = same_bounds && given.pixels.width() == std::as_const(layer).pixels().width() &&
+                      given.pixels.height() == std::as_const(layer).pixels().height();
+    for (std::int32_t y = 0; same_bytes && y < given.pixels.height(); ++y) {
+      same_bytes = std::memcmp(given.pixels.pixel(0, y), std::as_const(layer).pixels().pixel(0, y),
+                               static_cast<std::size_t>(given.pixels.width()) * 4U) == 0;
+    }
+    if (!same_bytes) {
+      std::printf("[INFO] stroke gradient bounds differ from the bake: %s\n", entry.name);
+    }
+    CHECK(same_bytes);
+    // A box one pixel off renders something else, so the comparison can tell.
+    auto shifted = stroke_bounds;
+    shifted.width += 6;
+    const patchy::VectorPaintBounds off{canvas, std::nullopt, shifted};
+    const auto moved = patchy::rasterize_vector_shape(content, bake_domain, nullptr, &layer, &off);
+    bool differs = !(moved.bounds == given.bounds);
+    for (std::int32_t y = 0; !differs && y < given.pixels.height(); ++y) {
+      differs = std::memcmp(given.pixels.pixel(0, y), moved.pixels.pixel(0, y),
+                            static_cast<std::size_t>(given.pixels.width()) * 4U) != 0;
+    }
+    CHECK(differs);
+  }
+
+  // Without Align with Layer, or with no stroke drawn, the box is the canvas.
+  patchy::Layer layer(1, "Shape 1", patchy::PixelBuffer());
+  auto content = base;
+  content.stroke.content.gradient.align_with_layer = false;
+  layer.set_vector_shape(content);
+  CHECK(patchy::gradient_stroke_alignment_bounds(std::as_const(layer), canvas) == canvas);
+  content = base;
+  content.stroke.width = 0.0;
+  layer.set_vector_shape(content);
+  CHECK(patchy::gradient_stroke_alignment_bounds(std::as_const(layer), canvas) == canvas);
+}
+
+// Stop edits from the canvas handles keep both lists sorted, track the edited stop, keep at
+// least two stops and clamp locations and midpoints like the Edit Gradient Stops dialog.
+void gradient_fill_stop_edits_keep_stops_sorted() {
+  patchy::LayerStyleGradient gradient;
+  gradient.smoothness = 0;
+  gradient.color_stops = {{0.0F, patchy::RgbColor{0, 0, 0}, 0.5F}, {1.0F, patchy::RgbColor{200, 100, 50}, 0.5F}};
+  gradient.alpha_stops = {{0.0F, 1.0F, 0.5F}, {1.0F, 0.0F, 0.5F}};
+  const auto added = patchy::add_gradient_color_stop(gradient, 0.5F);
+  CHECK(added == 1U);
+  CHECK(gradient.color_stops.size() == 3U);
+  const auto mid = gradient.color_stops[1].color;
+  CHECK(std::abs(static_cast<int>(mid.red) - 100) <= 2 && std::abs(static_cast<int>(mid.green) - 50) <= 2 &&
+        std::abs(static_cast<int>(mid.blue) - 25) <= 2);
+  const auto alpha_added = patchy::add_gradient_alpha_stop(gradient, 0.25F);
+  CHECK(alpha_added == 1U);
+  CHECK(std::abs(gradient.alpha_stops[1].opacity - 0.75F) < 0.02F);
+  // Moving the first stop past the middle one re-sorts it; a midpoint travels with its stop.
+  patchy::set_gradient_color_midpoint(gradient, 1U, 0.3F);
+  const auto moved = patchy::move_gradient_color_stop(gradient, 0U, 0.8F);
+  CHECK(moved == 1U);
+  CHECK(gradient.color_stops[1].color.red == 0 && gradient.color_stops[1].location == 0.8F);
+  CHECK(gradient.color_stops[0].midpoint == 0.3F);
+  // Locations clamp; an equal location keeps the order.
+  CHECK(patchy::move_gradient_color_stop(gradient, 2U, 1.5F) == 2U);
+  CHECK(gradient.color_stops[2].location == 1.0F);
+  CHECK(gradient.color_stops[2].color.red == 200);
+  CHECK(patchy::move_gradient_alpha_stop(gradient, 0U, 0.5F) == 1U);
+  CHECK(gradient.alpha_stops[0].location == 0.25F && gradient.alpha_stops[1].location == 0.5F);
+  // Midpoints clamp to 5%..95%; the first stop has none.
+  patchy::set_gradient_color_midpoint(gradient, 2U, 0.99F);
+  CHECK(gradient.color_stops[2].midpoint == 0.95F);
+  patchy::set_gradient_alpha_midpoint(gradient, 1U, 0.0F);
+  CHECK(gradient.alpha_stops[1].midpoint == 0.05F);
+  const auto first_midpoint = gradient.color_stops[0].midpoint;
+  patchy::set_gradient_color_midpoint(gradient, 0U, 0.2F);
+  CHECK(gradient.color_stops[0].midpoint == first_midpoint);
+  // Removal keeps at least two stops.
+  CHECK(patchy::remove_gradient_color_stop(gradient, 1U));
+  CHECK(!patchy::remove_gradient_color_stop(gradient, 0U));
+  CHECK(gradient.color_stops.size() == 2U);
+  CHECK(patchy::remove_gradient_alpha_stop(gradient, 2U));
+  CHECK(!patchy::remove_gradient_alpha_stop(gradient, 1U));
+  CHECK(gradient.alpha_stops.size() == 2U);
+}
+
+// GitHub issue 663 follow-up: a gradient preset becomes the tool's own stops, not 33 samples.
+// Every built-in preset keeps its stop count and locations (Black to White is two stops), the
+// tool's straight ramp with midpoints matches the preset at smoothness 0, an opacity-only
+// location merges in, disagreeing midpoints write out only their segment, Noise is sampled.
+void gradient_tool_stops_keep_a_presets_own_stops() {
+  const auto as_layer_gradient = [](const patchy::GradientDefinition& definition) {
+    patchy::LayerStyleGradient gradient;
+    static_cast<patchy::GradientDefinition&>(gradient) = definition;
+    for (auto& stop : gradient.color_stops) {
+      stop.kind = patchy::GradientColorStop::Kind::User;
+    }
+    return gradient;
+  };
+  // The tool's color and alpha at `position` against the preset's straight (smoothness 0) ramp.
+  const auto worst_difference = [](const patchy::LayerStyleGradient& gradient,
+                                   const std::vector<patchy::GradientStop>& stops) {
+    auto straight = gradient;
+    straight.smoothness = 0;
+    int worst = 0;
+    const auto sorted = patchy::normalized_gradient_stops(stops);
+    for (int index = 0; index <= 400; ++index) {
+      const auto position = static_cast<float>(index) / 400.0F;
+      const auto tool = patchy::gradient_color_at(sorted, 1.0F, false, position);
+      const auto color = patchy::gradient_color(straight, position);
+      const auto alpha = static_cast<int>(std::lround(patchy::gradient_stop_opacity(straight, position) * 255.0F));
+      worst = std::max({worst, std::abs(tool.r - color.red), std::abs(tool.g - color.green),
+                        std::abs(tool.b - color.blue), std::abs(tool.a - alpha)});
+    }
+    return worst;
+  };
+  for (const auto& preset : patchy::builtin_gradient_presets()) {
+    const auto gradient = as_layer_gradient(preset.definition);
+    const auto stops = patchy::gradient_tool_stops_from_gradient(gradient);
+    CHECK(stops.size() == gradient.color_stops.size());
+    for (std::size_t index = 0; index < stops.size() && index < gradient.color_stops.size(); ++index) {
+      CHECK(std::abs(stops[index].location - gradient.color_stops[index].location) < 1e-6F);
+      CHECK(stops[index].color.r == gradient.color_stops[index].color.red);
+    }
+    const auto worst = worst_difference(gradient, stops);
+    if (worst > 1) {
+      std::cerr << preset.english_name << " differs by " << worst << '\n';
+    }
+    CHECK(worst <= 1);
+    if (std::string_view(preset.english_name) == "Black to White") {
+      CHECK(stops.size() == 2U);
+    }
+  }
+
+  // Midpoints stay on their stops; an opacity-only location merges in where the color ramp
+  // is straight; the tool reproduces both.
+  patchy::LayerStyleGradient custom;
+  custom.color_stops = {{0.0F, patchy::RgbColor{0, 0, 0}, 0.5F},
+                        {0.4F, patchy::RgbColor{255, 0, 0}, 0.25F},
+                        {1.0F, patchy::RgbColor{0, 0, 255}, 0.5F}};
+  custom.alpha_stops = {{0.0F, 1.0F, 0.5F}, {0.4F, 1.0F, 0.5F}, {0.7F, 0.2F, 0.5F}, {1.0F, 1.0F, 0.5F}};
+  const auto merged = patchy::gradient_tool_stops_from_gradient(custom);
+  CHECK(merged.size() == 4U);
+  if (merged.size() == 4U) {
+    CHECK(merged[1].midpoint == 0.25F);
+    CHECK(std::abs(merged[2].location - 0.7F) < 1e-6F);
+    CHECK(merged[2].color.a == 51);
+  }
+  CHECK(worst_difference(custom, merged) <= 1);
+
+  // A color midpoint over a segment whose opacity also ramps cannot share one midpoint:
+  // that segment alone is written out in straight pieces, close to the preset.
+  patchy::LayerStyleGradient clash;
+  clash.color_stops = {{0.0F, patchy::RgbColor{0, 0, 0}, 0.5F}, {1.0F, patchy::RgbColor{255, 255, 255}, 0.2F}};
+  clash.alpha_stops = {{0.0F, 1.0F, 0.5F}, {1.0F, 0.0F, 0.5F}};
+  const auto pieces = patchy::gradient_tool_stops_from_gradient(clash);
+  CHECK(pieces.size() == 9U);
+  CHECK(worst_difference(clash, pieces) <= 24);
+
+  // Noise has no stops to keep: it is sampled.
+  patchy::LayerStyleGradient noise;
+  noise.form = patchy::GradientDefinitionForm::Noise;
+  CHECK(patchy::gradient_tool_stops_from_gradient(noise).size() == 65U);
+
+  // The explicit-midpoint form (QGradient previews) is the same ramp written straight.
+  const auto explicit_stops = patchy::gradient_stops_with_explicit_midpoints(merged);
+  CHECK(explicit_stops.size() == merged.size() + 1U);
+  int preview_worst = 0;
+  for (int index = 0; index <= 200; ++index) {
+    const auto position = static_cast<double>(index) / 200.0;
+    const auto a = patchy::gradient_color_at(merged, 1.0F, false, position);
+    const auto b = patchy::gradient_color_at(explicit_stops, 1.0F, false, position);
+    preview_worst = std::max({preview_worst, std::abs(a.r - b.r), std::abs(a.g - b.g), std::abs(a.b - b.b)});
+  }
+  CHECK(preview_worst <= 1);
+}
+
+namespace {
+
+// The Gradient tool's drag painted into a fresh layer of a `bits` document.
+patchy::Document paint_tool_gradient(int width, int height, patchy::BitDepth depth, const patchy::GradientOptions& options,
+                                     int x0, int y0, int x1, int y1) {
+  patchy::Document document(width, height, patchy::PixelFormat::rgba8());
+  patchy::PixelBuffer pixels(width, height, patchy::PixelFormat::rgba8());
+  pixels.clear(0);
+  document.add_pixel_layer("Paint", std::move(pixels));
+  if (depth != patchy::BitDepth::UInt8) {
+    patchy::convert_document_depth(document, depth);
+  }
+  const auto id = document.layers().front().id();
+  CHECK(!patchy::draw_gradient(document, id, x0, y0, x1, y1, patchy::EditOptions{}, options).empty());
+  return document;
+}
+
+double worst_layer_difference(const patchy::Document& a, const patchy::Document& b) {
+  const auto& pa = std::as_const(a).layers().front().pixels();
+  const auto& pb = std::as_const(b).layers().front().pixels();
+  double worst = 0.0;
+  for (int y = 0; y < pa.height(); ++y) {
+    for (int x = 0; x < pa.width(); ++x) {
+      const auto va = patchy::load_pixel(pa.format(), pa.pixel(x, y));
+      const auto vb = patchy::load_pixel(pb.format(), pb.pixel(x, y));
+      for (std::size_t c = 0; c < 4U; ++c) {
+        worst = std::max(worst, static_cast<double>(std::abs(va[c] - vb[c])));
+      }
+    }
+  }
+  return worst;
+}
+
+}  // namespace
+
+// GitHub issue 663, one gradient editor: the Gradient tool's two-track gradient. Old flat stops
+// (tools/gradientStops, scripts) convert to color and opacity stops that paint what the flat
+// stops painted, at 8, 16 and 32 bits, every style, reversed, with a midpoint and an Intensity.
+void gradient_tool_two_track_paints_like_the_flat_stops() {
+  const std::vector<patchy::GradientStop> flat{
+      patchy::GradientStop{0.0F, patchy::EditColor{230, 20, 10, 255}},
+      patchy::GradientStop{0.4F, patchy::EditColor{255, 255, 0, 128}, 0.0F, 0.3F},
+      patchy::GradientStop{1.0F, patchy::EditColor{0, 128, 255, 40}}};
+  const auto two_track = patchy::gradient_from_tool_stops(flat);
+  CHECK(two_track.color_stops.size() == 3U && two_track.alpha_stops.size() == 3U);
+  CHECK(two_track.smoothness == 0);
+  CHECK(two_track.color_stops[1].midpoint == 0.3F && two_track.alpha_stops[1].midpoint == 0.3F);
+  CHECK(std::abs(two_track.alpha_stops[1].opacity - 128.0F / 255.0F) < 1e-6F);
+  // Back to flat stops: the same three.
+  const auto back = patchy::gradient_tool_stops_from_gradient(two_track);
+  CHECK(back.size() == 3U);
+  if (back.size() == 3U) {
+    CHECK(back[1].color.a == 128 && back[1].midpoint == 0.3F);
+  }
+  // A stop's 32-bit Intensity travels with it and lifts that end at 32 bits (between stops the
+  // two-track gradient interpolates Intensity in stops, the flat one mixed the lifted colors).
+  {
+    auto lifted = flat;
+    lifted[0].intensity_stops = 1.0F;
+    const auto lifted_two_track = patchy::gradient_from_tool_stops(lifted);
+    CHECK(lifted_two_track.color_stops[0].intensity_stops == 1.0F);
+    CHECK(patchy::gradient_tool_stops_from_gradient(lifted_two_track).front().intensity_stops == 1.0F);
+    patchy::GradientOptions options;
+    options.definition = lifted_two_track;
+    const auto plain = paint_tool_gradient(48, 32, patchy::BitDepth::Float32,
+                                           [&] {
+                                             auto unlifted = options;
+                                             unlifted.definition = two_track;
+                                             return unlifted;
+                                           }(),
+                                           6, 5, 40, 27);
+    const auto bright = paint_tool_gradient(48, 32, patchy::BitDepth::Float32, options, 6, 5, 40, 27);
+    const auto& a = std::as_const(plain).layers().front();
+    const auto& b = std::as_const(bright).layers().front();
+    const auto at_start = [](const patchy::Layer& layer) {
+      return patchy::load_pixel(layer.pixels().format(), layer.pixels().pixel(6 - layer.bounds().x, 5 - layer.bounds().y));
+    };
+    CHECK(std::abs(at_start(b)[0] - 2.0F * at_start(a)[0]) < 0.02F * std::max(1.0F, at_start(a)[0]));
+  }
+  for (const auto depth : {patchy::BitDepth::UInt8, patchy::BitDepth::UInt16, patchy::BitDepth::Float32}) {
+    for (const auto method : {patchy::GradientMethod::Linear, patchy::GradientMethod::Radial,
+                              patchy::GradientMethod::Reflected, patchy::GradientMethod::Diamond,
+                              patchy::GradientMethod::Angle}) {
+      for (const bool reverse : {false, true}) {
+        patchy::GradientOptions flat_options;
+        flat_options.method = method;
+        flat_options.reverse = reverse;
+        flat_options.opacity = 0.8F;
+        flat_options.stops = flat;
+        auto two_track_options = flat_options;
+        two_track_options.definition = two_track;
+        const auto a = paint_tool_gradient(48, 32, depth, flat_options, 6, 5, 40, 27);
+        const auto b = paint_tool_gradient(48, 32, depth, two_track_options, 6, 5, 40, 27);
+        // A level at 8 and 16 bits (one rounding), and on the 32-bit scale a level of 255 too.
+        const auto worst = worst_layer_difference(a, b);
+        const auto limit = depth == patchy::BitDepth::UInt8 ? 1.0 : 1.01;
+        if (worst > limit) {
+          std::cerr << "two-track tool gradient differs by " << worst << " (depth " << static_cast<int>(depth)
+                    << ", method " << static_cast<int>(method) << ")\n";
+        }
+        CHECK(worst <= limit);
+      }
+    }
+  }
+}
+
+// A tool gradient and a Gradient Fill made from the same preset (two tracks, smoothness, the
+// fill's own evaluation) paint the same; Foreground/Background stops take the current colors.
+void gradient_tool_matches_a_fill_from_the_same_preset() {
+  constexpr int kWidth = 64;
+  constexpr int kHeight = 48;
+  const auto canvas = patchy::Rect::from_size(kWidth, kHeight);
+  int checked = 0;
+  for (const auto& preset : patchy::builtin_gradient_presets()) {
+    const auto resolved = patchy::resolved_tool_gradient(preset.definition, patchy::EditColor{20, 90, 200, 255},
+                                                         patchy::EditColor{250, 240, 30, 255}, 0.0F, 0.0F);
+    for (const auto& stop : resolved.color_stops) {
+      CHECK(stop.kind == patchy::GradientColorStop::Kind::User);
+    }
+    for (const auto method : {patchy::GradientMethod::Linear, patchy::GradientMethod::Radial}) {
+      patchy::GradientOptions options;
+      options.method = method;
+      options.definition = resolved;
+      const auto painted = paint_tool_gradient(kWidth, kHeight, patchy::BitDepth::UInt8, options, 5, 10, 50, 30);
+      patchy::Layer fill(1, "Gradient Fill 1", patchy::PixelBuffer());
+      patchy::VectorShapeContent content;
+      content.fill.kind = patchy::VectorFillKind::Gradient;
+      content.fill.gradient = patchy::gradient_fill_from_drag(resolved, method, false, canvas, 5, 10, 50, 30);
+      CHECK(content.fill.gradient.smoothness == preset.definition.smoothness);
+      CHECK(content.fill.gradient.color_stops.size() == preset.definition.color_stops.size());
+      content.stroke.enabled = false;
+      fill.set_vector_shape(content);
+      fill.metadata()[patchy::kLayerMetadataVectorShape] = "1";
+      patchy::update_vector_shape_raster(fill, canvas, nullptr);
+      const auto& paint = std::as_const(painted).layers().front();
+      int worst = 0;
+      for (int y = 0; y < kHeight; ++y) {
+        for (int x = 0; x < kWidth; ++x) {
+          const auto* expected = paint.pixels().pixel(x - paint.bounds().x, y - paint.bounds().y);
+          const auto* actual = std::as_const(fill).pixels().pixel(x - fill.bounds().x, y - fill.bounds().y);
+          const int first_channel = expected[3] >= 8 ? 0 : 3;  // color only where alpha carries it
+          for (int channel = first_channel; channel < 4; ++channel) {
+            worst = std::max(worst, std::abs(static_cast<int>(expected[channel]) - static_cast<int>(actual[channel])));
+          }
+        }
+      }
+      if (worst > 2) {
+        std::cerr << preset.english_name << " tool and fill differ by " << worst << '\n';
+      }
+      CHECK(worst <= 2);
+      ++checked;
+    }
+  }
+  CHECK(checked > 10);
+  // Foreground and Background stops resolve to the colors given, with their Intensity.
+  patchy::GradientDefinition dynamic;
+  dynamic.color_stops = {patchy::GradientColorStop{0.0F, {}, 0.5F, patchy::GradientColorStop::Kind::Foreground},
+                         patchy::GradientColorStop{1.0F, {}, 0.5F, patchy::GradientColorStop::Kind::Background}};
+  dynamic.alpha_stops = {{0.0F, 1.0F, 0.5F}, {1.0F, 1.0F, 0.5F}};
+  const auto resolved = patchy::resolved_tool_gradient(dynamic, patchy::EditColor{1, 2, 3, 255},
+                                                       patchy::EditColor{4, 5, 6, 255}, 2.0F, -1.0F);
+  CHECK(resolved.color_stops[0].color == (patchy::RgbColor{1, 2, 3}) && resolved.color_stops[0].intensity_stops == 2.0F);
+  CHECK(resolved.color_stops[1].color == (patchy::RgbColor{4, 5, 6}) && resolved.color_stops[1].intensity_stops == -1.0F);
+}
+
+std::vector<patchy::test::TestCase> vector_raster_tests() {
+  return {
+      {"gradient_tool_two_track_paints_like_the_flat_stops", gradient_tool_two_track_paints_like_the_flat_stops},
+      {"gradient_tool_matches_a_fill_from_the_same_preset", gradient_tool_matches_a_fill_from_the_same_preset},
+      {"gradient_tool_stops_keep_a_presets_own_stops", gradient_tool_stops_keep_a_presets_own_stops},
+      {"gradient_fill_line_inverts_the_drag_placement", gradient_fill_line_inverts_the_drag_placement},
+      {"gradient_fill_draft_renders_a_part_at_a_coarser_scale", gradient_fill_draft_renders_a_part_at_a_coarser_scale},
+      {"gradient_fill_alignment_bounds_follow_the_bake", gradient_fill_alignment_bounds_follow_the_bake},
+      {"gradient_stroke_alignment_bounds_follow_the_bake", gradient_stroke_alignment_bounds_follow_the_bake},
+      {"gradient_fill_stop_edits_keep_stops_sorted", gradient_fill_stop_edits_keep_stops_sorted},
+      {"gradient_fill_from_drag_renders_the_gradient_tool_drag", gradient_fill_from_drag_renders_the_gradient_tool_drag},
+      {"gradient_fill_layer_geometry_matches_photoshop_probes", gradient_fill_layer_geometry_matches_photoshop_probes},
+      {"gradient_fill_layer_aligns_to_its_mask_bounds", gradient_fill_layer_aligns_to_its_mask_bounds},
+      {"raster_shape_feather_softens_edge_and_density_floors_alpha",
+       raster_shape_feather_softens_edge_and_density_floors_alpha},
+      {"raster_shape_density_spreads_the_strokes_paint", raster_shape_density_spreads_the_strokes_paint},
+      {"raster_axis_aligned_rect_coverage_is_exact", raster_axis_aligned_rect_coverage_is_exact},
+      {"raster_pixel_aligned_rect_shortcut_matches_reference", raster_pixel_aligned_rect_shortcut_matches_reference},
+      {"vector_stroke_aligned_edges_match_photoshop", vector_stroke_aligned_edges_match_photoshop},
+      {"raster_half_plane_diagonal_ramp", raster_half_plane_diagonal_ramp},
+      {"raster_area_sum_matches_analytic", raster_area_sum_matches_analytic},
+      {"raster_combine_ops_match_photoshop_semantics", raster_combine_ops_match_photoshop_semantics},
+      {"raster_first_op_initial_accumulator_semantics", raster_first_op_initial_accumulator_semantics},
+      {"raster_even_odd_within_group_ops_between_groups", raster_even_odd_within_group_ops_between_groups},
+      {"raster_curves_donut_and_open_chord", raster_curves_donut_and_open_chord},
+      {"raster_empty_path_fills_clip", raster_empty_path_fills_clip},
+      {"raster_mask_inverted_coverage", raster_mask_inverted_coverage},
+      {"raster_golden_digests_are_stable", raster_golden_digests_are_stable},
+      {"raster_shape_paints_solid_gradient_pattern", raster_shape_paints_solid_gradient_pattern},
+      {"stroke_center_band_and_miter_corner", stroke_center_band_and_miter_corner},
+      {"stroke_combined_shapes_follow_boolean_boundary", stroke_combined_shapes_follow_boolean_boundary},
+      {"stroke_first_intersection_keeps_fill_without_outline", stroke_first_intersection_keeps_fill_without_outline},
+      {"stroke_alignment_inside_outside", stroke_alignment_inside_outside},
+      {"stroke_arc_band_has_no_winding_notches", stroke_arc_band_has_no_winding_notches},
+      {"stroke_caps_butt_square_round", stroke_caps_butt_square_round},
+      {"stroke_joins_miter_bevel_round", stroke_joins_miter_bevel_round},
+      {"stroke_dashes_and_offset", stroke_dashes_and_offset},
+      {"stroke_aligned_dashes_keep_cap_size_and_gaps", stroke_aligned_dashes_keep_cap_size_and_gaps},
+      {"stroke_aligned_dots_follow_compound_fill_side", stroke_aligned_dots_follow_compound_fill_side},
+      {"stroke_zero_length_dots_keep_first_dot_and_tangent", stroke_zero_length_dots_keep_first_dot_and_tangent},
+      {"stroke_aligned_round_dots_keep_circles_on_curves", stroke_aligned_round_dots_keep_circles_on_curves},
+      {"stroke_dotted_pattern_draws_on_butt_caps", stroke_dotted_pattern_draws_on_butt_caps},
+      {"stroke_dash_presets_follow_caps_and_map_back", stroke_dash_presets_follow_caps_and_map_back},
+      {"stroke_dash_presets_set_caps_and_corners", stroke_dash_presets_set_caps_and_corners},
+      {"stroke_open_path_alignment_moves_band_sideways", stroke_open_path_alignment_moves_band_sideways},
+      {"stroke_open_curve_alignment_stays_beside_the_curve", stroke_open_curve_alignment_stays_beside_the_curve},
+      {"stroke_open_path_alignment_dashes_follow_the_path", stroke_open_path_alignment_dashes_follow_the_path},
+      {"stroke_golden_digests_are_stable", stroke_golden_digests_are_stable},
+      {"stroke_bezier_circle_is_translation_stable", stroke_bezier_circle_is_translation_stable},
+      {"raster_clipped_flattening_matches_full_flattening", raster_clipped_flattening_matches_full_flattening},
+      {"stroke_miter_spike_stays_in_bounds", stroke_miter_spike_stays_in_bounds},
+      {"stroke_curve_is_insensitive_to_sub_quantum_anchor_jitter",
+       stroke_curve_is_insensitive_to_sub_quantum_anchor_jitter},
+      {"stroke_shape_composites_fill_and_stroke", stroke_shape_composites_fill_and_stroke},
+      {"stroke_shape_fill_and_stroke_share_edge_pixels", stroke_shape_fill_and_stroke_share_edge_pixels},
+      {"vector_mask_composites_in_flatten", vector_mask_composites_in_flatten},
+      {"vector_mask_multiplies_with_raster_mask", vector_mask_multiplies_with_raster_mask},
+      {"update_vector_shape_raster_bakes_pixels", update_vector_shape_raster_bakes_pixels},
+      {"vector_compound_copy_part_groups_paint_like_their_source", vector_compound_copy_part_groups_paint_like_their_source},
+      {"update_vector_shape_raster_keeps_off_canvas_shape", update_vector_shape_raster_keeps_off_canvas_shape},
+      {"combine_shape_layers_truth_table", combine_shape_layers_truth_table},
+      {"combine_shape_candidates_refuses_mixed_parents_locks_and_fill_layers",
+       combine_shape_candidates_refuses_mixed_parents_locks_and_fill_layers},
+      {"document_paths_add_find_and_work_semantics", document_paths_add_find_and_work_semantics},
+      {"stroke_sub_lattice_dashes_are_bounded", stroke_sub_lattice_dashes_are_bounded},
+  };
+}

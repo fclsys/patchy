@@ -1,0 +1,275 @@
+#pragma once
+
+#include "core/layer.hpp"
+
+#include <array>
+#include <optional>
+#include <string>
+#include <string_view>
+#include <vector>
+
+namespace patchy {
+
+inline constexpr const char* kLayerMetadataMaskLinked = "patchy.mask_linked";
+// Marks a layer mask that originated as a document-level alpha channel (a flat image's
+// per-pixel alpha, or a PSD "Alpha 1" saved channel) rather than a hand-authored layer
+// mask. Such masks are written back as the file's alpha / a PSD "Alpha 1" channel on save.
+inline constexpr const char* kLayerMetadataDocumentAlpha = "patchy.document_alpha";
+inline constexpr const char* kLayerMetadataGroupExpanded = "patchy.layer_group_expanded";
+// Whether the rows under a layer (its layer styles and Smart Filters) are open in the Layers
+// panel: "true" or "false", absent when unknown. PSD layer record flags bit 5 (0x20) holds it,
+// one bit for both lists (GitHub issue 361, docs/ps-compat.md).
+inline constexpr const char* kLayerMetadataFxExpanded = "patchy.layer_fx_expanded";
+// The layer's PSD lspf protection value as read, in decimal: the PSD writer re-emits it while
+// the locks still match it, keeping Photoshop's Lock All and Prevent Auto Nesting bits.
+inline constexpr const char* kLayerMetadataPsdProtectionFlags = "patchy.psd.protection_flags";
+inline constexpr const char* kLayerMetadataText = "patchy.text";
+inline constexpr const char* kLayerMetadataTextHtml = "patchy.text.html";
+inline constexpr const char* kLayerMetadataTextRuns = "patchy.text.runs";
+inline constexpr const char* kLayerMetadataTextParagraphRuns = "patchy.text.paragraph_runs";
+inline constexpr const char* kLayerMetadataTextFlow = "patchy.text.flow";
+// Area text keeps flow="box" for the existing frame/transform machinery.
+inline constexpr const char* kLayerMetadataTextArea = "patchy.text.area";
+// Text along a path (docs/path-text.md): the owned contour in text-local coordinates
+// (serialize_vector_path, one open or closed subpath) and its "start end" range in Photoshop's
+// segment units. Mutually exclusive with the area contour; flow stays "box" like area text,
+// for the same frame and transform machinery.
+inline constexpr const char* kLayerMetadataTextPath = "patchy.text.path";
+inline constexpr const char* kLayerMetadataTextPathRange = "patchy.text.path_range";
+// Unrecognized native geometry: preserve its data and pixels, prohibit reflow.
+inline constexpr const char* kLayerMetadataTextGeometryProtected = "patchy.text.geometry_protected";
+inline constexpr const char* kLayerMetadataTextBoxWidth = "patchy.text.box_width";
+inline constexpr const char* kLayerMetadataTextBoxHeight = "patchy.text.box_height";
+inline constexpr const char* kLayerMetadataTextFont = "patchy.text.font";
+inline constexpr const char* kLayerMetadataTextSize = "patchy.text.size";
+inline constexpr const char* kLayerMetadataTextColor = "patchy.text.color";
+inline constexpr const char* kLayerMetadataTextBold = "patchy.text.bold";
+inline constexpr const char* kLayerMetadataTextItalic = "patchy.text.italic";
+inline constexpr const char* kLayerMetadataTextAntiAlias = "patchy.text.anti_alias";
+// kLayerMetadataTextAntiAlias holds Photoshop's EngineData /AntiAlias number, as Photoshop
+// 2026 writes it (GitHub issue 344 fixture). 5 is not a mode Photoshop writes.
+inline constexpr int kTextAntiAliasNone = 0;
+inline constexpr int kTextAntiAliasCrisp = 1;
+inline constexpr int kTextAntiAliasStrong = 2;
+inline constexpr int kTextAntiAliasSmooth = 3;
+inline constexpr int kTextAntiAliasSharp = 4;
+inline constexpr int kTextAntiAliasWindowsLcd = 6;
+inline constexpr int kTextAntiAliasWindows = 7;
+inline constexpr const char* kLayerMetadataTextSourceBlock = "patchy.text.source_block";
+inline constexpr const char* kLayerMetadataTextRasterStatus = "patchy.text.raster_status";
+// "photoshop" on text layers imported from a Photoshop-authored TySh block: the renderer lays
+// lines out with Photoshop's leading model (per-line max leading, auto = paragraph fraction x
+// size, box first baseline at the typographic ascender) instead of Qt's natural line spacing.
+// Patchy-authored text (including Patchy-written PSDs reopened later) never carries this, so
+// native layout stays byte-stable.
+inline constexpr const char* kLayerMetadataTextLayoutMode = "patchy.text.layout";
+inline constexpr const char* kTextLayoutModePhotoshop = "photoshop";
+// "vertical" on type layers whose glyphs stack top to bottom in columns that advance right to
+// left (Photoshop's Vertical Type tool, TySh Ornt = Vrtc). Absent means horizontal. The layout
+// model is documented in docs/text-render-calibration-vertical-rtl.md ("Vertical type").
+inline constexpr const char* kLayerMetadataTextOrientation = "patchy.text.orientation";
+inline constexpr const char* kTextOrientationVertical = "vertical";
+inline constexpr const char* kLayerMetadataTextTransform = "patchy.text.transform";
+inline constexpr const char* kLayerMetadataPsdTextTransform = "patchy.psd.text.transform";
+inline constexpr const char* kLayerMetadataPsdTextBounds = "patchy.psd.text.bounds";
+inline constexpr const char* kLayerMetadataPsdTextBoundingBox = "patchy.psd.text.bounding_box";
+inline constexpr const char* kLayerMetadataPsdTextBoxBounds = "patchy.psd.text.box_bounds";
+inline constexpr const char* kLayerMetadataPsdTextTailBounds = "patchy.psd.text.tail_bounds";
+inline constexpr const char* kLayerMetadataPsdTextIndex = "patchy.psd.text.index";
+// Layout metrics of the raster Patchy drew, recorded by the renderer so the Qt-free PSD writer
+// can place Photoshop's re-layout on the same pixels
+// (docs/text-render-calibration-patchy-authored.md, "Patchy text re-renders where Patchy drew it").
+// All values are text-local units of the render plan.
+// - first_baseline: the first line's baseline below the raster's top row; the writer anchors a
+//   point-text transform there (Photoshop treats ty as the first baseline).
+// - box_baseline_inset: Qt's first baseline minus Photoshop's box rule for a Patchy block (cap
+//   height x size) for box text; the writer moves the transform origin down by it. Absent
+//   (zero) on Photoshop-layout layers.
+// - auto_leading: Qt's baseline advance as a fraction of the dominant size; written as the
+//   paragraph /AutoLeading so Photoshop's auto leading matches Qt's natural line pitch.
+// - raster_top: the raster's top row relative to the text-local origin for point text (0, or
+//   negative when glyph ink overshoots the first line top and the buffer grew upward). The
+//   writer compares it with the layer's real raster offset to tell a transform still at the
+//   origin (anchor it on the baseline) from one already at the baseline (leave it); the ink
+//   test it used before mistook a grown buffer for an anchored one (CoreText's smaller ascent
+//   grows the issue 20 "M", and its saved baseline landed an ascent high).
+// - anchor_x: horizontal point text whose first line is centered or right-aligned: that line's
+//   justification point (its middle or its end) from the text-local origin. Photoshop's anchor
+//   (its click point, the TySh tx) is that point on the first baseline, while the origin Patchy
+//   draws from is the line box's left edge; the writer moves the transform there together with
+//   the baseline. Absent for left-aligned text, where the two are the same column.
+// The reader recovers box_baseline_inset from a Patchy-signed TySh; the others only exist on
+// layers Patchy rendered in this session (the writer falls back to its raster heuristics).
+inline constexpr const char* kLayerMetadataTextFirstBaseline = "patchy.text.first_baseline";
+inline constexpr const char* kLayerMetadataTextBoxBaselineInset = "patchy.text.box_baseline_inset";
+inline constexpr const char* kLayerMetadataTextAutoLeading = "patchy.text.auto_leading";
+inline constexpr const char* kLayerMetadataTextRasterTop = "patchy.text.raster_top";
+inline constexpr const char* kLayerMetadataTextAnchorX = "patchy.text.anchor_x";
+// "x y": the anchor a point-text layer's FILE gave it (Photoshop's click point), as a point of
+// the text-local space the layer's transform (kLayerMetadataTextTransform) now maps, carried
+// through a re-render that kept the text where it was. A session commit records it for a layer
+// whose transform was still the file's (or that already carried one) when the first paragraph's
+// alignment did not change; every other render erases it (store_text_layout_metrics). The
+// writer puts the TySh anchor back on it, so Photoshop lays the text out from the very point it
+// used before: Patchy's own measure of that point (anchor_x and first_baseline) is only good to
+// about a pixel, and Photoshop rounds the anchor before it draws. Session only, like the layout
+// metrics; a saved file carries the anchor in its transform.
+inline constexpr const char* kLayerMetadataTextFileAnchor = "patchy.text.file_anchor";
+// "w h": the size of the text box a box-text layer's FILE gave it, in text-local units, carried
+// through a re-render that left the box alone (the committed whole-pixel box is within a pixel
+// of it). Photoshop's boxes are fractional (121.845 x 120.046) and Patchy's are whole pixels;
+// the writer puts the file's size back into the TySh bounds, /BoxBounds and the Txt2 frame, so
+// Photoshop wraps in, and aligns layer effects to, the box it had (a gradient stroke aligned
+// with the layer shifted a pixel on the psd-tools effect-stroke-gradient file). Session only.
+inline constexpr const char* kLayerMetadataTextFileBox = "patchy.text.file_box";
+// Marks a box-text raster rendered with the line-aware box preview (main_window.cpp).
+inline constexpr const char* kLayerMetadataTextLineAwareBoxPreview = "patchy.text.line_aware_box_preview";
+
+// SVG import handoff (the Qt-free reader cannot decode PNGs or render text):
+// MainWindow's post-open pass decodes pending_image data URIs, renders
+// pending_text layers through the internal text pipeline (positioning from
+// the baseline point + anchor), then drops these keys.
+inline constexpr const char* kLayerMetadataSvgPendingImage = "patchy.svg.pending_image";
+inline constexpr const char* kLayerMetadataSvgPendingText = "patchy.svg.pending_text_render";
+inline constexpr const char* kLayerMetadataSvgTextAnchor = "patchy.svg.text_anchor";
+inline constexpr const char* kLayerMetadataSvgTextBaselineX = "patchy.svg.text_baseline_x";
+inline constexpr const char* kLayerMetadataSvgTextBaselineY = "patchy.svg.text_baseline_y";
+
+// Affinity .af text import handoff (same pattern as SVG): the Qt-free reader
+// stores the story under the standard patchy.text.* keys plus these placement
+// markers; MainWindow::render_pending_af_text_layers renders post-open and
+// drops them. frame = "x0 y0 x1 y1" (the node's TxtH FrmB layout box); ascent
+// is present for artistic text (Affinity's baseline sits at y0 + ascent);
+// align is 0 left / 1 centre / 2 right within the frame box.
+inline constexpr const char* kLayerMetadataAfPendingText = "patchy.af.pending_text_render";
+inline constexpr const char* kLayerMetadataAfTextFrame = "patchy.af.text_frame";
+inline constexpr const char* kLayerMetadataAfTextAscent = "patchy.af.text_ascent";
+inline constexpr const char* kLayerMetadataAfTextAlign = "patchy.af.text_align";
+// Rotated/sheared artistic text: the node's full Xfrm ("a b tx c d ty", wire
+// order); the post-open pass renders the glyphs through the affine and stamps
+// the standard patchy.text.transform. Frame/box text never carries this.
+inline constexpr const char* kLayerMetadataAfTextXfrm = "patchy.af.text_xfrm";
+
+// GIMP text outline handoff (docs/xcf-text-layers.md, "Text layers"): GIMP's raster of an
+// outlined text layer has the outline baked in, so MainWindow::render_pending_xcf_text_layers
+// redraws the text post-open, adds the outline as a Stroke layer style and drops this key.
+// Value: "<outside|inside|center> <size px> <#rrggbb> <opacity 0..1> <fill|nofill>".
+inline constexpr const char* kLayerMetadataXcfPendingOutline = "patchy.xcf.pending_outline";
+
+// GIMP text layers painted on after their text was set open as pixels and keep the text GIMP
+// stored (docs/xcf-text-layers.md, "Text layers"): every key the editable layer would have had
+// (the patchy.text.* keys and kLayerMetadataXcfPendingOutline), each under this prefix, and the
+// box key, GIMP's layer rect "x y width height" where the text box starts. The open-time
+// choice (imports/xcfPaintedTextLayers) moves them back. In memory only: no format writes them.
+inline constexpr const char* kLayerMetadataXcfStoredTextPrefix = "patchy.xcf.stored_text.";
+inline constexpr const char* kLayerMetadataXcfStoredTextBox = "patchy.xcf.stored_text_box";
+
+// PDF vector import handoff (same pattern as SVG and .af). The Qt-free reader emits
+// the story under the standard patchy.text.* keys plus these markers, and
+// MainWindow::render_pending_pdf_text_layers renders post-open and drops them.
+// xfrm is the run's full text-rendering matrix ("a b c d e f", the PDF/QTransform
+// six-number order), which PDF needs because a Tm may rotate or shear a run.
+// intended_width is the advance width the PDF laid the run out at, in document
+// pixels: the render pass compares it against the substituted font's measured width
+// and sets tracking so the run keeps its authored extent.
+inline constexpr const char* kLayerMetadataPdfPendingText = "patchy.pdf.pending_text_render";
+inline constexpr const char* kLayerMetadataPdfTextXfrm = "patchy.pdf.text_xfrm";
+inline constexpr const char* kLayerMetadataPdfTextIntendedWidth = "patchy.pdf.text_intended_width";
+// A placed image awaiting the Qt-side smart-object render: the reader has already
+// put the bytes in the document's SmartObjectStore and written the placement quad,
+// so this only marks the layer for MainWindow::render_pending_pdf_image_layers.
+inline constexpr const char* kLayerMetadataPdfPendingImage = "patchy.pdf.pending_image_render";
+// A PDF import's page group (docs/pdf-import.md): "x,y,width,height" of the page on the merged
+// canvas, so exporting by groups gives each page its own size again. Patchy-only: never
+// written to PSD.
+inline constexpr const char* kLayerMetadataPdfPageRect = "patchy.pdf.page_rect";
+
+using LayerAffineTransform = std::array<double, 6>;
+
+[[nodiscard]] bool layer_locks_transparent_pixels(const Layer& layer);
+void set_layer_locks_transparent_pixels(Layer& layer, bool locked);
+
+[[nodiscard]] bool layer_locks_image_pixels(const Layer& layer);
+void set_layer_locks_image_pixels(Layer& layer, bool locked);
+
+[[nodiscard]] bool layer_locks_position(const Layer& layer);
+void set_layer_locks_position(Layer& layer, bool locked);
+
+[[nodiscard]] bool layer_locks_all(const Layer& layer);
+void set_layer_locks_all(Layer& layer, bool locked);
+// Prevent Auto-Nesting (kLayerLockArtboardAutonest), the layer's own flag only.
+[[nodiscard]] bool layer_prevents_auto_nesting(const Layer& layer);
+void set_layer_prevents_auto_nesting(Layer& layer, bool prevented);
+
+[[nodiscard]] LayerLockFlags layer_lock_flags(const Layer& layer);
+void set_layer_lock_flags(Layer& layer, LayerLockFlags flags);
+void set_layer_lock_flag(Layer& layer, LayerLockFlags flag, bool locked);
+[[nodiscard]] LayerLockFlags layer_effective_lock_flags(const std::vector<Layer>& layers, LayerId layer_id);
+[[nodiscard]] LayerLockFlags layer_ancestor_lock_flags(const std::vector<Layer>& layers, LayerId layer_id);
+[[nodiscard]] bool layer_effectively_locks_transparent_pixels(const std::vector<Layer>& layers, LayerId layer_id);
+// Photoshop's Background layer (GitHub issue 274): the bottom top-level pixel layer with no
+// transparency, covering exactly the canvas, with its position locked. File > New and Flatten
+// Image make one, the PSD reader turns Photoshop's (a bottom record with no transparency
+// channel) into one, and the PSD writer writes it back as one. It stays at the bottom of the
+// stack and takes no layer styles; clearing its position lock (Layer from Background) makes it
+// an ordinary layer. Null when the stack has none.
+[[nodiscard]] const Layer* background_layer(const std::vector<Layer>& layers, std::int32_t canvas_width,
+                                            std::int32_t canvas_height);
+// Clears the locks the Background status carries (position, transparent pixels, artboard
+// auto-nest) and keeps any other lock. Layer from Background uses it, and so does every copy
+// of the Background (Duplicate, Alt-drag, Copy, copy to another document): Photoshop makes
+// the copy an ordinary unlocked layer (GitHub issue 604).
+void clear_background_locks(Layer& layer);
+// Makes the Background an ordinary layer, as Layer from Background does: clear_background_locks
+// and, when `name` is not empty, that name. The UI and scripts pass their translated "Layer 0"
+// (layer_from_background_name, ui/canvas_widget_shared.hpp); core callers without one leave the
+// name alone. A canvas resize that leaves the Background's kept pixels beyond the canvas runs it
+// too (GitHub issue 701, resize_canvas_to_frame).
+void release_background(Layer& layer, std::string_view name);
+// clear_background_locks on `copy` when `source_id` is the Background of `layers`.
+void clear_background_locks_if_copy_of_background(Layer& copy, LayerId source_id, const std::vector<Layer>& layers,
+                                                  std::int32_t canvas_width, std::int32_t canvas_height);
+// False when `before` has a Background and `after` no longer has that layer (by id) as its
+// bottom top-level layer: a reorder, nesting or insertion that would move it off the bottom.
+[[nodiscard]] bool layer_stack_keeps_background(const std::vector<Layer>& before, const std::vector<Layer>& after,
+                                                std::int32_t canvas_width, std::int32_t canvas_height);
+[[nodiscard]] bool layer_effectively_locks_image_pixels(const std::vector<Layer>& layers, LayerId layer_id);
+[[nodiscard]] bool layer_effectively_locks_position(const std::vector<Layer>& layers, LayerId layer_id);
+
+[[nodiscard]] bool layer_is_locked(const Layer& layer);
+void set_layer_locked(Layer& layer, bool locked);
+[[nodiscard]] bool layer_is_effectively_locked(const std::vector<Layer>& layers, LayerId layer_id);
+[[nodiscard]] bool layer_has_locked_ancestor(const std::vector<Layer>& layers, LayerId layer_id);
+
+[[nodiscard]] bool layer_mask_linked(const Layer& layer);
+void set_layer_mask_linked(Layer& layer, bool linked);
+
+[[nodiscard]] bool layer_mask_is_document_alpha(const Layer& layer);
+void set_layer_mask_is_document_alpha(Layer& layer, bool document_alpha);
+
+[[nodiscard]] bool layer_group_expanded(const Layer& layer);
+void set_layer_group_expanded(Layer& layer, bool expanded);
+// kLayerMetadataFxExpanded as read: nullopt when the layer carries no state.
+[[nodiscard]] std::optional<bool> layer_fx_expanded(const Layer& layer);
+
+[[nodiscard]] bool layer_is_text(const Layer& layer);
+// Drops every text key and the TySh block: the layer keeps its raster as plain pixels
+// (Layer > Rasterize, and Perspective Crop under a non-affine map).
+void clear_layer_text_metadata(Layer& layer);
+
+// The stored GIMP text of a painted-on layer (kLayerMetadataXcfStoredTextBox).
+[[nodiscard]] bool layer_has_stored_xcf_text(const Layer& layer);
+// Moves the stored text keys back into place, dropping the stored copy, and returns GIMP's
+// layer rect; nullopt (nothing changed) without a readable stored text.
+[[nodiscard]] std::optional<Rect> take_stored_xcf_text(Layer& layer);
+// Drops the stored text without restoring it.
+void clear_stored_xcf_text(Layer& layer);
+
+[[nodiscard]] std::optional<LayerAffineTransform> parse_layer_affine_transform(std::string_view text);
+[[nodiscard]] std::string serialize_layer_affine_transform(const LayerAffineTransform& transform);
+[[nodiscard]] LayerAffineTransform compose_layer_affine_transform(const LayerAffineTransform& outer,
+                                                                  const LayerAffineTransform& inner);
+void translate_moved_layer_metadata(Layer& layer, std::int32_t dx, std::int32_t dy, std::int32_t document_width,
+                                    std::int32_t document_height);
+
+}  // namespace patchy

@@ -1,0 +1,5967 @@
+// CanvasWidget's event dispatchers, split out of canvas_widget.cpp: the
+// app-level eventFilter, event() (the magnetic-lasso/guide ShortcutOverride
+// and native pinch gesture), the wheel/resize/mouse/key/focus/enter/leave/
+// timer handlers, handle_opacity_digit_key, refresh_tool_cursor, begin_edit,
+// and effective_tool_for_input. Pure function moves from canvas_widget.cpp;
+// behavior must stay identical.
+
+#include "ui/canvas_widget.hpp"
+
+#include "core/document.hpp"
+#include "core/document_channel.hpp"
+#include "core/layer.hpp"
+#include "core/layer_metadata.hpp"
+#include "core/layer_render_utils.hpp"
+#include "core/layer_tree.hpp"
+#include "core/pixel_buffer.hpp"
+#include "core/pixel_tools.hpp"
+#include "core/smart_object.hpp"
+#include "core/vector_shape.hpp"
+#include "ui/canvas_types.hpp"
+#include "ui/canvas_widget_shared.hpp"
+#include "ui/tool_modifier_style.hpp"
+#include "ui/main_window_shared.hpp"
+#include "ui/image_document_io.hpp"
+#include "ui/modifier_names.hpp"
+#include "ui/qt_geometry.hpp"
+#include "ui/tool_cursors.hpp"
+
+#include <QApplication>
+#include <QEnterEvent>
+#include <QEvent>
+#include <QFocusEvent>
+#include <QHideEvent>
+#include <QImage>
+#include <QKeyEvent>
+#include <QMouseEvent>
+#include <QNativeGestureEvent>
+#include <QObject>
+#include <QPoint>
+#include <QPointF>
+#include <QRect>
+#include <QRectF>
+#include <QRegion>
+#include <QResizeEvent>
+#include <QMetaObject>
+#include <QScopeGuard>
+#include <QScopedValueRollback>
+#include <QSize>
+#include <QString>
+#include <QTimerEvent>
+#include <QWheelEvent>
+#include <QWidget>
+#include <Qt>
+#include <QtGlobal>
+
+#include <algorithm>
+#include <array>
+#include <chrono>
+#include <cmath>
+#include <cstdint>
+#include <cstdio>
+#include <cstring>
+#include <functional>
+#include <iostream>
+#include <iterator>
+#include <optional>
+#include <ratio>
+#include <utility>
+#include <vector>
+
+namespace patchy::ui {
+
+namespace {
+
+bool render_trace_enabled() noexcept {
+  static const bool enabled = qEnvironmentVariableIsSet("PATCHY_RENDER_TRACE");
+  return enabled;
+}
+
+// PATCHY_WHEEL_TRACE=1 prints every canvas wheel and native gesture event to stderr:
+// what a trackpad, mouse wheel or tablet driver actually delivers on this machine.
+bool wheel_trace_enabled() noexcept {
+  static const bool enabled = qEnvironmentVariableIsSet("PATCHY_WHEEL_TRACE");
+  return enabled;
+}
+
+bool tool_supports_off_canvas_brush_strokes(CanvasTool tool) noexcept {
+  switch (tool) {
+    case CanvasTool::Brush:
+    case CanvasTool::MixerBrush:
+    case CanvasTool::PatternStamp:
+    case CanvasTool::Clone:
+    case CanvasTool::Healing:
+    case CanvasTool::SpotHealing:
+    case CanvasTool::Smudge:
+    case CanvasTool::Dodge:
+    case CanvasTool::Burn:
+    case CanvasTool::Sponge:
+    case CanvasTool::BlurBrush:
+    case CanvasTool::SharpenBrush:
+    case CanvasTool::ColorReplace:
+    case CanvasTool::BackgroundEraser:
+    case CanvasTool::Eraser:
+      return true;
+    default:
+      return false;
+  }
+}
+
+// The brushes that share the toning stroke plumbing (press, spacing, release): Dodge, Burn,
+// Sponge, Blur, Sharpen, and Color Replacement and the Background Eraser, which paint through
+// their own segment function.
+bool is_local_adjustment_tool(CanvasTool tool) noexcept {
+  switch (tool) {
+    case CanvasTool::Dodge:
+    case CanvasTool::Burn:
+    case CanvasTool::Sponge:
+    case CanvasTool::BlurBrush:
+    case CanvasTool::SharpenBrush:
+    case CanvasTool::ColorReplace:
+    case CanvasTool::BackgroundEraser:
+      return true;
+    default:
+      return false;
+  }
+}
+
+// Tools whose opacity the bare digit keys adjust while the canvas has focus (Smudge: its Strength).
+bool tool_supports_opacity_digit_keys(CanvasTool tool) noexcept {
+  switch (tool) {
+    case CanvasTool::Brush:
+    case CanvasTool::PatternStamp:
+    case CanvasTool::Clone:
+    case CanvasTool::Healing:
+    case CanvasTool::Smudge:
+    case CanvasTool::Eraser:
+    case CanvasTool::Gradient:
+    case CanvasTool::Line:
+    case CanvasTool::Rectangle:
+    case CanvasTool::Ellipse:
+      return true;
+    default:
+      return false;
+  }
+}
+
+// Tools without an opacity, strength or exposure of their own: there the bare digit keys
+// set the selected layers' opacity, as in Photoshop (GitHub issue 527). The Fill, toning,
+// focus, Mixer and Spot Healing tools keep ignoring them (their own amounts may take the
+// keys one day), and the crop tools stay out while a crop box may be pending.
+bool tool_sets_layer_opacity_with_digit_keys(CanvasTool tool) noexcept {
+  switch (tool) {
+    case CanvasTool::Move:
+    case CanvasTool::Artboard:
+    case CanvasTool::Marquee:
+    case CanvasTool::EllipticalMarquee:
+    case CanvasTool::Lasso:
+    case CanvasTool::PolygonLasso:
+    case CanvasTool::MagneticLasso:
+    case CanvasTool::MagicWand:
+    case CanvasTool::QuickSelect:
+    case CanvasTool::ObjectSelect:
+    case CanvasTool::Eyedropper:
+    case CanvasTool::Ruler:
+    case CanvasTool::Text:
+    case CanvasTool::TypeMask:
+    case CanvasTool::Pan:
+    case CanvasTool::Zoom:
+    case CanvasTool::Pen:
+    case CanvasTool::AddAnchor:
+    case CanvasTool::DeleteAnchor:
+    case CanvasTool::ConvertPoint:
+    case CanvasTool::PathSelect:
+    case CanvasTool::DirectSelect:
+    case CanvasTool::Polygon:
+    case CanvasTool::CustomShape:
+    case CanvasTool::PatchTool:
+    case CanvasTool::ContentAwareMove:
+    case CanvasTool::RedEye:
+    case CanvasTool::RotateView:
+      return true;
+    default:
+      return false;
+  }
+}
+
+constexpr int kAirbrushTimerIntervalMs = 50;
+
+// The rects one move event's stroke samples wrote, as a few bounding boxes: a
+// sample joins the running box while the box stays at most twice the area of
+// what it covers, so a fast arc composites along its path instead of its whole
+// bounding square (which can pass the full-refresh threshold).
+QRegion stroke_samples_dirty_region(const std::vector<QRect>& rects) {
+  constexpr int kMaxGroups = 16;
+  std::vector<QRect> groups;
+  QRect group;
+  std::int64_t group_member_area = 0;
+  const auto area = [](QRect rect) {
+    return static_cast<std::int64_t>(rect.width()) * static_cast<std::int64_t>(rect.height());
+  };
+  for (const auto& rect : rects) {
+    if (rect.isEmpty()) {
+      continue;
+    }
+    if (group.isEmpty()) {
+      group = rect;
+      group_member_area = area(rect);
+      continue;
+    }
+    const auto merged = group.united(rect);
+    if (area(merged) <= 2 * (group_member_area + area(rect))) {
+      group = merged;
+      group_member_area += area(rect);
+    } else {
+      groups.push_back(group);
+      group = rect;
+      group_member_area = area(rect);
+    }
+  }
+  if (!group.isEmpty()) {
+    groups.push_back(group);
+  }
+  QRegion region;
+  if (static_cast<int>(groups.size()) > kMaxGroups) {
+    QRect bounds;
+    for (const auto& rect : groups) {
+      bounds = bounds.united(rect);
+    }
+    return QRegion(bounds);
+  }
+  for (const auto& rect : groups) {
+    region += rect;
+  }
+  return region;
+}
+
+}  // namespace
+
+bool CanvasWidget::eventFilter(QObject* watched, QEvent* event) {
+  // The source key held (Alt, or Ctrl in the GIMP-style and Krita-style tool modifiers, GitHub
+  // issue 302) aims a new Clone or Healing source: the old source's overlay hides until it is
+  // released (GitHub issue 573). The key event itself says which way the key went.
+  if ((event->type() == QEvent::KeyPress || event->type() == QEvent::KeyRelease) && isVisible()) {
+    const auto* key_event = static_cast<QKeyEvent*>(event);
+    if (key_event->key() == tool_modifier_key(ToolModifierRole::RetouchSource, CanvasTool::Clone) &&
+        !key_event->isAutoRepeat()) {
+      set_clone_overlay_alt_held(event->type() == QEvent::KeyPress);
+    }
+  }
+  // The Hand (the tool, or Space held over another tool) shows the magnifier
+  // while Ctrl or Alt would make a click zoom (GitHub issue 304).
+  if ((event->type() == QEvent::KeyPress || event->type() == QEvent::KeyRelease) && isVisible() &&
+      (tool_ == CanvasTool::Pan || spacebar_panning_) && !panning_ && !hand_zoom_pending_) {
+    auto* key_event = static_cast<QKeyEvent*>(event);
+    if (!key_event->isAutoRepeat() && (key_event->key() == Qt::Key_Control || key_event->key() == Qt::Key_Alt)) {
+      // The event reports the modifier state before this key; fold it in.
+      const auto bit = key_event->key() == Qt::Key_Alt ? Qt::AltModifier : Qt::ControlModifier;
+      apply_hand_cursor(event->type() == QEvent::KeyPress ? (key_event->modifiers() | bit)
+                                                          : (key_event->modifiers() & ~bit));
+      return QWidget::eventFilter(watched, event);
+    }
+  }
+  // Refresh the selection-mode cursor badge on any Shift/Alt change, regardless
+  // of which widget holds focus. Gated on visibility (so only the active
+  // document tab reacts); setting the cursor while the pointer is elsewhere is
+  // harmless since it only shows once the pointer is back over the canvas.
+  if ((event->type() == QEvent::KeyPress || event->type() == QEvent::KeyRelease) && isVisible() &&
+      !selecting_ && !lassoing_ && !magnetic_lassoing_ && !polygon_lassoing_ && !quick_selecting_ &&
+      !object_selecting_ && !moving_selection_ &&
+      !spacebar_panning_ && !panning_ && !dragging_transform_) {
+    auto* key_event = static_cast<QKeyEvent*>(event);
+    if (!key_event->isAutoRepeat() &&
+        (key_event->key() == Qt::Key_Shift || key_event->key() == Qt::Key_Alt ||
+         (key_event->key() == Qt::Key_Control && (pen_family_tool_active() || tool_ == CanvasTool::Move ||
+                                                  tool_ == CanvasTool::Text || tool_has_ctrl_temporary_move(tool_) ||
+                                                  tool_has_ctrl_tool_modifier(tool_) ||
+                                                  transforming_layer_ ||
+                                                  path_transform_active_ || tool_ == CanvasTool::PathSelect ||
+                                                  tool_ == CanvasTool::DirectSelect || shape_tool_active() ||
+                                                  tool_ == CanvasTool::Crop)))) {
+      // The event reports the modifier state before this key, so fold the
+      // pressed/released key into the modifiers we evaluate.
+      const auto bit = key_event->key() == Qt::Key_Shift   ? Qt::ShiftModifier
+                       : key_event->key() == Qt::Key_Alt   ? Qt::AltModifier
+                                                           : Qt::ControlModifier;
+      const auto modifiers = event->type() == QEvent::KeyPress ? (key_event->modifiers() | bit)
+                                                               : (key_event->modifiers() & ~bit);
+      // The Shift+click line preview (GitHub issue 445) shows and hides with the key alone.
+      set_stroke_connect_preview_modifiers(modifiers);
+      if (transforming_layer_ && !warping_layer_) {
+        // A pending Free Transform: Ctrl, Alt and Shift change what a handle drag
+        // does, so the cursor over a handle shows that gesture before the press.
+        apply_session_transform_cursor(last_mouse_position_, modifiers);
+      } else if (path_transform_active_) {
+        // The path transform box takes the same gestures (GitHub issue 248).
+        if (path_transform_drag_handle_ == TransformHandle::None) {
+          apply_path_transform_cursor(last_mouse_position_, modifiers);
+        }
+      } else if (tool_ == CanvasTool::PathSelect || tool_ == CanvasTool::DirectSelect) {
+        // Ctrl swaps the two arrows with a stationary pointer (not mid-drag).
+        if (path_drag_mode_ == PathEditDrag::None) {
+          set_arrow_swap((modifiers & Qt::ControlModifier) != 0);
+        }
+      } else if (tool_ == CanvasTool::Zoom) {
+        if (key_event->key() == tool_modifier_key(ToolModifierRole::ZoomOut, CanvasTool::Zoom)) {
+          // Idle: the zoom-out key (Alt, or Ctrl: GitHub issue 302) flips the magnifier badge
+          // between + and -. Mid-drag it suppresses the marquee, so repaint to show/hide the preview.
+          if (zooming_) {
+            update();
+          } else {
+            apply_zoom_cursor(zoom_tool_zoom_out_active(modifiers));
+          }
+        }
+      } else if (pen_family_tool_active()) {
+        // Alt (convert badge) and Ctrl (temporary Direct Select arrow) both
+        // change the pen cursor with a stationary pointer; refresh it from the
+        // folded modifiers, skipping mid-gesture states so drags never flicker.
+        if (!pen_handle_dragging_ && !pen_temp_direct_select_ && pen_session_drag_anchor_ < 0) {
+          pen_cursor_modifier_override_ = modifiers;
+          update_tool_cursor();
+          pen_cursor_modifier_override_.reset();
+        }
+      } else if (key_event->key() == Qt::Key_Control && tool_ == CanvasTool::Crop) {
+        // Ctrl held is the Crop tool's temporary Straighten (GitHub issue 702): the cross
+        // shows with a stationary pointer; a gesture in progress keeps its cursor.
+        if (crop_session_active_ && !crop_straightening_ && !crop_dragging_out_ && !crop_rotating_ &&
+            crop_drag_handle_ == TransformHandle::None) {
+          if ((modifiers & Qt::ControlModifier) != 0) {
+            setCursor(Qt::CrossCursor);
+          } else {
+            update_tool_cursor();
+          }
+        }
+      } else if (key_event->key() == Qt::Key_Control && shape_tool_active()) {
+        // Ctrl is a shape tool's temporary Path Select (GitHub issue 312): the arrow and the
+        // path overlay show with a stationary pointer; a drag in progress keeps its mode.
+        if (!drawing_shape_ && !shape_temp_path_select_ && !shape_handle_drag_active()) {
+          set_shape_ctrl_path_select((modifiers & Qt::ControlModifier) != 0);
+        }
+      } else if (key_event->key() == Qt::Key_Control && tool_ == CanvasTool::Text) {
+        // Ctrl is the Type tool's temporary Move (GitHub issue 216): the four-way cursor shows
+        // over a text layer a press would drag, from the folded modifiers, no motion needed.
+        if (!text_layer_move_active_) {
+          text_ctrl_cursor_override_ = (modifiers & Qt::ControlModifier) != 0;
+          update_tool_cursor();
+          text_ctrl_cursor_override_.reset();
+        }
+      } else if (tool_ == CanvasTool::Move && apply_move_box_handle_cursor(last_mouse_position_, modifiers)) {
+        // Over a Move-box corner or side, Ctrl (with Shift) turns the press into a
+        // distort or skew (GitHub issue 351): the cursor shows it, no motion needed.
+      } else if (key_event->key() == Qt::Key_Control && tool_ == CanvasTool::Move) {
+        // With Auto-Select off, Ctrl held over artwork previews the layer a
+        // click would select (GitHub issue 73); refresh the outline from the
+        // folded modifiers at the last pointer position, no motion needed.
+        update_move_hover_outline(last_mouse_position_, modifiers);
+      } else if (key_event->key() == tool_modifier_key(ToolModifierRole::ToningSwap, tool_) &&
+                 alt_swapped_toning_tool(tool_) != tool_) {
+        // Alt (Ctrl in the GIMP-style tool modifiers) swaps Dodge and Burn, Blur and Sharpen for
+        // a stroke that starts with it held (GitHub #662): the status bar names the operation a
+        // press would paint.
+        if (!painting_ && status_callback_) {
+          const auto swap_held = tool_modifier_held(ToolModifierRole::ToningSwap, tool_, modifiers);
+          const auto operation = swap_held ? alt_swapped_toning_tool(tool_) : tool_;
+          const auto name = tool_name(operation);
+          status_callback_(swap_held ? resolve_tool_modifier_names(tr("%1 while %SWAP_KEY% is held"), tool_).arg(name)
+                                     : name);
+        }
+      } else if ((key_event->key() == tool_modifier_key(ToolModifierRole::RetouchSource, tool_) &&
+                  retouch_source_tool_active()) ||
+                 (key_event->key() == tool_modifier_key(ToolModifierRole::TemporaryMove, tool_) &&
+                  tool_has_ctrl_temporary_move(tool_))) {
+        // Ctrl is every painting tool's temporary Move and Alt Clone's and Healing's source
+        // cursor (GitHub issues 380, 421; the GIMP-style and Krita-style tool modifiers swap the
+        // two where the source or pick is Ctrl, issue 302), from the folded modifiers with a
+        // stationary pointer; a stroke or a Move drag in progress keeps its cursor.
+        if (!painting_ && !move_drag_pending_ && !moving_layer_ && !paint_ctrl_click_.has_value()) {
+          retouch_cursor_modifier_override_ = modifiers;
+          update_tool_cursor();
+          retouch_cursor_modifier_override_.reset();
+        }
+      } else if (key_event->key() == tool_modifier_key(ToolModifierRole::ColorPick, tool_) &&
+                 (tool_uses_alt_left_for_color_pick(tool_) || tool_ == CanvasTool::Eyedropper) && !painting_ &&
+                 !drawing_shape_) {
+        // Alt is the temporary-eyedropper modifier for paint/shape/fill tools;
+        // swap to (or back from) the eyedropper cursor the instant it toggles.
+        // Drive it from the folded modifier state (authoritative here, unlike the
+        // global keyboard state, which can lag this filter and leave the cursor
+        // stuck on release). Skipped mid-stroke, where Alt has no picking effect.
+        alt_color_pick_cursor_override_ = tool_modifier_held(ToolModifierRole::ColorPick, tool_, modifiers);
+        update_tool_cursor();
+        alt_color_pick_cursor_override_.reset();
+      } else {
+        const auto mode = selection_operation(modifiers);
+        // Over a marquee resize handle the resize cursor stays whatever the
+        // modifier: Alt there mirrors, it does not subtract (GitHub issue 66).
+        // The Options-bar badge still follows the combine mode.
+        const auto handle = tool_ == CanvasTool::Marquee || tool_ == CanvasTool::EllipticalMarquee
+                                ? marquee_resize_handle_at(last_mouse_position_)
+                                : TransformHandle::None;
+        if (handle != TransformHandle::None) {
+          set_transform_cursor_for_handle(handle);
+        } else {
+          apply_selection_cursor_for_mode(mode);
+        }
+        if (selection_mode_changed_callback_) {
+          selection_mode_changed_callback_(mode);
+        }
+      }
+    }
+  }
+  return QWidget::eventFilter(watched, event);
+}
+
+bool CanvasWidget::event(QEvent* event) {
+  if (event->type() == QEvent::DevicePixelRatioChange) {
+    // The logical scale stays put when the window lands on a differently
+    // scaled screen, so the view zoom (per device pixel) changes: refresh the
+    // readout and the mip/renderer choices that follow it (GitHub issue 75).
+    const auto handled = QWidget::event(event);
+    update_tool_cursor();
+    update();
+    notify_view_changed();
+    return handled;
+  }
+  if (event->type() == QEvent::ShortcutOverride) {
+    if (processing_render_wait_active_) {
+      // A blocking processing wait is live and the canvas has focus (every
+      // drag press focuses it): accepting the override keeps app-level
+      // hotkeys (tool switches, undo) from firing into a half-committed
+      // operation. On wasm the nested wait loop can otherwise dispatch them.
+      event->accept();
+      return true;
+    }
+    const auto* key_event = static_cast<QKeyEvent*>(event);
+    if ((move_layer_selection_gesture_ || gradient_handle_drag_.has_value() || shape_handle_drag_active()) &&
+        key_event->key() == Qt::Key_Escape) {
+      event->accept();
+      return true;
+    }
+    if (pending_pixel_shape_ != nullptr &&
+        (key_event->key() == Qt::Key_Escape || key_event->key() == Qt::Key_Return ||
+         key_event->key() == Qt::Key_Enter)) {
+      event->accept();
+      return true;
+    }
+    // A selected gradient stop (GitHub issue 663 follow-up) owns Delete and Backspace, so the
+    // key never reaches Edit > Clear or a layer delete while one is selected.
+    if (gradient_handles_enabled() && key_event->modifiers() == Qt::NoModifier &&
+        (key_event->key() == Qt::Key_Delete || key_event->key() == Qt::Key_Backspace) &&
+        gradient_fill_selected_stop().has_value()) {
+      event->accept();
+      return true;
+    }
+    if (key_event->modifiers() == Qt::NoModifier &&
+        (key_event->key() == Qt::Key_Backspace || key_event->key() == Qt::Key_Delete)) {
+      // While a magnetic or polygonal lasso is live (Backspace pops the last point) or
+      // guides are selected (Delete/Backspace removes them), the canvas owns these keys.
+      // Accepting the override suppresses the app-level shortcuts (layer.clear binds
+      // Backspace on macOS and Delete everywhere) so keyPressEvent receives a plain key
+      // event instead of QShortcutMap consuming it first.
+      if (magnetic_lasso_active() || polygon_lasso_active() || pen_session_active_ ||
+          (path_edit_tool_active() && path_edit_has_selection()) ||
+          (!guides_locked_ && has_selected_guides())) {
+        event->accept();
+        return true;
+      }
+    }
+  }
+  if (event->type() == QEvent::ToolTip && show_gradient_fill_handle_tooltip(event)) {
+    return true;
+  }
+  if (event->type() == QEvent::NativeGesture) {
+    const auto* gesture = static_cast<QNativeGestureEvent*>(event);
+    if (wheel_trace_enabled()) {
+      std::fprintf(stderr, "[wheel] gesture type=%d value=%.4f device=%d\n", static_cast<int>(gesture->gestureType()),
+                   gesture->value(),
+                   gesture->pointingDevice() != nullptr ? static_cast<int>(gesture->pointingDevice()->type()) : -1);
+    }
+    if (gesture->gestureType() == Qt::ZoomNativeGesture) {
+      // macOS trackpad pinch: value() is this step's incremental scale delta. Zoom about
+      // the pointer exactly like Alt+wheel (Photoshop-mac behavior). Dropped while a
+      // press-drag gesture is live, like continuous scrolling (see wheelEvent).
+      if (!processing_render_wait_active_ && !view_gesture_blocked_by_pointer()) {
+        zoom_at_widget_point(gesture->position(), 1.0 + gesture->value());
+      }
+      event->accept();
+      return true;
+    }
+  }
+  return QWidget::event(event);
+}
+
+bool CanvasWidget::wheel_event_is_continuous_scroll(const QWheelEvent& event) noexcept {
+  // Trackpads, the Magic Mouse and touch tablets report scroll phases; a stepped mouse
+  // wheel never does. pixelDelta alone cannot tell them apart: the wasm plugin fills it
+  // for an ordinary wheel notch (docs/wasm.md).
+  if (event.phase() == Qt::NoScrollPhase) {
+    return false;
+  }
+  // A phase alone is not enough either: on macOS a tablet driver's pen Scroll button
+  // (measured with a Wacom Intuos, October 2026) sends phased events that are still
+  // wheel notches, angleDelta a whole +-120 beside a small accelerated pixelDelta.
+  // A true finger scroll reports angleDelta as twice its pixelDelta.
+  const auto angle = event.angleDelta();
+  const auto pixel = event.pixelDelta();
+  const bool notch = !angle.isNull() && angle.x() % 120 == 0 && angle.y() % 120 == 0 && angle != pixel * 2;
+  return !notch;
+}
+
+double CanvasWidget::wheel_zoom_factor(const QWheelEvent& event) noexcept {
+  const auto wheel_delta = !event.pixelDelta().isNull() ? event.pixelDelta() : event.angleDelta();
+  const auto primary_delta = wheel_delta.y() != 0 ? wheel_delta.y() : wheel_delta.x();
+  if (primary_delta == 0) {
+    return 1.0;
+  }
+  if (wheel_event_is_continuous_scroll(event)) {
+    // A finger scroll is a stream of small deltas: zoom in proportion to travel
+    // (about 175 px doubles) instead of one wheel step per event.
+    constexpr double kContinuousZoomFactorPerPixel = 1.004;
+    return std::pow(kContinuousZoomFactorPerPixel, static_cast<double>(primary_delta));
+  }
+  return primary_delta > 0 ? 1.1 : 0.9;
+}
+
+bool CanvasWidget::view_gesture_blocked_by_pointer() const noexcept {
+  return pointer_gesture_active() || panning_ || zooming_ || hand_zoom_pending_ || pen_zoom_dragging_ ||
+         brush_adjust_dragging_;
+}
+
+void CanvasWidget::wheelEvent(QWheelEvent* event) {
+  if (wheel_trace_enabled()) {
+    std::fprintf(stderr, "[wheel] pixel=(%d,%d) angle=(%d,%d) phase=%d inverted=%d device=%d mods=0x%x\n",
+                 event->pixelDelta().x(), event->pixelDelta().y(), event->angleDelta().x(), event->angleDelta().y(),
+                 static_cast<int>(event->phase()), event->inverted() ? 1 : 0,
+                 event->pointingDevice() != nullptr ? static_cast<int>(event->pointingDevice()->type()) : -1,
+                 static_cast<unsigned>(event->modifiers()));
+  }
+  if (processing_render_wait_active_) {
+    // Re-entrant input during a processing wait (see mousePressEvent): a
+    // mid-commit zoom change would shift the widget rects the release is
+    // about to repaint.
+    event->accept();
+    return;
+  }
+
+  // In the GIMP-style tool modifiers Ctrl+wheel zooms and Alt+wheel pans as Ctrl does here
+  // (GitHub issue 302): the two keys trade places for every test below.
+  auto wheel_modifiers = event->modifiers();
+  if (tool_modifier(ToolModifierRole::WheelZoom, CanvasTool::Zoom) == Qt::ControlModifier) {
+    const auto ctrl = wheel_modifiers.testFlag(Qt::ControlModifier);
+    wheel_modifiers.setFlag(Qt::ControlModifier, wheel_modifiers.testFlag(Qt::AltModifier));
+    wheel_modifiers.setFlag(Qt::AltModifier, ctrl);
+  }
+
+  if (wheel_event_is_continuous_scroll(*event)) {
+    // Two-finger scrolling pans freely on both axes at finger speed, whatever the
+    // wheel-zoom preference says (pinch is the trackpad's zoom); Alt zooms.
+    event->accept();
+    if (event->phase() == Qt::ScrollBegin) {
+      swallow_scroll_momentum_ = false;
+    }
+    // A pan under a live stroke or drag would shift the document under the pointer
+    // (a palm on the trackpad while drawing), and momentum from an earlier flick
+    // must not carry into a gesture that began after it.
+    if (view_gesture_blocked_by_pointer() ||
+        (swallow_scroll_momentum_ && event->phase() == Qt::ScrollMomentum)) {
+      return;
+    }
+    const auto delta = !event->pixelDelta().isNull() ? QPointF(event->pixelDelta())
+                                                     : QPointF(event->angleDelta()) / 8.0;
+    if (delta.isNull()) {
+      return;
+    }
+    if ((wheel_modifiers & Qt::AltModifier) != 0) {
+      zoom_at_widget_point(event->position(), wheel_zoom_factor(*event));
+      return;
+    }
+    const auto old_pan = pan_;
+    pan_ += delta;
+    constrain_pan();
+    if (pan_ != old_pan) {
+      update();
+      notify_view_changed();
+    }
+    return;
+  }
+
+  // A whole notch counts as 120 on every platform: macOS pairs it with a small
+  // accelerated pixelDelta (1 to 7), which made a wheel step pan only a pixel or two.
+  const auto angle_delta = event->angleDelta();
+  const bool whole_notches = !angle_delta.isNull() && angle_delta.x() % 120 == 0 && angle_delta.y() % 120 == 0;
+  const auto wheel_delta = whole_notches || event->pixelDelta().isNull() ? angle_delta : event->pixelDelta();
+  const auto primary_delta = wheel_delta.y() != 0 ? wheel_delta.y() : wheel_delta.x();
+  if (primary_delta == 0) {
+    event->accept();
+    return;
+  }
+
+  // Alt+wheel always zooms, in either mode.
+  if ((wheel_modifiers & Qt::AltModifier) != 0) {
+    zoom_at_widget_point(event->position(), wheel_zoom_factor(*event));
+    event->accept();
+    return;
+  }
+
+  // A sideways-only step (a tilt wheel, or macOS turning Shift+wheel into a horizontal
+  // delta) pans horizontally in either mode. Alt is excluded above: Qt moves an
+  // Alt+wheel step onto the x axis on Windows and Linux.
+  if (wheel_delta.y() == 0) {
+    constexpr double kSidewaysPanScale = 0.5;
+    const auto old_pan = pan_;
+    pan_.rx() += static_cast<double>(primary_delta) * kSidewaysPanScale;
+    constrain_pan();
+    event->accept();
+    if (pan_ != old_pan) {
+      update();
+      notify_view_changed();
+    }
+    return;
+  }
+
+  // In wheel-zoom mode a plain wheel zooms (centered on the cursor) and the
+  // modifiers pan; otherwise a plain wheel pans (Photoshop-style navigation).
+  // A pen button configured as "scroll" arrives here as a wheel event, so this
+  // mode also lets that button zoom.
+  if (wheel_zooms_) {
+    const auto modifiers = wheel_modifiers;
+    if ((modifiers & Qt::ControlModifier) == 0 && (modifiers & Qt::ShiftModifier) == 0) {
+      zoom_at_widget_point(event->position(), primary_delta > 0 ? 1.1 : 0.9);
+      event->accept();
+      return;
+    }
+  }
+
+  constexpr double kWheelPanScale = 0.5;
+  const auto old_pan = pan_;
+  // Photoshop's axes: with wheel zoom off a plain wheel scrolls vertically and Ctrl
+  // (or Shift) horizontally. In wheel-zoom mode Ctrl pans vertically, Shift horizontally.
+  const bool pan_vertically =
+      wheel_zooms_ ? (wheel_modifiers & Qt::ShiftModifier) == 0
+                   : (wheel_modifiers & (Qt::ControlModifier | Qt::ShiftModifier)) == 0;
+  if (pan_vertically) {
+    pan_.ry() += static_cast<double>(primary_delta) * kWheelPanScale;
+  } else {
+    pan_.rx() += static_cast<double>(primary_delta) * kWheelPanScale;
+  }
+  constrain_pan();
+  event->accept();
+  if (pan_ != old_pan) {
+    update();
+    notify_view_changed();
+  }
+}
+
+void CanvasWidget::resizeEvent(QResizeEvent* event) {
+  QWidget::resizeEvent(event);
+  // A maximized window, a dock opening or closing and a resized float window all re-anchor
+  // the view (GitHub issue 241). Hidden tabs too, so they show centered when chosen. Only
+  // a view something placed (view_size_ is set): a canvas no command has placed keeps its
+  // default pan. Not during a drag: the options row can change height mid-gesture, and the
+  // document must not slide under the pointer.
+  const bool recentered = view_size_.isValid() && !view_gesture_blocked_by_pointer() &&
+      keep_view_centered_across_resize(view_size_);
+  if (view_size_.isValid()) {
+    view_size_ = size();
+  }
+  if (isVisible() && (constrain_pan() || recentered)) {
+    update();
+    notify_view_changed();
+  }
+  // Bar geometry and page step track the viewport even when pan was unchanged
+  // (idempotent when notify_view_changed already synced above).
+  sync_scroll_bars();
+}
+
+void CanvasWidget::mousePressEvent(QMouseEvent* event) {
+  if (processing_render_wait_active_) {
+    // A blocking processing wait is live (undo snapshot or accurate-patch
+    // render mid-commit). Desktop defers user input for the duration, but
+    // wasm delivers DOM input synchronously into the nested wait loop
+    // (ExcludeUserInputEvents only defers queued window-system events), so
+    // re-entrant input must not reach gesture state: drop it. Releases are
+    // parked instead (see mouseReleaseEvent).
+    event->accept();
+    return;
+  }
+  flush_pending_drag_move();
+  if (gradient_pending_commit_.has_value() &&
+      (gradient_pending_commit_->new_layer || event->button() != Qt::LeftButton)) {
+    // A Gradient Fill layer still on its way (GitHub #714 follow-up) lands before the press
+    // looks for its handles; a menu press reads the layer itself, so an existing fill's
+    // pending gradient lands first too. A left press on an existing fill does not wait.
+    flush_gradient_fill_pending_commit();
+  }
+  clear_gradient_fill_drag_hold();  // a new gesture never draws under a held preview
+  // A stroke in progress hides the Shift+click line preview (GitHub issue 445).
+  const auto refresh_connect_preview = qScopeGuard([this] { refresh_stroke_connect_preview(); });
+  if (!handling_tablet_event_) {
+    active_pen_input_sample_.reset();
+  }
+  // A preview dialog's point handle takes the press before any tool (docs/gmic.md).
+  if (press_preview_point_handle(event)) {
+    event->accept();
+    return;
+  }
+  // Momentum still coasting from a trackpad flick ends at a press (see wheelEvent).
+  swallow_scroll_momentum_ = true;
+  dragging_text_entry_selection_ = false;
+  setFocus(Qt::MouseFocusReason);
+  last_mouse_position_ = event->pos();
+  emit_info_for_widget_position(event->pos());
+  context_press_pos_.reset();
+  if (event->button() == Qt::LeftButton) {
+    // A new press also retires a pending selection whose release was lost.
+    cancel_move_layer_selection();
+  }
+
+  // Right-click on a ruler opens the unit menu (Photoshop's gesture); it must win
+  // over the canvas context-menu press below.
+  if (event->button() == Qt::RightButton && rulers_visible_ && widget_position_in_ruler(event->pos())) {
+    show_ruler_unit_menu(event->globalPosition().toPoint());
+    event->accept();
+    return;
+  }
+
+  if (brush_adjust_dragging_) {
+    if ((event->buttons() & Qt::RightButton) != 0) {
+      event->accept();
+      return;
+    }
+    // Stale drag after a lost right-button release: end it and let this
+    // press behave normally.
+    end_brush_adjust_drag(true);
+  }
+
+  // Photoshop-style brush resize: Alt+Right-drag adjusts size (horizontal)
+  // and softness (vertical). Must win over the context-menu press below. Pen
+  // barrel buttons get the same Alt chord in dispatch_tablet_as_mouse; without
+  // Alt their synthesized right presses keep the configured pen action, so the
+  // tablet path is excluded here.
+  if (event->button() == Qt::RightButton && (event->modifiers() & Qt::AltModifier) != 0 &&
+      !handling_tablet_event_ && !edit_locked_ && !spacebar_panning_ && !painting_ && !drawing_shape_ &&
+      !quick_selecting_ && !transforming_layer_ && tool_supports_brush_adjust_drag(tool_)) {
+    begin_brush_adjust_drag(event->pos());
+    event->accept();
+    return;
+  }
+
+  // A stale pen-button mouse gesture after a lost release, or a left press
+  // that must win over it, ends the gesture so this press behaves normally.
+  if (mouse_pen_action_button_ != Qt::NoButton &&
+      ((event->buttons() & mouse_pen_action_button_) == 0 || event->button() == Qt::LeftButton)) {
+    mouse_pen_action_button_ = Qt::NoButton;
+    if (pen_zoom_dragging_) {
+      end_zoom_drag();
+    }
+  }
+
+  // Pen buttons mapped to "Right/Middle Mouse Click" in the tablet driver
+  // arrive as plain mouse presses, not tablet events, so resolve the
+  // configured pen-button action here. Gated on the pen actually hovering
+  // (tablet events streamed a moment ago), which a bare mouse never
+  // satisfies, so a real mouse keeps the classic middle drag-to-pan and the
+  // right-click context menu.
+  if (!handling_tablet_event_ && pen_input_settings_.enabled && !painting_ && !drawing_shape_ &&
+      !spacebar_panning_ && (event->modifiers() & Qt::AltModifier) == 0 &&
+      (event->button() == Qt::RightButton || event->button() == Qt::MiddleButton) &&
+      pen_recently_in_proximity()) {
+    if (mouse_pen_action_button_ != Qt::NoButton) {
+      // A second pen button while a gesture is active: swallow it.
+      event->accept();
+      return;
+    }
+    const auto action = pen_action_for_button(event->button());
+    if (action == PenButtonAction::ZoomCanvas) {
+      mouse_pen_action_button_ = event->button();
+      begin_zoom_drag(event->position());
+      event->accept();
+      return;
+    }
+    if (action != PenButtonAction::PanCanvas) {
+      // One-shot actions fire on press; None just swallows. Either way the
+      // held button must not fall through and start a pan.
+      mouse_pen_action_button_ = event->button();
+      auto sample = last_pen_input_sample_.value_or(PenInputSample{});
+      sample.widget_position = event->position();
+      sample.document_position = document_position_f(event->position());
+      sample.button = event->button();
+      sample.buttons = event->buttons();
+      sample.modifiers = event->modifiers();
+      perform_pen_button_action(action, sample);
+      event->accept();
+      return;
+    }
+    // PanCanvas: the configured pen button pans, whichever button it is.
+    panning_ = true;
+    setCursor(Qt::ClosedHandCursor);
+    event->accept();
+    return;
+  }
+
+  if (event->button() == Qt::RightButton) {
+    // The right button is the context-menu button (it no longer pans; panning
+    // is the middle button, the spacebar, or the Pan tool). The press only
+    // records where it landed and the release decides: no drag opens the
+    // canvas context menu (show_canvas_context_menu), a drag opens nothing.
+    if (event->buttons() == Qt::RightButton && document_ != nullptr && !spacebar_panning_ &&
+        !handling_tablet_event_ && !pen_recently_in_proximity() && !pointer_gesture_active() &&
+        (event->modifiers() & Qt::AltModifier) == 0) {
+      context_press_pos_ = event->pos();
+    }
+    event->accept();
+    return;
+  }
+
+  if (spacebar_panning_ || tool_ == CanvasTool::Pan || (event->buttons() & Qt::MiddleButton) != 0) {
+    // Ctrl or Alt with the Hand zooms like a Zoom-tool click, on release
+    // (GitHub issue 304); a middle-button pan ignores the modifiers.
+    if (event->button() == Qt::LeftButton && (event->buttons() & Qt::MiddleButton) == 0 &&
+        hand_click_zooms(event->modifiers())) {
+      hand_zoom_pending_ = true;
+      hand_zoom_out_ = (event->modifiers() & Qt::AltModifier) != 0;
+      event->accept();
+      return;
+    }
+    panning_ = true;
+    setCursor(Qt::ClosedHandCursor);
+    return;
+  }
+
+  if (tool_ == CanvasTool::RotateView && event->button() == Qt::LeftButton && document_ != nullptr) {
+    begin_rotate_view_drag(event->position());
+    event->accept();
+    return;
+  }
+
+  if (transient_read_callback_ && event->button() == Qt::LeftButton) {
+    const auto point = document_position(event->pos());
+    if (document_contains(point)) {
+      transient_read_dragging_ = true;
+      grabMouse();
+      auto callback = transient_read_callback_;
+      callback(CanvasReadGesture{point, event->globalPosition().toPoint(), event->modifiers(),
+                                 CanvasReadPhase::Press});
+    }
+    event->accept();
+    return;
+  }
+
+  if (edit_locked_ && tool_ != CanvasTool::Zoom) {
+    // A filter dialog that lets the selection change passes a selection tool's
+    // left press; nothing else reaches the document (local-028).
+    if (event->button() != Qt::LeftButton || !selection_tool_passes_edit_lock() ||
+        widget_position_in_ruler(event->pos()) || guide_at_widget_position(event->pos()) >= 0) {
+      show_edit_locked_message();
+      event->accept();
+      return;
+    }
+    if (selection_sampling_callback_ &&
+        (tool_ == CanvasTool::MagicWand || tool_ == CanvasTool::QuickSelect ||
+         tool_ == CanvasTool::MagneticLasso || tool_ == CanvasTool::ObjectSelect)) {
+      auto callback = selection_sampling_callback_;
+      callback();
+    }
+  }
+
+  if (event->button() == Qt::LeftButton && widget_position_in_ruler(event->pos())) {
+    begin_new_guide_drag(event->pos());
+    event->accept();
+    return;
+  }
+
+  if (warping_layer_ && event->button() == Qt::LeftButton) {
+    // Unlike free transform, a click off the cage keeps the warp session alive
+    // (Photoshop behavior); only Enter/Esc or the options-bar buttons end it.
+    const auto handle = warp_handle_at(event->pos());
+    if (handle >= 0) {
+      dragging_warp_handle_ = true;
+      warp_drag_index_ = handle;
+      transform_session_step_at_press_ = current_transform_session_step();
+      update();
+    }
+    event->accept();
+    return;
+  }
+
+  if (transforming_layer_ && event->button() == Qt::LeftButton) {
+    const auto handle = transform_handle_at(event->pos());
+    if (handle != TransformHandle::None) {
+      if (!prepare_free_transform_source()) {
+        cancel_free_transform();
+        event->accept();
+        return;
+      }
+      dragging_transform_ = true;
+      transform_drag_uses_proxy_preview_ = false;
+      transform_drag_uses_clip_group_preview_ = false;
+      transform_drag_handle_ = handle;
+      transform_drag_start_point_ = document_position_f(event->position());
+      transform_drag_start_rect_ = transform_current_rect_;
+      transform_start_angle_ = transform_angle_;
+      transform_drag_grab_offset_ = transform_handle_grab_offset(handle, transform_current_rect_, transform_angle_,
+                                                                 transform_drag_start_point_);
+      transform_session_step_at_press_ = current_transform_session_step();
+      if (!begin_transform_distort_drag(handle, event->modifiers(), transform_drag_start_point_)) {
+        dragging_transform_ = false;
+        transform_drag_handle_ = TransformHandle::None;
+      }
+      transform_drag_start_scale_x_sign_ = transform_scale_x_sign_;
+      transform_drag_start_scale_y_sign_ = transform_scale_y_sign_;
+      update_drag_readout_region();
+      event->accept();
+      return;
+    }
+    // Like the warp cage, a click off the box keeps the session alive (Photoshop
+    // behavior); only Enter/Esc, the options-bar buttons, or a tool/layer switch
+    // end it. Discarding a half-built transform on a stray click was too harsh.
+    event->accept();
+    return;
+  }
+
+  // Artboards (canvas_widget_artboard.cpp): the Artboard tool owns every left press, and
+  // with the Move tool a press on an artboard's name label selects and moves it.
+  if (tool_ == CanvasTool::Artboard && event->button() == Qt::LeftButton && handle_artboard_press(event)) {
+    event->accept();
+    return;
+  }
+  if (tool_ == CanvasTool::Move && event->button() == Qt::LeftButton &&
+      (handle_artboard_label_press(event) || handle_move_tool_artboard_press(event))) {
+    event->accept();
+    return;
+  }
+
+  if (tool_ == CanvasTool::Ruler && document_ != nullptr && event->button() == Qt::LeftButton &&
+      !((event->modifiers() & Qt::ControlModifier) != 0 && guide_at_widget_position(event->pos()) >= 0)) {
+    // The Ruler owns every left press (Ctrl on a guide still drags the guide): an end,
+    // the line, or a new line, on the canvas or the pasteboard.
+    handle_ruler_press(event);
+    event->accept();
+    return;
+  }
+
+  // The Gradient tool's handles on the active Gradient Fill (GitHub issue 663): a press on an
+  // end, the line, a stop or a midpoint edits that gradient; anywhere else draws a new one.
+  // Under another tool (the Shape Appearance window's Show handles boxes, GitHub issue
+  // 694) a press on a part does the same, ahead of that tool's own handles and anchor points;
+  // anywhere else is the tool's press.
+  if (gradient_handles_enabled() && document_ != nullptr && event->button() == Qt::LeftButton &&
+      press_gradient_fill_handle(event)) {
+    event->accept();
+    return;
+  }
+
+  if (tool_ == CanvasTool::PerspectiveCrop && document_ != nullptr && event->button() == Qt::LeftButton) {
+    // Perspective Crop owns every left press: corners, the inside, click placement
+    // and the first drag, on the canvas or the pasteboard.
+    handle_perspective_crop_press(event);
+    event->accept();
+    update();
+    return;
+  }
+
+  if (tool_ == CanvasTool::Crop && crop_session_active_ && event->button() == Qt::LeftButton) {
+    // Handles adjust, the interior of a custom box moves it, a press on the
+    // canvas inside the default frame lays out a new box, and a press off the
+    // box rotates it (a mere click keeps the pending rect alive).
+    handle_crop_session_press(event);
+    event->accept();
+    return;
+  }
+
+  if (pen_family_tool_active() && event->button() == Qt::LeftButton) {
+    if (handle_pen_press(event, document_position_f(event->position()))) {
+      event->accept();
+      return;
+    }
+  }
+
+  if ((tool_ == CanvasTool::PathSelect || tool_ == CanvasTool::DirectSelect) &&
+      event->button() == Qt::LeftButton) {
+    if (handle_path_edit_press(event, document_position_f(event->position()))) {
+      event->accept();
+      return;
+    }
+  }
+
+  // A pending pixel shape (GitHub issue 716): a press on its box edits it; a press off it
+  // paints it into the target, and this same press goes on to start the next shape.
+  if (pending_pixel_shape_ != nullptr && event->button() == Qt::LeftButton && !drawing_shape_) {
+    if (press_shape_resize_handle(event)) {
+      event->accept();
+      return;
+    }
+    commit_pending_pixel_shape();
+  }
+
+  // Ctrl with a shape tool is a temporary Path Select (GitHub issue 312), read
+  // from this press's own modifiers like the Pen's temporary Direct Select.
+  if (shape_tool_active() && event->button() == Qt::LeftButton && !drawing_shape_) {
+    shape_temp_path_select_ = false;  // a lost release never outlives the next press
+    // Ctrl on a ruler guide still drags the guide (any tool's Ctrl gesture, below).
+    if ((event->modifiers() & Qt::ControlModifier) != 0 && guide_at_widget_position(event->pos()) < 0) {
+      if (handle_shape_ctrl_press(event, document_position_f(event->position()))) {
+        event->accept();
+        return;
+      }
+    } else {
+      set_shape_ctrl_path_select(false);
+      // A press on a resize handle of the active shape's box resizes it (GitHub issue 690);
+      // anywhere else draws a new shape, below. A guide under the handle is not in the way:
+      // only Ctrl drags a guide with these tools.
+      if (press_shape_resize_handle(event)) {
+        event->accept();
+        return;
+      }
+    }
+  }
+
+  const auto document_point = document_position(event->pos());
+  const auto document_point_f = stroke_position_f(event->position());
+  const auto effective_tool = effective_tool_for_input();
+  const auto quick_mask_tool_is_unavailable = [](CanvasTool tool) {
+    switch (tool) {
+      case CanvasTool::Move:
+      case CanvasTool::Marquee:
+      case CanvasTool::EllipticalMarquee:
+      case CanvasTool::Lasso:
+      case CanvasTool::PolygonLasso:
+      case CanvasTool::MagneticLasso:
+      case CanvasTool::MagicWand:
+      case CanvasTool::QuickSelect:
+      case CanvasTool::ObjectSelect:
+      case CanvasTool::Clone:
+      case CanvasTool::PatternStamp:
+      case CanvasTool::Healing:
+      case CanvasTool::SpotHealing:
+      case CanvasTool::PatchTool:
+      case CanvasTool::ContentAwareMove:
+      case CanvasTool::Smudge:
+      case CanvasTool::MixerBrush:
+      case CanvasTool::Dodge:
+      case CanvasTool::Burn:
+      case CanvasTool::Sponge:
+      case CanvasTool::BlurBrush:
+      case CanvasTool::SharpenBrush:
+      case CanvasTool::ColorReplace:
+      case CanvasTool::BackgroundEraser:
+      case CanvasTool::MagicEraser:
+      case CanvasTool::Text:
+      case CanvasTool::TypeMask:
+      case CanvasTool::Pen:
+      case CanvasTool::AddAnchor:
+      case CanvasTool::DeleteAnchor:
+      case CanvasTool::ConvertPoint:
+      case CanvasTool::PathSelect:
+      case CanvasTool::DirectSelect:
+      case CanvasTool::Crop:
+      case CanvasTool::PerspectiveCrop:
+      case CanvasTool::RedEye:
+        return true;
+      default:
+        return false;
+    }
+  };
+  if (quick_mask_active_ && event->button() == Qt::LeftButton &&
+      quick_mask_tool_is_unavailable(effective_tool)) {
+    report_status_error(tr("This tool is unavailable in Quick Mask mode"));
+    event->accept();
+    return;
+  }
+  if (layer_edit_target_ == LayerEditTarget::SmartFilterMask &&
+      event->button() == Qt::LeftButton &&
+      quick_mask_tool_is_unavailable(effective_tool)) {
+    report_status_error(tr("This tool is unavailable while editing a Smart Filter mask"));
+    event->accept();
+    return;
+  }
+  if (event->button() == Qt::LeftButton) {
+    const auto guide_index = guide_at_widget_position(event->pos());
+    const auto guide_drag_allowed = tool_ == CanvasTool::Move || event->modifiers().testFlag(Qt::ControlModifier);
+    if (guide_index >= 0 && guide_drag_allowed) {
+      begin_guide_drag(guide_index, event->pos());
+      event->accept();
+      return;
+    }
+    clear_guide_selection();
+  }
+  const bool color_pick_press =
+      event->button() == Qt::LeftButton &&
+      (tool_ == CanvasTool::Eyedropper ||
+       (tool_modifier_held(ToolModifierRole::ColorPick, tool_, event->modifiers()) &&
+        tool_uses_alt_left_for_color_pick(tool_)));
+  if (color_pick_press) {
+    // With the Eyedropper tool itself a click sets the color its Sets option
+    // names, and Alt inverts that for the click: with Foreground (the default)
+    // Alt+click sets the background, Photoshop's convention (GitHub issues 150,
+    // 151). The paint tools' Alt eyedropper is the other branch of
+    // color_pick_press and always sets the foreground.
+    color_pick_to_background_ =
+        tool_ == CanvasTool::Eyedropper && eyedropper_target_is_background(event->modifiers());
+    begin_color_pick(event->pos(), event->globalPosition().toPoint());
+    event->accept();
+    return;
+  }
+  const bool channel_view_active = layer_edit_target_ == LayerEditTarget::DocumentChannel ||
+                                   CanvasWidget::is_component_preview(layer_edit_target_);
+  if (event->button() == Qt::LeftButton && channel_view_active &&
+      (effective_tool == CanvasTool::Move || effective_tool == CanvasTool::Clone ||
+       effective_tool == CanvasTool::Healing || effective_tool == CanvasTool::SpotHealing ||
+       uses_patch_drag(effective_tool) || effective_tool == CanvasTool::PatternStamp ||
+       effective_tool == CanvasTool::Smudge || effective_tool == CanvasTool::MixerBrush ||
+       is_local_adjustment_tool(effective_tool) || effective_tool == CanvasTool::MagicEraser ||
+       is_type_tool(effective_tool) || effective_tool == CanvasTool::Crop ||
+       effective_tool == CanvasTool::PerspectiveCrop || effective_tool == CanvasTool::RedEye)) {
+    report_status_error(tr("This tool is unavailable while viewing a document channel"));
+    event->accept();
+    return;
+  }
+  // Ctrl is the painting tools' temporary Move (GitHub issues 380, 421, 423; Alt on a tool
+  // whose pick, source or swap the GIMP-style or Krita-style tool modifiers put on Ctrl,
+  // issue 302), read from this press's own modifiers: a drag moves the selected layers like
+  // the Move tool with Auto-Select off, a click that never drags selects the layer under the
+  // pointer. Ctrl on a ruler guide already went to the guide drag above.
+  const auto temporary_move_modifier = tool_modifier(ToolModifierRole::TemporaryMove, tool_);
+  if (event->button() == Qt::LeftButton && tool_has_ctrl_temporary_move(tool_) && !painting_ &&
+      event->modifiers().testFlag(temporary_move_modifier) &&
+      !event->modifiers().testFlag(other_tool_modifier(temporary_move_modifier))) {
+    begin_paint_temporary_move(event, document_point);
+    event->accept();
+    return;
+  }
+
+  if (!document_contains(document_point)) {
+    // Move can recover selected layers from the grey area. Marquee/lasso and
+    // brush strokes may also begin there, and Zoom uses the nearest frame point.
+    // Shape, Line and Text drags start there too, as in Photoshop: a shape or
+    // text box may hang partly off the canvas, and a pixel-mode shape clips to
+    // the document on commit (the release paths handle both already). A Gradient
+    // drag starts there as well (GitHub #725): the ramp may begin off the canvas,
+    // as its end already could.
+    const bool allows_off_canvas_press = (tool_ == CanvasTool::Move && event->button() == Qt::LeftButton) ||
+                                         (tool_ == CanvasTool::Gradient && event->button() == Qt::LeftButton) ||
+                                         tool_ == CanvasTool::Marquee ||
+                                         tool_ == CanvasTool::EllipticalMarquee ||
+                                         tool_ == CanvasTool::Lasso ||
+                                         tool_ == CanvasTool::PolygonLasso ||
+                                         tool_ == CanvasTool::MagneticLasso ||
+                                         tool_ == CanvasTool::QuickSelect ||
+                                         tool_ == CanvasTool::ObjectSelect ||
+                                         uses_patch_drag(tool_) ||
+                                         tool_ == CanvasTool::Crop ||
+                                         tool_ == CanvasTool::Zoom ||
+                                         tool_ == CanvasTool::Rectangle ||
+                                         tool_ == CanvasTool::Ellipse ||
+                                         tool_ == CanvasTool::Line ||
+                                         tool_ == CanvasTool::Polygon ||
+                                         tool_ == CanvasTool::CustomShape ||
+                                         is_type_tool(tool_) ||
+                                         (event->button() == Qt::LeftButton &&
+                                          tool_supports_off_canvas_brush_strokes(effective_tool));
+    if (!allows_off_canvas_press) {
+      set_move_transform_controls_layer(std::nullopt);
+      return;
+    }
+  }
+
+  // Photoshop-style stroke connect: Shift+click joins the new stroke to the
+  // previous stroke's end point with a straight brush segment, when both paint the same way:
+  // an Alt-swapped stroke (Dodge as Burn) joins only another one (GitHub #662).
+  std::optional<QPointF> connect_from;
+  if (event->button() == Qt::LeftButton && (event->modifiers() & Qt::ShiftModifier) != 0 &&
+      last_stroke_end_document_.has_value() && tool_supports_shift_click_stroke_connect(effective_tool) &&
+      press_alt_swaps(event->modifiers()) == last_stroke_end_alt_swapped_) {
+    connect_from = last_stroke_end_document_;
+  }
+
+  if (effective_tool == CanvasTool::Clone || effective_tool == CanvasTool::Healing) {
+    const auto healing = effective_tool == CanvasTool::Healing;
+    if (editing_grayscale_target()) {
+      report_status_error(healing ? tr("Healing is unavailable while editing a grayscale channel")
+                                  : tr("Clone is unavailable while editing a grayscale channel"));
+      return;
+    }
+    if (tool_modifier_held(ToolModifierRole::RetouchSource, effective_tool, event->modifiers())) {
+      set_clone_source(document_point);
+      return;
+    }
+    if (!clone_source_set_) {
+      report_status_error(resolve_tool_modifier_names(healing ? tr("%SOURCE_KEY%-click to set a healing source")
+                                                              : tr("%SOURCE_KEY%-click to set a clone source"),
+                                                      effective_tool));
+      return;
+    }
+    const auto paint_layer_artboard = retarget_paint_to_clicked_artboard(document_point);
+    // Each step of the press, for patchy_perf_tests clonepress (GitHub #597 follow-up 3).
+    RetouchPressTimings timings;
+    auto step_started = std::chrono::steady_clock::now();
+    const auto lap = [&step_started](double& into) {
+      const auto now = std::chrono::steady_clock::now();
+      into = std::chrono::duration<double, std::milli>(now - step_started).count();
+      step_started = now;
+    };
+    const bool edit_begun = begin_edit(healing ? tr("Healing brush") : tr("Clone stamp"));
+    lap(timings.begin_edit_ms);
+    if (edit_begun) {
+      add_paint_layer_on_artboard(paint_layer_artboard);
+      arm_paint_stroke_history();
+      lap(timings.history_ms);
+      // Filled tile by tile as the stroke reaches it (GitHub #597 follow-up 3).
+      take_clone_source_snapshot();
+      clone_source_deep_ = document_->color_state().bit_depth != BitDepth::UInt8 ? retouch_source_deep()
+                                                                                 : PixelBuffer{};
+      lap(timings.source_ms);
+      const bool offset_changed = !clone_aligned_ || !clone_aligned_offset_set_;
+      if (offset_changed) {
+        clone_source_offset_ = clone_source_point_ - document_point;
+        clone_aligned_offset_set_ = clone_aligned_;
+      }
+      // The Clone Stamp samples through the source transform; the Healing Brush keeps
+      // the plain offset (docs/healing.md "Clone source settings").
+      invalidate_clone_overlay();
+      clone_stroke_mapping_ = patchy::CloneSourceMapping(
+          clone_source_point_.x(), clone_source_point_.y(), clone_source_offset_.x(), clone_source_offset_.y(),
+          healing ? patchy::CloneSourceTransform{} : clone_source_transform_);
+      if (offset_changed) {
+        notify_clone_source_changed();
+      }
+      clear_brush_stroke_tracking();
+      // The Healing Brush (except Replace) previews the raw source while painting and
+      // heals the whole footprint once on release, from the stroke-start pixels kept here.
+      if (healing && healing_mode_ != HealingMode::Replace) {
+        if (const auto* target = active_pixel_layer(); target != nullptr) {
+          healing_membrane_stroke_ = true;
+          healing_stroke_original_pixels_ = std::as_const(*target).pixels();
+          healing_stroke_original_bounds_ = target->bounds();
+          healing_stroke_footprint_ = QRect();
+        }
+      }
+      begin_axis_constrained_stroke(QPointF(document_point));
+      painting_ = true;
+      begin_coalesced_mouse_tracking(*this, *event, coalesced_mouse_state_);
+      sync_stroke_input_compression();
+      last_document_position_ = document_point;
+      last_document_position_f_ = QPointF(document_point);
+      lap(timings.setup_ms);
+      retouch_press_times_layer_detach_ = true;
+      last_retouch_press_timings_.layer_detach_ms = 0.0;
+      const auto dirty = connect_from.has_value() ? clone_brush_segment(connect_from->toPoint(), document_point)
+                                                  : clone_brush_at(document_point);
+      retouch_press_times_layer_detach_ = false;
+      timings.layer_detach_ms = last_retouch_press_timings_.layer_detach_ms;
+      lap(timings.first_dab_ms);
+      if (!dirty.isEmpty()) {
+        active_edit_target_changed_impl(QRegion(dirty), DocumentChangeReason::BrushStrokePreview);
+      }
+      lap(timings.preview_ms);
+    }
+    last_retouch_press_timings_ = timings;
+    return;
+  }
+
+  if (effective_tool == CanvasTool::SpotHealing) {
+    if (editing_grayscale_target()) {
+      report_status_error(tr("Spot healing is unavailable while editing a grayscale channel"));
+      return;
+    }
+    if (!can_begin_pixel_edit(/*report=*/true)) {
+      return;
+    }
+    spot_heal_source_cache_ = retouch_source_snapshot();
+    if (spot_heal_source_cache_.isNull()) {
+      return;
+    }
+    begin_axis_constrained_stroke(QPointF(document_point));
+    begin_spot_heal_stroke(document_point, connect_from);
+    emit_info_for_widget_position(event->pos());
+    update();
+    return;
+  }
+
+  if (effective_tool == CanvasTool::RedEye) {
+    // A click or a drag box; the correction runs once on release (canvas_widget_red_eye.cpp).
+    if (event->button() == Qt::LeftButton) {
+      begin_red_eye_gesture(document_point);
+      emit_info_for_widget_position(event->pos());
+    }
+    return;
+  }
+
+  if (is_local_adjustment_tool(effective_tool)) {
+    if (editing_grayscale_target()) {
+      report_status_error(effective_tool == CanvasTool::ColorReplace
+                              ? tr("Color Replacement is unavailable while editing a mask or channel")
+                              : effective_tool == CanvasTool::BackgroundEraser
+                                    ? tr("%1 is unavailable while editing a mask or channel").arg(tr("Background Eraser"))
+                                    : tr("Local adjustment brushes are unavailable while editing a grayscale channel"));
+      return;
+    }
+    // Alt (Ctrl in the GIMP-style tool modifiers) at the press paints the stroke with the
+    // opposite tool (GitHub #662, #302).
+    const bool alt_swap = tool_modifier_held(ToolModifierRole::ToningSwap, effective_tool, event->modifiers()) &&
+                          alt_swapped_toning_tool(effective_tool) != effective_tool;
+    QString label;
+    switch (alt_swap ? alt_swapped_toning_tool(effective_tool) : effective_tool) {
+      case CanvasTool::Dodge:
+        label = tr("Dodge");
+        break;
+      case CanvasTool::Burn:
+        label = tr("Burn");
+        break;
+      case CanvasTool::Sponge:
+        label = tr("Sponge");
+        break;
+      case CanvasTool::BlurBrush:
+        label = tr("Blur brush");
+        break;
+      case CanvasTool::SharpenBrush:
+        label = tr("Sharpen brush");
+        break;
+      case CanvasTool::ColorReplace:
+        label = tr("Color replacement");
+        break;
+      case CanvasTool::BackgroundEraser:
+        label = tr("Background Eraser");
+        break;
+      default:
+        break;
+    }
+    const auto paint_layer_artboard = retarget_paint_to_clicked_artboard(document_point);
+    // Each step of the press, for patchy_perf_tests toningstroke (GitHub #660).
+    RetouchPressTimings timings;
+    auto step_started = std::chrono::steady_clock::now();
+    const auto lap = [&step_started](double& into) {
+      const auto now = std::chrono::steady_clock::now();
+      into = std::chrono::duration<double, std::milli>(now - step_started).count();
+      step_started = now;
+    };
+    const bool edit_begun = begin_edit(label);
+    lap(timings.begin_edit_ms);
+    if (edit_begun) {
+      add_paint_layer_on_artboard(paint_layer_artboard);
+      arm_paint_stroke_history();
+      lap(timings.history_ms);
+      clear_brush_stroke_tracking();
+      local_adjustment_alt_swap_ = alt_swap;
+      if (auto* layer = active_pixel_layer(); layer != nullptr && document_->active_layer_id().has_value()) {
+        ensure_brush_stroke_layer_snapshot(*document_->active_layer_id(), std::as_const(*layer));
+      }
+      lap(timings.source_ms);
+      begin_axis_constrained_stroke(QPointF(document_point));
+      painting_ = true;
+      begin_coalesced_mouse_tracking(*this, *event, coalesced_mouse_state_);
+      sync_stroke_input_compression();
+      last_document_position_ = document_point;
+      last_document_position_f_ = QPointF(document_point);
+      lap(timings.setup_ms);
+      retouch_press_times_layer_detach_ = true;
+      last_retouch_press_timings_.layer_detach_ms = 0.0;
+      const auto dirty = connect_from.has_value()
+                             ? local_adjustment_brush_segment(connect_from->toPoint(), document_point)
+                             : local_adjustment_brush_segment(document_point, document_point);
+      retouch_press_times_layer_detach_ = false;
+      timings.layer_detach_ms = last_retouch_press_timings_.layer_detach_ms;
+      lap(timings.first_dab_ms);
+      if (!dirty.isEmpty()) {
+        active_edit_target_changed_impl(QRegion(dirty), DocumentChangeReason::BrushStrokePreview);
+      }
+      lap(timings.preview_ms);
+    }
+    last_retouch_press_timings_ = timings;
+    return;
+  }
+
+  if (tool_ == CanvasTool::TypeMask) {
+    // Type Mask (GitHub issue 670; docs/type-mask.md): every press starts new mask text, never
+    // an edit of a text layer; a click places point text, a drag draws a box. The press's own
+    // modifiers choose how the letters combine with the selection on commit.
+    type_mask_press_modifiers_ = event->modifiers();
+    dragging_text_rect_ = true;
+    text_rect_start_ = snapped_document_point(document_point);
+    text_rect_current_ = text_rect_start_;
+    event->accept();
+    update();
+    return;
+  }
+
+  if (tool_ == CanvasTool::Text) {
+    // Ctrl is the temporary Move tool (GitHub issue 216): the press drags the text layer under
+    // the pointer instead of opening it; elsewhere Ctrl changes nothing (the I-beam says so).
+    if (event->button() == Qt::LeftButton && event->modifiers().testFlag(Qt::ControlModifier)) {
+      if (auto* layer = topmost_text_layer_at(document_point); layer != nullptr) {
+        begin_text_layer_move(layer->id(), event->pos());
+        event->accept();
+        return;
+      }
+    }
+    // One answer for the press and the cursor (type_tool_target_at): an existing text layer
+    // first, then a line, then the inside of a shape, else new text where the press lands.
+    const auto target = type_tool_target_at(document_point);
+    if (auto* layer = target.layer; layer != nullptr) {
+      if (layer_effectively_locks_image_pixels(*layer)) {
+        show_layer_pixels_locked_message();
+        return;
+      }
+      activate_layer(*layer);
+      request_text_at_press(document_point, event->position());
+      // The session opened inside this press, so the drag that follows arrives here and not at
+      // the new editor: keep it selecting from the caret the press placed, as one gesture.
+      dragging_text_entry_selection_ =
+          event->button() == Qt::LeftButton && text_entry_selection_drag_callback_ &&
+          text_entry_selection_drag_callback_(event->position(), true);
+      event->accept();
+      update();
+      return;
+    }
+    if (target.kind != TypeToolTargetKind::NewText) {
+      if (text_requested_callback_) text_requested_callback_(document_point, QRect());
+      event->accept();
+      update();
+      return;
+    }
+    dragging_text_rect_ = true;
+    text_rect_start_ = snapped_document_point(document_point);
+    text_rect_current_ = text_rect_start_;
+    update();
+    return;
+  }
+
+  if (tool_ == CanvasTool::Move && handle_move_vector_mask_press(event, document_position_f(event->position()))) {
+    event->accept();
+    return;
+  }
+  if (tool_ == CanvasTool::Move) {
+    const ZoomTraceScope press_trace("move_press", zoom_);
+    Layer* top_clicked_layer = nullptr;
+    Layer* clicked_layer = nullptr;
+    {
+      const ZoomTraceScope hit_trace("move_press.hit_test", zoom_);
+      top_clicked_layer = topmost_move_layer_at(document_point, false);
+      // The pasteboard picks like the canvas: a layer lying outside the document
+      // is grabbed by its (unpainted) pixels there.
+      clicked_layer = topmost_move_layer_at(document_point, true);
+      // Auto-Select Group (GitHub issue 168): a click picks the outermost group
+      // holding the artwork. Only clicks that select read it; with Auto-Select
+      // off the press drags the selection and never looks at clicked_layer.
+      // A plain press on a layer that is itself selected keeps that layer
+      // (GitHub issue 703); Ctrl and Shift clicks still pick the group.
+      const bool favor_selected =
+          !event->modifiers().testFlag(Qt::ControlModifier) && !event->modifiers().testFlag(Qt::ShiftModifier);
+      clicked_layer = const_cast<Layer*>(auto_select_target_layer(clicked_layer, favor_selected));
+    }
+    const auto passive_transform_rect = move_transform_controls_rect();
+    auto passive_handle = TransformHandle::None;
+    if (passive_transform_rect.has_value()) {
+      passive_handle =
+          transform_handle_at(event->pos(), *passive_transform_rect, 0.0, TransformHitZones::EdgesAndCorners);
+    }
+    // Ctrl on a corner or side distorts or skews it, as Ctrl does in a Free
+    // Transform session (GitHub issue 351); anywhere else Ctrl selects layers.
+    if (event->modifiers().testFlag(Qt::ControlModifier) && !transform_handle_is_corner(passive_handle) &&
+        !transform_handle_is_edge(passive_handle)) {
+      begin_move_layer_selection(event, clicked_layer, true);
+      return;
+    }
+    if (passive_transform_rect.has_value()) {
+      if (passive_handle != TransformHandle::None && passive_handle != TransformHandle::Move) {
+        // A handle grab starts a Free Transform session; at zoom <= 50% its
+        // source preparation builds the preview-scaled document (every raster
+        // layer box-downscaled once), which is where a slow handle grab on a
+        // thousands-of-layers document goes.
+        const ZoomTraceScope handle_trace("move_press.handle_transform_start", zoom_);
+        if (begin_free_transform() && prepare_free_transform_source()) {
+          dragging_transform_ = true;
+          transform_drag_uses_proxy_preview_ = false;
+          transform_drag_uses_clip_group_preview_ = false;
+          transform_drag_handle_ = passive_handle;
+          transform_drag_start_point_ = document_position_f(event->position());
+          transform_drag_start_rect_ = transform_current_rect_;
+          transform_start_angle_ = transform_angle_;
+          transform_drag_grab_offset_ = transform_handle_grab_offset(
+              passive_handle, transform_current_rect_, transform_angle_, transform_drag_start_point_);
+          transform_session_step_at_press_ = current_transform_session_step();
+          transform_drag_start_scale_x_sign_ = transform_scale_x_sign_;
+          transform_drag_start_scale_y_sign_ = transform_scale_y_sign_;
+          if (begin_transform_distort_drag(passive_handle, event->modifiers(), transform_drag_start_point_)) {
+            update_drag_readout_region();
+          } else {
+            // A corner distort the target cannot take (type): nothing changed, so
+            // the session this grab opened closes again; the status says why.
+            dragging_transform_ = false;
+            transform_drag_handle_ = TransformHandle::None;
+            cancel_free_transform();
+          }
+        } else {
+          cancel_free_transform();
+        }
+        event->accept();
+        return;
+      }
+    }
+    // A press inside the pixel selection moves the selected pixels of the target layer
+    // on that layer, with Auto-Select on or off (GitHub issue 532): a floating session
+    // that commits on release as one Move step. Shift locks the axis; Alt keeps
+    // duplicating layers; a press outside the selection moves layers as before.
+    if (!event->modifiers().testFlag(Qt::AltModifier) && move_press_floats_selection(document_point)) {
+      begin_move_selected_pixels_drag(document_position_f(event->position()), event->modifiers());
+      event->accept();
+      return;
+    }
+    Layer* hit_layer = nullptr;
+    Layer* transform_controls_layer = nullptr;
+    std::vector<LayerId> layer_ids;
+    if (event->modifiers().testFlag(Qt::ShiftModifier) && clicked_layer != nullptr) {
+      begin_move_layer_selection(event, clicked_layer, false);
+      return;
+    }
+    // The selected box remains a Move target on the pasteboard where no
+    // artwork is under the pointer. With auto-select off, any workspace press
+    // can move the selection, including a press outside its box; passive
+    // controls must not consume that first drag.
+    const bool move_selected_layers = !auto_select_layer_ ||
+        (!document_contains(document_point) && passive_handle == TransformHandle::Move);
+    if (!move_selected_layers && clicked_layer == nullptr) {
+      begin_move_layer_selection(event, nullptr, true);
+      return;
+    }
+    if (move_selected_layers) {
+      // Auto-Select off drags the selection; with nothing selected a
+      // one-layer document still has an obvious target.
+      select_only_layer_if_none_active();
+    }
+    const auto selected_move_layer_ids = movable_layer_ids();
+    if (move_selected_layers) {
+      layer_ids = selected_move_layer_ids;
+    } else {
+      hit_layer = clicked_layer;
+      // A group target (Auto-Select Group) is selected as itself, not through
+      // a selected ancestor or a selected child.
+      const auto& selected_targets =
+          hit_layer != nullptr && hit_layer->kind() == LayerKind::Group ? selected_layer_ids_ : selected_move_layer_ids;
+      const auto hit_selected_layer =
+          hit_layer != nullptr && !selected_layer_ids_.empty() &&
+          std::find(selected_targets.begin(), selected_targets.end(), hit_layer->id()) != selected_targets.end();
+      if (hit_selected_layer) {
+        if (selected_layer_ids_.size() != 1U || selected_layer_ids_.front() != hit_layer->id()) {
+          // Like a layer-row click, collapse only on release: a drag still
+          // moves the selected set, including a selected folder's contents.
+          begin_move_layer_selection(event, hit_layer, false);
+          return;
+        }
+        layer_ids = selected_move_layer_ids;
+        if (selected_layer_ids_.size() < 2U && selected_move_layer_ids.size() == 1U) {
+          transform_controls_layer = hit_layer;
+        }
+      } else if (hit_layer != nullptr) {
+        activate_layer(*hit_layer);
+        if (hit_layer->kind() == LayerKind::Group) {
+          collect_movable_leaf_ids(*hit_layer, kLayerLockNone, layer_ids);
+        } else {
+          layer_ids.push_back(hit_layer->id());
+        }
+        // The picked layer's link group moves with it (GitHub issue 656).
+        const auto& layers = std::as_const(*document_).layers();
+        const auto with_links = with_linked_layer_ids(layers, {hit_layer->id()});
+        for (const auto id : root_drop_layer_ids(layers, with_links)) {
+          if (const auto* linked = std::as_const(*document_).find_layer(id); linked != nullptr && id != hit_layer->id()) {
+            collect_movable_leaf_ids(*linked, kLayerLockNone, layer_ids);
+          }
+        }
+        transform_controls_layer = hit_layer;
+      }
+    }
+    if (!move_selected_layers && show_transform_controls_) {
+      if (transform_controls_layer != nullptr) {
+        const ZoomTraceScope controls_trace("move_press.set_controls_layer", zoom_);
+        set_move_transform_controls_layer(transform_controls_layer->id());
+      } else if (transform_controls_layer == nullptr && passive_transform_rect.has_value() &&
+                 passive_handle == TransformHandle::None) {
+        set_move_transform_controls_layer(std::nullopt);
+        event->accept();
+        return;
+      } else if (passive_handle == TransformHandle::Move) {
+        // Keep existing controls while the normal Move path handles the drag.
+      } else {
+        set_move_transform_controls_layer(std::nullopt);
+      }
+    }
+    if (!move_selected_layers && transform_controls_layer == nullptr && passive_transform_rect.has_value() &&
+        passive_handle == TransformHandle::None) {
+      set_move_transform_controls_layer(std::nullopt);
+      event->accept();
+      return;
+    }
+    if (layer_ids.empty()) {
+      if (top_clicked_layer != nullptr && layer_effectively_locks_position(*top_clicked_layer)) {
+        report_status_error(tr("Layer position is locked."));
+      } else {
+        report_status_error(tr("Click an editable layer to move"));
+      }
+      return;
+    }
+    // Alt-drag duplicates (GitHub issue 69). The copy is of the selection roots,
+    // not the flattened leaves, so a folder copies as a folder; it is made on
+    // the first drag frame, never on a bare Alt+click.
+    std::vector<LayerId> duplicate_roots;
+    if (event->modifiers().testFlag(Qt::AltModifier) && move_duplicate_requested_callback_) {
+      const bool hit_outside_selection =
+          hit_layer != nullptr && std::find(selected_layer_ids_.begin(), selected_layer_ids_.end(),
+                                            hit_layer->id()) == selected_layer_ids_.end();
+      if (hit_outside_selection) {
+        duplicate_roots.push_back(hit_layer->id());
+      } else {
+        duplicate_roots = selected_layer_ids_;
+        if (duplicate_roots.empty() && document_->active_layer_id().has_value()) {
+          duplicate_roots.push_back(*document_->active_layer_id());
+        }
+      }
+    }
+    {
+      const ZoomTraceScope begin_trace("move_press.begin_move_drag", zoom_);
+      begin_move_drag(layer_ids, document_point, event->pos(), std::move(duplicate_roots));
+    }
+    return;
+  }
+
+  if (const auto handle = marquee_resize_handle_at(event->pos());
+      event->button() == Qt::LeftButton && handle != TransformHandle::None && marquee_shape_.has_value()) {
+    // Grab an edge or corner handle of a committed marquee to resize it. Tested
+    // before the interior move because the handles overlap the interior edge.
+    // Modifiers do not demote the grab: Alt here is the symmetric resize and
+    // Shift the held aspect, never Subtract/Add (GitHub issue 66).
+    marquee_resize_handle_ = handle;
+    marquee_resize_start_rect_ = marquee_shape_->rect;
+    marquee_resize_current_rect_ = marquee_shape_->rect;
+    spacebar_repositioning_drag_rect_ = false;
+    selection_edges_visible_ = true;
+    selection_press_widget_position_ = event->pos();
+    capture_selection_before_edit();
+    selection_operation_ = SelectionMode::Replace;
+    set_transform_cursor_for_handle(handle);
+    update();
+    return;
+  }
+
+  if (can_move_selection_at(document_point, event->modifiers())) {
+    // Grab inside an existing selection to drag the outline (pixels stay put).
+    // A press that does not turn into a drag falls through to click-to-deselect
+    // in the release handler.
+    moving_selection_ = true;
+    selection_edges_visible_ = true;
+    selection_press_widget_position_ = event->pos();
+    selection_move_origin_document_ = document_point;
+    selection_move_preview_delta_ = {};
+    selection_move_preview_clipped_ = false;
+    capture_selection_before_edit();
+    selection_operation_ = SelectionMode::Replace;
+    setCursor(Qt::SizeAllCursor);
+    update();
+    return;
+  }
+
+  if (tool_ == CanvasTool::Crop) {
+    begin_crop_drag_out(event, document_point);
+    event->accept();
+    return;
+  }
+
+  if (tool_ == CanvasTool::Marquee || tool_ == CanvasTool::EllipticalMarquee) {
+    const auto snapped_point = snapped_document_point(document_point);
+    selecting_ = true;
+    spacebar_repositioning_drag_rect_ = false;
+    selection_edges_visible_ = true;
+    selection_press_widget_position_ = event->pos();
+    // Shift adds to an existing selection, but constrains to a square when there
+    // is nothing to add to.
+    selection_shift_at_press_ = (event->modifiers() & Qt::ShiftModifier) != 0 && !selection_.isEmpty();
+    selection_shift_released_since_press_ = false;
+    selection_square_constrained_ = false;
+    // With no existing selection Alt does not subtract; instead it mirrors the
+    // marquee about the press point (Photoshop's draw-from-center). Alt held
+    // from the press over a selection is Subtract, so it only mirrors once
+    // released and pressed again mid-drag (GitHub issue 78; the Shift rule).
+    selection_alt_at_press_ =
+        tool_modifier_held(ToolModifierRole::SelectionSubtract, tool_, event->modifiers()) && !selection_.isEmpty();
+    selection_alt_released_since_press_ = false;
+    update_marquee_from_center(event->modifiers());
+    selection_start_ = snapped_point;
+    selection_current_ = snapped_point;
+    capture_selection_before_edit();
+    selection_operation_ = selection_operation(event->modifiers());
+    // Replace shows the rectangle live as you drag; Add/Subtract/Intersect keep
+    // the existing selection visible and only draw the candidate outline,
+    // committing the combine on release (like the Lasso) so you can see what
+    // you are about to add/subtract/intersect.
+    if (selection_operation_ == SelectionMode::Replace) {
+      combine_selection_from_region(marquee_selection_region(selection_start_, selection_current_));
+    }
+    emit_info_for_widget_position(event->pos());
+    update();
+    return;
+  }
+
+  if (uses_patch_drag(tool_) && event->button() == Qt::LeftButton) {
+    if (editing_grayscale_target()) {
+      report_status_error(tool_ == CanvasTool::ContentAwareMove
+                              ? tr("Content-Aware Move is unavailable while editing a grayscale channel")
+                              : tr("Patch is unavailable while editing a grayscale channel"));
+      return;
+    }
+    // A press inside the existing selection starts the heal drag; Shift/Alt
+    // (a non-Replace combine mode) forces outline drawing instead, Photoshop
+    // style. Everything else falls through to the shared lasso outline press.
+    if (selection_operation(event->modifiers()) == SelectionMode::Replace && !selection_.isEmpty() &&
+        selection_.contains(document_point)) {
+      if (!can_begin_pixel_edit(/*report=*/true)) {
+        return;
+      }
+      if (begin_patch_tool_drag(document_point)) {
+        emit_info_for_widget_position(event->pos());
+        update();
+      }
+      return;
+    }
+  }
+
+  // The Polygonal Lasso, and the Lasso while its Alt-release switch runs the
+  // same session: a click places a vertex (Shift keeps 45 degrees), a click on
+  // the start point closes, and a press after the first may drag a freehand run.
+  if (polygon_lassoing_ || tool_ == CanvasTool::PolygonLasso) {
+    if (document_ == nullptr || event->button() != Qt::LeftButton) {
+      return;
+    }
+    if (!polygon_lassoing_) {
+      // The combine mode latches at the starting click; later Shift/Alt are the
+      // 45 degree constraint and the freehand run.
+      selection_operation_ = selection_operation(event->modifiers());
+      start_polygon_lasso(QPolygon{document_point}, /*from_lasso=*/false);
+    } else if (polygon_lasso_start_hit(event->pos())) {
+      finish_polygon_lasso();
+    } else {
+      add_polygon_lasso_vertex(polygon_lasso_target(document_point, event->modifiers()));
+      polygon_lasso_button_down_ = true;
+      polygon_lasso_freehand_run_ = false;
+    }
+    emit_info_for_widget_position(event->pos());
+    update();
+    return;
+  }
+
+  if (tool_ == CanvasTool::Lasso || uses_patch_drag(tool_)) {
+    lassoing_ = true;
+    lasso_alt_at_press_ = event->modifiers().testFlag(Qt::AltModifier);
+    lasso_alt_released_since_press_ = false;
+    selection_edges_visible_ = true;
+    selection_press_widget_position_ = event->pos();
+    lasso_points_.clear();
+    // Clamp the first point to the canvas (as the move/release handlers do) so a
+    // drag begun in the grey area starts at the edge rather than drawing a
+    // preview line in from outside the canvas.
+    lasso_points_ << (document_ != nullptr ? clamped_document_point(*document_, document_point) : document_point);
+    capture_selection_before_edit();
+    selection_operation_ = selection_operation(event->modifiers());
+    restore_selection_before_edit();
+    update();
+    return;
+  }
+
+  if (tool_ == CanvasTool::MagneticLasso) {
+    if (document_ == nullptr || event->button() != Qt::LeftButton) {
+      return;
+    }
+    const auto point = clamped_document_point(*document_, document_point);
+    if (!magnetic_lassoing_) {
+      start_magnetic_lasso(point, event->modifiers());
+    } else {
+      // Close when the click lands back on the start anchor; otherwise the click
+      // freezes the live segment as a manual anchor.
+      const auto start_hit =
+          (event->pos() - widget_position(magnetic_anchors_.first())).manhattanLength() <= 9;
+      if (start_hit && magnetic_committed_path_.size() + magnetic_live_path_.size() >= 3) {
+        finish_magnetic_lasso();
+      } else {
+        extract_magnetic_live_path(point, /*snap_target=*/false);
+        add_magnetic_anchor();
+      }
+    }
+    emit_info_for_widget_position(event->pos());
+    update();
+    return;
+  }
+
+  if (tool_ == CanvasTool::QuickSelect) {
+    if (document_ == nullptr) {
+      return;
+    }
+    selection_edges_visible_ = true;
+    capture_selection_before_edit();
+    auto operation = selection_operation(event->modifiers());
+    if (operation == SelectionMode::Intersect) {
+      // Quick Select has no Intersect mode (Photoshop parity); Shift+Alt acts as Add.
+      operation = SelectionMode::Add;
+    }
+    selection_operation_ = operation;
+    begin_quick_select_stroke(document_point);
+    emit_info_for_widget_position(event->pos());
+    update();
+    return;
+  }
+
+  if (tool_ == CanvasTool::ObjectSelect) {
+    if (event->button() == Qt::LeftButton) {
+      begin_object_select(event->pos(), document_point, event->modifiers());
+      emit_info_for_widget_position(event->pos());
+      update();
+    }
+    return;
+  }
+
+  if (tool_ == CanvasTool::MagicWand) {
+    selection_edges_visible_ = true;
+    capture_selection_before_edit();
+    selection_operation_ = selection_operation(event->modifiers());
+    begin_processing_operation();
+    magic_wand_select(document_point);
+    end_processing_operation();
+    record_selection_history(tr("Magic Wand"), selection_snapshot_before_edit());
+    clear_selection_before_edit();
+    return;
+  }
+
+  if (tool_ == CanvasTool::Zoom) {
+    zooming_ = true;
+    // Clamp the anchor to the frame so a marquee that begins in the grey margin
+    // stays clamped to the canvas edges instead of spanning into the margin.
+    zoom_start_ = document_ != nullptr ? clamped_document_point(*document_, document_point) : document_point;
+    zoom_current_ = zoom_start_;
+    // Scrubby Zoom (docs/view-navigation-zoom-tool.md): the press arms a live drag zoom
+    // about the frame-clamped press point instead of a marquee. A click (travel under
+    // kZoomClickSlopPx) still takes one zoom-ladder step on release (zoom_click_step).
+    zoom_scrubbing_ = zoom_scrubby_;
+    zoom_scrub_started_ = false;
+    if (zoom_scrubbing_) {
+      zoom_drag_anchor_widget_ = zoom_click_anchor(event->position());
+      zoom_drag_last_pos_ = event->position();
+    }
+    emit_info_for_widget_position(event->pos());
+    update();
+    return;
+  }
+
+  if (tool_ == CanvasTool::MagicEraser) {
+    // One click erases the region the Fill tool would flood (canvas_widget_erasers.cpp).
+    if (editing_grayscale_target()) {
+      report_status_error(tr("%1 is unavailable while editing a mask or channel").arg(tr("Magic Eraser")));
+      return;
+    }
+    if (begin_edit(tr("Magic Eraser"))) {
+      begin_processing_operation();
+      const auto dirty = magic_erase_pixels(document_point, magic_eraser_options_, secondary_color_);
+      tick_processing_operation();
+      active_edit_target_changed_impl(QRegion(dirty));
+      end_processing_operation();
+    }
+    return;
+  }
+
+  if (tool_ == CanvasTool::Fill) {
+    const auto paint_layer_artboard = retarget_paint_to_clicked_artboard(document_point);
+    if (begin_edit(tr("Fill"))) {
+      add_paint_layer_on_artboard(paint_layer_artboard);
+      const auto processing = !editing_smart_filter_mask();
+      if (processing) {
+        begin_processing_operation();
+      }
+      const auto dirty = flood_fill(document_point);
+      if (processing) {
+        tick_processing_operation();
+      }
+      active_edit_target_changed_impl(QRegion(dirty));
+      if (processing) {
+        end_processing_operation();
+      }
+    }
+    return;
+  }
+
+  if (effective_tool == CanvasTool::Brush || effective_tool == CanvasTool::MixerBrush ||
+      effective_tool == CanvasTool::PatternStamp ||
+      effective_tool == CanvasTool::Smudge ||
+      effective_tool == CanvasTool::Eraser) {
+    if ((effective_tool == CanvasTool::Smudge || effective_tool == CanvasTool::MixerBrush) &&
+        editing_grayscale_target()) {
+      report_status_error(effective_tool == CanvasTool::MixerBrush
+                              ? tr("Mixer Brush is unavailable while editing a grayscale channel")
+                              : tr("Smudge is unavailable while editing a grayscale channel"));
+      return;
+    }
+    auto label = tr("Erase");
+    if (effective_tool == CanvasTool::Brush) {
+      label = tr("Brush stroke");
+    } else if (effective_tool == CanvasTool::MixerBrush) {
+      label = tr("Mixer Brush stroke");
+    } else if (effective_tool == CanvasTool::PatternStamp) {
+      if (!begin_pattern_stamp_stroke(document_point)) {
+        report_status_error(tr("Choose a pattern before painting"));
+        return;
+      }
+      label = tr("Pattern stamp");
+    } else if (effective_tool == CanvasTool::Smudge) {
+      label = tr("Smudge");
+    }
+    const auto paint_layer_artboard = retarget_paint_to_clicked_artboard(document_point);
+    if (begin_edit(label)) {
+      add_paint_layer_on_artboard(paint_layer_artboard);
+      arm_paint_stroke_history();
+      clear_brush_stroke_tracking();
+      smudge_state_ = {};
+      mixer_brush_state_ = {};
+      if (effective_tool == CanvasTool::MixerBrush) {
+        begin_mixer_brush_stroke();
+      }
+      const auto stroke_brush_size = effective_brush_input().size;
+      begin_axis_constrained_stroke(stroke_brush_size == 1 ? QPointF(document_point) : document_point_f);
+      painting_ = true;
+      invalidate_brush_overlay();  // the stroke shows the paint itself (GitHub issue 517)
+      begin_coalesced_mouse_tracking(*this, *event, coalesced_mouse_state_);
+      sync_stroke_input_compression();
+      last_document_position_ = document_point;
+      last_document_position_f_ = document_point_f;
+      // Axis constraint first (Shift-locked strokes stay locked), then the
+      // stabilizer, then the always-on midpoint smoother. The press dab lands
+      // at the raw press point: begin() snaps output = raw.
+      begin_stroke_stabilizer(stroke_brush_size == 1 ? QPointF(document_point) : document_point_f,
+                              effective_tool);
+      if (effective_tool != CanvasTool::Smudge) {
+        if (stroke_brush_size == 1) {
+          reset_brush_smoothing();
+        } else {
+          begin_brush_smoothing(document_point_f);
+        }
+        QRect dirty;
+        if (connect_from.has_value()) {
+          const auto erase = effective_tool == CanvasTool::Eraser;
+          dirty = stroke_brush_size == 1
+                      ? draw_brush_segment(connect_from->toPoint(), document_point, erase, true)
+                      : draw_brush_segment(*connect_from, document_point_f, erase, true);
+        } else {
+          dirty = draw_brush_at(document_point, effective_tool == CanvasTool::Eraser);
+        }
+        if (!dirty.isEmpty()) {
+          active_edit_target_changed_impl(QRegion(dirty), DocumentChangeReason::BrushStrokePreview);
+        }
+        if (effective_tool == CanvasTool::Brush && brush_build_up_) {
+          airbrush_timer_.start(kAirbrushTimerIntervalMs, this);
+        }
+      } else {
+        reset_brush_smoothing();
+        if (connect_from.has_value()) {
+          const auto dirty = smudge_brush_segment(connect_from->toPoint(), document_point);
+          if (!dirty.isEmpty()) {
+            active_edit_target_changed_impl(QRegion(dirty), DocumentChangeReason::BrushStrokePreview);
+          }
+        }
+      }
+    }
+    return;
+  }
+
+  if (tool_ == CanvasTool::Gradient || tool_ == CanvasTool::Line || tool_ == CanvasTool::Rectangle ||
+      tool_ == CanvasTool::Ellipse || tool_ == CanvasTool::Polygon ||
+      tool_ == CanvasTool::CustomShape) {
+    // A Shape/Path-mode drag never edits the active layer's pixels (the
+    // release routes to MainWindow, which pushes its own undo entry), so it
+    // skips begin_edit; that also lets it start while a shape/text/smart
+    // layer is active, where the raster guard would refuse. Polygon and
+    // Custom Shape commit through their own path callbacks; in Pixels mode
+    // they paint like Rectangle and Ellipse (GitHub issue 716).
+    const bool path_tool = tool_ == CanvasTool::Polygon || tool_ == CanvasTool::CustomShape;
+    const bool vector_shape_drag =
+        tool_ != CanvasTool::Gradient && vector_tool_mode_ != VectorToolMode::Pixels &&
+        (path_tool || vector_shape_drawn_callback_) &&
+        !quick_mask_active_ &&
+        (layer_edit_target_ == LayerEditTarget::Content ||
+         (layer_edit_target_ == LayerEditTarget::VectorMask && vector_mask_target_layer() != nullptr));
+    // A Fill Layer mode gradient (GitHub issue 580) likewise leaves the pixels alone, and so
+    // does a pixel shape that stays pending (GitHub issue 716): its commit begins the edit.
+    const bool stays_pending = !vector_shape_drag && !gradient_drag_makes_fill_layer() && tool_keeps_pixel_shapes_pending();
+    if (vector_shape_drag || gradient_drag_makes_fill_layer() ||
+        (stays_pending ? can_begin_edit(tr("Shape"))
+                       : begin_edit(tool_ == CanvasTool::Gradient ? tr("Gradient") : tr("Shape")))) {
+      const auto snapped_point = snapped_document_point(document_point);
+      clear_brush_stroke_tracking();
+      if (tool_ == CanvasTool::Gradient) {
+        // The drag's composite preview samples the selection once: start from a fresh source.
+        gradient_view_preview_source_.reset();
+      }
+      drawing_shape_ = true;
+      spacebar_repositioning_drag_rect_ = false;
+      shape_start_ = snapped_point;
+      shape_current_ = snapped_point;
+      shape_square_constrained_ = (event->modifiers() & Qt::ShiftModifier) != 0 &&
+                                  (tool_ == CanvasTool::Rectangle || tool_ == CanvasTool::Ellipse ||
+                          tool_ == CanvasTool::CustomShape);
+      shape_from_center_ = (event->modifiers() & Qt::AltModifier) != 0 &&
+                           (tool_ == CanvasTool::Rectangle || tool_ == CanvasTool::Ellipse ||
+                          tool_ == CanvasTool::CustomShape);
+      // Shift at the press also adds this one shape to the targeted shape layer
+      // (GitHub issue 313); Shift during the drag still only constrains.
+      shape_press_adds_to_shape_ = vector_shape_drag && (event->modifiers() & Qt::ShiftModifier) != 0;
+      update();
+    }
+  }
+}
+
+// Dodge, Burn and Sponge paint a segment only once the stroke has moved a tenth of the brush
+// diameter from the last painted point, the spacing Smudge places its dabs at (GitHub issue
+// 660, second report). Every segment re-evaluates the soft front edge of the brush, about
+// 60,000 pixels at 775 px however short the step, so a pointer that reports every motion
+// (Wayland, a zoomed-out view) made the cost follow the event rate rather than the distance
+// painted. The capsules still join without gaps (Photoshop spaces its dabs a quarter of the
+// brush apart); the release, or a pause of the pointer (toning_tail_timer_), paints the rest.
+// Blur and Sharpen place their own dabs by distance; brushes under 20 px are unaffected.
+bool CanvasWidget::toning_segment_waits_for_spacing(QPoint from, QPoint to) const {
+  const auto operation = local_adjustment_operation();
+  if (operation == CanvasTool::BlurBrush || operation == CanvasTool::SharpenBrush ||
+      operation == CanvasTool::ColorReplace || operation == CanvasTool::BackgroundEraser) {
+    return false;
+  }
+  const auto spacing = std::max(1.0, static_cast<double>(effective_brush_input().size) / 10.0);
+  const auto dx = static_cast<double>(to.x() - from.x());
+  const auto dy = static_cast<double>(to.y() - from.y());
+  return dx * dx + dy * dy < spacing * spacing;
+}
+
+// Smudge stamps a dab at the end of every segment, a whole 775 px disk per pointer sample, so
+// it likewise paints only once the stroke has moved its dab spacing (a fifth of the radius,
+// smudge_brush_segment) from the last painted point; the release paints the rest.
+bool CanvasWidget::smudge_segment_waits_for_spacing(QPoint from, QPoint to) const {
+  const auto spacing = std::max(1.0, static_cast<double>(std::max(1, effective_brush_input().size) / 2) * 0.2);
+  const auto dx = static_cast<double>(to.x() - from.x());
+  const auto dy = static_cast<double>(to.y() - from.y());
+  return dx * dx + dy * dy < spacing * spacing;
+}
+
+// The pointer paused on a point the segment spacing held back: paint up to it.
+void CanvasWidget::paint_toning_tail() {
+  const auto pending = std::exchange(toning_pending_point_, std::nullopt);
+  if (!pending.has_value() || !painting_ || *pending == last_document_position_) {
+    return;
+  }
+  const auto tool = effective_tool_for_input();
+  QRect dirty;
+  if (tool == CanvasTool::Smudge) {
+    dirty = smudge_brush_segment(last_document_position_, *pending);
+  } else if (is_local_adjustment_tool(tool)) {
+    dirty = local_adjustment_brush_segment(last_document_position_, *pending);
+  } else {
+    return;
+  }
+  last_document_position_ = *pending;
+  last_document_position_f_ = QPointF(*pending);
+  if (!dirty.isEmpty()) {
+    active_edit_target_changed_impl(QRegion(dirty), DocumentChangeReason::BrushStrokePreview);
+  }
+}
+
+void CanvasWidget::count_toning_segment(std::chrono::steady_clock::time_point started) noexcept {
+  ++render_cache_diagnostics_.toning_segments;
+  render_cache_diagnostics_.toning_segment_ms +=
+      std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count();
+}
+
+QRect CanvasWidget::advance_paint_stroke(QPoint document_point, QPointF document_point_f,
+                                         Qt::KeyboardModifiers modifiers, CanvasTool effective_tool) {
+  QRect dirty;
+  if (effective_tool == CanvasTool::Clone || effective_tool == CanvasTool::Healing) {
+    const auto constrained_point = axis_constrained_stroke_point(document_point, modifiers);
+    dirty = clone_brush_segment(last_document_position_, constrained_point);
+    last_document_position_ = constrained_point;
+    last_document_position_f_ = QPointF(constrained_point);
+  } else if (effective_tool == CanvasTool::Smudge) {
+    if (smudge_segment_waits_for_spacing(last_document_position_, document_point)) {
+      toning_pending_point_ = document_point;
+      return dirty;  // a later sample, a pause or the release paints through this point
+    }
+    toning_pending_point_.reset();
+    const auto started = std::chrono::steady_clock::now();
+    dirty = smudge_brush_segment(last_document_position_, document_point);
+    count_toning_segment(started);
+    last_document_position_ = document_point;
+    last_document_position_f_ = document_point_f;
+  } else if (is_local_adjustment_tool(effective_tool)) {
+    const auto constrained_point = axis_constrained_stroke_point(document_point, modifiers);
+    if (toning_segment_waits_for_spacing(last_document_position_, constrained_point)) {
+      toning_pending_point_ = constrained_point;
+      return dirty;  // a later sample, a pause or the release paints through this point
+    }
+    toning_pending_point_.reset();
+    const auto started = std::chrono::steady_clock::now();
+    dirty = local_adjustment_brush_segment(last_document_position_, constrained_point);
+    count_toning_segment(started);
+    last_document_position_ = constrained_point;
+    last_document_position_f_ = QPointF(constrained_point);
+  } else if (effective_brush_input().size == 1) {
+    auto constrained_point = axis_constrained_stroke_point(document_point, modifiers);
+    if (stroke_stabilizer_.active() && tool_uses_stroke_stabilizer(effective_tool)) {
+      const auto smoothed = stabilized_stroke_point(QPointF(constrained_point), effective_tool);
+      constrained_point = QPoint(static_cast<int>(std::lround(smoothed.x())),
+                                 static_cast<int>(std::lround(smoothed.y())));
+    }
+    dirty = draw_brush_segment(last_document_position_, constrained_point, effective_tool == CanvasTool::Eraser);
+    last_document_position_ = constrained_point;
+    last_document_position_f_ = QPointF(constrained_point);
+  } else {
+    const auto constrained_point =
+        stabilized_stroke_point(axis_constrained_stroke_point(document_point_f, modifiers),
+                                effective_tool);
+    dirty = advance_smoothed_brush_stroke(constrained_point, effective_tool == CanvasTool::Eraser);
+    last_document_position_ = QPoint(static_cast<int>(std::lround(constrained_point.x())),
+                                     static_cast<int>(std::lround(constrained_point.y())));
+    last_document_position_f_ = constrained_point;
+  }
+  return dirty;
+}
+
+std::vector<QPointF> CanvasWidget::coalesced_stroke_positions(const QMouseEvent& event) {
+  if (replay_stroke_positions_.has_value()) {
+    // A replayed coalesced stroke move (flush_pending_drag_move): the positions recorded
+    // before it, each still its own sample.
+    auto positions = std::move(*replay_stroke_positions_);
+    replay_stroke_positions_.reset();
+    return positions;
+  }
+  if (handling_tablet_event_) {
+    // Qt already delivers every pen sample (the Windows pointer history, X11
+    // tablet motion is never compressed); the synthesized move carries one.
+    return {};
+  }
+  if (coalesced_mouse_positions_provider_) {
+    return coalesced_mouse_positions_provider_(event);
+  }
+  return coalesced_mouse_positions(*this, event, coalesced_mouse_state_);
+}
+
+void CanvasWidget::set_coalesced_mouse_positions_provider(CoalescedMousePositionsProvider provider) {
+  coalesced_mouse_positions_provider_ = std::move(provider);
+}
+
+void CanvasWidget::sync_stroke_input_compression() {
+  stroke_input_scope_.set_engaged(painting_);
+}
+
+void CanvasWidget::mouseMoveEvent(QMouseEvent* event) {
+  if (processing_render_wait_active_) {
+    // Re-entrant input during a processing wait (see mousePressEvent): a
+    // move delivered mid-commit would keep driving the drag and shift
+    // move_preview_delta_ under the release that is committing it.
+    event->accept();
+    return;
+  }
+  if (defer_coalesced_drag_move(*event)) {
+    event->accept();
+    return;
+  }
+  if (!handling_tablet_event_) {
+    active_pen_input_sample_.reset();
+  }
+  if (preview_point_drag_ >= 0 && move_preview_point_handle(event, false)) {
+    event->accept();
+    return;
+  }
+  // A hover over the rulers or their corner ends on the arrow, whatever the tool set on the
+  // way (GitHub issue 472); a press there starts a guide, so no tool cursor applies.
+  ruler_hover_ = rect().contains(event->pos()) && over_ruler_bars(event->pos());
+  const auto ruler_arrow = qScopeGuard([this, event] {
+    if (ruler_hover_ && event->buttons() == Qt::NoButton && !dragging_guide_ && !spacebar_panning_ &&
+        !sample_loupe_hides_cursor_ && !transient_read_callback_) {
+      setCursor(Qt::ArrowCursor);
+    }
+  });
+  emit_info_for_widget_position(event->pos());
+  if (!brush_adjust_dragging_) {
+    // The source key pressed or released while another window had the keys (GitHub issue 573).
+    set_clone_overlay_alt_held(
+        tool_modifier_held(ToolModifierRole::RetouchSource, CanvasTool::Clone, event->modifiers()));
+  }
+  track_brush_hover_position(event->pos());
+  track_eyedropper_sample_outline(event->pos());
+  track_stroke_connect_preview(event->pos(), event->modifiers());
+  if (!preview_points_.empty()) {
+    // Hover switches between the hand over a preview marker and the arrow elsewhere.
+    last_mouse_position_ = event->pos();
+    update_tool_cursor();
+  }
+  if (brush_adjust_dragging_) {
+    if ((event->buttons() & Qt::RightButton) != 0) {
+      brush_adjust_pointer_moved(event->pos());
+    } else {
+      // The right-button release was lost (see the tablet path): commit
+      // instead of tracking a button nobody is holding.
+      end_brush_adjust_drag(true);
+    }
+    last_mouse_position_ = event->pos();
+    event->accept();
+    return;
+  }
+  if (mouse_pen_action_button_ != Qt::NoButton) {
+    // Driver-injected pen-button clicks are invisible to the tablet stream,
+    // so moves synthesized from hover tablet events report no held buttons;
+    // only a real mouse move saying the button is gone ends the gesture.
+    if (!handling_tablet_event_ && (event->buttons() & mouse_pen_action_button_) == 0) {
+      mouse_pen_action_button_ = Qt::NoButton;
+      if (pen_zoom_dragging_) {
+        end_zoom_drag();
+      }
+    } else {
+      if (pen_zoom_dragging_) {
+        update_zoom_drag(event->position());
+      }
+      last_mouse_position_ = event->pos();
+      event->accept();
+      return;
+    }
+  }
+  if (color_picking_) {
+    if ((event->buttons() & Qt::LeftButton) != 0) {
+      update_color_pick(event->pos(), event->globalPosition().toPoint());
+    } else {
+      end_color_pick();
+    }
+    last_mouse_position_ = event->pos();
+    event->accept();
+    return;
+  }
+  if (paint_ctrl_click_.has_value() && !move_drag_pending_ && !moving_layer_) {
+    // A painting tool's Ctrl press with nothing it could move: dragging says why once
+    // and the release selects nothing.
+    if ((event->buttons() & Qt::LeftButton) == 0) {
+      paint_ctrl_click_.reset();
+    } else if ((event->pos() - paint_ctrl_click_->widget_point).manhattanLength() >=
+               QApplication::startDragDistance()) {
+      paint_ctrl_click_.reset();
+      report_paint_temporary_move_refused();
+    }
+    last_mouse_position_ = event->pos();
+    event->accept();
+    return;
+  }
+  if (!panning_ && (event->buttons() & Qt::RightButton) != 0 && (event->buttons() & Qt::LeftButton) == 0) {
+    // A held right button drives nothing but the context click: crossing the
+    // drag threshold retires it, even if the pointer returns to its starting
+    // point before release.
+    if (context_press_pos_ &&
+        (event->pos() - *context_press_pos_).manhattanLength() >= QApplication::startDragDistance()) {
+      context_press_pos_.reset();
+    }
+    last_mouse_position_ = event->pos();
+    event->accept();
+    return;
+  }
+  if (hand_zoom_pending_) {
+    // A Hand zoom click: travel before the release neither pans nor reaches the tool.
+    last_mouse_position_ = event->pos();
+    event->accept();
+    return;
+  }
+  if (panning_) {
+    clear_move_hover_outline();
+    const auto delta = event->pos() - last_mouse_position_;
+    const auto old_pan = pan_;
+    pan_ += QPointF(delta);
+    constrain_pan();
+    last_mouse_position_ = event->pos();
+    if (pan_ != old_pan) {
+      update();
+      notify_view_changed();
+    }
+    return;
+  }
+  if (rotating_view_) {
+    update_rotate_view_drag(event->position(), event->modifiers());
+    event->accept();
+    return;
+  }
+
+  if (transient_read_dragging_) {
+    const auto phase = (event->buttons() & Qt::LeftButton) != 0 ? CanvasReadPhase::Drag
+                                                               : CanvasReadPhase::Cancel;
+    auto callback = transient_read_callback_;
+    if (phase == CanvasReadPhase::Cancel) {
+      transient_read_dragging_ = false;
+      if (QWidget::mouseGrabber() == this) {
+        releaseMouse();
+      }
+    }
+    if (callback) {
+      callback(CanvasReadGesture{document_position(event->pos()), event->globalPosition().toPoint(),
+                                 event->modifiers(), phase});
+    }
+    last_mouse_position_ = event->pos();
+    event->accept();
+    return;
+  }
+
+  if (dragging_text_entry_selection_) {
+    // A move without the button means the release went elsewhere (a prompt shown while the
+    // session opened): the gesture is over, and this move takes its normal path.
+    if ((event->buttons() & Qt::LeftButton) != 0 && text_entry_selection_drag_callback_ &&
+        text_entry_selection_drag_callback_(event->position(), false)) {
+      last_mouse_position_ = event->pos();
+      event->accept();
+      return;
+    }
+    dragging_text_entry_selection_ = false;
+  }
+
+  if (edit_locked_ && !zooming_ && !selection_tool_passes_edit_lock()) {
+    clear_move_hover_outline();
+    last_mouse_position_ = event->pos();
+    event->accept();
+    return;
+  }
+
+  if (dragging_guide_) {
+    clear_move_hover_outline();
+    // The position readout anchors on the pointer, so record it first.
+    last_mouse_position_ = event->pos();
+    update_guide_drag(event->pos(), event->modifiers());
+    return;
+  }
+
+  // Gradient handles under another tool (GitHub issue 694): a handle drag, or the hover over
+  // a handle part, comes before the tool branches below, which keep every move for themselves.
+  // A drag another gesture owns (a button is down) passes through untouched.
+  if (tool_ != CanvasTool::Gradient && (gradient_handle_drag_.has_value() || gradient_handles_enabled()) &&
+      move_gradient_fill_handle(event)) {
+    clear_move_hover_outline();
+    last_mouse_position_ = event->pos();
+    event->accept();
+    return;
+  }
+
+  if (pen_family_tool_active()) {
+    handle_pen_move(event, document_position_f(event->position()));
+    last_mouse_position_ = event->pos();
+    if ((event->buttons() & Qt::LeftButton) == 0) {
+      // Hover: refresh the context badge (add/delete/convert/close) from the
+      // event's authoritative position and modifiers, and say what a click
+      // would do.
+      update_path_hover_hint(apply_pen_cursor(event->position(), event->modifiers()));
+    }
+    event->accept();
+    return;
+  }
+
+  if (shape_temp_path_select_ && (event->buttons() & Qt::LeftButton) == 0) {
+    shape_temp_path_select_ = false;  // the release went elsewhere
+  }
+  // A resize-handle drag in progress keeps its mode, whatever Ctrl does (GitHub issue 690).
+  if (shape_tool_active() && !drawing_shape_ && !shape_handle_drag_active()) {
+    if (!shape_temp_path_select_) {
+      set_shape_ctrl_path_select((event->modifiers() & Qt::ControlModifier) != 0);
+    }
+    if (shape_temp_path_select_ || shape_ctrl_path_select_) {
+      if (shape_temp_path_select_) {
+        handle_path_edit_move(event, document_position_f(event->position()));
+      }
+      last_mouse_position_ = event->pos();
+      update_tool_cursor();
+      event->accept();
+      return;
+    }
+  }
+  // A shape tool's resize-handle drag, or the resize cursor over a handle (GitHub issue 690).
+  if ((shape_handle_drag_active() || shape_tool_active()) && !drawing_shape_ &&
+      move_shape_resize_handle(event)) {
+    clear_move_hover_outline();
+    last_mouse_position_ = event->pos();
+    event->accept();
+    return;
+  }
+
+  if (move_vector_mask_drag_) {
+    handle_path_edit_move(event, document_position_f(event->position()));
+    last_mouse_position_ = event->pos();
+    event->accept();
+    return;
+  }
+  if (tool_ == CanvasTool::PathSelect || tool_ == CanvasTool::DirectSelect) {
+    handle_path_edit_move(event, document_position_f(event->position()));
+    last_mouse_position_ = event->pos();
+    if (path_transform_active_) {
+      apply_path_transform_cursor(event->pos(), event->modifiers());
+    }
+    if ((event->buttons() & Qt::LeftButton) == 0 && !path_transform_active_) {
+      if (path_drag_mode_ == PathEditDrag::None) {
+        set_arrow_swap((event->modifiers() & Qt::ControlModifier) != 0);
+      }
+      update_path_select_hover_hint(path_hover_target_at(event->position()));
+    }
+    if (!path_transform_active_) {
+      apply_arrow_cursor();
+    }
+    event->accept();
+    return;
+  }
+
+  if (dragging_warp_handle_) {
+    clear_move_hover_outline();
+    set_warp_handle_document_position(warp_drag_index_, document_position_f(event->position()));
+    last_mouse_position_ = event->pos();
+    return;
+  }
+
+  if (warping_layer_) {
+    clear_move_hover_outline();
+    setCursor(warp_handle_at(event->pos()) >= 0 ? Qt::SizeAllCursor : Qt::ArrowCursor);
+    last_mouse_position_ = event->pos();
+    return;
+  }
+
+  if (dragging_transform_) {
+    clear_move_hover_outline();
+    // The readout anchors on the pointer, so record it before the preview
+    // update computes the readout's repaint rect.
+    last_mouse_position_ = event->pos();
+    update_free_transform_preview(document_position_f(event->position()), event->modifiers());
+    return;
+  }
+
+  if (transforming_layer_) {
+    clear_move_hover_outline();
+    apply_session_transform_cursor(event->pos(), event->modifiers());
+    last_mouse_position_ = event->pos();
+    return;
+  }
+
+  if (artboard_drag_active()) {
+    clear_move_hover_outline();
+    if ((event->buttons() & Qt::LeftButton) != 0) {
+      update_artboard_drag(event);
+    }
+    update_artboard_tool_cursor(event->pos());
+    last_mouse_position_ = event->pos();
+    return;
+  }
+  if (tool_ == CanvasTool::Artboard) {
+    clear_move_hover_outline();
+    update_artboard_tool_cursor(event->pos());
+    last_mouse_position_ = event->pos();
+    return;
+  }
+
+  if (tool_ == CanvasTool::Gradient && !dragging_guide_ && move_gradient_fill_handle(event)) {
+    last_mouse_position_ = event->pos();
+    event->accept();
+    return;
+  }
+
+  if (tool_ == CanvasTool::Ruler && !dragging_guide_) {
+    clear_move_hover_outline();
+    if (ruler_drag_part_ != RulerPart::None) {
+      update_ruler_drag(document_position_f(event->position()), event->modifiers());
+    }
+    update_ruler_cursor(event->pos());
+    last_mouse_position_ = event->pos();
+    return;
+  }
+
+  if (tool_ == CanvasTool::PerspectiveCrop && perspective_crop_session_pending()) {
+    clear_move_hover_outline();
+    update_perspective_crop_drag(document_position_f(event->position()), event->modifiers());
+    last_mouse_position_ = event->pos();
+    update_perspective_crop_cursor(event->pos());
+    return;
+  }
+
+  if (tool_ == CanvasTool::Crop && crop_straightening_) {
+    // The Straighten line follows the pointer; the box waits for the release.
+    clear_move_hover_outline();
+    crop_straighten_end_ = document_position_f(event->position());
+    last_mouse_position_ = event->pos();
+    update();
+    return;
+  }
+
+  if (tool_ == CanvasTool::Crop && crop_dragging_out_) {
+    clear_move_hover_outline();
+    update_crop_drag_out(document_position(event->pos()), event->modifiers());
+    last_mouse_position_ = event->pos();
+    return;
+  }
+
+  if (tool_ == CanvasTool::Crop && crop_rotating_ && (event->buttons() & Qt::LeftButton) != 0) {
+    clear_move_hover_outline();
+    update_crop_rotate_drag(event->position(), event->modifiers());
+    last_mouse_position_ = event->pos();
+    return;
+  }
+
+  if (tool_ == CanvasTool::Crop && crop_drag_handle_ != TransformHandle::None &&
+      (event->buttons() & Qt::LeftButton) != 0) {
+    clear_move_hover_outline();
+    update_crop_adjust_drag(event->position(), event->modifiers());
+    if (spacebar_repositioning_drag_rect_) {
+      setCursor(Qt::SizeAllCursor);
+    } else {
+      set_crop_handle_cursor(crop_drag_handle_, true);
+    }
+    last_mouse_position_ = event->pos();
+    return;
+  }
+
+  if (tool_ == CanvasTool::Crop && crop_session_active_) {
+    clear_move_hover_outline();
+    const auto crop_handle = crop_handle_at(event->pos());
+    if (crop_straighten_armed_ || event->modifiers().testFlag(Qt::ControlModifier)) {
+      // Straighten: a press draws a line, wherever it lands.
+      setCursor(Qt::CrossCursor);
+    } else if (crop_handle == TransformHandle::None) {
+      // Off the box a drag rotates it; hint that with the nearest corner's rotate cursor.
+      setCursor(transform_rotate_cursor_at(event->pos(), QRectF(crop_rect_), crop_angle_, false));
+    } else {
+      set_crop_handle_cursor(crop_handle, false);
+    }
+    last_mouse_position_ = event->pos();
+    return;
+  }
+
+  if (move_layer_selection_gesture_) {
+    if (!event->buttons().testFlag(Qt::LeftButton)) {
+      cancel_move_layer_selection();
+    } else if (update_move_layer_selection(event)) {
+      last_mouse_position_ = event->pos();
+      event->accept();
+      return;
+    }
+    // A promoted layer drag processes this same move through the normal path.
+  }
+
+  const auto document_point = document_position(event->pos());
+  const auto document_point_f = stroke_position_f(event->position());
+  const auto effective_tool = effective_tool_for_input();
+  if (dragging_text_rect_) {
+    clear_move_hover_outline();
+    text_rect_current_ = snapped_document_point(document_point);
+    emit_info_for_widget_position(event->pos());
+    update();
+  } else if (painting_) {
+    clear_move_hover_outline();
+    // Every position the platform folded into this event gets its own stroke
+    // sample, so a slow frame joins the true path instead of a straight
+    // segment across it (GitHub issue 165); the canvas repaints once.
+    // Constraint: these are only positions the platform already recorded
+    // (coalesced_pointer_input.cpp, coalesced_pointer_input_mac.mm), and their
+    // timestamps only order them. Nothing predicts or extrapolates the pointer,
+    // and no speed feeds deposition or Smoothing; adding either needs a new
+    // review (docs/legal-constraints.md, "Brush behavior").
+    std::vector<QRect> dirty;
+    {
+      // Spaced Brush and Eraser dabs of all these samples are painted together (GitHub
+      // issue 677 follow-up; flush_brush_dab_batch).
+      ++brush_dab_batch_depth_;
+      const auto close_batch = qScopeGuard([this] { --brush_dab_batch_depth_; });
+      for (const auto& position : coalesced_stroke_positions(*event)) {
+        dirty.push_back(advance_paint_stroke(document_position(position.toPoint()), stroke_position_f(position),
+                                             event->modifiers(), effective_tool));
+      }
+      dirty.push_back(advance_paint_stroke(document_point, document_point_f, event->modifiers(), effective_tool));
+      const auto batched = flush_brush_dab_batch();
+      dirty.insert(dirty.end(), batched.begin(), batched.end());
+    }
+    if (const auto region = stroke_samples_dirty_region(dirty); !region.isEmpty()) {
+      active_edit_target_changed_impl(region, DocumentChangeReason::BrushStrokePreview);
+    }
+    // A point the segment spacing held back is painted if the pointer pauses (GitHub #660).
+    // Only for the window system's own input: a test's events are applied as sent.
+    const auto real_input = event->spontaneous() || handling_tablet_event_ ||
+                            (replaying_drag_move_ && drag_move_coalescing_mode_ == DragMoveCoalescing::Default);
+    if (toning_pending_point_.has_value() && real_input) {
+      toning_tail_timer_.start(kToningTailPauseMs, this);
+    } else {
+      toning_tail_timer_.stop();
+    }
+  } else if (drawing_shape_) {
+    clear_move_hover_outline();
+    if (spacebar_repositioning_drag_rect_) {
+      const auto delta = document_point - spacebar_reposition_last_document_position_;
+      shape_start_ += delta;
+      shape_current_ += delta;
+      spacebar_reposition_last_document_position_ = document_point;
+    } else {
+      shape_current_ = snapped_document_point(document_point);
+    }
+    shape_square_constrained_ = (event->modifiers() & Qt::ShiftModifier) != 0 &&
+                                (tool_ == CanvasTool::Rectangle || tool_ == CanvasTool::Ellipse ||
+                          tool_ == CanvasTool::CustomShape);
+    shape_from_center_ = (event->modifiers() & Qt::AltModifier) != 0 &&
+                         (tool_ == CanvasTool::Rectangle || tool_ == CanvasTool::Ellipse ||
+                          tool_ == CanvasTool::CustomShape);
+    update();
+  } else if (move_drag_pending_ || moving_layer_) {
+    std::optional<QRectF> old_transform_controls_rect;
+    if (move_drag_pending_) {
+      const auto widget_delta = event->pos() - move_press_widget_position_;
+      if (widget_delta.manhattanLength() < QApplication::startDragDistance()) {
+        last_mouse_position_ = event->pos();
+        return;
+      }
+      if (!move_drag_duplicate_roots_.empty()) {
+        // Alt-drag (GitHub issue 69): the duplicate is made only now that the
+        // press became a drag, so an Alt+click never leaves a copy behind. The
+        // host selects the copies; the drag continues with them. A refused
+        // request keeps the originals moving.
+        auto roots = std::move(move_drag_duplicate_roots_);
+        move_drag_duplicate_roots_.clear();
+        if (move_duplicate_requested_callback_ && move_duplicate_requested_callback_(std::move(roots))) {
+          if (const auto copies = movable_layer_ids(); !copies.empty()) {
+            begin_move_drag(copies, move_start_, move_press_widget_position_);
+          }
+        }
+      }
+      old_transform_controls_rect = move_transform_controls_rect();
+      move_drag_pending_ = false;
+      moving_layer_ = true;
+      paint_ctrl_click_.reset();  // a painting tool's Ctrl press became a move
+      move_readout_base_rect_ = moving_layers_readout_base_rect();
+      if (move_press_reused_retained_caches_) {
+        ++render_cache_diagnostics_.move_preview_cache_reuses;
+        move_press_reused_retained_caches_ = false;
+      }
+      update_move_transform_controls_dirty(old_transform_controls_rect);
+    }
+    clear_move_hover_outline();
+    const auto old_delta = move_preview_delta_;
+    const auto overlay_before = path_overlay_preview_document_rect();
+    const auto constrained_delta = axis_constrained_move_delta(document_point - move_start_, event->modifiers());
+    const auto snap = snapped_move_delta_with_matches(constrained_delta);
+    move_preview_delta_ = axis_constrained_move_delta(snap.delta, event->modifiers());
+    // The second constraint zeroes any correction the pinned axis received, so
+    // that axis shows no alignment guide (docs/alignment.md).
+    move_snap_x_ = move_preview_delta_.x() == snap.delta.x() ? snap.x : std::nullopt;
+    move_snap_y_ = move_preview_delta_.y() == snap.delta.y() ? snap.y : std::nullopt;
+    last_mouse_position_ = event->pos();
+    update_drag_readout_region();
+    update_move_snap_guides_region();
+    if (move_preview_delta_ == old_delta || document_ == nullptr || moving_layers_.empty()) {
+      return;
+    }
+    // The path overlay of a moving shape layer follows the drag; its old and
+    // new extents join whichever bounded repaint the branches below choose.
+    if (const auto overlay_after = path_overlay_preview_document_rect();
+        !overlay_before.isEmpty() || !overlay_after.isEmpty()) {
+      update(widget_rect_for_document_rect(overlay_before.united(overlay_after))
+                 .toAlignedRect()
+                 .adjusted(-2, -2, 2, 2));
+    }
+    // Cold preparation on large documents must not occupy the input handler.
+    // Keep a moving outline until the snapshot worker supplies the base/proxy.
+    if (!moving_layers_use_outline_preview_ && !move_drag_uses_proxy_preview_ &&
+        (move_base_cache_.isNull() || move_proxy_image_.isNull()) &&
+        should_prepare_move_preview_async() &&
+        request_move_preview()) {
+      moving_layers_use_outline_preview_ = true;
+      move_preview_patches_.clear();
+      move_preview_patches_delta_.reset();
+    }
+    if (!moving_layers_use_outline_preview_ && !move_drag_uses_proxy_preview_ &&
+        (move_live_frame_slow_ || moving_layers_should_use_outline_preview(old_delta, move_preview_delta_))) {
+      move_preview_patches_.clear();
+      move_preview_patches_delta_.reset();
+      // Heavy drags latch onto the translated-snapshot proxy for the rest of
+      // the drag: one base + snapshot render now, then every frame is a blit.
+      // The dashed outline stays as the last resort when no snapshot can be
+      // built. Both latches are sticky until release. Deliberately no
+      // ensure_render_cache() here: a dirty cache would synchronously
+      // recomposite the whole document inside the mouse handler, and the base
+      // build is self-sufficient (scaled document at zoom <= 50%, banded
+      // hidden-layer render in the full-res dirty case); the post-release
+      // async refresh owns full invalidations.
+      ensure_move_base_cache();
+      if (!move_base_cache_.isNull() && ensure_move_proxy_image()) {
+        move_drag_uses_proxy_preview_ = true;
+        ++render_cache_diagnostics_.move_proxy_previews;
+      } else {
+        moving_layers_use_outline_preview_ = true;
+        ++render_cache_diagnostics_.move_outline_previews;
+        clear_retained_move_caches();
+      }
+    }
+    if (move_drag_uses_proxy_preview_) {
+      // Re-cleared every move so a mid-drag external refresh cannot leave a
+      // stale composited patch under the proxy blit.
+      move_preview_patches_.clear();
+      move_preview_patches_delta_.reset();
+      const auto dirty = move_proxy_dirty_rect(old_delta, move_preview_delta_);
+      if (!dirty.isEmpty()) {
+        update(widget_rect_for_document_rect(dirty));
+      }
+      last_mouse_position_ = event->pos();
+      return;
+    }
+    if (moving_layers_use_outline_preview_) {
+      move_preview_patches_.clear();
+      move_preview_patches_delta_.reset();
+      const auto dirty = moving_layers_outline_dirty_rect(old_delta, move_preview_delta_);
+      if (!dirty.isEmpty()) {
+        update(widget_rect_for_document_rect(dirty));
+      }
+      last_mouse_position_ = event->pos();
+      return;
+    }
+    // No ensure_render_cache() (see the latch branch above): live frames draw
+    // base + patches, neither of which reads the render cache once the base
+    // exists, and the base-less fallback tolerates a stale cache under it.
+    ensure_move_base_cache();
+    // Display-resolution compositing: at zoom <= 50% the live patches render
+    // from the preview-scaled document at the display mip level.
+    const auto composite_level = preview_composite_level_for_zoom(view_zoom());
+    Document* scaled_preview_document =
+        composite_level >= 1 ? preview_scaled_document_for_level(composite_level) : nullptr;
+    const QRegion canvas_region(QRect(0, 0, document_->width(), document_->height()));
+    auto previous_preview_region = QRegion();
+    for (const auto& patch : move_preview_patches_) {
+      if (!patch.document_rect.isEmpty()) {
+        previous_preview_region += patch.document_rect;
+      }
+    }
+    auto preview_region = moving_layers_dirty_region(QPoint(), move_preview_delta_).intersected(canvas_region);
+    // With the base cache in place the vacated (zero-delta) half of the region
+    // repaints straight from the base, so only the new-position half needs a
+    // recomposite each frame - roughly half the live-path cost. The full
+    // region still drives the repaint below (the first live frame must repaint
+    // the origin), and the base-less fallback keeps patching both halves
+    // because paint then draws over the unmodified render cache.
+    auto patch_region = move_base_cache_.isNull()
+                            ? preview_region
+                            : moving_layers_dirty_region(move_preview_delta_, move_preview_delta_)
+                                  .intersected(canvas_region);
+    // At mip-rendered zoom levels the preview patches must cover whole mip
+    // blocks so their downscale matches the surrounding display mips (and so
+    // scaled patch rects map exactly between the two documents); see
+    // draw_document_patch in paintEvent.
+    if (const auto align_level =
+            scaled_preview_document != nullptr ? composite_level : display_mip_level_for_zoom(view_zoom());
+        align_level > 0 && !patch_region.isEmpty()) {
+      QRegion aligned_region;
+      for (const auto& rect : patch_region) {
+        aligned_region += rect_aligned_to_mip_grid(rect, align_level);
+      }
+      patch_region = aligned_region.intersected(canvas_region);
+    }
+    auto update_region =
+        previous_preview_region.united(preview_region).united(patch_region).intersected(canvas_region);
+    // The outline also shows on the pasteboard, so its repaint is the one part
+    // of the update that is not clipped to the canvas.
+    const auto outline_dirty = moving_layers_outline_dirty_rect(old_delta, move_preview_delta_);
+    if (!outline_dirty.isEmpty()) {
+      update_region += outline_dirty;
+    }
+    if (!patch_region.isEmpty()) {
+      const auto patch_render_start = std::chrono::steady_clock::now();
+      if (scaled_preview_document != nullptr) {
+        // Render from the scaled document (4^level less work) but keep the
+        // patch document_rects full-res for the update/paint math. Scaled
+        // patches are never reused for the release cache patch, so the commit
+        // stays full-res accurate.
+        QRegion scaled_region;
+        for (const auto& rect : patch_region) {
+          scaled_region += preview_scaled_document_rect(rect, composite_level);
+        }
+        const auto scaled_floor = [composite_level](std::int32_t value) {
+          const auto scale = std::int32_t{1} << composite_level;
+          return value >= 0 ? value / scale : -((-value + scale - 1) / scale);
+        };
+        auto scaled_bounds = moving_layer_bounds(move_preview_delta_);
+        for (auto& [layer_id, bounds] : scaled_bounds) {
+          const auto* scaled_layer = std::as_const(*scaled_preview_document).find_layer(layer_id);
+          if (scaled_layer != nullptr) {
+            bounds = Rect{scaled_floor(bounds.x), scaled_floor(bounds.y), scaled_layer->bounds().width,
+                          scaled_layer->bounds().height};
+          }
+        }
+        // Rendered from the re-nested copy while the drag carries layers into another
+        // artboard, so the frame shows what the release will (docs/artboards.md).
+        move_preview_patches_ = qimage_patches_from_document_region_with_layer_bounds(
+            move_patch_source(*scaled_preview_document, composite_level, move_preview_delta_), scaled_region, true,
+            scaled_bounds);
+        for (auto& patch : move_preview_patches_) {
+          patch.image = patch.image.convertToFormat(QImage::Format_RGBA8888);
+          patch.document_rect =
+              QRect(patch.document_rect.x() << composite_level, patch.document_rect.y() << composite_level,
+                    patch.document_rect.width() << composite_level, patch.document_rect.height() << composite_level)
+                  .intersected(QRect(0, 0, document_->width(), document_->height()));
+        }
+        if (move_preview_patches_scale_level_ == 0) {
+          ++render_cache_diagnostics_.move_scaled_previews;
+        }
+        move_preview_patches_scale_level_ = composite_level;
+        move_preview_patches_delta_.reset();
+        move_preview_patches_rendered_delta_ = move_preview_delta_;
+      } else {
+        move_preview_patches_scale_level_ = 0;
+        move_preview_patches_ = qimage_patches_from_document_region_with_layer_bounds(
+            move_patch_source(std::as_const(*document_), 0, move_preview_delta_), patch_region, true,
+            moving_layer_bounds(move_preview_delta_));
+        for (auto& patch : move_preview_patches_) {
+          patch.image = patch.image.convertToFormat(QImage::Format_RGBA8888);
+        }
+        move_preview_patches_delta_ = move_preview_delta_;
+        move_preview_patches_rendered_delta_ = move_preview_delta_;
+      }
+      const auto patch_render_ms =
+          std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - patch_render_start).count();
+      if (patch_render_ms > live_preview_frame_latch_ms()) {
+        move_live_frame_slow_ = true;
+      }
+    } else {
+      move_preview_patches_.clear();
+      move_preview_patches_delta_.reset();
+    }
+    if (!update_region.isEmpty()) {
+      QRegion widget_region;
+      for (const auto& rect : update_region) {
+        widget_region += widget_rect_for_document_rect(rect);
+      }
+      update(widget_region);
+    }
+  } else if (moving_selection_) {
+    clear_move_hover_outline();
+    preview_selection_move(document_point - selection_move_origin_document_);
+    setCursor(Qt::SizeAllCursor);
+    emit_info_for_widget_position(event->pos());
+    update();
+  } else if (marquee_resize_handle_ != TransformHandle::None) {
+    clear_move_hover_outline();
+    update_marquee_resize_drag(document_point, event->modifiers());
+    if (spacebar_repositioning_drag_rect_) {
+      setCursor(Qt::SizeAllCursor);
+    } else {
+      set_transform_cursor_for_handle(marquee_resize_handle_);
+    }
+    emit_info_for_widget_position(event->pos());
+    update();
+  } else if (selecting_) {
+    clear_move_hover_outline();
+    if (spacebar_repositioning_drag_rect_) {
+      const auto raw_delta = document_point - spacebar_reposition_origin_document_position_;
+      const auto delta = snapped_rect_delta(
+          marquee_selection_rect(spacebar_reposition_start_selection_start_,
+                                 spacebar_reposition_start_selection_current_),
+          raw_delta);
+      selection_start_ = spacebar_reposition_start_selection_start_ + delta;
+      selection_current_ = spacebar_reposition_start_selection_current_ + delta;
+    } else {
+      update_selection_square_constraint(event->modifiers());
+      update_marquee_from_center(event->modifiers());
+      selection_current_ = snapped_marquee_current_point(selection_start_, document_point);
+    }
+    // Replace updates the live selection; the combine modes defer to release and
+    // only redraw the candidate outline (see draw_selection_overlay).
+    if (selection_operation_ == SelectionMode::Replace) {
+      combine_selection_from_region(marquee_selection_region(selection_start_, selection_current_));
+    }
+    emit_info_for_widget_position(event->pos());
+    update();
+  } else if (polygon_lassoing_ && document_ != nullptr) {
+    // Button up, the rubber band follows the pointer. A held button adds a
+    // freehand run while Alt is down (always in the Lasso's Alt switch, whose
+    // release closes the outline unless Alt is still held).
+    clear_move_hover_outline();
+    if (polygon_lasso_from_lasso_ && !polygon_lasso_button_down_ &&
+        !event->modifiers().testFlag(Qt::AltModifier)) {
+      // Alt came up where the canvas missed the key release (another widget had
+      // focus): the move's own modifiers close the Lasso's Alt switch.
+      finish_polygon_lasso();
+    } else if (polygon_lasso_button_down_ &&
+               (polygon_lasso_from_lasso_ || event->modifiers().testFlag(Qt::AltModifier))) {
+      if (polygon_lasso_points_.last() != document_point) {
+        polygon_lasso_points_ << document_point;
+        polygon_lasso_freehand_run_ = true;
+      }
+      polygon_lasso_cursor_ = document_point;
+      update();
+    } else {
+      update_polygon_lasso_rubber_band(document_point, event->modifiers());
+    }
+    emit_info_for_widget_position(event->pos());
+  } else if (lassoing_ && document_ != nullptr) {
+    clear_move_hover_outline();
+    if (!event->modifiers().testFlag(Qt::AltModifier)) {
+      lasso_alt_released_since_press_ = true;
+    }
+    const auto point = clamped_document_point(*document_, document_point);
+    if (lasso_points_.isEmpty() || (point - lasso_points_.last()).manhattanLength() >= 1) {
+      lasso_points_ << point;
+      update();
+    }
+    emit_info_for_widget_position(event->pos());  // the status-bar selection readout follows
+  } else if (magnetic_lassoing_ && document_ != nullptr) {
+    // The trace runs button-up (mouseTracking delivers hover moves): keep the live
+    // segment snapped to the cursor and let long segments cool into anchors.
+    clear_move_hover_outline();
+    extract_magnetic_live_path(clamped_document_point(*document_, document_point));
+    cool_magnetic_live_path();
+    update();
+    emit_info_for_widget_position(event->pos());
+  } else if (quick_selecting_) {
+    clear_move_hover_outline();
+    extend_quick_select_stroke(document_point);
+    emit_info_for_widget_position(event->pos());
+  } else if (object_selecting_) {
+    clear_move_hover_outline();
+    extend_object_select(document_point);
+    emit_info_for_widget_position(event->pos());
+  } else if (spot_healing_stroke_active_) {
+    clear_move_hover_outline();
+    const auto constrained_point = axis_constrained_stroke_point(document_point, event->modifiers());
+    extend_spot_heal_stroke(constrained_point);
+    emit_info_for_widget_position(event->pos());
+  } else if (patch_tool_dragging_) {
+    clear_move_hover_outline();
+    update_patch_tool_drag(document_point);
+    emit_info_for_widget_position(event->pos());
+  } else if (red_eye_dragging_) {
+    clear_move_hover_outline();
+    update_red_eye_gesture(document_point);
+    emit_info_for_widget_position(event->pos());
+  } else if (zooming_ && document_ != nullptr) {
+    clear_move_hover_outline();
+    if (zoom_scrubbing_) {
+      // Horizontal travel drives the zoom (right = in, left = out). The first
+      // move past the click slop applies the accumulated delta at once, so the
+      // gesture has no dead zone; zoom_drag_last_pos_ holds the press point
+      // until then.
+      if (!zoom_scrub_started_ &&
+          (event->pos() - zoom_drag_last_pos_.toPoint()).manhattanLength() >= kZoomClickSlopPx) {
+        zoom_scrub_started_ = true;
+      }
+      if (zoom_scrub_started_) {
+        apply_zoom_drag_step(event->position().x() - zoom_drag_last_pos_.x());
+        zoom_drag_last_pos_ = event->position();
+      }
+    } else {
+      zoom_current_ = clamped_document_point(*document_, document_point);
+      update();
+    }
+    emit_info_for_widget_position(event->pos());
+  } else {
+    const auto guide_index = guide_at_widget_position(event->pos());
+    const auto guide_drag_allowed = tool_ == CanvasTool::Move || event->modifiers().testFlag(Qt::ControlModifier);
+    if (guide_index >= 0 && !guides_locked_ && guide_drag_allowed) {
+      clear_move_hover_outline();
+      const auto orientation = document_->guides()[static_cast<std::size_t>(guide_index)].orientation;
+      setCursor(orientation == GuideOrientation::Vertical ? Qt::SplitHCursor : Qt::SplitVCursor);
+    } else {
+      if (tool_ == CanvasTool::Move) {
+        if (const auto rect = move_transform_controls_rect(); rect.has_value()) {
+          const auto handle = transform_handle_at(event->pos(), *rect, 0.0, TransformHitZones::EdgesAndCorners);
+          if (handle != TransformHandle::None) {
+            if (handle == TransformHandle::Move) {
+              apply_move_tool_cursor(event->pos());
+            } else if (!apply_move_box_handle_cursor(event->pos(), event->modifiers())) {
+              set_transform_cursor_at(event->pos(), handle, *rect, 0.0);
+            }
+            if (handle == TransformHandle::Move && auto_select_layer_) {
+              update_move_hover_outline(event->pos(), event->modifiers());
+            } else {
+              clear_move_hover_outline();
+            }
+            last_mouse_position_ = event->pos();
+            return;
+          }
+        }
+      }
+      if (const auto handle = marquee_resize_handle_at(event->pos());
+          handle != TransformHandle::None) {
+        // Signal that grabbing here resizes the committed marquee (with any
+        // modifier: Alt mirrors, it does not subtract).
+        set_transform_cursor_for_handle(handle);
+      } else if (can_move_selection_at(document_point, event->modifiers())) {
+        // Signal that grabbing here drags the selection outline.
+        setCursor(Qt::SizeAllCursor);
+      } else if (uses_patch_drag(tool_) &&
+                 selection_operation(event->modifiers()) == SelectionMode::Replace &&
+                 !selection_.isEmpty() && selection_.contains(document_point)) {
+        // Signal that grabbing here drags the patch region to its source.
+        setCursor(Qt::SizeAllCursor);
+      } else {
+        // The idle tool cursor reads last_mouse_position_ (the marquee and
+        // crop handle checks), so it must already be this event's position.
+        last_mouse_position_ = event->pos();
+        if (tool_ == CanvasTool::Text) {
+          text_ctrl_cursor_override_ = event->modifiers().testFlag(Qt::ControlModifier);
+        }
+        if (tool_has_ctrl_temporary_move(tool_)) {
+          retouch_cursor_modifier_override_ = event->modifiers();
+        }
+        update_tool_cursor();
+        text_ctrl_cursor_override_.reset();
+        retouch_cursor_modifier_override_.reset();
+      }
+      update_move_hover_outline(event->pos(), event->modifiers());
+    }
+  }
+
+  last_mouse_position_ = event->pos();
+}
+
+void CanvasWidget::refresh_tool_cursor() {
+  // Re-apply the tool cursor unless an in-progress gesture owns it. Used when
+  // the pointer enters the canvas or the canvas/window regains focus, since a
+  // pen does not emit move events on its own and Windows may reset the cursor
+  // to an arrow when the window is re-activated.
+  if (!panning_ && !pen_zoom_dragging_ && !dragging_transform_ && !transforming_layer_ && !color_picking_) {
+    update_tool_cursor();
+  }
+}
+
+void CanvasWidget::request_text_at_press(QPoint document_point, QPointF widget_position) {
+  if (!text_requested_callback_) {
+    return;
+  }
+  text_request_precise_point_ = document_position_f(widget_position);
+  text_requested_callback_(document_point, QRect());
+  text_request_precise_point_.reset();
+}
+
+void CanvasWidget::refresh_type_tool_cursor() {
+  if (tool_ == CanvasTool::Text && !dragging_text_rect_ && !text_layer_move_active_) {
+    refresh_tool_cursor();
+  }
+}
+
+void CanvasWidget::enterEvent(QEnterEvent* event) {
+  // Apply the tool cursor as soon as the pointer enters the canvas. With a
+  // mouse the cursor is refreshed by the steady stream of move events, but a
+  // pen only emits events once it moves, so without this the brush cursor can
+  // lag behind the pen when it first comes into proximity over the canvas.
+  refresh_tool_cursor();
+  QWidget::enterEvent(event);
+}
+
+void CanvasWidget::focusInEvent(QFocusEvent* event) {
+  refresh_tool_cursor();
+  QWidget::focusInEvent(event);
+}
+
+void CanvasWidget::hideEvent(QHideEvent* event) {
+  // A hidden tab misses Shift's release; it shows no stale line when it comes back.
+  hide_stroke_connect_preview();
+  // Never leave the pointer locked on a surface that is going away (GitHub issue 637).
+  end_brush_adjust_drag(true);
+  QWidget::hideEvent(event);
+}
+
+void CanvasWidget::leaveEvent(QEvent* event) {
+  ruler_hover_ = false;
+  clear_move_hover_outline();
+  hide_stroke_connect_preview();
+  hide_eyedropper_sample_outline();
+  invalidate_clone_overlay();
+  invalidate_brush_overlay();
+  if (brush_hover_position_valid_) {
+    const auto stale = brush_outline_uses_overlay() ? brush_hover_outline_rect() : QRect();
+    brush_hover_position_valid_ = false;
+    if (!stale.isNull()) {
+      update(stale.adjusted(-2, -2, 2, 2));
+    }
+  }
+  QWidget::leaveEvent(event);
+}
+
+void CanvasWidget::mouseReleaseEvent(QMouseEvent* event) {
+  if (processing_render_wait_active_) {
+    // Never drop a release (the gesture that owns the press would stay
+    // latched, e.g. painting_ mid-brush-stroke) and never re-post it (a
+    // re-posted clone wakes the wasm nested wait loop every turn and keeps
+    // it from suspending): park it for wait_for_processing_operation to
+    // replay after the outermost wait unwinds.
+    deferred_wait_release_ = DeferredWaitRelease{event->position(), event->globalPosition(),
+                                                event->button(), event->buttons(), event->modifiers()};
+    event->accept();
+    return;
+  }
+  // The last moves before the release land first, so the drop is where the pointer was.
+  flush_pending_drag_move();
+  // The finished stroke's end is the next Shift+click line's anchor (GitHub issue 445).
+  const auto refresh_connect_preview = qScopeGuard([this] { refresh_stroke_connect_preview(); });
+  // A painting tool's Ctrl+drag or Ctrl+click (GitHub issues 380, 423) gets its tool cursor
+  // back after the commit.
+  const bool ends_retouch_move = tool_has_ctrl_temporary_move(tool_) &&
+                                 (move_drag_pending_ || moving_layer_ || paint_ctrl_click_.has_value()) &&
+                                 event->button() == Qt::LeftButton;
+  const auto restore_retouch_cursor = qScopeGuard([this, ends_retouch_move, modifiers = event->modifiers()] {
+    if (ends_retouch_move) {
+      retouch_cursor_modifier_override_ = modifiers;
+      update_tool_cursor();
+      retouch_cursor_modifier_override_.reset();
+    }
+  });
+  // A Type-tool Ctrl+drag ends with this release, once the Move commit below has run.
+  const bool ends_text_layer_move = text_layer_move_active_ && event->button() == Qt::LeftButton;
+  const auto finish_text_move = qScopeGuard([this, ends_text_layer_move] {
+    if (ends_text_layer_move) {
+      finish_text_layer_move();
+    }
+  });
+  if (!handling_tablet_event_) {
+    active_pen_input_sample_.reset();
+  }
+  if (preview_point_drag_ >= 0 && event->button() == Qt::LeftButton && move_preview_point_handle(event, true)) {
+    event->accept();
+    return;
+  }
+  if (brush_adjust_dragging_) {
+    if (event->button() == Qt::RightButton || (event->buttons() & Qt::RightButton) == 0) {
+      end_brush_adjust_drag(true);
+    }
+    event->accept();
+    return;
+  }
+  if (mouse_pen_action_button_ != Qt::NoButton) {
+    if (event->button() == mouse_pen_action_button_) {
+      mouse_pen_action_button_ = Qt::NoButton;
+      if (pen_zoom_dragging_) {
+        end_zoom_drag();
+      }
+      event->accept();
+      return;
+    }
+    if (!handling_tablet_event_ && (event->buttons() & mouse_pen_action_button_) == 0) {
+      // Lost release: clean up, then let this event take its normal path.
+      mouse_pen_action_button_ = Qt::NoButton;
+      if (pen_zoom_dragging_) {
+        end_zoom_drag();
+      }
+    }
+  }
+  if (color_picking_) {
+    if (event->button() == Qt::LeftButton || (event->buttons() & Qt::LeftButton) == 0) {
+      update_color_pick(event->pos(), event->globalPosition().toPoint());
+      end_color_pick();
+    }
+    event->accept();
+    return;
+  }
+  if (event->button() == Qt::RightButton && !panning_) {
+    // The context click resolves here: a release within the drag distance of
+    // its press opens the canvas context menu; anything else was nothing.
+    const auto context_press = context_press_pos_;
+    context_press_pos_.reset();
+    if (context_press.has_value() &&
+        (event->pos() - *context_press).manhattanLength() < QApplication::startDragDistance()) {
+      show_canvas_context_menu(*context_press, event->globalPosition().toPoint());
+    }
+    event->accept();
+    return;
+  }
+  if (hand_zoom_pending_) {
+    if (event->button() == Qt::LeftButton || (event->buttons() & Qt::LeftButton) == 0) {
+      hand_zoom_pending_ = false;
+      zoom_click_step(event->position(), hand_zoom_out_);
+      emit_info_for_widget_position(event->pos());
+    }
+    event->accept();
+    return;
+  }
+  if (panning_) {
+    panning_ = false;
+    update_tool_cursor();
+    return;
+  }
+  if (rotating_view_ && (event->button() == Qt::LeftButton || (event->buttons() & Qt::LeftButton) == 0)) {
+    end_rotate_view_drag(false);
+    event->accept();
+    return;
+  }
+
+  if (transient_read_dragging_ &&
+      (event->button() == Qt::LeftButton || (event->buttons() & Qt::LeftButton) == 0)) {
+    transient_read_dragging_ = false;
+    if (QWidget::mouseGrabber() == this) {
+      releaseMouse();
+    }
+    auto callback = transient_read_callback_;
+    if (callback) {
+      callback(CanvasReadGesture{document_position(event->pos()), event->globalPosition().toPoint(),
+                                 event->modifiers(), CanvasReadPhase::Release});
+    }
+    last_mouse_position_ = event->pos();
+    event->accept();
+    return;
+  }
+
+  if (edit_locked_ && !zooming_ &&
+      (event->button() != Qt::LeftButton || !selection_tool_passes_edit_lock())) {
+    clear_move_hover_outline();
+    event->accept();
+    return;
+  }
+
+  // Before the Pen and path tools, which take every release (the handles work under them too,
+  // GitHub issue 694).
+  if (gradient_handle_drag_.has_value() && release_gradient_fill_handle(event)) {
+    event->accept();
+    return;
+  }
+
+  if (pen_family_tool_active()) {
+    if (handle_pen_release(event)) {
+      event->accept();
+      return;
+    }
+  }
+
+  if (shape_temp_path_select_ && event->button() == Qt::LeftButton) {
+    handle_path_edit_release(event);
+    shape_temp_path_select_ = false;
+    set_shape_ctrl_path_select((event->modifiers() & Qt::ControlModifier) != 0);
+    update_tool_cursor();
+    event->accept();
+    return;
+  }
+
+  if (move_vector_mask_drag_ && event->button() == Qt::LeftButton) {
+    handle_path_edit_release(event);
+    move_vector_mask_drag_ = false;
+    clear_path_edit_selection();
+    event->accept();
+    return;
+  }
+  if (tool_ == CanvasTool::PathSelect || tool_ == CanvasTool::DirectSelect) {
+    if (handle_path_edit_release(event)) {
+      if (!path_transform_active_) {
+        set_arrow_swap((event->modifiers() & Qt::ControlModifier) != 0);
+      }
+      event->accept();
+      return;
+    }
+  }
+
+  if (dragging_guide_) {
+    finish_guide_drag(event->pos(), event->modifiers());
+    return;
+  }
+
+  if (magnetic_lassoing_) {
+    // The trace is driven by presses and hover moves; releases (including the
+    // start click's) must not fall through to the deselect/selection logic.
+    event->accept();
+    return;
+  }
+
+  if (polygon_lassoing_) {
+    // Like the magnetic trace, the session runs on presses and hover moves. A
+    // freehand run ends in a vertex, so Backspace drops the run with it.
+    if (polygon_lasso_button_down_ && polygon_lasso_freehand_run_) {
+      add_polygon_lasso_vertex(document_position(event->pos()));
+    }
+    polygon_lasso_button_down_ = false;
+    polygon_lasso_freehand_run_ = false;
+    if (polygon_lasso_from_lasso_ && !event->modifiers().testFlag(Qt::AltModifier)) {
+      finish_polygon_lasso();
+    }
+    emit_info_for_widget_position(event->pos());
+    update();
+    event->accept();
+    return;
+  }
+
+  if (dragging_warp_handle_) {
+    // Cleared first: the release renders the resting (full-quality) preview.
+    dragging_warp_handle_ = false;
+    set_warp_handle_document_position(warp_drag_index_, document_position_f(event->position()));
+    warp_drag_index_ = -1;
+    record_transform_session_step(transform_session_step_at_press_);
+    update();
+    return;
+  }
+
+  if (dragging_transform_) {
+    last_mouse_position_ = event->pos();
+    update_free_transform_preview(document_position_f(event->position()), event->modifiers());
+    dragging_transform_ = false;
+    transform_drag_handle_ = TransformHandle::None;
+    transform_drag_kind_ = TransformDragKind::Scale;
+    clear_drag_readout();
+    if (transform_move_float_drag_) {
+      // A Move drag of the selected pixels lands on release (GitHub issue 532).
+      transform_drag_uses_proxy_preview_ = false;
+      transform_drag_uses_clip_group_preview_ = false;
+      commit_free_transform();
+      update_tool_cursor();
+      update();
+      return;
+    }
+    record_transform_session_step(transform_session_step_at_press_);
+    if (transform_drag_uses_proxy_preview_ || transform_drag_uses_clip_group_preview_) {
+      // The latched drag skipped the composited patches; render them once at
+      // the final geometry so the resting preview is accurate. The latch stays
+      // set until the patches exist so paints during the overlay wait keep
+      // showing the proxy (or the clip-group blit) rather than the raw source.
+      refresh_transform_composited_preview_cache(true);
+      transform_drag_uses_proxy_preview_ = false;
+      transform_drag_uses_clip_group_preview_ = false;
+    } else if (transform_preview_patches_banded_) {
+      // Live drag frames render in preview-only bands; the resting preview
+      // (and the commit hold built from it) gets the exact render.
+      refresh_transform_composited_preview_cache(true);
+    }
+    update_tool_cursor();
+    update();
+    notify_transform_controls_changed();
+    return;
+  }
+
+  if (shape_handle_drag_active() && release_shape_resize_handle(event)) {
+    event->accept();
+    return;
+  }
+
+  if (tool_ == CanvasTool::Ruler && ruler_drag_part_ != RulerPart::None && event->button() == Qt::LeftButton) {
+    finish_ruler_drag(event);
+    event->accept();
+    return;
+  }
+
+  if (tool_ == CanvasTool::PerspectiveCrop &&
+      (perspective_crop_dragging_out_ || perspective_crop_drag_part_ >= 0) &&
+      event->button() == Qt::LeftButton) {
+    finish_perspective_crop_mouse_release(event);
+    event->accept();
+    return;
+  }
+
+  if (tool_ == CanvasTool::Crop && crop_straightening_ && event->button() == Qt::LeftButton) {
+    finish_crop_straighten_line(event);
+    event->accept();
+    return;
+  }
+
+  if (tool_ == CanvasTool::Crop &&
+      (crop_dragging_out_ || crop_rotating_ || crop_drag_handle_ != TransformHandle::None) &&
+      event->button() == Qt::LeftButton) {
+    finish_crop_mouse_release(event);
+    return;
+  }
+
+  if (artboard_drag_active() && event->button() == Qt::LeftButton) {
+    finish_artboard_drag(event);
+    update_artboard_tool_cursor(event->pos());
+    event->accept();
+    return;
+  }
+
+  if (painting_) {
+    QRect dirty;
+    const auto document_point = document_position(event->pos());
+    const auto document_point_f = stroke_position_f(event->position());
+    const auto effective_tool = effective_tool_for_input();
+    if (effective_tool == CanvasTool::Clone || effective_tool == CanvasTool::Healing) {
+      const auto constrained_point = axis_constrained_stroke_point(document_point, event->modifiers());
+      dirty = clone_brush_segment(last_document_position_, constrained_point);
+      last_document_position_ = constrained_point;
+      last_document_position_f_ = QPointF(constrained_point);
+    } else if (is_local_adjustment_tool(effective_tool)) {
+      const auto constrained_point = axis_constrained_stroke_point(document_point, event->modifiers());
+      dirty = local_adjustment_brush_segment(last_document_position_, constrained_point);
+      last_document_position_ = constrained_point;
+      last_document_position_f_ = QPointF(constrained_point);
+    } else if (effective_tool == CanvasTool::Smudge && document_point != last_document_position_) {
+      // The rest of a Smudge stroke its segment spacing held back (GitHub #660).
+      dirty = smudge_brush_segment(last_document_position_, document_point);
+      last_document_position_ = document_point;
+      last_document_position_f_ = document_point_f;
+    } else if (effective_tool == CanvasTool::Brush || effective_tool == CanvasTool::MixerBrush ||
+               effective_tool == CanvasTool::PatternStamp ||
+               effective_tool == CanvasTool::Eraser) {
+      if (effective_brush_input().size == 1) {
+        auto constrained_point = axis_constrained_stroke_point(document_point, event->modifiers());
+        if (stroke_stabilizer_.active() && tool_uses_stroke_stabilizer(effective_tool)) {
+          // Catch-up on Stroke End releases at the raw point; otherwise the
+          // stroke ends wherever the leash left the output.
+          const auto final_point =
+              stroke_stabilizer_.finish(constrained_point.x(), constrained_point.y());
+          constrained_point = QPoint(static_cast<int>(std::lround(final_point.x)),
+                                     static_cast<int>(std::lround(final_point.y)));
+        }
+        // The release pixel is painted, as the hard 1 px line does; the dab-spaced path
+        // (Flow, Airbrush) can otherwise stop a pixel short of it (local-040).
+        const auto erase = effective_tool == CanvasTool::Eraser;
+        dirty = draw_brush_segment(last_document_position_, constrained_point, erase,
+                                   brush_uses_dab_stroke(effective_brush_input(), erase));
+        last_document_position_ = constrained_point;
+        last_document_position_f_ = QPointF(constrained_point);
+      } else {
+        auto constrained_point = axis_constrained_stroke_point(document_point_f, event->modifiers());
+        if (stroke_stabilizer_.active() && tool_uses_stroke_stabilizer(effective_tool)) {
+          const auto final_point =
+              stroke_stabilizer_.finish(constrained_point.x(), constrained_point.y());
+          constrained_point = QPointF(final_point.x, final_point.y);
+        }
+        dirty = finish_smoothed_brush_stroke(constrained_point, effective_tool == CanvasTool::Eraser);
+        last_document_position_ = QPoint(static_cast<int>(std::lround(constrained_point.x())),
+                                         static_cast<int>(std::lround(constrained_point.y())));
+        last_document_position_f_ = constrained_point;
+      }
+      dirty = dirty.united(finish_brush_tip_stroke(effective_tool == CanvasTool::Eraser));
+    } else {
+      last_document_position_ = document_point;
+      last_document_position_f_ = document_point_f;
+    }
+    dirty = dirty.united(finish_healing_brush_stroke());
+    painting_ = false;
+    set_retouch_source_indicator(std::nullopt);
+    invalidate_clone_overlay();
+    invalidate_brush_overlay();
+    sync_stroke_input_compression();
+    last_stroke_end_document_ = last_document_position_f_;
+    last_stroke_end_alt_swapped_ = stroke_end_is_alt_swapped();
+    clone_source_cache_ = QImage();
+    end_lazy_clone_source();
+    clone_source_deep_ = PixelBuffer{};
+    smudge_state_ = {};
+    mixer_brush_state_ = {};
+    reset_brush_smoothing();
+    reset_axis_constrained_stroke();
+    clear_brush_stroke_tracking();
+    close_stroke_growth_reserve();  // the final bounds, before the stroke is reported
+    if (!dirty.isEmpty()) {
+      active_edit_target_changed_impl(QRegion(dirty), DocumentChangeReason::BrushStrokeFinished);
+    } else if (quick_mask_active_) {
+      finish_quick_mask_edit();
+    } else if (layer_edit_target_ == LayerEditTarget::SmartFilterMask) {
+      // The press dab may already have changed the temporary mask even when
+      // release adds no final segment. Complete that gesture exactly once.
+      finish_smart_filter_mask_edit();
+    } else {
+      notify_document_changed(DocumentChangeReason::BrushStrokeFinished);
+    }
+    // After the final segment's dirty rect has been reported above.
+    finish_paint_stroke_history();
+    return;
+  }
+
+  if (dragging_text_entry_selection_ && event->button() == Qt::LeftButton) {
+    dragging_text_entry_selection_ = false;
+    event->accept();
+    return;
+  }
+
+  if (dragging_text_rect_) {
+    dragging_text_rect_ = false;
+    text_rect_current_ = snapped_document_point(document_position(event->pos()));
+    const auto rect = normalized_rect(text_rect_start_, text_rect_current_);
+    QRect requested_box;
+    if (rect.width() >= 16 && rect.height() >= 16) {
+      requested_box = rect;
+    }
+    if (text_requested_callback_) {
+      text_requested_callback_(requested_box.isValid() && !requested_box.isEmpty() ? requested_box.topLeft()
+                                                                                   : text_rect_start_,
+                               requested_box);
+    }
+    update();
+    return;
+  }
+
+  if (move_layer_selection_gesture_ && event->button() == Qt::LeftButton) {
+    finish_move_layer_selection(event);
+    event->accept();
+    return;
+  }
+
+  if (paint_ctrl_click_.has_value() && event->button() == Qt::LeftButton) {
+    // A painting tool's Ctrl+click that never dragged selects the layer under the
+    // pointer (GitHub issue 423); the pending move below then ends as a plain click.
+    const auto click_point = paint_ctrl_click_->document_point;
+    paint_ctrl_click_.reset();
+    select_paint_layer_at(click_point);
+    if (!move_drag_pending_) {
+      event->accept();
+      return;
+    }
+  }
+
+  if (move_drag_pending_) {
+    move_drag_pending_ = false;
+    moving_layers_.clear();
+    move_preview_delta_ = QPoint();
+    move_preview_patches_.clear();
+    move_preview_patches_delta_.reset();
+    moving_layers_use_outline_preview_ = false;
+    // A click that never became a drag changed nothing: keep any retained
+    // base/proxy for the next drag (unless something external landed while
+    // the press was pending).
+    move_drag_uses_proxy_preview_ = false;
+    move_press_reused_retained_caches_ = false;
+    if (move_external_change_during_drag_) {
+      clear_retained_move_caches();
+    }
+    reset_axis_constrained_stroke();
+    update_move_hover_outline(event->pos(), event->modifiers());
+    update();
+    return;
+  }
+
+  if (moving_layer_) {
+    const auto trace_move_release = render_trace_enabled();
+    const auto trace_start =
+        trace_move_release ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    const auto constrained_delta =
+        axis_constrained_move_delta(document_position(event->pos()) - move_start_, event->modifiers());
+    move_preview_delta_ = axis_constrained_move_delta(snapped_move_delta(constrained_delta), event->modifiers());
+    // The whole commit reads these captured copies, never the live members:
+    // the waits below can dispatch re-entrant input on wasm (the handler
+    // guards drop it, but the members must stay authoritative for exactly
+    // one delta between patch render, layer mutation, and retention).
+    const auto commit_delta = move_preview_delta_;
+    const auto committed_layers = moving_layers_;
+    std::vector<LayerId> committed_move_ids;
+    committed_move_ids.reserve(committed_layers.size());
+    for (const auto& moving_layer : committed_layers) {
+      committed_move_ids.push_back(moving_layer.id);
+    }
+    QRegion dirty_region;
+    QRegion patched_region;
+    std::vector<RenderedDocumentPatch> precommit_patches;
+    bool attempted_precommit_patch = false;
+    bool used_precommit_patch = false;
+    bool reused_preview_patch = false;
+    bool defer_accurate_patches = false;
+    const auto move_layer_count = committed_layers.size();
+    const auto move_operation_active = !commit_delta.isNull();
+    bool move_rolled_back = false;
+    // Auto-nesting (docs/artboards.md): decided from the pre-move tree, exactly as the drag
+    // previewed it, and applied right after the move inside the same undo step.
+    const auto commit_nest_moves = commit_delta.isNull() ? std::vector<ArtboardNestMove>{}
+                                                         : move_nest_moves_for_delta(commit_delta);
+    bool nested_layers = false;
+    const bool rerender_smart_filters =
+        document_ != nullptr &&
+        std::any_of(committed_layers.begin(), committed_layers.end(),
+                    [this](const MovingLayer& moving_layer) {
+                      const auto* layer = document_->find_layer(moving_layer.id);
+                      return layer != nullptr &&
+                             move_layer_requires_smart_filter_rerender(*layer);
+                    });
+    if (move_operation_active) {
+      begin_processing_operation();
+    }
+    if (!commit_delta.isNull()) {
+      const auto move_label =
+          committed_layers.size() > 1U ? tr("Move layers") : tr("Move layer");
+      std::optional<Document> rollback_document;
+      if (rerender_smart_filters && document_ != nullptr) {
+        rollback_document.emplace(*document_);
+      }
+      dirty_region = moving_layers_dirty_region(committed_layers, QPoint(), commit_delta);
+      patched_region = dirty_region;
+      if (document_ != nullptr) {
+        patched_region = patched_region.intersected(QRect(0, 0, document_->width(), document_->height()));
+      }
+      tick_processing_operation();
+      if (!rerender_smart_filters && before_edit_callback_) {
+        before_edit_callback_(move_label);
+      }
+      if (document_ != nullptr && !rerender_smart_filters &&
+          !patched_region.isEmpty() && !render_cache_dirty_ &&
+          !render_cache_.isNull() &&
+          render_cache_.size() == QSize(document_->width(), document_->height())) {
+        attempted_precommit_patch = true;
+        if (move_preview_patches_delta_.has_value() && *move_preview_patches_delta_ == commit_delta &&
+            !move_preview_patches_.empty()) {
+          // The reused live patches only cover the new-position half (the base
+          // cache carried the vacated area during the drag); render the
+          // vacated half fresh so the cache patch leaves no trail. Vacated
+          // rects go first: Source-mode patching lets the new-position
+          // patches rewrite the old/new overlap. Both halves come from the
+          // re-nested tree when the move changes artboards, like the preview.
+          if (!move_base_cache_.isNull()) {
+            const auto vacated_region =
+                moving_layers_dirty_region(committed_layers, QPoint(), QPoint()).intersected(patched_region);
+            precommit_patches = qimage_patches_from_document_region_with_layer_bounds(
+                move_patch_source(std::as_const(*document_), 0, commit_delta), vacated_region, true,
+                moving_layer_bounds(committed_layers, commit_delta));
+            for (auto& patch : precommit_patches) {
+              patch.image = patch.image.convertToFormat(QImage::Format_RGBA8888);
+            }
+          }
+          precommit_patches.insert(precommit_patches.end(),
+                                   std::make_move_iterator(move_preview_patches_.begin()),
+                                   std::make_move_iterator(move_preview_patches_.end()));
+          move_preview_patches_.clear();
+          reused_preview_patch = true;
+        } else {
+          const auto final_bounds = moving_layer_bounds(committed_layers, commit_delta);
+          const auto force_processing_wait =
+              moving_layers_use_outline_preview_ || move_drag_uses_proxy_preview_ ||
+              std::any_of(committed_layers.begin(), committed_layers.end(),
+                          [](const MovingLayer& layer) { return layer.expensive_style; });
+          const bool can_defer = can_hold_move_commit_preview(commit_delta) || move_preview_requested_;
+          if (!commit_nest_moves.empty() && !can_defer) {
+            // Re-nested by this release: the patch renderer reads the live tree, so the
+            // bounded invalidation after the re-parent renders these rects instead.
+          } else if ((force_processing_wait || dirty_region_should_use_processing_wait(patched_region) ||
+                      !commit_nest_moves.empty()) &&
+                     can_defer) {
+            // Deferred commit: this render would block behind the processing
+            // overlay (a 4000x2781 styled poster paid 9-19 s per release,
+            // September 2026). Mutate now, keep the preview frame on screen,
+            // and render the accurate patches on a worker (start_move_commit_job).
+            defer_accurate_patches = true;
+            if (can_hold_move_commit_preview(commit_delta)) arm_move_commit_hold(commit_delta);
+          } else {
+            precommit_patches =
+                render_document_patches_with_processing(patched_region, final_bounds, force_processing_wait);
+            for (auto& patch : precommit_patches) {
+              patch.image = patch.image.convertToFormat(QImage::Format_RGBA8888);
+            }
+          }
+        }
+      }
+      bool smart_filter_rerender_failed = false;
+      for (const auto& moving_layer : committed_layers) {
+        auto* layer = document_->find_layer(moving_layer.id);
+        if (layer == nullptr) {
+          continue;
+        }
+        auto new_bounds = moving_layer.original_bounds;
+        new_bounds.x += commit_delta.x();
+        new_bounds.y += commit_delta.y();
+        layer->set_bounds(new_bounds);
+        patchy::translate_moved_layer_metadata(*layer, commit_delta.x(), commit_delta.y(),
+                                               document_->width(), document_->height());
+        if (move_layer_requires_smart_filter_rerender(*layer)) {
+          if (!smart_object_transform_render_callback_ ||
+              !smart_object_transform_render_callback_(moving_layer.id)) {
+            smart_filter_rerender_failed = true;
+            break;
+          }
+          layer = document_->find_layer(moving_layer.id);
+          if (layer != nullptr) {
+            dirty_region +=
+                to_qrect(layer_bounds_with_effects(*layer, layer->bounds()));
+          }
+        }
+      }
+      // The re-parent joins the move (and, below, its undo snapshot); a failed Smart
+      // Filter re-render rolls both back.
+      if (!smart_filter_rerender_failed && !commit_nest_moves.empty()) {
+        nested_layers = apply_artboard_nest_moves(*document_, commit_nest_moves);
+      }
+      if (smart_filter_rerender_failed && rollback_document.has_value()) {
+        *document_ = std::move(*rollback_document);
+        precommit_patches.clear();
+        move_rolled_back = true;
+        nested_layers = false;
+      } else if (rerender_smart_filters && rollback_document.has_value()) {
+        auto committed_document = *document_;
+        *document_ = std::move(*rollback_document);
+        if (before_edit_callback_) {
+          before_edit_callback_(move_label);
+        }
+        *document_ = std::move(committed_document);
+      }
+    }
+    const bool proxy_content_complete = !move_proxy_image_.isNull() && !move_proxy_rect_canvas_clipped_;
+    // The dashed outline also shows on the pasteboard, which the canvas-clipped
+    // commit repaints below never reach.
+    if (const auto outline_dirty = moving_layers_outline_dirty_rect(commit_delta, commit_delta);
+        !outline_dirty.isEmpty()) {
+      update(widget_rect_for_document_rect(outline_dirty));
+    }
+    cancel_move_preview();
+    moving_layer_ = false;
+    move_drag_pending_ = false;
+    moving_layers_.clear();
+    move_preview_patches_.clear();
+    move_preview_patches_delta_.reset();
+    moving_layers_use_outline_preview_ = false;
+    move_readout_base_rect_.reset();
+    clear_drag_readout();
+    clear_move_snap_guides();
+    reset_axis_constrained_stroke();
+    update_move_transform_controls_dirty(std::nullopt);
+    update_move_hover_outline(event->pos(), event->modifiers());
+    // Base/proxy clears are deferred to the retention decision below: the
+    // precommit-patch and zero-delta routes keep them for the next drag of
+    // the same selection.
+    bool retain_move_caches = false;
+    if (!dirty_region.isEmpty()) {
+      if (defer_accurate_patches) {
+        start_move_commit_job(patched_region);
+        retain_move_caches = true;
+        if (nested_layers) {
+          clear_preview_scaled_document();  // its tree predates the re-parent
+        } else {
+          retarget_preview_scaled_for_committed_move(committed_move_ids);
+        }
+        if (async_render_cache_in_flight_) {
+          async_render_cache_pending_ = true;
+        }
+        notify_document_changed();
+        update();
+      } else if (!precommit_patches.empty() && patch_render_cache_patches(precommit_patches)) {
+        ++render_cache_diagnostics_.move_precommit_patches;
+        if (reused_preview_patch) {
+          ++render_cache_diagnostics_.move_preview_patch_reuses;
+        }
+        used_precommit_patch = true;
+        retain_move_caches = true;
+        // This route skips document_changed_impl, so the preview-scaled
+        // document survives; refit its copies of the moved layers or the next
+        // proxy snapshot renders them at their pre-commit positions.
+        if (nested_layers) {
+          clear_preview_scaled_document();  // its tree predates the re-parent
+        } else {
+          retarget_preview_scaled_for_committed_move(committed_move_ids);
+        }
+        // It also skips the generation bump, so an async refresh snapshotted
+        // before this commit would install pre-move pixels over the patch.
+        // Pending makes its completion discard that frame and re-snapshot;
+        // cancelling instead would strand the stale mix that
+        // document_changed_async_preview relies on the refresh to replace.
+        if (async_render_cache_in_flight_) {
+          async_render_cache_pending_ = true;
+        }
+        notify_document_changed();
+        if (zoom_ < 1.0) {
+          update();
+        } else {
+          QRegion widget_region;
+          for (const auto& rect : patched_region) {
+            widget_region += widget_repaint_rect_for_document_rect(rect);
+          }
+          update(widget_region);
+        }
+      } else {
+        document_changed_effect_bounds(dirty_region);
+      }
+    } else {
+      // Zero-delta release: nothing changed, so the caches stay valid as-is.
+      retain_move_caches = true;
+      update();
+    }
+    if (retain_move_caches && !move_external_change_during_drag_) {
+      retain_move_preview_caches(committed_move_ids, commit_delta, proxy_content_complete);
+    } else {
+      clear_retained_move_caches();
+    }
+    if (move_operation_active) {
+      end_processing_operation();
+    }
+    // The release re-nested layers into or out of artboards (docs/artboards.md): the
+    // panels follow; the canvas is already patched.
+    if (layers_moved_callback_ && nested_layers && !move_rolled_back) {
+      layers_moved_callback_(committed_move_ids);
+    }
+    if (trace_move_release) {
+      const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() -
+                                                                                trace_start);
+      const auto trace_dirty = patched_region.boundingRect();
+      std::cerr << "PATCHY_RENDER_TRACE move_release dirty=" << trace_dirty.x() << "," << trace_dirty.y() << ","
+                << trace_dirty.width() << "," << trace_dirty.height() << " layers=" << move_layer_count
+                << " precommit_attempted=" << (attempted_precommit_patch ? 1 : 0)
+                << " precommit_patched=" << (used_precommit_patch ? 1 : 0)
+                << " preview_reused=" << (reused_preview_patch ? 1 : 0)
+                << " deferred=" << (defer_accurate_patches ? 1 : 0) << " elapsed_ms=" << elapsed.count()
+                << '\n';
+    }
+    return;
+  }
+
+  if (marquee_resize_handle_ != TransformHandle::None) {
+    const auto document_point = document_position(event->pos());
+    const auto widget_delta = event->pos() - selection_press_widget_position_;
+    if (widget_delta.manhattanLength() < QApplication::startDragDistance()) {
+      // A click on a handle with no travel changes nothing (and must not
+      // deselect the way a click inside the selection does).
+      restore_selection_before_edit();
+    } else {
+      update_marquee_resize_drag(document_point, event->modifiers());
+      record_selection_history(tr("Resize Selection"), selection_snapshot_before_edit());
+    }
+    marquee_resize_handle_ = TransformHandle::None;
+    spacebar_repositioning_drag_rect_ = false;
+    clear_selection_before_edit();
+    emit_info_for_widget_position(event->pos());
+    update_tool_cursor();
+    update();
+    return;
+  }
+
+  if (moving_selection_) {
+    moving_selection_ = false;
+    const auto document_point = document_position(event->pos());
+    const auto widget_delta = event->pos() - selection_press_widget_position_;
+    const bool was_click = widget_delta.manhattanLength() < QApplication::startDragDistance();
+    if (was_click) {
+      // A press inside the selection that never became a drag is a plain click,
+      // which does what the tool's click does: the polygonal and magnetic
+      // lassos start a trace at the press, the Magic Wand selects from it, and
+      // the marquees and Lasso deselect (GitHub issue 436).
+      restore_selection_before_edit();
+      const auto press_point = selection_move_origin_document_;
+      if (tool_ == CanvasTool::PolygonLasso && document_ != nullptr) {
+        start_polygon_lasso(QPolygon{press_point}, /*from_lasso=*/false);
+      } else if (tool_ == CanvasTool::MagneticLasso && document_ != nullptr) {
+        start_magnetic_lasso(clamped_document_point(*document_, press_point), Qt::NoModifier);
+      } else if (tool_ == CanvasTool::MagicWand) {
+        begin_processing_operation();
+        magic_wand_select(press_point);
+        end_processing_operation();
+        record_selection_history(tr("Magic Wand"), selection_snapshot_before_edit());
+      } else {
+        clear_selection();
+        record_selection_history(tr("Deselect"), selection_snapshot_before_edit());
+      }
+    } else {
+      apply_selection_move(document_point - selection_move_origin_document_);
+      // Coalesce with any preceding move/nudge so a run of repositions is one
+      // undo step that returns to the pre-move location.
+      record_selection_history(tr("Move Selection"), selection_snapshot_before_edit(), /*coalesce=*/true);
+    }
+    clear_selection_before_edit();
+    emit_info_for_widget_position(event->pos());
+    update_tool_cursor();
+    update();
+    return;
+  }
+
+  if (selecting_) {
+    selecting_ = false;
+    const auto document_point = document_position(event->pos());
+    const auto widget_delta = event->pos() - selection_press_widget_position_;
+    const bool was_click = !spacebar_repositioning_drag_rect_ &&
+                           marquee_style_ != MarqueeStyle::FixedSize &&
+                           widget_delta.manhattanLength() < QApplication::startDragDistance();
+    const auto marquee_label =
+        tool_ == CanvasTool::EllipticalMarquee ? tr("Elliptical Marquee") : tr("Rectangular Marquee");
+    if (was_click) {
+      // A plain click (no drag) deselects in Replace mode; add/subtract are no-ops.
+      restore_selection_before_edit();
+      if (selection_operation_ == SelectionMode::Replace) {
+        clear_selection();
+      }
+      record_selection_history(tr("Deselect"), selection_snapshot_before_edit());
+      clear_selection_before_edit();
+      emit_info_for_widget_position(event->pos());
+      update();
+      return;
+    }
+    if (spacebar_repositioning_drag_rect_) {
+      const auto raw_delta = document_point - spacebar_reposition_origin_document_position_;
+      const auto delta = snapped_rect_delta(
+          marquee_selection_rect(spacebar_reposition_start_selection_start_,
+                                 spacebar_reposition_start_selection_current_),
+          raw_delta);
+      selection_start_ = spacebar_reposition_start_selection_start_ + delta;
+      selection_current_ = spacebar_reposition_start_selection_current_ + delta;
+      spacebar_repositioning_drag_rect_ = false;
+    } else {
+      update_selection_square_constraint(event->modifiers());
+      update_marquee_from_center(event->modifiers());
+      selection_current_ = snapped_marquee_current_point(selection_start_, document_point);
+    }
+    // Rounded corners commit through the mask path too so the curved edges pick
+    // up the Anti-alias setting (the QRegion path is hard-edged).
+    if (selection_feather_radius_ > 0 ||
+        marquee_effective_corner_radius(marquee_selection_rect(selection_start_, selection_current_)) > 0.0) {
+      QRect mask_bounds;
+      auto mask = marquee_selection_mask(selection_start_, selection_current_, mask_bounds);
+      combine_selection_from_mask(mask_bounds, std::move(mask));
+    } else {
+      combine_selection_from_region(marquee_selection_region(selection_start_, selection_current_));
+    }
+    // Only a plain Replace commit leaves a shape whose edges can be dragged
+    // later; a combined result is no longer a rectangle or ellipse.
+    if (selection_operation_ == SelectionMode::Replace && !selection_.isEmpty()) {
+      marquee_shape_ = current_marquee_shape(marquee_selection_rect(selection_start_, selection_current_));
+    }
+    record_selection_history(marquee_label, selection_snapshot_before_edit());
+    clear_selection_before_edit();
+    marquee_from_center_ = false;
+    emit_info_for_widget_position(event->pos());
+    update();
+    return;
+  }
+
+  if (quick_selecting_) {
+    extend_quick_select_stroke(document_position(event->pos()));
+    finish_quick_select_stroke();
+    emit_info_for_widget_position(event->pos());
+    update();
+    return;
+  }
+
+  if (object_selecting_) {
+    extend_object_select(document_position(event->pos()));
+    finish_object_select(event->pos());
+    emit_info_for_widget_position(event->pos());
+    update();
+    return;
+  }
+
+  if (spot_healing_stroke_active_) {
+    const auto document_point = document_position(event->pos());
+    const auto constrained_point = axis_constrained_stroke_point(document_point, event->modifiers());
+    extend_spot_heal_stroke(constrained_point);
+    last_stroke_end_document_ = QPointF(constrained_point);
+    last_stroke_end_alt_swapped_ = false;
+    reset_axis_constrained_stroke();
+    finish_spot_heal_stroke();
+    emit_info_for_widget_position(event->pos());
+    update();
+    return;
+  }
+
+  if (patch_tool_dragging_) {
+    release_patch_tool_drag(document_position(event->pos()));
+    emit_info_for_widget_position(event->pos());
+    update();
+    return;
+  }
+
+  if (red_eye_dragging_) {
+    finish_red_eye_gesture(document_position(event->pos()));
+    emit_info_for_widget_position(event->pos());
+    return;
+  }
+
+  if (lassoing_) {
+    lassoing_ = false;
+    // Alt pressed during a Lasso drag and still held at the release switches to
+    // straight segments: the drag so far stays, and clicks add vertices until Alt
+    // is released (Photoshop's Lasso). Alt held from the press is Subtract only.
+    if (tool_ == CanvasTool::Lasso && document_ != nullptr && event->modifiers().testFlag(Qt::AltModifier) &&
+        (!lasso_alt_at_press_ || lasso_alt_released_since_press_)) {
+      const auto point = clamped_document_point(*document_, document_position(event->pos()));
+      if (lasso_points_.isEmpty() || lasso_points_.last() != point) {
+        lasso_points_ << point;
+      }
+      clear_selection_before_edit();
+      start_polygon_lasso(std::exchange(lasso_points_, QPolygon{}), /*from_lasso=*/true);
+      emit_info_for_widget_position(event->pos());
+      update();
+      return;
+    }
+    // A click is a gesture whose WHOLE traced path stayed tiny, not one that
+    // merely released near the press point: a carefully closed loop ends where
+    // it began, and comparing only press vs release turned it into a deselect.
+    const auto path_bounds = lasso_points_.boundingRect();
+    // boundingRect of N identical points is 1x1; the traced span is size - 1.
+    const auto widget_extent =
+        static_cast<double>(std::max(path_bounds.width(), path_bounds.height()) - 1) * zoom_;
+    const bool was_click = widget_extent < static_cast<double>(QApplication::startDragDistance());
+    if (was_click) {
+      // A plain click (no drag) deselects in Replace mode; add/subtract are no-ops.
+      restore_selection_before_edit();
+      if (selection_operation_ == SelectionMode::Replace) {
+        clear_selection();
+      }
+      record_selection_history(tr("Deselect"), selection_snapshot_before_edit());
+      clear_selection_before_edit();
+      lasso_points_.clear();
+      emit_info_for_widget_position(event->pos());
+      update();
+      return;
+    }
+    if (document_ != nullptr) {
+      const auto point = clamped_document_point(*document_, document_position(event->pos()));
+      if (lasso_points_.isEmpty() || lasso_points_.last() != point) {
+        lasso_points_ << point;
+      }
+      if (lasso_points_.size() >= 3) {
+        combine_selection_from_lasso(lasso_points_);
+      } else {
+        restore_selection_before_edit();
+      }
+    }
+    record_selection_history(tool_ == CanvasTool::PatchTool          ? tr("Patch Selection")
+                             : tool_ == CanvasTool::ContentAwareMove ? tr("Content-Aware Move Selection")
+                                                                     : tr("Lasso"),
+                             selection_snapshot_before_edit());
+    clear_selection_before_edit();
+    // Object Selection (GitHub issue 599 follow-up): a New outline becomes the object inside
+    // it, as its own undo step after the outline's; a failure keeps the outline and says so.
+    bool object_pass_failed = false;
+    if (tool_ == CanvasTool::ContentAwareMove && content_aware_move_object_selection_ &&
+        selection_operation_ == SelectionMode::Replace && !selection_.isEmpty() && lasso_points_.size() >= 3) {
+      object_pass_failed = !content_aware_move_object_pass(lasso_points_.boundingRect());
+    }
+    if (tool_ == CanvasTool::PatchTool && !selection_.isEmpty() && status_callback_) {
+      // The patch workflow's second step is not discoverable on its own; say
+      // what to do with the freshly drawn region.
+      status_callback_(patch_tool_mode_ == PatchToolMode::Destination
+                           ? tr("Drag the selection to where the copy should go")
+                           : tr("Drag the selection to a clean area to sample from, or press Enter to "
+                                "remove the object automatically"));
+    } else if (tool_ == CanvasTool::ContentAwareMove && !selection_.isEmpty() && !object_pass_failed &&
+               status_callback_) {
+      status_callback_(content_aware_move_mode_ == ContentAwareMoveMode::Extend
+                           ? tr("Drag the selection to where the copy should go")
+                           : tr("Drag the selection to where the object should go"));
+    }
+    lasso_points_.clear();
+    emit_info_for_widget_position(event->pos());
+    update();
+    return;
+  }
+
+  if (zooming_) {
+    zooming_ = false;
+    // A scrub already applied its zoom on every move; the release is a no-op.
+    const bool scrubbed = zoom_scrubbing_ && zoom_scrub_started_;
+    zoom_scrubbing_ = zoom_scrub_started_ = false;
+    if (document_ != nullptr && !scrubbed) {
+      zoom_current_ = clamped_document_point(*document_, document_position(event->pos()));
+      const bool zoom_out = zoom_tool_zoom_out_active(event->modifiers());
+      const auto widget_drag = (event->pos() - widget_position(zoom_start_)).manhattanLength();
+      const auto zoom_rect = normalized_rect(zoom_start_, zoom_current_);
+      // Alt is always a point zoom-out, never a marquee. A drag counts as a
+      // marquee when it covers real distance and spans more than a pixel in at
+      // least one axis, so a thin strip clamped to an edge still zooms to fit.
+      if (!zoom_out && widget_drag >= kZoomClickSlopPx && (zoom_rect.width() > 1 || zoom_rect.height() > 1)) {
+        zoom_to_document_rect(zoom_rect);
+      } else {
+        zoom_click_step(event->position(), zoom_out);
+      }
+    }
+    emit_info_for_widget_position(event->pos());
+    update();
+    return;
+  }
+
+  if (drawing_shape_) {
+    // The Shift-at-press add (GitHub issue 313) covers only this release's commit.
+    const auto end_shape_add = qScopeGuard([this] { shape_press_adds_to_shape_ = false; });
+    const auto document_point = document_position(event->pos());
+    const auto snapped_point = snapped_document_point(document_point);
+    if (spacebar_repositioning_drag_rect_) {
+      const auto delta = document_point - spacebar_reposition_last_document_position_;
+      shape_start_ += delta;
+      shape_current_ += delta;
+      spacebar_repositioning_drag_rect_ = false;
+    } else {
+      shape_current_ = snapped_point;
+    }
+    shape_square_constrained_ = (event->modifiers() & Qt::ShiftModifier) != 0 &&
+                                (tool_ == CanvasTool::Rectangle || tool_ == CanvasTool::Ellipse ||
+                          tool_ == CanvasTool::CustomShape);
+    shape_from_center_ = (event->modifiers() & Qt::AltModifier) != 0 &&
+                         (tool_ == CanvasTool::Rectangle || tool_ == CanvasTool::Ellipse ||
+                          tool_ == CanvasTool::CustomShape);
+    const auto erase = false;
+    // The vector bounds of a drag's rect: its corners as edge coordinates, so the width is
+    // right - left. A Fixed Ratio or Fixed Size rect is W x H whole pixels (GitHub issue 716:
+    // the Style applies in every mode), so its vector size is that, not one less.
+    const auto shape_vector_bounds = [this](QRect corner_rect) {
+      QRectF bounds(QPointF(corner_rect.topLeft()), QPointF(corner_rect.bottomRight()));
+      if (shape_style_ != MarqueeStyle::Normal &&
+          (tool_ == CanvasTool::Rectangle || tool_ == CanvasTool::Ellipse || tool_ == CanvasTool::CustomShape)) {
+        bounds.setSize(QSizeF(corner_rect.size()));
+      }
+      return bounds;
+    };
+    auto shape_from = shape_start_;
+    auto shape_end = shape_current_;
+    if (tool_ == CanvasTool::Rectangle || tool_ == CanvasTool::Ellipse ||
+        tool_ == CanvasTool::CustomShape) {
+      const auto rect = shape_drag_rect(shape_start_, shape_current_);
+      shape_from = rect.topLeft();
+      shape_end = rect.bottomRight();
+    }
+    // A bare click (no drag) in a vector mode asks the host for dimensions
+    // (Photoshop's Create <Shape> dialog) instead of committing a degenerate
+    // shape. Line has no such dialog in Photoshop, and a Fixed Size click
+    // already places the exact W x H shape, so both keep the drag commit.
+    // Only a release on the press's own document pixel counts as a click
+    // (Seth, September 2026): any real extent, however small on screen, is a
+    // deliberate drag and commits the shape. Both endpoints snap identically
+    // for a click, so the document points are the test, not the event delta.
+    const bool tap_requests_dimensions =
+        shape_create_requested_callback_ && shape_current_ == shape_start_ &&
+        (tool_ == CanvasTool::Polygon || tool_ == CanvasTool::CustomShape ||
+         ((tool_ == CanvasTool::Rectangle || tool_ == CanvasTool::Ellipse) &&
+          shape_style_ != MarqueeStyle::FixedSize));
+    // Polygon and Custom Shape commit canvas-side (they carry their own
+    // geometry options) through the committed-path callback.
+    if ((tool_ == CanvasTool::Polygon || tool_ == CanvasTool::CustomShape) &&
+        vector_tool_mode_ != VectorToolMode::Pixels && !quick_mask_active_ &&
+        (layer_edit_target_ == LayerEditTarget::Content ||
+         (layer_edit_target_ == LayerEditTarget::VectorMask &&
+          vector_mask_target_layer() != nullptr))) {
+      drawing_shape_ = false;
+      clear_brush_stroke_tracking();
+      update();
+      if (tap_requests_dimensions) {
+        shape_create_requested_callback_(tool_, QPointF(shape_start_));
+        return;
+      }
+      if (tool_ == CanvasTool::Polygon) {
+        commit_polygon_drag(QPointF(shape_start_), QPointF(shape_current_));
+      } else {
+        const auto corner_rect = normalized_rect(shape_from, shape_end);
+        commit_custom_shape_drag(shape_vector_bounds(corner_rect));
+      }
+      return;
+    }
+    // Shape/Path mode hands the drag geometry to MainWindow (shape layer or
+    // work path) instead of painting; mask/channel/quick-mask targets keep the
+    // raster behavior so the drag still edits the targeted plane.
+    if ((tool_ == CanvasTool::Line || tool_ == CanvasTool::Rectangle || tool_ == CanvasTool::Ellipse) &&
+        vector_tool_mode_ != VectorToolMode::Pixels && vector_shape_drawn_callback_ &&
+        !quick_mask_active_ &&
+        (layer_edit_target_ == LayerEditTarget::Content ||
+         (layer_edit_target_ == LayerEditTarget::VectorMask &&
+          vector_mask_target_layer() != nullptr))) {
+      drawing_shape_ = false;
+      clear_brush_stroke_tracking();
+      update();
+      if (tap_requests_dimensions) {
+        shape_create_requested_callback_(tool_, QPointF(shape_start_));
+        return;
+      }
+      const auto kind = tool_ == CanvasTool::Line        ? patchy::LiveShapeKind::Line
+                        : tool_ == CanvasTool::Rectangle ? patchy::LiveShapeKind::Rectangle
+                                                         : patchy::LiveShapeKind::Ellipse;
+      const auto corner_rect = normalized_rect(shape_from, shape_end);
+      // Edge semantics: the drag corners are edge coordinates, so the vector
+      // width is right - left (not QRect's inclusive-pixel width).
+      const QRectF bounds = shape_vector_bounds(corner_rect);
+      vector_shape_drawn_callback_(kind, bounds, QPointF(shape_start_), QPointF(shape_current_));
+      return;
+    }
+    // Fill Layer mode hands the drag to MainWindow, which makes or rewrites a
+    // Gradient Fill layer with its own undo entry (GitHub issue 580).
+    if (gradient_drag_makes_fill_layer()) {
+      drawing_shape_ = false;
+      clear_brush_stroke_tracking();
+      update();
+      if (shape_current_ != shape_start_) {
+        // The drag's preview stays up until the composite with the new or redrawn layer is
+        // on screen (GitHub #714 follow-up: on a large image the picture from before the
+        // drag flashed in between), unless the host changes nothing.
+        begin_gradient_fill_drag_hold(shape_start_, shape_current_);
+        gradient_fill_drawn_callback_(shape_start_, shape_current_);
+        settle_gradient_fill_drag_hold();
+      }
+      return;
+    }
+    // A pixel shape that stays editable (GitHub issue 716): the drag only sets its geometry.
+    // A click without a drag makes none, except a Fixed Size click, which places W x H.
+    if (tool_keeps_pixel_shapes_pending()) {
+      drawing_shape_ = false;
+      clear_brush_stroke_tracking();
+      const bool dragged = shape_current_ != shape_start_;
+      if (tool_ == CanvasTool::Polygon) {
+        const QPointF center(shape_start_);
+        const QPointF delta = QPointF(shape_current_) - center;
+        const double radius = std::hypot(delta.x(), delta.y());
+        if (dragged && radius >= 1.0) {
+          begin_pending_pixel_shape(tool_, QRectF(center.x() - radius, center.y() - radius, radius * 2.0, radius * 2.0),
+                                    std::atan2(delta.y(), delta.x()));
+        }
+      } else if (dragged || shape_style_ == MarqueeStyle::FixedSize) {
+        const auto corner_rect = normalized_rect(shape_from, shape_end);
+        if (tool_ == CanvasTool::CustomShape) {
+          const QRectF bounds = shape_vector_bounds(corner_rect);
+          if (custom_shape_path_ != nullptr && !custom_shape_path_->empty() && bounds.width() >= 1.0 &&
+              bounds.height() >= 1.0) {
+            begin_pending_pixel_shape(tool_, bounds, 0.0);
+          }
+        } else {
+          // The whole pixels the drag covers, as edges.
+          begin_pending_pixel_shape(
+              tool_, QRectF(corner_rect.left(), corner_rect.top(), corner_rect.width(), corner_rect.height()), 0.0);
+        }
+      }
+      update();
+      return;
+    }
+    QRect preview_rect = normalized_rect(shape_from, shape_end);
+    if (tool_ == CanvasTool::Polygon) {
+      // The polygon's circle about the press point.
+      const auto delta = shape_current_ - shape_start_;
+      const auto radius = static_cast<int>(std::ceil(std::hypot(delta.x(), delta.y()))) + 1;
+      preview_rect = QRect(shape_start_ - QPoint(radius, radius), QSize(2 * radius, 2 * radius));
+    }
+    if (document_ != nullptr) {
+      // The stroke can reach a whole width outside the outline, and Soft feathers past it.
+      const auto stroke_reach = shape_pixel_style_.line.has_value()
+                                    ? static_cast<int>(std::ceil(shape_pixel_style_.line->width))
+                                    : brush_size_;
+      const auto margin = std::max(4, 2 * std::max(brush_size_, stroke_reach) + 4);
+      preview_rect = preview_rect.adjusted(-margin, -margin, margin, margin)
+                         .intersected(QRect(0, 0, document_->width(), document_->height()));
+    }
+    const auto processing = !editing_smart_filter_mask();
+    if (processing) {
+      begin_processing_operation();
+    }
+    QRect dirty;
+    if (tool_ == CanvasTool::Line) {
+      dirty = draw_line(shape_start_, shape_current_, erase);
+    } else if (tool_ == CanvasTool::Gradient) {
+      // The drag's composite preview, for the final points, stays up until the composite
+      // with the painted layer is on screen (the frame from before would show otherwise).
+      refresh_gradient_drag_view_preview();
+      dirty = draw_gradient(shape_start_, shape_current_);
+      hold_gradient_drag_view_preview();
+    } else if (tool_ == CanvasTool::Rectangle) {
+      dirty = draw_rectangle(shape_from, shape_end, erase);
+    } else if (tool_ == CanvasTool::Ellipse) {
+      dirty = draw_ellipse(shape_from, shape_end, erase);
+    } else if (tool_ == CanvasTool::Polygon) {
+      // Pixels mode, or a mask, channel or Quick Mask target (GitHub issue 716).
+      patchy::VectorPath path;
+      path.subpaths.push_back(polygon_drag_subpath(QPointF(shape_start_), QPointF(shape_current_)));
+      if (path.subpaths.front().anchors.size() >= 3U) {
+        dirty = draw_shape_path_pixels(path, erase);
+      }
+    } else if (tool_ == CanvasTool::CustomShape) {
+      const auto corner_rect = normalized_rect(shape_from, shape_end);
+      const QRectF bounds = shape_vector_bounds(corner_rect);
+      if (custom_shape_path_ != nullptr && !custom_shape_path_->empty() && bounds.width() >= 1.0 &&
+          bounds.height() >= 1.0) {
+        auto path = *custom_shape_path_;
+        transform_vector_path(path, {bounds.width(), 0.0, 0.0, bounds.height(), bounds.x(), bounds.y()});
+        dirty = draw_shape_path_pixels(path, erase);
+      }
+    }
+    if (processing) {
+      tick_processing_operation();
+    }
+    drawing_shape_ = false;
+    clear_brush_stroke_tracking();
+    const auto repaint_rect =
+        !preview_rect.isEmpty() && !dirty.isEmpty() ? preview_rect.united(dirty)
+        : !preview_rect.isEmpty()                  ? preview_rect
+                                                   : dirty;
+    active_edit_target_changed_impl(QRegion(repaint_rect));
+    // The drag size readout is drawn offset from the drag corner, outside the shape's
+    // dirty margin, so the bounded repaint above would leave it on screen after the
+    // commit; repaint the whole viewport once to clear it.
+    update();
+    if (processing) {
+      end_processing_operation();
+    }
+    return;
+  }
+}
+
+void CanvasWidget::mouseDoubleClickEvent(QMouseEvent* event) {
+  if (processing_render_wait_active_) {
+    // Re-entrant input during a processing wait (see mousePressEvent).
+    event->accept();
+    return;
+  }
+  // A double-click opens editors that read the layer: a gradient commit still being baked
+  // (GitHub #714 follow-up) lands first.
+  flush_gradient_fill_pending_commit();
+  const auto document_point = document_position(event->pos());
+  if (edit_locked_) {
+    // Under a filter dialog that lets the selection change, only the double-click
+    // that closes a magnetic or polygonal lasso passes (local-028); a double-click
+    // must never open text or shape editing there.
+    const bool closes_lasso =
+        event->button() == Qt::LeftButton && selection_tool_passes_edit_lock() &&
+        ((tool_ == CanvasTool::MagneticLasso && magnetic_lassoing_) || polygon_lassoing_ ||
+         tool_ == CanvasTool::PolygonLasso);
+    if (!closes_lasso) {
+      if (!selection_tool_passes_edit_lock()) {
+        show_edit_locked_message();
+      }
+      event->accept();
+      return;
+    }
+  }
+  if (gradient_handles_enabled() && double_click_gradient_fill_handle(event)) {
+    event->accept();
+    return;
+  }
+  // Double-clicking an artboard's name label renames it, whatever the tool.
+  if (handle_artboard_label_double_click(event)) {
+    event->accept();
+    return;
+  }
+  if (quick_mask_active_ && event->button() == Qt::LeftButton &&
+      (tool_ == CanvasTool::Move || tool_ == CanvasTool::Marquee ||
+       tool_ == CanvasTool::EllipticalMarquee || tool_ == CanvasTool::Lasso ||
+       tool_ == CanvasTool::PolygonLasso || tool_ == CanvasTool::MagneticLasso || tool_ == CanvasTool::MagicWand ||
+       tool_ == CanvasTool::QuickSelect || tool_ == CanvasTool::ObjectSelect || tool_ == CanvasTool::Clone ||
+       tool_ == CanvasTool::Healing ||
+       tool_ == CanvasTool::Smudge || is_local_adjustment_tool(tool_) || is_type_tool(tool_))) {
+    report_status_error(tr("This tool is unavailable in Quick Mask mode"));
+    event->accept();
+    return;
+  }
+  if (layer_edit_target_ == LayerEditTarget::SmartFilterMask && event->button() == Qt::LeftButton &&
+      (tool_ == CanvasTool::Move || tool_ == CanvasTool::Marquee ||
+       tool_ == CanvasTool::EllipticalMarquee || tool_ == CanvasTool::Lasso ||
+       tool_ == CanvasTool::PolygonLasso || tool_ == CanvasTool::MagneticLasso || tool_ == CanvasTool::MagicWand ||
+       tool_ == CanvasTool::QuickSelect || tool_ == CanvasTool::ObjectSelect || tool_ == CanvasTool::Clone ||
+       tool_ == CanvasTool::Healing ||
+       tool_ == CanvasTool::Smudge || is_local_adjustment_tool(tool_) || is_type_tool(tool_))) {
+    report_status_error(tr("This tool is unavailable while editing a Smart Filter mask"));
+    event->accept();
+    return;
+  }
+  if (tool_ == CanvasTool::MagneticLasso && magnetic_lassoing_ && event->button() == Qt::LeftButton) {
+    // Must run before the text-layer branch below (which is not tool-gated).
+    // Qt already delivered this double-click's press, so the path gained a
+    // harmless final manual anchor before closing. Alt+double-click closes
+    // with a straight segment, plain double-click magnetically (PS).
+    finish_magnetic_lasso(!event->modifiers().testFlag(Qt::AltModifier));
+    event->accept();
+    return;
+  }
+  if ((polygon_lassoing_ || tool_ == CanvasTool::PolygonLasso) && event->button() == Qt::LeftButton) {
+    // The double-click's first press already placed the final vertex (or, on the
+    // start point, already closed). Either way it never reaches the text-layer
+    // branch below.
+    finish_polygon_lasso();
+    event->accept();
+    return;
+  }
+  if (event->button() == Qt::LeftButton) {
+    const bool inside_document = document_contains(document_point);
+    if (inside_document && transforming_layer_ && transform_layer_id_.has_value()) {
+      const auto transform_hit = transform_handle_at(event->pos(), TransformHitZones::HandlesOnly);
+      const auto text_layer_id = *transform_layer_id_;
+      auto* transformed_layer = document_ != nullptr ? document_->find_layer(text_layer_id) : nullptr;
+      if (transformed_layer != nullptr && layer_is_text(*transformed_layer) &&
+          transform_hit != TransformHandle::None) {
+        finish_free_transform();
+        if (auto* layer = document_ != nullptr ? document_->find_layer(text_layer_id) : nullptr; layer != nullptr) {
+          activate_layer(*layer);
+          request_text_at_press(document_point, event->position());
+          event->accept();
+          return;
+        }
+      }
+    }
+    if (transforming_layer_) {
+      // A double-click inside the box (off its handles) applies the transform,
+      // like Enter (GitHub issue 225). Anywhere else it is just a second press
+      // (the base class replays it as one), and it must never reach the text
+      // and shape editor branches below. Warp keeps its own grid drags.
+      const auto session_hit = transform_handle_at(event->pos(), TransformHitZones::HandlesOnly);
+      if (!warping_layer_ && (session_hit == TransformHandle::None || session_hit == TransformHandle::Move) &&
+          transform_session_box_contains(event->pos())) {
+        finish_free_transform();
+        event->accept();
+        return;
+      }
+      QWidget::mouseDoubleClickEvent(event);
+      return;
+    }
+    // Type Mask never opens a text layer: its double-click is just two presses of new mask text.
+    if (auto* layer = inside_document && tool_ != CanvasTool::TypeMask ? topmost_text_layer_at(document_point)
+                                                                        : nullptr;
+        layer != nullptr) {
+      activate_layer(*layer);
+      request_text_at_press(document_point, event->position());
+      event->accept();
+      return;
+    }
+    // Path Select / Direct Select: a double-click on the target shape layer's
+    // geometry (anchor, segment, or a painted pixel) opens its appearance
+    // editor, the way a text layer's double-click opens its editor.
+    if (inside_document && (tool_ == CanvasTool::PathSelect || tool_ == CanvasTool::DirectSelect) &&
+        layer_edit_target_ != LayerEditTarget::VectorMask && !active_document_path_.has_value() &&
+        shape_appearance_requested_callback_) {
+      if (const auto* layer = path_edit_target_layer(); layer != nullptr && layer->vector_shape() != nullptr) {
+        bool hit = path_anchor_at(event->position()).first >= 0;
+        if (!hit) {
+          std::pair<int, int> segment;
+          double segment_t = 0.0;
+          hit = path_segment_at(event->position(), segment, segment_t);
+        }
+        if (!hit) {
+          const auto bounds = layer->bounds();
+          const auto local = document_point - QPoint(bounds.x, bounds.y);
+          const auto& pixels = std::as_const(*layer).pixels();
+          hit = local.x() >= 0 && local.y() >= 0 && local.x() < pixels.width() && local.y() < pixels.height() &&
+                pixels.format().channels >= 4 && pixels.pixel(local.x(), local.y())[3] > 0;
+        }
+        if (hit) {
+          shape_appearance_requested_callback_();
+          event->accept();
+          return;
+        }
+      }
+    }
+  }
+  QWidget::mouseDoubleClickEvent(event);
+}
+
+void CanvasWidget::keyPressEvent(QKeyEvent* event) {
+  if (processing_render_wait_active_) {
+    // Re-entrant input during a processing wait (see mousePressEvent); this
+    // also keeps arrow-key nudges from nesting inside their own commit wait.
+    event->accept();
+    return;
+  }
+  // A modifier or Escape acts on the drag where the pointer really is.
+  flush_pending_drag_move();
+  if (event->key() == Qt::Key_Escape) {
+    clear_gradient_fill_drag_hold();  // only the held picture; the release's edit stays
+  }
+  if (event->key() != layer_nudge_hold_key_) {
+    // Another key ends a held arrow's nudge run: the next nudge is a new undo step.
+    end_layer_nudge_hold();
+  }
+  if (rotating_view_ && event->key() == Qt::Key_Escape && event->modifiers() == Qt::NoModifier) {
+    // Escape during a Rotate View drag puts the drag's angle back.
+    end_rotate_view_drag(true);
+    event->accept();
+    return;
+  }
+  if (move_layer_selection_gesture_ && event->key() == Qt::Key_Escape) {
+    cancel_move_layer_selection();
+    event->accept();
+    return;
+  }
+
+  if (brush_adjust_dragging_ && event->key() == Qt::Key_Escape) {
+    end_brush_adjust_drag(false);
+    event->accept();
+    return;
+  }
+
+  if (spot_healing_stroke_active_ && event->key() == Qt::Key_Escape) {
+    // Discards the accumulated footprint before anything was written: no
+    // pixels change and no history entry exists yet (begin_edit runs at
+    // release).
+    cancel_spot_heal_stroke();
+    reset_axis_constrained_stroke();
+    update();
+    event->accept();
+    return;
+  }
+
+  if (red_eye_dragging_ && event->key() == Qt::Key_Escape) {
+    cancel_red_eye_gesture();  // nothing was written yet: the correction runs on release
+    event->accept();
+    return;
+  }
+
+  if (patch_tool_dragging_ && event->key() == Qt::Key_Escape) {
+    // Same contract as the spot-heal cancel: nothing was written yet.
+    cancel_patch_tool_drag();
+    update();
+    event->accept();
+    return;
+  }
+
+  if (tool_ == CanvasTool::ContentAwareMove && patch_tool_dragging_ && event->modifiers() == Qt::NoModifier &&
+      (event->key() == Qt::Key_Return || event->key() == Qt::Key_Enter)) {
+    // Enter commits a live Content-Aware Move drag like a release.
+    release_patch_tool_drag(document_position(last_mouse_position_));
+    event->accept();
+    return;
+  }
+  if (tool_ == CanvasTool::PatchTool && event->modifiers() == Qt::NoModifier &&
+      (event->key() == Qt::Key_Return || event->key() == Qt::Key_Enter)) {
+    // Enter is the Patch tool's keyboard path: commit a live drag the way the
+    // release does, or, with a selection and no drag, run Remove Object (the
+    // automatic heal of the selection; canvas_widget_spot_healing.cpp).
+    if (patch_tool_dragging_) {
+      release_patch_tool_drag(document_position(last_mouse_position_));
+    } else if (has_selection()) {
+      if (remove_object_requested_callback_) {
+        remove_object_requested_callback_();
+      } else {
+        remove_object_in_selection();
+      }
+    }
+    event->accept();
+    return;
+  }
+
+  if (transient_read_callback_ && event->key() == Qt::Key_Escape) {
+    if (transient_read_dragging_) {
+      transient_read_dragging_ = false;
+      if (QWidget::mouseGrabber() == this) {
+        releaseMouse();
+      }
+      auto callback = transient_read_callback_;
+      callback(CanvasReadGesture{document_position(last_mouse_position_), mapToGlobal(last_mouse_position_),
+                                 event->modifiers(), CanvasReadPhase::Cancel});
+      event->accept();
+      return;
+    }
+    // The canvas and non-modal owner are sibling windows, so an unhandled key
+    // cannot bubble back to the dialog after an on-canvas sample takes focus.
+    auto callback = transient_read_callback_;
+    callback(CanvasReadGesture{document_position(last_mouse_position_), mapToGlobal(last_mouse_position_),
+                               event->modifiers(), CanvasReadPhase::Dismiss});
+    event->accept();
+    return;
+  }
+
+  if (edit_locked_) {
+    if (event->key() == Qt::Key_Space && !event->isAutoRepeat()) {
+      spacebar_panning_ = true;
+      apply_hand_cursor(event->modifiers());
+      event->accept();
+      return;
+    }
+    // Under a filter dialog that lets the selection change (local-028), a selection
+    // tool keeps its modifier keys, the arrow nudges of the selection outline, and
+    // the keys of a live magnetic or polygonal lasso; every other key stays locked
+    // (digits would set layer opacity, Escape deselect layers).
+    const auto key = event->key();
+    const auto key_modifiers = event->modifiers() & ~Qt::KeypadModifier;
+    const bool lasso_key = (magnetic_lassoing_ || polygon_lassoing_) &&
+                           (key == Qt::Key_Escape || key == Qt::Key_Backspace || key == Qt::Key_Delete ||
+                            key == Qt::Key_Return || key == Qt::Key_Enter);
+    const bool modifier_key =
+        key == Qt::Key_Shift || key == Qt::Key_Alt || key == Qt::Key_Control || key == Qt::Key_Meta;
+    const bool nudge_key = (key == Qt::Key_Left || key == Qt::Key_Right || key == Qt::Key_Up || key == Qt::Key_Down) &&
+                           (key_modifiers == Qt::NoModifier || key_modifiers == Qt::ShiftModifier);
+    if (!selection_tool_passes_edit_lock() || !(lasso_key || modifier_key || nudge_key)) {
+      show_edit_locked_message();
+      event->accept();
+      return;
+    }
+  }
+
+  // Gradient handles under another tool (GitHub issue 694): the stop a press selected owns
+  // Delete and Backspace, and Esc cancels a handle drag, ahead of the path tools' own keys
+  // (which would delete the selected anchor points instead).
+  if (tool_ != CanvasTool::Gradient && handle_gradient_handle_key(event)) {
+    event->accept();
+    return;
+  }
+
+  // An active pen-path session owns Escape/Backspace/Delete/Enter the same way
+  // the magnetic lasso does (ShortcutOverride accepted in event()).
+  if (handle_pen_key(event)) {
+    event->accept();
+    return;
+  }
+
+  // Path-edit selections own Delete/Backspace (delete anchors), Escape
+  // (deselect), and the arrow keys (nudge).
+  if (handle_path_edit_key(event)) {
+    event->accept();
+    return;
+  }
+
+  // An active magnetic-lasso trace owns Escape/Backspace/Delete/Enter. Backspace and
+  // Delete both pop the last anchor (Photoshop behavior); they reach this handler even
+  // though layer.clear binds them app-level because CanvasWidget::event() accepts the
+  // ShortcutOverride for these keys while a trace is live.
+  if (magnetic_lassoing_) {
+    if (event->key() == Qt::Key_Escape) {
+      cancel_magnetic_lasso();
+      event->accept();
+      return;
+    }
+    if (event->key() == Qt::Key_Backspace || event->key() == Qt::Key_Delete) {
+      pop_magnetic_anchor();
+      event->accept();
+      return;
+    }
+    if (event->key() == Qt::Key_Return || event->key() == Qt::Key_Enter) {
+      // Alt+Enter closes with a straight segment, plain Enter magnetically (PS).
+      finish_magnetic_lasso(!event->modifiers().testFlag(Qt::AltModifier));
+      event->accept();
+      return;
+    }
+  }
+
+  // A polygonal lasso owns the same keys (ShortcutOverride accepted in event()),
+  // and Shift re-aims the rubber band with the pointer still.
+  if (polygon_lassoing_) {
+    if (event->key() == Qt::Key_Escape) {
+      cancel_polygon_lasso();
+      event->accept();
+      return;
+    }
+    if (event->key() == Qt::Key_Backspace || event->key() == Qt::Key_Delete) {
+      pop_polygon_lasso_vertex();
+      event->accept();
+      return;
+    }
+    if (event->key() == Qt::Key_Return || event->key() == Qt::Key_Enter) {
+      finish_polygon_lasso();
+      event->accept();
+      return;
+    }
+    if (event->key() == Qt::Key_Shift && !event->isAutoRepeat() && !polygon_lasso_button_down_) {
+      // The event reports the modifier state before this key, so fold it in.
+      update_polygon_lasso_rubber_band(document_position(last_mouse_position_),
+                                       event->modifiers() | Qt::ShiftModifier);
+      event->accept();
+      return;
+    }
+  }
+
+  if (dragging_guide_ && event->key() == Qt::Key_Escape) {
+    cancel_guide_drag();
+    event->accept();
+    return;
+  }
+
+  if (!guides_locked_ && has_selected_guides() &&
+      (event->key() == Qt::Key_Delete || event->key() == Qt::Key_Backspace)) {
+    clear_selected_guides();
+    event->accept();
+    return;
+  }
+
+  if (!event->isAutoRepeat() && event->key() == Qt::Key_A &&
+      event->modifiers() == Qt::ControlModifier) {
+    if (quick_mask_active_) {
+      report_status_error(tr("Select All is unavailable in Quick Mask mode"));
+    } else {
+      select_all();
+    }
+    event->accept();
+    return;
+  }
+
+  // Shift/Alt toggled mid-drag arrives as a key event, not a mouse move; update
+  // the square and from-center constraints here so a stationary cursor still
+  // responds (GitHub issue 78). The event reports the modifier state before
+  // this key, so fold the pressed key in.
+  // The from-center key is the subtract key: Alt, or Ctrl in the GIMP-style tool modifiers.
+  if (selecting_ && !spacebar_repositioning_drag_rect_ &&
+      (event->key() == Qt::Key_Shift ||
+       event->key() == tool_modifier_key(ToolModifierRole::SelectionSubtract, tool_)) &&
+      !event->isAutoRepeat()) {
+    const auto bit = event->key() == Qt::Key_Shift ? Qt::ShiftModifier
+                                                   : tool_modifier(ToolModifierRole::SelectionSubtract, tool_);
+    update_selection_square_constraint(event->modifiers() | bit);
+    update_marquee_from_center(event->modifiers() | bit);
+    refresh_active_marquee_selection();
+    event->accept();
+    return;
+  }
+  // Same for the marquee resize handles: Shift on a corner holds the aspect.
+  if (marquee_resize_handle_ != TransformHandle::None && event->key() == Qt::Key_Shift &&
+      !event->isAutoRepeat()) {
+    update_marquee_resize_drag(document_position(last_mouse_position_), event->modifiers() | Qt::ShiftModifier);
+    update();
+    event->accept();
+    return;
+  }
+
+  // Shift/Alt toggled mid-crop-drag-out arrives as a key event, not a mouse
+  // move; update the square and from-center constraints so a stationary
+  // cursor still responds (GitHub issue 78).
+  if (crop_dragging_out_ && !spacebar_repositioning_drag_rect_ &&
+      (event->key() == Qt::Key_Shift || event->key() == Qt::Key_Alt) && !event->isAutoRepeat()) {
+    if (event->key() == Qt::Key_Shift) {
+      crop_square_constrained_ = true;
+    } else {
+      crop_from_center_ = true;
+    }
+    update();
+    event->accept();
+    return;
+  }
+
+  // The same for a shape tool's resize-handle drag (GitHub issue 690): Shift holds the
+  // proportions, Alt resizes about the center. The event reports the modifier state before
+  // this key, so fold the pressed key in.
+  if (shape_resize_drag_.has_value() && (event->key() == Qt::Key_Shift || event->key() == Qt::Key_Alt) &&
+      !event->isAutoRepeat()) {
+    const auto bit = event->key() == Qt::Key_Shift ? Qt::ShiftModifier : Qt::AltModifier;
+    update_shape_resize_drag(shape_resize_drag_->pointer_widget, event->modifiers() | bit);
+    event->accept();
+    return;
+  }
+
+  // Shift/Alt toggled mid-shape-drag arrives as a key event, not a mouse move; update
+  // the square/from-center constraints so a stationary cursor still snaps.
+  if (drawing_shape_ && !spacebar_repositioning_drag_rect_ &&
+      (event->key() == Qt::Key_Shift || event->key() == Qt::Key_Alt) && !event->isAutoRepeat() &&
+      (tool_ == CanvasTool::Rectangle || tool_ == CanvasTool::Ellipse || tool_ == CanvasTool::CustomShape)) {
+    if (event->key() == Qt::Key_Shift) {
+      shape_square_constrained_ = true;
+    } else {
+      shape_from_center_ = true;
+    }
+    update();
+    event->accept();
+    return;
+  }
+
+  // Shift/Alt/Ctrl pressed mid-transform-drag: replay the drag at the last pointer
+  // position so a stationary cursor re-snaps (aspect lock, 15-degree rotate
+  // steps, Alt scale-about-reference, Ctrl's distort). The event reports the modifier state
+  // before this key, so fold the pressed key in.
+  if (dragging_transform_ &&
+      (event->key() == Qt::Key_Shift || event->key() == Qt::Key_Alt || event->key() == Qt::Key_Control) &&
+      !event->isAutoRepeat()) {
+    const auto bit = event->key() == Qt::Key_Shift ? Qt::ShiftModifier
+                     : event->key() == Qt::Key_Alt ? Qt::AltModifier
+                                                   : Qt::ControlModifier;
+    update_free_transform_preview(document_position_f(QPointF(last_mouse_position_)), event->modifiers() | bit);
+    event->accept();
+    return;
+  }
+
+  // Shift pressed mid-anchor-drag arrives as a key event, not a mouse move;
+  // replay the drag at the last raw pointer position so a stationary cursor
+  // still snaps onto the constrained axis.
+  if (path_drag_mode_ == PathEditDrag::Anchors && event->key() == Qt::Key_Shift &&
+      !event->isAutoRepeat()) {
+    update_path_edit_drag(path_drag_raw_document_, event->modifiers() | Qt::ShiftModifier);
+    event->accept();
+    return;
+  }
+
+  // Shift pressed mid-path-marquee squares the rect without waiting for a
+  // mouse move (mirrors the selection marquee's constraint).
+  if (path_drag_mode_ == PathEditDrag::Marquee && !spacebar_repositioning_drag_rect_ &&
+      event->key() == Qt::Key_Shift && !event->isAutoRepeat()) {
+    path_marquee_current_ = constrain_marquee_current(path_marquee_raw_current_,
+                                                      event->modifiers() | Qt::ShiftModifier);
+    update();
+    event->accept();
+    return;
+  }
+
+  if (warping_layer_) {
+    if (event->key() == Qt::Key_Escape) {
+      cancel_warp_transform();
+      event->accept();
+      return;
+    }
+    if (event->key() == Qt::Key_Return || event->key() == Qt::Key_Enter) {
+      commit_warp_transform();
+      event->accept();
+      return;
+    }
+  }
+
+  // macOS physical arrow keys can carry KeypadModifier even outside the
+  // numeric keypad (remote input may omit it). It is not a command modifier.
+  const auto arrow_modifiers = event->modifiers() & ~Qt::KeypadModifier;
+
+  if (transforming_layer_) {
+    if (event->key() == Qt::Key_Escape) {
+      cancel_free_transform();
+      event->accept();
+      return;
+    }
+    if (event->key() == Qt::Key_Return || event->key() == Qt::Key_Enter) {
+      commit_free_transform();
+      event->accept();
+      return;
+    }
+    // Arrow keys nudge the pending transform (box + preview together), the same way a
+    // Move-handle drag does — never the destructive layer nudge below. Shift = 10px.
+    // Auto-repeat is allowed (holding an arrow scrolls the box); the move is pending
+    // inside the transform, so there is no per-keystroke undo to spam.
+    if (arrow_modifiers == Qt::NoModifier || arrow_modifiers == Qt::ShiftModifier) {
+      const auto step = arrow_modifiers == Qt::ShiftModifier ? 10 : 1;
+      QPoint delta;
+      switch (event->key()) {
+        case Qt::Key_Left:
+          delta = QPoint(-step, 0);
+          break;
+        case Qt::Key_Right:
+          delta = QPoint(step, 0);
+          break;
+        case Qt::Key_Up:
+          delta = QPoint(0, -step);
+          break;
+        case Qt::Key_Down:
+          delta = QPoint(0, step);
+          break;
+        default:
+          break;
+      }
+      if (!delta.isNull()) {
+        if (prepare_free_transform_source()) {
+          const auto step_before = current_transform_session_step();
+          transform_current_rect_.translate(delta.x(), delta.y());
+          record_transform_session_step(step_before, /*nudge=*/true);
+          refresh_transform_composited_preview_cache();
+          update();
+          notify_transform_controls_changed();
+        }
+        event->accept();
+        return;
+      }
+    }
+  }
+
+  if (tool_ == CanvasTool::Artboard) {
+    if (event->key() == Qt::Key_Escape && artboard_drag_active()) {
+      cancel_artboard_drag();
+      event->accept();
+      return;
+    }
+    // Arrow keys nudge the selected artboard and its content (Shift = 10 px); MainWindow
+    // folds a run of nudges into one undo step like the Move tool's.
+    if (arrow_modifiers == Qt::NoModifier || arrow_modifiers == Qt::ShiftModifier) {
+      const auto step = arrow_modifiers == Qt::ShiftModifier ? 10 : 1;
+      QPoint delta;
+      switch (event->key()) {
+        case Qt::Key_Left:
+          delta = QPoint(-step, 0);
+          break;
+        case Qt::Key_Right:
+          delta = QPoint(step, 0);
+          break;
+        case Qt::Key_Up:
+          delta = QPoint(0, -step);
+          break;
+        case Qt::Key_Down:
+          delta = QPoint(0, step);
+          break;
+        default:
+          break;
+      }
+      if (!delta.isNull() && nudge_selected_artboard(delta)) {
+        event->accept();
+        return;
+      }
+    }
+  }
+
+  if (handle_gradient_handle_key(event)) {
+    event->accept();
+    return;
+  }
+
+  if (shape_handle_drag_active() && event->key() == Qt::Key_Escape) {
+    // Esc mid-drag puts the shape back as it was before the press.
+    cancel_shape_resize_drag();
+    event->accept();
+    return;
+  }
+
+  // A pending pixel shape (GitHub issue 716): Enter paints it, Esc drops it.
+  if (pending_pixel_shape_ != nullptr && !drawing_shape_) {
+    if (event->key() == Qt::Key_Escape) {
+      cancel_pending_pixel_shape();
+      event->accept();
+      return;
+    }
+    if (event->key() == Qt::Key_Return || event->key() == Qt::Key_Enter) {
+      commit_pending_pixel_shape();
+      event->accept();
+      return;
+    }
+  }
+
+  if (tool_ == CanvasTool::Ruler && ruler_drag_part_ != RulerPart::None && event->key() == Qt::Key_Escape) {
+    // Esc mid-drag puts the line back as it was before the press.
+    cancel_ruler_drag();
+    event->accept();
+    return;
+  }
+
+  if (tool_ == CanvasTool::PerspectiveCrop && perspective_crop_session_pending()) {
+    if (event->key() == Qt::Key_Escape) {
+      cancel_perspective_crop_session();
+      event->accept();
+      return;
+    }
+    if (event->key() == Qt::Key_Return || event->key() == Qt::Key_Enter) {
+      commit_perspective_crop_session();
+      event->accept();
+      return;
+    }
+  }
+
+  if (tool_ == CanvasTool::Crop && (crop_session_active_ || crop_dragging_out_)) {
+    if (event->key() == Qt::Key_Escape && crop_straightening_) {
+      // Esc mid-line drops the line only; the box and the button stay (GitHub issue 702).
+      cancel_crop_straighten_line();
+      event->accept();
+      return;
+    }
+    if (event->key() == Qt::Key_Escape && crop_straighten_armed_) {
+      // An armed Straighten button with no line yet: Esc turns it off and keeps the box.
+      set_crop_straighten_armed(false);
+      event->accept();
+      return;
+    }
+    if (event->key() == Qt::Key_Escape) {
+      // Esc puts the box back around the canvas (Photoshop); only a tool
+      // switch ends the session.
+      reset_crop_session_to_canvas();
+      event->accept();
+      return;
+    }
+    if (crop_session_active_ &&
+        (event->key() == Qt::Key_Return || event->key() == Qt::Key_Enter)) {
+      commit_crop_session();
+      event->accept();
+      return;
+    }
+    // Arrow keys nudge the pending crop rect (Shift = 10px); the move is
+    // pending inside the session, so auto-repeat spams no undo steps.
+    if (crop_session_active_ &&
+        (arrow_modifiers == Qt::NoModifier || arrow_modifiers == Qt::ShiftModifier)) {
+      const auto step = arrow_modifiers == Qt::ShiftModifier ? 10 : 1;
+      QPoint delta;
+      switch (event->key()) {
+        case Qt::Key_Left:
+          delta = QPoint(-step, 0);
+          break;
+        case Qt::Key_Right:
+          delta = QPoint(step, 0);
+          break;
+        case Qt::Key_Up:
+          delta = QPoint(0, -step);
+          break;
+        case Qt::Key_Down:
+          delta = QPoint(0, step);
+          break;
+        default:
+          break;
+      }
+      if (!delta.isNull()) {
+        nudge_crop_rect(delta);
+        event->accept();
+        return;
+      }
+    }
+  }
+
+  if (dragging_text_rect_ && event->key() == Qt::Key_Escape) {
+    dragging_text_rect_ = false;
+    text_rect_current_ = text_rect_start_;
+    emit_info_for_widget_position(last_mouse_position_);
+    update();
+    event->accept();
+    return;
+  }
+
+  // Ctrl+Enter loads the targeted Paths-panel path as a selection (Photoshop).
+  // Deliberately after the transform/warp/text-rect handlers so session
+  // commit/cancel keys keep priority.
+  if ((event->key() == Qt::Key_Return || event->key() == Qt::Key_Enter) &&
+      event->modifiers() == Qt::ControlModifier && panel_path_targeted_ &&
+      path_load_selection_callback_) {
+    path_load_selection_callback_();
+    event->accept();
+    return;
+  }
+
+  if (event->key() == Qt::Key_Space && !event->isAutoRepeat()) {
+    if (selecting_) {
+      spacebar_repositioning_drag_rect_ = true;
+      spacebar_reposition_last_document_position_ = document_position(last_mouse_position_);
+      spacebar_reposition_origin_document_position_ = spacebar_reposition_last_document_position_;
+      spacebar_reposition_start_selection_start_ = selection_start_;
+      spacebar_reposition_start_selection_current_ = selection_current_;
+      setCursor(Qt::SizeAllCursor);
+    } else if (marquee_resize_handle_ != TransformHandle::None) {
+      // Space during a handle drag slides the whole selection, like the drag-out.
+      spacebar_repositioning_drag_rect_ = true;
+      spacebar_reposition_origin_document_position_ = document_position(last_mouse_position_);
+      spacebar_reposition_last_document_position_ = spacebar_reposition_origin_document_position_;
+      spacebar_reposition_start_marquee_rect_ = marquee_resize_current_rect_;
+      spacebar_reposition_start_marquee_start_rect_ = marquee_resize_start_rect_;
+      setCursor(Qt::SizeAllCursor);
+    } else if (crop_drag_handle_ != TransformHandle::None) {
+      // Same for a crop handle drag: the box slides whole, and the drag-start
+      // rect follows so releasing Space resumes the resize in place.
+      spacebar_repositioning_drag_rect_ = true;
+      spacebar_reposition_origin_document_position_ = document_position(last_mouse_position_);
+      spacebar_reposition_last_document_position_ = spacebar_reposition_origin_document_position_;
+      spacebar_reposition_start_marquee_rect_ = crop_rect_;
+      spacebar_reposition_start_marquee_start_rect_ = crop_drag_start_rect_;
+      setCursor(Qt::SizeAllCursor);
+    } else if (drawing_shape_ || crop_dragging_out_) {
+      spacebar_repositioning_drag_rect_ = true;
+      spacebar_reposition_last_document_position_ = document_position(last_mouse_position_);
+      setCursor(Qt::SizeAllCursor);
+    } else if (path_drag_mode_ == PathEditDrag::Marquee) {
+      // Space during the path-edit marquee repositions the whole rect.
+      spacebar_repositioning_drag_rect_ = true;
+      spacebar_reposition_last_document_position_ = document_position(last_mouse_position_);
+      setCursor(Qt::SizeAllCursor);
+    } else if (shape_handle_drag_active()) {
+      // A shape tool's resize-handle drag keeps its cursor: Space neither pans nor slides it.
+    } else {
+      spacebar_panning_ = true;
+      apply_hand_cursor(event->modifiers());
+      invalidate_brush_overlay();  // the hand replaces the dab preview
+    }
+    event->accept();
+    return;
+  }
+
+  if (handle_opacity_digit_key(event->key(), event->modifiers(), event->isAutoRepeat())) {
+    event->accept();
+    return;
+  }
+
+  // With a brush tip that has a direction (brush_tip_has_direction: a sampled tip, the
+  // Square, a flattened Round), Left and Right turn the tip by a degree (Shift: 15),
+  // counterclockwise and clockwise (GitHub issue 708); Up and Down still nudge the layer, and
+  // a plain round tip, which has nothing to turn, keeps all four arrows for the nudge. The
+  // host owns the angle (a session value for Round and Square, the tip library's for a
+  // sampled tip). Auto-repeat is allowed: a turn records no undo step. A live stroke or drag
+  // keeps its tip, so the key is swallowed until release. A pending warp returned nothing
+  // above and keeps the keys it had.
+  if (brush_tip_has_direction() && brush_rotate_callback_ && !warping_layer_ &&
+      (event->key() == Qt::Key_Left || event->key() == Qt::Key_Right) &&
+      (arrow_modifiers == Qt::NoModifier || arrow_modifiers == Qt::ShiftModifier)) {
+    const auto step = arrow_modifiers == Qt::ShiftModifier ? 15 : 1;
+    if (pointer_gesture_active() || brush_rotate_callback_(event->key() == Qt::Key_Left ? -step : step)) {
+      event->accept();
+      return;
+    }
+  }
+
+  // With a selection tool active and a live selection, arrow keys nudge the
+  // selection outline (Shift = 10px); the Move tool still nudges layer pixels.
+  // Auto-repeat is allowed here so holding an arrow scrolls the selection along;
+  // the nudges coalesce into a single undo step (see nudge_selection), so
+  // auto-repeat does not spam the history.
+  if (layer_edit_target_ != LayerEditTarget::SmartFilterMask &&
+      !selection_.isEmpty() && !moving_selection_ &&
+      (tool_ == CanvasTool::Marquee || tool_ == CanvasTool::EllipticalMarquee ||
+       tool_ == CanvasTool::Lasso || tool_ == CanvasTool::PolygonLasso || tool_ == CanvasTool::MagneticLasso ||
+       tool_ == CanvasTool::MagicWand) &&
+      (arrow_modifiers == Qt::NoModifier || arrow_modifiers == Qt::ShiftModifier)) {
+    const auto step = arrow_modifiers == Qt::ShiftModifier ? 10 : 1;
+    QPoint delta;
+    switch (event->key()) {
+      case Qt::Key_Left:
+        delta = QPoint(-step, 0);
+        break;
+      case Qt::Key_Right:
+        delta = QPoint(step, 0);
+        break;
+      case Qt::Key_Up:
+        delta = QPoint(0, -step);
+        break;
+      case Qt::Key_Down:
+        delta = QPoint(0, step);
+        break;
+      default:
+        break;
+    }
+    if (!delta.isNull()) {
+      nudge_selection(delta);
+      event->accept();
+      return;
+    }
+  }
+
+  // The Move tool with an artboard itself selected nudges the artboard (rect and content).
+  if (tool_ == CanvasTool::Move && selected_root_artboard_id().has_value() &&
+      (arrow_modifiers == Qt::NoModifier || arrow_modifiers == Qt::ShiftModifier)) {
+    const auto step = arrow_modifiers == Qt::ShiftModifier ? 10 : 1;
+    QPoint delta;
+    switch (event->key()) {
+      case Qt::Key_Left:
+        delta = QPoint(-step, 0);
+        break;
+      case Qt::Key_Right:
+        delta = QPoint(step, 0);
+        break;
+      case Qt::Key_Up:
+        delta = QPoint(0, -step);
+        break;
+      case Qt::Key_Down:
+        delta = QPoint(0, step);
+        break;
+      default:
+        break;
+    }
+    if (!delta.isNull() && nudge_selected_artboard(delta)) {
+      event->accept();
+      return;
+    }
+  }
+
+  // Holding an arrow keeps nudging (key auto-repeat, GitHub #659); the press and its
+  // repeats share one run token, so the whole hold is one undo step.
+  if (arrow_modifiers == Qt::NoModifier || arrow_modifiers == Qt::ShiftModifier) {
+    const auto step = arrow_modifiers == Qt::ShiftModifier ? 10 : 1;
+    QPoint delta;
+    switch (event->key()) {
+      case Qt::Key_Left:
+        delta = QPoint(-step, 0);
+        break;
+      case Qt::Key_Right:
+        delta = QPoint(step, 0);
+        break;
+      case Qt::Key_Up:
+        delta = QPoint(0, -step);
+        break;
+      case Qt::Key_Down:
+        delta = QPoint(0, step);
+        break;
+      default:
+        break;
+    }
+    // A nudge under a live stroke or drag would move the layer out from under the
+    // gesture's snapshot (the rest of a brush stroke reads originals a pixel off; a Move
+    // drag commits pixels and metadata by different deltas). Swallow it until release.
+    const bool gesture_active = move_layer_selection_gesture_.has_value() || painting_ || moving_layer_ ||
+                                move_drag_pending_ || drawing_shape_ ||
+                                dragging_transform_ || selecting_ || lassoing_ || magnetic_lassoing_ ||
+                                polygon_lassoing_ || moving_selection_ || quick_selecting_ || object_selecting_ ||
+                                spot_healing_stroke_active_ || patch_tool_dragging_;
+    const auto movable_ids = gesture_active ? std::vector<LayerId>{} : movable_layer_ids();
+    if (!delta.isNull() && !movable_ids.empty()) {
+      if (!event->isAutoRepeat() || layer_nudge_hold_key_ != event->key() || layer_nudge_hold_token_ == 0) {
+        static std::uint64_t next_layer_nudge_hold_token = 0;
+        layer_nudge_hold_key_ = event->key();
+        layer_nudge_hold_token_ = ++next_layer_nudge_hold_token;
+      }
+      begin_processing_operation();
+      tick_processing_operation();
+      const auto dirty = move_active_layer_by(delta, layer_nudge_hold_token_);
+      if (!dirty.isEmpty()) {
+        document_changed_effect_bounds(dirty);
+      }
+      end_processing_operation();
+      // The pointer has not moved, but the layer beneath it has. Refresh the
+      // cached hover bounds and repaint both outlines, including the pasteboard.
+      if (underMouse()) {
+        update_move_hover_outline(last_mouse_position_, event->modifiers());
+      }
+      event->accept();
+      return;
+    } else if (!delta.isNull() && active_layer_locks_position()) {
+      show_layer_position_locked_message();
+      event->accept();
+      return;
+    }
+  }
+  // A turned view takes an unused Escape first, with any tool: the quick way back upright
+  // (docs/view-navigation-rotation.md). Every cancelable session above returned already.
+  if (event->key() == Qt::Key_Escape && event->modifiers() == Qt::NoModifier && !event->isAutoRepeat() &&
+      view_rotation_degrees_ != 0.0 && !pointer_gesture_active() && !transforming_layer_ && !warping_layer_) {
+    set_view_rotation(0.0);
+    event->accept();
+    return;
+  }
+  // A full-screen screen mode takes the unused Escape before layer deselection
+  // (GitHub issue 212): it is the way back without menus, so it must not depend
+  // on the layer selection being empty.
+  if (event->key() == Qt::Key_Escape && event->modifiers() == Qt::NoModifier && !event->isAutoRepeat() &&
+      !pointer_gesture_active() && !transforming_layer_ && !warping_layer_ && unused_escape_callback_ &&
+      unused_escape_callback_()) {
+    event->accept();
+    return;
+  }
+  // Lowest-priority Escape: every cancelable session above (gestures, pen
+  // and path editing, magnetic lasso, guides, warp, free transform, crop, text
+  // rect) returned already, so a plain Escape that reaches here has nothing
+  // to cancel and deselects the layers instead (Photoshop-style two-stage
+  // Escape for path anchors: the first press clears anchors, the second
+  // deselects). Live drags without their own Escape branch (marquee, lasso,
+  // move, shape, quick select) keep the selection intact.
+  if (event->key() == Qt::Key_Escape && event->modifiers() == Qt::NoModifier && !event->isAutoRepeat() &&
+      document_ != nullptr && !pointer_gesture_active() && !transforming_layer_ && !warping_layer_ &&
+      (!selected_layer_ids_.empty() || document_->active_layer_id().has_value())) {
+    request_layer_deselection();
+    event->accept();
+    return;
+  }
+  QWidget::keyPressEvent(event);
+}
+
+void CanvasWidget::keyReleaseEvent(QKeyEvent* event) {
+  if (!processing_render_wait_active_) {
+    flush_pending_drag_move();
+  }
+  if (!event->isAutoRepeat() && event->key() == layer_nudge_hold_key_) {
+    end_layer_nudge_hold();
+  }
+  // Space released mid-path-marquee goes back to resizing WITHOUT set_tool:
+  // that would drop the Pen's Ctrl latch and strand the drag.
+  if (event->key() == Qt::Key_Space && !event->isAutoRepeat() &&
+      path_drag_mode_ == PathEditDrag::Marquee && spacebar_repositioning_drag_rect_) {
+    spacebar_repositioning_drag_rect_ = false;
+    event->accept();
+    return;
+  }
+  if (event->key() == Qt::Key_Space && !event->isAutoRepeat()) {
+    spacebar_repositioning_drag_rect_ = false;
+    spacebar_panning_ = false;
+    set_tool(tool_);
+    event->accept();
+    return;
+  }
+  if (lassoing_ && event->key() == Qt::Key_Alt && !event->isAutoRepeat()) {
+    lasso_alt_released_since_press_ = true;
+  }
+  if (polygon_lassoing_ && !event->isAutoRepeat()) {
+    if (event->key() == Qt::Key_Alt && polygon_lasso_from_lasso_ && !polygon_lasso_button_down_) {
+      // The Lasso's Alt switch closes when Alt comes up.
+      finish_polygon_lasso();
+      event->accept();
+      return;
+    }
+    if (event->key() == Qt::Key_Shift && !polygon_lasso_button_down_) {
+      update_polygon_lasso_rubber_band(document_position(last_mouse_position_),
+                                       event->modifiers() & ~Qt::ShiftModifier);
+      event->accept();
+      return;
+    }
+  }
+  if (selecting_ && !spacebar_repositioning_drag_rect_ &&
+      (event->key() == Qt::Key_Shift ||
+       event->key() == tool_modifier_key(ToolModifierRole::SelectionSubtract, tool_)) &&
+      !event->isAutoRepeat()) {
+    const auto bit = event->key() == Qt::Key_Shift ? Qt::ShiftModifier
+                                                   : tool_modifier(ToolModifierRole::SelectionSubtract, tool_);
+    update_selection_square_constraint(event->modifiers() & ~bit);
+    update_marquee_from_center(event->modifiers() & ~bit);
+    refresh_active_marquee_selection();
+    event->accept();
+    return;
+  }
+  if (marquee_resize_handle_ != TransformHandle::None && event->key() == Qt::Key_Shift &&
+      !event->isAutoRepeat()) {
+    update_marquee_resize_drag(document_position(last_mouse_position_), event->modifiers() & ~Qt::ShiftModifier);
+    update();
+    event->accept();
+    return;
+  }
+  if (crop_dragging_out_ && !spacebar_repositioning_drag_rect_ &&
+      (event->key() == Qt::Key_Shift || event->key() == Qt::Key_Alt) && !event->isAutoRepeat()) {
+    if (event->key() == Qt::Key_Shift) {
+      crop_square_constrained_ = false;
+    } else {
+      crop_from_center_ = false;
+    }
+    update();
+    event->accept();
+    return;
+  }
+  if (shape_resize_drag_.has_value() && (event->key() == Qt::Key_Shift || event->key() == Qt::Key_Alt) &&
+      !event->isAutoRepeat()) {
+    const auto bit = event->key() == Qt::Key_Shift ? Qt::ShiftModifier : Qt::AltModifier;
+    update_shape_resize_drag(shape_resize_drag_->pointer_widget, event->modifiers() & ~bit);
+    event->accept();
+    return;
+  }
+  if (drawing_shape_ && !spacebar_repositioning_drag_rect_ &&
+      (event->key() == Qt::Key_Shift || event->key() == Qt::Key_Alt) && !event->isAutoRepeat()) {
+    if (event->key() == Qt::Key_Shift) {
+      shape_square_constrained_ = false;
+    } else {
+      shape_from_center_ = false;
+    }
+    update();
+    event->accept();
+    return;
+  }
+  // Shift/Alt/Ctrl released mid-transform-drag: replay without the released key so
+  // the box snaps back to the unconstrained geometry under a stationary cursor.
+  if (dragging_transform_ &&
+      (event->key() == Qt::Key_Shift || event->key() == Qt::Key_Alt || event->key() == Qt::Key_Control) &&
+      !event->isAutoRepeat()) {
+    const auto bit = event->key() == Qt::Key_Shift ? Qt::ShiftModifier
+                     : event->key() == Qt::Key_Alt ? Qt::AltModifier
+                                                   : Qt::ControlModifier;
+    update_free_transform_preview(document_position_f(QPointF(last_mouse_position_)), event->modifiers() & ~bit);
+    event->accept();
+    return;
+  }
+  // Shift released mid-anchor-drag: snap the selection back to the raw mouse
+  // position without waiting for the next mouse move.
+  if (path_drag_mode_ == PathEditDrag::Anchors && event->key() == Qt::Key_Shift &&
+      !event->isAutoRepeat()) {
+    update_path_edit_drag(path_drag_raw_document_, event->modifiers() & ~Qt::ShiftModifier);
+    event->accept();
+    return;
+  }
+  // Shift released mid-path-marquee: back to the raw free-aspect rect.
+  if (path_drag_mode_ == PathEditDrag::Marquee && !spacebar_repositioning_drag_rect_ &&
+      event->key() == Qt::Key_Shift && !event->isAutoRepeat()) {
+    path_marquee_current_ = constrain_marquee_current(path_marquee_raw_current_,
+                                                      event->modifiers() & ~Qt::ShiftModifier);
+    update();
+    event->accept();
+    return;
+  }
+  QWidget::keyReleaseEvent(event);
+}
+
+bool CanvasWidget::handle_opacity_digit_key(int key, Qt::KeyboardModifiers modifiers, bool auto_repeat) {
+  // Photoshop-style numeric entry: Brush uses Shift+digits for Flow, except
+  // while Airbrush is on, when bare digits set Flow and Shift+digits set
+  // Opacity. Pattern Stamp uses bare digits for Opacity and Shift+digits for
+  // Flow. Other painting tools keep the historical bare-digit Opacity path.
+  if (auto_repeat || key < Qt::Key_0 || key > Qt::Key_9) {
+    return false;
+  }
+  // Tools with no opacity of their own set the selected layers' instead (GitHub issue 527),
+  // never in the middle of a drag or a transform, whose commit owns the next history entry.
+  const bool targets_layer = !tool_supports_opacity_digit_keys(tool_);
+  if (targets_layer &&
+      (!tool_sets_layer_opacity_with_digit_keys(tool_) || !layer_opacity_digit_callback_ ||
+       pointer_gesture_active() || free_transform_active() || warp_transform_active() || path_transform_active())) {
+    return false;
+  }
+  const auto semantic_modifiers = modifiers & ~Qt::KeypadModifier;
+  const auto shift = semantic_modifiers == Qt::ShiftModifier;
+  if ((semantic_modifiers != Qt::NoModifier && !shift) ||
+      (shift && tool_ != CanvasTool::Brush && tool_ != CanvasTool::PatternStamp)) {
+    return false;
+  }
+  const auto targets_flow =
+      (tool_ == CanvasTool::Brush && (brush_build_up_ ? !shift : shift)) ||
+      (tool_ == CanvasTool::PatternStamp && shift);
+  if (opacity_pending_digit_ >= 0 &&
+      (targets_flow != opacity_digit_targets_flow_ || targets_layer != opacity_digit_targets_layer_)) {
+    opacity_pending_digit_ = -1;
+    opacity_digit_timer_.invalidate();
+  }
+  opacity_digit_targets_flow_ = targets_flow;
+  opacity_digit_targets_layer_ = targets_layer;
+  constexpr qint64 kDigitPairWindowMs = 800;
+  const auto digit = key - Qt::Key_0;
+  int value = 0;
+  if (opacity_pending_digit_ >= 0 && opacity_digit_timer_.isValid() &&
+      opacity_digit_timer_.elapsed() < kDigitPairWindowMs) {
+    value = opacity_pending_digit_ * 10 + digit;
+    // "00" is 0% for layers, tools and Flow alike (GitHub issue 562): the options bar runs
+    // 0..100 (issue 253), and a 0% stroke paints nothing.
+    opacity_pending_digit_ = -1;
+    opacity_digit_timer_.invalidate();
+  } else {
+    value = digit == 0 ? 100 : digit * 10;
+    opacity_pending_digit_ = digit;
+    opacity_digit_timer_.start();
+  }
+  value = std::clamp(value, 0, 100);
+  if (targets_layer) {
+    layer_opacity_digit_callback_(value);
+    return true;
+  }
+  if (targets_flow) {
+    set_brush_flow(value);
+    if (status_callback_) {
+      // Bare digits reach Flow only with Airbrush on, which is easy to miss (GitHub issue 562).
+      status_callback_(tool_ == CanvasTool::Brush && brush_build_up_ && !shift
+                           ? tr("Brush flow: %1% (Airbrush is on; Shift+number sets opacity)").arg(brush_flow_)
+                           : tr("Brush flow: %1%").arg(brush_flow_));
+    }
+  } else if (tool_ == CanvasTool::Gradient) {
+    set_gradient_opacity(value);
+    if (status_callback_) {
+      status_callback_(tr("Gradient opacity: %1%").arg(gradient_opacity_));
+    }
+  } else if (tool_ == CanvasTool::Smudge) {
+    set_smudge_strength(value);  // Smudge's digits set its Strength (GitHub issue 675)
+    if (status_callback_) {
+      status_callback_(tr("Smudge strength: %1%").arg(smudge_strength_));
+    }
+  } else {
+    set_brush_opacity(value);
+    if (status_callback_) {
+      status_callback_(tr("Brush opacity: %1%").arg(brush_opacity_));
+    }
+  }
+  notify_brush_settings_changed();
+  if (targets_flow && tool_ == CanvasTool::Brush && brush_build_up_ && !shift && airbrush_flow_digit_callback_) {
+    airbrush_flow_digit_callback_();
+  }
+  return true;
+}
+
+bool CanvasWidget::step_tool_opacity(int delta) {
+  // The tools the opacity digits reach, never the layer fallback: these commands step a tool.
+  if (!tool_supports_opacity_digit_keys(tool_)) {
+    return false;
+  }
+  if (tool_ == CanvasTool::Gradient) {
+    set_gradient_opacity(gradient_opacity_ + delta);
+    if (status_callback_) {
+      status_callback_(tr("Gradient opacity: %1%").arg(gradient_opacity_));
+    }
+  } else if (tool_ == CanvasTool::Smudge) {
+    set_smudge_strength(smudge_strength_ + delta);  // Smudge's opacity is its Strength (issue 675)
+    if (status_callback_) {
+      status_callback_(tr("Smudge strength: %1%").arg(smudge_strength_));
+    }
+  } else {
+    set_brush_opacity(brush_opacity_ + delta);
+    if (status_callback_) {
+      status_callback_(tr("Brush opacity: %1%").arg(brush_opacity_));
+    }
+  }
+  notify_brush_settings_changed();
+  return true;
+}
+
+bool CanvasWidget::defer_coalesced_drag_move(const QMouseEvent& event) {
+  if (replaying_drag_move_ || handling_tablet_event_ || !coalescing_drag_active() ||
+      drag_move_coalescing_mode_ == DragMoveCoalescing::Off) {
+    return false;
+  }
+  // Only window-system moves queue up behind a slow frame; moves a test sends one by
+  // one are applied one by one, as before.
+  if (!event.spontaneous() && drag_move_coalescing_mode_ != DragMoveCoalescing::AllMoves) {
+    return false;
+  }
+  if (!drag_move_pass_active_) {
+    // The first move of this pass is applied now.
+    begin_drag_move_pass();
+    return false;
+  }
+  if (coalescing_retouch_stroke()) {
+    // A stroke keeps every position, in order: the move recorded before this one, then
+    // the samples the platform folded into this event (Windows' pointer history).
+    if (pending_drag_move_.has_value()) {
+      pending_stroke_positions_.push_back(pending_drag_move_->position);
+    }
+    auto folded = coalesced_stroke_positions(event);
+    pending_stroke_positions_.insert(pending_stroke_positions_.end(), folded.begin(), folded.end());
+  }
+  pending_drag_move_ = PendingDragMove{event.position(), event.globalPosition(), event.buttons(), event.modifiers()};
+  ++render_cache_diagnostics_.drag_moves_coalesced;
+  return true;
+}
+
+void CanvasWidget::begin_drag_move_pass() {
+  // Queued behind the input already waiting, so it runs once that has been read.
+  drag_move_pass_active_ = true;
+  QMetaObject::invokeMethod(this, [this] { end_drag_move_pass(); }, Qt::QueuedConnection);
+}
+
+void CanvasWidget::end_drag_move_pass() {
+  drag_move_pass_active_ = false;
+  if (!pending_drag_move_.has_value()) {
+    return;
+  }
+  if (coalescing_drag_active()) {
+    // Moves that queue up behind this apply coalesce into the next pass.
+    begin_drag_move_pass();
+  }
+  flush_pending_drag_move();
+}
+
+void CanvasWidget::flush_pending_drag_move() {
+  if (!pending_drag_move_.has_value()) {
+    return;
+  }
+  const auto pending = *pending_drag_move_;
+  pending_drag_move_.reset();
+  auto stroke_positions = std::exchange(pending_stroke_positions_, {});
+  if (!coalescing_drag_active()) {
+    return;  // the drag ended or was cancelled before the apply ran
+  }
+  QMouseEvent replay(QEvent::MouseMove, pending.position, pending.global_position, Qt::NoButton, pending.buttons,
+                     pending.modifiers);
+  const QScopedValueRollback replaying(replaying_drag_move_, true);
+  if (coalescing_retouch_stroke()) {
+    replay_stroke_positions_ = std::move(stroke_positions);
+  }
+  ++render_cache_diagnostics_.drag_moves_replayed;
+  mouseMoveEvent(&replay);
+  replay_stroke_positions_.reset();
+}
+
+void CanvasWidget::cancel_pointer_gestures() {
+  const bool cancel_move = move_drag_pending_ || moving_layer_;
+  pending_drag_move_.reset();
+  pending_stroke_positions_.clear();
+  context_press_pos_.reset();
+  cancel_move_layer_selection();
+  if (selecting_ || lassoing_ || quick_selecting_ || moving_selection_ ||
+      marquee_resize_handle_ != TransformHandle::None) {
+    restore_selection_before_edit();
+  }
+  selecting_ = lassoing_ = quick_selecting_ = moving_selection_ = false;
+  cancel_object_select();
+  marquee_resize_handle_ = TransformHandle::None;
+  quick_select_seed_mask_ = QImage();
+  quick_select_seed_bounds_ = {};
+  quick_select_stroke_points_.clear();
+  lasso_points_.clear();
+  cancel_spot_heal_stroke();
+  cancel_patch_tool_drag();
+  cancel_red_eye_gesture();
+  cancel_shape_resize_drag();
+  clear_gradient_fill_drag_hold();
+  drawing_shape_ = dragging_text_rect_ = dragging_text_entry_selection_ = false;
+  shape_press_adds_to_shape_ = shape_temp_path_select_ = false;
+  move_drag_pending_ = moving_layer_ = false;
+  paint_ctrl_click_.reset();
+  // After the move state above is cleared, so a resumed text session starts from a quiet canvas.
+  const auto finish_text_move = qScopeGuard([this] { finish_text_layer_move(); });
+  moving_layers_.clear();
+  move_readout_base_rect_.reset();
+  clear_drag_readout();
+  clear_move_snap_guides();
+  move_preview_delta_ = {};
+  move_preview_patches_.clear();
+  move_preview_patches_delta_.reset();
+  moving_layers_use_outline_preview_ = false;
+  move_drag_uses_proxy_preview_ = false;
+  if (cancel_move) {
+    clear_retained_move_caches();
+    reset_move_live_latch();
+  }
+  dragging_transform_ = dragging_warp_handle_ = false;
+  transform_drag_uses_proxy_preview_ = false;
+  transform_drag_uses_clip_group_preview_ = false;
+  path_transform_drag_handle_ = TransformHandle::None;
+  path_drag_mode_ = PathEditDrag::None;
+  finish_path_drag_rasters();  // a cancelled Path Select drag still ends on a fresh bake
+  pen_handle_dragging_ = false;
+  pen_session_drag_anchor_ = -1;
+  crop_dragging_out_ = crop_rotating_ = crop_straightening_ = false;
+  crop_drag_handle_ = TransformHandle::None;
+  if (dragging_guide_) {
+    cancel_guide_drag();
+  }
+  panning_ = zooming_ = hand_zoom_pending_ = false;
+  zoom_scrubbing_ = zoom_scrub_started_ = false;
+  spacebar_repositioning_drag_rect_ = spacebar_panning_ = false;
+  update();
+}
+
+void CanvasWidget::end_layer_nudge_hold() noexcept {
+  layer_nudge_hold_key_ = 0;
+  layer_nudge_hold_token_ = 0;
+}
+
+void CanvasWidget::focusOutEvent(QFocusEvent* event) {
+  end_layer_nudge_hold();
+  // View navigation and window movement can transfer focus during an automated
+  // stroke. Its caller owns the stroke lifetime and restores its tool state;
+  // the manual focus-loss cleanup would discard its spacing/pickup/coverage.
+  if (script_brush_progress_) {
+    QWidget::focusOutEvent(event);
+    return;
+  }
+  if (coalescing_retouch_stroke()) {
+    // The stroke ends below: its recorded positions land first (GitHub #597).
+    flush_pending_drag_move();
+  }
+  const auto was_painting = painting_;
+  const auto was_drawing_smart_filter_mask_shape =
+      drawing_shape_ && layer_edit_target_ == LayerEditTarget::SmartFilterMask;
+  if (transient_read_dragging_) {
+    transient_read_dragging_ = false;
+    if (QWidget::mouseGrabber() == this) {
+      releaseMouse();
+    }
+    auto callback = transient_read_callback_;
+    if (callback) {
+      callback(CanvasReadGesture{document_position(last_mouse_position_), mapToGlobal(last_mouse_position_),
+                                 Qt::NoModifier, CanvasReadPhase::Cancel});
+    }
+  }
+  if (brush_adjust_dragging_) {
+    end_brush_adjust_drag(true);
+  }
+  if (color_picking_) {
+    end_color_pick();
+  }
+  spacebar_repositioning_drag_rect_ = false;
+  spacebar_panning_ = false;
+  hand_zoom_pending_ = false;
+  dragging_text_rect_ = false;
+  // In-flight crop drags end on focus loss; the established session survives
+  // (like the transform box).
+  crop_dragging_out_ = false;
+  crop_rotating_ = false;
+  crop_straightening_ = false;
+  crop_drag_handle_ = TransformHandle::None;
+  if (was_drawing_smart_filter_mask_shape) {
+    // Shape pixels are applied only on release. Losing focus before that point
+    // cancels the visual drag and its untouched pre-edit snapshot.
+    drawing_shape_ = false;
+    cancel_smart_filter_mask_edit();
+  }
+  cancel_pointer_gestures();
+  if (was_painting) {
+    // A click cut short keeps its held first dab, like a released one.
+    const auto held_dab = finish_brush_tip_stroke(effective_tool_for_input() == CanvasTool::Eraser);
+    if (!held_dab.isEmpty()) {
+      active_edit_target_changed_impl(QRegion(held_dab), DocumentChangeReason::BrushStrokePreview);
+    }
+    // A Healing Brush stroke cut short heals what it painted, like a released one.
+    if (const auto healed = finish_healing_brush_stroke(); !healed.isEmpty()) {
+      active_edit_target_changed_impl(QRegion(healed), DocumentChangeReason::BrushStrokePreview);
+    }
+    painting_ = false;
+    set_retouch_source_indicator(std::nullopt);
+    sync_stroke_input_compression();
+    last_stroke_end_document_ = last_document_position_f_;
+    last_stroke_end_alt_swapped_ = stroke_end_is_alt_swapped();
+    refresh_stroke_connect_preview();
+  }
+  if (!was_painting && !drawing_shape_) {
+    clear_brush_stroke_tracking();
+  }
+  clone_source_cache_ = QImage();
+  end_lazy_clone_source();
+  clone_source_deep_ = PixelBuffer{};
+  smudge_state_ = {};
+  mixer_brush_state_ = {};
+  reset_brush_smoothing();
+  reset_axis_constrained_stroke();
+  zooming_ = false;
+  zoom_scrubbing_ = zoom_scrub_started_ = false;
+  // A hover trace cannot survive losing the keyboard: Backspace/Enter/Escape
+  // would land elsewhere while the wire keeps following the pointer.
+  cancel_magnetic_lasso();
+  cancel_polygon_lasso();
+  set_tool(tool_);
+  if (was_painting) {
+    clear_brush_stroke_tracking();
+    if (quick_mask_active_) {
+      finish_quick_mask_edit();
+    } else if (layer_edit_target_ == LayerEditTarget::SmartFilterMask) {
+      finish_smart_filter_mask_edit();
+    } else {
+      notify_document_changed(DocumentChangeReason::BrushStrokeFinished);
+    }
+  }
+  // A stroke cut short by focus loss keeps what it painted; its history entry
+  // shrinks to that footprint like a released one.
+  finish_paint_stroke_history();
+  QWidget::focusOutEvent(event);
+}
+
+void CanvasWidget::timerEvent(QTimerEvent* event) {
+  if (event->timerId() == toning_tail_timer_.timerId()) {
+    toning_tail_timer_.stop();
+    paint_toning_tail();
+    event->accept();
+    return;
+  }
+  if (event->timerId() == airbrush_timer_.timerId()) {
+    if (!painting_ || !brush_build_up_ || effective_tool_for_input() != CanvasTool::Brush) {
+      airbrush_timer_.stop();
+    } else {
+      // Patent boundary (July 2026): classic Airbrush is only a fixed-rate
+      // repetition of one current flat 2D brush stamp. Shape and Transfer
+      // dynamics advance, but stationary ticks suppress Scattering and Count;
+      // they do not model particles, a 3D spray cone or stylus pose,
+      // velocity-dependent flow, bristles, fluid surfaces, wet paint, or
+      // bidirectional paint transfer.
+      const auto started = std::chrono::steady_clock::now();
+      const auto dirty = draw_airbrush_dab(last_document_position_f_);
+      if (!dirty.isEmpty()) {
+        active_edit_target_changed_impl(QRegion(dirty),
+                                        DocumentChangeReason::BrushStrokePreview);
+      }
+      ++render_cache_diagnostics_.airbrush_ticks;
+      render_cache_diagnostics_.airbrush_tick_ms +=
+          std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count();
+    }
+    event->accept();
+    return;
+  }
+  if (event->timerId() == stabilizer_timer_.timerId()) {
+    const auto effective_tool = effective_tool_for_input();
+    if (!painting_ || !stroke_stabilizer_.active() || !tool_uses_stroke_stabilizer(effective_tool)) {
+      stabilizer_timer_.stop();
+    } else if (const auto ticked = stroke_stabilizer_.tick(kStrokeStabilizerTickSeconds);
+               ticked.has_value()) {
+      // Stationary catch-up: the held pointer keeps painting toward the cursor
+      // through the same segment path a mouse move uses. The tick feeds the
+      // core stabilizer a fixed dt; no wall clock is read.
+      const QPointF point(ticked->x, ticked->y);
+      const auto erase = effective_tool == CanvasTool::Eraser;
+      QRect dirty;
+      if (effective_brush_input().size == 1) {
+        const QPoint rounded(static_cast<int>(std::lround(point.x())),
+                             static_cast<int>(std::lround(point.y())));
+        dirty = draw_brush_segment(last_document_position_, rounded, erase);
+        last_document_position_ = rounded;
+        last_document_position_f_ = QPointF(rounded);
+      } else {
+        dirty = advance_smoothed_brush_stroke(point, erase);
+        last_document_position_ = QPoint(static_cast<int>(std::lround(point.x())),
+                                         static_cast<int>(std::lround(point.y())));
+        last_document_position_f_ = point;
+      }
+      invalidate_stroke_leash_overlay();
+      if (!dirty.isEmpty()) {
+        active_edit_target_changed_impl(QRegion(dirty), DocumentChangeReason::BrushStrokePreview);
+      }
+    }
+    event->accept();
+    return;
+  }
+  if (event->timerId() == processing_animation_timer_.timerId()) {
+    processing_animation_frame_ = (processing_animation_frame_ + 1) % 12;
+    ++render_cache_diagnostics_.processing_overlay_frames;
+    if (processing_overlay_visible_ || first_render_spinner_active() ||
+        preview_render_overlay_visible() || background_refresh_overlay_visible()) {
+      update();
+    } else if (preview_renders_in_flight_ == 0 && !async_render_cache_in_flight_ && !move_commit_job_.has_value()) {
+      // Keep ticking while a preview render, background refresh, or deferred
+      // Move commit is in flight but still inside the badge delay; the first
+      // post-delay tick paints the badge.
+      processing_animation_timer_.stop();
+    }
+    event->accept();
+    return;
+  }
+  if (event->timerId() == selection_timer_.timerId()) {
+    selection_dash_offset_ = (selection_dash_offset_ + 1) % 8;
+    if ((!quick_mask_active_ && !selection_.isEmpty() &&
+         selection_edges_drawn()) ||
+        lassoing_ || magnetic_lassoing_ || polygon_lassoing_ || (zooming_ && !zoom_scrubbing_)) {
+      update();
+    }
+    event->accept();
+    return;
+  }
+  QWidget::timerEvent(event);
+}
+
+bool CanvasWidget::can_begin_edit(QString label) {
+  begin_edit_check_only_ = true;
+  const bool allowed = begin_edit(std::move(label));
+  begin_edit_check_only_ = false;
+  return allowed;
+}
+
+bool CanvasWidget::begin_edit(QString label) {
+  // A pending pixel shape goes into the target before anything else does (its own commit
+  // takes it first, so this is a no-op there).
+  commit_pending_pixel_shape();
+  if (quick_mask_active_) {
+    if (!begin_edit_check_only_ && !quick_mask_edit_before_.has_value()) {
+      quick_mask_edit_before_ = capture_selection_snapshot();
+      quick_mask_edit_label_ = std::move(label);
+      quick_mask_edit_dirty_ = QRegion();
+    }
+    return true;
+  }
+  if (layer_edit_target_ == LayerEditTarget::SmartFilterMask) {
+    if (!editing_smart_filter_mask()) {
+      report_status_error(tr("The Smart Filter mask is no longer available"));
+      clear_smart_filter_mask_edit_target();
+      return false;
+    }
+    if (!begin_edit_check_only_ && !smart_filter_mask_edit_before_.has_value()) {
+      smart_filter_mask_edit_before_ = smart_filter_mask_pixels_;
+      smart_filter_mask_edit_label_ = std::move(label);
+      smart_filter_mask_edit_dirty_ = QRegion();
+    }
+    return true;
+  }
+  if (layer_edit_target_ == LayerEditTarget::DocumentChannel) {
+    const auto* channel = active_document_channel_const();
+    if (channel == nullptr) {
+      report_status_error(tr("Select a saved channel to edit"));
+      return false;
+    }
+    if (channel->kind() != DocumentChannelKind::Alpha) {
+      report_status_error(tr("Spot channels are read-only"));
+      return false;
+    }
+    if (before_edit_callback_ && !begin_edit_check_only_) {
+      before_edit_callback_(label);
+    }
+    return true;
+  }
+  if (CanvasWidget::is_component_preview(layer_edit_target_)) {
+    report_status_error(tr("Color component channels are read-only"));
+    return false;
+  }
+  if (layer_edit_target_ == LayerEditTarget::VectorMask) {
+    report_status_error(tr("Vector masks are edited with the pen and path tools"));
+    return false;
+  }
+  select_only_layer_if_none_active();
+  if (document_ != nullptr && !std::as_const(*document_).active_layer_id().has_value()) {
+    report_status_error(select_layer_first_message(tool_name(effective_tool_for_input())));
+    return false;
+  }
+  if (active_layer_locks_image_pixels()) {
+    show_layer_pixels_locked_message();
+    return false;
+  }
+
+  if (layer_edit_target_ == LayerEditTarget::Mask) {
+    // editing_layer_mask() is the non-bumping const check; the mutable
+    // active_layer_mask() accessor would bump revisions on this read-only
+    // precondition (rejected edits must not invalidate caches).
+    if (!editing_layer_mask()) {
+      report_status_error(tr("Select a layer mask to edit"));
+      return false;
+    }
+    if (before_edit_callback_ && !begin_edit_check_only_) {
+      before_edit_callback_(label);
+    }
+    return true;
+  }
+
+  auto* layer = active_pixel_layer();
+  // Format check through const: the non-const pixels() accessor bumps all
+  // three revisions on access, so a REJECTED edit (non-8-bit layer) must not
+  // invalidate the layer's caches. Accepted edits bump when they write.
+  // Every pixel edit started here writes 16/32-bit layers at depth (write_pixel, the
+  // brush stroke compositor, the retouch tools; docs/high-bit-depth.md): only a color
+  // layer is required.
+  if (layer == nullptr || std::as_const(*layer).pixels().format().channels < 3) {
+    report_status_error(tr("Select an editable 8-bit pixel layer first"));
+    return false;
+  }
+  if (layer_is_text(*layer)) {
+    report_status_error(tr("Select a normal pixel layer before painting on text"));
+    return false;
+  }
+  if (layer_is_smart_object(*layer)) {
+    const auto layer_id = layer->id();
+    if (smart_object_paint_prompt_callback_) {
+      // The host may rasterize the layer or open its contents; `layer` may
+      // dangle after this returns. The press is consumed either way: the modal
+      // prompt swallows the release, so starting a stroke here would leave
+      // painting_ armed with the button already up.
+      smart_object_paint_prompt_callback_(layer_id);
+    } else {
+      report_status_error(tr("Smart object contents can't be painted. Rasterize the layer to edit its pixels."));
+    }
+    return false;
+  }
+  if (layer_is_vector_shape(*layer)) {
+    report_status_error(tr("Shape layers can't be painted. Rasterize the layer to edit its pixels."));
+    return false;
+  }
+
+  if (before_edit_callback_ && !begin_edit_check_only_) {
+    before_edit_callback_(label);
+  }
+  return true;
+}
+
+void CanvasWidget::begin_paint_temporary_move(QMouseEvent* event, QPoint document_point) {
+  if (document_ == nullptr) {
+    return;
+  }
+  // Until it drags, the press is a click that selects the layer under the pointer
+  // (the release), so nothing to move is reported only once it drags.
+  paint_ctrl_click_ = PaintCtrlClick{document_point, event->pos()};
+  setCursor(Qt::SizeAllCursor);
+  select_only_layer_if_none_active();
+  const auto layer_ids = movable_layer_ids();
+  if (!layer_ids.empty()) {
+    begin_move_drag(layer_ids, document_point, event->pos());
+  }
+}
+
+void CanvasWidget::report_paint_temporary_move_refused() {
+  const auto& document = std::as_const(*document_);
+  const auto* active =
+      document.active_layer_id().has_value() ? document.find_layer(*document.active_layer_id()) : nullptr;
+  if (active != nullptr && layer_effectively_locks_position(*active)) {
+    report_status_error(tr("Layer position is locked."));
+  } else {
+    report_status_error(tr("Click an editable layer to move"));
+  }
+}
+
+void CanvasWidget::select_paint_layer_at(QPoint document_point) {
+  // The topmost layer with a visible pixel under the pointer, the Move tool's
+  // precise pick; a position lock does not matter (the layer is selected to be
+  // painted, not moved). Empty space keeps the selection.
+  const auto* hit = topmost_visible_move_layer_at(document_point);
+  if (hit == nullptr) {
+    return;
+  }
+  const auto id = hit->id();
+  if (selected_layer_ids_.size() == 1U && selected_layer_ids_.front() == id &&
+      std::as_const(*document_).active_layer_id() == id) {
+    return;
+  }
+  request_layer_selection({id}, id);
+}
+
+bool CanvasWidget::can_begin_pixel_edit(bool report) {
+  if (report) {
+    // A reporting precheck is a real press; the silent one (hover, cursor)
+    // must not change the selection.
+    select_only_layer_if_none_active();
+  }
+  if (document_ == nullptr || !std::as_const(*document_).active_layer_id().has_value()) {
+    if (report && document_ != nullptr) {
+      report_status_error(select_layer_first_message(tool_name(effective_tool_for_input())));
+    }
+    return false;
+  }
+  if (active_layer_locks_image_pixels()) {
+    if (report) {
+      show_layer_pixels_locked_message();
+    }
+    return false;
+  }
+  auto* layer = active_pixel_layer();
+  // Const access only: a rejected precheck must not bump layer revisions
+  // (same rule as begin_edit above).
+  // Spot Healing and Remove Object run at any depth (NarrowedLayerEdit, docs/high-bit-depth.md).
+  if (layer == nullptr || std::as_const(*layer).pixels().format().channels < 3) {
+    if (report) {
+      report_status_error(tr("Select an editable 8-bit pixel layer first"));
+    }
+    return false;
+  }
+  if (layer_is_text(*layer)) {
+    if (report) {
+      report_status_error(tr("Select a normal pixel layer before painting on text"));
+    }
+    return false;
+  }
+  if (layer_is_smart_object(*layer)) {
+    if (report) {
+      const auto layer_id = layer->id();
+      if (smart_object_paint_prompt_callback_) {
+        // Same contract as begin_edit: the host may rasterize the layer, so
+        // `layer` may dangle after this returns and the press is consumed.
+        smart_object_paint_prompt_callback_(layer_id);
+      } else {
+        report_status_error(tr("Smart object contents can't be painted. Rasterize the layer to edit its pixels."));
+      }
+    }
+    return false;
+  }
+  if (layer_is_vector_shape(*layer)) {
+    if (report) {
+      report_status_error(tr("Shape layers can't be painted. Rasterize the layer to edit its pixels."));
+    }
+    return false;
+  }
+  return true;
+}
+
+CanvasTool CanvasWidget::effective_tool_for_input() const noexcept {
+  if (active_pen_input_sample_.has_value() && pen_input_settings_.enabled && pen_input_settings_.use_eraser_tip &&
+      active_pen_input_sample_->pointer_type == PenInputSample::PointerType::Eraser) {
+    switch (tool_) {
+      case CanvasTool::Brush:
+      case CanvasTool::MixerBrush:
+      case CanvasTool::PatternStamp:
+      case CanvasTool::Clone:
+      case CanvasTool::Healing:
+      case CanvasTool::SpotHealing:
+      case CanvasTool::Smudge:
+      case CanvasTool::Dodge:
+      case CanvasTool::Burn:
+      case CanvasTool::Sponge:
+      case CanvasTool::BlurBrush:
+      case CanvasTool::SharpenBrush:
+      case CanvasTool::ColorReplace:
+        return CanvasTool::Eraser;
+      default:
+        break;
+    }
+  }
+  return tool_;
+}
+
+}  // namespace patchy::ui

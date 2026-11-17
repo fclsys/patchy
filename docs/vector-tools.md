@@ -1,0 +1,362 @@
+# Vector tools: pen paths, shape layers, vector masks, Paths panel
+
+References: [scripting](vector-automation.md), [preview](vector-preview.md), [merging](layer-merging.md), [open strokes](open-path-strokes.md), [point editing and commands](vector-commands.md), [fixtures and render differences](vector-fixtures.md).
+
+PS 27.8 COM probes: `local-test-fixtures/vector-probe/`.
+Rules: docs/legal-constraints.md.
+
+Related documents:
+
+- [vector-tools-custom-shapes.md](vector-tools-custom-shapes.md): the custom shape library (builtins, seeding, user entries), the Shapes Manager and the options-bar Shape picker, the bundled game-icons.net pack, and Photoshop .csh import.
+- [vector-tools-appearance.md](vector-tools-appearance.md): Shape Appearance (the stay-open window and the modal dialog; paint, stroke and dash presets, geometry, opacity, Edge), the dialog's worker-thread preview, and fill layers.
+- [vector-psd-encodings.md](vector-psd-encodings.md): the observed PSD encodings of shape and fill layers, vector masks, strokes, live shapes and document paths.
+- [vector-tools-shape-handles.md](vector-tools-shape-handles.md): the shape tools' eight-handle resize box and the two drag points of a live Polygon and Line (GitHub #690).
+- [vector-tools-lines.md](vector-tools-lines.md): the Line tool: a line's stroke alignment, Weight and arrowheads, the arrowhead size limits, and a head longer than its line.
+
+## Shape tools (Line / Rectangle / Ellipse)
+
+Shape | Path | Pixels persists as `tools/vectorToolMode` (default Shape).
+Shape drags preview options-bar fill/stroke at draw time for the Content
+target, with the committed stroke alignment, join and cap (the inside/outside
+band clipped by the fill path, as in `rasterize_vector_stroke`; issue 125);
+mask/channel/quick-mask targets always rasterize. A drag that commits a work
+path or vector-mask subpaths (Path mode, Polygon, Custom Shape) previews the
+committed geometry as a path-accent outline (`shape_drag_preview_path`), never
+Pixels mode's brush-size paint (`ui_path_mode_drag_previews_path_outline_only`). Release creates a
+shape layer from live parameters (rect, rounded rect via Radius, ellipse,
+line with Weight) and the options-bar paints. Stroke alignment is the bar's
+alignment list (`vectorStrokeAlignCombo`, Inside until it is changed, `tools/vectorStrokeAlign`);
+a line gets Center ([why](vector-tools-lines.md#a-lines-stroke)). An open subpath (a two-point Pen line) has no area to clip
+to, so `rasterize_vector_stroke` moves its centered stroke half a width to the
+right of the path's direction for Inside, to the left for Outside, as PS draws
+it (issue 553, measured on a PS file; `offset_open_polyline` first skips steps shorter than
+`0.25 * sqrt(offset)` px (an eighth of a pixel at least, corners kept), since a flattened curve's
+bunched steps point anywhere within the lattice's rounding, and drops moved steps that come out
+reversed on the inner side of a sharp corner; either fold made a miter join throw a spike, `stroke_open_curve_alignment_stays_beside_the_curve`); closed subpaths keep the clip. Dashes
+are spaced along the path itself and each dash is then moved, so dashes past
+a corner keep the centered stroke's phase (issue 558, PS COM renders). Combine (New Layer / Add / Subtract / Intersect / Exclude)
+appends a group with that op to the active shape layer (Shift at the press: Add
+once; Ctrl: [Path Select](vector-commands.md#tool-roles)). Path mode appends
+to the work path; Pixels keeps the raster commit byte-identical.
+
+Fill/Stroke popups (No Fill / Solid / Gradient / Pattern) use app-wide
+`VectorFill` mirrors. Gradient picks resolve FG/BG stops immediately; patterns
+enter the document store at commit (`ensure_vector_fill_patterns`, honoring
+the [Patt-block refusal](vector-psd-encodings.md#shape-and-fill-layer-structure)). Kind and preset ids persist under
+vectorFill*/vectorStrokePaint* keys; gradient/pattern PLACEMENT resets each
+launch. The controls also serve Path Select / Direct Select and next-shape
+defaults; [width 0 = no stroke](options-bar-shape-rows.md#shape-tool-rows) (bar,
+dialog); multi-shape edits: [batch appearance](batch-appearance.md).
+
+A bare click with Rectangle, Ellipse, Polygon, or Custom Shape opens the
+Create <Shape> dialog (shape_create_dialog.cpp, no shape menu): W and H share
+a row, From Center (click = center, else top-left), the title fits.
+Rectangle: one linked Radius (unlinked or unequal radii: four corners).
+Polygon: Sides; Custom Shape: the bar's picker (`populate_custom_shape_combo`);
+both go back to the bar. It commits like a drag (mode routing, Combine,
+vector-mask target, naming); values persist per tool for the session.
+A click releases on the press's document pixel. Line has no dialog, a
+Fixed Size click places its W x H (the Style row shows in every mode, GitHub issue 716), and a
+Pixels-mode click makes no shape ([pending pixel shapes](tools.md#pending-pixel-shapes)).
+A click off the canvas (outside the document, or outside every artboard
+when it has them) opens no dialog: it deselects like Select > Deselect
+(selected path anchors too; one undo step only when a pixel selection
+went away). Drags that start there still draw.
+
+The options-bar W / H spins (`vectorShapeWidthSpin`/`vectorShapeHeightSpin`,
+link button for proportional edits) mirror the active shape layer's bounds:
+Line and the Pen show them in Shape mode (disabled with no shape layer),
+Path Select / Direct Select only with an editable shape layer, not Move. Rectangle, Ellipse,
+Polygon and Custom Shape show the same size in their Style row's pixel pair instead
+([options-bar-shape-rows.md](options-bar-shape-rows.md#the-style-row)); the two spins stay
+behind it as the value and the edit path. A debounced edit
+scales the shape about its top-left through `transform_layer_vector_data`
+(live shapes stay live; one "Shape size" undo per edit). The Properties panel
+repeats the row (`propertiesShapeSizePanel`) for an active editable shape
+layer; both share `handle_vector_shape_size_value_changed`
+(`ui_shape_size_controls_follow_move_and_properties_selection`). The rows are built by
+`MainWindow::build_properties_size_panel`, which also builds the rows every other layer
+kind gets ([free-transform-targets.md](free-transform-targets.md#size-fields-in-the-properties-panel-github-issue-693));
+a lone shape layer shows only the shape rows.
+
+### Handles and drag points on the shape tools (GitHub #690)
+
+With a shape tool active the active shape layer can be edited in place: Rectangle,
+Ellipse and Custom Shape show their box with eight resize handles, a live Polygon
+shows its center and first vertex, a live Line its two ends. A press anywhere else
+still draws a new shape. Details, hide cases and tests:
+[vector-tools-shape-handles.md](vector-tools-shape-handles.md).
+
+### Live components and the Properties panel (GitHub #521)
+
+`MainWindow::path_component_target` decides what the size fields act on: the active
+shape layer (whole, or only the components Path/Direct Select selected), or the selected
+components of the targeted work path, saved path or vector mask (those need a selection).
+The Properties row adds X / Y (`propertiesShapeXSpin`/`YSpin`, the left and top edge);
+an edit scales the components about their old top-left and moves them there, one "Shape
+size" undo step (`apply_path_component_geometry`). The options-bar W / H keep their
+shape-layer-only visibility. `propertiesLiveShapePanel` shows Radius
+(`propertiesShapeRadiusSpin`, all four corners) for a live rectangle and Sides / Star inset
+for a live polygon, when exactly one component is targeted; each change regenerates that
+component (`replace_live_shape_group`), one "Edit shape" step, and reselects it. The
+options-bar Sides and Star inset follow into a selected live polygon, as Radius does for
+rectangles. Work and saved paths keep Path-mode Rectangle, Ellipse and Polygon parameters
+in `DocumentPath::live_shapes` (session-only, never written). Every read goes through
+`resolve_live_shape_group`: an entry counts only while its group still matches what it
+generates up to a translation (a Path Select move), so a point edit ends it without any
+bookkeeping. Tests: `ui_polygon_stays_live_and_edits_in_properties_panel`,
+`ui_path_components_size_place_and_stay_live`.
+
+Picking among shapes (`path_pick_at`): the work path and the saved path targeted last keep
+drawing as plain outlines under the path and shape tools while another path is the target
+(`background_document_paths`). Their anchors and outline outrank every shape layer; their
+inside counts only where no shape and not the target's own fill is. A pick retargets the
+Paths panel row (`set_path_retarget_callback`); a shape pick drops a work-path target even
+when its layer was already active (`ui_path_select_picks_work_path_among_shape_layers`).
+
+Combine Shapes: the Layers panel menu has a Combine Shapes submenu for two or more
+combinable layers, and the canvas path menu lists the four commands under Path/Direct Select
+while they are enabled. With fewer than two layers but two or more selected components of
+the target path (shape layer, work path, saved path or vector mask) they combine those
+(`combine_selected_path_components`): the first in path order keeps its op, the rest take
+the command's, one undo step; no geometry merge
+(`ui_combine_shapes_in_context_menus_and_on_path_components`).
+
+## Pen tool
+
+Pen (P): click adds a corner, drag pulls symmetric handles (Alt breaks the
+pair; Shift, ends: [more](vector-commands.md#pen-extending-and-ending-paths)), clicking the first anchor closes and commits, Enter commits the open
+path (it fills its implied chord, PS's open-subpath rule), Backspace pops
+the last anchor, Escape cancels; tool switches commit, document switches
+cancel. Shape mode turns the committed path into a shape layer (or extends
+the active one per Combine); other modes route to the work path. Overlay:
+canvas_widget_vector_tools.cpp.
+
+Badge cursor, hover classifier, Auto Add/Delete, anchor tools:
+[vector-commands.md](vector-commands.md). Holding Ctrl acts as Direct
+Select: with no session it latches the gesture onto the path-edit handlers
+(one "Edit path" undo entry); mid-session it drags an in-progress anchor
+(Ctrl+click away ends the path); it never inserts, deletes, closes or
+extends. Delete removes a Ctrl-selected anchor.
+
+## Polygon, Custom Shape, and line arrowheads
+
+Polygon drags center-out with Sides and a Star inset percent (0 = plain);
+Custom Shape stamps a library shape (unit box, own proportions) into the drag
+rect; Shift, Style Fixed Ratio 1 : 1 or the W/H link (the Properties panel's twin; the Custom
+Shape bar has the Style row in its place) keeps it square, so the shape
+keeps its proportions; Alt: from center. Both paint pixels in Pixels mode with the bar's fill and stroke
+(GitHub issue 716, [tools.md](tools.md#shapes-in-pixels-mode)). Only the Pen is vector-only: its combo greys
+out Pixels and shows the effective mode (Path) without changing the stored one. Custom Shape writes plain paths. Polygon is a live
+shape (`LiveShapeKind::Polygon`, GitHub #521): sides, star inset and first-vertex angle inside a box
+(a drag's circle, or the Create dialog's W x H), regenerated by `generate_live_shape_subpaths`. The PSD
+writer leaves it out (no vogk, `live_polygon_regenerates_resolves_and_writes_a_plain_path`): PS's polygon
+record is only partly known ([vector-psd-encodings.md](vector-psd-encodings.md#vogk-vector-origination--live-shapes)).
+The reader gives a shape layer whose one outline is exactly a generated polygon or star its parameters
+back (`recognize_live_polygon`, #643; an axis-aligned rectangle never counts), so Patchy's polygons stay
+live through save and recovery (`psd_reopened_polygons_are_recognized_as_live`). Scripts see no live
+entry for it. The Line tool's Weight, arrowheads and their limits, and a line's stroke, are in
+[vector-tools-lines.md](vector-tools-lines.md). The
+custom shape library, the Shapes Manager, the Shape picker, the bundled
+game-icons.net pack and .csh import are in
+[vector-tools-custom-shapes.md](vector-tools-custom-shapes.md).
+
+## Path editing (Path Select / Direct Select)
+
+Path Select (A, black arrow) moves whole shape groups only
+([roles](vector-commands.md#tool-roles)). Direct Select (white arrow, Shift+A)
+works per anchor: click or marquee selects, drag moves
+anchors or knobs (smooth pairs stay colinear; a collapsed handle on its
+corner anchor is not grabbable), Shift adds, arrows
+nudge (1 px, Shift 10 px, coalesced per burst), Delete removes selected
+anchors (subpaths under two anchors disappear;
+[emptied shape layers go](vector-commands-selection.md#deleting-the-last-shape)), Escape deselects. With a
+selection, the options-bar Combine box rewrites the selected shapes' op in
+place. The Pen doubles as the point editor (insert by exact de Casteljau
+split, delete, Alt+click converts). A direct edit drops the touched groups' live-shape
+annotations (PS's keyShapeInvalidated rule) and re-rasterizes, except where a group is
+still exactly what it generates up to a translation: a Path Select or Ctrl+shape-tool move,
+a nudge or an align moves the annotation with it, so the shape stays live
+(`keep_or_drop_live_shapes_after_path_edit`, #643; `ui_shape_appearance_polygon_moved_after_drawing`). The target is
+the active shape layer (a press picks another), else the work path. A layer,
+selection, path or edit-target change cancels a path transform.
+
+## Vector mask UI
+
+Layers with a vector mask get a link chain (`layerVectorMaskLinkButton`) and a
+third row thumbnail (grayscale coverage, density and disabled-cross
+conventions; `refresh_layer_thumbnails` redraws it from the render revision).
+Click targets the mask path for pen/path tools (raster painting refuses) and
+never toggles back (#447: adding a mask already targets it, so a toggle turned
+the first click into "edit the pixels"; the content thumbnail returns). The
+target border is the `layerTargetActive` QSS rule shared with the other
+thumbnails. Ctrl-click loads the coverage as a selection, Alt-click toggles the
+grayscale view, Shift-click disables, double-click opens Mask Properties
+(below). Layer > Vector Mask: Reveal All (empty path = full coverage), Hide All
+(inverted empty path; the first shape drawn into it clears the inversion, so
+drawing reveals, `add_subpaths_to_vector_mask`), Current Path (copies the work path), Delete, Disable,
+Rasterize (bakes coverage, density and any raster mask multiplied in, into
+the layer mask). An empty mask's status message names the Pen and shape tools.
+
+While the vector-mask target is active, everything on the mask path works as
+on a work path, each gesture one undo step with live coverage: shape drags
+(Path or Shape mode) and pen commits append subpaths, Path Select and Direct
+Select (and the Pen's Ctrl latch) move and edit them, Delete removes the
+selection, Ctrl+T runs the path transform, and the Paths panel selects the
+transient "<layer> Vector Mask" row; a click on that row (even already
+selected) targets the mask (tests/ui/vector_mask_editing_tests.cpp). Drags
+patch only the swept area, and expensive effects draft hidden until release
+(["Vector-shape edits"](performance.md#vector-shape-edits-invalidate-their-effect-rect-not-the-canvas)).
+Effects draw from the masked shape (the "Hides Effects" options off), so the
+drop shadow follows the mask (`ui_vector_mask_layer_effects_render_on_canvas`).
+
+Link (`LayerVectorMask::unlinked`, vmsk bit 1): the chain or the thumbnail menu
+toggles it, one undo step. A linked mask follows Move and Free Transform; an
+unlinked one stays (`translate_moved_layer_metadata`,
+`transform_keeping_unlinked_vector_mask` in canvas_widget_transform.cpp). Move
+with an unlinked mask targeted drags only the mask path
+(`handle_move_vector_mask_press` latches the path-edit handlers as Path Select).
+
+Mask Properties (`mask_properties_dialog.cpp`, `edit_layer_mask_properties`):
+a double-click on the vector mask or layer mask thumbnail, or the thumbnail
+menu, opens a non-modal Density (0 to 100%) and Feather (0 to 1000 px) dialog
+for that mask. Edits preview live under the preview-dialog edit lock; OK is
+one undo step, Cancel restores; a field left alone keeps its exact stored
+value.
+
+## Paths panel
+
+Tabs with Channels. Rows: saved paths (filled coverage thumbnails so boolean
+holes read, 1 px outline), the work path (italic, last), and a transient row
+for the active layer's shape or vector-mask path. Selecting a row targets it
+for pen/path tools (outranking the layer/work-path fallback); empty-space
+click deselects. Double-click saves the work path: inline rename, row moves
+to the END (DocumentPath::set_kind drops the stale 1025 source so the writer
+allocates a saved-range id; psd_work_path_saved_as_named_round_trips).
+Ctrl-click (Cmd on macOS) loads a row's path as a selection without changing
+targeting; Ctrl+Enter on the CANVAS does the same for the targeted row.
+
+Saved rows drag-reorder among themselves (frame-breaking drops revert); the
+writer assigns the sorted saved-range id set by document order so reorders
+round-trip with verbatim payloads (psd_saved_paths_reorder_round_trips).
+Writer invariants: new paths allocate ABOVE the highest stored id, ids
+outside 2000..2997 never enter the saved set, path-range entries normalize
+to ascending id order after upserts.
+
+A selected row's outline draws with every tool, except a shape layer's own
+path: path and shape tools only ([vector-commands.md](vector-commands.md)).
+Anchors/handles stay path-tool-only. A drawn layer-owned outline follows its
+layer's Move drag or Free Transform preview
+([interactive-previews.md](interactive-previews.md)). View > Show > Target Path
+(Ctrl+Shift+H, view.target_path, not persisted) hides the overlay without
+touching targeting; a path-transform session always draws its box. View >
+Extras (Ctrl+H, view.selection_edges) hides it while Show Extras Options ticks
+Target path ([view-navigation.md](view-navigation.md#extras-view--extras-ctrlh);
+ui_ctrl_h_hides_path_points_with_selection_edges). The context menu's
+Clipping Path entry makes ONE saved path the document clipping path
+(resource 2999; name underlines). Work-path draws and layer activation
+auto-select/target their rows; activating a layer with its own path drops a
+stale work/saved-path target (vector-commands.md). Dismissal (empty click, or
+Escape with no anchor selected) sticks per layer until the layer changes, the
+row is re-clicked, or a new drag commits; a path tool still draws its
+edit-target fallback.
+
+Footer commands (row commands need a selected row; the panel refreshes on
+selectionChanged AND currentItemChanged;
+ui_paths_panel_actions_follow_row_selection pins it):
+
+- New Path: empty, immediately targeted.
+- Fill Path: persisted dialog; FG/BG color or a PATTERN with
+  Scale/Angle/Offset/Align-with-layer rows (shared PatternTileSampler; Align
+  anchors at the layer's effects reference point) plus opacity; raster-only;
+  palette mode snaps via snap_pixel_to_palette.
+- Stroke Path: replays the flattened path through the BRUSH ENGINE as
+  synthetic input (one "Stroke path" undo); Simulate Pressure sends tablet
+  events with a sine taper; open subpaths get no implied chord.
+- Make Selection: feather (triple box blur), anti-alias, combine ops.
+- Make Work Path from Selection: tolerance (persisted); traces the
+  hard selection, fits via core/path_fit (Douglas-Peucker corners +
+  Schneider cubics); outer loops Add, holes Subtract.
+- Delete Path; Duplicate Path in the row context menu ("<name> copy"). Delete Path acts on
+  every row kind (`delete_selected_path`): a saved path or the work path is removed ("Delete
+  path"); the active layer's own row deletes what it shows (`delete_active_layer_path_row`,
+  keyed by `active_layer_path_row_kind`, which also names the row): a Text Boundary row (area
+  or path text) and a Shape Path row delete that layer ("Delete layer", the active layer only,
+  whatever else is selected), a Vector Mask row deletes the mask as Layer > Vector Mask >
+  Delete does (refused, with the reason, when the file's vector data is protected). An open
+  text session is committed first (`finish_active_text_editor`), so undo of the delete brings
+  the typed text back; if that commit removed the layer or activated another, nothing more is
+  deleted. The layer row still cannot be duplicated. The canvas path menu's Delete Path is the
+  same action.
+- Delete and Backspace in the list are Delete Path on its selected row (GitHub issue 717), one
+  undo step. `PathsPanel::eventFilter` claims the key at the ShortcutOverride, so the
+  application's Clear hotkey never fires as well while the list has the keyboard; a held key
+  deletes once; with no row selected the key passes through. Tests:
+  `ui_paths_panel_delete_key_deletes_the_selected_path_not_the_layer` and
+  `ui_paths_panel_delete_key_on_{text_boundary_row_deletes_the_text_layer,
+  vector_mask_row_deletes_the_mask,shape_path_row_deletes_the_shape_layer}`.
+
+## Geometry operations
+
+Document-geometry ops transform the vector data with the pixels and
+re-rasterize at the new canvas: Image Size scales anchors and stroke width,
+Canvas Size/crop translate (canvas-relative PSD records need this),
+90-degree rotates map edge coordinates, per-layer flips mirror about the
+pixel-bounds center. Free Transform applies its affine delta to the path
+model and re-rasterizes (no resampling); Move translates the model. Stroke
+width never scales and the box hugs the ink, so the path maps onto the box
+inset by the stroke overhang (`shape_free_transform_delta`); the drag
+preview still stretches the stroke. Live-shape annotations survive positive
+axis-aligned scale + translate and drop otherwise (keyShapeInvalidated
+rule). Saved and work paths ride document ops. Warp refuses on shape layers
+and vector masks (convert to a smart object or rasterize first).
+
+## Appearance editing and fill layers
+
+Shape Appearance (the stay-open window and the modal dialog: paint, strokes
+and dash presets, geometry, opacity, Edge, the worker preview) and fill layers
+are in [vector-tools-appearance.md](vector-tools-appearance.md).
+
+## Photoshop file encodings
+
+The observed PSD encodings (shape and fill layer structure, `vmsk`/`vsms`, `SoCo`/`GdFl`/`PtFl`, `vstk`, `vogk`, stroke rasterization, vector masks, document path resources) are in [vector-psd-encodings.md](vector-psd-encodings.md).
+
+## Patents and trademarks (assessed July 2026)
+
+Claim-level record: docs/patent-research.md. docs/legal-constraints.md binds
+this section.
+
+Published earlier work, now expired: classic pen-tool
+bezier editing (Illustrator 88 era); shape layers with editable fill, vector
+clipping masks, combine ops, and vector masks (PS 6/7, patents expired
+~2021-2024); boolean path combines, even-odd/nonzero fills, stroke dashing,
+caps/joins (decades-old techniques); selection-to-path conversion via
+boundary tracing, Douglas-Peucker (1973), and Schneider cubic fitting (1990;
+shipped in Photoshop 3, 1994).
+
+Excluded pending their own review (do NOT build without a new patent check):
+
+- Curvature Pen tool (2018+) and any auto-fitting curve-through-points UX.
+- Edge-magnetic vector snapping. (Image tracing itself is reviewed with
+  boundaries: docs/image-trace.md and the "Vector tracing" bullet in
+  docs/legal-constraints.md.)
+- Snap-to-pixel "align edges" automatic pixel-grid fitting of vector renders
+  (plain user-invoked grid/guide snapping of anchors is fine).
+- On-canvas live-shape gizmo widgets (in-canvas corner-radius handles,
+  side-count or star-inset handles etc.); options-bar/dialog parameter
+  editing is the reviewed route (Apple US 8971623; docs/patent-research.md).
+  Two things are reviewed and built
+  ([vector-tools-shape-handles.md](vector-tools-shape-handles.md)): the
+  shape tools' bounding-box handles (GitHub #690), the Move tool's frame
+  with eight resize squares, which edit no shape parameter; and the two
+  points of the drawing drag on a live Polygon (center, first vertex) and a
+  live Line (its ends), checked 2026-11-10
+  ([record](patent-research-shape-handles.md),
+  [rules](legal-constraints.md#shape-drag-points)). Every other handle
+  stays excluded.
+- Variable-width strokes / art brushes on paths (out of scope).
+
+Method rules (as for all PSD work): ground truth is licensed Photoshop's
+observed output via COM byte-diffing; no Adobe specification text in the
+repo; self-authored fixtures only; referential "compatible with Adobe
+Photoshop" phrasing; original tool icons with non-Photoshop geometry.

@@ -1,0 +1,216 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Testy Photopea host</title>
+<style>
+  body { margin:0; background:#14161a; color:#d8dade; font:13px "Segoe UI", sans-serif; }
+  #log { padding:8px 12px; white-space:pre-wrap; max-height:160px; overflow:auto; }
+  iframe { width:100vw; height:calc(100vh - 176px); border:0; }
+</style>
+</head>
+<body>
+<div id="log">starting...</div>
+<iframe id="pea"></iframe>
+<script>
+"use strict";
+// Drives an embedded photopea.com through its official postMessage API:
+// scripts are posted as strings; Photopea answers with ArrayBuffers (saveToOE),
+// echo strings (app.echoToOE), and a final "done" per script. Export bytes are
+// POSTed back to the Testy server, and the driver (selenium) polls
+// window.__testyResult for the outcome.
+const params = new URLSearchParams(location.search);
+const fileUrl = params.get("file");
+const uploadBase = params.get("upload");        // e.g. http://127.0.0.1:8901/testy-upload?name=
+const renderName = params.get("render") || ""; // runs/<run>/.../render.png (optional when a resave is asked for)
+const resaveName = params.get("resave") || ""; // optional psd upload target
+// Optional (nudge=1): make Photopea lay its text layers out afresh before the export.
+// It shows the raster cached in the file until a text layer is edited; assigning a
+// text property its own value is such an edit and changes nothing else. Each layer
+// gets its own script and its own timeout (the script engine never answers when
+// textItem is touched on a layer that is not text, so only LayerKind.TEXT is listed); result.nudge lists the layer names done and the ones that failed.
+const nudge = params.get("nudge") || "";
+// Optional: font files (URLs separated by "|") to hand Photopea before the document
+// opens. It only has its own web fonts; these are the faces the document's text
+// uses, as installed on this machine. result.fonts counts those loaded and failed.
+const fontUrls = (params.get("fonts") || "").split("|").filter(u => u.length > 0);
+const NUDGE_LIST_SCRIPT =
+  "var out=[];function walk(ls,path){for(var i=0;i<ls.length;i++){var L=ls[i];var p=path.concat([i]);" +
+  "if(L.typename==\"LayerSet\"){walk(L.layers,p);continue;}" +
+  "var isText=false;try{isText=(L.kind==LayerKind.TEXT);}catch(e){}if(!isText)continue;" +
+  "out.push(p.join(\".\")+\":\"+encodeURIComponent(L.name));}}" +
+  "walk(app.activeDocument.layers,[]);app.echoToOE(\"textlayers:\"+out.join(\"|\"));";
+function nudgeLayerScript(path) {
+  return "var L=app.activeDocument;var p=[" + path.split(".").join(",") + "];" +
+    "for(var i=0;i<p.length;i++){L=L.layers[p[i]];}" +
+    "var t=L.textItem;t.kind=t.kind;app.echoToOE(\"nudged-ok\");";
+}
+const NUDGE_LAYER_TIMEOUT_MS = 20000;
+
+const logDiv = document.getElementById("log");
+const notes = [];
+function log(message) {
+  notes.push(String(message));
+  logDiv.textContent = notes.slice(-14).join("\n");
+}
+
+let buffers = [];
+let echoes = [];
+let resolver = null;
+window.addEventListener("message", event => {
+  const data = event.data;
+  if (data === "done") {
+    if (resolver) {
+      const resolve = resolver;
+      resolver = null;
+      resolve({ buffers: buffers.splice(0), echoes: echoes.splice(0) });
+    }
+    return;
+  }
+  if (data instanceof ArrayBuffer) {
+    buffers.push(data);
+  } else if (typeof data === "string") {
+    echoes.push(data);
+  }
+});
+
+function runScript(script, timeoutMs) {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      resolver = null;
+      reject(new Error("script timed out"));
+    }, timeoutMs || 45000);
+    resolver = result => { clearTimeout(timer); resolve(result); };
+    document.getElementById("pea").contentWindow.postMessage(script, "*");
+  });
+}
+
+function waitReady(timeoutMs) {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      resolver = null;
+      reject(new Error("Photopea never became ready (offline? file failed to load?)"));
+    }, timeoutMs);
+    resolver = result => { clearTimeout(timer); resolve(result); };
+  });
+}
+
+async function upload(name, buffer) {
+  const response = await fetch(uploadBase + encodeURIComponent(name), {
+    method: "POST",
+    body: buffer,
+  });
+  if (!response.ok) throw new Error("upload failed for " + name + ": " + response.status);
+}
+
+function finish(result) {
+  result.notes = notes.slice(-30);
+  window.__testyResult = JSON.stringify(result);
+  document.title = "TESTY-" + (result.ok ? "DONE" : "FAIL");
+  log(result.ok ? "ALL DONE" : "FAILED: " + result.error);
+}
+
+async function main() {
+  if (!fileUrl || !uploadBase || !(renderName || resaveName)) {
+    throw new Error("missing required parameters");
+  }
+  // Photopea's https iframe cannot fetch our plain-http local URLs itself (the
+  // config's files entry silently hangs at "Loading"), so the host fetches the
+  // bytes same-origin and posts them as an ArrayBuffer - the API opens a posted
+  // buffer as a document.
+  document.getElementById("pea").src =
+    "https://www.photopea.com#" + encodeURIComponent(JSON.stringify({ environment: {} }));
+  log("waiting for the Photopea editor");
+  await waitReady(60000);
+  const fontReport = { loaded: 0, failed: 0 };
+  for (const fontUrl of fontUrls) {
+    try {
+      const fontResponse = await fetch(fontUrl);
+      if (!fontResponse.ok) throw new Error("fetch " + fontResponse.status);
+      const fontBuffer = await fontResponse.arrayBuffer();
+      log("loading font " + (fontReport.loaded + fontReport.failed + 1) + " of " + fontUrls.length);
+      await new Promise((resolve, reject) => {
+        const timer = setTimeout(() => { resolver = null; reject(new Error("font load timed out")); }, 30000);
+        resolver = result => { clearTimeout(timer); resolve(result); };
+        document.getElementById("pea").contentWindow.postMessage(fontBuffer, "*");
+      });
+      fontReport.loaded++;
+    } catch (error) {
+      fontReport.failed++;
+      log("font not loaded: " + error);
+    }
+  }
+  log("editor ready; fetching " + fileUrl);
+  const fileResponse = await fetch(fileUrl);
+  if (!fileResponse.ok) throw new Error("file fetch failed: " + fileResponse.status);
+  const fileBuffer = await fileResponse.arrayBuffer();
+  log("posting " + fileBuffer.byteLength + " bytes into Photopea");
+  await new Promise((resolve, reject) => {
+    const timer = setTimeout(() => { resolver = null; reject(new Error("file open timed out")); }, 90000);
+    resolver = result => { clearTimeout(timer); resolve(result); };
+    document.getElementById("pea").contentWindow.postMessage(fileBuffer, "*");
+  });
+  // Belt and braces: confirm a document actually exists before scripting it.
+  let documentReady = false;
+  for (let attempt = 0; attempt < 10 && !documentReady; attempt++) {
+    const probe = await runScript('app.echoToOE("docs:" + app.documents.length);', 15000);
+    const echo = probe.echoes.find(e => e.indexOf("docs:") === 0);
+    if (echo && parseInt(echo.slice(5), 10) > 0) { documentReady = true; break; }
+    await new Promise(resolve => setTimeout(resolve, 1500));
+    log("document not open yet (attempt " + (attempt + 1) + ")");
+  }
+  if (!documentReady) throw new Error("document never finished loading in Photopea");
+  let nudgeReport = null;
+  if (nudge) {
+    nudgeReport = { done: [], failed: [], error: "" };
+    try {
+      const listed = await runScript(NUDGE_LIST_SCRIPT, 45000);
+      const listEcho = listed.echoes.find(e => e.indexOf("textlayers:") === 0);
+      if (listEcho === undefined) throw new Error("text layers were not listed");
+      const items = listEcho.slice(11).split("|").filter(item => item.length > 0);
+      for (const item of items) {
+        const colon = item.indexOf(":");
+        const name = decodeURIComponent(item.slice(colon + 1));
+        log("re-rendering text layer " + (nudgeReport.done.length + nudgeReport.failed.length + 1) +
+            " of " + items.length);
+        try {
+          const one = await runScript(nudgeLayerScript(item.slice(0, colon)), NUDGE_LAYER_TIMEOUT_MS);
+          if (one.echoes.indexOf("nudged-ok") < 0) throw new Error("no confirmation");
+          nudgeReport.done.push(name);
+        } catch (error) {
+          nudgeReport.failed.push(name);
+          log("text layer not re-rendered: " + error);
+        }
+      }
+    } catch (error) {
+      nudgeReport.error = String(error);
+      log("text re-render failed: " + error);
+    }
+  }
+  let result = null;
+  if (renderName) {
+    log("document ready; exporting PNG");
+    result = await runScript('app.activeDocument.saveToOE("png");');
+    if (result.buffers.length !== 1) throw new Error("PNG export returned " + result.buffers.length + " buffers");
+    await upload(renderName, result.buffers[0]);
+    log("render uploaded");
+  }
+
+  if (resaveName) {
+    log("exporting PSD");
+    result = await runScript('app.activeDocument.saveToOE("psd");', 90000);
+    if (result.buffers.length !== 1) throw new Error("PSD export returned " + result.buffers.length + " buffers");
+    await upload(resaveName, result.buffers[0]);
+    log("resave uploaded");
+  }
+
+  // The forced-text-re-render pass is strictly best-effort for Photopea: contents
+  // assignment can hang its engine on some documents (the script's "done" never
+  // arrives), and the exports above are already secured - never fail the cell here.
+  finish({ ok: true, nudge: nudgeReport, fonts: fontReport });
+}
+
+main().catch(error => finish({ ok: false, error: String(error) }));
+</script>
+</body>
+</html>

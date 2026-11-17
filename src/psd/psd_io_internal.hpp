@@ -1,0 +1,1027 @@
+#pragma once
+
+// Constants, structs, and helper declarations shared by the psd_*.cpp split of
+// the PSD codec (psd_document_io.cpp, psd_io_common.cpp, psd_channel_data.cpp,
+// psd_adjustments.cpp, psd_image_resources.cpp). Helpers used by more than one
+// of those translation units are promoted out of the per-file anonymous
+// namespaces into this header. Internal to the codec implementation - do not
+// include this from outside src/psd.
+
+#include "color/color_management.hpp"
+#include "core/adjustment_layer.hpp"
+#include "core/document_path.hpp"
+#include "core/text_warp.hpp"
+#include "core/vector_raster.hpp"
+#include "core/vector_shape.hpp"
+#include "psd/psd_binary.hpp"
+#include "psd/psd_descriptor.hpp"
+#include "psd/psd_document_io.hpp"
+#include "psd/psd_smart_objects.hpp"
+#include "psd/psd_text_engine_block.hpp"
+#include "psd/psd_text_runs.hpp"
+#include "support/srgb_transfer.hpp"
+
+#include <algorithm>
+#include <array>
+#include <cmath>
+#include <cstddef>
+#include <cstdint>
+#include <filesystem>
+#include <optional>
+#include <span>
+#include <sstream>
+#include <string>
+#include <string_view>
+#include <utility>
+#include <vector>
+
+namespace patchy::psd {
+
+constexpr std::uint16_t kColorModeBitmap = 0;
+constexpr std::uint16_t kColorModeGrayscale = 1;
+constexpr std::uint16_t kColorModeIndexed = 2;
+constexpr std::uint16_t kColorModeRgb = 3;
+constexpr std::uint16_t kColorModeCmyk = 4;
+constexpr std::uint16_t kColorModeMultichannel = 7;
+constexpr std::uint16_t kColorModeDuotone = 8;
+constexpr std::uint16_t kColorModeLab = 9;
+constexpr std::uint16_t kCompressionRaw = 0;
+constexpr std::uint16_t kCompressionRle = 1;
+constexpr std::uint16_t kCompressionZip = 2;
+constexpr std::uint16_t kCompressionZipPrediction = 3;
+constexpr std::uint16_t kChannelRed = 0;
+constexpr std::uint16_t kChannelGray = 0;  // grayscale-mode files: the one color plane
+constexpr std::uint16_t kChannelGreen = 1;
+constexpr std::uint16_t kChannelBlue = 2;
+constexpr std::uint16_t kChannelBlack = 3;
+constexpr std::uint16_t kChannelTransparency = 0xFFFFU;
+constexpr std::uint16_t kChannelUserMask = 0xFFFEU;
+constexpr std::uint16_t kChannelRealUserMask = 0xFFFDU;
+constexpr std::uint16_t kImageResourceAlphaChannelNames = 1006;
+constexpr std::uint16_t kImageResourceDisplayInfo = 1007;
+constexpr std::uint16_t kImageResourceResolutionInfo = 1005;
+constexpr std::uint16_t kImageResourceGridAndGuidesInfo = 1032;
+constexpr std::uint16_t kImageResourceGlobalLightAngle = 1037;
+constexpr std::uint16_t kImageResourceIccProfile = 1039;
+constexpr std::uint16_t kImageResourceUnicodeAlphaChannelNames = 1045;
+constexpr std::uint16_t kImageResourceGlobalLightAltitude = 1049;
+constexpr std::uint16_t kImageResourceAlphaIdentifiers = 1053;
+constexpr std::uint16_t kImageResourceVersionInfo = 1057;
+// Layer links (GitHub issue 656): 1026 holds one big-endian u16 link group per layer record
+// in record order (0 unlinked), 1072 one byte per record (1, the links are on).
+constexpr std::uint16_t kImageResourceLayerGroupInfo = 1026;
+constexpr std::uint16_t kImageResourceLayerGroupsEnabled = 1072;
+constexpr std::uint16_t kImageResourceDisplayInfoFloat = 1077;
+// Patchy-private resource (Photoshop plug-in id range 4000-4999): the document
+// palette for the palettized editing mode. Photoshop and pre-feature Patchy
+// builds preserve unknown resource ids verbatim, so the palette round-trips and
+// the file stays a plain RGB PSD everywhere else. Payload, big-endian: magic
+// 'PtcP', u16 version = 1, u16 flags (bit0 = palette mode active), u8 alpha
+// threshold, u8 reserved, u16 color count, then count RGB byte triples.
+// Optional trailing 'Nm01' + count {u16 UTF-8 byte length, bytes} stores labels
+// (at most 4096 bytes each). Old readers ignore the suffix; unnamed files keep
+// their original bytes. A malformed suffix discards names, never valid RGB data.
+constexpr std::uint16_t kImageResourcePatchyPalette = 4210;
+constexpr std::uint32_t kPatchyPaletteMagic = 0x50746350U;  // 'PtcP'
+// Plug-in image resource: 'PtcV', u16 version 1, u16 reserved 0, u32 count,
+// then count pairs {u32 Photoshop lyid, u32 CompoundVectorGroupKind}.
+constexpr std::uint16_t kImageResourcePatchyCompoundVectors = 4211;
+constexpr std::uint32_t kPatchyCompoundVectorsMagic = 0x50746356U;  // 'PtcV'
+// Plug-in image resource: 'PtcS', u16 version 1, u16 reserved 0, u32 count,
+// then count 12-byte entries {u32 Photoshop lyid, u16 drop-shadow index in the
+// layer's lfx2 order, u16 flags (bit 0 = continuous), u32 fade percent as
+// 16.16 fixed point}. Carries the Patchy-only long-shadow fields of
+// LayerDropShadow beside a standard DrSh, which Photoshop renders as a plain
+// shadow at Distance. Photoshop may drop the resource when it re-saves.
+constexpr std::uint16_t kImageResourcePatchyLongShadows = 4212;
+constexpr std::uint32_t kPatchyLongShadowsMagic = 0x50746353U;  // 'PtcS'
+constexpr std::uint16_t kPatchyLongShadowFlagContinuous = 0x0001U;
+// Plug-in image resource: 'PtcM', u16 version 1, u16 reserved 0, u32 count, then
+// count entries {u8 FileInfoTextKind, then key, value and language as u32 UTF-8 byte
+// length + bytes}. Carries File Info text that has no Photoshop resource (PNG text
+// chunks such as generator prompts, JPEG/GIF comments) through a PSD round trip and
+// crash recovery (docs/file-info.md). Photoshop keeps unknown plug-in resources but
+// may drop them when it re-saves.
+constexpr std::uint16_t kImageResourcePatchyFileInfoText = 4213;
+constexpr std::uint32_t kPatchyFileInfoTextMagic = 0x5074634DU;  // 'PtcM'
+constexpr float kDefaultGlobalLightAngle = 120.0F;
+constexpr float kDefaultGlobalLightAltitude = 30.0F;
+constexpr std::int32_t kDefaultGridCycle32 = 576;
+constexpr std::array<char, 4> kPatchyLayerStyleBlockKey{'p', 'l', 'F', 'X'};
+constexpr std::array<char, 4> kPatchyLayerStylePayloadSignature{'P', 'L', 'F', 'X'};
+constexpr std::uint16_t kPatchyLayerStyleVersion = 1;
+constexpr std::uint16_t kMaxPatchyLayerStyleEntries = 512;
+constexpr std::array<char, 4> kPatchyAdjustmentPayloadSignature{'P', 'L', 'A', 'D'};
+constexpr std::uint16_t kPatchyAdjustmentVersion = 4;
+constexpr std::array<char, 4> kPatchyCurvesExtensionSignature{'C', 'R', 'V', '2'};
+constexpr std::uint16_t kPatchyCurvesExtensionVersion = 1;
+constexpr std::uint16_t kPatchyCurvesExtensionChannelCount = 4;
+constexpr std::size_t kPatchyCurvesExtensionMaxPayloadSize =
+    2U + 2U + kPatchyCurvesExtensionChannelCount * (1U + 1U + 2U + 19U * 4U);
+constexpr std::array<char, 4> kPhotoshopLevelsAdjustmentBlockKey{'l', 'e', 'v', 'l'};
+constexpr std::uint16_t kPhotoshopLevelsAdjustmentVersion = 2;
+constexpr int kPhotoshopLevelsRecordCount = 29;
+constexpr std::array<char, 4> kPhotoshopCurvesAdjustmentBlockKey{'c', 'u', 'r', 'v'};
+constexpr std::array<char, 4> kPhotoshopCurvesExtraMarker{'C', 'r', 'v', ' '};
+constexpr std::array<char, 4> kPhotoshopHueSaturationBlockKey{'h', 'u', 'e', '2'};
+constexpr std::uint16_t kPhotoshopHueSaturationVersion = 2;
+// Invert carries no settings: Photoshop writes the block with an empty payload.
+constexpr std::array<char, 4> kPhotoshopInvertBlockKey{'n', 'v', 'r', 't'};
+// Posterize and Threshold are 4 bytes each: u16 value + 2 zero pad bytes
+// (pinned by PS 2026 captures: photoshop-posterize.psd levels 6 = 00 06 00 00,
+// photoshop-threshold.psd level 96 = 00 60 00 00).
+constexpr std::array<char, 4> kPhotoshopPosterizeBlockKey{'p', 'o', 's', 't'};
+constexpr std::array<char, 4> kPhotoshopThresholdBlockKey{'t', 'h', 'r', 's'};
+// Exposure is 16 bytes: u16 version (1), then exposure, offset and gamma as
+// big-endian float32, then 2 zero pad bytes (psd-tools' exposure_rgb.psd, saved
+// by Photoshop: 00 01 | 40 01 EB 85 | 3D 9E B8 52 | 3F C2 8F 5C | 00 00).
+constexpr std::array<char, 4> kPhotoshopExposureBlockKey{'e', 'x', 'p', 'A'};
+// Brightness/Contrast: legacy-mode PS 2026 writes ONLY the 8-byte 'brit'
+// (brightness i16, contrast i16, mean u16 = 127, lab u8 = 0, pad u8 = 0);
+// modern mode writes an all-zero 'brit' plus a 'CgEd' descriptor (u32 version
+// 16, class "null", items Vrsn=1, Brgh, Cntr, means=127, "Lab "=false,
+// useLegacy, Auto=false). A parseable CgEd is authoritative over brit.
+constexpr std::array<char, 4> kPhotoshopBrightnessContrastBlockKey{'b', 'r', 'i', 't'};
+constexpr std::array<char, 4> kPhotoshopBrightnessContrastDescriptorBlockKey{'C', 'g', 'E', 'd'};
+// Color Balance: 20 bytes (PS 2026 capture) - shadows i16 x3, midtones i16 x3,
+// highlights i16 x3 (cyan/red, magenta/green, yellow/blue each), preserve
+// luminosity u8, pad u8. Patchy models the midtones triple only.
+constexpr std::array<char, 4> kPhotoshopColorBalanceBlockKey{'b', 'l', 'n', 'c'};
+constexpr std::array<char, 4> kPhotoshopChannelMixerBlockKey{'m', 'i', 'x', 'r'};
+constexpr std::array<char, 4> kPhotoshopPhotoFilterBlockKey{'p', 'h', 'f', 'l'};
+constexpr std::array<char, 4> kPhotoshopGradientMapBlockKey{'g', 'r', 'd', 'm'};
+constexpr std::array<char, 4> kPhotoshopBlackWhiteBlockKey{'b', 'l', 'w', 'h'};
+constexpr std::array<char, 4> kPhotoshopColorLookupBlockKey{'c', 'l', 'r', 'L'};
+constexpr std::array<char, 4> kPhotoshopSelectiveColorBlockKey{'s', 'e', 'l', 'c'};
+constexpr std::array<char, 4> kPhotoshopVibranceBlockKey{'v', 'i', 'b', 'A'};
+// version u16, colorize u8, pad u8, colorize h/s/l i16 x3, master h/s/l i16 x3,
+// then six band records of four i16 range stops plus an i16 h/s/l triple, then
+// an undocumented 36-byte trailer Photoshop always writes.
+constexpr std::size_t kPhotoshopHueSaturationHeaderSize = 16;
+constexpr std::size_t kPhotoshopHueSaturationBandRecordSize = 14;
+constexpr std::size_t kPhotoshopHueSaturationBandBlockSize = kPhotoshopHueSaturationBandRecordSize * 6U;
+constexpr int kMaxTextSizePixels = 8192;
+constexpr std::uint32_t kPsdProtectTransparency = 1U << 0U;
+constexpr std::uint32_t kPsdProtectComposite = 1U << 1U;
+constexpr std::uint32_t kPsdProtectPosition = 1U << 2U;
+// "Prevent Auto Nesting" (artboards): kLayerLockArtboardAutonest (GitHub issue 246).
+constexpr std::uint32_t kPsdProtectArtboardAutonest = 1U << 3U;
+// Lock All is its own bit: Photoshop writes 0x80000000 with the three single locks clear
+// (PS 2026 capture, GitHub issue 245), and reads three set singles as three locks, not Lock All.
+constexpr std::uint32_t kPsdProtectAll = 1U << 31U;
+// The Patchy locks an lspf value means.
+[[nodiscard]] LayerLockFlags layer_locks_from_psd_protection(std::uint32_t protection) noexcept;
+// The lspf value to write: the value read from the file while the locks still match it,
+// otherwise Lock All for all three locks (Patchy's Lock All), else the single locks,
+// plus Prevent Auto Nesting when the layer has it.
+[[nodiscard]] std::uint32_t psd_protection_for_layer(const Layer& layer);
+// Photoshop's PSD/PSB dimension caps; a document over the PSD cap must be saved as PSB.
+constexpr std::int32_t kMaxPsdDimension = 30000;
+constexpr std::int32_t kMaxPsbDimension = 300000;
+
+[[nodiscard]] bool tagged_block_length_is_u64(std::string_view key) noexcept;
+
+struct LayerChannelInfo {
+  std::uint16_t id{0};
+  std::uint64_t length{0};  // 4 bytes in PSD records, 8 in PSB
+};
+
+struct LayerMaskInfo {
+  Rect bounds{};
+  std::uint8_t default_color{255};
+  bool disabled{false};
+  bool linked{true};
+  // Mask-data flags bit 3: the stored plane was rendered from other data (the
+  // baked vector-mask coverage Photoshop writes when density/feather are set).
+  bool from_rendering{false};
+  // Mask parameters (flags bit 4): raster (user) mask and vector-mask density
+  // (raw 0..255) and feather in pixels, when present.
+  std::optional<std::uint8_t> user_density{};
+  std::optional<double> user_feather{};
+  std::optional<std::uint8_t> vector_density{};
+  std::optional<double> vector_feather{};
+  // The "real user mask" fields of the 36+ byte form. Photoshop writes them
+  // when a layer carries BOTH a raster mask and a vector mask with density or
+  // feather set: channel -2 then holds the combined rendered plane (flags bit
+  // 3) and channel -3 holds the raster mask the user painted, described here.
+  struct RealUserMask {
+    Rect bounds{};
+    std::uint8_t default_color{255};
+    bool disabled{false};
+    bool linked{true};
+  };
+  std::optional<RealUserMask> real_user_mask{};
+};
+
+struct PsdTextBoundsD {
+  double left{0.0};
+  double top{0.0};
+  double right{0.0};
+  double bottom{0.0};
+};
+
+struct PsdTextGeometry {
+  std::array<double, 6> transform{1.0, 0.0, 0.0, 1.0, 0.0, 0.0};
+  PsdTextBoundsD bounds{};
+  PsdTextBoundsD bounding_box{};
+  PsdTextBoundsD box_bounds{};
+  std::array<int, 4> tail_bounds{0, 0, 0, 0};
+  int text_index{0};
+  // TySh 'Ornt' = Vrtc: Photoshop's Vertical Type (columns top to bottom, right to left).
+  bool vertical{false};
+  // Non-identity Warp Text settings from the TySh warp descriptor (box = 'bounds').
+  std::optional<TextWarp> warp;
+};
+
+struct LayerRecord {
+  Rect bounds;
+  std::vector<LayerChannelInfo> channels;
+  std::vector<std::uint8_t> blending_ranges;
+  BlendMode blend_mode{BlendMode::Normal};
+  std::uint8_t opacity{255};
+  std::optional<std::uint8_t> fill_opacity;
+  bool visible{true};
+  // Flags bit 5 (0x20): Photoshop's Layers panel shows the layer's effects and Smart Filters.
+  bool fx_expanded{false};
+  bool clipping{false};
+  std::string name;
+  std::uint32_t section_divider_type{0};
+  std::optional<LayerMaskInfo> mask;
+  std::vector<UnknownPsdBlock> additional_blocks;
+  // Smart-object placement parsed from 'SoLd'/'SoLE' (authoritative) or 'PlLd'.
+  std::optional<PlacedLayerInfo> placed;
+  std::string placed_source_block;
+  bool placed_from_sold{false};
+  bool placed_parse_failed{false};
+  std::optional<std::string> text;
+  std::optional<std::string> text_html;
+  std::optional<std::string> text_runs;
+  std::optional<std::string> text_paragraph_runs;
+  std::optional<Rect> text_box;
+  std::optional<std::string> text_font;
+  std::optional<int> text_size;
+  std::optional<RgbColor> text_color;
+  std::optional<bool> text_bold;
+  std::optional<bool> text_italic;
+  std::optional<int> text_anti_alias;
+  std::optional<std::string> text_source_block;
+  bool text_patchy_generated_type_block{false};
+  // A Patchy-signed TySh whose normal style sheet carries the Photoshop layout mark
+  // (/StyleRunAlignment, written only for kTextLayoutModePhotoshop layers; GitHub issue 683).
+  bool text_patchy_photoshop_layout{false};
+  std::optional<PsdTextGeometry> text_geometry;
+  // A Patchy-signed box block's baseline inset (-'bounds' top), folded back out of
+  // text_geometry on read: the writer moved the transform origin down by it so Photoshop's
+  // first baseline meets Qt's; the frame Patchy edits reopens at the restored origin. Becomes
+  // kLayerMetadataTextBoxBaselineInset.
+  std::optional<double> text_box_baseline_inset;
+  std::uint32_t protection_flags{0};
+  // Photoshop's 'lclr' layer color label (the u16 index; GitHub issue 244).
+  LayerColorLabel color_label{kLayerColorNone};
+  bool layer_mask_hides_effects{false};
+  bool vector_mask_hides_effects{false};
+  bool blend_interior_elements{false};
+  bool blend_clipped_elements{true};
+  // 'brst' channel blending restrictions: the big-endian u32 channel indices
+  // the block excludes from compositing. nullopt = no brst block; malformed
+  // marks a payload whose length is not a multiple of four.
+  std::optional<std::vector<std::uint32_t>> channel_restrictions;
+  bool channel_restrictions_malformed{false};
+  LayerStyle layer_style;
+  // True once 'lmfx' supplied the style: the multi-instance block is
+  // authoritative over the single-instance compatibility lfx2 beside it.
+  bool layer_style_from_lmfx{false};
+};
+
+struct DecodedLayer {
+  Layer layer;
+  std::uint32_t section_divider_type{0};
+};
+
+enum class EncodedLayerKind {
+  Pixel,
+  Adjustment,
+  Group,
+  GroupBoundary
+};
+
+struct EncodedChannel {
+  std::uint16_t id{0};
+  std::int32_t width{0};
+  std::int32_t height{0};
+  std::uint16_t compression{kCompressionRaw};
+  std::vector<std::uint8_t> data;
+};
+
+struct EncodedLayer {
+  const Layer* layer{nullptr};
+  EncodedLayerKind kind{EncodedLayerKind::Pixel};
+  Rect bounds;
+  std::vector<EncodedChannel> channels;
+  const std::vector<std::uint8_t>* blending_ranges{nullptr};
+  // A regenerated type layer's TextIndex when the document keeps a preserved 'Txt2' block: an
+  // index no text object in that block has, so Photoshop reads this layer from its own TySh
+  // instead of the stale object (see write_layered_rgb8 in psd_document_io.cpp).
+  std::optional<std::int32_t> text_index_override;
+  bool preserve_native_color_blocks{false};
+};
+
+struct ImageResource {
+  std::array<char, 4> signature{'8', 'B', 'I', 'M'};
+  std::uint16_t id{0};
+  std::string name;
+  std::vector<std::uint8_t> payload;
+};
+
+// Metadata for one extra plane in the composite image data. Photoshop stores a
+// DisplayInfo record and a name for merged transparency as well as saved
+// alpha/spot channels, but merged transparency deliberately has no alpha ID.
+struct CompositeChannelInfo {
+  std::string_view name;
+  bool merged_transparency{false};
+  bool alpha_identifier_eligible{false};
+  std::optional<std::uint32_t> photoshop_identifier;
+  DocumentChannelDisplayInfo display_info;
+  std::span<const std::uint8_t> raw_display_info;
+};
+
+struct ParsedCompositeChannelResources {
+  std::vector<std::string> legacy_names;
+  std::vector<std::string> unicode_names;
+  std::vector<std::uint32_t> identifiers;
+  std::vector<std::vector<std::uint8_t>> display_records;
+};
+
+// PsdTextStyleRun / PsdTextParagraphRun and the runs/html serializers moved to
+// the public psd/psd_text_runs.hpp (included above) so the .af importer can
+// emit the same editable-text metadata.
+
+// Defaults from the engine data's ResourceDict "normal" style/paragraph sheets. Style runs omit
+// every property that matches these document defaults, so run parsing must fall back here (the
+// restaurant-menu bug: dish names omitted /FontSize because they used the default 12.0, and the
+// old code fell back to the first /FontSize found anywhere in the engine data instead).
+struct PsdTextEngineDefaults {
+  double baseline_shift{0.0};
+  double font_size{12.0};
+  bool auto_leading{true};
+  double leading{0.0};
+  double tracking{0.0};
+  double horizontal_scale{1.0};
+  double vertical_scale{1.0};
+  std::optional<int> font_index;
+  bool faux_bold{false};
+  bool faux_italic{false};
+  int baseline_direction{0};
+  int font_caps{0};
+  int font_baseline{0};
+  bool underline{false};
+  bool strikethrough{false};
+  bool ligatures{true};
+  bool discretionary_ligatures{false};
+  // The normal style sheet's /Language, TySh numbering (photoshop_txt2_language_from_tysh).
+  std::optional<int> language;
+  std::optional<RgbColor> fill_color;
+  double auto_leading_fraction{1.2};
+  // The normal style sheet's /AutoKerning and /Kerning, for a run that leaves them out.
+  bool auto_kerning{true};
+  double kerning{0.0};
+};
+
+struct DocumentAlphaComposite {
+  PixelBuffer rgb;                  // canvas-sized RGB8 (unmasked, original colors)
+  std::vector<std::uint8_t> alpha;  // canvas-sized grayscale, row-major
+  std::string_view channel_name;    // 1006 label: "Alpha 1" (saved channel) or "Transparency"
+};
+
+// Naive CMYK ink mix used when no usable ICC profile is present (definition in
+// psd_channel_data.cpp; see CmykColorConverter below).
+RgbColor rgb_from_cmyk_ink_fractions(double cyan, double magenta, double yellow, double black);
+
+// Threaded through the descriptor and text-engine parsers so their CMYK colors convert
+// through the SAME transform as the pixel decode (ink fractions are quantized to the
+// inverted 8-bit channel convention first); without a usable profile both fall back to
+// the same naive mix. Keeping the two paths identical preserves the relationship between
+// effect/text colors and the converted pixels. Grayscale-mode documents use the same
+// carrier: their 'Grsc' descriptor colors and engine-data /Type 0 fill colors convert
+// through `gray_icc` exactly like the gray pixel plane (neutral copy without a profile).
+struct CmykColorConverter {
+  const CmykToRgbTransform* icc{nullptr};
+  const GrayToRgbTransform* gray_icc{nullptr};
+  // Indexed documents: the 768-byte color table from the color mode data section (all
+  // reds, then all greens, then all blues). Null for every other mode.
+  const std::uint8_t* indexed_palette{nullptr};
+  // CMYK documents with a usable profile: the space their adjustment layers run in
+  // (core/ink_space.hpp). Null otherwise, which leaves adjustments on RGB math.
+  std::shared_ptr<const InkSpace> ink_space{};
+  // 32-bit documents: descriptor RGB values (fill layers, gradient stops, effect colors)
+  // are linear light on the 0..255 scale, like the file's float channels. Photoshop
+  // renders psd-tools' 300dpi.psb fill of (172, 11, 11) as (215, 60, 60), its sRGB
+  // encoding; 8- and 16-bit documents store encoded values and keep them as they are.
+  bool linear_rgb{false};
+  enum class InkView { Display, Cmy, Black };
+  InkView ink_view{InkView::Display};
+  const std::array<RgbColor, 256>* duotone_colors{nullptr};
+  // Grayscale documents: each stored gray value's sRGB color, for the noise gradients the
+  // document renders gray (GradientGrayOutput). Null for every other mode.
+  std::shared_ptr<const std::array<RgbColor, 256>> gray_display{};
+
+  [[nodiscard]] RgbColor rgb_from_descriptor_rgb(double red, double green, double blue) const {
+    const auto byte = [&](double value) {
+      if (linear_rgb) {
+        return linear_to_srgb8(static_cast<float>(value / 255.0));
+      }
+      return static_cast<std::uint8_t>(std::clamp(std::lround(value), 0L, 255L));
+    };
+    return RgbColor{byte(red), byte(green), byte(blue)};
+  }
+
+  [[nodiscard]] RgbColor rgb_from_ink(double cyan, double magenta, double yellow,
+                                      double black) const {
+    if (ink_view != InkView::Display) {
+      const auto inverted = [](double ink) {
+        return static_cast<std::uint8_t>(
+            std::clamp(std::lround((1.0 - std::clamp(ink, 0.0, 1.0)) * 255.0), 0L, 255L));
+      };
+      return ink_view == InkView::Cmy ? RgbColor{inverted(cyan), inverted(magenta), inverted(yellow)}
+                                     : RgbColor{inverted(black), inverted(black), inverted(black)};
+    }
+    if (icc != nullptr) {
+      const auto inverted = [](double ink) {
+        return static_cast<std::uint8_t>(
+            std::clamp(std::lround((1.0 - std::clamp(ink, 0.0, 1.0)) * 255.0), 0L, 255L));
+      };
+      return icc->convert_single(inverted(cyan), inverted(magenta), inverted(yellow),
+                                 inverted(black));
+    }
+    return rgb_from_cmyk_ink_fractions(cyan, magenta, yellow, black);
+  }
+
+  // `lightness` is 0 = black, 1 = white (the gray channel convention). Photoshop's 'Grsc'
+  // descriptor key 'Gry ' is the black percentage (100 = black; a 30 overlay rendered the
+  // same 179 as a 30% GrayColor fill, September 2026) and engine-data /Type 0 /Values is
+  // [alpha, lightness] (30% gray text stored .7), so callers pass 1 - Gry/100 and the
+  // engine value unchanged.
+  [[nodiscard]] RgbColor rgb_from_gray(double lightness) const {
+    const auto gray = static_cast<std::uint8_t>(
+        std::clamp(std::lround(std::clamp(lightness, 0.0, 1.0) * 255.0), 0L, 255L));
+    if (duotone_colors != nullptr) return (*duotone_colors)[gray];
+    if (gray_icc != nullptr) {
+      return gray_icc->convert_single(gray);
+    }
+    return RgbColor{gray, gray, gray};
+  }
+};
+
+// Generic byte-level plumbing shared across the split TUs (definitions in
+// psd_io_common.cpp).
+std::uint32_t checked_u32(std::size_t value, const char* field);
+std::uint16_t checked_u16(std::size_t value, const char* field);
+void check_write_dimensions(const Document& document, bool large_document);
+void skip_length_block(BigEndianReader& reader, const char* section_name);
+std::vector<std::uint8_t> read_length_block(BigEndianReader& reader, const char* section_name);
+PixelFormat format_from_header(const Header& header);
+std::vector<std::uint8_t> read_file_bytes(const std::filesystem::path& path);
+void write_file_bytes(const std::filesystem::path& path, std::span<const std::uint8_t> bytes);
+std::uint32_t read_section_length(BigEndianReader& reader, const char* section_name);
+std::uint64_t read_section_length_u64(BigEndianReader& reader, const char* section_name);
+std::uint32_t write_length_prefixed_block(BigEndianWriter& writer, const std::vector<std::uint8_t>& payload);
+void write_signature(BigEndianWriter& writer, const std::array<char, 4>& signature);
+bool is_source_color_channel(std::uint16_t channel_id, std::uint16_t source_color_mode) noexcept;
+std::string read_pascal_string(BigEndianReader& reader, std::size_t padded_multiple);
+void write_pascal_string(BigEndianWriter& writer, const std::string& value, std::size_t padded_multiple);
+std::vector<std::uint16_t> utf8_to_utf16(std::string_view text);
+// UTF-16 code units to UTF-8; a surrogate pair becomes one code point, a lone
+// surrogate U+FFFD (definition in engine_data.cpp).
+std::string utf16_units_to_utf8(const std::vector<std::uint16_t>& units);
+// Photoshop's unsigned 16.16 fixed-point number (definition in psd_image_resources.cpp).
+double fixed_16_16_to_double(std::uint32_t value) noexcept;
+// Photoshop's 10-byte color (u16 color space + four u16 components) as written by the
+// PS 5.x 'lrFX' effects and 'tySh' type records (definition in psd_layer_styles.cpp).
+RgbColor read_legacy_effect_color(BigEndianReader& reader, const CmykColorConverter& cmyk);
+std::optional<std::string> read_unicode_string_payload(std::span<const std::uint8_t> payload);
+std::vector<std::uint8_t> unicode_string_payload(std::string_view text);
+#ifdef _WIN32
+std::wstring wide_from_utf8(std::string_view text);
+std::string utf8_from_wide(std::wstring_view text);
+#endif
+std::array<char, 4> blend_mode_key(BlendMode mode);
+BlendMode blend_mode_from_key(const std::array<char, 4>& key);
+BlendMode blend_mode_from_descriptor_enum(std::string_view value, const std::array<char, 4>& fallback_key);
+std::optional<std::array<char, 4>> block_key_from_string(std::string_view key);
+// Per-layer blocks must keep pad_payload_to_even: Photoshop's layer-record walk
+// advances by the declared length rounded up to an even byte count, so one odd
+// block makes it misparse every following block as "unknown data". Only the
+// global-section emitter passes false (it 4-aligns outside the declared length).
+void write_additional_layer_block(BigEndianWriter& writer, const std::array<char, 4>& key,
+                                  std::span<const std::uint8_t> payload, bool large_document,
+                                  bool force_wide = false, bool pad_payload_to_even = true);
+
+// Generic descriptor-writing primitives (definitions in psd_io_common.cpp).
+void write_descriptor_item_header(BigEndianWriter& writer, std::string_view key, const std::array<char, 4>& type);
+void write_descriptor_enum_item(BigEndianWriter& writer, std::string_view key, std::string_view enum_type,
+                                std::string_view enum_value);
+void write_descriptor_bool_item(BigEndianWriter& writer, std::string_view key, bool value);
+void write_descriptor_long_item(BigEndianWriter& writer, std::string_view key, std::int32_t value);
+void write_descriptor_double_item(BigEndianWriter& writer, std::string_view key, double value);
+void write_descriptor_unit_float_item(BigEndianWriter& writer, std::string_view key, const std::array<char, 4>& unit,
+                                      double value);
+void write_descriptor_unit_float_item(BigEndianWriter& writer, std::string_view key, double value);
+void write_descriptor_object_header(BigEndianWriter& writer, std::string_view name, std::string_view class_id,
+                                    std::uint32_t item_count);
+void write_descriptor_raw_item(BigEndianWriter& writer, std::string_view key, std::span<const std::uint8_t> payload);
+void write_descriptor_object_item(BigEndianWriter& writer, std::string_view key, double left, double top,
+                                  double right, double bottom);
+void write_descriptor_object_item(BigEndianWriter& writer, std::string_view key, const PsdTextBoundsD& bounds);
+void write_descriptor_text_item(BigEndianWriter& writer, std::string_view key, std::string_view text);
+
+// Channel/composite image-data codec helpers (definitions in psd_channel_data.cpp).
+EncodedChannel encode_channel(std::uint16_t id, std::int32_t width, std::int32_t height,
+                              std::span<const std::uint8_t> raw_data, bool wide_rle_counts);
+// Deep documents (docs/high-bit-depth-formats.md): one channel of `buffer`, which must already be
+// at `depth`, as big-endian samples (a channel index past the buffer's count yields a
+// constant full-scale plane, the opaque alpha of an RGB layer).
+[[nodiscard]] std::vector<std::uint8_t> big_endian_plane(const PixelBuffer& buffer, std::size_t channel);
+// encode_channel for big-endian samples at `depth`: 8 bits is encode_channel itself;
+// 16 bits RLE-encodes the byte rows when that is smaller; 32 bits stays raw.
+EncodedChannel encode_channel_at_depth(std::uint16_t id, std::int32_t width, std::int32_t height,
+                                       std::span<const std::uint8_t> big_endian_samples, BitDepth depth,
+                                       bool wide_rle_counts);
+// Composite image data for a 16 or 32-bit file: the RGB planes of `rgb` (at `depth`)
+// followed by `extra_planes` (big-endian samples at `depth`), RLE for 16 bits when
+// smaller, raw otherwise.
+void write_deep_image_data(BigEndianWriter& writer, const PixelBuffer& rgb,
+                           const std::vector<std::vector<std::uint8_t>>& extra_planes, BitDepth depth,
+                           bool wide_rle_counts);
+
+// The writer's side of CmykColorConverter::linear_rgb: while a 32-bit document is
+// written, RGB descriptor values (fills, gradient stops, effect colors) are linear light
+// on the 0..255 scale. Outside the scope a component is written as it is.
+class ScopedLinearDescriptorColors {
+public:
+  explicit ScopedLinearDescriptorColors(bool linear) noexcept;
+  ~ScopedLinearDescriptorColors();
+  ScopedLinearDescriptorColors(const ScopedLinearDescriptorColors&) = delete;
+  ScopedLinearDescriptorColors& operator=(const ScopedLinearDescriptorColors&) = delete;
+
+private:
+  bool previous_;
+};
+[[nodiscard]] double descriptor_rgb_component(std::uint8_t encoded) noexcept;
+// Inside ScopedLinearDescriptorColors (a 32-bit document being written): a layer blend
+// mode Photoshop refuses at 32 bits is written as Normal (blend_mode_supported_at_depth).
+[[nodiscard]] BlendMode writable_layer_blend_mode(BlendMode mode) noexcept;
+void write_rgb8_image_data(BigEndianWriter& writer, const PixelBuffer& pixels, bool wide_rle_counts);
+[[nodiscard]] std::optional<DocumentAlphaComposite> document_alpha_composite(const Document& document);
+[[nodiscard]] DocumentAlphaComposite merged_flatten_composite(const Document& document);
+// A 16 or 32-bit document's composite at its own depth (docs/high-bit-depth-formats.md): `rgb`
+// is canvas-sized 3-channel at `depth`, `alpha` the matching coverage plane (empty when
+// channel_name is), `alpha8` that plane narrowed for the writer's channel bookkeeping.
+struct DeepDocumentComposite {
+  PixelBuffer rgb;
+  PixelBuffer alpha;
+  std::vector<std::uint8_t> alpha8;
+  std::string_view channel_name;
+};
+// document_alpha_composite at depth: the single masked layer's own colors and its mask.
+[[nodiscard]] std::optional<DeepDocumentComposite> deep_document_alpha_composite(const Document& document,
+                                                                                BitDepth depth);
+// merged_flatten_composite at depth, from the deep compositor.
+[[nodiscard]] DeepDocumentComposite deep_merged_flatten_composite(const Document& document, BitDepth depth);
+void write_rgb8_image_data_with_extra_channels(
+    BigEndianWriter& writer, const PixelBuffer& pixels,
+    std::span<const std::span<const std::uint8_t>> extra_channels, bool wide_rle_counts);
+// Rebuilds an embedded PSD/PSB whose merged-composite RLE rows include odd byte
+// counts, splitting one literal per odd row (identical decode). Photoshop's
+// smart-object embed parser rejects odd composite rows outright; see the
+// make_packbits_row_even note in psd_channel_data.cpp. Returns nullopt when the
+// bytes are not an 8-bit RLE-composite PSD/PSB or are already compliant.
+[[nodiscard]] std::optional<std::vector<std::uint8_t>> even_composite_rows_normalized(
+    std::span<const std::uint8_t> file_bytes);
+// How a channel's samples decode into Patchy's 8-bit pipeline. 16-bit samples are
+// full-range big-endian u16 (value/257, rounded); 32-bit samples are big-endian
+// linear-light floats: color channels sRGB-encode, alpha/mask/saved channels scale
+// linearly. zip_payload_length is the compressed byte count for zip/zip-prediction
+// channels (not derivable from the stream itself; layer records carry it).
+struct ChannelDecodeInfo {
+  std::uint16_t depth{8};
+  bool color_channel{true};
+  std::uint64_t zip_payload_length{0};
+};
+// Converts big-endian 16/32-bit planar samples to 8 bits in place of the input
+// vector; depth 8 passes through untouched.
+[[nodiscard]] std::vector<std::uint8_t> convert_channel_to_8bit(std::vector<std::uint8_t>&& data,
+                                                                std::uint16_t depth, bool color_channel);
+// damaged_rows, when given, counts the RLE scanlines that did not decode to exactly the
+// channel width. Those rows are recovered rather than thrown on (see
+// decode_packbits_scanline), and the readers turn a nonzero count into an import notice.
+std::vector<std::uint8_t> read_channel_data(BigEndianReader& reader, std::uint16_t compression, std::int32_t width,
+                                            std::int32_t height, bool wide_rle_counts,
+                                            const ChannelDecodeInfo& decode_info = {},
+                                            std::size_t* damaged_rows = nullptr);
+// The same decode without the 8-bit conversion: the channel's big-endian samples at the
+// file's depth, for documents that keep it (docs/high-bit-depth-formats.md).
+std::vector<std::uint8_t> read_channel_samples(BigEndianReader& reader, std::uint16_t compression, std::int32_t width,
+                                               std::int32_t height, bool wide_rle_counts,
+                                               const ChannelDecodeInfo& decode_info = {},
+                                               std::size_t* damaged_rows = nullptr);
+// Copies one big-endian plane of `depth`-bit samples into channel `channel` of a buffer of
+// the same depth, in host order (32-bit floats stay linear and unclamped).
+void store_native_plane(PixelBuffer& target, std::size_t channel, std::span<const std::uint8_t> plane,
+                        std::uint16_t depth);
+// Rejects a composite whose declared planes `encoded_bytes` of image data cannot describe
+// (docs/psd-reader-hardening.md, "Decode budget"), before anything is sized from the header.
+void require_composite_fits_data(const Header& header, std::uint16_t compression, std::size_t encoded_bytes);
+// keep_native returns each plane's big-endian samples at the file's depth instead of
+// converting them to 8 bits (documents that keep their depth).
+std::vector<std::vector<std::uint8_t>> read_flat_image_channels(BigEndianReader& reader, const Header& header,
+                                                                std::uint16_t compression,
+                                                                std::size_t* damaged_rows = nullptr,
+                                                                bool keep_native = false);
+std::vector<std::vector<std::uint8_t>> read_flat_image_channels_from(
+    BigEndianReader& reader, const Header& header, std::uint16_t compression,
+    std::uint16_t first_channel, std::size_t* damaged_rows = nullptr, bool keep_native = false);
+// Appends the "some scanlines were damaged" import notice when the count is nonzero.
+void append_damaged_row_notice(std::size_t damaged_rows, std::vector<std::string>* notices);
+bool is_cmyk_color_mode(std::uint16_t color_mode) noexcept;
+// True for every mode whose pixels are one plane: Grayscale, Duotone (read as its gray
+// plane, the way the format tells readers without duotone support to), Bitmap (1-bit,
+// expanded on read) and Indexed (palette indices; see convert_indexed_plane_to_rgb).
+bool is_grayscale_color_mode(std::uint16_t color_mode) noexcept;
+bool is_lab_color_mode(std::uint16_t color_mode) noexcept;
+// Indexed: each sample is an index into the document's 256-entry color table.
+void convert_indexed_plane_to_rgb(PixelBuffer& pixels, const std::uint8_t* indices, std::size_t pixel_count,
+                                  const std::uint8_t* palette);
+// Lab: the buffer's first three components hold L, a, b as stored (L 0..255 = 0..100,
+// a and b offset by 128) and are replaced in place by sRGB. Alpha is left untouched.
+void convert_lab_pixels_to_rgb(PixelBuffer& pixels);
+// Converts native big-endian 16-bit color planes into an RGB16/RGBA16 buffer.
+// Transparency is already in the target and is never color transformed.
+void convert_16_bit_color_planes_to_rgb(PixelBuffer& pixels,
+                                       std::span<const std::vector<std::uint8_t>> planes,
+                                       std::uint16_t color_mode, const CmykColorConverter& colors);
+// One CIE Lab color (D50; lightness 0..100, a and b about -128..127) as sRGB.
+std::array<std::uint8_t, 3> srgb8_from_lab(double lightness, double a, double b);
+// Multichannel: the planes are inks, stored like CMYK's (255 = none). The first three
+// are read as cyan, magenta and yellow; a missing plane counts as no ink.
+void convert_multichannel_planes_to_rgb(PixelBuffer& pixels, std::span<const std::vector<std::uint8_t>> planes,
+                                        std::size_t pixel_count);
+// The one plane of a 1-bit Bitmap document's composite, expanded to 8-bit gray (a set
+// bit is black). Rows are packed to whole bytes.
+std::vector<std::uint8_t> read_bitmap_composite_plane(BigEndianReader& reader, const Header& header,
+                                                      std::uint16_t compression, std::size_t* damaged_rows);
+void convert_cmyk_planes_to_rgb(PixelBuffer& pixels, const std::uint8_t* cyan,
+                                const std::uint8_t* magenta, const std::uint8_t* yellow,
+                                const std::uint8_t* black, std::size_t pixel_count,
+                                const CmykToRgbTransform* icc);
+// Expands one decoded gray plane (0 = black) into the RGB(A) pixel buffer's color
+// components: through the document's embedded gray ICC profile when usable (Photoshop's
+// Dot Gain / Gray Gamma handling), a neutral copy otherwise. Alpha is left untouched.
+void convert_gray_plane_to_rgb(PixelBuffer& pixels, const std::uint8_t* gray, std::size_t pixel_count,
+                               const GrayToRgbTransform* icc);
+
+// Adjustment-layer codec: the Photoshop levl/curv/hue2 payloads and the private
+// plAD block (definitions in psd_adjustments.cpp). hue2 payloads patch in place
+// and curv payloads preserve imported bytes exactly - persistence contracts.
+void write_i32(BigEndianWriter& writer, int value);
+int read_i32(BigEndianReader& reader);
+std::vector<std::uint8_t> photoshop_levels_payload(LevelsAdjustment settings);
+std::optional<AdjustmentSettings> parse_photoshop_levels_adjustment(std::span<const std::uint8_t> payload);
+std::optional<AdjustmentSettings> parse_photoshop_hue2_adjustment(std::span<const std::uint8_t> payload);
+std::vector<std::uint8_t> photoshop_hue2_payload(const HueSaturationAdjustment& settings,
+                                                 const UnknownPsdBlock* original);
+std::optional<AdjustmentSettings> parse_photoshop_curves_adjustment(
+    std::span<const std::uint8_t> payload);
+std::vector<std::uint8_t> photoshop_curves_payload(const CurvesAdjustment& curves,
+                                                   const UnknownPsdBlock* original);
+std::optional<AdjustmentSettings> parse_photoshop_posterize_adjustment(std::span<const std::uint8_t> payload);
+std::vector<std::uint8_t> photoshop_posterize_payload(const PosterizeAdjustment& settings,
+                                                      const UnknownPsdBlock* original);
+std::optional<AdjustmentSettings> parse_photoshop_threshold_adjustment(std::span<const std::uint8_t> payload);
+std::vector<std::uint8_t> photoshop_threshold_payload(const ThresholdAdjustment& settings,
+                                                      const UnknownPsdBlock* original);
+std::optional<AdjustmentSettings> parse_photoshop_channel_mixer_adjustment(std::span<const std::uint8_t> payload);
+// Writes the modeled rows over the original payload (bytes past them are kept); fresh
+// layers get Photoshop's 44-byte RGB shape.
+std::vector<std::uint8_t> photoshop_channel_mixer_payload(const ChannelMixerAdjustment& settings,
+                                                          const UnknownPsdBlock* original);
+std::optional<AdjustmentSettings> parse_photoshop_photo_filter_adjustment(std::span<const std::uint8_t> payload);
+// Writes the modeled fields over the original payload (its trailing pad is kept); fresh
+// layers get Photoshop's 20-byte version 2 Lab shape.
+std::vector<std::uint8_t> photoshop_photo_filter_payload(const PhotoFilterAdjustment& settings,
+                                                         const UnknownPsdBlock* original);
+std::optional<AdjustmentSettings> parse_photoshop_gradient_map_adjustment(std::span<const std::uint8_t> payload);
+// The original payload when the settings are unchanged; otherwise a version 3 block that
+// keeps the original's noise fields.
+std::vector<std::uint8_t> photoshop_gradient_map_payload(const GradientMapAdjustment& settings,
+                                                         const UnknownPsdBlock* original);
+std::optional<AdjustmentSettings> parse_photoshop_black_white_adjustment(std::span<const std::uint8_t> payload);
+// The original payload when the settings are unchanged; otherwise its descriptor with the
+// modeled values replaced (a fresh layer gets Photoshop 2026's shape).
+std::vector<std::uint8_t> photoshop_black_white_payload(const BlackWhiteAdjustment& settings,
+                                                        const UnknownPsdBlock* original);
+std::optional<AdjustmentSettings> parse_photoshop_color_lookup_adjustment(std::span<const std::uint8_t> payload);
+// The ICC v4 RGB device link Photoshop renders a Color Lookup through, for a table.
+std::vector<std::uint8_t> photoshop_color_lookup_profile(const ColorLookupTable& table, std::string_view name);
+// The original payload when the lookup is unchanged; otherwise a 'clrL' carrying the
+// table's profile.
+std::vector<std::uint8_t> photoshop_color_lookup_payload(const ColorLookupAdjustment& settings,
+                                                         const UnknownPsdBlock* original);
+std::optional<AdjustmentSettings> parse_photoshop_selective_color_adjustment(std::span<const std::uint8_t> payload);
+// The original payload when the settings are unchanged; otherwise the modeled fields over it
+// (a fresh layer starts from Photoshop's all-zero Relative block).
+std::vector<std::uint8_t> photoshop_selective_color_payload(const SelectiveColorAdjustment& settings,
+                                                            const UnknownPsdBlock* original);
+// A legacy Vibrance 'vibA' block; nullopt for anything else, including the readable blocks
+// photoshop_vibrance_block_is_color_and_vibrance accepts.
+std::optional<AdjustmentSettings> parse_photoshop_vibrance_adjustment(std::span<const std::uint8_t> payload);
+// True for a readable 'vibA' descriptor carrying Photoshop's newer Color and Vibrance
+// settings (useLegacy false, temperature, tint or another key), which Patchy keeps as a
+// placeholder.
+bool photoshop_vibrance_block_is_color_and_vibrance(std::span<const std::uint8_t> payload);
+// The original payload when the settings are unchanged; otherwise the legacy descriptor
+// Photoshop writes, holding only the non-zero sliders.
+std::vector<std::uint8_t> photoshop_vibrance_payload(const VibranceAdjustment& settings,
+                                                     const UnknownPsdBlock* original);
+std::optional<AdjustmentSettings> parse_photoshop_exposure_adjustment(std::span<const std::uint8_t> payload);
+std::vector<std::uint8_t> photoshop_exposure_payload(const ExposureAdjustment& settings,
+                                                     const UnknownPsdBlock* original);
+std::optional<AdjustmentSettings> parse_photoshop_brightness_contrast_adjustment(
+    std::span<const std::uint8_t> payload);
+struct BrightnessContrastDescriptorParse {
+  AdjustmentSettings settings;
+  bool use_legacy{false};
+};
+std::optional<BrightnessContrastDescriptorParse> parse_photoshop_brightness_contrast_descriptor(
+    std::span<const std::uint8_t> payload);
+// Re-emits the imported 'brit' bytes when the layer's settings still match the
+// imported state (CgEd authoritative); regenerates on a real edit - the
+// value-carrying legacy 8-byte shape, or Photoshop's all-zero compatibility
+// brit when the settings are modern. `layer` provides the preserved originals.
+std::vector<std::uint8_t> photoshop_brightness_contrast_payload(const BrightnessContrastAdjustment& settings,
+                                                                const Layer& layer);
+// The 'CgEd' descriptor that must accompany the brit: preserved bytes when
+// unedited, a regenerated PS-2026-shape descriptor on an edit, and nullopt
+// when the layer should stay descriptor-free (legacy settings on a file that
+// never carried one - a stale CgEd would win over brit in Photoshop).
+std::optional<std::vector<std::uint8_t>> photoshop_brightness_contrast_descriptor_payload(
+    const BrightnessContrastAdjustment& settings, const Layer& layer);
+std::optional<AdjustmentSettings> parse_photoshop_color_balance_adjustment(
+    std::span<const std::uint8_t> payload);
+// Writes all three tone triples and Preserve Luminosity over the original
+// payload (bytes past them are kept); fresh layers get the 20-byte shape.
+std::vector<std::uint8_t> photoshop_color_balance_payload(const ColorBalanceAdjustment& settings,
+                                                          const UnknownPsdBlock* original);
+// Reads the legacy private 'plAD' block. Read-only since 2026-07: Photoshop
+// reports the unknown key as "unknown data" on open, so no kind writes it
+// anymore; native levl/curv/hue2/blnc blocks carry the modeled state instead.
+std::optional<AdjustmentSettings> parse_patchy_adjustment(std::span<const std::uint8_t> payload);
+
+// Layer-style codecs: lfx2/lrFX parse, global-light resolution, and the private
+// plFX block (definitions in psd_layer_styles.cpp). The public lfx2 write API
+// shared with the .asl codec is declared in psd/psd_layer_effects.hpp.
+// descriptor_enum/percent_to_unit/descriptor_rgb_color/parse_layer_style_gradient
+// are the PS-calibrated descriptor vocabulary shared with the vector codec.
+std::string descriptor_enum(const DescriptorObject& object, std::string_view key, std::string fallback = {});
+float percent_to_unit(double value);
+RgbColor descriptor_rgb_color(const DescriptorObject& object, std::string_view key,
+                              const CmykColorConverter& cmyk, RgbColor fallback = {});
+LayerStyleGradient parse_layer_style_gradient(const DescriptorObject& effect, const CmykColorConverter& cmyk);
+void write_f32(BigEndianWriter& writer, float value);
+LayerStyle parse_lfx2_layer_style(std::span<const std::uint8_t> payload,
+                                  const CmykColorConverter& cmyk);
+LayerStyle layer_style_from_lefx_descriptor(const DescriptorObject& root, const CmykColorConverter& cmyk);
+LayerStyle parse_lrfx_layer_style(std::span<const std::uint8_t> payload, const CmykColorConverter& cmyk);
+void resolve_global_light(LayerStyle& style, float angle_degrees, float altitude_degrees);
+void merge_missing_layer_style_effects(LayerStyle& target, LayerStyle source);
+std::optional<LayerStyle> parse_patchy_layer_style(std::span<const std::uint8_t> payload);
+
+// Layer-record codec: the per-layer record read (bounds/channels/blend/flags/
+// mask/blending-ranges/name and the tagged-block walk) and the write/encode
+// pipeline for the layer info section (definitions in psd_layer_records.cpp).
+LayerRecord read_layer_record(BigEndianReader& reader, bool large_document,
+                              const CmykColorConverter& cmyk, std::span<const TextFrameGeometry> text_frames,
+                              bool has_text_engine, bool named_key_text_engine = false);
+// synthesized_photoshop_layer_id: nonzero writes a fresh 'lyid' block for a
+// smart-object layer that has none preserved (see write_layer_record).
+void write_layer_record(BigEndianWriter& writer, const EncodedLayer& encoded, bool strip_smart_object_blocks,
+                        bool large_document, std::uint32_t synthesized_photoshop_layer_id,
+                        Rect canvas);
+// `canvas` identifies Photoshop's Background record: the only pixel record written without a
+// transparency channel is the bottom one covering exactly the canvas (see encode_layer).
+// `depth` is the document's: deep documents write their channels at it.
+void append_encoded_layers(const Layer& layer, std::vector<EncodedLayer>& encoded_layers, bool large_document,
+                           Rect canvas, BitDepth depth = BitDepth::UInt8);
+
+// Vector shape/path codec: vmsk/vsms path records, SoCo/GdFl/PtFl fill
+// content, vstk stroke style, vogk live-shape origination, and the saved-path
+// image resources (definitions in psd_vector.cpp; encodings recorded in
+// docs/vector-psd-encodings.md from PS 27.8 captures).
+struct ParsedVectorMaskBlock {
+  VectorPath path;
+  bool disabled{false};
+  bool inverted{false};
+  bool unlinked{false};
+};
+std::optional<ParsedVectorMaskBlock> parse_vector_mask_block(std::span<const std::uint8_t> payload,
+                                                             std::int32_t canvas_width,
+                                                             std::int32_t canvas_height);
+// The image-resource form: the same 26-byte record stream without the
+// version/flags header (saved paths 2000..2997 and the work path 1025).
+std::optional<VectorPath> parse_path_resource_records(std::span<const std::uint8_t> payload,
+                                                      std::int32_t canvas_width,
+                                                      std::int32_t canvas_height);
+std::optional<VectorFill> parse_vector_fill_block(std::string_view key,
+                                                  std::span<const std::uint8_t> payload,
+                                                  const CmykColorConverter& cmyk);
+// `content_present` (optional) reports whether the descriptor carried a
+// strokeStyleContent object; CS6 files keep the stroke paint in `vscg` instead.
+std::optional<VectorStroke> parse_vector_stroke_block(std::span<const std::uint8_t> payload,
+                                                      const CmykColorConverter& cmyk,
+                                                      bool* content_present = nullptr);
+std::optional<std::vector<LiveShapeParams>> parse_vector_origination_block(
+    std::span<const std::uint8_t> payload);
+[[nodiscard]] bool is_vector_content_block_key(std::string_view key) noexcept;
+// Write side: payloads regenerate patch-in-place from preserved originals
+// where possible, otherwise the PS 27.8-captured canonical shapes; all padded
+// to 4 bytes like Photoshop's own vector blocks.
+[[nodiscard]] const char* vector_fill_block_key(VectorFillKind kind);
+std::vector<std::uint8_t> vector_mask_block_payload(const VectorPath& path, bool disabled, bool inverted,
+                                                    bool unlinked, std::int32_t canvas_width,
+                                                    std::int32_t canvas_height);
+std::vector<std::uint8_t> vector_fill_block_payload(const VectorFill& fill,
+                                                    const UnknownPsdBlock* original);
+std::vector<std::uint8_t> vector_stroke_block_payload(const VectorStroke& stroke,
+                                                      const UnknownPsdBlock* original);
+std::vector<std::uint8_t> vector_origination_block_payload(std::span<const LiveShapeParams> origination,
+                                                           const UnknownPsdBlock* original);
+// True when every subpath group of `path` has an origination entry the vogk
+// serializer will actually emit. Photoshop refuses to OPEN a file whose
+// keyDescriptorList covers only some subpath groups (July 2026 byte
+// bisection: a polygon + live ellipse layer with the ellipse-only entry was
+// rejected in every index permutation), so a partial list writes no
+// vogk/vowv at all — the shapes stay plain paths, PS's own fallback.
+[[nodiscard]] bool origination_covers_path_groups(const VectorPath& path,
+                                                  std::span<const LiveShapeParams> origination);
+// The baked "derived from other data" user-mask plane Photoshop stores beside
+// non-default vector-mask density/feather: UNFEATHERED path coverage over the
+// path's pixel hull (+1 px pad), deterministic.
+[[nodiscard]] CoverageBuffer vector_mask_derived_plane(const LayerVectorMask& mask);
+std::vector<std::uint8_t> document_path_resource_payload(const DocumentPath& path,
+                                                         std::int32_t canvas_width,
+                                                         std::int32_t canvas_height);
+void upsert_document_path_resources(std::vector<ImageResource>& resources, const Document& document);
+// Post-read pass (after global pattern blocks decode): rasterizes shape layers
+// whose channels were empty and bakes vector-mask caches that did not import a
+// derived plane.
+void finalize_vector_layers(Document& document);
+// Parses saved/work/clipping path resources into document.paths().
+void parse_document_path_resources(Document& document, std::span<const std::uint8_t> image_resources);
+
+// Image-resources (8BIM) section codec (definitions in psd_image_resources.cpp).
+void upsert_image_resource(std::vector<ImageResource>& resources, std::uint16_t id,
+                           std::vector<std::uint8_t> payload);
+void remove_image_resource(std::vector<ImageResource>& resources, std::uint16_t id);
+std::optional<std::vector<std::uint8_t>> find_image_resource_payload(std::span<const std::uint8_t> resources,
+                                                                     std::uint16_t id);
+ParsedCompositeChannelResources parse_composite_channel_resources(
+    std::span<const std::uint8_t> image_resources);
+std::uint16_t composite_color_channel_count(std::uint16_t color_mode) noexcept;
+void add_saved_composite_channels(Document& document,
+                                  std::vector<std::vector<std::uint8_t>> channel_planes,
+                                  std::uint16_t first_saved_channel, const Header& header,
+                                  const ParsedCompositeChannelResources& resources);
+std::optional<DocumentPrintSettings> print_settings_from_resolution_resource(std::span<const std::uint8_t> payload);
+std::optional<std::pair<DocumentGridSettings, std::vector<DocumentGuide>>>
+grid_guides_from_resource(std::span<const std::uint8_t> payload);
+void apply_patchy_palette_resource(Document& document, std::span<const std::uint8_t> payload);
+std::optional<Document> prepare_compound_vector_psd(const Document& document);
+void apply_compound_vector_resource(Document& document, std::span<const std::uint8_t> payload);
+// Resource 4212: restores LayerDropShadow::continuous/fade onto the drop
+// shadows already parsed from lfx2, matched by unique 'lyid' and index. Any
+// malformed field rejects the whole record.
+void apply_long_shadow_resource(Document& document, std::span<const std::uint8_t> payload);
+// File Info (docs/file-info.md): moves the metadata-only resources (XMP, EXIF, IPTC,
+// caption digest, copyright flag/URL, thumbnails, version/print/auto-save info,
+// Patchy's 4213 text) out of metadata().raw_psd_image_resources into file_info(), so
+// File Info edits them and image_resources_for_document writes them back from there.
+void lift_file_info_resources(Document& document, std::uint16_t source_color_mode, bool large_document);
+// `output_icc_profile`, when given, replaces resource 1039 (empty removes it): a CMYK Proof
+// save's CMYK profile. `thumbnail`, when given, replaces the document's thumbnails 1033 and
+// 1036 (empty writes none).
+// `layered` is a save that writes the document's layer records: resources 1026 and 1072 then
+// carry its layer links (written when a layer is linked or the file already had them); a flat
+// save drops them.
+std::vector<std::uint8_t> image_resources_for_document(const Document& document,
+                                                       std::span<const CompositeChannelInfo> channels,
+                                                       std::uint16_t output_mode = kColorModeRgb,
+                                                       const std::vector<std::uint8_t>* output_icc_profile = nullptr,
+                                                       const std::vector<std::uint8_t>* thumbnail = nullptr,
+                                                       bool layered = false);
+// Layer links in PSD record order (bottom to top; a folder is its closing boundary record,
+// its children, then the folder record): one entry per record, 0 for a boundary and for a
+// layer without a partner. Ids are renumbered 1, 2, ... in record order to fit 1026's u16.
+std::vector<std::uint16_t> layer_link_groups_in_record_order(const std::vector<Layer>& layers);
+// Sets each layer's link group from resource 1026 read in the same record order. A payload
+// whose entry count is not the record count is ignored. Groups left with one member clear.
+void apply_layer_link_resource(std::vector<Layer>& layers, std::span<const std::uint8_t> payload);
+
+
+// Engine-data (TySh) text READ codec: engine-data parsing, run serialization
+// (runs metadata v1-v3 are persistence contracts), the placeholder preview
+// renderer, and TySh descriptor-geometry extraction (definitions in
+// psd_text_read.cpp).
+std::optional<std::string> extract_engine_data_text(std::span<const std::uint8_t> payload,
+                                                  bool allow_descriptor_fallback = false);
+std::optional<int> extract_engine_data_font_size(std::span<const std::uint8_t> payload);
+std::optional<RgbColor> extract_engine_data_fill_color(std::span<const std::uint8_t> payload,
+                                                       const CmykColorConverter& cmyk);
+std::optional<int> extract_engine_data_anti_alias(std::span<const std::uint8_t> payload);
+// The anti-aliasing method the TySh descriptor names ('AntA'), which is the one Photoshop shows
+// and draws with: files exist whose EngineData /AntiAlias disagrees with it (Smooth beside 4,
+// Crisp beside 2), and reading the number saved such a layer as Sharp or Strong.
+std::optional<int> extract_type_tool_anti_alias(std::span<const std::uint8_t> payload);
+std::string rgb_hex_color(RgbColor color);
+std::optional<RgbColor> rgb_color_from_hex(std::string_view text);
+std::string percent_decode(std::string_view text);
+std::optional<std::vector<PsdTextStyleRun>> extract_engine_text_runs(std::span<const std::uint8_t> payload,
+                                                                     std::string_view text,
+                                                                     int fallback_size,
+                                                                     RgbColor fallback_color,
+                                                                     const CmykColorConverter& cmyk,
+                                                                     std::span<const TextParagraphFontSize> paragraph_font_sizes = {},
+                                                                     std::span<const TextStyleRunFeatures> style_features = {},
+                                                                     std::span<const TextStyleRunKerning> style_kerning = {});
+std::optional<std::vector<PsdTextParagraphRun>> extract_engine_paragraph_runs(std::span<const std::uint8_t> payload,
+                                                                              std::string_view text);
+std::string serialize_paragraph_metric(double value);
+PixelBuffer render_placeholder_text(std::string_view text, std::int32_t width, std::int32_t height);
+bool has_visible_alpha(const PixelBuffer& pixels);
+std::optional<Rect> visible_pixel_local_bounds(const PixelBuffer& pixels);
+std::optional<PsdTextBoundsD> visible_text_local_bounds_from_layer_pixels(const Layer& layer, const Rect& visible,
+                                                                          const std::array<double, 6>& transform);
+int estimate_text_size_from_alpha(const PixelBuffer& pixels);
+std::optional<PsdTextGeometry> extract_type_tool_geometry(std::span<const std::uint8_t> payload);
+std::optional<Rect> extract_type_tool_text_box(std::span<const std::uint8_t> payload);
+// A Photoshop PostScript font name resolved to the installed face (DirectWrite, then the
+// registry, then the suffix heuristic on Windows; the app's font-database resolver, then the
+// heuristic elsewhere). Definition in psd_text_read.cpp.
+ResolvedPhotoshopFont resolve_photoshop_font_name(std::string_view font_name);
+
+// Photoshop 5.0/5.5 'tySh' type record ("Type tool info"), decoded into the same model the
+// modern TySh path feeds (docs/psd-legacy-text.md). Definitions in psd_text_legacy.cpp.
+struct LegacyTypeToolInfo {
+  // Text space to document pixels; tx/ty is the first line's baseline anchor at the
+  // alignment point (left edge, center, or right edge of the line).
+  std::array<double, 6> transform{1.0, 0.0, 0.0, 1.0, 0.0, 0.0};
+  // UTF-8 with '\n' line separators (the record's '\r' line ends, one UTF-16 unit each).
+  std::string text;
+  // Style runs in UTF-16 unit indices of `text`; one run per stretch of equal style mark.
+  std::vector<PsdTextStyleRun> runs;
+  // One paragraph run per line, carrying the line's alignment.
+  std::vector<PsdTextParagraphRun> paragraph_runs;
+  // The record's single fill color (PS 5 has one color per type layer).
+  RgbColor color{0, 0, 0};
+  // The record's anti-alias byte (0 off, 1 on); legacy_type_tool_anti_alias maps it.
+  std::uint8_t anti_alias_raw{0};
+  // Any line whose orientation is not horizontal (PS 5 vertical type): not modeled.
+  bool unsupported_orientation{false};
+};
+std::optional<LegacyTypeToolInfo> extract_legacy_type_tool(std::span<const std::uint8_t> payload,
+                                                           const CmykColorConverter& cmyk);
+// The modern engine-data /AntiAlias value for a PS 5 anti-alias byte: 0 stays None, anything
+// else is Sharp (4), which is what Photoshop 2026 assigns when it upgrades the record.
+int legacy_type_tool_anti_alias(std::uint8_t raw) noexcept;
+
+// Text write-prep and TySh generation: metadata field serialization, the
+// imported-text preview regeneration, and the generated engine-data/TySh
+// type-tool payload (definitions in psd_text_write.cpp).
+template <std::size_t Size>
+std::string serialize_double_array(const std::array<double, Size>& values) {
+  std::ostringstream stream;
+  stream << std::setprecision(17);
+  for (std::size_t index = 0; index < values.size(); ++index) {
+    if (index > 0U) {
+      stream << ' ';
+    }
+    stream << values[index];
+  }
+  return stream.str();
+}
+bool serialized_runs_have_photoshop_leading_signals(std::string_view runs_text);
+std::string serialize_text_bounds(const PsdTextBoundsD& bounds);
+std::string serialize_int_array(const std::array<int, 4>& values);
+bool should_regenerate_imported_text_preview(const LayerRecord& record, const PixelBuffer& pixels);
+std::optional<PixelBuffer> render_regenerated_imported_text_pixels(const LayerRecord& record,
+                                                                   std::int32_t width,
+                                                                   std::int32_t height);
+std::optional<std::vector<std::uint8_t>> photoshop_type_tool_payload_for_layer(const Layer& layer,
+                                                                               const Rect& bounds,
+                                                                               std::optional<std::int32_t> text_index_override = std::nullopt);
+bool should_write_generated_text_block(const EncodedLayer& encoded);
+// The text, runs, fonts and frame a type layer's engine data is written from (the same values
+// the TySh gets), or nullopt for a layer without text. Feeds the Txt2 text object writer.
+std::optional<TextEngineInputs> text_engine_inputs_for_layer(const Layer& layer, const Rect& bounds);
+// True when the layer's TySh is re-emitted from its imported Photoshop bytes (untouched imported
+// geometry) rather than regenerated; its Txt2 object stays the imported one too.
+bool text_layer_keeps_photoshop_type_block(const Layer& layer);
+}  // namespace patchy::psd

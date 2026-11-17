@@ -1,0 +1,367 @@
+#include "ui/document_save_coordinator.hpp"
+#include "ui/save_progress.hpp"
+
+#include "color/color_management.hpp"
+#include "color/rgb_profiles.hpp"
+#include "core/blend_math.hpp"
+#include "core/layer_metadata.hpp"
+#include "core/vector_shape.hpp"
+#include "formats/format_registry.hpp"
+#include "formats/aseprite_document_io.hpp"
+#include "formats/layered_blend_support.hpp"
+#include "formats/metadata/metadata_edit.hpp"
+#include "formats/ora_document_io.hpp"
+#include "psd/psd_document_io.hpp"
+#include "formats/svg_document_io.hpp"
+#include "formats/xcf_document_io.hpp"
+#include "ui/document_session.hpp"
+#include "ui/image_document_io.hpp"
+#include "ui/image_save_options_dialog.hpp"
+#include "ui/pdf_import.hpp"
+#include "ui/qt_paths.hpp"
+#include "ui/smart_object_render.hpp"
+#include "patchy_version.hpp"
+#include <QDateTime>
+#include <QFileInfo>
+#include <QUuid>
+#include <utility>
+
+namespace patchy::ui {
+
+metadata::SaveStamp save_stamp_now() {
+  const auto now = QDateTime::currentDateTime();
+  return metadata::SaveStamp{metadata::xmp_date(now.toSecsSinceEpoch(), now.offsetFromUtc() / 60),
+                             std::string("Patchy ") + PATCHY_VERSION,
+                             QUuid::createUuid().toString(QUuid::WithoutBraces).toStdString()};
+}
+
+namespace {
+
+bool is_jpeg_save_extension(const QString& extension) {
+  return extension == QStringLiteral("jpg") || extension == QStringLiteral("jpeg") ||
+         extension == QStringLiteral("jpe") || extension == QStringLiteral("jfif");
+}
+
+// Photoshop's save record in the document's XMP and EXIF (docs/file-info-save-stamp.md, "Save stamp"):
+// the save itself, and the file as written: `format` is dc:format, `color_mode` the PSD
+// header mode photoshop:ColorMode names (3 RGB, 4 CMYK).
+void stamp_document_for_save(Document& document, const char* format, int color_mode) {
+  const auto& read = std::as_const(document);
+  metadata::SaveStampDocument described;
+  described.format = format;
+  described.color_mode = color_mode;
+  described.width = read.width();
+  described.height = read.height();
+  described.horizontal_ppi = read.print_settings().horizontal_ppi;
+  described.vertical_ppi = read.print_settings().vertical_ppi;
+  const auto& profile = read.color_state().embedded_icc_profile;
+  described.srgb = color_mode == 3 && !profile.empty() && is_srgb_profile(profile);
+  metadata::stamp_file_info_for_save(document.file_info(), save_stamp_now(), &described);
+}
+
+}  // namespace
+
+bool is_photoshop_document_extension(const QString& extension) {
+  return extension == QStringLiteral("psd") || extension == QStringLiteral("psb");
+}
+
+bool is_tiff_extension(const QString& extension) {
+  return extension == QStringLiteral("tif") || extension == QStringLiteral("tiff");
+}
+
+// Formats whose writers keep the document's layer structure: PSD/PSB, Aseprite and
+// OpenRaster save the layer tree (OpenRaster bakes what it cannot hold after its own
+// warning, docs/ora.md), and ICO/CUR are exempt because multi-size icons deliberately live
+// as one hidden "WxH" layer per size that their writers round-trip.
+bool save_extension_preserves_layers(const QString& extension) {
+  return is_photoshop_document_extension(extension) || extension == QStringLiteral("aseprite") ||
+         extension == QStringLiteral("ase") || extension == QStringLiteral("ora") ||
+         extension == QStringLiteral("ico") || extension == QStringLiteral("cur");
+}
+
+// True when the session's file came from a format Patchy can only read (camera raw):
+// Save can never write back to such a path, so it must become Save As.
+//
+// PDF is listed explicitly rather than falling out of the registry, for two reasons. The
+// registry has no PDF row at all (the writer is Qt-side, in write_flat_image_file), and
+// more importantly a PDF import is a RASTERIZATION at a chosen resolution: saving over the
+// source would replace a multi-page vector document with one flat re-render. Save As and
+// Export to .pdf still work; only Save-in-place is redirected.
+bool is_read_only_source_extension(const QString& extension) {
+  if (extension.isEmpty()) {
+    return false;
+  }
+  if (is_pdf_extension(extension)) {
+    return true;
+  }
+  const auto* handler = builtin_format_registry().find_by_extension(extension.toStdString());
+  return handler != nullptr && !handler->can_write();
+}
+
+// Photoshop's "this format cannot store the document's features" test, reduced to what a
+// flat save discards in Patchy: a second layer or group, a non-pixel layer (group,
+// adjustment, text, smart object), a hand-authored mask, or layer styles. A single pixel
+// layer whose only mask is the document-alpha marker round-trips through flat formats
+// (the mask is written back as the file's alpha plane), so it does not count.
+bool flat_save_discards_layers(const Document& document) {
+  const auto& layers = document.layers();
+  if (layers.size() != 1) {
+    return !layers.empty();
+  }
+  const Layer& layer = layers.front();
+  if (layer.kind() != LayerKind::Pixel || !layer.children().empty() ||
+      layer_pixels_are_procedural(layer)) {
+    return true;
+  }
+  if (layer.mask().has_value() && !layer_mask_is_document_alpha(layer)) {
+    return true;
+  }
+  const auto blend_if_status = layer.blend_if_payload_status();
+  const bool has_blend_if = blend_if_status == BlendIfPayloadStatus::Unsupported
+                                ? !layer.raw_psd_blending_ranges().empty()
+                                : !blend_if_is_identity(layer.blend_if());
+  return !layer.layer_style().empty() || has_blend_if;
+}
+
+// Whether saving `document` into `extension` loses layer content. Flat formats
+// lose everything past one plain pixel layer. SVG keeps shape layers, folders,
+// vector masks and paint servers as real vectors, so it asks the writer for a
+// dry run and warns only when something bakes (text, pixels, smart objects,
+// adjustments, styles, raster masks, inexpressible blend modes): a shape-only
+// document saves in place with no warning.
+bool save_discards_layers(const Document& document, const QString& extension) {
+  // A TIFF keeps the layers unless its options turn them off, which
+  // MainWindow::save_document_to_path decides (docs/tiff.md).
+  if (save_extension_preserves_layers(extension) || is_tiff_extension(extension) ||
+      !flat_save_discards_layers(document)) {
+    return false;
+  }
+  if (extension == QStringLiteral("svg")) {
+    return !svg::DocumentIo::baked_content(document).empty();
+  }
+  return true;
+}
+
+bool DocumentSaveCoordinator::save(std::int64_t session_id) {
+  auto* target = host_.find_session(session_id);
+  if (target == nullptr) return false;
+  const auto path = target->path;
+  if (target->smart_object_link.has_value()) {
+    if (target->smart_object_link->external) {
+      // A linked-file child: the file on disk is the source of truth, so write it
+      // first and only then refresh the parent's previews and link metadata.
+      if (path.isEmpty()) {
+        return host_.save_as();
+      }
+      if (!host_.save_to_path(path)) {
+        return false;
+      }
+      return true;
+    }
+    // An embedded Edit Smart Object Contents tab: Save applies the contents back to
+    // the parent document instead of writing a file (Photoshop semantics).
+    return host_.commit_embedded(session_id);
+  }
+  if (path.isEmpty()) {
+    return host_.save_as();
+  }
+  if (is_read_only_source_extension(QFileInfo(path).suffix().toLower()) ||
+      xcf::is_compressed_xcf_file_name(QFileInfo(path).fileName().toStdString())) {
+    // The document was developed from a read-only source (camera raw); writing the raw
+    // back is impossible, so Save is really Save As (defaulting to <basename>.psd).
+    return host_.save_as();
+  }
+  if (!target->content_extension.isEmpty()) {
+    // The file opened by its content, not its name (a PSD named src.bin, GitHub issue
+    // 362): Save asks for a name that fits instead of writing under the misleading one.
+    return host_.save_as();
+  }
+  if (save_discards_layers(std::as_const(target->document), QFileInfo(path).suffix().toLower())) {
+    // Photoshop behavior: Save on a document whose file format cannot hold its layers
+    // (a JPEG that grew layers) turns into Save As, defaulting to PSD, instead of
+    // silently flattening back over the original file. A shape-only SVG holds its
+    // layers as vectors, so it saves in place.
+    return host_.save_as();
+  }
+  return host_.save_to_path(path);
+}
+
+ImageSaveOptions DocumentSaveCoordinator::effective_options(
+    const DocumentSession& session, const QString& path, const QString& extension,
+    const std::optional<ImageSaveOptions>& requested, const ImageSaveOptions& defaults) {
+  auto effective = requested.value_or(defaults);
+  if (!requested.has_value() && image_save_options_apply_to_extension(extension)) {
+    if (session.image_save_options.has_value() && session.image_save_options_path == path &&
+        session.image_save_options_extension == extension) {
+      effective = *session.image_save_options;
+    }
+  }
+  return effective;
+}
+
+namespace {
+
+// Layers in blend modes the layered format lacks: rebuilt to keep the look when the save
+// asked for it, otherwise written as Normal by the writer. Either way the save says so.
+void settle_unsupported_blend_modes(Document& snapshot, LayeredSaveFormat format, bool bake,
+                                    std::vector<std::string>& notices) {
+  if (find_unsupported_blend_modes(snapshot, format).empty()) {
+    return;
+  }
+  if (bake) {
+    (void)bake_unsupported_blend_modes(snapshot, format);
+    notices.emplace_back(QT_TRANSLATE_NOOP("QObject",
+                                           "Layers in blend modes this format cannot store were rebuilt as Normal "
+                                           "layers that keep the look."));
+  } else {
+    notices.emplace_back(QT_TRANSLATE_NOOP("QObject",
+                                           "Layers in blend modes this format cannot store were saved as Normal, "
+                                           "so the saved image looks different."));
+  }
+}
+
+}  // namespace
+
+std::optional<DocumentSaveResult> DocumentSaveCoordinator::write_prepared(
+    std::int64_t session_id, const QString& path, const QString& extension,
+    const ImageSaveOptions& effective_image_options, bool quiet, bool export_copy, bool discards_layers,
+    const std::optional<SaveWatermark>& watermark, bool stamp_save) {
+  auto* target = host_.find_session(session_id);
+  if (target == nullptr) return std::nullopt;
+  std::vector<std::string> writer_notices;
+  if (is_photoshop_document_extension(extension)) {
+    // Linked smart objects store their path relative to the document's folder, which
+    // is only known here (a never-saved document has none, and Save As can move it).
+    // Writer bookkeeping like Photoshop's own: no undo step.
+    refresh_smart_object_link_relative_paths(
+        target->document.metadata().smart_objects,
+        target->path.isEmpty() ? QString() : QFileInfo(target->path).absolutePath(),
+        QFileInfo(path).absolutePath());
+    // Photoshop's save record in the XMP and EXIF: the modify and metadata dates, a new
+    // instance, and on the first save the creation date and Patchy as the creator
+    // (docs/file-info-save-stamp.md, "Save stamp").
+    const bool psb = extension == QStringLiteral("psb");
+    const auto cmyk_proof = effective_image_options.psd_cmyk_proof ? working_cmyk_space() : nullptr;
+    if (stamp_save) {
+      psd::WriteOptions mode_options{psb};
+      mode_options.cmyk_proof = cmyk_proof;
+      const auto mode = psd::DocumentIo::layered_save_color_mode(std::as_const(target->document), mode_options).mode;
+      stamp_document_for_save(target->document, "application/vnd.adobe.photoshop", mode);
+    }
+    // The writer reads a copy-on-write snapshot on a worker, so the window keeps painting
+    // the Saving dialog through the composite (recovery writes the same way).
+    Document snapshot = std::as_const(*target).document_for_write();
+    const bool bake = effective_image_options.bake_unsupported_blend_modes;
+    host_.run_write(path, /*on_worker*/ true, !quiet,
+                    [&snapshot, &path, psb, &cmyk_proof, bake, &writer_notices](SaveProgress& progress) {
+      settle_unsupported_blend_modes(snapshot, LayeredSaveFormat::Photoshop, bake, writer_notices);
+      psd::WriteOptions options{psb};
+      options.cmyk_proof = cmyk_proof;
+      options.progress = [&progress](int done, int total, const std::string& label) {
+        progress.report(done, total, SaveProgress::Kind::Layers, QString::fromStdString(label));
+      };
+      options.encode_thumbnail = [](const PixelBuffer& pixels) {
+        const QImage image(pixels.data().data(), pixels.width(), pixels.height(),
+                           static_cast<qsizetype>(pixels.width()) * 3, QImage::Format_RGB888);
+        return encode_thumbnail_jpeg(image);
+      };
+      psd::DocumentIo::write_layered_rgb8_file(snapshot, to_filesystem_path(path), options);
+    });
+  } else if (extension == QStringLiteral("aseprite") || extension == QStringLiteral("ase")) {
+    // Layered save: the Aseprite writer keeps the layer tree instead of flattening.
+    Document written = std::as_const(*target).document_for_write();
+    settle_unsupported_blend_modes(written, LayeredSaveFormat::Aseprite,
+                                   effective_image_options.bake_unsupported_blend_modes, writer_notices);
+    std::optional<Document> narrowed;
+    aseprite::DocumentIo::write_file(document_for_8bit_writer(written, narrowed), to_filesystem_path(path));
+  } else if (extension == QStringLiteral("ora")) {
+    // Layered OpenRaster save from a copy-on-write snapshot on a worker; the writer bakes
+    // what ORA cannot hold (the save warned first) and reports it.
+    const Document snapshot = std::as_const(*target).document_for_write();
+    host_.run_write(path, /*on_worker*/ true, !quiet, [&snapshot, &path, &writer_notices](SaveProgress& progress) {
+      const ScopedSaveProgress scope(progress);
+      ora::DocumentIo::write_file(snapshot, to_filesystem_path(path), &writer_notices);
+    });
+  } else if (extension == QStringLiteral("svg")) {
+    // Structure-preserving vector write (never write_flat_image_file):
+    // shape layers stay SVG vectors, the writer reports what it baked.
+    std::optional<Document> narrowed;
+    svg::DocumentIo::write_file(document_for_8bit_writer(target->document, narrowed), to_filesystem_path(path),
+                                &writer_notices);
+  } else {
+    // A JPEG Save or Save As records itself like a PSD save (decided October 25, 2026); its
+    // EXIF then also carries a thumbnail (add_jpeg_exif_thumbnail). Copies (a script's
+    // exportAs) and every other flat format stay as they are; File > Export > Flat Image never comes here.
+    if (stamp_save && !export_copy && is_jpeg_save_extension(extension)) {
+      stamp_document_for_save(target->document, "image/jpeg", effective_image_options.export_cmyk ? 4 : 3);
+    }
+    // Editable PDF keeps layers and reports what it baked, like the SVG writer. Every flat
+    // format and PDF writes a copy-on-write snapshot on a worker (a one-page PDF of a grid
+    // of scanned pages took 10 s on this thread); PDF reports its pages.
+    const Document snapshot = std::as_const(target->document);
+    // A layered TIFF carries Photoshop layer records; a flat one is the composite.
+    const bool layered_tiff = is_tiff_extension(extension) && effective_image_options.tiff_layers.value_or(false);
+    host_.run_write(path, /*on_worker*/ true, !quiet,
+                    [&snapshot, &path, &extension, &effective_image_options, &writer_notices, &watermark,
+                     layered_tiff](SaveProgress& progress) {
+                      const ScopedSaveProgress scope(progress);
+                      std::optional<Document> settled;
+                      if (layered_tiff && !find_unsupported_blend_modes(snapshot, LayeredSaveFormat::Photoshop).empty()) {
+                        settled = snapshot;
+                        settle_unsupported_blend_modes(*settled, LayeredSaveFormat::Photoshop,
+                                                       effective_image_options.bake_unsupported_blend_modes,
+                                                       writer_notices);
+                      }
+                      const Document& source = settled.has_value() ? *settled : snapshot;
+                      std::optional<Document> marked;
+                      if (watermark.has_value()) {
+                        marked = watermarked_save_document(
+                            source, *watermark, image_format_preserves_alpha(extension.toStdString()),
+                            &writer_notices);
+                      }
+                      write_flat_image_file(marked.has_value() ? *marked : source, path, extension,
+                                            effective_image_options, &writer_notices);
+                    });
+  }
+  host_.offer_download(path);
+  target = host_.find_session(session_id);
+  if (target == nullptr) return std::nullopt;
+  const bool saved_flattened_copy =
+      discards_layers && !(target->smart_object_link.has_value() && target->smart_object_link->external);
+  if (saved_flattened_copy || export_copy) {
+    // A copy does not take ownership of the session path or clear its modified state.
+    if (!quiet) {
+      host_.remember_directory(path);
+      if (image_save_options_apply_to_extension(extension)) {
+        host_.persist_defaults(effective_image_options);
+      }
+    }
+    host_.add_recent(path);
+    return DocumentSaveResult{saved_flattened_copy, std::move(writer_notices)};
+  }
+  target->path = path;
+  target->title = QFileInfo(path).fileName();
+  target->content_extension.clear();
+  if (!quiet) host_.remember_directory(path);
+  target = host_.find_session(session_id);
+  if (target == nullptr) return std::nullopt;
+  if (!is_photoshop_document_extension(extension) && image_save_options_apply_to_extension(extension)) {
+    target->image_save_options = effective_image_options;
+    target->image_save_options_path = path;
+    target->image_save_options_extension = extension;
+    if (!quiet) host_.persist_defaults(effective_image_options);
+  } else {
+    target->image_save_options.reset();
+    target->image_save_options_path.clear();
+    target->image_save_options_extension.clear();
+  }
+  host_.mark_saved(session_id);
+  host_.add_recent(path);
+  return DocumentSaveResult{false, std::move(writer_notices)};
+}
+
+void DocumentSaveCoordinator::mark_saved(DocumentSession& session) {
+  session.saved_revision = session.revision;
+}
+
+}  // namespace patchy::ui

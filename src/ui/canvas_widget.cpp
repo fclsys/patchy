@@ -1,0 +1,2525 @@
+#include "ui/canvas_widget.hpp"
+#include "ui/quick_mask_trace.hpp"
+
+#include "color/color_management.hpp"
+#include "core/adjustment_layer.hpp"
+#include "core/document_channel.hpp"
+#include "core/layer.hpp"
+#include "core/layer_metadata.hpp"
+#include "core/layer_render_utils.hpp"
+#include "core/layer_tree.hpp"
+#include "core/pattern_resource.hpp"
+#include "core/pixel_buffer.hpp"
+#include "core/pixel_depth.hpp"
+#include "core/pixel_tools.hpp"
+#include "core/rect_utils.hpp"
+#include "core/smart_object.hpp"
+#include "core/text_area.hpp"
+#include "render/compositor.hpp"
+#include "ui/canvas_alt_space_filter.hpp"
+#include "ui/canvas_types.hpp"
+#include "ui/canvas_widget_shared.hpp"
+#include "ui/curves_clipping_preview.hpp"
+#include "ui/edit_conversions.hpp"
+#include "ui/image_document_io.hpp"
+#include "ui/qt_geometry.hpp"
+#include "ui/text_area_layout.hpp"
+#include "ui/theme_script_host.hpp"
+#include "ui/theme_sounds.hpp"
+
+#include <QApplication>
+#include <QColor>
+#include <QCursor>
+#include <QImage>
+#include <QPainter>
+#include <QPixmap>
+#include <QPoint>
+#include <QPointF>
+#include <QRect>
+#include <QRectF>
+#include <QRegion>
+#include <QScrollBar>
+#include <QSize>
+#include <QString>
+#include <QWidget>
+#include <Qt>
+#include <QtGlobal>
+
+#include <algorithm>
+#include <array>
+#include <cmath>
+#include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <functional>
+#include <memory>
+#include <optional>
+#include <string>
+#include <string_view>
+#include <utility>
+#include <vector>
+
+namespace patchy::ui {
+
+namespace {
+
+// A copy of `document` with those layers hidden, for the deep retouch snapshot of a
+// Current & Below sample (the copy shares pixel storage until written).
+Document document_with_hidden_layers(const Document& document, const std::vector<LayerId>& hidden_layer_ids) {
+  Document copy = document;
+  for (const auto id : hidden_layer_ids) {
+    if (auto* layer = copy.find_layer(id); layer != nullptr) {
+      layer->set_visible(false);
+    }
+  }
+  return copy;
+}
+
+QImage qimage_from_flat_composite_pixels(const PixelBuffer& pixels) {
+  if (pixels.empty() || pixels.format().bit_depth != BitDepth::UInt8 || pixels.format().channels < 3) {
+    return {};
+  }
+
+  QImage image(pixels.width(), pixels.height(), QImage::Format_RGBA8888);
+  const auto channels = pixels.format().channels;
+  const auto source_stride = pixels.stride_bytes();
+  const auto* source_bytes = pixels.data().data();
+  for (std::int32_t y = 0; y < pixels.height(); ++y) {
+    const auto* source_row = source_bytes + static_cast<std::size_t>(y) * source_stride;
+    auto* target_row = image.scanLine(y);
+    if (channels >= 4) {
+      std::memcpy(target_row, source_row, static_cast<std::size_t>(pixels.width()) * 4U);
+      continue;
+    }
+    for (std::int32_t x = 0; x < pixels.width(); ++x) {
+      const auto* src = source_row + static_cast<std::size_t>(x) * channels;
+      auto* dst = target_row + static_cast<std::size_t>(x) * 4U;
+      dst[0] = src[0];
+      dst[1] = src[1];
+      dst[2] = src[2];
+      dst[3] = 255;
+    }
+  }
+  return image;
+}
+
+// The hit-test walks must not count as mutations: descending through the
+// non-const Layer::children() accessor bumps every visited group's revisions
+// on every Move-tool hover and press, silently invalidating the revision-keyed
+// thumbnail and style-mask caches (same bug class as Document::find_layer_recursive).
+// Walk const here; the topmost_*_at wrappers cast the hit.
+const Layer* topmost_pixel_layer_at_recursive(const std::vector<Layer>& layers, QPoint document_point,
+                                              bool require_visible_pixel, bool skip_locked,
+                                              LayerLockFlags ancestor_lock_flags = kLayerLockNone) {
+  for (auto it = layers.rbegin(); it != layers.rend(); ++it) {
+    const auto& layer = *it;
+    if (!layer.visible() || layer.opacity() <= 0.0F) {
+      continue;
+    }
+    const auto effective_lock_flags = ancestor_lock_flags | patchy::layer_lock_flags(layer);
+    if (layer.kind() == LayerKind::Group) {
+      if (const auto* found =
+              topmost_pixel_layer_at_recursive(layer.children(), document_point, require_visible_pixel, skip_locked,
+                                               effective_lock_flags);
+          found != nullptr) {
+        return found;
+      }
+      continue;
+    }
+    if (skip_locked && (effective_lock_flags & kLayerLockImagePixels) != kLayerLockNone) {
+      continue;
+    }
+    if (pixel_layer_contains_document_point(layer, document_point, require_visible_pixel)) {
+      return &layer;
+    }
+  }
+  return nullptr;
+}
+
+// One walk for both Move-tool hit passes: `contains` is the pixel-precise
+// test (move_layer_contains_document_point) or the outline-rect test
+// (move_layer_rect_contains_document_point); see topmost_move_layer_at.
+template <typename Contains>
+const Layer* topmost_move_layer_at_recursive(const std::vector<Layer>& layers, QPoint document_point, bool skip_locked,
+                                             const Contains& contains,
+                                             LayerLockFlags ancestor_lock_flags = kLayerLockNone) {
+  for (auto it = layers.rbegin(); it != layers.rend(); ++it) {
+    const auto& layer = *it;
+    if (!layer.visible() || layer.opacity() <= 0.0F) {
+      continue;
+    }
+    const auto effective_lock_flags = ancestor_lock_flags | patchy::layer_lock_flags(layer);
+    if (layer.kind() == LayerKind::Group) {
+      if (const auto* found = topmost_move_layer_at_recursive(layer.children(), document_point, skip_locked, contains,
+                                                              effective_lock_flags);
+          found != nullptr) {
+        return found;
+      }
+      continue;
+    }
+    if (skip_locked && (effective_lock_flags & kLayerLockPosition) != kLayerLockNone) {
+      continue;
+    }
+    if (contains(layer, document_point)) {
+      return &layer;
+    }
+  }
+  return nullptr;
+}
+
+// The largest type size of a text layer, in text-local pixels. The runs carry the sizes
+// (column 3 of each patchy.text.runs line); the layer-level size key is only what a session
+// starts from, and a script-made layer keeps a small default there.
+double largest_text_size(const Layer& layer) {
+  double size = 0.0;
+  if (const auto found = layer.metadata().find(kLayerMetadataTextSize); found != layer.metadata().end()) {
+    size = static_cast<double>(std::atoi(found->second.c_str()));
+  }
+  const auto runs = layer.metadata().find(kLayerMetadataTextRuns);
+  if (runs == layer.metadata().end()) {
+    return size;
+  }
+  const std::string_view text = runs->second;
+  std::size_t line_start = 0;
+  while (line_start < text.size()) {
+    auto line_end = text.find('\n', line_start);
+    if (line_end == std::string_view::npos) {
+      line_end = text.size();
+    }
+    // start, length, size: the third tab-separated field. The version line has no tabs.
+    const auto line = text.substr(line_start, line_end - line_start);
+    const auto first_tab = line.find('\t');
+    const auto second_tab = first_tab == std::string_view::npos ? first_tab : line.find('\t', first_tab + 1);
+    if (second_tab != std::string_view::npos) {
+      const std::string field(line.substr(second_tab + 1, line.find('\t', second_tab + 1) - second_tab - 1));
+      const double run_size = std::strtod(field.c_str(), nullptr);
+      if (std::isfinite(run_size)) {
+        size = std::max(size, run_size);
+      }
+    }
+    line_start = line_end + 1;
+  }
+  return size;
+}
+
+// Whether a Type tool press at the point lands on this text layer (CanvasWidget::
+// type_tool_hits_text_layer; `path_reach` is its type_tool_path_reach).
+bool text_layer_contains_type_point(const Layer& layer, QPoint document_point, double path_reach) {
+  if (!layer_is_text(layer)) {
+    return false;
+  }
+  if (const auto area = text_area_in_document(layer)) {
+    return TextAreaGeometry(*area).contains(document_point);
+  }
+  const bool in_bounds = layer.bounds().contains(document_point.x(), document_point.y());
+  const auto path = text_path_in_document(layer);
+  if (!path) {
+    return in_bounds;
+  }
+  // Text on a path: its line, bare parts included, so a click there opens the layer; and the
+  // band its glyphs stand in. The rest of its bounding box (the inside of a ring of text, the
+  // corners around a slanted line) belongs to whatever else is there.
+  const auto transform = text_area_transform(layer);
+  const double scale = std::sqrt(std::abs(transform[0] * transform[3] - transform[1] * transform[2]));
+  // As far as glyphs reach either side of the line (the session's own measure, main_window.cpp
+  // path_text_reach), in document pixels.
+  const double glyph_reach = std::max(12.0, 1.6 * std::max(1.0, largest_text_size(layer))) * std::max(scale, 0.0001);
+  const double reach = in_bounds ? std::max(path_reach, glyph_reach) : path_reach;
+  if (const auto contour_bounds = path->bounds();
+      !contour_bounds || document_point.x() < contour_bounds->left - reach ||
+      document_point.x() > contour_bounds->right + reach || document_point.y() < contour_bounds->top - reach ||
+      document_point.y() > contour_bounds->bottom + reach) {
+    return false;
+  }
+  return TextPathCurve(*path).nearest(document_point.x(), document_point.y()).gap <= reach;
+}
+
+const Layer* topmost_text_layer_at_recursive(const std::vector<Layer>& layers, QPoint document_point,
+                                             double path_reach) {
+  for (auto it = layers.rbegin(); it != layers.rend(); ++it) {
+    const auto& layer = *it;
+    if (!layer.visible()) {
+      continue;
+    }
+    if (layer.kind() == LayerKind::Group) {
+      if (const auto* found = topmost_text_layer_at_recursive(layer.children(), document_point, path_reach);
+          found != nullptr) {
+        return found;
+      }
+      continue;
+    }
+    if (text_layer_contains_type_point(layer, document_point, path_reach)) {
+      return &layer;
+    }
+  }
+  return nullptr;
+}
+
+bool expand_mask_to_include_rect(LayerMask& mask, QRect document_rect, QSize canvas_size) {
+  document_rect = document_rect.normalized().intersected(QRect(QPoint(), canvas_size));
+  if (document_rect.isEmpty()) {
+    return false;
+  }
+
+  const auto current = QRect(mask.bounds.x, mask.bounds.y, mask.bounds.width, mask.bounds.height);
+  if (!mask.pixels.empty() && current.contains(document_rect)) {
+    return true;
+  }
+
+  const auto expanded = (mask.pixels.empty() ? document_rect : current.united(document_rect))
+                            .intersected(QRect(QPoint(), canvas_size));
+  if (expanded.isEmpty()) {
+    return false;
+  }
+
+  // A 16/32-bit mask grows at its depth (docs/high-bit-depth.md).
+  const auto format = !mask.pixels.empty() && mask.pixels.format().channels == 1U ? mask.pixels.format()
+                                                                                   : PixelFormat::gray8();
+  PixelBuffer next(expanded.width(), expanded.height(), format);
+  if (format.bit_depth == BitDepth::UInt8) {
+    next.clear(mask.default_color);
+  } else {
+    const std::vector<float> fill(static_cast<std::size_t>(expanded.width()), static_cast<float>(mask.default_color));
+    for (int y = 0; y < expanded.height(); ++y) {
+      store_coverage_row(next, y, 0, expanded.width(), fill);
+    }
+  }
+  if (!mask.pixels.empty() && mask.pixels.format() == format) {
+    const auto copy_rect = current.intersected(expanded);
+    const auto sample_bytes = bytes_per_pixel(format);
+    for (int y = copy_rect.top(); y <= copy_rect.bottom(); ++y) {
+      for (int x = copy_rect.left(); x <= copy_rect.right(); ++x) {
+        const auto* from = std::as_const(mask.pixels).pixel(x - current.x(), y - current.y());
+        std::copy(from, from + sample_bytes, next.pixel(x - expanded.x(), y - expanded.y()));
+      }
+    }
+  }
+
+  mask.bounds = Rect{expanded.x(), expanded.y(), expanded.width(), expanded.height()};
+  mask.pixels = std::move(next);
+  return true;
+}
+
+}  // namespace
+
+CanvasWidget::CanvasWidget(QWidget* parent) : QWidget(parent) {
+  // Windows: keep Alt+Space mid-gesture away from Qt's system-menu path.
+  install_alt_space_drag_filter();
+  setAutoFillBackground(false);
+  setMouseTracking(true);
+  setTabletTracking(true);
+  setFocusPolicy(Qt::StrongFocus);
+  const auto make_scroll_bar = [this](Qt::Orientation orientation, const QString& name) {
+    auto* bar = new QScrollBar(orientation, this);
+    bar->setObjectName(name);
+    bar->setFocusPolicy(Qt::NoFocus);  // keep canvas keyboard handling unaffected
+    bar->setCursor(Qt::ArrowCursor);   // children otherwise inherit the canvas tool cursor
+    bar->hide();
+    connect(bar, &QScrollBar::valueChanged, this,
+            [this, orientation](int value) { handle_scroll_bar_value_changed(orientation, value); });
+    return bar;
+  };
+  horizontal_scroll_bar_ = make_scroll_bar(Qt::Horizontal, QStringLiteral("canvasHorizontalScrollBar"));
+  vertical_scroll_bar_ = make_scroll_bar(Qt::Vertical, QStringLiteral("canvasVerticalScrollBar"));
+  // Watch the whole app for modifier-key changes so the selection cursor badge
+  // updates the instant Shift/Alt change even when the canvas does not hold
+  // keyboard focus (the key events otherwise go to whichever panel has focus).
+  qApp->installEventFilter(this);
+  selection_timer_.start(120, this);
+  pen_proximity_clock_.start();
+}
+
+void CanvasWidget::set_document(Document* document) {
+  set_document_internal(document, /*preserve_frame_for_same_size=*/false);
+}
+
+void CanvasWidget::set_document_after_canvas_growth(Document* document, QPoint document_shift) {
+  const QImage old_frame = render_cache_dirty_ ? QImage() : render_cache_;
+  set_document_internal(document, /*preserve_frame_for_same_size=*/false);
+  if (document_ == nullptr || old_frame.isNull()) {
+    return;
+  }
+  QImage seeded(document_->width(), document_->height(), old_frame.format());
+  seeded.fill(Qt::transparent);
+  {
+    QPainter painter(&seeded);
+    painter.setCompositionMode(QPainter::CompositionMode_Source);
+    painter.drawImage(document_shift, old_frame);
+  }
+  // Still dirty: the edit changed pixels too, so the refresh renders the whole canvas;
+  // until it lands this seed is the frame paint shows (should_defer_full_refresh_to_async).
+  render_cache_ = std::move(seeded);
+  render_cache_dirty_ = true;
+}
+
+bool CanvasWidget::pointer_gesture_active() const noexcept {
+  return move_layer_selection_gesture_.has_value() || painting_ || drawing_shape_ || dragging_text_rect_ ||
+         rotating_view_ ||
+         move_drag_pending_ ||
+         moving_layer_ || dragging_transform_ || dragging_warp_handle_ || selecting_ ||
+         lassoing_ || quick_selecting_ || object_selecting_ || spot_healing_stroke_active_ ||
+         patch_tool_dragging_ || red_eye_dragging_ ||
+         moving_selection_ || marquee_resize_handle_ != TransformHandle::None || dragging_guide_ ||
+         crop_dragging_out_ || crop_rotating_ ||
+         crop_drag_handle_ != TransformHandle::None || pen_handle_dragging_ ||
+         pen_session_drag_anchor_ >= 0 || path_drag_mode_ != PathEditDrag::None ||
+         path_transform_drag_handle_ != TransformHandle::None || artboard_drag_active() ||
+         ruler_drag_part_ != RulerPart::None || gradient_handle_drag_.has_value() ||
+         shape_handle_drag_active();
+}
+
+void CanvasWidget::set_tiling_preview_enabled(bool enabled) {
+  if (tiling_preview_enabled_ == enabled) {
+    return;
+  }
+  tiling_preview_enabled_ = enabled;
+  tiling_tile_pixmap_ = QPixmap();
+  tiling_tile_pixmap_size_ = QSize();
+  update();
+}
+
+bool CanvasWidget::tiling_preview_enabled() const noexcept {
+  return tiling_preview_enabled_;
+}
+
+void CanvasWidget::set_document_for_history_restore(Document* document, bool normal_composite_unchanged) {
+  set_document_internal(document, /*preserve_frame_for_same_size=*/true, normal_composite_unchanged);
+}
+
+void CanvasWidget::set_document_internal(Document* document, bool preserve_frame_for_same_size,
+                                         bool normal_composite_unchanged) {
+  // Only the document the drag hid effects in may be touched: a different one can
+  // mean the old document is already gone.
+  if (document == document_) {
+    finish_path_drag_rasters();
+    restore_path_drag_effects();
+  } else {
+    path_drag_effects_hidden_layer_.reset();
+    path_drag_raster_lag_.clear();  // the shifted rasters belong to the outgoing document
+    move_float_memory_.reset();  // the remembered floating pixels belong to the outgoing document
+  }
+  close_canvas_context_menu();
+  invalidate_vector_preview();
+  cancel_pointer_gestures();
+  painting_ = false;
+  sync_stroke_input_compression();
+  // An armed stroke ends with the outgoing document (the host validates the
+  // entry before shrinking it).
+  finish_paint_stroke_history();
+  clear_brush_stroke_tracking();
+  reset_brush_smoothing();
+  reset_axis_constrained_stroke();
+  deferred_wait_release_.reset();
+  cancel_pen_path();  // an in-flight path belongs to the outgoing document
+  cancel_path_transform();
+  clear_preview_scaled_document();
+  preview_scale_cache_.reset();
+  clear_transform_commit_hold();  // a held commit frame belongs to the outgoing state
+  gradient_view_preview_.reset();
+  gradient_view_preview_source_.reset();
+  gradient_view_preview_raster_ = PixelBuffer();
+  gradient_drag_hold_.reset();
+  gradient_pending_commit_.reset();
+  cancel_move_commit_job();
+  active_document_path_.reset();
+  last_saved_path_target_.reset();
+  path_selected_anchors_.clear();
+  extra_selected_anchors_.clear();
+  clear_transient_read_interaction();
+  curves_clipping_mode_.reset();
+  curves_clipping_channel_.reset();
+  curves_clipping_preview_image_ = QImage();
+  curves_clipping_display_mip_cache_.clear();
+  curves_clipping_display_mip_source_key_ = 0;
+  const auto old_transform_controls_rect = move_transform_controls_rect();
+  const bool render_cache_was_dirty = render_cache_dirty_;
+  const bool preserve_frame = preserve_frame_for_same_size && document != nullptr && !render_cache_.isNull() &&
+                              render_cache_.size() == QSize(document->width(), document->height());
+  const bool preserve_quick_mask =
+      preserve_frame_for_same_size && quick_mask_active_ && document != nullptr &&
+      document_ != nullptr && document_->width() == document->width() &&
+      document_->height() == document->height();
+  const bool quick_mask_was_cleared = quick_mask_active_ && !preserve_quick_mask;
+  // The Ruler line survives a history restore of the same size; another document or a
+  // new canvas size clears it (docs/pick-tool.md).
+  const bool keep_ruler_line = preserve_frame_for_same_size && document != nullptr && document_ != nullptr &&
+                               document_->width() == document->width() &&
+                               document_->height() == document->height();
+  if (quick_mask_was_cleared) {
+    quick_mask_trace(QStringLiteral("Quick Mask off: the canvas's document was replaced"));
+    quick_mask_active_ = false;
+    quick_mask_pixels_ = {};
+    primary_color_ = quick_mask_saved_primary_;
+    secondary_color_ = quick_mask_saved_secondary_;
+    quick_mask_edit_before_.reset();
+    quick_mask_edit_label_.clear();
+    quick_mask_edit_dirty_ = QRegion();
+  }
+  // A Smart Filter mask edit buffer is tied to a layer instance in the old
+  // document. History restoration installs a different Document object, so the
+  // host must explicitly resync the target after it has resolved that owner.
+  smart_filter_mask_pixels_ = {};
+  smart_filter_mask_owner_id_ = 0;
+  smart_filter_mask_edit_before_.reset();
+  smart_filter_mask_edit_label_.clear();
+  smart_filter_mask_edit_dirty_ = QRegion();
+  const auto restore_channel_id =
+      preserve_frame_for_same_size && layer_edit_target_ == LayerEditTarget::DocumentChannel
+          ? active_document_channel_id_
+          : ChannelId{0};
+  const auto restore_component_target =
+      preserve_frame_for_same_size &&
+              (CanvasWidget::is_component_preview(layer_edit_target_))
+          ? layer_edit_target_
+          : LayerEditTarget::Content;
+  // A layer mask (or vector mask) being edited survives a history restore as
+  // long as the restored active layer still has one: undoing a brush stroke on
+  // a mask used to drop the user back onto the layer pixels, so the next
+  // stroke went to the wrong place (GitHub issue 105).
+  const auto restore_layer_mask_target =
+      preserve_frame_for_same_size &&
+              (layer_edit_target_ == LayerEditTarget::Mask || layer_edit_target_ == LayerEditTarget::VectorMask)
+          ? layer_edit_target_
+          : LayerEditTarget::Content;
+  const auto restore_channel_display_mode = mask_display_mode_;
+  const auto restore_channel_view = preserve_frame_for_same_size ? channel_view_ : composite_channel_view();
+  cancel_pending_pixel_shape();  // the document it was drawn over is gone or was swapped
+  cancel_free_transform();
+  if (warping_layer_) {
+    reset_warp_state();
+  }
+  cancel_move_layer_selection();
+  move_drag_pending_ = false;
+  moving_layer_ = false;
+  paint_ctrl_click_.reset();
+  moving_layers_.clear();
+  move_readout_base_rect_.reset();
+  drag_readout_dirty_rect_ = QRect();
+  move_preview_delta_ = QPoint();
+  move_preview_patches_.clear();
+  move_preview_patches_delta_.reset();
+  moving_layers_use_outline_preview_ = false;
+  clear_retained_move_caches();
+  reset_move_live_latch();
+  document_ = document;
+  set_move_transform_controls_layer(std::nullopt);
+  selected_guide_index_ = -1;
+  dragging_guide_ = false;
+  creating_guide_ = false;
+  guide_drag_remove_ = false;
+  layer_edit_target_ = LayerEditTarget::Content;
+  active_document_channel_id_ = 0;
+  mask_display_mode_ = MaskDisplayMode::None;
+  mask_display_image_ = QImage();
+  mask_display_image_layer_ = 0;
+  mask_display_image_channel_ = 0;
+  mask_display_image_revision_ = 0;
+  if (restore_channel_id != 0 && document_ != nullptr &&
+      static_cast<const Document*>(document_)->find_channel(restore_channel_id) != nullptr) {
+    layer_edit_target_ = LayerEditTarget::DocumentChannel;
+    active_document_channel_id_ = restore_channel_id;
+    mask_display_mode_ = restore_channel_display_mode == MaskDisplayMode::None
+                             ? MaskDisplayMode::Grayscale
+                             : restore_channel_display_mode;
+  } else if (restore_component_target != LayerEditTarget::Content) {
+    layer_edit_target_ = restore_component_target;
+    mask_display_mode_ = MaskDisplayMode::Grayscale;
+  } else if (restore_layer_mask_target != LayerEditTarget::Content && document_ != nullptr) {
+    const auto* restored = static_cast<const Document*>(document_);
+    const auto active_id = restored->active_layer_id();
+    const auto* active = active_id.has_value() ? restored->find_layer(*active_id) : nullptr;
+    const bool still_has_target = active != nullptr &&
+                                  (restore_layer_mask_target == LayerEditTarget::Mask
+                                       ? active->mask().has_value()
+                                       : active->vector_mask() != nullptr);
+    if (still_has_target) {
+      layer_edit_target_ = restore_layer_mask_target;
+      mask_display_mode_ = restore_channel_display_mode;
+    }
+  }
+  channel_view_ = layer_edit_target_ == LayerEditTarget::DocumentChannel
+                      ? composite_channel_view()
+                      : channel_view_for_target(restore_channel_view, channel_view_target_for(layer_edit_target_));
+  if (!preserve_frame) {
+    render_cache_ = QImage();
+    render_cache_diagnostics_ = {};
+  }
+  const bool keep_normal_composite_cache = preserve_frame && normal_composite_unchanged;
+  if (!keep_normal_composite_cache) {
+    // An in-flight background refresh snapshotted the outgoing document
+    // state; its completion must not install that frame over the incoming
+    // one (a repaint no longer marks a current-generation refresh pending).
+    cancel_async_render_cache_refresh();
+  }
+  render_cache_dirty_ = keep_normal_composite_cache ? render_cache_was_dirty : true;
+  if (!preserve_frame && document_ != nullptr && document_->metadata().psd_flat_composite.has_value()) {
+    const auto& flat_composite = *document_->metadata().psd_flat_composite;
+    // RGB-only PSD compatibility composites cannot preserve transparency, so
+    // using them as a cache seed hides checkerboards until the next refresh.
+    if (flat_composite.format().channels >= 4 && flat_composite.width() == document_->width() &&
+        flat_composite.height() == document_->height()) {
+      render_cache_ = qimage_from_flat_composite_pixels(flat_composite);
+      quantize_image_for_palette_display(render_cache_);
+      render_cache_dirty_ = render_cache_.isNull();
+    }
+    document_->metadata().psd_flat_composite.reset();
+  }
+  if (!keep_normal_composite_cache) {
+    invalidate_display_mip_cache();
+  }
+  clear_move_hover_outline();
+  update_move_transform_controls_dirty(old_transform_controls_rect);
+  smudge_state_ = {};
+  mixer_brush_state_ = {};
+  cancel_quick_select_stroke();
+  cancel_object_select();
+  // Undo and redo swap Document copies in here; the pixel signature decides on next use.
+  mark_object_select_embedding_unverified();
+  cancel_spot_heal_stroke();
+  cancel_red_eye_gesture();
+  cancel_patch_tool_drag();
+  cancel_crop_session();
+  cancel_perspective_crop_session();
+  abandon_gradient_fill_handle_drag();
+  abandon_shape_resize_drag();
+  if (keep_ruler_line) {
+    cancel_ruler_drag();
+  } else {
+    clear_ruler_line();
+  }
+  begin_default_crop_session();  // the Crop tool frames the incoming document
+  reset_axis_constrained_stroke();
+  last_stroke_end_document_.reset();
+  last_stroke_end_alt_swapped_ = false;
+  refresh_stroke_connect_preview();
+  if (brush_adjust_dragging_) {
+    end_brush_adjust_drag(false);
+  }
+  if (isVisible()) {
+    constrain_pan();
+  }
+  sync_scroll_bars();  // this path constrains pan without notify_view_changed()
+  update();
+  if (quick_mask_was_cleared && quick_mask_changed_callback_) {
+    quick_mask_changed_callback_();
+  }
+}
+
+void CanvasWidget::forget_stroke_connect_point() {
+  last_stroke_end_document_.reset();
+  last_stroke_end_alt_swapped_ = false;
+  refresh_stroke_connect_preview();
+}
+
+void CanvasWidget::set_tool(CanvasTool tool) {
+  const auto tool_changed = tool_ != tool;
+  const auto old_transform_controls_rect = move_transform_controls_rect();
+  if (tool_changed) {
+    // The resize drag belongs to the old tool's brush; it also holds the pointer lock.
+    end_brush_adjust_drag(true);
+    close_canvas_context_menu();
+    hide_eyedropper_sample_outline();
+    if (pen_session_active_) {
+      // Switching away commits the open path (Photoshop keeps the work): the
+      // callback routes it to a shape layer or the work path.
+      commit_pen_path(false);
+    }
+    if (tool_ == CanvasTool::PathSelect && tool == CanvasTool::DirectSelect) {
+      // Path Select selects whole shapes; Direct Select starts with no points
+      // selected, so its first press drags one point (GitHub issue 248).
+      clear_path_edit_selection();
+    } else if (tool == CanvasTool::PathSelect && tool_ != CanvasTool::PathSelect) {
+      // Carried-over points (Direct Select, the Pen's Ctrl latch) become their
+      // whole shapes: Path Select never holds a partial shape.
+      expand_path_selection_to_groups();
+    }
+    pen_temp_direct_select_ = false;
+    shape_temp_path_select_ = false;
+    move_vector_mask_drag_ = false;
+    finish_path_drag_rasters();
+    restore_path_drag_effects();
+    shape_ctrl_path_select_ = false;
+    arrow_swap_active_ = false;
+    path_selection_by_path_select_ = tool == CanvasTool::PathSelect;
+    pen_session_drag_anchor_ = -1;
+    path_hover_hint_action_ = PenHoverAction::Draw;
+    path_hover_hint_target_ = PathHoverTarget::None;
+    cancel_magnetic_lasso();
+    cancel_polygon_lasso();
+    cancel_spot_heal_stroke();
+    cancel_red_eye_gesture();
+    cancel_patch_tool_drag();
+    // A pending crop cancels on tool switch (never commits): an accidental
+    // switch must not resize the document.
+    cancel_crop_session();
+    cancel_perspective_crop_session();
+    cancel_ruler_drag();
+    cancel_gradient_fill_handle_drag();
+    clear_gradient_fill_drag_hold();  // the held preview is the Gradient tool's
+    cancel_shape_resize_drag();
+    finish_gradient_opacity_popup(true);
+    gradient_stop_selection_.reset();
+    cancel_artboard_drag();
+    commit_path_transform();  // tool switches commit, like the pen session
+    commit_pending_pixel_shape();  // and a pending pixel shape is painted (GitHub issue 716)
+    finish_free_transform();
+    finish_warp_transform();
+    cancel_move_layer_selection();
+    move_drag_pending_ = false;
+    moving_layer_ = false;
+    paint_ctrl_click_.reset();
+    moving_layers_.clear();
+    move_readout_base_rect_.reset();
+    drag_readout_dirty_rect_ = QRect();
+    clear_move_snap_guides();
+    move_preview_delta_ = QPoint();
+    move_preview_patches_.clear();
+    move_preview_patches_delta_.reset();
+    moving_layers_use_outline_preview_ = false;
+    clear_retained_move_caches();
+    reset_move_live_latch();
+    set_move_transform_controls_layer(std::nullopt);
+    clear_move_hover_outline();
+    mixer_brush_state_ = {};
+  }
+  tool_ = tool;
+  if (tool_changed) {
+    refresh_stroke_connect_preview();
+  }
+  // Each selection tool keeps its own combine mode; surface this tool's stored
+  // mode so the cursor badge and Options bar follow when switching tools.
+  if (const auto index = selection_tool_index(tool_); index >= 0) {
+    selection_mode_ = selection_modes_per_tool_[static_cast<std::size_t>(index)];
+  }
+  if (tool_changed) {
+    // Picking Crop frames the canvas (or the selection) at once, handles ready.
+    begin_default_crop_session();
+  }
+  update_tool_cursor();
+  if (tool_changed) {
+    update_move_transform_controls_dirty(old_transform_controls_rect);
+    update();
+    notify_transform_controls_changed();
+    notify_selection_mode_changed();
+  }
+}
+
+CanvasTool CanvasWidget::tool() const noexcept {
+  return tool_;
+}
+
+void CanvasWidget::set_edit_locked(bool locked) noexcept {
+  if (edit_locked_ == locked) {
+    return;
+  }
+  edit_locked_ = locked;
+  // A preview dialog's first refresh can render only what it changed when the
+  // settled frame's document is known (GitHub #601 follow-up). The copy shares
+  // layer pixels with the live document, so it lives only while the lock does.
+  render_cache_snapshot_.reset();
+  render_cache_snapshot_key_ = 0;
+  if (edit_locked_ && document_ != nullptr && !render_cache_dirty_ && !render_cache_.isNull() &&
+      render_cache_.size() == QSize(document_->width(), document_->height())) {
+    render_cache_snapshot_ = std::make_shared<const Document>(*document_);
+    render_cache_snapshot_key_ = render_cache_.cacheKey();
+  }
+  if (edit_locked_) {
+    close_canvas_context_menu();
+    clear_move_hover_outline();
+    cancel_move_layer_selection();
+    move_drag_pending_ = false;
+    moving_layer_ = false;
+    paint_ctrl_click_.reset();
+    moving_layers_.clear();
+    move_readout_base_rect_.reset();
+    drag_readout_dirty_rect_ = QRect();
+    clear_move_snap_guides();
+    move_preview_delta_ = QPoint();
+    move_preview_patches_.clear();
+    move_preview_patches_delta_.reset();
+    moving_layers_use_outline_preview_ = false;
+    clear_retained_move_caches();
+    reset_move_live_latch();
+    dragging_text_rect_ = false;
+    dragging_text_entry_selection_ = false;
+    selecting_ = false;
+    lassoing_ = false;
+    cancel_magnetic_lasso();
+    cancel_polygon_lasso();
+    cancel_quick_select_stroke();
+    cancel_object_select();
+    cancel_spot_heal_stroke();
+    cancel_red_eye_gesture();
+    cancel_patch_tool_drag();
+    cancel_crop_session();
+    cancel_perspective_crop_session();
+    cancel_ruler_drag();
+    cancel_gradient_fill_handle_drag();
+    clear_gradient_fill_drag_hold();
+    cancel_shape_resize_drag();
+    moving_selection_ = false;
+    drawing_shape_ = false;
+    dragging_guide_ = false;
+    creating_guide_ = false;
+    guide_drag_remove_ = false;
+    reset_axis_constrained_stroke();
+  } else {
+    begin_default_crop_session();
+  }
+  update_tool_cursor();
+  update();
+}
+
+bool CanvasWidget::edit_locked() const noexcept {
+  return edit_locked_;
+}
+
+void CanvasWidget::set_selection_edits_allowed_while_locked(bool allowed) noexcept {
+  if (selection_edits_allowed_while_locked_ == allowed) {
+    return;
+  }
+  selection_edits_allowed_while_locked_ = allowed;
+  if (!allowed && edit_locked_) {
+    // A selection gesture still live when the dialog closes ends here, as
+    // set_edit_locked ends every gesture when the lock begins.
+    selecting_ = false;
+    lassoing_ = false;
+    moving_selection_ = false;
+    marquee_resize_handle_ = TransformHandle::None;
+    cancel_magnetic_lasso();
+    cancel_polygon_lasso();
+    cancel_quick_select_stroke();
+    cancel_object_select();
+  }
+  update_tool_cursor();
+  update();
+}
+
+bool CanvasWidget::selection_edits_allowed_while_locked() const noexcept {
+  return selection_edits_allowed_while_locked_;
+}
+
+void CanvasWidget::set_selection_sampling_callback(std::function<void()> callback) {
+  selection_sampling_callback_ = std::move(callback);
+}
+
+bool CanvasWidget::selection_tool_passes_edit_lock() const noexcept {
+  if (!selection_edits_allowed_while_locked_) {
+    return false;
+  }
+  switch (tool_) {
+    case CanvasTool::Marquee:
+    case CanvasTool::EllipticalMarquee:
+    case CanvasTool::Lasso:
+    case CanvasTool::PolygonLasso:
+    case CanvasTool::MagneticLasso:
+    case CanvasTool::MagicWand:
+    case CanvasTool::QuickSelect:
+    case CanvasTool::ObjectSelect:
+      return true;
+    default:
+      return false;
+  }
+}
+
+void CanvasWidget::set_layer_edit_target(LayerEditTarget target) noexcept {
+  if (layer_edit_target_ == target) {
+    return;
+  }
+  commit_pending_pixel_shape();  // into the target it was drawn for
+  cancel_path_transform();
+  if (layer_edit_target_ == LayerEditTarget::SmartFilterMask &&
+      target != LayerEditTarget::SmartFilterMask) {
+    // Generic layer/channel switching is an exit path. Pending mask pixels are
+    // temporary and must not leak onto a subsequently selected layer.
+    smart_filter_mask_pixels_ = {};
+    smart_filter_mask_owner_id_ = 0;
+    smart_filter_mask_edit_before_.reset();
+    smart_filter_mask_edit_label_.clear();
+    smart_filter_mask_edit_dirty_ = QRegion();
+    ++smart_filter_mask_revision_;
+    mask_display_mode_ = MaskDisplayMode::None;
+    mask_display_image_ = QImage();
+    mask_display_image_layer_ = 0;
+    mask_display_image_channel_ = 0;
+    mask_display_image_revision_ = 0;
+  }
+  layer_edit_target_ = target;
+  channel_view_ = target == LayerEditTarget::DocumentChannel
+                      ? composite_channel_view()
+                      : channel_view_for_target(channel_view_, channel_view_target_for(target));
+  drop_point_selection_if_target_changed();
+  if (target != LayerEditTarget::DocumentChannel) {
+    active_document_channel_id_ = 0;
+  }
+  if (!is_cmyk_plate(target)) {
+    // Up to four bytes per document pixel: kept only while a plate is shown.
+    plate_inks_ = {};
+    plate_inks_source_key_ = 0;
+    plate_inks_space_.reset();
+  }
+  if (CanvasWidget::is_component_preview(target)) {
+    mask_display_mode_ = MaskDisplayMode::Grayscale;
+    mask_display_image_ = QImage();
+    mask_display_image_layer_ = 0;
+    mask_display_image_channel_ = 0;
+    mask_display_image_revision_ = 0;
+  }
+  clear_brush_stroke_tracking();
+  update_tool_cursor();
+  update();
+}
+
+CanvasWidget::LayerEditTarget CanvasWidget::layer_edit_target() const noexcept {
+  return layer_edit_target_;
+}
+
+void CanvasWidget::set_document_channel_edit_target(ChannelId id, MaskDisplayMode mode) {
+  const auto* channel = document_ != nullptr ? static_cast<const Document*>(document_)->find_channel(id) : nullptr;
+  if (channel == nullptr) {
+    set_layer_edit_target(LayerEditTarget::Content);
+    set_mask_display_mode(MaskDisplayMode::None);
+    return;
+  }
+  if (layer_edit_target_ == LayerEditTarget::SmartFilterMask) {
+    clear_smart_filter_mask_edit_target();
+  }
+  layer_edit_target_ = LayerEditTarget::DocumentChannel;
+  channel_view_ = composite_channel_view();
+  active_document_channel_id_ = id;
+  mask_display_mode_ = mode == MaskDisplayMode::None ? MaskDisplayMode::Grayscale : mode;
+  mask_display_image_ = QImage();
+  mask_display_image_layer_ = 0;
+  mask_display_image_channel_ = 0;
+  mask_display_image_revision_ = 0;
+  clear_brush_stroke_tracking();
+  update_tool_cursor();
+  update();
+}
+
+void CanvasWidget::set_component_channel_preview(LayerEditTarget component) {
+  if (!is_component_preview(component)) {
+    set_layer_edit_target(LayerEditTarget::Content);
+    set_mask_display_mode(MaskDisplayMode::None);
+    return;
+  }
+  set_layer_edit_target(component);
+}
+
+void CanvasWidget::set_channel_view(ChannelView view) {
+  if (view.visible == 0 || (view.visible & ~channel_view_all_bits(view.group)) != 0 || view == channel_view_) {
+    return;
+  }
+  channel_view_ = view;
+  if (is_component_preview(layer_edit_target_)) {
+    mask_display_image_ = QImage();
+    mask_display_image_revision_ = 0;
+  }
+  update();
+}
+
+ChannelView CanvasWidget::channel_view() const noexcept {
+  return channel_view_;
+}
+
+ChannelViewTarget CanvasWidget::channel_view_target_for(LayerEditTarget target) noexcept {
+  switch (target) {
+    case LayerEditTarget::ComponentRed:
+      return channel_view_target(ChannelViewGroup::Color, 0);
+    case LayerEditTarget::ComponentGreen:
+      return channel_view_target(ChannelViewGroup::Color, 1);
+    case LayerEditTarget::ComponentBlue:
+      return channel_view_target(ChannelViewGroup::Color, 2);
+    case LayerEditTarget::ComponentCyan:
+      return channel_view_target(ChannelViewGroup::Ink, 0);
+    case LayerEditTarget::ComponentMagenta:
+      return channel_view_target(ChannelViewGroup::Ink, 1);
+    case LayerEditTarget::ComponentYellow:
+      return channel_view_target(ChannelViewGroup::Ink, 2);
+    case LayerEditTarget::ComponentBlack:
+      return channel_view_target(ChannelViewGroup::Ink, 3);
+    case LayerEditTarget::Content:
+    case LayerEditTarget::Mask:
+    case LayerEditTarget::VectorMask:
+    case LayerEditTarget::DocumentChannel:
+    case LayerEditTarget::SmartFilterMask:
+      break;
+  }
+  return composite_channel_target();
+}
+
+CanvasWidget::LayerEditTarget CanvasWidget::layer_edit_target_for(ChannelViewTarget target) noexcept {
+  if (target.composite) {
+    return LayerEditTarget::Content;
+  }
+  if (target.group == ChannelViewGroup::Color) {
+    return target.index == 0   ? LayerEditTarget::ComponentRed
+           : target.index == 1 ? LayerEditTarget::ComponentGreen
+                               : LayerEditTarget::ComponentBlue;
+  }
+  return target.index == 0   ? LayerEditTarget::ComponentCyan
+         : target.index == 1 ? LayerEditTarget::ComponentMagenta
+         : target.index == 2 ? LayerEditTarget::ComponentYellow
+                             : LayerEditTarget::ComponentBlack;
+}
+
+std::optional<ChannelId> CanvasWidget::active_document_channel_id() const noexcept {
+  if (layer_edit_target_ != LayerEditTarget::DocumentChannel || active_document_channel_id_ == 0) {
+    return std::nullopt;
+  }
+  return active_document_channel_id_;
+}
+
+bool CanvasWidget::editing_document_channel() const noexcept {
+  return layer_edit_target_ == LayerEditTarget::DocumentChannel && active_document_channel_const() != nullptr;
+}
+
+bool CanvasWidget::document_channel_is_editable() const noexcept {
+  const auto* channel = active_document_channel_const();
+  return channel != nullptr && channel->kind() == DocumentChannelKind::Alpha;
+}
+
+void CanvasWidget::set_mask_display_mode(MaskDisplayMode mode) {
+  if (mask_display_mode_ == mode) {
+    return;
+  }
+  mask_display_mode_ = mode;
+  mask_display_image_ = QImage();
+  mask_display_image_layer_ = 0;
+  mask_display_image_channel_ = 0;
+  mask_display_image_revision_ = 0;
+  update();
+}
+
+CanvasWidget::MaskDisplayMode CanvasWidget::mask_display_mode() const noexcept {
+  return mask_display_mode_;
+}
+
+void CanvasWidget::invalidate_mask_display() {
+  mask_display_image_ = QImage();
+  mask_display_image_layer_ = 0;
+  mask_display_image_channel_ = 0;
+  mask_display_image_revision_ = 0;
+  if (mask_display_mode_ != MaskDisplayMode::None) {
+    update();
+  }
+}
+
+void CanvasWidget::set_auto_select_layer(bool enabled) noexcept {
+  auto_select_layer_ = enabled;
+  clear_move_hover_outline();
+}
+
+bool CanvasWidget::auto_select_layer() const noexcept {
+  return auto_select_layer_;
+}
+
+QString move_auto_select_target_token(MoveAutoSelectTarget target) {
+  return target == MoveAutoSelectTarget::Group ? QStringLiteral("group") : QStringLiteral("layer");
+}
+
+MoveAutoSelectTarget move_auto_select_target_from_token(const QString& token) {
+  return token == QStringLiteral("group") ? MoveAutoSelectTarget::Group : MoveAutoSelectTarget::Layer;
+}
+
+void CanvasWidget::set_auto_select_target(MoveAutoSelectTarget target) noexcept {
+  auto_select_target_ = target;
+  clear_move_hover_outline();
+}
+
+MoveAutoSelectTarget CanvasWidget::auto_select_target() const noexcept {
+  return auto_select_target_;
+}
+
+void CanvasWidget::set_primary_color(QColor color) {
+  if (color.alpha() == 0) {
+    color.setAlpha(255);
+  }
+  if (const auto* snap = editing_grayscale_target() ? nullptr : palette_snap_context();
+      snap != nullptr) {
+    const auto snapped = snap->lut->snap(static_cast<std::uint8_t>(color.red()),
+                                         static_cast<std::uint8_t>(color.green()),
+                                         static_cast<std::uint8_t>(color.blue()));
+    color = QColor(snapped.red, snapped.green, snapped.blue, color.alpha());
+  }
+  if (color.rgb() != primary_color_.rgb()) {
+    paint_intensity_.foreground = 0.0;
+  }
+  primary_color_ = color;
+  invalidate_brush_overlay();  // the Brush overlay paints in the foreground color
+  pending_pixel_shape_inputs_changed();
+}
+
+QColor CanvasWidget::primary_color() const noexcept {
+  return primary_color_;
+}
+
+void CanvasWidget::set_secondary_color(QColor color) {
+  if (color.alpha() == 0) {
+    color.setAlpha(255);
+  }
+  if (const auto* snap = editing_grayscale_target() ? nullptr : palette_snap_context();
+      snap != nullptr) {
+    const auto snapped = snap->lut->snap(static_cast<std::uint8_t>(color.red()),
+                                         static_cast<std::uint8_t>(color.green()),
+                                         static_cast<std::uint8_t>(color.blue()));
+    color = QColor(snapped.red, snapped.green, snapped.blue, color.alpha());
+  }
+  if (color.rgb() != secondary_color_.rgb()) {
+    paint_intensity_.background = 0.0;
+  }
+  secondary_color_ = color;
+}
+
+QColor CanvasWidget::secondary_color() const noexcept {
+  return secondary_color_;
+}
+
+void CanvasWidget::set_gradient_method(GradientMethod method) noexcept {
+  gradient_method_ = method;
+}
+
+GradientMethod CanvasWidget::gradient_method() const noexcept {
+  return gradient_method_;
+}
+
+void CanvasWidget::set_gradient_tool_mode(GradientToolMode mode) noexcept {
+  if (gradient_tool_mode_ != mode && gradient_drag_hold_.has_value()) {
+    gradient_drag_hold_.reset();  // a Fill Layer mode release's preview
+    update();
+  }
+  gradient_tool_mode_ = mode;
+}
+
+GradientToolMode CanvasWidget::gradient_tool_mode() const noexcept {
+  return gradient_tool_mode_;
+}
+
+void CanvasWidget::set_gradient_fill_drawn_callback(std::function<void(QPoint, QPoint)> callback) {
+  gradient_fill_drawn_callback_ = std::move(callback);
+}
+
+bool CanvasWidget::gradient_drag_makes_fill_layer() const {
+  return tool_ == CanvasTool::Gradient && gradient_tool_mode_ == GradientToolMode::FillLayer &&
+         gradient_fill_drawn_callback_ && !quick_mask_active_ && layer_edit_target_ == LayerEditTarget::Content;
+}
+
+void CanvasWidget::set_gradient_reverse(bool reverse) noexcept {
+  gradient_reverse_ = reverse;
+}
+
+bool CanvasWidget::gradient_reverse() const noexcept {
+  return gradient_reverse_;
+}
+
+void CanvasWidget::set_gradient_opacity(int opacity) noexcept {
+  gradient_opacity_ = std::clamp(opacity, 0, 100);
+}
+
+int CanvasWidget::gradient_opacity() const noexcept {
+  return gradient_opacity_;
+}
+
+void CanvasWidget::set_gradient_definition(std::optional<GradientDefinition> definition) {
+  if (definition.has_value() && definition->form == GradientDefinitionForm::Solid &&
+      (definition->color_stops.empty() || definition->alpha_stops.empty())) {
+    // A Solid gradient needs both tracks; one without either is no gradient at all.
+    definition.reset();
+  }
+  gradient_definition_ = std::move(definition);
+}
+
+const std::optional<GradientDefinition>& CanvasWidget::gradient_definition() const noexcept {
+  return gradient_definition_;
+}
+
+namespace {
+
+GradientDefinition default_tool_gradient_definition() {
+  // Foreground to Background, straight (smoothness 0) as the tool always drew it; the stops
+  // follow the current colors and their Intensity.
+  GradientDefinition definition;
+  definition.name = "Foreground to Background";
+  definition.smoothness = 0;
+  definition.color_stops = {GradientColorStop{0.0F, RgbColor{0, 0, 0}, 0.5F, GradientColorStop::Kind::Foreground},
+                            GradientColorStop{1.0F, RgbColor{255, 255, 255}, 0.5F,
+                                              GradientColorStop::Kind::Background}};
+  definition.alpha_stops = {GradientAlphaStop{0.0F, 1.0F, 0.5F}, GradientAlphaStop{1.0F, 1.0F, 0.5F}};
+  return definition;
+}
+
+}  // namespace
+
+GradientDefinition CanvasWidget::effective_gradient_definition() const {
+  return gradient_definition_.has_value() ? *gradient_definition_ : default_tool_gradient_definition();
+}
+
+LayerStyleGradient CanvasWidget::default_resolved_gradient() const {
+  return resolved_tool_gradient(default_tool_gradient_definition(), edit_color(primary_color_),
+                                edit_color(secondary_color_), static_cast<float>(paint_intensity_.foreground),
+                                static_cast<float>(paint_intensity_.background));
+}
+
+LayerStyleGradient CanvasWidget::resolved_gradient() const {
+  return resolved_tool_gradient(effective_gradient_definition(), edit_color(primary_color_),
+                                edit_color(secondary_color_), static_cast<float>(paint_intensity_.foreground),
+                                static_cast<float>(paint_intensity_.background));
+}
+
+void CanvasWidget::set_gradient_stops(std::optional<std::vector<GradientStop>> stops) {
+  if (stops.has_value() && normalized_gradient_stops(*stops).size() >= 2U) {
+    set_gradient_definition(GradientDefinition(gradient_from_tool_stops(*stops)));
+  } else if (stops.has_value()) {
+    set_gradient_definition(GradientDefinition(gradient_from_tool_stops(effective_gradient_stops())));
+  } else {
+    set_gradient_definition(std::nullopt);
+  }
+}
+
+std::optional<std::vector<GradientStop>> CanvasWidget::gradient_stops() const {
+  if (!gradient_definition_.has_value()) {
+    return std::nullopt;
+  }
+  return effective_gradient_stops();
+}
+
+std::vector<GradientStop> CanvasWidget::effective_gradient_stops() const {
+  return normalized_gradient_stops(gradient_tool_stops_from_gradient(resolved_gradient()));
+}
+
+void CanvasWidget::set_clone_aligned(bool aligned) noexcept {
+  if (clone_aligned_ == aligned) {
+    return;
+  }
+  clone_aligned_ = aligned;
+  clone_aligned_offset_set_ = false;
+}
+
+bool CanvasWidget::clone_aligned() const noexcept {
+  return clone_aligned_;
+}
+
+void CanvasWidget::set_pattern_stamp_pattern(std::optional<PatternResource> pattern) {
+  if (pattern.has_value() &&
+      (pattern->tile.empty() || pattern->tile.format() != PixelFormat::rgba8())) {
+    pattern.reset();
+  }
+  const auto old_id = pattern_stamp_pattern_.has_value() ? pattern_stamp_pattern_->id : std::string{};
+  const auto new_id = pattern.has_value() ? pattern->id : std::string{};
+  pattern_stamp_pattern_ = std::move(pattern);
+  if (old_id != new_id) {
+    pattern_stamp_origin_.reset();
+  }
+}
+
+const std::optional<PatternResource>& CanvasWidget::pattern_stamp_pattern() const noexcept {
+  return pattern_stamp_pattern_;
+}
+
+void CanvasWidget::set_pattern_stamp_aligned(bool aligned) noexcept {
+  if (pattern_stamp_aligned_ == aligned) {
+    return;
+  }
+  pattern_stamp_aligned_ = aligned;
+  pattern_stamp_origin_.reset();
+}
+
+bool CanvasWidget::pattern_stamp_aligned() const noexcept {
+  return pattern_stamp_aligned_;
+}
+
+void CanvasWidget::set_healing_diffusion(int diffusion) noexcept {
+  healing_diffusion_ = std::clamp(diffusion, 1, 7);
+}
+
+int CanvasWidget::healing_diffusion() const noexcept {
+  return healing_diffusion_;
+}
+
+void CanvasWidget::set_healing_mode(HealingMode mode) noexcept {
+  healing_mode_ = mode;
+}
+
+CanvasWidget::HealingMode CanvasWidget::healing_mode() const noexcept {
+  return healing_mode_;
+}
+
+void CanvasWidget::set_retouch_sample_layers(SampleLayers mode) noexcept {
+  switch (mode) {
+    case SampleLayers::AllLayersNoAdjustments:
+      mode = SampleLayers::AllLayers;
+      break;
+    case SampleLayers::CurrentAndBelowNoAdjustments:
+      mode = SampleLayers::CurrentAndBelow;
+      break;
+    default:
+      break;
+  }
+  retouch_sample_layers_ = mode;
+}
+
+SampleLayers CanvasWidget::retouch_sample_layers() const noexcept {
+  return retouch_sample_layers_;
+}
+
+void CanvasWidget::set_retouch_ignore_adjustments(bool ignore) noexcept {
+  retouch_ignore_adjustments_ = ignore;
+}
+
+bool CanvasWidget::retouch_ignore_adjustments() const noexcept {
+  return retouch_ignore_adjustments_;
+}
+
+SampleLayers CanvasWidget::retouch_effective_sample_layers() const noexcept {
+  if (!retouch_ignore_adjustments_) {
+    return retouch_sample_layers_;
+  }
+  switch (retouch_sample_layers_) {
+    case SampleLayers::AllLayers:
+      return SampleLayers::AllLayersNoAdjustments;
+    case SampleLayers::CurrentAndBelow:
+      return SampleLayers::CurrentAndBelowNoAdjustments;
+    default:
+      return retouch_sample_layers_;
+  }
+}
+
+PixelBuffer CanvasWidget::retouch_source_deep() {
+  if (document_ == nullptr) {
+    return {};
+  }
+  const auto mode = retouch_effective_sample_layers();
+  if (mode == SampleLayers::AllLayers) {
+    return Compositor{}.flatten_rgba_deep(*document_);
+  }
+  if (mode != SampleLayers::CurrentLayer) {
+    const auto& document = std::as_const(*document_);
+    const auto excluded = sample_layers_excluded_ids(document.layers(), document.active_layer_id(), mode);
+    if (!excluded.has_value()) {
+      return {};
+    }
+    return Compositor{}.flatten_rgba_deep(document_with_hidden_layers(document, *excluded));
+  }
+  const auto* layer = active_pixel_layer();
+  const auto depth = document_->color_state().bit_depth;
+  PixelBuffer source(document_->width(), document_->height(), with_bit_depth(PixelFormat::rgba8(), depth));
+  source.clear(0);
+  if (layer == nullptr || !layer->visible() || layer->opacity() <= 0.0F) {
+    return source;
+  }
+  // active_layer_sample_image at depth: the layer's own colors, alpha times its mask
+  // and opacity.
+  const auto& pixels = std::as_const(*layer).pixels();
+  if (pixels.empty() || pixels.format().channels < 3) {
+    return source;
+  }
+  const auto bounds = layer->bounds();
+  const auto area = intersect_rect(bounds, Rect::from_size(document_->width(), document_->height()));
+  for (std::int32_t y = area.y; y < area.y + area.height; ++y) {
+    for (std::int32_t x = area.x; x < area.x + area.width; ++x) {
+      auto value = load_pixel(pixels.format(), pixels.pixel(x - bounds.x, y - bounds.y));
+      value[3] *= layer_mask_alpha_at(*layer, x, y) * layer->opacity();
+      store_pixel(source.format(), source.pixel(x, y), value);
+    }
+  }
+  return source;
+}
+
+QImage CanvasWidget::retouch_source_snapshot() {
+  if (document_ == nullptr) {
+    return QImage();
+  }
+  const auto mode = retouch_effective_sample_layers();
+  if (mode == SampleLayers::AllLayers) {
+    // The settled render cache is this composite, kept current region by region (the
+    // Magic Wand reads it as exact pixels too): sharing it spares every press a
+    // full-document render, 40 ms of a 3580x5370 Clone press (GitHub #597). Palette
+    // display snaps the cache, so palette mode renders.
+    if (retouch_snapshot_cache_reuse_enabled_ && render_settled() && !async_render_cache_pending_ &&
+        !document_->palette_editing().has_value() &&
+        render_cache_.size() == QSize(document_->width(), document_->height()) &&
+        render_cache_.format() == QImage::Format_RGBA8888) {
+      ++render_cache_diagnostics_.retouch_snapshot_cache_reuses;
+      return render_cache_;
+    }
+    return render_document_image_with_processing();
+  }
+  if (mode != SampleLayers::CurrentLayer) {
+    // Current & Below (GitHub issue 382): the merged document without the layers above
+    // the active one, so a heal on an empty layer above the photo reads the photo; the
+    // No Adjustments variants (Ignore Adjustment Layers, GitHub issue 383) also leave
+    // out every adjustment layer, so a Curves above is not sampled into the heal and
+    // then applied a second time over it.
+    const auto& document = std::as_const(*document_);
+    const auto excluded = sample_layers_excluded_ids(document.layers(), document.active_layer_id(), mode);
+    if (!excluded.has_value()) {
+      return QImage();
+    }
+    return render_document_image_with_processing(*excluded);
+  }
+  const auto* layer = active_pixel_layer();
+  if (layer == nullptr) {
+    return QImage();
+  }
+  return active_layer_sample_image(*layer, QSize(document_->width(), document_->height()));
+}
+
+void CanvasWidget::set_local_adjustment_strength(int strength) noexcept {
+  local_adjustment_strength_ = std::clamp(strength, 1, 100);
+}
+
+int CanvasWidget::local_adjustment_strength() const noexcept {
+  return local_adjustment_strength_;
+}
+
+void CanvasWidget::set_smudge_strength(int strength) noexcept {
+  smudge_strength_ = std::clamp(strength, 0, 100);  // 0 smudges nothing (issue 253)
+}
+
+int CanvasWidget::smudge_strength() const noexcept {
+  return smudge_strength_;
+}
+
+void CanvasWidget::set_local_tone_range(LocalToneRange range) noexcept {
+  local_tone_range_ = range;
+}
+
+CanvasWidget::LocalToneRange CanvasWidget::local_tone_range() const noexcept {
+  return local_tone_range_;
+}
+
+void CanvasWidget::set_local_protect_tones(bool enabled) noexcept {
+  local_protect_tones_ = enabled;
+}
+
+bool CanvasWidget::local_protect_tones() const noexcept {
+  return local_protect_tones_;
+}
+
+void CanvasWidget::set_eyedropper_sample_size(int size) noexcept {
+  const auto old_outline = eyedropper_sample_outline_widget_rect();
+  // Odd sides only, so the square centers on the clicked pixel.
+  eyedropper_sample_size_ = std::clamp(size, 1, 101) | 1;
+  const auto new_outline = eyedropper_sample_outline_widget_rect();
+  if (old_outline != new_outline) {
+    update(old_outline.value_or(QRect()).united(new_outline.value_or(QRect())).adjusted(-2, -2, 2, 2));
+  }
+}
+
+int CanvasWidget::eyedropper_sample_size() const noexcept {
+  return eyedropper_sample_size_;
+}
+
+void CanvasWidget::set_eyedropper_sample_layers(SampleLayers mode) noexcept {
+  eyedropper_sample_layers_ = mode;
+}
+
+SampleLayers CanvasWidget::eyedropper_sample_layers() const noexcept {
+  return eyedropper_sample_layers_;
+}
+
+void CanvasWidget::set_eyedropper_picks_background(bool background) {
+  eyedropper_picks_background_ = background;
+  if (tool_ == CanvasTool::Eyedropper) {
+    update_tool_cursor();  // the badge shows the new target
+  }
+}
+
+bool CanvasWidget::eyedropper_picks_background() const noexcept {
+  return eyedropper_picks_background_;
+}
+
+void CanvasWidget::set_eyedropper_show_sample_ring(bool enabled) {
+  eyedropper_show_sample_ring_ = enabled;
+  if (!enabled) {
+    clear_sample_loupe();
+  }
+}
+
+bool CanvasWidget::eyedropper_show_sample_ring() const noexcept {
+  return eyedropper_show_sample_ring_;
+}
+
+bool CanvasWidget::eyedropper_target_is_background(Qt::KeyboardModifiers modifiers) const noexcept {
+  return eyedropper_picks_background_ != ((modifiers & Qt::AltModifier) != 0);
+}
+
+void CanvasWidget::set_sponge_mode(SpongeMode mode) noexcept {
+  sponge_mode_ = mode;
+}
+
+CanvasWidget::SpongeMode CanvasWidget::sponge_mode() const noexcept {
+  return sponge_mode_;
+}
+
+void CanvasWidget::set_sponge_vibrance(bool enabled) noexcept {
+  sponge_vibrance_ = enabled;
+}
+
+bool CanvasWidget::sponge_vibrance() const noexcept {
+  return sponge_vibrance_;
+}
+
+void CanvasWidget::set_show_transform_controls(bool enabled) noexcept {
+  const auto old_transform_controls_rect = move_transform_controls_rect();
+  show_transform_controls_ = enabled;
+  if (!enabled) {
+    cancel_free_transform();
+    set_move_transform_controls_layer(std::nullopt);
+  }
+  update_move_transform_controls_dirty(old_transform_controls_rect);
+  clear_move_hover_outline();
+  notify_transform_controls_changed();
+}
+
+bool CanvasWidget::show_transform_controls() const noexcept {
+  return show_transform_controls_;
+}
+
+std::optional<QRect> CanvasWidget::active_layer_document_rect() const noexcept {
+  const auto* layer = active_pixel_layer();
+  if (layer == nullptr) {
+    return std::nullopt;
+  }
+  return to_qrect(layer->bounds());
+}
+
+bool CanvasWidget::smart_filter_mask_pixels_are_valid(const PixelBuffer& pixels) const noexcept {
+  return document_ != nullptr && pixels.format() == PixelFormat::gray8() &&
+         pixels.width() == document_->width() && pixels.height() == document_->height();
+}
+
+bool CanvasWidget::set_smart_filter_mask_edit_target(LayerId owner_id, PixelBuffer pixels,
+                                                     MaskDisplayMode mode) {
+  const auto* owner = document_ != nullptr && owner_id != 0
+                          ? static_cast<const Document*>(document_)->find_layer(owner_id)
+                          : nullptr;
+  if (quick_mask_active_ || owner == nullptr || !smart_filter_mask_pixels_are_valid(pixels)) {
+    return false;
+  }
+
+  cancel_smart_filter_mask_edit();
+  smart_filter_mask_owner_id_ = owner_id;
+  smart_filter_mask_pixels_ = std::move(pixels);
+  ++smart_filter_mask_revision_;
+  smart_filter_mask_edit_before_.reset();
+  smart_filter_mask_edit_label_.clear();
+  smart_filter_mask_edit_dirty_ = QRegion();
+  layer_edit_target_ = LayerEditTarget::SmartFilterMask;
+  active_document_channel_id_ = 0;
+  mask_display_mode_ = mode;
+  invalidate_mask_display();
+  clear_brush_stroke_tracking();
+  update_tool_cursor();
+  update();
+  return true;
+}
+
+bool CanvasWidget::resync_smart_filter_mask_edit_target(LayerId owner_id, PixelBuffer pixels) {
+  const auto mode = layer_edit_target_ == LayerEditTarget::SmartFilterMask
+                        ? mask_display_mode_
+                        : MaskDisplayMode::Overlay;
+  return set_smart_filter_mask_edit_target(owner_id, std::move(pixels), mode);
+}
+
+void CanvasWidget::clear_smart_filter_mask_edit_target() {
+  if (layer_edit_target_ != LayerEditTarget::SmartFilterMask &&
+      smart_filter_mask_owner_id_ == 0 && smart_filter_mask_pixels_.empty()) {
+    return;
+  }
+
+  cancel_smart_filter_mask_edit();
+  if (painting_) {
+    painting_ = false;
+    sync_stroke_input_compression();
+    reset_brush_smoothing();
+    reset_axis_constrained_stroke();
+  }
+  if (drawing_shape_) {
+    drawing_shape_ = false;
+  }
+  clear_brush_stroke_tracking();
+  smart_filter_mask_pixels_ = {};
+  smart_filter_mask_owner_id_ = 0;
+  smart_filter_mask_edit_before_.reset();
+  smart_filter_mask_edit_label_.clear();
+  smart_filter_mask_edit_dirty_ = QRegion();
+  ++smart_filter_mask_revision_;
+  if (layer_edit_target_ == LayerEditTarget::SmartFilterMask) {
+    layer_edit_target_ = LayerEditTarget::Content;
+  }
+  mask_display_mode_ = MaskDisplayMode::None;
+  invalidate_mask_display();
+  update_tool_cursor();
+  update();
+}
+
+bool CanvasWidget::editing_smart_filter_mask() const noexcept {
+  if (document_ == nullptr || layer_edit_target_ != LayerEditTarget::SmartFilterMask ||
+      smart_filter_mask_owner_id_ == 0 || !smart_filter_mask_pixels_are_valid(smart_filter_mask_pixels_)) {
+    return false;
+  }
+  return static_cast<const Document*>(document_)->find_layer(smart_filter_mask_owner_id_) != nullptr;
+}
+
+std::optional<LayerId> CanvasWidget::smart_filter_mask_owner_id() const noexcept {
+  return editing_smart_filter_mask() ? std::optional<LayerId>{smart_filter_mask_owner_id_}
+                                     : std::nullopt;
+}
+
+const PixelBuffer& CanvasWidget::smart_filter_mask_pixels() const noexcept {
+  return smart_filter_mask_pixels_;
+}
+
+std::uint64_t CanvasWidget::smart_filter_mask_revision() const noexcept {
+  return smart_filter_mask_revision_;
+}
+
+QRect CanvasWidget::fill_smart_filter_mask(QColor color, QString history_label) {
+  if (!editing_smart_filter_mask() || !begin_edit(std::move(history_label))) {
+    return {};
+  }
+  const auto dirty = fill_active_layer_mask(color);
+  active_edit_target_changed_impl(QRegion(dirty), DocumentChangeReason::Immediate);
+  return dirty;
+}
+
+QRect CanvasWidget::invert_smart_filter_mask(QString history_label) {
+  if (!editing_smart_filter_mask() || !begin_edit(std::move(history_label))) {
+    return {};
+  }
+  auto bytes = smart_filter_mask_pixels_.data();
+  for (auto& value : bytes) {
+    value = static_cast<std::uint8_t>(255U - value);
+  }
+  const auto dirty = QRect(0, 0, document_->width(), document_->height());
+  active_edit_target_changed_impl(QRegion(dirty), DocumentChangeReason::Immediate);
+  return dirty;
+}
+
+void CanvasWidget::finish_smart_filter_mask_edit() {
+  if (!smart_filter_mask_edit_before_.has_value()) {
+    return;
+  }
+  auto before = std::move(*smart_filter_mask_edit_before_);
+  const auto owner_id = smart_filter_mask_owner_id_;
+  auto label = std::move(smart_filter_mask_edit_label_);
+  auto pixels = smart_filter_mask_pixels_;
+  auto dirty = smart_filter_mask_edit_dirty_;
+  smart_filter_mask_edit_before_.reset();
+  smart_filter_mask_edit_label_.clear();
+  smart_filter_mask_edit_dirty_ = QRegion();
+
+  const auto* owner = document_ != nullptr && owner_id != 0
+                          ? static_cast<const Document*>(document_)->find_layer(owner_id)
+                          : nullptr;
+  bool committed = dirty.isEmpty();
+  if (owner != nullptr && !dirty.isEmpty() && smart_filter_mask_committed_callback_) {
+    committed = smart_filter_mask_committed_callback_(owner_id, std::move(label), std::move(pixels),
+                                                       std::move(dirty));
+  }
+  if (!committed && layer_edit_target_ == LayerEditTarget::SmartFilterMask &&
+      smart_filter_mask_owner_id_ == owner_id) {
+    // Native FEid regeneration is fail-closed. Keep the temporary canvas in
+    // lockstep with the last accepted model state when the host rejects a
+    // gesture instead of leaving an uncommitted mask visible.
+    smart_filter_mask_pixels_ = std::move(before);
+    ++smart_filter_mask_revision_;
+    invalidate_mask_display();
+    update();
+  }
+}
+
+void CanvasWidget::cancel_smart_filter_mask_edit() {
+  if (!smart_filter_mask_edit_before_.has_value()) {
+    return;
+  }
+  smart_filter_mask_pixels_ = std::move(*smart_filter_mask_edit_before_);
+  smart_filter_mask_edit_before_.reset();
+  smart_filter_mask_edit_label_.clear();
+  smart_filter_mask_edit_dirty_ = QRegion();
+  ++smart_filter_mask_revision_;
+  invalidate_mask_display();
+  update();
+}
+
+void CanvasWidget::set_before_edit_callback(std::function<void(QString)> callback) {
+  before_edit_callback_ = std::move(callback);
+}
+
+void CanvasWidget::set_edit_run_before_edit_callback(std::function<void(QString, std::uint64_t)> callback) {
+  edit_run_before_edit_callback_ = std::move(callback);
+}
+
+void CanvasWidget::notify_before_edit(const QString& label, std::uint64_t edit_run_token) {
+  if (edit_run_token != 0 && edit_run_before_edit_callback_) {
+    edit_run_before_edit_callback_(label, edit_run_token);
+  } else if (before_edit_callback_) {
+    before_edit_callback_(label);
+  }
+}
+
+void CanvasWidget::set_paint_stroke_history_callback(std::function<void(const PaintStrokeHistoryEvent&)> callback) {
+  paint_stroke_history_callback_ = std::move(callback);
+}
+
+void CanvasWidget::open_stroke_growth_reserve() {
+  close_stroke_growth_reserve();
+  if (document_ == nullptr || quick_mask_active_ || layer_edit_target_ != LayerEditTarget::Content) {
+    return;
+  }
+  const auto* layer = active_pixel_layer();
+  if (layer == nullptr) {
+    return;
+  }
+  const auto canvas = patchy::Rect::from_size(document_->width(), document_->height());
+  if (unite_rect(layer->bounds(), canvas) == layer->bounds()) {
+    return;  // already covers the canvas: dabs never grow it
+  }
+  stroke_growth_reserve_.emplace(layer->id(), canvas);
+}
+
+void CanvasWidget::close_stroke_growth_reserve() {
+  if (!stroke_growth_reserve_.has_value()) {
+    return;
+  }
+  if (document_ != nullptr) {
+    if (auto* layer = document_->find_layer(stroke_growth_reserve_->layer_id()); layer != nullptr) {
+      static_cast<void>(stroke_growth_reserve_->close(*layer));
+    }
+  }
+  stroke_growth_reserve_.reset();
+}
+
+void CanvasWidget::arm_paint_stroke_history() {
+  open_stroke_growth_reserve();
+  paint_stroke_history_armed_ = false;
+  if (theme_stroke_tool_.isEmpty()) {
+    theme_stroke_tool_ = theme_tool_id(effective_tool_for_input());
+    fire_theme_event(ThemeSoundEvent::StrokeStart, {{QStringLiteral("tool"), theme_stroke_tool_}});
+  }
+  if (!paint_stroke_history_callback_ || document_ == nullptr || quick_mask_active_) {
+    return;
+  }
+  if (layer_edit_target_ != LayerEditTarget::Content && layer_edit_target_ != LayerEditTarget::Mask &&
+      layer_edit_target_ != LayerEditTarget::DocumentChannel) {
+    return;
+  }
+  paint_stroke_history_event_ = PaintStrokeHistoryEvent{};
+  paint_stroke_history_event_.target = layer_edit_target_;
+  paint_stroke_history_event_.layer_id = document_->active_layer_id().value_or(0);
+  paint_stroke_history_event_.channel_id = active_document_channel_id_;
+  paint_stroke_history_armed_ = true;
+  paint_stroke_history_callback_(paint_stroke_history_event_);
+}
+
+void CanvasWidget::finish_paint_stroke_history() {
+  close_stroke_growth_reserve();
+  if (!theme_stroke_tool_.isEmpty()) {
+    const auto tool = std::exchange(theme_stroke_tool_, QString());
+    fire_theme_event(ThemeSoundEvent::StrokeEnd, {{QStringLiteral("tool"), tool}});
+  }
+  if (!paint_stroke_history_armed_) {
+    return;
+  }
+  paint_stroke_history_armed_ = false;
+  paint_stroke_history_event_.phase = PaintStrokeHistoryEvent::Phase::Finish;
+  if (paint_stroke_history_callback_) {
+    paint_stroke_history_callback_(paint_stroke_history_event_);
+  }
+}
+
+void CanvasWidget::set_selection_history_callback(std::function<void(QString, SelectionSnapshot, bool)> callback) {
+  selection_history_callback_ = std::move(callback);
+}
+
+void CanvasWidget::set_quick_mask_changed_callback(
+    std::function<void()> callback) {
+  quick_mask_changed_callback_ = std::move(callback);
+}
+
+void CanvasWidget::set_smart_filter_mask_committed_callback(
+    std::function<bool(LayerId, QString, PixelBuffer, QRegion)> callback) {
+  smart_filter_mask_committed_callback_ = std::move(callback);
+}
+
+void CanvasWidget::set_selection_mode_changed_callback(std::function<void(SelectionMode)> callback) {
+  selection_mode_changed_callback_ = std::move(callback);
+}
+
+void CanvasWidget::set_color_picked_callback(std::function<void(QColor)> callback) {
+  color_picked_callback_ = std::move(callback);
+}
+
+void CanvasWidget::set_transient_read_interaction(
+    std::function<void(const CanvasReadGesture&)> callback, QCursor cursor) {
+  clear_transient_read_interaction();
+  transient_read_callback_ = std::move(callback);
+  transient_read_cursor_ = std::move(cursor);
+  update_tool_cursor();
+  // The tool's hover overlays (brush outline, dab and clone previews, Shift line, sample
+  // square) give way to the dialog's picker cursor (GitHub issue 638): repaint once.
+  update();
+}
+
+void CanvasWidget::clear_transient_read_interaction() {
+  auto callback = transient_read_callback_;
+  const auto was_dragging = transient_read_dragging_;
+  transient_read_dragging_ = false;
+  transient_read_callback_ = {};
+  if (QWidget::mouseGrabber() == this) {
+    releaseMouse();
+  }
+  if (was_dragging && callback) {
+    callback(CanvasReadGesture{document_position(last_mouse_position_), mapToGlobal(last_mouse_position_),
+                               Qt::NoModifier, CanvasReadPhase::Cancel});
+  }
+  update_tool_cursor();
+  if (callback) {
+    update();  // the tool's hover overlays come back (GitHub issue 638)
+  }
+}
+
+bool CanvasWidget::has_transient_read_interaction() const noexcept {
+  return static_cast<bool>(transient_read_callback_);
+}
+
+void CanvasWidget::set_proof_display_transform(std::shared_ptr<const CmykProofTransform> transform) {
+  if (transform == proof_display_transform_) {
+    return;
+  }
+  proof_display_transform_ = std::move(transform);
+  proofed_images_.clear();
+  // The tiling tile pixmap is built from what the canvas displays.
+  tiling_tile_pixmap_ = QPixmap();
+  tiling_tile_pixmap_size_ = QSize();
+  update();
+}
+
+const QImage& CanvasWidget::proof_display_image(const QImage& image) {
+  if (proof_display_transform_ == nullptr || image.isNull()) {
+    return image;
+  }
+  const auto key = image.cacheKey();
+  const auto found = std::find_if(proofed_images_.begin(), proofed_images_.end(),
+                                  [key](const ProofedImage& entry) { return entry.source_key == key; });
+  if (found != proofed_images_.end()) {
+    std::rotate(found, found + 1, proofed_images_.end());
+    return proofed_images_.back().image;
+  }
+  // Straight alpha, so the transform sees the colors themselves.
+  QImage proofed = image.convertToFormat(QImage::Format_RGBA8888);
+  for (int y = 0; y < proofed.height(); ++y) {
+    proof_display_transform_->apply(proofed.scanLine(y), static_cast<std::size_t>(proofed.width()));
+  }
+  // The full composite, a drag base and its mip, and a frame's patches fit comfortably;
+  // the byte bound drops stale full-size copies. The most recently drawn entry always
+  // stays, so a drag base larger than the bound is not re-proofed for every patch.
+#ifdef Q_OS_WASM
+  constexpr qsizetype kMaxBytes = qsizetype{128} * 1024 * 1024;
+#else
+  constexpr qsizetype kMaxBytes = qsizetype{512} * 1024 * 1024;
+#endif
+  constexpr std::size_t kMaxEntries = 24;
+  auto bytes = proofed.sizeInBytes();
+  for (const auto& entry : proofed_images_) {
+    bytes += entry.image.sizeInBytes();
+  }
+  while (proofed_images_.size() > 1 && (proofed_images_.size() >= kMaxEntries || bytes > kMaxBytes)) {
+    bytes -= proofed_images_.front().image.sizeInBytes();
+    proofed_images_.erase(proofed_images_.begin());
+  }
+  proofed_images_.push_back(ProofedImage{key, std::move(proofed)});
+  return proofed_images_.back().image;
+}
+
+void CanvasWidget::set_curves_clipping_preview(std::optional<CurvesClippingMode> mode,
+                                               std::optional<CurvesChannel> channel) {
+  curves_clipping_mode_ = mode;
+  curves_clipping_channel_ = mode.has_value() ? channel : std::nullopt;
+  if (mode.has_value()) {
+    wait_for_move_commit_job();  // the clipping preview scans exact composite pixels
+    // A background refresh under way (a preview dialog's frames, #687) brings the current
+    // composite and its clipping view; rendering it here as well stalled each Alt press.
+    const bool cache_has_frame =
+        document_ != nullptr && render_cache_.size() == QSize(document_->width(), document_->height());
+    const bool background_refresh_coming =
+        async_render_cache_explicit_hold_ && (async_render_cache_in_flight_ || async_render_cache_pending_ ||
+                                              async_render_cache_start_queued_);
+    const bool cache_needs_refresh =
+        document_ != nullptr && (!cache_has_frame || (render_cache_dirty_ && !background_refresh_coming));
+    if (cache_needs_refresh) {
+      // ensure_render_cache refreshes the clipping image after replacing the
+      // source cache, so do not scan it a second time here.
+      ensure_render_cache();
+    } else {
+      refresh_curves_clipping_preview();
+    }
+  } else {
+    refresh_curves_clipping_preview();
+  }
+  update();
+}
+
+std::optional<CurvesClippingMode> CanvasWidget::curves_clipping_preview_mode() const noexcept {
+  return curves_clipping_mode_;
+}
+
+void CanvasWidget::set_brush_settings_changed_callback(std::function<void()> callback) {
+  brush_settings_changed_callback_ = std::move(callback);
+}
+
+void CanvasWidget::set_pen_button_action_callback(std::function<void(PenButtonAction)> callback) {
+  pen_button_action_callback_ = std::move(callback);
+}
+
+void CanvasWidget::set_text_requested_callback(std::function<void(QPoint, QRect)> callback) {
+  text_requested_callback_ = std::move(callback);
+}
+
+void CanvasWidget::set_text_entry_selection_drag_callback(std::function<bool(QPointF, bool)> callback) {
+  text_entry_selection_drag_callback_ = std::move(callback);
+}
+
+void CanvasWidget::set_active_layer_changed_callback(std::function<void(LayerId)> callback) {
+  active_layer_changed_callback_ = std::move(callback);
+}
+
+void CanvasWidget::set_layer_opacity_digit_callback(std::function<void(int)> callback) {
+  layer_opacity_digit_callback_ = std::move(callback);
+}
+
+void CanvasWidget::set_airbrush_flow_digit_callback(std::function<void()> callback) {
+  airbrush_flow_digit_callback_ = std::move(callback);
+}
+
+void CanvasWidget::set_layer_selection_requested_callback(
+    std::function<void(std::vector<LayerId>, LayerId)> callback) {
+  layer_selection_requested_callback_ = std::move(callback);
+}
+
+void CanvasWidget::set_move_duplicate_requested_callback(std::function<bool(std::vector<LayerId>)> callback) {
+  move_duplicate_requested_callback_ = std::move(callback);
+}
+
+void CanvasWidget::request_layer_selection(std::vector<LayerId> layer_ids, LayerId active_id) {
+  if (layer_selection_requested_callback_) {
+    // The host round-trips synchronously: the panel selection change pushes
+    // back into set_selected_layer_ids and sets the document's active layer.
+    layer_selection_requested_callback_(std::move(layer_ids), active_id);
+    return;
+  }
+  // Standalone canvas (no panel wired): apply the selection directly. Do not
+  // fire active_layer_changed_callback_ here; in hosted embeddings it reveals
+  // a single layer with ClearAndSelect, which would collapse the selection.
+  if (document_ != nullptr &&
+      (!document_->active_layer_id().has_value() || *document_->active_layer_id() != active_id)) {
+    document_->set_active_layer(active_id);
+  }
+  set_selected_layer_ids(std::move(layer_ids));
+}
+
+void CanvasWidget::request_layer_deselection() {
+  if (layer_selection_requested_callback_) {
+    // Empty ids are the deselect-all contract; the host clears the panel rows
+    // and the document's active layer, then pushes {} back.
+    layer_selection_requested_callback_({}, LayerId{});
+    return;
+  }
+  if (document_ != nullptr) {
+    document_->clear_active_layer();
+  }
+  if (layer_edit_target_ != LayerEditTarget::Content) {
+    set_layer_edit_target(LayerEditTarget::Content);
+  }
+  set_selected_layer_ids({});
+  update();
+}
+
+void CanvasWidget::set_status_callback(std::function<void(QString)> callback) {
+  status_callback_ = std::move(callback);
+}
+
+void CanvasWidget::set_error_status_callback(std::function<void(QString)> callback) {
+  error_status_callback_ = std::move(callback);
+}
+
+// Blocking refusals from canvas tools. Falls back to the plain status callback
+// so hosts that wire only set_status_callback still see the message text.
+void CanvasWidget::select_only_layer_if_none_active() {
+  if (document_ == nullptr || edit_locked_ || document_->active_layer_id().has_value()) {
+    return;
+  }
+  if (const auto id = only_layer_id(std::as_const(*document_).layers()); id.has_value()) {
+    request_layer_selection({*id}, *id);
+  }
+}
+
+void CanvasWidget::report_status_error(const QString& message) const {
+  if (error_status_callback_) {
+    error_status_callback_(message);
+  } else if (status_callback_) {
+    status_callback_(message);
+  }
+}
+
+void CanvasWidget::set_info_callback(std::function<void(CanvasInfoState)> callback) {
+  info_callback_ = std::move(callback);
+}
+
+void CanvasWidget::refresh_info_display() const {
+  emit_info_for_widget_position(mapFromGlobal(QCursor::pos()));
+}
+
+void CanvasWidget::set_document_changed_callback(std::function<void()> callback) {
+  document_changed_callback_ = std::move(callback);
+  document_changed_reason_callback_ = nullptr;
+}
+
+void CanvasWidget::set_document_changed_callback(std::function<void(DocumentChangeReason)> callback) {
+  document_changed_reason_callback_ = std::move(callback);
+  document_changed_callback_ = nullptr;
+}
+
+void CanvasWidget::set_view_changed_callback(std::function<void()> callback) {
+  view_changed_callback_ = std::move(callback);
+}
+
+void CanvasWidget::set_transform_controls_changed_callback(std::function<void()> callback) {
+  transform_controls_changed_callback_ = std::move(callback);
+}
+
+void CanvasWidget::set_smart_object_transform_render_callback(std::function<bool(LayerId)> callback) {
+  smart_object_transform_render_callback_ = std::move(callback);
+}
+
+void CanvasWidget::set_smart_object_source_image_callback(
+    std::function<std::optional<QImage>(LayerId, QString* error)> callback) {
+  smart_object_source_image_callback_ = std::move(callback);
+}
+
+void CanvasWidget::set_smart_object_paint_prompt_callback(std::function<void(LayerId)> callback) {
+  smart_object_paint_prompt_callback_ = std::move(callback);
+}
+
+void CanvasWidget::set_text_layer_transform_render_callback(std::function<bool(LayerId)> callback) {
+  text_layer_transform_render_callback_ = std::move(callback);
+}
+
+void CanvasWidget::set_missing_font_transform_confirm_callback(
+    std::function<bool(const std::vector<LayerId>&)> callback) {
+  missing_font_transform_confirm_callback_ = std::move(callback);
+}
+
+void CanvasWidget::set_selected_layer_ids(std::vector<LayerId> layer_ids) {
+  if (layer_ids != selected_layer_ids_) {
+    commit_pending_pixel_shape();  // into the layer it was drawn on (GitHub issue 716)
+    cancel_path_transform();
+  }
+  const auto old_transform_controls_rect = move_transform_controls_rect();
+  // Transform Selection does not depend on the layers, so a layer switch keeps it.
+  auto keeps_active_transform =
+      (transforming_layer_ && transform_selection_only_) ||
+      (transforming_layer_ && transform_layer_id_.has_value() && layer_ids.size() == 1U &&
+       layer_ids.front() == *transform_layer_id_);
+  if (transforming_layer_ && !keeps_active_transform && !transform_session_root_ids_.empty()) {
+    // Multi-target session: an identical re-selection of the same roots (panel
+    // refreshes re-push the selection) keeps the session alive.
+    auto sorted_ids = layer_ids;
+    std::sort(sorted_ids.begin(), sorted_ids.end());
+    keeps_active_transform = sorted_ids == transform_session_root_ids_;
+  }
+  if (transforming_layer_ && !keeps_active_transform) {
+    finish_free_transform();
+  }
+  const auto keeps_active_warp = warping_layer_ && warp_layer_id_.has_value() && layer_ids.size() == 1U &&
+                                 layer_ids.front() == *warp_layer_id_;
+  if (warping_layer_ && !keeps_active_warp) {
+    finish_warp_transform();
+  }
+  if (move_transform_controls_layer_id_.has_value() &&
+      !(layer_ids.size() == 1U && layer_ids.front() == *move_transform_controls_layer_id_)) {
+    set_move_transform_controls_layer(std::nullopt);
+  }
+  selected_layer_ids_ = std::move(layer_ids);
+  clear_guide_selection();
+  update_move_transform_controls_dirty(old_transform_controls_rect);
+  notify_transform_controls_changed();
+}
+
+bool CanvasWidget::document_contains(QPoint point) const noexcept {
+  return document_ != nullptr && point.x() >= 0 && point.y() >= 0 && point.x() < document_->width() &&
+         point.y() < document_->height();
+}
+
+bool CanvasWidget::selection_allows(QPoint point) const noexcept {
+  return quick_mask_active_ || selection_contains(point);
+}
+
+bool CanvasWidget::selection_clips_grayscale_edits() const noexcept {
+  return !quick_mask_active_ && has_selection();
+}
+
+Layer* CanvasWidget::active_pixel_layer() const noexcept {
+  if (document_ == nullptr || !document_->active_layer_id().has_value()) {
+    return nullptr;
+  }
+
+  auto* layer = document_->find_layer(*document_->active_layer_id());
+  if (layer == nullptr || layer->kind() != LayerKind::Pixel) {
+    return nullptr;
+  }
+  return layer;
+}
+
+LayerMask* CanvasWidget::active_layer_mask() const noexcept {
+  if (document_ == nullptr || !document_->active_layer_id().has_value()) {
+    return nullptr;
+  }
+
+  auto* layer = document_->find_layer(*document_->active_layer_id());
+  if (layer == nullptr || !layer->mask().has_value()) {
+    return nullptr;
+  }
+  return &*layer->mask();
+}
+
+bool CanvasWidget::editing_layer_mask() const noexcept {
+  if (layer_edit_target_ != LayerEditTarget::Mask || document_ == nullptr ||
+      !document_->active_layer_id().has_value()) {
+    return false;
+  }
+  // Const walk on purpose: this predicate runs from read-only paths (color
+  // setters, cursor updates, begin_edit preconditions) and the non-const
+  // mask() accessor bumps revisions on ACCESS (see docs/performance.md) — merely
+  // picking a color while a mask was targeted
+  // invalidated the layer's thumbnail and style-mask caches. Writers keep
+  // going through active_layer_mask(), whose bump is load-bearing.
+  const auto* layer = std::as_const(*document_).find_layer(*document_->active_layer_id());
+  return layer != nullptr && layer->mask().has_value();
+}
+
+DocumentChannel* CanvasWidget::active_document_channel() const noexcept {
+  if (document_ == nullptr || layer_edit_target_ != LayerEditTarget::DocumentChannel ||
+      active_document_channel_id_ == 0) {
+    return nullptr;
+  }
+  return document_->find_channel(active_document_channel_id_);
+}
+
+const DocumentChannel* CanvasWidget::active_document_channel_const() const noexcept {
+  if (document_ == nullptr || layer_edit_target_ != LayerEditTarget::DocumentChannel ||
+      active_document_channel_id_ == 0) {
+    return nullptr;
+  }
+  return static_cast<const Document*>(document_)->find_channel(active_document_channel_id_);
+}
+
+std::optional<CanvasWidget::GrayscaleEditTarget> CanvasWidget::active_grayscale_edit_target(QRect required_rect) {
+  if (document_ == nullptr) {
+    return std::nullopt;
+  }
+  if (quick_mask_active_) {
+    if (quick_mask_pixels_.format() != PixelFormat::gray8() ||
+        quick_mask_pixels_.width() != document_->width() ||
+        quick_mask_pixels_.height() != document_->height()) {
+      return std::nullopt;
+    }
+    return GrayscaleEditTarget{
+        &quick_mask_pixels_,
+        QRect(0, 0, document_->width(), document_->height())};
+  }
+  if (layer_edit_target_ == LayerEditTarget::SmartFilterMask) {
+    if (!editing_smart_filter_mask()) {
+      return std::nullopt;
+    }
+    return GrayscaleEditTarget{
+        &smart_filter_mask_pixels_, QRect(0, 0, document_->width(), document_->height())};
+  }
+  if (editing_layer_mask()) {
+    auto* mask = active_layer_mask();
+    if (mask == nullptr ||
+        (!required_rect.isEmpty() &&
+         !expand_mask_to_include_rect(*mask, required_rect, QSize(document_->width(), document_->height())))) {
+      return std::nullopt;
+    }
+    return GrayscaleEditTarget{&mask->pixels,
+                               QRect(mask->bounds.x, mask->bounds.y, mask->bounds.width, mask->bounds.height)};
+  }
+  auto* channel = active_document_channel();
+  if (channel == nullptr || channel->kind() != DocumentChannelKind::Alpha) {
+    return std::nullopt;
+  }
+  auto& pixels = channel->pixels();
+  // Saved channels follow the document's depth; mask writes blend at any depth.
+  if (pixels.format().channels != 1U || pixels.width() != document_->width() ||
+      pixels.height() != document_->height()) {
+    return std::nullopt;
+  }
+  return GrayscaleEditTarget{&pixels, QRect(0, 0, document_->width(), document_->height())};
+}
+
+bool CanvasWidget::editing_grayscale_target() const noexcept {
+  return quick_mask_active_ || editing_smart_filter_mask() || editing_layer_mask() ||
+         (editing_document_channel() && document_channel_is_editable());
+}
+
+bool CanvasWidget::active_layer_locks_transparent_pixels() const noexcept {
+  const auto* layer = active_pixel_layer();
+  return layer != nullptr && layer_locks_transparent_pixels(*layer);
+}
+
+bool CanvasWidget::active_layer_locks_image_pixels() const noexcept {
+  if (document_ == nullptr || !document_->active_layer_id().has_value()) {
+    return false;
+  }
+  return patchy::layer_effectively_locks_image_pixels(document_->layers(), *document_->active_layer_id());
+}
+
+bool CanvasWidget::active_layer_locks_position() const noexcept {
+  if (document_ == nullptr || !document_->active_layer_id().has_value()) {
+    return false;
+  }
+  return patchy::layer_effectively_locks_position(document_->layers(), *document_->active_layer_id());
+}
+
+bool CanvasWidget::layer_effectively_locks_image_pixels(const Layer& layer) const noexcept {
+  return document_ != nullptr && patchy::layer_effectively_locks_image_pixels(document_->layers(), layer.id());
+}
+
+bool CanvasWidget::layer_effectively_locks_position(const Layer& layer) const noexcept {
+  return document_ != nullptr && patchy::layer_effectively_locks_position(document_->layers(), layer.id());
+}
+
+void CanvasWidget::show_layer_pixels_locked_message() const {
+  report_status_error(tr("Layer pixels are locked."));
+}
+
+void CanvasWidget::show_layer_position_locked_message() const {
+  report_status_error(tr("Layer position is locked."));
+}
+
+void CanvasWidget::show_edit_locked_message() const {
+  report_status_error(tr("Finish the open dialog before editing the document"));
+}
+
+Layer* CanvasWidget::topmost_pixel_layer_at(QPoint document_point, bool require_visible_pixel,
+                                            bool skip_locked) const noexcept {
+  if (document_ == nullptr) {
+    return nullptr;
+  }
+
+  return const_cast<Layer*>(topmost_pixel_layer_at_recursive(std::as_const(*document_).layers(), document_point,
+                                                             require_visible_pixel, skip_locked));
+}
+
+Layer* CanvasWidget::topmost_move_layer_at(QPoint document_point, bool skip_locked) const noexcept {
+  if (document_ == nullptr) {
+    return nullptr;
+  }
+
+  // Three passes, shared by the press handler, the hover outline, and the
+  // lock status message so they always agree on the grabbed layer:
+  // 1. a visible pixel under the point wins (precise, the original test);
+  // 2. otherwise a selected layer whose Move rect contains the point (the box
+  //    the user is looking at beats a larger unselected rect above it);
+  // 3. otherwise the topmost layer whose Move rect contains the point, so a
+  //    press on a transparent pixel inside a layer's outline still grabs it
+  //    instead of drawing the layer-selection rectangle (Photoshop parity).
+  const auto& document = std::as_const(*document_);
+  if (const auto* hit = topmost_move_layer_at_recursive(document.layers(), document_point, skip_locked,
+                                                        move_layer_contains_document_point);
+      hit != nullptr) {
+    return const_cast<Layer*>(hit);
+  }
+  for (const auto id : movable_layer_ids()) {
+    const auto* layer = document.find_layer(id);
+    if (layer != nullptr && move_layer_rect_contains_document_point(*layer, document_point)) {
+      return const_cast<Layer*>(layer);
+    }
+  }
+  return const_cast<Layer*>(topmost_move_layer_at_recursive(document.layers(), document_point, skip_locked,
+                                                            move_layer_rect_contains_document_point));
+}
+
+Layer* CanvasWidget::topmost_visible_move_layer_at(QPoint document_point) const noexcept {
+  if (document_ == nullptr) {
+    return nullptr;
+  }
+  return const_cast<Layer*>(topmost_move_layer_at_recursive(std::as_const(*document_).layers(), document_point,
+                                                            false, move_layer_contains_document_point));
+}
+
+Layer* CanvasWidget::topmost_text_layer_at(QPoint document_point) const noexcept {
+  if (document_ == nullptr) {
+    return nullptr;
+  }
+
+  return const_cast<Layer*>(
+      topmost_text_layer_at_recursive(std::as_const(*document_).layers(), document_point, type_tool_path_reach()));
+}
+
+double CanvasWidget::type_tool_path_reach() const {
+  return std::max(1.5, 6.0 / std::max(0.0001, zoom()));
+}
+
+bool CanvasWidget::type_tool_hits_text_layer(const Layer& layer, QPoint document_point) const {
+  return text_layer_contains_type_point(layer, document_point, type_tool_path_reach());
+}
+
+CanvasWidget::TypeToolTarget CanvasWidget::type_tool_target_at(QPoint document_point) const {
+  if (document_ == nullptr) {
+    return {};
+  }
+  if (auto* layer = topmost_text_layer_at(document_point); layer != nullptr) {
+    const auto& text = std::as_const(*layer);
+    if (text_path_for_layer(text).has_value()) {
+      return {TypeToolTargetKind::EditPathText, layer};
+    }
+    return {text_area_for_layer(text).has_value() ? TypeToolTargetKind::EditAreaText : TypeToolTargetKind::EditText,
+            layer};
+  }
+  // A line wins over the inside of a closed shape: the edge of a shape starts path text.
+  if (text_path_at(QPointF(document_point)).has_value()) {
+    return {TypeToolTargetKind::NewPathText, nullptr};
+  }
+  if (text_area_at(document_point).has_value()) {
+    return {TypeToolTargetKind::NewAreaText, nullptr};
+  }
+  return {};
+}
+
+bool CanvasWidget::text_layer_move_target_at(QPoint widget_point) const {
+  return document_ != nullptr && topmost_text_layer_at(document_position(widget_point)) != nullptr;
+}
+
+bool CanvasWidget::begin_text_layer_move(LayerId id, QPoint widget_point, std::function<void()> finished) {
+  auto* layer = document_ == nullptr ? nullptr : document_->find_layer(id);
+  if (layer == nullptr || !layer_is_text(*layer)) {
+    return false;
+  }
+  if (layer_effectively_locks_position(*layer)) {
+    show_layer_position_locked_message();
+    return false;
+  }
+  activate_layer(*layer);
+  begin_move_drag({id}, document_position(widget_point), widget_point);
+  text_layer_move_active_ = true;
+  text_layer_move_finished_ = std::move(finished);
+  if (text_layer_move_finished_) {
+    grabMouse();
+  }
+  update_tool_cursor();
+  return true;
+}
+
+void CanvasWidget::finish_text_layer_move() {
+  if (!text_layer_move_active_) {
+    return;
+  }
+  text_layer_move_active_ = false;
+  if (mouseGrabber() == this) {
+    releaseMouse();
+  }
+  update_tool_cursor();
+  if (auto finished = std::exchange(text_layer_move_finished_, {}); finished) {
+    finished();
+  }
+}
+
+std::optional<TextPathFrame> CanvasWidget::text_path_at(QPointF document_point) const {
+  if (!document_ || topmost_text_layer_at(document_point.toPoint())) return std::nullopt;
+  // Six screen pixels either side of the line, never under a pixel and a half of the document
+  // (the Type tool reports whole document pixels). Existing path text takes its own line with
+  // the same reach, so no strip beside it falls through to the path underneath.
+  const double reach = type_tool_path_reach();
+  std::optional<TextPathFrame> best;
+  double best_gap = reach;
+  const auto consider = [&](const VectorPath& source) {
+    for (const auto& subpath : source.subpaths) {
+      VectorPath contour;
+      contour.subpaths.push_back(subpath);
+      contour.subpaths.front().op = PathCombineOp::Xor;
+      contour.subpaths.front().shape_group = 0;
+      if (!valid_text_path(contour)) continue;
+      const auto bounds = contour.bounds();
+      if (!bounds || document_point.x() < bounds->left - reach || document_point.x() > bounds->right + reach ||
+          document_point.y() < bounds->top - reach || document_point.y() > bounds->bottom + reach) {
+        continue;
+      }
+      const TextPathCurve curve(contour);
+      if (!curve.valid()) continue;
+      const auto nearest = curve.nearest(document_point.x(), document_point.y());
+      if (nearest.gap > best_gap) continue;
+      best_gap = nearest.gap;
+      const double count = static_cast<double>(curve.segment_count());
+      TextPathRange range{nearest.parameter, curve.closed() ? nearest.parameter + count : count};
+      // A click on the last few pixels of an open contour leaves no room: take all of it.
+      if (!curve.closed() && curve.length() - nearest.distance < 8.0) range = {0.0, count};
+      const auto normalized = normalized_text_path_range(contour, range);
+      best = TextPathFrame{std::move(contour), normalized};
+    }
+  };
+  if (target_path_visible_) {
+    if (const auto* target = path_edit_target_path()) consider(*target);
+  }
+  if (best) return best;
+  const auto visit = [&](auto&& self, const std::vector<Layer>& layers) -> void {
+    for (auto it = layers.rbegin(); it != layers.rend() && !best; ++it) {
+      if (!it->visible()) continue;
+      self(self, it->children());
+      if (best) return;
+      if (const auto* shape = it->vector_shape(); shape && !shape->path_disabled) consider(shape->path);
+    }
+  };
+  visit(visit, std::as_const(*document_).layers());
+  return best;
+}
+
+std::optional<VectorPath> CanvasWidget::text_area_at(QPoint document_point) const {
+  if (!document_ || topmost_text_layer_at(document_point)) return std::nullopt;
+  const auto pick = [&](const VectorPath& source) -> std::optional<VectorPath> {
+    for (const auto& subpath : source.subpaths) {
+      VectorPath area;
+      area.subpaths.push_back(subpath);
+      area.subpaths.front().op = PathCombineOp::Xor;
+      area.subpaths.front().shape_group = 0;
+      if (valid_text_area(area) && TextAreaGeometry(area).contains(QPointF(document_point))) return area;
+    }
+    return std::nullopt;
+  };
+  if (target_path_visible_) {
+    if (const auto* target = path_edit_target_path()) {
+      if (auto area = pick(*target)) return area;
+    }
+  }
+  const auto visit = [&](auto&& self, const std::vector<Layer>& layers) -> std::optional<VectorPath> {
+    for (auto it = layers.rbegin(); it != layers.rend(); ++it) {
+      if (!it->visible()) continue;
+      if (auto area = self(self, it->children())) return area;
+      if (const auto* shape = it->vector_shape(); shape && !shape->path_disabled && !shape->path_inverted) {
+        if (auto area = pick(shape->path)) return area;
+      }
+    }
+    return std::nullopt;
+  };
+  return visit(visit, std::as_const(*document_).layers());
+}
+
+void CanvasWidget::activate_layer(Layer& layer) {
+  if (document_ == nullptr) {
+    return;
+  }
+  if (document_->active_layer_id() != layer.id() ||
+      layer_edit_target_ != LayerEditTarget::Content) {
+    commit_pending_pixel_shape();  // into the layer it was drawn on, before that changes
+    cancel_path_transform();
+  }
+  if (layer_edit_target_ == LayerEditTarget::SmartFilterMask) {
+    clear_smart_filter_mask_edit_target();
+  }
+  const auto old_transform_controls_rect = move_transform_controls_rect();
+  const auto keeps_multi_transform =
+      !transform_session_root_ids_.empty() &&
+      std::find(transform_session_root_ids_.begin(), transform_session_root_ids_.end(), layer.id()) !=
+          transform_session_root_ids_.end();
+  if (transforming_layer_ && !keeps_multi_transform && !transform_selection_only_ &&
+      (!transform_layer_id_.has_value() || *transform_layer_id_ != layer.id())) {
+    finish_free_transform();
+  }
+  if (move_transform_controls_layer_id_.has_value() && *move_transform_controls_layer_id_ != layer.id()) {
+    set_move_transform_controls_layer(std::nullopt);
+  }
+  clear_guide_selection();
+  if (!document_->active_layer_id().has_value() || *document_->active_layer_id() != layer.id()) {
+    document_->set_active_layer(layer.id());
+  }
+  layer_edit_target_ = LayerEditTarget::Content;
+  drop_point_selection_if_target_changed();
+  if (active_layer_changed_callback_) {
+    active_layer_changed_callback_(layer.id());
+  }
+  update_move_transform_controls_dirty(old_transform_controls_rect);
+}
+
+QPoint CanvasWidget::layer_position(const Layer& layer, QPoint document_point) const noexcept {
+  const auto bounds = layer.bounds();
+  return QPoint(document_point.x() - bounds.x, document_point.y() - bounds.y);
+}
+
+QRect CanvasWidget::widget_rect_for_document_rect(QRect document_rect) const {
+  if (!view_axis_aligned()) {
+    // A rotated view: the on-screen bounding box of the rect (repaints and clips;
+    // outlines that must follow the rotation map the corners instead).
+    return view_transform()
+        .widget_bounds_of_document_rect(QRectF(document_rect))
+        .toAlignedRect()
+        .adjusted(-2, -2, 2, 2);
+  }
+  const auto top_left = widget_position(document_rect.topLeft());
+  const auto bottom_right = widget_position(document_rect.bottomRight() + QPoint(1, 1));
+  return QRect(top_left, bottom_right).normalized().adjusted(-2, -2, 2, 2);
+}
+
+QRect CanvasWidget::widget_repaint_rect_for_document_rect(QRect document_rect) const {
+  const auto rect = widget_rect_for_document_rect(document_rect);
+  const auto view = view_zoom();
+  if (!uses_smooth_display_scaling(view, deep_zoom_pixels_active())) {
+    return rect;
+  }
+  // Zoomed out, the patched display mip blends one mip pixel into its neighbours;
+  // magnified, the bilinear scale reaches half a document pixel past the rect.
+  const int margin = zoom_ < 1.0 ? 2 : static_cast<int>(std::ceil(zoom_ * 0.5));
+  return rect.adjusted(-margin, -margin, margin, margin);
+}
+
+QRectF CanvasWidget::widget_rect_for_document_rect(QRectF document_rect) const {
+  // The rect itself while upright; its on-screen bounding box under a rotated view.
+  return view_transform().widget_bounds_of_document_rect(document_rect);
+}
+
+void CanvasWidget::emit_info_for_widget_position(QPoint widget_position) const {
+  if (!info_callback_) {
+    return;
+  }
+
+  CanvasInfoState info;
+  const auto document_point = document_position(widget_position);
+  info.document_point = document_point;
+  info.inside_document = document_contains(document_point);
+  if (info.inside_document) {
+    info.color = compose_document_pixel(document_point.x(), document_point.y());
+    if (document_ != nullptr && document_->color_state().bit_depth == BitDepth::Float32) {
+      const ScopedDocumentDepthRender at_depth;
+      const auto image = qimage_from_document_rect(*document_, QRect(document_point, QSize(1, 1)), true);
+      if (image.format() == QImage::Format_RGBA32FPx4) {
+        const auto* px = reinterpret_cast<const float*>(image.constScanLine(0));
+        info.linear_color = std::array<float, 3>{px[0], px[1], px[2]};
+      }
+    }
+  }
+  if (document_ != nullptr && selecting_) {
+    info.active_rect = marquee_selection_region(selection_start_, selection_current_).boundingRect();
+    info.active_rect_label = tr("Selection");
+  } else if (document_ != nullptr && drawing_shape_) {
+    info.active_rect = shape_drag_rect(shape_start_, snapped_document_point(document_point));
+    info.active_rect_label = tr("Shape");
+  } else if (document_ != nullptr && dragging_text_rect_) {
+    info.active_rect = normalized_rect(text_rect_start_, snapped_document_point(document_point));
+    info.active_rect_label = tr("Text");
+  } else if (document_ != nullptr && zooming_ && !zoom_scrubbing_) {
+    info.active_rect = normalized_rect(zoom_start_, document_point);
+    info.active_rect_label = tr("Zoom");
+  } else if (document_ != nullptr && !selection_.isEmpty()) {
+    info.active_rect = selection_.boundingRect();
+    info.active_rect_label = selection_.rectCount() == 1 ? tr("Selection") : tr("Selection bounds");
+  }
+  info_callback_(std::move(info));
+}
+
+}  // namespace patchy::ui
+
+// AUTOMOC generates this here instead of in the shared mocs_compilation.cpp, so a
+// change to this class's header rebuilds this object only (docs/building-incremental.md).
+#include "moc_canvas_widget.cpp"

@@ -1,0 +1,191 @@
+# Open from Clipboard
+
+File > Open from Clipboard (`file.open_clipboard`, action `fileOpenClipboardAction`)
+creates a new, unsaved document directly from the current system clipboard image.
+Windows and Linux use Ctrl+Alt+Shift+N; macOS uses Command+Option+Shift+N through
+Qt's normal modifier mapping. The shortcut is editable in Preferences > Hotkeys.
+The action works with an empty workspace or existing documents and bypasses the
+New Document dialog. A preview edit lock refuses it, like File > New.
+
+`create_clipboard_document` also serves New Document's Clipboard preset. It keeps
+the image's full pixel dimensions, including high-DPI clipboard images, and alpha,
+creates an 8-bit document with one Clipboard Image layer at (0, 0), assigns 72 PPI, fits oversized images
+to the view, and marks the session modified so closing warns about unsaved work.
+It reads the system image rather than Patchy's private editable-layer payload.
+The action is enabled only while `clipboard_offers_image()` (new_document_dialog.cpp)
+holds, the same rule that enables the New Document dialog's Clipboard card (GitHub
+issue 218): text, file URLs without image data, and empty clipboards disable it.
+Image data that still fails to read reports "Clipboard does not contain an image"
+without creating a tab. Copy an image itself to use this command; Edit > Paste retains its separate Files as
+Layers behavior for copied file URLs.
+
+## File paths copied as text
+
+When the clipboard holds no Patchy layer payload, SVG, image or file URLs, Edit > Paste
+reads its text as file paths (`file_paths_from_clipboard_text`, src/ui/clipboard_text_paths.cpp;
+`MainWindow::paste_clipboard_text_paths`, main_window_files.cpp). Every non-empty line must
+be an absolute path: one pair of surrounding double or single quotes is stripped (Windows
+Copy as path), `file:` URLs decode, `~/` expands on macOS and Linux, and Windows takes drive
+and UNC paths only. Any other line, a control character, more than 32 lines or more than
+32 KB of text means the text is not a path list and the paste keeps "Clipboard does not
+contain an image". Paste opens each path through `open_document_path` (File > Open's path);
+Paste in Place with a document adds them through `add_files_as_layers_interactive`, as a
+file-manager paste does, and with no document opens them. Missing paths ("File not found:"),
+folders ("Not a file:") and unsupported files go to the status line while the good ones
+open. With no document both actions are document actions turned on only while the
+clipboard text parses as paths (`refresh_paste_without_document_state`, on
+`QClipboard::dataChanged`). A focused line edit, spin box or the canvas text editor accepts
+the Ctrl+V ShortcutOverride, so the text pastes there and nothing opens. The start panel's
+recent filter takes focus when the panel shows; a click on the panel's empty area or a
+label (the panel has `Qt::ClickFocus`) or Escape in the filter moves focus to the panel, so
+Ctrl+V opens the path. Compiled out on
+WebAssembly (no host paths). Tests: `ui_clipboard_text_paths_parse_quotes_urls_and_lines`,
+`ui_paste_text_path_*`, `ui_paste_in_place_text_path_adds_a_layer`,
+`ui_start_panel_background_click_frees_ctrl_v_for_path_paste`,
+`ui_unicode_paste_text_path_opens_unicode_name`.
+
+## Edit > Copy and the system clipboard
+
+`copy_selection` (main_window_layer_ops.cpp) has two payloads. With a pixel selection on
+pixel layers it copies the selected pixels (`ClipboardPayload::pixels`) and puts the same
+image on the system clipboard. Without a selection, or with a text, shape, adjustment,
+folder or Smart Object layer among the copied ones, it copies whole layers
+(`layers_top_to_bottom`) and, since GitHub issue 116, also renders those layers by
+themselves (`render_layers_for_system_clipboard`: a scratch document with the copied
+layers and the Smart Object, filter and pattern stores they reference, cropped to the
+layers' bounds and trimmed to painted pixels) onto the system clipboard. Clearing it instead
+would reach a Wayland compositor as `set_selection(nil)` and leave a paste in another
+program empty. Paste inside Patchy prefers the layer payload because
+`set_system_clipboard_image` records the image's signature as Patchy's own; an image copied
+elsewhere afterwards wins (`ui_external_clipboard_image_paste_overrides_internal_payload`).
+Hidden copied layers render nothing, so then the clipboard is cleared. Test:
+`ui_whole_layer_copy_puts_its_pixels_on_the_system_clipboard`.
+
+A pixel Copy, Cut or Copy Merged whose selected area holds no visible pixel (a marquee
+off the canvas or over transparency, artboard paper included, since the compositor paints
+it and no layer stores it) refuses as Photoshop does: "Could not complete the Copy command
+because the selected area is empty." (`copyEmptySelectionMessageBox`; a status error when
+unattended). The clipboard keeps what it held and Cut records no undo step, so Paste never
+makes an invisible layer (`ui_copy_over_transparent_pixels_refuses_and_keeps_the_clipboard`,
+`ui_copy_over_artboard_paper_refuses_but_copy_merged_copies_it`). Layer via Copy/Cut find
+the selected pixel layers anywhere in the tree and insert directly above the topmost one,
+on its artboard or in its folder (`ui_layer_via_copy_finds_a_layer_on_an_artboard`).
+With no selection Layer via Copy (Ctrl+J) is Duplicate Layer, as in Photoshop: text, shape,
+Smart Object, adjustment and group layers keep their kind (#401,
+`ui_layer_via_copy_without_selection_duplicates_the_layer`).
+
+## Platforms
+
+Native builds read `QClipboard::Clipboard` in response to the action. This uses
+the ordinary clipboard on Windows, macOS, X11, and Wayland, not X11's primary
+mouse selection. The enabled state follows `QClipboard::dataChanged`, checking only
+the offered formats (`QMimeData::hasImage`), never the image; the File menu does not
+query the clipboard when it opens, so a slow clipboard owner cannot delay it. The
+click reads the current data and validates it. Qt's
+[QClipboard documentation](https://doc.qt.io/qt-6/qclipboard.html) describes the
+event-loop requirement on X11 and activation-based change notification on macOS.
+
+The command is hidden, disabled, and has no trigger handler on WebAssembly,
+while its identifier stays registered. In the pinned
+[Qt 6.10.3 browser backend](https://github.com/qt/qtbase/blob/v6.10.3/src/plugins/platforms/wasm/qwasmclipboard.cpp),
+`mimeData()` returns cached data; `sendClipboardData()` fills it from a browser
+paste event and delivers Ctrl+V. An arbitrary menu click or Ctrl+Alt+Shift+N
+does not refresh that cache. Exposing the desktop implementation would risk
+opening an earlier image after the host clipboard had changed.
+
+Copy in the other direction (Patchy to the browser clipboard) does not use
+Qt's write path either. The same backend serializes a copied image to PNG and
+calls `navigator.clipboard.write()` with a Blob built by qstdweb's
+`Blob::fromArrayBuffer`, which carries no MIME type. Chromium rejects a
+`ClipboardItem` whose Blob type does not match its key (`NotAllowedError: Type
+image/png does not match the blob's type`) and Qt only prints "clipboard error" on
+the console, so Qt alone cannot copy an image out to a Chromium browser.
+`set_system_clipboard_image` therefore also calls `wasm_clipboard::write_image_png` (`src/ui/clipboard_wasm.cpp`),
+which encodes the PNG and writes it through a typed Blob from the same user
+gesture; Qt's own rejected write still logs its warning. The Qt clipboard is
+still set so the internal paste signature and the New Document Clipboard preset
+keep working. A refused write (insecure context, no user activation, permission
+denied) only warns on the console; the copy stays usable inside Patchy. Text and
+SVG copies go through Qt's write unchanged (strings need no Blob). The browser
+pane inside Claude's desktop app denies clipboard permissions outright, so
+verify this in a real browser.
+
+A future browser implementation needs a fresh, asynchronous read, explicit
+permission/error handling, and protection against applying a late result to a
+closed or locked workspace. Browser reads require a secure context and may need
+user activation, permission, or a browser paste prompt; embedded frames also have
+permissions-policy restrictions. See the
+[Clipboard API](https://developer.mozilla.org/en-US/docs/Web/API/Clipboard/read)
+and [wasm.md](wasm.md) for Patchy's promise/event-loop constraints. Do not enable
+the action on the strength of `QClipboard::image()` returning a cached image.
+
+## Slow or locked clipboards
+
+Qt's Windows clipboard opens the system clipboard for every query (`QMimeData::hasImage`,
+`hasText`). While another process holds it open (a clipboard manager, a remote-desktop
+agent, a hung program), Qt sleeps and retries before it gives up: on the machine measured,
+about 0.5 s for a `hasText` and 3 s for the first `hasImage`. That machine's clipboard
+stayed locked, and its window took 6.1 s to be ready because startup asked five times
+(the Open from Clipboard state, then the no-document Paste state on four action-state
+refreshes). So the window asks the format list first:
+`system_clipboard_may_offer` (src/ui/clipboard_format_probe.cpp) calls
+`IsClipboardFormatAvailable`, which neither opens the clipboard nor calls its owner, for
+every format Qt 6.8's converters accept (image: `CF_DIB`, registered `PNG` and
+`application/x-qt-image`; text: `CF_UNICODETEXT`, `CF_TEXT`, registered `text/plain`).
+When none is listed the answer is "no" without asking Qt; otherwise Qt reads as before.
+Windows lists `CF_DIB` and `CF_UNICODETEXT` for data offered in the formats it converts
+from, so a "no" is exact. `clipboard_offers_image` and the no-document Paste state use it.
+
+The no-document Paste state (`clipboard_text_names_file_paths`) also remembers its answer
+for the clipboard's change number (`GetClipboardSequenceNumber`): every action-state
+refresh without a document asks, and each Qt read copies the whole text across processes.
+Listed text that Qt could not read is asked again next time instead of being remembered.
+
+Both apply only on Qt's native Windows platform. Elsewhere, and under the offscreen
+platform (whose clipboard is Qt's own, so the tests never see the machine's clipboard),
+the probe returns "maybe" and the change number 0, and Qt answers every query
+(`ui_clipboard_format_probe_defers_to_qt_off_native_platform`).
+
+## Legal review (2026-10-04)
+
+Scope: this independently implemented, user-invoked raster command and shortcut,
+which lacks an element of every independent claim read below. This is a scoped
+engineering review, not a worldwide search or a guarantee about undiscovered claims.
+
+- Copyright: the U.S. Copyright Office excludes methods of operation and short
+  phrases from copyright protection. The functional command/shortcut can be
+  implemented independently; no Affinity code, assets, documentation, or branding
+  is copied. [Copyright Office FAQ](https://www.copyright.gov/help/faq/faq-protect.html).
+- Published precedent: GIMP 2.4's Paste as New Image documentation records a
+  2006-07-27 revision and describes creating a new image at the copied selection's
+  dimensions with transparent uncovered regions.
+  [GIMP manual](https://docs.gimp.org/2.4/en/gimp-edit-paste-as.html).
+- Patent searches covered clipboard/new-image/new-document and clipboard
+  shortcuts, including Serif/Affinity and Adobe terms. No blocking claim was
+  identified for this design. Two relevant granted patents were read at the
+  independent-claim level, rather than assuming that the copyright review also covers patents.
+- [Dropbox US12099886B2](https://patents.google.com/patent/US12099886B2/en),
+  independent claims 1, 17, and 20, require determining a file format from
+  clipboard metadata and creating a stored content item in a content management
+  system. Patchy creates an unsaved in-memory raster document; this command
+  selects no output file format or destination and invokes no content-management
+  service. The patent's background itself describes photo editors creating new
+  in-memory image containers from clipboard contents. Do not extend this review
+  to one-click clipboard-to-file/cloud storage.
+- [Adobe US9396176B2](https://patents.google.com/patent/US9396176B2/en),
+  independent claims 1 and 9, require stored associations between multiple
+  destination locations in a target document and key sequences, followed by
+  copying selected source content and pasting to the associated destination.
+  Patchy's shortcut creates a new document from an existing clipboard image; it
+  stores no destination associations and performs no source-copy step.
+
+## Verification
+
+The `ui_open_clipboard` tests exercise empty-workspace creation, File-menu
+placement, shortcut dispatch with an existing document, unchanged source history,
+replacement of a private copy with a current external image, exact RGBA bytes and
+high-DPI dimensions, 72 PPI, unsaved/pathless state, and invalid clipboard refusal.
+Run alongside `ui_new_document_presets_and_clipboard_work`, plus
+`ui_hotkey_defaults_have_no_conflicts` when the action or its shortcut changes,
+`ui_no_widget_ships_unresolved_theme_tokens` when QSS or theme roles change,
+and the translation build gate.

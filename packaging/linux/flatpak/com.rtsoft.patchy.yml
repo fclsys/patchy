@@ -1,0 +1,180 @@
+# See packaging/linux/README.md.
+app-id: com.rtsoft.patchy
+runtime: org.kde.Platform
+runtime-version: '6.11'
+sdk: org.kde.Sdk
+command: patchy
+# GEGL's catalogs stay in the app: a separate .Locale extension is missing from the
+# single-file bundle, and GEGL's filter names would fall back to English there.
+separate-locales: false
+finish-args:
+  - --socket=wayland
+  - --socket=fallback-x11
+  - --share=ipc
+  - --device=dri
+  # Theme and script sounds through paplay (PipeWire serves this socket too).
+  - --socket=pulseaudio
+  # Update check and Object Selection's High Quality model download (it lands in the
+  # app's data folder, which `flatpak uninstall --delete-data` removes).
+  - --share=network
+  # Recent files, command-line file arguments, brush and palette folders.
+  - --filesystem=home
+  # USB scanners (SANE) and cameras (libgphoto2) for File > Import > From Scanner or
+  # Camera (docs/import-scanner.md). Network scanners need only --share=network.
+  - --device=all
+cleanup:
+  - /include
+  - /lib/cmake
+  - /onnxruntime
+modules:
+  # Automatic selection (docs/ai-selection-models.md): the pinned ONNX Runtime CPU package. The
+  # headers and link library stay under /onnxruntime for the patchy build (cleaned up
+  # afterwards); the shared library goes to /app/lib, where the loader finds it. Keep the
+  # version and checksums in sync with scripts/setup-ai-deps.sh.
+  - name: onnxruntime
+    buildsystem: simple
+    build-commands:
+      - mkdir -p /app/onnxruntime /app/lib
+      - cp -a include lib LICENSE ThirdPartyNotices.txt /app/onnxruntime/
+      - cp -a lib/libonnxruntime.so* /app/lib/
+    sources:
+      - type: archive
+        only-arches: [x86_64]
+        url: https://github.com/microsoft/onnxruntime/releases/download/v1.30.0/onnxruntime-linux-x64-1.30.0.tgz
+        sha256: a5ed5a3cac51fbb2e90da632ae43d19212faaa20e76484e62bcb7c23ddb3b3fd
+      - type: archive
+        only-arches: [aarch64]
+        url: https://github.com/microsoft/onnxruntime/releases/download/v1.30.0/onnxruntime-linux-aarch64-1.30.0.tgz
+        sha256: e16a27a8ed330bbc698df7330b0cf56e722f354e3bcc92118682c74ef3c3e3da
+  # Scanner and camera acquisition (docs/import-scanner.md): the KDE runtime carries neither SANE
+  # nor libgphoto2, and Patchy dlopens both at run time. SANE's own gphoto2 backend stays
+  # off: cameras go through libgphoto2 directly.
+  - name: sane-backends
+    buildsystem: autotools
+    config-opts:
+      - --disable-locking
+      - --disable-rpath
+      - --without-gphoto2
+      - --without-api-spec
+    sources:
+      - type: archive
+        url: https://gitlab.com/-/project/429008/uploads/843c156420e211859e974f78f64c3ea3/sane-backends-1.4.0.tar.gz
+        sha256: f99205c903dfe2fb8990f0c531232c9a00ec9c2c66ac7cb0ce50b4af9f407a72
+      # Where the source of both libraries is published (docs/legal-licensing.md,
+      # PatchyLinuxScannerSources.zip from scripts/release/make-linux-scanner-sources.ps1).
+      - type: file
+        path: ../../../packaging/linux/flatpak/scanner-SOURCES.txt
+    post-install:
+      - install -Dm644 COPYING /app/share/licenses/com.rtsoft.patchy/sane-backends-COPYING.txt
+      - install -Dm644 LICENSE /app/share/licenses/com.rtsoft.patchy/sane-backends-LICENSE.txt
+      - install -Dm644 scanner-SOURCES.txt /app/share/licenses/com.rtsoft.patchy/scanner-SOURCES.txt
+    cleanup:
+      - /bin
+      - /sbin
+      - /share/man
+      - /share/doc
+  - name: libgphoto2
+    buildsystem: autotools
+    config-opts:
+      - --disable-static
+    sources:
+      - type: archive
+        url: https://github.com/gphoto/libgphoto2/releases/download/v2.5.32/libgphoto2-2.5.32.tar.xz
+        sha256: 495a347be21b8f970607a81e739aa91513a8479cbd73b79454a339c73e2b860e
+    post-install:
+      - install -Dm644 COPYING /app/share/licenses/com.rtsoft.patchy/libgphoto2-COPYING.txt
+    cleanup:
+      - /bin
+      - /share/man
+      - /share/doc
+  # Patchy's own GEGL (docs/gegl-filters.md, "Bundled GEGL"): babl and GEGL from gimp.org's
+  # tarballs with every optional dependency off; the runtime supplies GLib and json-glib.
+  # Keep the versions and checksums in sync with scripts/dev/gegl/ (sources.lock). The
+  # cleanups leave the operation modules the Windows bundle ships, GPL-3 module included:
+  # never file loaders and savers, transforms, seamless clone or vector fill
+  # (docs/legal-licensing.md).
+  - name: babl
+    buildsystem: meson
+    config-opts:
+      - --libdir=lib
+      - -Dauto_features=disabled
+      - -Dwith-docs=false
+      - -Denable-gir=false
+      - -Denable-vapi=false
+    sources:
+      - type: archive
+        url: https://download.gimp.org/pub/babl/0.1/babl-0.1.128.tar.xz
+        sha256: e676507b421d414d49db8627415dc1eadbd787536baa7d6fe94a1f1971cbe73e
+    post-install:
+      - install -Dm644 "$FLATPAK_BUILDER_BUILDDIR/COPYING" /app/share/licenses/com.rtsoft.patchy/babl-COPYING.txt
+    cleanup:
+      - /bin
+      - /include
+      - /lib/pkgconfig
+      - /lib/babl-0.1/cairo.so
+  - name: gegl
+    buildsystem: meson
+    config-opts:
+      - --libdir=lib
+      - -Dauto_features=disabled
+      - -Ddocs=false
+      - -Dworkshop=false
+      - -Dintrospection=false
+    sources:
+      - type: archive
+        url: https://download.gimp.org/pub/gegl/0.4/gegl-0.4.72.tar.xz
+        sha256: ccbb8cdd1db56ecd4ece5dbabae0118ab2c46b5b3439c94f3cec467798ce956d
+      # The operations Patchy's GEGL is built without, as on every platform.
+      - type: file
+        path: ../../../scripts/dev/gegl/common.sh
+      - type: shell
+        commands:
+          - . ./common.sh && patchy_gegl_drop_operations .
+    post-install:
+      - install -Dm644 "$FLATPAK_BUILDER_BUILDDIR/COPYING.LESSER" /app/share/licenses/com.rtsoft.patchy/gegl-COPYING.LESSER.txt
+      - install -Dm644 "$FLATPAK_BUILDER_BUILDDIR/COPYING" /app/share/licenses/com.rtsoft.patchy/gegl-COPYING.txt
+      - sh -c '. "$FLATPAK_BUILDER_BUILDDIR/common.sh" && { echo "Patchy GEGL 0.4.72, babl 0.1.128 (gimp.org tarballs); GLib and json-glib are the runtime'"'"'s."; patchy_gegl_sources_note; }' > /app/share/licenses/com.rtsoft.patchy/gegl-SOURCES.txt
+    cleanup:
+      - /bin
+      - /include
+      - /lib/pkgconfig
+      - /lib/libgegl-npd-*
+      - /lib/libgegl-sc-*
+      - /lib/gegl-0.4/*-load.so
+      - /lib/gegl-0.4/*-save.so
+      - /lib/gegl-0.4/*transformops*
+      - /lib/gegl-0.4/seamless-clone*
+      - /lib/gegl-0.4/vector-fill.so
+      - /lib/gegl-0.4/*.json
+  - name: patchy
+    buildsystem: cmake-ninja
+    config-opts:
+      - -DCMAKE_BUILD_TYPE=Release
+      - -DPATCHY_BUILD_TESTS=OFF
+      - -DPATCHY_REQUIRE_AI_SELECTION=ON
+      - -DPATCHY_GMIC_THREADS=ON
+      - -DPATCHY_ONNXRUNTIME_DIR=/app/onnxruntime
+      - -DPATCHY_AI_MODELS_DIR=/run/build/patchy/ai-models-pinned
+    sources:
+      - type: dir
+        path: ../../..
+        skip:
+          - build
+          - .deps
+          - .git
+          - local-secrets
+          - local-test-fixtures
+          - test-artifacts
+      # The int8 automatic selection models, pinned like scripts/setup-ai-deps.sh.
+      # Not "ai-models-download": the build clears that folder in the build directory (cmake/patchy_ai.cmake).
+      - type: file
+        url: https://github.com/SethRobinson/Patchy/releases/download/ai-models-1/mobile_sam_image_encoder_int8.onnx
+        sha256: 6af3f249f7a5a6a8a3ef988b6814015e8c3a300977c135d1f9572ed2f2930cd7
+        dest: ai-models-pinned
+      - type: file
+        url: https://github.com/SethRobinson/Patchy/releases/download/ai-models-1/sam_mask_decoder_multi_int8.onnx
+        sha256: aa1410bec8f050b6017fba29ca07f16317029a8f74a98e5998aeed46680c10a6
+        dest: ai-models-pinned
+      # birefnet_lite_general_1024_int8.onnx (Select Subject) is left out while
+      # PATCHY_ENABLE_SELECT_SUBJECT is off (held back pending patent review); restore it from
+      # scripts/setup-ai-deps.sh together with -DPATCHY_ENABLE_SELECT_SUBJECT=ON.

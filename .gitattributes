@@ -1,0 +1,53 @@
+* text=auto eol=lf
+
+*.bat text eol=crlf
+*.cmd text eol=crlf
+*.ps1 text eol=crlf
+*.sh text eol=lf
+
+*.cpp text
+*.h text
+*.hpp text
+*.cmake text
+CMakeLists.txt text
+*.json text
+*.md text
+# Parallel branches each add a dated block at the top: keep both (docs/scripting.md).
+docs/scripting-api-changes.md merge=union
+*.yml text
+*.yaml text
+
+*.8bf binary -eol
+*.zip binary -eol
+*.asl binary -eol
+*.pat binary -eol
+*.psd binary -eol
+*.psb binary -eol
+*.png binary -eol
+*.jpg binary -eol
+*.jpeg binary -eol
+*.jxl binary -eol
+*.pdn binary -eol
+*.xcf binary -eol
+*.gz binary -eol
+*.bz2 binary -eol
+*.xz binary -eol
+*.ico binary -eol
+*.icns binary -eol
+*.icc binary -eol
+*.ICC binary -eol
+*.icm binary -eol
+
+# Preserve vendored libheif source byte-for-byte apart from Patchy's documented
+# WebCodecs adapter changes; upstream files contain intentional whitespace quirks.
+src/formats/libheif/** -whitespace
+
+# Vendored libjxl, Highway, Brotli and skcms stay byte-for-byte upstream.
+src/formats/libjxl/** -whitespace
+
+# Vendored dav1d and libavif (with its libyuv subset) stay byte-for-byte upstream.
+src/formats/dav1d/** -whitespace
+src/formats/libavif/** -whitespace
+
+# Keep the upstream font license byte-for-byte, including its trailing spaces.
+third_party/fonts-web/nanum_gothic/OFL.txt -whitespace

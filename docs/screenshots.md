@@ -1,0 +1,245 @@
+# Screenshot gallery
+
+[Back to Patchy](../README.md)
+
+Click any image to inspect it at full size. These are captures of the real editor.
+
+[Photos and selections](#photos-and-selections) · [Filters](#filters) · [Layer styles and textures](#layer-styles-and-textures) · [Type and vectors](#type-and-vectors) · [Painting, pixel art, and games](#painting-pixel-art-and-games) · [Documents and formats](#documents-and-formats) · [Scanning](#scanning) · [Plug-ins and scripting](#plug-ins-and-scripting)
+
+## Photos and selections
+
+<table>
+<tr>
+<td align="center" valign="top" width="50%">
+      <a href="images/screenshots/smart_filters.png"><img src="images/screenshots/smart_filters.png" width="430" alt="Cyclist photo with color-wheel and Levels controls, a Levels adjustment layer, native Smart Filters and a shared mask, grouped text, and a clipping mask"></a>
+      <br><sub>Color and Levels controls with live preview, editable adjustment layers and Smart Filters, grouped text, and clipping masks</sub>
+    </td>
+<td align="center" valign="top" width="50%">
+      <a href="images/screenshots/camera_raw.png"><img src="images/screenshots/camera_raw.png" width="430" alt="Camera Raw develop dialog showing a snowy mountain photo with white balance, tone, color, and detail controls"></a>
+      <br><sub>Camera Raw development with white balance, tone, color, demosaic, and denoise controls; 16-bit processing currently produces an 8-bit document</sub>
+    </td>
+</tr>
+<tr>
+<td align="center" valign="top" width="50%">
+      <a href="images/screenshots/object_select.png"><img src="images/screenshots/object_select.png" width="430" alt="Object Selection tool with a vintage car selected in a busy Havana street, the rest of the photo muted by layers filled through the inverted selection"></a>
+      <br><sub>Object Selection: one loose box drag picks out the car from a busy street, wheels and mirrors included, on the CPU with the High Quality model</sub>
+    </td>
+<td align="center" valign="top" width="50%">
+      <a href="images/screenshots/quick_mask.png"><img src="images/screenshots/quick_mask.png" width="430" alt="Quick Mask over the San Francisco skyline: the sky, selected with a few Magic Wand clicks, stays clear while the towers and city below sit under the red overlay, with the Quick Mask channel in the Channels panel"></a>
+      <br><sub>Quick Mask: a Magic Wand selection of the sky becomes a red overlay you can paint with any brush, then turns back into a selection</sub>
+    </td>
+</tr>
+<tr>
+<td align="center" valign="top" width="50%">
+      <a href="images/screenshots/remove_object.png"><img src="images/screenshots/remove_object.png" width="430" alt="Remove Object on a misty beach photo: the lone walker and his shadow are gone, filled from the sand around them, with a Before inset and the Remove Object dialog with Reroll, tone match and edge feather"></a>
+      <br><sub>Remove Object: outline an object and it is filled from its surroundings, on your CPU with no download. Reroll for another variation, or keep the fill on its own layer</sub>
+    </td>
+<td align="center" valign="top" width="50%">
+      <a href="images/screenshots/openai_images.png"><img src="images/screenshots/openai_images.png" width="430" alt="OpenAI Image Tools via API Key: a watercolor version of the beach photo made from a prompt with the photo as reference image 1, the result added as a new layer, two variations in the results row"></a>
+      <br><sub>OpenAI Image Tools via API Key: a prompt and a reference image become new layers (here a watercolor of the beach photo). It uses your own OpenAI key; nothing is sent until you click Create</sub>
+    </td>
+</tr>
+</table>
+
+## Filters
+
+<table>
+<tr>
+<td align="center" valign="top" width="50%">
+      <a href="images/screenshots/gmic.png"><img src="images/screenshots/gmic.png" width="430" alt="G'MIC Filter Library with Rodilius chosen among the Artistic filters and previewing live inside a selection on the right half of a Havana street photo"></a>
+      <br><sub>The G'MIC Filter Library: nearly 400 filters with generated controls and a live preview on the canvas, here inside a selection</sub>
+    </td>
+<td align="center" valign="top" width="50%">
+      <a href="images/screenshots/tilt_shift.png"><img src="images/screenshots/tilt_shift.png" width="430" alt="Tilt-Shift Blur in the Filter Gallery over a real San Francisco city photograph with draggable focus controls"></a>
+      <br><sub>Tilt-Shift Blur with live on-image focus, angle, and transition controls</sub>
+    </td>
+</tr>
+<tr>
+<td align="center" valign="top" width="50%">
+      <a href="images/screenshots/flame.png"><img src="images/screenshots/flame.png" width="430" alt="The word FIRE burning on a night background, with short flames licking up from the outlines of dark charred letters, the letters' path selected in the Paths panel, and the Flame dialog set to Campfire and Follow Path with its own preview"></a>
+      <br><sub>Flame: fire grows along the selected path, here the outline of the word FIRE, previewed live on the canvas and in the dialog. 14 presets, with length, turbulence, glow, smoke and sparks to tune</sub>
+    </td>
+<td align="center" valign="top" width="50%">
+      <a href="images/screenshots/perspective_planes.png"><img src="images/screenshots/perspective_planes.png" width="430" alt="Perspective Planes workspace on a photo of a brick wall seen from below: one plane follows the brick courses, with San Francisco and Havana posters pasted onto it and a Sunset poster still floating with its handles"></a>
+      <br><sub>Perspective Planes: posters pasted onto a brick wall follow its perspective, and the Sunset poster is still movable with its handles</sub>
+    </td>
+</tr>
+<tr>
+<td align="center" valign="top" width="50%">
+      <a href="images/screenshots/gegl.png"><img src="images/screenshots/gegl.png" width="430" alt="GEGL Little Planet filter turning a mirrored San Francisco skyline into a tiny round planet, with the filter dialog, its live preview and the Filter from GEGL credit"></a>
+      <br><sub>Over a hundred GEGL filters in Patchy's filter dialog with live preview, here Little Planet on the San Francisco skyline</sub>
+    </td>
+<td align="center" valign="top" width="50%">
+      <a href="images/screenshots/liquify.png"><img src="images/screenshots/liquify.png" width="430" alt="Liquify dialog on the stylized sunset: the sun twirled and bloated and a ridge pushed up, with Show Mesh on so the warp reads as a bent grid"></a>
+      <br><sub>Liquify: warp, twirl, pucker, bloat and freeze brushes, with the mesh shown so every push is visible</sub>
+    </td>
+</tr>
+</table>
+
+## Layer styles and textures
+
+<table>
+<tr>
+<td align="center" valign="top" width="50%">
+      <a href="images/screenshots/layer_styles.png"><img src="images/screenshots/layer_styles.png" width="430" alt="Layer Style dialog editing stroke, gradient overlay, and drop shadow, with the gradient color picker beside layered artwork"></a>
+      <br><sub>Layer styles with multiple effects, blending controls, and Photoshop-compatible presets</sub>
+    </td>
+<td align="center" valign="top" width="50%">
+      <a href="images/screenshots/long_shadow.png"><img src="images/screenshots/long_shadow.png" width="430" alt="Layer Style dialog with effects and blending controls beside editable text casting continuous long shadows"></a>
+      <br><sub>Continuous long shadows on editable type, a Patchy extension of the drop shadow. Photoshop opens it as an ordinary drop shadow at the chosen distance and may discard the extension when saving</sub>
+    </td>
+</tr>
+<tr>
+<td align="center" valign="top" width="50%">
+      <a href="images/screenshots/material_styles.png"><img src="images/screenshots/material_styles.png" width="430" alt="Layer Style dialog applying Riveted Steel to large text from the built-in Materials preset folder"></a>
+      <br><sub>Material layer styles backed by bundled CC0 wood, stone, metal, fabric, and ground textures</sub>
+    </td>
+<td align="center" valign="top" width="50%">
+      <a href="images/screenshots/pattern_manager.png"><img src="images/screenshots/pattern_manager.png" width="430" alt="Pattern Manager showing the Textures folder with the bundled CC0 Weathered Marble photo texture selected in the large preview"></a>
+      <br><sub>Photo textures in the Pattern Manager, with full-resolution preview, import, organization, and editing</sub>
+    </td>
+</tr>
+</table>
+
+## Type and vectors
+
+<table>
+<tr>
+<td align="center" valign="top" width="50%">
+      <a href="images/screenshots/warp_text.png"><img src="images/screenshots/warp_text.png" width="430" alt="Type Playground with the Warp Text dialog and the Character and Paragraph panels open, a paragraph with bold, italic, color, underline, strikethrough, superscript, subscript, small caps and all caps, warped words, tracked lettering, and vertical Japanese text"></a>
+      <br><sub>Live Warp Text with the Character and Paragraph panels; one paragraph mixes bold, italic, color, underline, strikethrough, superscript, subscript, small caps and all caps, beside letter spacing and Japanese vertical columns, all editable text layers</sub>
+    </td>
+<td align="center" valign="top" width="50%">
+      <a href="images/screenshots/vector_tools.png"><img src="images/screenshots/vector_tools.png" width="430" alt="Vector sunset poster with editable mountain anchors, a rounded gradient badge with a dashed pattern stroke, and the Paths panel"></a>
+      <br><sub>Vector shape layers, editable pen paths and anchors, gradient and pattern paint, dashed strokes, rounded corners, and the Paths panel</sub>
+    </td>
+</tr>
+<tr>
+<td align="center" valign="top" width="50%">
+      <a href="images/screenshots/svg_import.png"><img src="images/screenshots/svg_import.png" width="430" alt="CC0 hot air balloon SVG clip art opened as editable shape layers with group folders in the Layers panel and the big balloon's bezier anchors selected on canvas"></a>
+      <br><sub>SVG files open as editable shape layers: groups become folders, paths stay live vectors</sub>
+    </td>
+<td align="center" valign="top" width="50%">
+      <a href="images/screenshots/image_trace.png"><img src="images/screenshots/image_trace.png" width="430" alt="Trace Image to Shapes dialog converting a stylized sunset landscape into editable vector shape layers, with anchor points marked on the traced preview"></a>
+      <br><sub>Trace Image to Shapes turns any image into editable vector shape layers, with Illustrator-style presets and a live traced preview</sub>
+    </td>
+</tr>
+</table>
+
+## Painting, pixel art, and games
+
+<table>
+<tr>
+<td align="center" valign="top" width="50%">
+      <a href="images/screenshots/brush_tips.png"><img src="images/screenshots/brush_tips.png" width="430" alt="Brush Tip Manager showing a collection of textured and shaped brush presets"></a>
+      <br><sub>Brush presets, import and management; spacing, roundness and texture controls; pressure-aware size, opacity, flow, angle, scatter and color dynamics</sub>
+    </td>
+<td align="center" valign="top" width="50%">
+      <a href="images/screenshots/palette_mode.png"><img src="images/screenshots/palette_mode.png" width="430" alt="Palette mode converting a cycling photo to an optimized 16-color palette, with the list of retro palettes open (NES, Commodore 64, Game Boy, PICO-8 and more) and the Foreground Color window showing the current palette"></a>
+      <br><sub>Palette mode: convert to a retro or optimized palette, then paint with only its colors while layers, text, and live layer effects stay editable</sub>
+    </td>
+</tr>
+<tr>
+<td align="center" valign="top" width="50%">
+      <a href="images/screenshots/tile_preview.png"><img src="images/screenshots/tile_preview.png" width="430" alt="Seamless tiling mode repeating one 50 by 50 pixel Dink Smallwood grass tile at 400 percent, a red wave painted across it that leaves the right edge at the height it enters the left, joining up in every copy, and the Palette panel showing the 256-color Dink Smallwood palette the tile is drawn in"></a>
+      <br><sub>Seamless tiling mode repeats the canvas live, so a line painted across an edge has to meet itself in every copy: here a single 50 x 50 grass tile from Dink Smallwood, with its 256-color game palette in the Palette panel</sub>
+    </td>
+<td align="center" valign="top" width="50%">
+      <a href="images/screenshots/web_export.png"><img src="images/screenshots/web_export.png" width="430" alt="Export for Web making an animated GIF of San Francisco going from afternoon to blue hour, paused on frame 4 of 8, with a split view comparing the original and the 16-color dithered result and the encoded size of every format"></a>
+      <br><sub>Export for Web: eight layers become an animated GIF that plays in the preview, a draggable split compares the original with a 16-color dithered result, and every format lists its real encoded size</sub>
+    </td>
+</tr>
+<tr>
+<td align="center" valign="top" width="50%">
+      <a href="images/screenshots/web_export_quad.webp"><img src="images/screenshots/web_export_quad.webp" width="430" alt="Animation: Export for Web in its 4-up view playing an animated WebP time-lapse at quality 80, 40 and 20 beside the original, each tile tagged with its encoded size"></a>
+      <br><sub>Export for Web in 4-up: an animated WebP plays at three qualities beside the original, each with its real encoded size</sub>
+    </td>
+<td align="center" valign="top" width="50%">
+      <a href="images/screenshots/rotate_view.png"><img src="images/screenshots/rotate_view.png" width="430" alt="The canvas turned 24 degrees with the Rotate View tool, gulls sketched on their own layer over the sunset, the options bar showing the rotation angle and Reset View"></a>
+      <br><sub>Rotate View turns the canvas like a sheet of paper under your pen; painting and selections work turned, and the image never changes</sub>
+    </td>
+</tr>
+<tr>
+<td align="center" valign="top" width="50%">
+      <a href="images/screenshots/dink_theme.png"><img src="images/screenshots/dink_theme.png" width="430" alt="The bundled Dink Smallwood theme: the interface in brown and gold with its own icons and a tiled grass backdrop behind the Home Screen, Dink walking along the bottom, and Preferences open on Colors and Themes with the theme selected"></a>
+      <br><sub>Theme packages change more than colors: the bundled Dink Smallwood theme brings icons, a tiled backdrop, sounds, effects and Dink himself walking across the Home Screen.  This theme is ugly as sin and gaudy as hell, please don't use it!</sub>
+    </td>
+<td width="50%"></td>
+</tr>
+</table>
+
+## Documents and formats
+
+<table>
+<tr>
+<td align="center" valign="top" width="50%">
+      <a href="images/screenshots/artboards.png"><img src="images/screenshots/artboards.png" width="430" alt="Patchy's Light theme with four artboards for a car-weekend campaign: a white story, a black banner, a cream post selected with the Artboard tool's handles and add buttons, and a transparent icon, with the Properties panel showing the post's position, size and background"></a>
+      <br><sub>Artboards: a story, banner, post and icon in one document, each with its own size and background, exported to separate files or PDF pages. This screenshot uses the Light theme.</sub>
+    </td>
+<td align="center" valign="top" width="50%">
+      <a href="images/screenshots/layered_import.png"><img src="images/screenshots/layered_import.png" width="430" alt="Why settle for only .psd? An introduction above eight labeled artboards in a 4 by 2 grid: Photoshop game artwork, Affinity game tips, a Krita character painting, a GIMP planet illustration, an OpenRaster city poster, a Paint.NET landscape, a layered TIFF print design, and Aseprite pixel art"></a>
+      <br><sub>Eight formats with layers, one document: PSD/PSB, Affinity, Krita, GIMP, OpenRaster, Paint.NET, layered TIFF, and Aseprite, each with different artwork and its own imported layer stack. Editable SVG and PDF imports are also supported.</sub>
+    </td>
+</tr>
+<tr>
+<td align="center" valign="top" width="50%">
+      <a href="images/screenshots/smart_objects.png"><img src="images/screenshots/smart_objects.png" width="430" alt="Game title art with a smart object mid warp transform showing the Bezier cage, and its embedded contents open in a second tab"></a>
+      <br><sub>Smart Objects: Warp Transform bends them non-destructively, Edit Contents opens the embedded file in its own tab</sub>
+    </td>
+<td align="center" valign="top" width="50%">
+      <a href="images/screenshots/pdf_viewer.png"><img src="images/screenshots/pdf_viewer.png" width="430" alt="The PDF viewer showing two pages of the sample book Harbor Lights, text beside a picture plate, with page thumbnails and the Two Pages, Cover Alone layout"></a>
+      <br><sub>The PDF viewer: one page or two, with the cover alone for books and comics, right to left reading, and thumbnails</sub>
+    </td>
+</tr>
+<tr>
+<td align="center" valign="top" width="50%">
+      <a href="images/screenshots/pdf_viewer_book_print.png"><img src="images/screenshots/pdf_viewer_book_print.png" width="430" alt="Print as Book over the PDF viewer: a saddle-stitched booklet with the cover sheet preview, both sides, and step-by-step folding and stapling instructions"></a>
+      <br><sub>Print as Book turns a PDF into a booklet, sewn signatures or a zine, with a sheet-by-sheet preview and the steps to put it together</sub>
+    </td>
+<td width="50%"></td>
+</tr>
+</table>
+
+## Scanning
+
+<table>
+<tr>
+<td align="center" valign="top" width="50%">
+      <a href="images/screenshots/divide_photos.png"><img src="images/screenshots/divide_photos.png" width="430" alt="Divide Scanned Photos on a scan of eight prints laid down crooked: the dialog has found all eight and outlines each one, with straightening, the top-edge direction and output options beside it"></a>
+      <br><sub>Divide Scanned Photos: eight crooked prints in one scan, each found and outlined, then opened straightened as its own image or saved to a folder</sub>
+    </td>
+<td align="center" valign="top" width="50%">
+      <a href="images/screenshots/book_scan.png"><img src="images/screenshots/book_scan.png" width="430" alt="Scan a Book to PDF scanning a novel: the open spread with its two page outlines and the gutter line, and a strip below with the front cover, pages 1 to 8 and the back cover"></a>
+      <br><sub>Scan a Book to PDF: each spread is found and split at the gutter as you scan, every page so far in the strip below</sub>
+    </td>
+</tr>
+<tr>
+<td align="center" valign="top" width="50%">
+      <a href="images/screenshots/book_scan_review.png"><img src="images/screenshots/book_scan_review.png" width="430" alt="Scan a Book to PDF review step: the cover and pages in order as thumbnails, a large preview of the cover, and page size, output and quality settings for the PDF"></a>
+      <br><sub>The review step: reorder or turn pages, pick a page size and color, grayscale or black and white output, then export one PDF whose pages share one size</sub>
+    </td>
+<td width="50%"></td>
+</tr>
+</table>
+
+## Plug-ins and scripting
+
+<table>
+<tr>
+<td align="center" valign="top" width="50%">
+      <a href="images/screenshots/plugin_kpt5.png"><img src="images/screenshots/plugin_kpt5.png" width="430" alt="Kai's Power Tools 5 Orb-It running in its own window over a San Francisco photo in Patchy"></a>
+      <br><sub>Kai's Power Tools 5 running in its own window over Patchy. Classic 32-bit and 64-bit 8BF filters work on Windows</sub>
+    </td>
+<td align="center" valign="top" width="50%">
+      <a href="images/screenshots/breakout.webp"><img src="images/screenshots/breakout.webp" width="430" alt="Animation: the Script Manager with Breakout chosen and running, and beside it the game playing on a Patchy document while the Layers panel lists the game layers and the controller window shows the score, lives and keys"></a>
+      <br><sub>Patchy's scripting is powerful enough to run a game: the bundled Breakout plays on a real document, its bricks, paddle and ball are layers, and its controller is the script's own window. The same JavaScript API edits documents, layers, text, selections, pixels and filters</sub>
+    </td>
+</tr>
+<tr>
+<td align="center" valign="top" width="50%">
+      <a href="images/screenshots/mcp_isometric.webp"><img src="images/screenshots/mcp_isometric.webp" width="430" alt="Animation: an AI agent building an isometric harbor town through the MCP connector, step by step in Slow mode, with its tool calls in a log and the AI activity controls in the status bar"></a>
+      <br><sub>AI control through the bundled MCP connector: an AI agent builds an isometric harbor from gradient-filled vector shapes, Smart Object trees that share one source, and native brush strokes, in a visible window with Slow mode showing each step</sub>
+    </td>
+<td width="50%"></td>
+</tr>
+</table>

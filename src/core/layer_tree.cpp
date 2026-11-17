@@ -1,0 +1,824 @@
+#include "core/layer_tree.hpp"
+
+#include "core/layer_metadata.hpp"
+
+#include <algorithm>
+#include <iterator>
+#include <array>
+#include <functional>
+#include <set>
+#include <utility>
+
+namespace patchy {
+
+namespace {
+
+bool target_is_inside_moved_layers(const std::vector<Layer>& layers, const std::vector<LayerId>& moving_ids,
+                                   LayerId target_id) {
+  for (const auto id : moving_ids) {
+    const auto* moving = find_layer_in_tree(layers, id);
+    if (moving != nullptr && (moving->id() == target_id || layer_contains_descendant(*moving, target_id))) {
+      return true;
+    }
+  }
+  return false;
+}
+
+void insert_layers_bottom_to_top(std::vector<Layer>& siblings, std::size_t insert_index,
+                                 std::vector<Layer>& moved_top_to_bottom) {
+  insert_index = std::min(insert_index, siblings.size());
+  auto destination = siblings.begin() + static_cast<std::ptrdiff_t>(insert_index);
+  for (auto it = moved_top_to_bottom.rbegin(); it != moved_top_to_bottom.rend(); ++it) {
+    destination = siblings.insert(destination, std::move(*it));
+    ++destination;
+  }
+}
+
+bool layer_is_pixel_or_text_candidate(const Layer& layer) {
+  return layer.kind() == LayerKind::Pixel || layer.kind() == LayerKind::Text || layer_is_text(layer);
+}
+
+using DefaultLayerCandidates = std::array<std::optional<LayerId>, 4>;
+
+void collect_default_layer_candidates(const std::vector<Layer>& layers, bool ancestors_visible,
+                                      LayerLockFlags ancestor_lock_flags, DefaultLayerCandidates& candidates) {
+  for (auto it = layers.rbegin(); it != layers.rend(); ++it) {
+    const auto effectively_visible = ancestors_visible && it->visible();
+    const auto effective_lock_flags = ancestor_lock_flags | layer_lock_flags(*it);
+    const auto pixels_locked = (effective_lock_flags & kLayerLockImagePixels) != kLayerLockNone;
+    if (layer_is_pixel_or_text_candidate(*it)) {
+      if (effectively_visible && !pixels_locked && !candidates[0].has_value()) {
+        candidates[0] = it->id();
+      }
+      if (!candidates[2].has_value()) {
+        candidates[2] = it->id();
+      }
+    } else if (it->kind() == LayerKind::Adjustment) {
+      if (effectively_visible && !pixels_locked && !candidates[1].has_value()) {
+        candidates[1] = it->id();
+      }
+      if (!candidates[3].has_value()) {
+        candidates[3] = it->id();
+      }
+    }
+    if (it->kind() == LayerKind::Group) {
+      collect_default_layer_candidates(it->children(), effectively_visible, effective_lock_flags, candidates);
+    }
+  }
+}
+
+}  // namespace
+
+std::size_t layer_descendant_count(const Layer& layer) {
+  std::size_t count = layer.children().size();
+  for (const auto& child : layer.children()) {
+    count += layer_descendant_count(child);
+  }
+  return count;
+}
+
+void collect_layer_descendant_ids(const Layer& layer, std::vector<LayerId>& ids) {
+  for (const auto& child : layer.children()) {
+    ids.push_back(child.id());
+    collect_layer_descendant_ids(child, ids);
+  }
+}
+
+std::size_t layer_tree_count(const std::vector<Layer>& layers) {
+  std::size_t count = layers.size();
+  for (const auto& layer : layers) {
+    count += layer_tree_count(layer.children());
+  }
+  return count;
+}
+
+std::optional<LayerId> default_non_group_layer_id(const std::vector<Layer>& layers) {
+  DefaultLayerCandidates candidates{};
+  collect_default_layer_candidates(layers, true, kLayerLockNone, candidates);
+  for (const auto candidate : candidates) {
+    if (candidate.has_value()) {
+      return candidate;
+    }
+  }
+  return std::nullopt;
+}
+
+std::optional<LayerId> only_layer_id(const std::vector<Layer>& layers) {
+  if (layers.size() != 1U || !layers.front().children().empty()) {
+    return std::nullopt;
+  }
+  return layers.front().id();
+}
+
+void collect_layer_group_ids(const std::vector<Layer>& layers, std::set<LayerId>& ids) {
+  for (const auto& layer : layers) {
+    if (layer.kind() == LayerKind::Group) {
+      ids.insert(layer.id());
+    }
+    collect_layer_group_ids(layer.children(), ids);
+  }
+}
+
+void collect_initially_collapsed_layer_groups(const std::vector<Layer>& layers, std::set<LayerId>& ids) {
+  for (const auto& layer : layers) {
+    if (layer.kind() == LayerKind::Group && !layer_group_expanded(layer)) {
+      ids.insert(layer.id());
+    }
+    collect_initially_collapsed_layer_groups(layer.children(), ids);
+  }
+}
+
+namespace {
+
+void collect_layer_group_disclosure_changes(const std::vector<Layer>& layers, const std::set<LayerId>& collapsed_ids,
+                                            std::vector<std::pair<LayerId, bool>>& changes) {
+  for (const auto& layer : layers) {
+    if (layer.kind() == LayerKind::Group) {
+      const bool expanded = !collapsed_ids.contains(layer.id());
+      if (layer_group_expanded(layer) != expanded) {
+        changes.emplace_back(layer.id(), expanded);
+      }
+    }
+    collect_layer_group_disclosure_changes(layer.children(), collapsed_ids, changes);
+  }
+}
+
+}  // namespace
+
+void apply_layer_group_disclosure(std::vector<Layer>& layers, const std::set<LayerId>& collapsed_ids) {
+  std::vector<std::pair<LayerId, bool>> changes;
+  collect_layer_group_disclosure_changes(std::as_const(layers), collapsed_ids, changes);
+  for (const auto& [id, expanded] : changes) {
+    if (auto* group = find_layer_in_tree(layers, id); group != nullptr) {
+      group->metadata_without_content_bump()[kLayerMetadataGroupExpanded] = expanded ? "true" : "false";
+    }
+  }
+}
+
+void collect_initial_layer_fx_disclosure(const std::vector<Layer>& layers, std::set<LayerId>& expanded_effects,
+                                         std::set<LayerId>& collapsed_smart_filters) {
+  for (const auto& layer : layers) {
+    if (const auto expanded = layer_fx_expanded(layer); expanded.has_value()) {
+      if (*expanded) {
+        expanded_effects.insert(layer.id());
+      } else if (layer.smart_filter_stack() != nullptr) {
+        collapsed_smart_filters.insert(layer.id());
+      }
+    }
+    collect_initial_layer_fx_disclosure(layer.children(), expanded_effects, collapsed_smart_filters);
+  }
+}
+
+namespace {
+
+void collect_layer_fx_disclosure_changes(const std::vector<Layer>& layers, const std::set<LayerId>& expanded_effects,
+                                         const std::set<LayerId>& collapsed_smart_filters,
+                                         std::vector<std::pair<LayerId, bool>>& changes) {
+  for (const auto& layer : layers) {
+    const bool has_effects = layer.layer_style().effect_count() > 0;
+    const bool has_smart_filters = layer.smart_filter_stack() != nullptr;
+    if (has_effects || has_smart_filters) {
+      const bool expanded = (has_effects && expanded_effects.contains(layer.id())) ||
+                            (has_smart_filters && !collapsed_smart_filters.contains(layer.id()));
+      if (layer_fx_expanded(layer) != std::optional<bool>{expanded}) {
+        changes.emplace_back(layer.id(), expanded);
+      }
+    }
+    collect_layer_fx_disclosure_changes(layer.children(), expanded_effects, collapsed_smart_filters, changes);
+  }
+}
+
+}  // namespace
+
+void apply_layer_fx_disclosure(std::vector<Layer>& layers, const std::set<LayerId>& expanded_effects,
+                               const std::set<LayerId>& collapsed_smart_filters) {
+  std::vector<std::pair<LayerId, bool>> changes;
+  collect_layer_fx_disclosure_changes(std::as_const(layers), expanded_effects, collapsed_smart_filters, changes);
+  for (const auto& [id, expanded] : changes) {
+    if (auto* layer = find_layer_in_tree(layers, id); layer != nullptr) {
+      layer->metadata_without_content_bump()[kLayerMetadataFxExpanded] = expanded ? "true" : "false";
+    }
+  }
+}
+
+bool collect_layer_ancestor_groups(const std::vector<Layer>& layers, LayerId id, std::vector<LayerId>& ancestors) {
+  for (const auto& layer : layers) {
+    if (layer.id() == id) {
+      return true;
+    }
+    if (collect_layer_ancestor_groups(layer.children(), id, ancestors)) {
+      if (layer.kind() == LayerKind::Group) {
+        ancestors.push_back(layer.id());
+      }
+      return true;
+    }
+  }
+  return false;
+}
+
+std::set<LayerId> layer_shared_ancestor_groups(const std::vector<Layer>& layers, const std::vector<LayerId>& ids) {
+  std::set<LayerId> shared;
+  bool first = true;
+  for (const auto id : ids) {
+    std::vector<LayerId> ancestors;
+    if (!collect_layer_ancestor_groups(layers, id, ancestors)) {
+      return {};
+    }
+    if (first) {
+      shared.insert(ancestors.begin(), ancestors.end());
+      first = false;
+      continue;
+    }
+    std::set<LayerId> kept;
+    for (const auto ancestor : ancestors) {
+      if (shared.contains(ancestor)) {
+        kept.insert(ancestor);
+      }
+    }
+    shared = std::move(kept);
+  }
+  return shared;
+}
+
+std::string_view sample_layers_token(SampleLayers mode) noexcept {
+  switch (mode) {
+  case SampleLayers::CurrentLayer:
+    return "current";
+  case SampleLayers::CurrentAndBelow:
+    return "currentAndBelow";
+  case SampleLayers::AllLayers:
+    return "all";
+  case SampleLayers::AllLayersNoAdjustments:
+    return "allNoAdjustments";
+  case SampleLayers::CurrentAndBelowNoAdjustments:
+    return "currentAndBelowNoAdjustments";
+  }
+  return "all";
+}
+
+SampleLayers sample_layers_from_settings(std::optional<std::string_view> token,
+                                         std::optional<bool> legacy_sample_all_layers) noexcept {
+  if (token.has_value()) {
+    for (const auto mode : {SampleLayers::CurrentLayer, SampleLayers::CurrentAndBelow, SampleLayers::AllLayers,
+                            SampleLayers::AllLayersNoAdjustments, SampleLayers::CurrentAndBelowNoAdjustments}) {
+      if (*token == sample_layers_token(mode)) {
+        return mode;
+      }
+    }
+  }
+  if (legacy_sample_all_layers.has_value() && !*legacy_sample_all_layers) {
+    return SampleLayers::CurrentLayer;
+  }
+  return SampleLayers::AllLayers;
+}
+
+namespace {
+
+// Appends the later siblings at each level of the path to `id`; true once found.
+bool collect_layers_above(const std::vector<Layer>& siblings, LayerId id, std::vector<LayerId>& above) {
+  for (std::size_t index = 0; index < siblings.size(); ++index) {
+    const auto& layer = siblings[index];
+    if (layer.id() != id && !collect_layers_above(layer.children(), id, above)) {
+      continue;
+    }
+    for (auto later = index + 1; later < siblings.size(); ++later) {
+      above.push_back(siblings[later].id());
+    }
+    return true;
+  }
+  return false;
+}
+
+void collect_adjustment_layer_ids(const std::vector<Layer>& layers, std::vector<LayerId>& ids) {
+  for (const auto& layer : layers) {
+    if (layer.kind() == LayerKind::Adjustment) {
+      ids.push_back(layer.id());
+    }
+    collect_adjustment_layer_ids(layer.children(), ids);
+  }
+}
+
+}  // namespace
+
+std::optional<std::vector<LayerId>> sample_layers_excluded_ids(const std::vector<Layer>& layers,
+                                                               std::optional<LayerId> active_id, SampleLayers mode) {
+  std::vector<LayerId> excluded;
+  switch (mode) {
+  case SampleLayers::CurrentLayer:
+    return std::nullopt;
+  case SampleLayers::AllLayers:
+    return excluded;
+  case SampleLayers::AllLayersNoAdjustments:
+    collect_adjustment_layer_ids(layers, excluded);
+    return excluded;
+  case SampleLayers::CurrentAndBelow:
+  case SampleLayers::CurrentAndBelowNoAdjustments:
+    if (!active_id.has_value() || !collect_layers_above(layers, *active_id, excluded)) {
+      return std::nullopt;
+    }
+    if (mode == SampleLayers::CurrentAndBelowNoAdjustments) {
+      collect_adjustment_layer_ids(layers, excluded);
+    }
+    return excluded;
+  }
+  return std::nullopt;
+}
+
+const Layer* find_layer_in_tree(const std::vector<Layer>& layers, LayerId id) {
+  for (const auto& layer : layers) {
+    if (layer.id() == id) {
+      return &layer;
+    }
+    if (const auto* found = find_layer_in_tree(layer.children(), id); found != nullptr) {
+      return found;
+    }
+  }
+  return nullptr;
+}
+
+Layer* find_layer_in_tree(std::vector<Layer>& layers, LayerId id) {
+  // A lookup must not count as a mutation: descending through the non-const
+  // children() accessor bumps every visited group's revisions and silently
+  // invalidates the revision-keyed caches (see Document::find_layer_recursive).
+  // Walk const, cast the hit.
+  return const_cast<Layer*>(find_layer_in_tree(std::as_const(layers), id));
+}
+
+bool layer_contains_descendant(const Layer& layer, LayerId id) {
+  for (const auto& child : layer.children()) {
+    if (child.id() == id || layer_contains_descendant(child, id)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+std::vector<LayerId> root_drop_layer_ids(const std::vector<Layer>& layers,
+                                         const std::vector<LayerId>& ids_top_to_bottom) {
+  std::vector<LayerId> roots;
+  std::set<LayerId> selected(ids_top_to_bottom.begin(), ids_top_to_bottom.end());
+  selected.erase(0);
+  std::set<LayerId> found;
+  std::set<LayerId> eligible;
+  // One tree walk replaces a tree search for every pair of selected layers.
+  // Preserve the caller's order below, including the all-or-nothing handling
+  // of missing ids used by drag/drop and transform commands.
+  const auto visit = [&](const auto& self, const std::vector<Layer>& siblings, bool ancestor_selected) -> void {
+    for (const auto& layer : siblings) {
+      const bool chosen = selected.contains(layer.id());
+      if (chosen) {
+        found.insert(layer.id());
+        if (!ancestor_selected) { eligible.insert(layer.id()); }
+      }
+      self(self, layer.children(), ancestor_selected || chosen);
+    }
+  };
+  visit(visit, layers, false);
+  if (found.size() != selected.size()) { return {}; }
+  for (const auto id : ids_top_to_bottom) {
+    if (eligible.erase(id) != 0) { roots.push_back(id); }
+  }
+  return roots;
+}
+
+namespace {
+
+template <typename Visit>
+void for_each_layer_in_tree(const std::vector<Layer>& layers, Visit& visit) {
+  for (const auto& layer : layers) {
+    visit(layer);
+    for_each_layer_in_tree(layer.children(), visit);
+  }
+}
+
+// Link groups never render, so the walk stays const (the mutable children() accessor bumps
+// revisions) and only the layers whose group changes are touched.
+template <typename Change>
+bool set_link_groups_where(std::vector<Layer>& layers, Change change) {
+  std::vector<std::pair<const Layer*, std::uint32_t>> updates;
+  auto collect = [&](const Layer& layer) {
+    if (const auto next = change(layer); next != layer.link_group()) {
+      updates.emplace_back(&layer, next);
+    }
+  };
+  for_each_layer_in_tree(std::as_const(layers), collect);
+  for (const auto& [layer, group] : updates) {
+    const_cast<Layer*>(layer)->set_link_group(group);
+  }
+  return !updates.empty();
+}
+
+}  // namespace
+
+std::map<std::uint32_t, std::size_t> link_group_member_counts(const std::vector<Layer>& layers) {
+  std::map<std::uint32_t, std::size_t> counts;
+  auto count = [&counts](const Layer& layer) {
+    if (layer.link_group() != 0U) {
+      ++counts[layer.link_group()];
+    }
+  };
+  for_each_layer_in_tree(layers, count);
+  return counts;
+}
+
+std::uint32_t effective_link_group(const std::vector<Layer>& layers, LayerId id) {
+  const auto* layer = find_layer_in_tree(layers, id);
+  if (layer == nullptr || layer->link_group() == 0U) {
+    return 0U;
+  }
+  const auto group = layer->link_group();
+  std::size_t members = 0;
+  auto count = [&](const Layer& other) {
+    if (other.link_group() == group) {
+      ++members;
+    }
+  };
+  for_each_layer_in_tree(layers, count);
+  return members > 1U ? group : 0U;
+}
+
+std::vector<LayerId> with_linked_layer_ids(const std::vector<Layer>& layers, const std::vector<LayerId>& ids) {
+  std::vector<LayerId> result = ids;
+  std::set<std::uint32_t> groups;
+  auto add_group = [&groups](const Layer& layer) {
+    if (layer.link_group() != 0U) {
+      groups.insert(layer.link_group());
+    }
+  };
+  for (const auto id : ids) {
+    if (const auto* layer = find_layer_in_tree(layers, id); layer != nullptr) {
+      add_group(*layer);
+      for_each_layer_in_tree(layer->children(), add_group);
+    }
+  }
+  if (groups.empty()) {
+    return result;
+  }
+  std::set<LayerId> listed(ids.begin(), ids.end());
+  auto add_partner = [&](const Layer& layer) {
+    if (layer.link_group() != 0U && groups.contains(layer.link_group()) && listed.insert(layer.id()).second) {
+      result.push_back(layer.id());
+    }
+  };
+  for_each_layer_in_tree(layers, add_partner);
+  return result;
+}
+
+std::vector<LayerId> linked_layer_ids(const std::vector<Layer>& layers, LayerId id) {
+  const auto* layer = find_layer_in_tree(layers, id);
+  if (layer == nullptr) {
+    return {};
+  }
+  const auto group = layer->link_group();
+  if (group == 0U) {
+    return {id};
+  }
+  std::vector<LayerId> members;
+  auto add_member = [&](const Layer& other) {
+    if (other.link_group() == group) {
+      members.push_back(other.id());
+    }
+  };
+  for_each_layer_in_tree(layers, add_member);
+  return members;
+}
+
+bool link_layers(std::vector<Layer>& layers, const std::vector<LayerId>& ids) {
+  std::set<LayerId> targets;
+  std::set<std::uint32_t> merged_groups;
+  for (const auto id : ids) {
+    if (const auto* layer = find_layer_in_tree(std::as_const(layers), id); layer != nullptr) {
+      targets.insert(id);
+      if (layer->link_group() != 0U) {
+        merged_groups.insert(layer->link_group());
+      }
+    }
+  }
+  if (targets.size() < 2U) {
+    return false;
+  }
+  // The lowest group already involved keeps its id; otherwise the lowest free one.
+  std::uint32_t group = 0U;
+  if (!merged_groups.empty()) {
+    group = *merged_groups.begin();
+  } else {
+    const auto used = link_group_member_counts(std::as_const(layers));
+    group = 1U;
+    while (used.contains(group)) {
+      ++group;
+    }
+  }
+  return set_link_groups_where(layers, [&](const Layer& layer) {
+    const bool member = targets.contains(layer.id()) ||
+                        (layer.link_group() != 0U && merged_groups.contains(layer.link_group()));
+    return member ? group : layer.link_group();
+  });
+}
+
+bool unlink_layers(std::vector<Layer>& layers, const std::vector<LayerId>& ids) {
+  const std::set<LayerId> targets(ids.begin(), ids.end());
+  const bool changed = set_link_groups_where(
+      layers, [&](const Layer& layer) { return targets.contains(layer.id()) ? 0U : layer.link_group(); });
+  return clear_single_member_link_groups(layers) || changed;
+}
+
+bool clear_single_member_link_groups(std::vector<Layer>& layers) {
+  const auto counts = link_group_member_counts(std::as_const(layers));
+  return set_link_groups_where(layers, [&](const Layer& layer) {
+    return layer.link_group() != 0U && counts.at(layer.link_group()) < 2U ? 0U : layer.link_group();
+  });
+}
+
+bool separate_copied_link_groups(std::vector<Layer>& layers, const std::vector<LayerId>& copy_root_ids) {
+  std::set<LayerId> copies;
+  for (const auto id : copy_root_ids) {
+    if (const auto* root = find_layer_in_tree(std::as_const(layers), id); root != nullptr) {
+      copies.insert(id);
+      std::vector<LayerId> descendants;
+      collect_layer_descendant_ids(*root, descendants);
+      copies.insert(descendants.begin(), descendants.end());
+    }
+  }
+  std::set<std::uint32_t> used_elsewhere;
+  std::map<std::uint32_t, std::size_t> copied_counts;
+  auto survey = [&](const Layer& layer) {
+    if (layer.link_group() == 0U) {
+      return;
+    }
+    if (copies.contains(layer.id())) {
+      ++copied_counts[layer.link_group()];
+    } else {
+      used_elsewhere.insert(layer.link_group());
+    }
+  };
+  for_each_layer_in_tree(std::as_const(layers), survey);
+  std::map<std::uint32_t, std::uint32_t> renumbered;
+  std::uint32_t next = 1U;
+  for (const auto& [group, count] : copied_counts) {
+    if (count < 2U) {
+      renumbered[group] = 0U;
+      continue;
+    }
+    while (used_elsewhere.contains(next)) {
+      ++next;
+    }
+    renumbered[group] = next++;
+  }
+  return set_link_groups_where(layers, [&](const Layer& layer) {
+    return copies.contains(layer.id()) && layer.link_group() != 0U ? renumbered.at(layer.link_group())
+                                                                    : layer.link_group();
+  });
+}
+
+std::optional<Layer> take_layer_from_tree(std::vector<Layer>& layers, LayerId id) {
+  const auto found = std::find_if(layers.begin(), layers.end(), [id](const Layer& layer) {
+    return layer.id() == id;
+  });
+  if (found != layers.end()) {
+    auto layer = std::move(*found);
+    layers.erase(found);
+    return layer;
+  }
+
+  for (auto& layer : layers) {
+    if (auto child = take_layer_from_tree(layer.children(), id); child.has_value()) {
+      return child;
+    }
+  }
+  return std::nullopt;
+}
+
+std::optional<LayerSiblingLocation> find_layer_location(std::vector<Layer>& layers, LayerId id) {
+  // Walk const, cast the hit (see find_layer_in_tree): the non-const descent
+  // bumped every traversed group's revisions on every layer drag-drop.
+  if (const auto found = find_layer_location(std::as_const(layers), id); found.has_value()) {
+    return LayerSiblingLocation{const_cast<std::vector<Layer>*>(found->siblings), found->index};
+  }
+  return std::nullopt;
+}
+
+std::optional<ConstLayerSiblingLocation> find_layer_location(const std::vector<Layer>& layers, LayerId id) {
+  for (std::size_t index = 0; index < layers.size(); ++index) {
+    if (layers[index].id() == id) {
+      return ConstLayerSiblingLocation{&layers, index};
+    }
+    const auto& children = layers[index].children();
+    if (auto found = find_layer_location(children, id); found.has_value()) {
+      return found;
+    }
+  }
+  return std::nullopt;
+}
+
+const Layer* effective_clip_base(const std::vector<Layer>& siblings, std::size_t index) {
+  if (index >= siblings.size()) {
+    return nullptr;
+  }
+  while (index > 0) {
+    const Layer& candidate = siblings[index - 1];
+    if (candidate.clipped() && candidate.kind() != LayerKind::Group) {
+      // Part of the same clipping run: keep walking toward its base.
+      --index;
+      continue;
+    }
+    return candidate.kind() == LayerKind::Pixel || candidate.kind() == LayerKind::Group ? &candidate : nullptr;
+  }
+  return nullptr;
+}
+
+std::vector<std::pair<LayerId, LayerId>> layer_tree_signature(const std::vector<Layer>& layers, LayerId parent_id) {
+  std::vector<std::pair<LayerId, LayerId>> signature;
+  std::function<void(const std::vector<Layer>&, LayerId)> append =
+      [&](const std::vector<Layer>& current_layers, LayerId current_parent_id) {
+    for (const auto& layer : current_layers) {
+      signature.emplace_back(layer.id(), current_parent_id);
+      append(layer.children(), layer.id());
+    }
+  };
+  append(layers, parent_id);
+  return signature;
+}
+
+bool move_layers_for_drop(std::vector<Layer>& layers, const LayerDropRequest& request) {
+  auto moving_ids = root_drop_layer_ids(layers, request.layer_ids_top_to_bottom);
+  if (moving_ids.empty()) {
+    return false;
+  }
+  if (request.target_layer_id.has_value() &&
+      target_is_inside_moved_layers(layers, moving_ids, *request.target_layer_id)) {
+    return false;
+  }
+  // Artboards never nest (docs/artboards.md): one can only move among the top-level layers.
+  const bool moving_artboard = std::any_of(moving_ids.begin(), moving_ids.end(), [&layers](LayerId id) {
+    const auto* layer = find_layer_in_tree(std::as_const(layers), id);
+    return layer != nullptr && layer->kind() == LayerKind::Group && layer->artboard().has_value();
+  });
+  if (moving_artboard && request.target_layer_id.has_value()) {
+    const auto* target = find_layer_in_tree(std::as_const(layers), *request.target_layer_id);
+    if (target == nullptr || (request.position == LayerDropPosition::OnItem && target->kind() == LayerKind::Group)) {
+      return false;
+    }
+    const auto location = find_layer_location(std::as_const(layers), *request.target_layer_id);
+    if (!location.has_value() || location->siblings != &std::as_const(layers)) {
+      return false;
+    }
+  }
+
+  std::vector<Layer> moved_top_to_bottom;
+  moved_top_to_bottom.reserve(moving_ids.size());
+  for (const auto id : moving_ids) {
+    auto moved = take_layer_from_tree(layers, id);
+    if (!moved.has_value()) {
+      return false;
+    }
+    moved_top_to_bottom.push_back(std::move(*moved));
+  }
+
+  if (!request.target_layer_id.has_value()) {
+    insert_layers_bottom_to_top(layers, 0, moved_top_to_bottom);
+    return true;
+  }
+
+  if (request.position == LayerDropPosition::OnItem) {
+    if (auto* target = find_layer_in_tree(layers, *request.target_layer_id);
+        target != nullptr && target->kind() == LayerKind::Group) {
+      insert_layers_bottom_to_top(target->children(), target->children().size(), moved_top_to_bottom);
+      return true;
+    }
+  }
+
+  auto target_location = find_layer_location(layers, *request.target_layer_id);
+  if (!target_location.has_value() || target_location->siblings == nullptr) {
+    return false;
+  }
+
+  const auto insert_index =
+      request.position == LayerDropPosition::BelowItem ? target_location->index : target_location->index + 1U;
+  insert_layers_bottom_to_top(*target_location->siblings, insert_index, moved_top_to_bottom);
+  return true;
+}
+
+bool arrange_layers_to_end(std::vector<Layer>& layers, const std::set<LayerId>& ids, bool front,
+                           std::optional<LayerId> pinned_bottom_id) {
+  bool changed = false;
+  const auto arrange = [&](const auto& self, std::vector<Layer>& siblings, bool root) -> void {
+    for (auto& layer : siblings) {
+      if (!ids.contains(layer.id()) && !std::as_const(layer).children().empty()) {
+        self(self, layer.children(), false);
+      }
+    }
+    auto first = siblings.begin();
+    if (root && pinned_bottom_id.has_value() && !siblings.empty() && siblings.front().id() == *pinned_bottom_id &&
+        !ids.contains(*pinned_bottom_id)) {
+      ++first;
+    }
+    std::vector<LayerId> before;
+    before.reserve(siblings.size());
+    for (const auto& layer : siblings) {
+      before.push_back(layer.id());
+    }
+    // Storage runs bottom to top, so the front is the end.
+    std::stable_partition(first, siblings.end(), [&](const Layer& layer) {
+      return ids.contains(layer.id()) != front;
+    });
+    for (std::size_t index = 0; index < siblings.size(); ++index) {
+      if (siblings[index].id() != before[index]) {
+        changed = true;
+        break;
+      }
+    }
+  };
+  arrange(arrange, layers, true);
+  return changed;
+}
+
+bool reverse_layers(std::vector<Layer>& layers, const std::set<LayerId>& ids,
+                    std::optional<LayerId> pinned_bottom_id) {
+  bool changed = false;
+  const auto reverse = [&](const auto& self, std::vector<Layer>& siblings) -> void {
+    std::vector<std::size_t> slots;
+    for (std::size_t index = 0; index < siblings.size(); ++index) {
+      auto& layer = siblings[index];
+      const bool pinned = pinned_bottom_id.has_value() && layer.id() == *pinned_bottom_id;
+      if (ids.contains(layer.id()) && !pinned) {
+        slots.push_back(index);  // a listed folder moves whole: its children are not visited
+      } else if (!std::as_const(layer).children().empty()) {
+        self(self, layer.children());
+      }
+    }
+    if (slots.size() < 2) {
+      return;
+    }
+    for (std::size_t low = 0, high = slots.size() - 1; low < high; ++low, --high) {
+      std::swap(siblings[slots[low]], siblings[slots[high]]);
+    }
+    changed = true;
+  };
+  reverse(reverse, layers);
+  return changed;
+}
+
+bool move_layers_out_of_folder(std::vector<Layer>& layers, const std::set<LayerId>& ids, bool above) {
+  bool changed = false;
+  // Top-down: a folder's listed children leave it before its remaining children are visited,
+  // so a layer moves out one level only.
+  const auto move_out = [&](const auto& self, std::vector<Layer>& siblings) -> void {
+    for (std::size_t index = 0; index < siblings.size(); ++index) {
+      if (ids.contains(siblings[index].id()) || siblings[index].kind() != LayerKind::Group) {
+        continue;
+      }
+      const auto& const_children = std::as_const(siblings[index]).children();
+      const bool any_listed = std::any_of(const_children.begin(), const_children.end(),
+                                          [&ids](const Layer& child) { return ids.contains(child.id()); });
+      if (!any_listed) {
+        if (!const_children.empty()) {
+          self(self, siblings[index].children());
+        }
+        continue;
+      }
+      auto& children = siblings[index].children();
+      std::vector<Layer> taken;
+      std::vector<Layer> kept;
+      for (auto& child : children) {
+        (ids.contains(child.id()) ? taken : kept).push_back(std::move(child));
+      }
+      children = std::move(kept);
+      self(self, children);
+      changed = true;
+      const auto count = taken.size();
+      const auto insert_at = static_cast<std::ptrdiff_t>(above ? index + 1U : index);
+      siblings.insert(siblings.begin() + insert_at, std::make_move_iterator(taken.begin()),
+                      std::make_move_iterator(taken.end()));
+      // Past the moved layers (and, below, the folder they left).
+      index += count;
+    }
+  };
+  move_out(move_out, layers);
+  return changed;
+}
+
+std::optional<std::vector<LayerId>> ungroup_layer(std::vector<Layer>& layers, LayerId group_id) {
+  const auto location = find_layer_location(layers, group_id);
+  if (!location.has_value() || location->siblings == nullptr) {
+    return std::nullopt;
+  }
+  auto& siblings = *location->siblings;
+  auto& group = siblings[location->index];
+  if (group.kind() != LayerKind::Group) {
+    return std::nullopt;
+  }
+  std::vector<Layer> children = std::move(group.children());
+  group.children().clear();
+  std::vector<LayerId> released;
+  released.reserve(children.size());
+  for (auto it = children.rbegin(); it != children.rend(); ++it) {
+    released.push_back(it->id());
+  }
+  const auto index = static_cast<std::ptrdiff_t>(location->index);
+  siblings.erase(siblings.begin() + index);
+  siblings.insert(siblings.begin() + index, std::make_move_iterator(children.begin()),
+                  std::make_move_iterator(children.end()));
+  return released;
+}
+
+}  // namespace patchy

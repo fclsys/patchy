@@ -1,0 +1,561 @@
+#include "ui/splash_dialog.hpp"
+
+#include "ui/app_credits.hpp"
+#include "ui/app_settings.hpp"
+#include "ui/build_info.hpp"
+#include "ui/dialog_utils.hpp"
+#include "ui/legacy_plugin_folder.hpp"
+#include "ui/memory_info.hpp"
+#include "ui/splash_artwork.hpp"
+#include "ui/update_checker.hpp"
+#include "ui/theme_qss.hpp"
+#include "ui/ui_text_size.hpp"
+#include "ui/window_effects.hpp"
+
+#include <QDesktopServices>
+#include <QDialog>
+#include <QDir>
+#include <QFileInfo>
+#include <QFrame>
+#include <QHBoxLayout>
+#include <QLabel>
+#include <QMouseEvent>
+#include <QObject>
+#include <QPoint>
+#include <QPushButton>
+#include <QPointer>
+#include <QStandardPaths>
+#include <QString>
+#include <QTimer>
+#include <QToolButton>
+#include <QUrl>
+#include <QVBoxLayout>
+#include <QWidget>
+#include <QWindow>
+
+#include <algorithm>
+#include <functional>
+#include <optional>
+
+#include "patchy_version.hpp"
+
+namespace patchy::ui {
+namespace {
+
+#ifndef Q_OS_WASM
+bool same_folder(const QString& a, const QString& b) {
+#ifdef Q_OS_WIN
+  constexpr auto kCase = Qt::CaseInsensitive;
+#else
+  constexpr auto kCase = Qt::CaseSensitive;
+#endif
+  return !a.isEmpty() && QDir::cleanPath(QFileInfo(a).absoluteFilePath())
+                             .compare(QDir::cleanPath(QFileInfo(b).absoluteFilePath()), kCase) == 0;
+}
+#endif
+
+QString format_memory_mb(qint64 mb) {
+  if (mb >= 1024) {
+    return QObject::tr("%1 GB").arg(static_cast<double>(mb) / 1024.0, 0, 'f', 1);
+  }
+  return QObject::tr("%1 MB").arg(mb);
+}
+
+// Returns false when no probe works on this platform (the caller hides the
+// row). On wasm three numbers matter: allocator-committed bytes ("used"), the
+// linear-memory buffer ("heap", the high-water mark browser tab accounting
+// sees), and the heap ceiling the shell page chose ("limit"); see
+// ui/memory_info.hpp.
+bool refresh_memory_label(QLabel& label) {
+  const auto current = current_process_memory_mb();
+  if (current >= 0) {
+    const auto heap = wasm_heap_reserved_mb();
+    label.setText(heap >= 0 ? QObject::tr("Memory used: %1 (heap %2, limit %3)")
+                                  .arg(format_memory_mb(current), format_memory_mb(heap),
+                                       format_memory_mb(wasm_heap_limit_mb()))
+                            : QObject::tr("Memory used: %1").arg(format_memory_mb(current)));
+    return true;
+  }
+  const auto peak = peak_process_memory_mb();
+  if (peak >= 0) {
+    label.setText(QObject::tr("Memory used (peak): %1").arg(format_memory_mb(peak)));
+    return true;
+  }
+  return false;
+}
+
+// The modal Help > About dialog. Startup no longer shows a splash: the start
+// panel carries the branding and the startup update check lives in MainWindow.
+class PatchySplashDialog final : public QDialog {
+public:
+  static constexpr int kDialogWidth = 650;
+  static constexpr int kMinimumDialogHeight = 435;
+
+  // `offers_update`: the caller can open the update prompt, so a check that finds a newer
+  // version shows the Update button.
+  explicit PatchySplashDialog(QWidget* parent = nullptr, bool offers_update = false)
+      : QDialog(parent), offers_update_(offers_update) {
+    setObjectName(QStringLiteral("patchySplashScreen"));
+    // About always opens centered on the app; a remembered spot is never wanted.
+    mark_dialog_always_centered(*this);
+    setWindowFlags(Qt::Dialog | Qt::FramelessWindowHint);
+    apply_frameless_window_effects_on_show(*this, WindowCornerRadius::Standard);
+    setModal(true);
+    setFixedWidth(ui_text_length(kDialogWidth));
+    set_themed_style(*this, QStringLiteral(R"(
+      QDialog#patchySplashScreen {
+        background: @splash_bg;
+        border: 1px solid @splash_border;
+      }
+      QWidget#splashArtwork {
+        /* Transparent, not the global QWidget window_bg: the artwork paints its
+           own card inside a margin, so an opaque fill draws a window-colored
+           rectangle around it on the dialog surface. */
+        background: transparent;
+      }
+      QLabel#splashTitle {
+        color: @splash_title_text;
+        font-size: 32px;
+        font-weight: 800;
+      }
+      QLabel#splashSubtitle {
+        color: @splash_subtitle_text;
+        font-size: 15px;
+      }
+      QLabel#splashCredit {
+        color: @splash_body_text;
+        font-size: 13px;
+      }
+      QLabel#splashMemory {
+        color: @splash_body_text;
+        font-size: 13px;
+      }
+      QLabel#splashContributors {
+        color: @splash_body_text;
+        font-size: 13px;
+      }
+      QLabel#splashHome {
+        color: @splash_body_text;
+        font-size: 13px;
+      }
+      QLabel#splashStatus {
+        color: @splash_status_text;
+        font-size: 12px;
+      }
+      QLabel#splashSettingsCaption, QLabel#splashDataCaption {
+        color: @splash_body_text;
+        font-size: 12px;
+        font-weight: 700;
+      }
+      QLabel#splashSettingsPath, QLabel#splashDataPath {
+        color: @splash_caption_text;
+        font-size: 11px;
+      }
+      QPushButton#splashOpenSettingsFolderButton, QPushButton#splashOpenDataFolderButton {
+        background: @splash_button_bg;
+        color: @splash_body_text;
+        border: 1px solid @splash_button_border;
+        padding: 5px 12px;
+        min-width: 120px;
+      }
+      QPushButton#splashOpenSettingsFolderButton:hover, QPushButton#splashOpenDataFolderButton:hover {
+        background: @splash_button_hover_bg;
+      }
+      QPushButton#splashUpdateButton {
+        background: @splash_button_bg;
+        color: @splash_body_text;
+        border: 1px solid @splash_button_border;
+        padding: 5px 18px;
+        min-width: 74px;
+      }
+      QPushButton#splashUpdateButton:hover {
+        background: @splash_button_hover_bg;
+      }
+      QPushButton#splashCloseButton {
+        background: @splash_primary_bg;
+        color: @text_on_accent;
+        border: 1px solid @splash_primary_border;
+        padding: 5px 18px;
+        min-width: 74px;
+      }
+      QPushButton#splashCloseButton:hover {
+        background: @splash_primary_hover_bg;
+      }
+      QToolButton#splashCloseGlyphButton {
+        background: transparent;
+        border: 0;
+        border-radius: 0;
+        padding: 0;
+      }
+      QToolButton#splashCloseGlyphButton:hover {
+        background: @window_close_hover_bg;
+      }
+      QToolButton#splashCloseGlyphButton:pressed {
+        background: @window_close_pressed_bg;
+      }
+    )"));
+
+    auto* layout = new QHBoxLayout(this);
+    layout->setContentsMargins(28, 26, 30, 24);
+    layout->setSpacing(28);
+
+    auto* artwork = new SplashArtwork(this);
+    artwork->setObjectName(QStringLiteral("splashArtwork"));
+    artwork->setFixedSize(180, 180);
+    layout->addWidget(artwork, 0, Qt::AlignTop);
+
+    auto* copy = new QVBoxLayout();
+    copy->setContentsMargins(0, 12, 0, 6);
+    copy->setSpacing(10);
+    layout->addLayout(copy, 1);
+
+    auto* title = new QLabel(QObject::tr("Patchy Image Editor"), this);
+    title->setObjectName(QStringLiteral("splashTitle"));
+    title->setTextFormat(Qt::PlainText);
+    title->setWordWrap(true);
+    copy->addWidget(title);
+
+    auto* subtitle = new QLabel(QObject::tr("Open source photo editing. Free forever, no subscriptions."), this);
+    subtitle->setObjectName(QStringLiteral("splashSubtitle"));
+    subtitle->setTextFormat(Qt::PlainText);
+    subtitle->setWordWrap(true);
+    copy->addWidget(subtitle);
+
+    auto* divider = new QFrame(this);
+    divider->setFrameShape(QFrame::HLine);
+    set_themed_style(*divider, QStringLiteral("color: @splash_border; background: @splash_border;"));
+    copy->addWidget(divider);
+
+    auto* version = new QLabel(
+        QObject::tr("Version %1 (built %2)").arg(QStringLiteral(PATCHY_VERSION), build_timestamp_text()), this);
+    version->setObjectName(QStringLiteral("splashCredit"));
+    version->setTextFormat(Qt::PlainText);
+    copy->addWidget(version);
+
+    // The link colors live inside the rich text, where QSS cannot reach, so they
+    // go through set_themed_label_text. Handing the token-bearing markup straight
+    // to QLabel leaves "color:@splash_link_text" in the HTML, which the rich-text
+    // parser cannot read: the links fall back to Qt's default blue, which is
+    // close to unreadable on the dark About surface.
+    auto* credit = new QLabel(this);
+    credit->setObjectName(QStringLiteral("splashCredit"));
+    credit->setTextFormat(Qt::RichText);
+    set_themed_label_text(
+        *credit, QObject::tr("Created by %1")
+                     .arg(QStringLiteral("<a style=\"color:@splash_link_text; text-decoration:none;\" "
+                                         "href=\"https://github.com/SethRobinson\">Seth A. Robinson</a>")));
+    credit->setTextInteractionFlags(Qt::TextBrowserInteraction);
+    credit->setOpenExternalLinks(true);
+    copy->addWidget(credit);
+
+    auto* contributors = new QLabel(this);
+    contributors->setObjectName(QStringLiteral("splashContributors"));
+    contributors->setTextFormat(Qt::RichText);
+    set_themed_label_text(
+        *contributors,
+        QObject::tr("Incredible people who donated suggestions, bug reports, and code: %1")
+            .arg(contributors_link_html(QStringLiteral("@splash_link_text"))));
+    contributors->setTextInteractionFlags(Qt::TextBrowserInteraction);
+    contributors->setOpenExternalLinks(true);
+    // The list outgrows one line; wrap inside the fixed dialog width.
+    contributors->setWordWrap(true);
+    copy->addWidget(contributors);
+
+    auto add_home_link = [this, copy](const QString& text) {
+      auto* label = new QLabel(this);
+      label->setObjectName(QStringLiteral("splashHome"));
+      label->setTextFormat(Qt::RichText);
+      label->setTextInteractionFlags(Qt::TextBrowserInteraction);
+      label->setOpenExternalLinks(true);
+      set_themed_label_text(*label, text);
+      copy->addWidget(label);
+    };
+    const auto github_link = QStringLiteral("<a style=\"color:@splash_link_text; text-decoration:none;\" "
+                                            "href=\"https://github.com/SethRobinson/Patchy\">SethRobinson/Patchy</a>");
+    add_home_link(QObject::tr("GitHub: %1").arg(github_link));
+    const auto seth_site_link = QStringLiteral("<a style=\"color:@splash_link_text; text-decoration:none;\" "
+                                               "href=\"https://rtsoft.com\">rtsoft.com</a>");
+    add_home_link(QObject::tr("Seth's site: %1").arg(seth_site_link));
+
+#ifndef Q_OS_WASM
+    // The wasm settings store is window.localStorage and its user data lives in
+    // IndexedDB, so there is no file to display and no folder a file manager could open.
+    // Each row: bold caption, selectable path, and a button that opens the folder
+    // (creating it first, since the data folder only appears once something is saved).
+    const auto add_folder_row = [this, copy](const QString& caption_text, const QString& path_text,
+                                             const QString& folder_path, const QString& button_text,
+                                             const QString& failure_text, const char* caption_name,
+                                             const char* path_name, const char* button_name,
+                                             std::function<void()> before_open = {}) {
+      auto* caption = new QLabel(caption_text, this);
+      caption->setObjectName(QString::fromLatin1(caption_name));
+      caption->setTextFormat(Qt::PlainText);
+      copy->addWidget(caption);
+
+      auto* path = new QLabel(QDir::toNativeSeparators(path_text), this);
+      path->setObjectName(QString::fromLatin1(path_name));
+      path->setTextFormat(Qt::PlainText);
+      path->setTextInteractionFlags(Qt::TextSelectableByMouse);
+      path->setWordWrap(true);
+      copy->addWidget(path);
+
+      auto* button_row = new QHBoxLayout();
+      button_row->setContentsMargins(0, 0, 0, 0);
+      auto* open_folder = new QPushButton(button_text, this);
+      open_folder->setObjectName(QString::fromLatin1(button_name));
+      connect(open_folder, &QPushButton::clicked, this, [this, folder_path, failure_text, before_open] {
+        if (before_open) {
+          before_open();
+        }
+        if (folder_path.isEmpty() || !QDir().mkpath(folder_path) ||
+            !QDesktopServices::openUrl(QUrl::fromLocalFile(folder_path))) {
+          auto* status = findChild<QLabel*>(QStringLiteral("splashStatus"));
+          if (status != nullptr) {
+            status->setText(failure_text);
+          }
+        }
+      });
+      button_row->addWidget(open_folder, 0);
+      button_row->addStretch(1);
+      copy->addLayout(button_row);
+    };
+
+    auto settings = app_settings();
+    const auto settings_file_path = settings.fileName();
+    const auto settings_folder_path = QFileInfo(settings_file_path).absolutePath();
+    // Dropped fonts and user scripts (QStandardPaths::AppDataLocation, keyed by the
+    // organization name; see app_data_migration.hpp).
+    const auto data_folder_path = QStandardPaths::writableLocation(QStandardPaths::AppDataLocation);
+    if (same_folder(settings_folder_path, data_folder_path)) {
+      // Windows and macOS keep Patchy.ini in the data folder itself (app_settings_file_path());
+      // Linux splits config from data, and a PATCHY_SETTINGS_DIR run moves the settings away.
+      add_folder_row(QObject::tr("Settings and data folder:"), data_folder_path, data_folder_path,
+                     QObject::tr("Open Folder"), QObject::tr("Could not open data folder."),
+                     "splashDataCaption", "splashDataPath", "splashOpenDataFolderButton");
+    } else {
+      add_folder_row(QObject::tr("Settings file:"), settings_file_path, settings_folder_path,
+                     QObject::tr("Open Settings Folder"), QObject::tr("Could not open settings folder."),
+                     "splashSettingsCaption", "splashSettingsPath", "splashOpenSettingsFolderButton");
+      add_folder_row(QObject::tr("User data folder (fonts, scripts):"), data_folder_path, data_folder_path,
+                     QObject::tr("Open Data Folder"), QObject::tr("Could not open data folder."),
+                     "splashDataCaption", "splashDataPath", "splashOpenDataFolderButton");
+    }
+#ifdef Q_OS_WIN
+    // Classic Photoshop .8bf filters (Windows only): the folder next to the
+    // application, created with its README on first open (docs/plugins.md).
+    const auto plugins_folder_path = legacy_plugins_folder_path();
+    add_folder_row(QObject::tr("Plug-ins folder (.8bf filters):"), plugins_folder_path, plugins_folder_path,
+                   QObject::tr("Open Plug-ins Folder"), QObject::tr("Could not open the plug-ins folder."),
+                   "splashPluginsCaption", "splashPluginsPath", "splashOpenPluginsFolderButton",
+                   [] { (void)ensure_legacy_plugins_folder(); });
+#endif
+#endif
+
+    // Live memory readout, mainly for the wasm build where the heap ceiling is
+    // what decides whether Safari keeps the tab alive.
+    auto* memory = new QLabel(this);
+    memory->setObjectName(QStringLiteral("splashMemory"));
+    memory->setTextFormat(Qt::PlainText);
+    if (refresh_memory_label(*memory)) {
+      auto* memory_timer = new QTimer(this);
+      memory_timer->setInterval(1000);
+      connect(memory_timer, &QTimer::timeout, memory,
+              [memory] { refresh_memory_label(*memory); });
+      memory_timer->start();
+    } else {
+      memory->hide();
+    }
+    copy->addWidget(memory);
+
+    copy->addStretch(1);
+
+    // The status line has the column's whole width, above the buttons: beside Update and
+    // Close it wrapped after three words, and a failed check's message ran to many lines.
+    status_ = new QLabel(QObject::tr("Patchy is ready."), this);
+    status_->setObjectName(QStringLiteral("splashStatus"));
+    status_->setTextFormat(Qt::PlainText);
+    status_->setWordWrap(true);
+    copy->addWidget(status_);
+
+    auto* bottom = new QHBoxLayout();
+    bottom->setContentsMargins(0, 0, 0, 0);
+    bottom->setSpacing(12);
+    copy->addLayout(bottom);
+    bottom->addStretch(1);
+
+    // Hidden until the update check finds a newer version (show_update_offer). While
+    // hidden it is no auto-default button, so it cannot become the one Enter presses.
+    update_button_ = new QPushButton(QObject::tr("Update..."), this);
+    update_button_->setObjectName(QStringLiteral("splashUpdateButton"));
+    update_button_->setAutoDefault(false);
+    update_button_->hide();
+    connect(update_button_, &QPushButton::clicked, this, [this] {
+      requested_update_ = offered_update_;
+      accept();
+    });
+    bottom->addWidget(update_button_, 0);
+
+    auto* close = new QPushButton(QObject::tr("Close"), this);
+    close->setObjectName(QStringLiteral("splashCloseButton"));
+    connect(close, &QPushButton::clicked, this, &QDialog::accept);
+    bottom->addWidget(close, 0);
+
+    // The height follows the content at the fixed width: the folder rows wrap their
+    // paths and the memory row only exists on platforms with a probe, so a fixed
+    // height compressed the column on Windows until a move forced a relayout.
+    // At a non-default interface text size the sheet's font sizes differ more from the
+    // inherited font, so the labels are polished first to measure with them (GitHub issue
+    // 495); the default size keeps its measured height.
+    if (ui_text_size_percent() != 100) {
+      for (auto* child : findChildren<QWidget*>()) {
+        child->ensurePolished();
+      }
+    }
+    fit_height_to_content();
+
+    // The X every chrome dialog has in its upper right, so About closes the
+    // same way as the other Help dialogs (GitHub issue 107). It floats over
+    // the dialog's margin, outside the layout.
+    close_glyph_ = new QToolButton(this);
+    close_glyph_->setObjectName(QStringLiteral("splashCloseGlyphButton"));
+    close_glyph_->setAutoRaise(false);
+    close_glyph_->setFocusPolicy(Qt::NoFocus);
+    close_glyph_->setIcon(dialog_chrome_close_icon());
+    close_glyph_->setIconSize(QSize(16, 16));
+    close_glyph_->setFixedSize(30, 30);
+    close_glyph_->setToolTip(QObject::tr("Close"));
+    connect(close_glyph_, &QToolButton::clicked, this, &QDialog::accept);
+    place_close_glyph();
+    close_glyph_->raise();
+  }
+
+#ifndef Q_OS_WASM
+  void begin_update_check() {
+    set_status(QObject::tr("Checking for updates..."));
+    const QPointer<PatchySplashDialog> dialog_guard(this);
+    request_update_check(this, QStringLiteral(PATCHY_VERSION), [dialog_guard](UpdateCheckResult result) {
+      if (dialog_guard != nullptr) {
+        dialog_guard->set_status(update_check_status_text(result));
+        if (result.update.has_value()) {
+          dialog_guard->show_update_offer(*result.update);
+        }
+      }
+    });
+  }
+#endif
+
+  // The update the user asked for with the Update button, once the dialog has closed.
+  [[nodiscard]] std::optional<UpdateInfo> requested_update() const { return requested_update_; }
+
+  void set_status(const QString& text) {
+    if (status_ != nullptr) {
+      status_->setText(text);
+    }
+  }
+
+protected:
+  void resizeEvent(QResizeEvent* event) override {
+    QDialog::resizeEvent(event);
+    place_close_glyph();
+  }
+
+  // Frameless, so there is no title bar to grab; dragging any non-interactive
+  // area moves the dialog instead. Only presses that no child widget consumed
+  // reach these handlers, so the links and buttons keep working.
+  void mousePressEvent(QMouseEvent* event) override {
+    if (event->button() == Qt::LeftButton) {
+      drag_position_ = event->globalPosition().toPoint() - frameGeometry().topLeft();
+      dragging_ = true;
+      if (auto* handle = windowHandle(); handle != nullptr && handle->startSystemMove()) {
+        dragging_ = false;
+      }
+      event->accept();
+      return;
+    }
+    QDialog::mousePressEvent(event);
+  }
+
+  void mouseMoveEvent(QMouseEvent* event) override {
+    if (dragging_ && (event->buttons() & Qt::LeftButton) != 0) {
+      move(event->globalPosition().toPoint() - drag_position_);
+      event->accept();
+      return;
+    }
+    QDialog::mouseMoveEvent(event);
+  }
+
+  void mouseReleaseEvent(QMouseEvent* event) override {
+    dragging_ = false;
+    QDialog::mouseReleaseEvent(event);
+  }
+
+private:
+  // Shows the Update button for a newer version the check found. The status line above it
+  // may have wrapped with its new text, so the height is fitted again.
+  void show_update_offer(const UpdateInfo& update) {
+    if (!offers_update_ || update_button_ == nullptr) {
+      return;
+    }
+    offered_update_ = update;
+    update_button_->setAutoDefault(true);
+    update_button_->show();
+    fit_height_to_content();
+  }
+
+  // As tall as the content at the fixed width, and never shorter than it already was.
+  void fit_height_to_content() {
+    auto* content = layout();
+    if (content == nullptr) {
+      return;
+    }
+    content->activate();
+    fitted_height_ = std::max({kMinimumDialogHeight, fitted_height_,
+                               content->totalHeightForWidth(ui_text_length(kDialogWidth))});
+    setFixedHeight(fitted_height_);
+  }
+
+  void place_close_glyph() {
+    if (close_glyph_ != nullptr) {
+      close_glyph_->move(width() - close_glyph_->width() - 4, 4);
+    }
+  }
+
+  QToolButton* close_glyph_{nullptr};
+  QLabel* status_{nullptr};
+  QPushButton* update_button_{nullptr};
+  bool offers_update_{false};
+  int fitted_height_{0};
+  std::optional<UpdateInfo> offered_update_;
+  std::optional<UpdateInfo> requested_update_;
+  bool dragging_{false};
+  QPoint drag_position_;
+};
+
+}  // namespace
+
+void show_about_splash(QWidget* parent, std::function<void(const UpdateInfo&)> open_update) {
+  std::optional<UpdateInfo> requested_update;
+  {
+    PatchySplashDialog splash(parent, static_cast<bool>(open_update));
+#ifndef Q_OS_WASM
+    // The web build always runs the latest deployed site, so there is no update
+    // to check for; the status label keeps its "Patchy is ready." text. The same
+    // goes for a store build, where the store delivers updates.
+    if (update_checks_available()) {
+      splash.begin_update_check();
+    }
+#endif
+    // exec_dialog centers the dialog on its owner clamped to the screen (a raw
+    // parent-centered move could push the Close button below a low main window)
+    // and remembers a position the user dragged it to.
+    exec_dialog(splash);
+    requested_update = splash.requested_update();
+  }
+  // The About dialog is destroyed by now: the update prompt can close Patchy to install
+  // (docs/auto-update.md), which must not happen under a modal dialog still on the stack.
+  if (requested_update.has_value() && open_update) {
+    open_update(*requested_update);
+  }
+}
+
+}  // namespace patchy::ui

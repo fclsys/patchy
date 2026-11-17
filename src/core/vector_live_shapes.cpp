@@ -1,0 +1,874 @@
+#include "core/vector_live_shapes.hpp"
+
+#include <algorithm>
+#include <cmath>
+#include <cstddef>
+#include <numbers>
+
+namespace patchy {
+
+namespace {
+
+PathAnchor corner_anchor(double x, double y) {
+  PathAnchor anchor;
+  anchor.anchor_x = anchor.in_x = anchor.out_x = x;
+  anchor.anchor_y = anchor.in_y = anchor.out_y = y;
+  anchor.smooth = false;
+  return anchor;
+}
+
+// A smooth knot whose handles default to the anchor; callers move in/out.
+PathAnchor smooth_anchor(double x, double y) {
+  auto anchor = corner_anchor(x, y);
+  anchor.smooth = true;
+  return anchor;
+}
+
+std::vector<PathSubpath> rectangle_subpaths(const LiveShapeParams& params) {
+  PathSubpath subpath;
+  subpath.closed = true;
+  subpath.op = PathCombineOp::Add;
+  subpath.shape_group = params.index;
+  subpath.anchors = {
+      corner_anchor(params.left, params.top),
+      corner_anchor(params.right, params.top),
+      corner_anchor(params.right, params.bottom),
+      corner_anchor(params.left, params.bottom),
+  };
+  return {std::move(subpath)};
+}
+
+std::vector<PathSubpath> rounded_rectangle_subpaths(const LiveShapeParams& params) {
+  const double width = params.right - params.left;
+  const double height = params.bottom - params.top;
+  // Proportional clamp so opposing radii never overlap (per side).
+  auto radii = params.corner_radii;  // TL, TR, BR, BL
+  for (auto& radius : radii) {
+    radius = std::max(0.0, radius);
+  }
+  double scale = 1.0;
+  const auto limit = [&scale](double a, double b, double extent) {
+    if (a + b > extent && a + b > 0.0) {
+      scale = std::min(scale, extent / (a + b));
+    }
+  };
+  limit(radii[0], radii[1], width);
+  limit(radii[3], radii[2], width);
+  limit(radii[0], radii[3], height);
+  limit(radii[1], radii[2], height);
+  for (auto& radius : radii) {
+    radius *= scale;
+  }
+  const double rtl = radii[0];
+  const double rtr = radii[1];
+  const double rbr = radii[2];
+  const double rbl = radii[3];
+  if (rtl <= 0.0 && rtr <= 0.0 && rbr <= 0.0 && rbl <= 0.0) {
+    return rectangle_subpaths(params);
+  }
+
+  PathSubpath subpath;
+  subpath.closed = true;
+  subpath.op = PathCombineOp::Add;
+  subpath.shape_group = params.index;
+  auto& anchors = subpath.anchors;
+
+  // Photoshop's construction: knots run clockwise starting at the top-left
+  // arc's end on the top edge; each rounded corner contributes its arc start
+  // and end knots (smooth, one kappa handle each); the top-left arc's start
+  // knot closes the loop. Zero-radius corners collapse to one corner knot.
+  const double left = params.left;
+  const double top = params.top;
+  const double right = params.right;
+  const double bottom = params.bottom;
+
+  bool tl_pending_start = false;
+  if (rtl > 0.0) {
+    // Arc end on the top edge: in-handle reaches back toward the arc.
+    auto arc_end = smooth_anchor(left + rtl, top);
+    arc_end.in_x = left + rtl - kLiveShapeKappa * rtl;
+    arc_end.in_y = top;
+    anchors.push_back(arc_end);
+    tl_pending_start = true;
+  } else {
+    anchors.push_back(corner_anchor(left, top));
+  }
+  if (rtr > 0.0) {
+    auto arc_start = smooth_anchor(right - rtr, top);
+    arc_start.out_x = right - rtr + kLiveShapeKappa * rtr;
+    arc_start.out_y = top;
+    anchors.push_back(arc_start);
+    auto arc_end = smooth_anchor(right, top + rtr);
+    arc_end.in_x = right;
+    arc_end.in_y = top + rtr - kLiveShapeKappa * rtr;
+    anchors.push_back(arc_end);
+  } else {
+    anchors.push_back(corner_anchor(right, top));
+  }
+  if (rbr > 0.0) {
+    auto arc_start = smooth_anchor(right, bottom - rbr);
+    arc_start.out_x = right;
+    arc_start.out_y = bottom - rbr + kLiveShapeKappa * rbr;
+    anchors.push_back(arc_start);
+    auto arc_end = smooth_anchor(right - rbr, bottom);
+    arc_end.in_x = right - rbr + kLiveShapeKappa * rbr;
+    arc_end.in_y = bottom;
+    anchors.push_back(arc_end);
+  } else {
+    anchors.push_back(corner_anchor(right, bottom));
+  }
+  if (rbl > 0.0) {
+    auto arc_start = smooth_anchor(left + rbl, bottom);
+    arc_start.out_x = left + rbl - kLiveShapeKappa * rbl;
+    arc_start.out_y = bottom;
+    anchors.push_back(arc_start);
+    auto arc_end = smooth_anchor(left, bottom - rbl);
+    arc_end.in_x = left;
+    arc_end.in_y = bottom - rbl + kLiveShapeKappa * rbl;
+    anchors.push_back(arc_end);
+  } else {
+    anchors.push_back(corner_anchor(left, bottom));
+  }
+  if (tl_pending_start) {
+    auto arc_start = smooth_anchor(left, top + rtl);
+    arc_start.out_x = left;
+    arc_start.out_y = top + rtl - kLiveShapeKappa * rtl;
+    anchors.push_back(arc_start);
+  }
+  return {std::move(subpath)};
+}
+
+std::vector<PathSubpath> ellipse_subpaths(const LiveShapeParams& params) {
+  const double cx = (params.left + params.right) / 2.0;
+  const double cy = (params.top + params.bottom) / 2.0;
+  const double rx = (params.right - params.left) / 2.0;
+  const double ry = (params.bottom - params.top) / 2.0;
+  const double kx = kLiveShapeKappa * rx;
+  const double ky = kLiveShapeKappa * ry;
+
+  PathSubpath subpath;
+  subpath.closed = true;
+  subpath.op = PathCombineOp::Add;
+  subpath.shape_group = params.index;
+
+  auto top = smooth_anchor(cx, params.top);
+  top.in_x = cx - kx;
+  top.out_x = cx + kx;
+  auto right = smooth_anchor(params.right, cy);
+  right.in_y = cy - ky;
+  right.out_y = cy + ky;
+  auto bottom = smooth_anchor(cx, params.bottom);
+  bottom.in_x = cx + kx;
+  bottom.out_x = cx - kx;
+  auto left = smooth_anchor(params.left, cy);
+  left.in_y = cy + ky;
+  left.out_y = cy - ky;
+  subpath.anchors = {top, right, bottom, left};
+  return {std::move(subpath)};
+}
+
+// Drops repeated points and there-and-back spikes from a closed corner outline: the heads
+// of a short line can put two of its points on one spot.
+void clean_closed_outline(std::vector<PathAnchor>& anchors) {
+  constexpr double kSamePoint = 1e-7;
+  const auto same = [](const PathAnchor& a, const PathAnchor& b) {
+    return std::abs(a.anchor_x - b.anchor_x) <= kSamePoint && std::abs(a.anchor_y - b.anchor_y) <= kSamePoint;
+  };
+  bool changed = true;
+  while (changed && anchors.size() > 3) {
+    changed = false;
+    for (std::size_t index = 0; index < anchors.size(); ++index) {
+      const auto next = (index + 1) % anchors.size();
+      const auto after = (index + 2) % anchors.size();
+      // A, A: one of the pair. A, B, A: the spike's point B (the pair then goes as A, A).
+      if (same(anchors[index], anchors[next]) || same(anchors[index], anchors[after])) {
+        anchors.erase(anchors.begin() + static_cast<std::ptrdiff_t>(next));
+        changed = true;
+        break;
+      }
+    }
+  }
+}
+
+std::vector<PathSubpath> line_subpaths(const LiveShapeParams& params) {
+  const double dx = params.line_end_x - params.line_start_x;
+  const double dy = params.line_end_y - params.line_start_y;
+  const double length = std::sqrt(dx * dx + dy * dy);
+  if (!(length > 0.0)) {
+    return {};
+  }
+  const double dir_x = dx / length;
+  const double dir_y = dy / length;
+  const double half = std::max(params.line_weight, 0.0) / 2.0;
+  // Photoshop's quad: [start+n, start-n, end-n, end+n], n = half * (-dy, dx).
+  const double nx = -dir_y * half;
+  const double ny = dir_x * half;
+
+  std::vector<PathSubpath> subpaths;
+
+  double head_length = params.arrow_length > 0.0 ? params.arrow_length : 0.0;
+  const double head_half_width = std::max(params.arrow_width, 0.0) / 2.0;
+  const bool start_head = params.arrow_start && head_length > 0.0;
+  const bool end_head = params.arrow_end && head_length > 0.0;
+  // A head wider than the shaft makes one outline with it (GitHub #622 follow-up): the
+  // shaft's edges run to where they meet the head's back edges, then around the head. One
+  // outline leaves no overlap, which the shape group's even-odd fill would punch out, and
+  // no gap behind a concave head's notch.
+  const bool merged = (start_head || end_head) && head_half_width > half;
+  // Concavity pulls the middle of a head's back toward the tip (positive) or away
+  // (negative); Photoshop stores percent, -50 to 50.
+  const double concavity = std::clamp(static_cast<double>(params.arrow_concavity) / 100.0, -0.5, 0.5);
+  const double reach = merged ? half / head_half_width : 1.0;  // along a back edge, notch to corner
+  // Where a head's back meets the shaft's edge, as a share of the head's length from its tip.
+  const double back = merged ? 1.0 - concavity * (1.0 - reach) : 1.0;
+
+  // A head keeps its size on a line shorter than it (local-051): its tip stays on the
+  // line's end and its back passes the other end. Two heads share the line instead: each is
+  // at most as long as lets their backs meet in the middle, at its own width.
+  bool heads_meet = false;
+  if (start_head && end_head) {
+    const double extent = std::max(1.0, back);  // the corners, or a convex head's meeting points
+    if (2.0 * head_length * extent >= length) {
+      head_length = length / (2.0 * extent);
+      heads_meet = true;
+    }
+  }
+
+  if (merged) {
+    const double hx = -dir_y * head_half_width;
+    const double hy = dir_x * head_half_width;
+    PathSubpath outline;
+    outline.closed = true;
+    outline.op = PathCombineOp::Add;
+    outline.shape_group = params.index;
+
+    if (start_head != end_head && head_length * back >= length) {
+      // One head, and no shaft left in front of its back: the head alone, plus what the
+      // line still fills of a concave head's notch.
+      const double tip_x = start_head ? params.line_start_x : params.line_end_x;
+      const double tip_y = start_head ? params.line_start_y : params.line_end_y;
+      const double toward_x = start_head ? dir_x : -dir_x;  // from the tip back along the line
+      const double toward_y = start_head ? dir_y : -dir_y;
+      const double first = start_head ? 1.0 : -1.0;
+      const double base_x = tip_x + toward_x * head_length;
+      const double base_y = tip_y + toward_y * head_length;
+      const double notch = head_length * (1.0 - concavity);  // tip to the middle of the back
+      std::vector<PathAnchor> head{corner_anchor(base_x + first * hx, base_y + first * hy),
+                                   corner_anchor(tip_x, tip_y),
+                                   corner_anchor(base_x - first * hx, base_y - first * hy)};
+      std::vector<PathAnchor> rest;
+      if (concavity > 0.0 && notch < length) {
+        // The line's other end sits inside the notch: the back edges are cut off there.
+        const double free_x = tip_x + toward_x * length;
+        const double free_y = tip_y + toward_y * length;
+        const double share = (length - notch) / (head_length * concavity);
+        rest = {corner_anchor(free_x - first * hx * share, free_y - first * hy * share),
+                corner_anchor(free_x + first * hx * share, free_y + first * hy * share)};
+      } else {
+        rest = {corner_anchor(tip_x + toward_x * notch, tip_y + toward_y * notch)};
+      }
+      // The same walk as below: the start's side of the outline first.
+      auto& leading = start_head ? head : rest;
+      auto& trailing = start_head ? rest : head;
+      outline.anchors = std::move(leading);
+      outline.anchors.insert(outline.anchors.end(), trailing.begin(), trailing.end());
+      clean_closed_outline(outline.anchors);
+      subpaths.push_back(std::move(outline));
+      return subpaths;
+    }
+
+    // A head at (tip_x, tip_y) whose shaft runs along (toward_x, toward_y), listed from
+    // the side `first` (+1: the +n side) to the other.
+    const auto append_head = [&](double tip_x, double tip_y, double toward_x, double toward_y, double first) {
+      const double base_x = tip_x + toward_x * head_length;
+      const double base_y = tip_y + toward_y * head_length;
+      const double mid_x = base_x - toward_x * head_length * concavity;
+      const double mid_y = base_y - toward_y * head_length * concavity;
+      for (const double side : {first, -first}) {
+        const double corner_x = base_x + side * hx;
+        const double corner_y = base_y + side * hy;
+        const double join_x = mid_x + (corner_x - mid_x) * reach;
+        const double join_y = mid_y + (corner_y - mid_y) * reach;
+        if (side == first) {
+          outline.anchors.push_back(corner_anchor(join_x, join_y));
+          outline.anchors.push_back(corner_anchor(corner_x, corner_y));
+          outline.anchors.push_back(corner_anchor(tip_x, tip_y));
+        } else {
+          outline.anchors.push_back(corner_anchor(corner_x, corner_y));
+          outline.anchors.push_back(corner_anchor(join_x, join_y));
+        }
+      }
+    };
+    // The headless end of a line with one head: its two corners, with the point of a convex
+    // head's back between them where that back passes the end.
+    bool back_passes_end = false;
+    const auto append_cap = [&](double x, double y, double toward_x, double toward_y, double first) {
+      outline.anchors.push_back(corner_anchor(x + first * nx, y + first * ny));
+      const double notch = head_length * (1.0 - concavity);
+      if (concavity < 0.0 && notch > length) {
+        const double share = (notch - length) / (notch - head_length * back);
+        back_passes_end = true;
+        outline.anchors.push_back(corner_anchor(x + first * nx * share, y + first * ny * share));
+        outline.anchors.push_back(corner_anchor(x + toward_x * (notch - length), y + toward_y * (notch - length)));
+        outline.anchors.push_back(corner_anchor(x - first * nx * share, y - first * ny * share));
+      }
+      outline.anchors.push_back(corner_anchor(x - first * nx, y - first * ny));
+    };
+    // Photoshop's quad order: start+n, start-n, end-n, end+n.
+    if (start_head) {
+      append_head(params.line_start_x, params.line_start_y, dir_x, dir_y, 1.0);
+    } else {
+      append_cap(params.line_start_x, params.line_start_y, -dir_x, -dir_y, 1.0);
+    }
+    if (end_head) {
+      append_head(params.line_end_x, params.line_end_y, -dir_x, -dir_y, -1.0);
+    } else {
+      append_cap(params.line_end_x, params.line_end_y, dir_x, dir_y, -1.0);
+    }
+    if (heads_meet || back_passes_end) {
+      clean_closed_outline(outline.anchors);
+    }
+    subpaths.push_back(std::move(outline));
+    return subpaths;
+  }
+
+  // Heads no wider than the shaft: separate polygons. The shaft shortens so heads sit
+  // tip-at-endpoint, and goes when the heads leave it no length.
+  double start_x = params.line_start_x;
+  double start_y = params.line_start_y;
+  double end_x = params.line_end_x;
+  double end_y = params.line_end_y;
+  double shaft_length = length;
+  if (start_head) {
+    start_x += dir_x * head_length;
+    start_y += dir_y * head_length;
+    shaft_length -= head_length;
+  }
+  if (end_head) {
+    end_x -= dir_x * head_length;
+    end_y -= dir_y * head_length;
+    shaft_length -= head_length;
+  }
+
+  if (!heads_meet && shaft_length > 0.0) {
+    PathSubpath shaft;
+    shaft.closed = true;
+    shaft.op = PathCombineOp::Add;
+    shaft.shape_group = params.index;
+    shaft.anchors = {
+        corner_anchor(start_x + nx, start_y + ny),
+        corner_anchor(start_x - nx, start_y - ny),
+        corner_anchor(end_x - nx, end_y - ny),
+        corner_anchor(end_x + nx, end_y + ny),
+    };
+    subpaths.push_back(std::move(shaft));
+  }
+
+  const auto append_head = [&](double tip_x, double tip_y, double toward_x, double toward_y) {
+    // toward = unit vector from tip back along the shaft.
+    const double base_x = tip_x + toward_x * head_length;
+    const double base_y = tip_y + toward_y * head_length;
+    const double bx = -toward_y * head_half_width;
+    const double by = toward_x * head_half_width;
+    const double mid_x = base_x - toward_x * head_length * concavity;
+    const double mid_y = base_y - toward_y * head_length * concavity;
+    PathSubpath head;
+    head.closed = true;
+    head.op = PathCombineOp::Add;
+    head.shape_group = params.index;
+    head.anchors = {
+        corner_anchor(tip_x, tip_y),
+        corner_anchor(base_x + bx, base_y + by),
+        corner_anchor(mid_x, mid_y),
+        corner_anchor(base_x - bx, base_y - by),
+    };
+    subpaths.push_back(std::move(head));
+  };
+  if (start_head) {
+    append_head(params.line_start_x, params.line_start_y, dir_x, dir_y);
+  }
+  if (end_head) {
+    append_head(params.line_end_x, params.line_end_y, -dir_x, -dir_y);
+  }
+  return subpaths;
+}
+
+std::vector<PathSubpath> polygon_subpaths(const LiveShapeParams& params) {
+  const double rx = (params.right - params.left) / 2.0;
+  const double ry = (params.bottom - params.top) / 2.0;
+  if (rx < 0.25 || ry < 0.25) {
+    return {};
+  }
+  const double cx = params.left + rx;
+  const double cy = params.top + ry;
+  auto subpath = generate_polygon_subpath(0.0, 0.0, 1.0, params.polygon_angle, params.polygon_sides,
+                                          std::clamp(params.polygon_star_inset, 0, 99));
+  for (auto& anchor : subpath.anchors) {
+    anchor.anchor_x = cx + anchor.anchor_x * rx;
+    anchor.anchor_y = cy + anchor.anchor_y * ry;
+    anchor.in_x = anchor.anchor_x;
+    anchor.in_y = anchor.anchor_y;
+    anchor.out_x = anchor.anchor_x;
+    anchor.out_y = anchor.anchor_y;
+  }
+  subpath.closed = true;
+  subpath.op = PathCombineOp::Add;
+  subpath.shape_group = params.index;
+  return {std::move(subpath)};
+}
+
+}  // namespace
+
+std::vector<PathSubpath> generate_live_shape_subpaths(const LiveShapeParams& params) {
+  switch (params.kind) {
+    case LiveShapeKind::Polygon:
+      return polygon_subpaths(params);
+    case LiveShapeKind::Rectangle:
+      return rectangle_subpaths(params);
+    case LiveShapeKind::RoundedRectangle:
+      return rounded_rectangle_subpaths(params);
+    case LiveShapeKind::Ellipse:
+      return ellipse_subpaths(params);
+    case LiveShapeKind::Line:
+      return line_subpaths(params);
+    case LiveShapeKind::None:
+    case LiveShapeKind::Custom:
+      break;
+  }
+  return {};
+}
+
+void populate_live_shape_box_corners(LiveShapeParams& params) noexcept {
+  params.box_corners = {params.left,  params.top,    params.right, params.top,
+                        params.right, params.bottom, params.left,  params.bottom};
+}
+
+void scale_live_shape_params(LiveShapeParams& params, double sx, double sy, double tx, double ty) noexcept {
+  const double uniform_scale = (sx + sy) / 2.0;
+  params.left = params.left * sx + tx;
+  params.right = params.right * sx + tx;
+  params.top = params.top * sy + ty;
+  params.bottom = params.bottom * sy + ty;
+  for (std::size_t i = 0; i < params.box_corners.size(); i += 2) {
+    params.box_corners[i] = params.box_corners[i] * sx + tx;
+    params.box_corners[i + 1] = params.box_corners[i + 1] * sy + ty;
+  }
+  for (auto& radius : params.corner_radii) {
+    radius *= uniform_scale;
+  }
+  params.line_start_x = params.line_start_x * sx + tx;
+  params.line_end_x = params.line_end_x * sx + tx;
+  params.line_start_y = params.line_start_y * sy + ty;
+  params.line_end_y = params.line_end_y * sy + ty;
+  params.line_weight *= uniform_scale;
+  params.arrow_width *= uniform_scale;
+  params.arrow_length *= uniform_scale;
+  params.transform[4] = params.transform[4] * sx + tx;
+  params.transform[5] = params.transform[5] * sy + ty;
+}
+
+void translate_live_shape_params(LiveShapeParams& params, double dx, double dy) noexcept {
+  params.left += dx;
+  params.right += dx;
+  params.top += dy;
+  params.bottom += dy;
+  for (std::size_t i = 0; i < params.box_corners.size(); i += 2) {
+    params.box_corners[i] += dx;
+    params.box_corners[i + 1] += dy;
+  }
+  params.line_start_x += dx;
+  params.line_end_x += dx;
+  params.line_start_y += dy;
+  params.line_end_y += dy;
+  params.transform[4] += dx;
+  params.transform[5] += dy;
+}
+
+RotationCosSin rotation_cos_sin(double degrees) noexcept {
+  const double quarters = degrees / 90.0;
+  const double nearest = std::round(quarters);
+  if (std::abs(quarters - nearest) <= 1e-9) {
+    // Exact at the quarter turns, so a shape turned by 90 degrees keeps whole coordinates.
+    const auto quarter = static_cast<int>(std::fmod(nearest, 4.0));
+    switch (((quarter % 4) + 4) % 4) {
+      case 0:
+        return {1.0, 0.0};
+      case 1:
+        return {0.0, 1.0};
+      case 2:
+        return {-1.0, 0.0};
+      default:
+        return {0.0, -1.0};
+    }
+  }
+  const double radians = degrees * std::numbers::pi / 180.0;
+  return {std::cos(radians), std::sin(radians)};
+}
+
+std::array<double, 6> rotation_matrix_about(double pivot_x, double pivot_y, double degrees) noexcept {
+  const auto turn = rotation_cos_sin(degrees);
+  return {turn.cos,
+          turn.sin,
+          -turn.sin,
+          turn.cos,
+          pivot_x - (turn.cos * pivot_x) + (turn.sin * pivot_y),
+          pivot_y - (turn.sin * pivot_x) - (turn.cos * pivot_y)};
+}
+
+std::optional<LiveShapeParams> rotate_live_shape_params(const LiveShapeParams& params, double pivot_x,
+                                                        double pivot_y, double degrees) {
+  if (!params.raw_descriptor.empty()) {
+    return std::nullopt;
+  }
+  const auto matrix = rotation_matrix_about(pivot_x, pivot_y, degrees);
+  const auto turned = [&matrix](double x, double y) {
+    return LiveShapePoint{(matrix[0] * x) + (matrix[2] * y) + matrix[4], (matrix[1] * x) + (matrix[3] * y) + matrix[5]};
+  };
+  const double quarters = degrees / 90.0;
+  const bool quarter_turn = std::abs(quarters - std::round(quarters)) <= 1e-9;
+  const int quarter = quarter_turn ? ((static_cast<int>(std::fmod(std::round(quarters), 4.0)) % 4) + 4) % 4 : 0;
+  auto result = params;
+  const auto anchor = turned(params.transform[4], params.transform[5]);
+  result.transform[4] = anchor.x;
+  result.transform[5] = anchor.y;
+  // The box about its turned center; a quarter turn swaps its sides.
+  const auto turn_box = [&](bool swap_sides) {
+    const auto center = turned((params.left + params.right) / 2.0, (params.top + params.bottom) / 2.0);
+    const double half_width = (swap_sides ? params.bottom - params.top : params.right - params.left) / 2.0;
+    const double half_height = (swap_sides ? params.right - params.left : params.bottom - params.top) / 2.0;
+    result.left = center.x - half_width;
+    result.right = center.x + half_width;
+    result.top = center.y - half_height;
+    result.bottom = center.y + half_height;
+    populate_live_shape_box_corners(result);
+  };
+  switch (params.kind) {
+    case LiveShapeKind::Line: {
+      const auto start = turned(params.line_start_x, params.line_start_y);
+      const auto end = turned(params.line_end_x, params.line_end_y);
+      result.line_start_x = start.x;
+      result.line_start_y = start.y;
+      result.line_end_x = end.x;
+      result.line_end_y = end.y;
+      // The box of a live line is the hull of what it generates.
+      VectorPath generated;
+      generated.subpaths = line_subpaths(result);
+      const auto hull = generated.bounds();
+      if (!hull.has_value()) {
+        return std::nullopt;
+      }
+      result.left = hull->left;
+      result.top = hull->top;
+      result.right = hull->right;
+      result.bottom = hull->bottom;
+      populate_live_shape_box_corners(result);
+      return result;
+    }
+    case LiveShapeKind::Polygon:
+      if (!quarter_turn && !live_polygon_is_regular(params)) {
+        return std::nullopt;
+      }
+      turn_box(quarter_turn && (quarter % 2) != 0);
+      result.polygon_angle = params.polygon_angle + (degrees * std::numbers::pi / 180.0);
+      return result;
+    case LiveShapeKind::Rectangle:
+    case LiveShapeKind::RoundedRectangle:
+    case LiveShapeKind::Ellipse:
+      if (!quarter_turn) {
+        return std::nullopt;
+      }
+      turn_box((quarter % 2) != 0);
+      // Clockwise: the top-left corner becomes the top-right one, and so on round.
+      for (std::size_t corner = 0; corner < params.corner_radii.size(); ++corner) {
+        result.corner_radii[(corner + static_cast<std::size_t>(quarter)) % 4U] = params.corner_radii[corner];
+      }
+      return result;
+    case LiveShapeKind::None:
+    case LiveShapeKind::Custom:
+      break;
+  }
+  return std::nullopt;
+}
+
+std::optional<LiveShapeParams> resolve_live_shape_group(const VectorPath& path,
+                                                        const std::vector<LiveShapeParams>& origination,
+                                                        std::int32_t group) {
+  const auto entry = std::find_if(origination.begin(), origination.end(), [group](const LiveShapeParams& params) {
+    return params.index == group && params.raw_descriptor.empty();
+  });
+  if (entry == origination.end()) {
+    return std::nullopt;
+  }
+  std::vector<const PathSubpath*> actual;
+  for (const auto& subpath : path.subpaths) {
+    if (subpath.shape_group == group) {
+      actual.push_back(&subpath);
+    }
+  }
+  const auto generated = generate_live_shape_subpaths(*entry);
+  if (actual.empty() || generated.size() != actual.size()) {
+    return std::nullopt;
+  }
+  if (generated.front().anchors.empty() || actual.front()->anchors.size() != generated.front().anchors.size()) {
+    return std::nullopt;
+  }
+  const double dx = actual.front()->anchors.front().anchor_x - generated.front().anchors.front().anchor_x;
+  const double dy = actual.front()->anchors.front().anchor_y - generated.front().anchors.front().anchor_y;
+  constexpr double kTolerance = 0.01;
+  const auto close = [dx, dy](double ax, double ay, double gx, double gy) {
+    return std::abs(ax - gx - dx) <= kTolerance && std::abs(ay - gy - dy) <= kTolerance;
+  };
+  for (std::size_t s = 0; s < generated.size(); ++s) {
+    const auto& want = generated[s].anchors;
+    const auto& have = actual[s]->anchors;
+    if (want.size() != have.size() || generated[s].closed != actual[s]->closed) {
+      return std::nullopt;
+    }
+    for (std::size_t a = 0; a < want.size(); ++a) {
+      if (!close(have[a].anchor_x, have[a].anchor_y, want[a].anchor_x, want[a].anchor_y) ||
+          !close(have[a].in_x, have[a].in_y, want[a].in_x, want[a].in_y) ||
+          !close(have[a].out_x, have[a].out_y, want[a].out_x, want[a].out_y)) {
+        return std::nullopt;
+      }
+    }
+  }
+  auto result = *entry;
+  translate_live_shape_params(result, dx, dy);
+  return result;
+}
+
+void keep_or_drop_live_shapes_after_path_edit(VectorShapeContent& content,
+                                              const std::vector<int>& touched_groups) {
+  std::vector<int> invalidated = touched_groups;
+  for (auto& params : content.origination) {
+    if (params.kind == LiveShapeKind::None || !params.raw_descriptor.empty()) {
+      continue;
+    }
+    auto moved = resolve_live_shape_group(content.path, {params}, params.index);
+    if (!moved.has_value()) {
+      continue;
+    }
+    std::erase(invalidated, params.index);
+    // An untouched group that did not move keeps its parameters bit for bit.
+    if (std::abs(moved->left - params.left) > 1e-9 || std::abs(moved->top - params.top) > 1e-9 ||
+        std::abs(moved->line_start_x - params.line_start_x) > 1e-9 ||
+        std::abs(moved->line_start_y - params.line_start_y) > 1e-9) {
+      params = std::move(*moved);
+    }
+  }
+  drop_live_shape_origination(content, invalidated);
+}
+
+bool replace_live_shape_group(VectorPath& path, const LiveShapeParams& params) {
+  auto generated = generate_live_shape_subpaths(params);
+  const auto first = std::find_if(path.subpaths.begin(), path.subpaths.end(), [&params](const PathSubpath& subpath) {
+    return subpath.shape_group == params.index;
+  });
+  if (generated.empty() || first == path.subpaths.end()) {
+    return false;
+  }
+  const auto op = first->op;
+  const auto position = static_cast<std::size_t>(first - path.subpaths.begin());
+  std::erase_if(path.subpaths, [&params](const PathSubpath& subpath) { return subpath.shape_group == params.index; });
+  for (auto& subpath : generated) {
+    subpath.op = op;
+    subpath.shape_group = params.index;
+  }
+  path.subpaths.insert(path.subpaths.begin() + static_cast<std::ptrdiff_t>(position),
+                       std::make_move_iterator(generated.begin()), std::make_move_iterator(generated.end()));
+  return true;
+}
+
+bool live_polygon_is_regular(const LiveShapeParams& params) noexcept {
+  if (params.kind != LiveShapeKind::Polygon) {
+    return false;
+  }
+  const double width = params.right - params.left;
+  const double height = params.bottom - params.top;
+  // A hundredth of a pixel: a proportional W / H edit keeps the box square to rounding.
+  return width >= 1.0 && height >= 1.0 && std::abs(width - height) <= 0.01;
+}
+
+LiveShapePoint live_polygon_center(const LiveShapeParams& params) noexcept {
+  return {(params.left + params.right) / 2.0, (params.top + params.bottom) / 2.0};
+}
+
+LiveShapePoint live_polygon_first_vertex(const LiveShapeParams& params) noexcept {
+  const auto center = live_polygon_center(params);
+  return {center.x + (params.right - params.left) / 2.0 * std::cos(params.polygon_angle),
+          center.y + (params.bottom - params.top) / 2.0 * std::sin(params.polygon_angle)};
+}
+
+bool set_live_polygon_first_vertex(LiveShapeParams& params, double x, double y) noexcept {
+  const auto center = live_polygon_center(params);
+  const double dx = x - center.x;
+  const double dy = y - center.y;
+  const double radius = std::hypot(dx, dy);
+  if (!(radius >= 1.0)) {
+    return false;
+  }
+  // CanvasWidget::commit_polygon_drag's parameters for a drag from the center to (x, y).
+  params.left = center.x - radius;
+  params.top = center.y - radius;
+  params.right = center.x + radius;
+  params.bottom = center.y + radius;
+  params.polygon_angle = std::atan2(dy, dx);
+  populate_live_shape_box_corners(params);
+  return true;
+}
+
+bool set_live_line_point(LiveShapeParams& params, bool end, double x, double y) {
+  auto moved = params;
+  (end ? moved.line_end_x : moved.line_start_x) = x;
+  (end ? moved.line_end_y : moved.line_start_y) = y;
+  if (!(std::hypot(moved.line_end_x - moved.line_start_x, moved.line_end_y - moved.line_start_y) >= 1.0)) {
+    return false;
+  }
+  // The box of a live line is the hull of what it generates (the ends sit on the
+  // centerline, half a weight inside it), as when the line is drawn.
+  VectorPath generated;
+  generated.subpaths = line_subpaths(moved);
+  const auto hull = generated.bounds();
+  if (!hull.has_value()) {
+    return false;
+  }
+  moved.left = hull->left;
+  moved.top = hull->top;
+  moved.right = hull->right;
+  moved.bottom = hull->bottom;
+  params = std::move(moved);
+  return true;
+}
+
+PathSubpath generate_polygon_subpath(double cx, double cy, double radius, double angle_radians,
+                                      int requested_sides, int star_inset) {
+  PathSubpath subpath;
+  if (radius < 0.5) {
+    return subpath;
+  }
+  const int sides = std::clamp(requested_sides, 3, 100);
+  const bool star = star_inset > 0;
+  const double inner_radius = radius * (100 - star_inset) / 100.0;
+  const int point_count = star ? sides * 2 : sides;
+  for (int i = 0; i < point_count; ++i) {
+    const double point_radius = star && (i % 2) != 0 ? inner_radius : radius;
+    const double angle =
+        angle_radians + i * 2.0 * std::numbers::pi / point_count;
+    PathAnchor anchor;
+    anchor.anchor_x = cx + point_radius * std::cos(angle);
+    anchor.anchor_y = cy + point_radius * std::sin(angle);
+    anchor.in_x = anchor.anchor_x;
+    anchor.in_y = anchor.anchor_y;
+    anchor.out_x = anchor.anchor_x;
+    anchor.out_y = anchor.anchor_y;
+    subpath.anchors.push_back(anchor);
+  }
+  return subpath;
+}
+
+std::optional<LiveShapeParams> recognize_live_polygon(const VectorPath& path) {
+  if (path.subpaths.size() != 1) {
+    return std::nullopt;
+  }
+  const auto& subpath = path.subpaths.front();
+  const auto& anchors = subpath.anchors;
+  const auto count = anchors.size();
+  if (!subpath.closed || count < 3 || count > 200) {
+    return std::nullopt;
+  }
+  constexpr double kHandleTolerance = 1e-6;
+  double sum_x = 0.0;
+  double sum_y = 0.0;
+  for (const auto& anchor : anchors) {
+    if (std::abs(anchor.in_x - anchor.anchor_x) > kHandleTolerance ||
+        std::abs(anchor.in_y - anchor.anchor_y) > kHandleTolerance ||
+        std::abs(anchor.out_x - anchor.anchor_x) > kHandleTolerance ||
+        std::abs(anchor.out_y - anchor.anchor_y) > kHandleTolerance) {
+      return std::nullopt;  // a curve: never a polygon
+    }
+    sum_x += anchor.anchor_x;
+    sum_y += anchor.anchor_y;
+  }
+  // The vertices of a regular polygon (and of a star's inner ring) average to its center.
+  const double cx = sum_x / static_cast<double>(count);
+  const double cy = sum_y / static_cast<double>(count);
+  const auto fit = [&](int sides, bool star) -> std::optional<LiveShapeParams> {
+    // Outer vertex k sits at (cx + rx cos(a + k t), cy + ry sin(a + k t)), t = 2 pi / sides;
+    // its Fourier sums against cos(k t) and sin(k t) give rx, ry and a directly.
+    const int step = star ? 2 : 1;
+    const double turn = 2.0 * std::numbers::pi / sides;
+    double ucos = 0.0, usin = 0.0, vcos = 0.0, vsin = 0.0;
+    for (int k = 0; k < sides; ++k) {
+      const auto& vertex = anchors[static_cast<std::size_t>(k * step)];
+      const double u = vertex.anchor_x - cx;
+      const double v = vertex.anchor_y - cy;
+      ucos += u * std::cos(k * turn);
+      usin += u * std::sin(k * turn);
+      vcos += v * std::cos(k * turn);
+      vsin += v * std::sin(k * turn);
+    }
+    const double rx = 2.0 / sides * std::hypot(ucos, usin);
+    const double ry = 2.0 / sides * std::hypot(vcos, vsin);
+    if (rx < 0.25 || ry < 0.25) {
+      return std::nullopt;
+    }
+    LiveShapeParams params;
+    params.kind = LiveShapeKind::Polygon;
+    params.left = cx - rx;
+    params.top = cy - ry;
+    params.right = cx + rx;
+    params.bottom = cy + ry;
+    params.polygon_sides = sides;
+    params.polygon_angle = std::atan2(-usin, ucos);
+    params.index = subpath.shape_group;
+    if (star) {
+      const auto& inner = anchors[1];
+      const double ratio = std::hypot((inner.anchor_x - cx) / rx, (inner.anchor_y - cy) / ry);
+      params.polygon_star_inset = static_cast<std::int32_t>(std::lround(100.0 * (1.0 - ratio)));
+      if (params.polygon_star_inset < 1 || params.polygon_star_inset > 99) {
+        return std::nullopt;
+      }
+    }
+    populate_live_shape_box_corners(params);
+    // Accept only what the generator reproduces: PSD path records hold 1/2^24 of the
+    // canvas, so a real polygon comes back within a small fraction of a pixel.
+    const auto generated = generate_live_shape_subpaths(params);
+    if (generated.size() != 1 || generated.front().anchors.size() != count) {
+      return std::nullopt;
+    }
+    const double tolerance = 0.02 + 1e-5 * std::max(rx, ry);
+    for (std::size_t i = 0; i < count; ++i) {
+      const auto& made = generated.front().anchors[i];
+      if (std::abs(made.anchor_x - anchors[i].anchor_x) > tolerance ||
+          std::abs(made.anchor_y - anchors[i].anchor_y) > tolerance) {
+        return std::nullopt;
+      }
+    }
+    return params;
+  };
+  if (count <= 100) {
+    if (count == 4) {
+      // An axis-aligned rectangle fits a 4-sided polygon too; leave it a plain path.
+      bool axis_aligned = true;
+      for (std::size_t i = 0; i < 4; ++i) {
+        const auto& from = anchors[i];
+        const auto& to = anchors[(i + 1) % 4];
+        if (std::abs(from.anchor_x - to.anchor_x) > 1e-3 && std::abs(from.anchor_y - to.anchor_y) > 1e-3) {
+          axis_aligned = false;
+        }
+      }
+      if (axis_aligned) {
+        return std::nullopt;
+      }
+    }
+    if (auto plain = fit(static_cast<int>(count), false)) {
+      return plain;
+    }
+  }
+  if (count % 2 == 0 && count >= 6) {
+    return fit(static_cast<int>(count / 2), true);
+  }
+  return std::nullopt;
+}
+
+}  // namespace patchy

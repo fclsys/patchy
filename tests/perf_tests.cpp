@@ -1,0 +1,6891 @@
+#include "core/brush_tip.hpp"
+#include "core/layer_metadata.hpp"
+#include "core/pixel_tools.hpp"
+#include "core/layer_render_utils.hpp"
+#include "core/rect_utils.hpp"
+#include "core/vector_live_shapes.hpp"
+#include "core/vector_raster.hpp"
+#include "core/vector_shape.hpp"
+#include "core/worker_budget.hpp"
+#include "filters/deep_filters.hpp"
+#include "filters/smart_filter_renderer.hpp"
+#include "formats/pdf_document_io.hpp"
+#include "psd/psd_document_io.hpp"
+#include "render/native_cmyk.hpp"
+#include "ui/qt_paths.hpp"
+#include "ui/app_settings.hpp"
+#include "ui/background_workers.hpp"
+#include "ui/brush_automation.hpp"
+#include "ui/canvas_widget.hpp"
+#include "ui/dialog_utils.hpp"
+#include "test_harness.hpp"
+#include "local_psd_fixtures.hpp"
+#include "ui/image_document_io.hpp"
+#include "ui/layer_list_widget.hpp"
+#include "ui/liquify_dialog.hpp"
+#include "ui/main_window.hpp"
+#include "ui/pdf_export.hpp"
+#include "ui/pdf_import.hpp"
+
+#include <QApplication>
+#include <QByteArray>
+#include <QCheckBox>
+#include <QComboBox>
+#include <QDialog>
+#include <QEventLoop>
+#include <QFile>
+#include <QLineF>
+#include <QFileInfo>
+#include <QFontComboBox>
+#include <QItemSelectionModel>
+#include <QKeyEvent>
+#include <QLabel>
+#include <QListWidget>
+#include <QMouseEvent>
+#include <QImage>
+#include <QPainter>
+#include <QPointer>
+#include <QProgressDialog>
+#if __has_include(<QPdfDocument>)
+#include <QPdfDocument>
+#include <QPdfDocumentRenderOptions>
+#define PATCHY_PERF_HAVE_QPDF 1
+#endif
+#include <QPushButton>
+#include <QRect>
+#include <QRegion>
+#include <QScopeGuard>
+#include <QSettings>
+#include <QSpinBox>
+#include <QTabWidget>
+#include <QTextCursor>
+#include <QTextEdit>
+#include <QTimer>
+
+#include <algorithm>
+#include <array>
+#include <atomic>
+#include <chrono>
+#include <cmath>
+#include <cstdio>
+#include <cstring>
+#include <ctime>
+#include <exception>
+#include <filesystem>
+#include <fstream>
+#include <functional>
+#include <future>
+#include <iomanip>
+#include <iostream>
+#include <map>
+#include <memory>
+#include <numeric>
+#include <optional>
+#include <span>
+#include <sstream>
+#include <string>
+#include <string_view>
+#include <thread>
+#include <utility>
+#include <vector>
+
+#ifdef Q_OS_WIN
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#include <dbghelp.h>
+#include "stack_walk_frame.hpp"
+#include <tlhelp32.h>
+#include <psapi.h>
+#pragma comment(lib, "dbghelp.lib")
+#endif
+
+namespace patchy::perf {
+int run_startup_scenario();  // tests/perf_startup.cpp
+}
+
+namespace patchy::ui {
+
+// Same friend-backdoor pattern as the visual suite's MainWindowTestAccess (one
+// definition per binary; this one only exposes what the perf scenarios need).
+class MainWindowTestAccess {
+ public:
+  static void open_document_path(MainWindow& window, const QString& path) {
+    // The Import PDF dialog, which pdfopen drives; a user's open shows a PDF in the viewer first.
+    window.open_document_path(path, MainWindow::OpenExisting::LoadCopy, MainWindow::PdfOpen::Import);
+  }
+  static bool has_document(MainWindow& window) { return window.active_session() != nullptr; }
+  static CanvasWidget* canvas(MainWindow& window) { return window.canvas_; }
+  static Document& document(MainWindow& window) { return window.document(); }
+  static void toggle_layer_folder_expanded(MainWindow& window, patchy::LayerId id) {
+    window.toggle_layer_folder_expanded(id);
+  }
+  static void refresh_layer_list(MainWindow& window) { window.refresh_layer_list(); }
+  static void edit_active_layer_style(MainWindow& window) { window.edit_active_layer_style(); }
+  static void undo(MainWindow& window) { window.undo(); }
+  static void duplicate_active_layer(MainWindow& window) { window.duplicate_active_layer(); }
+  static void add_text_at(MainWindow& window, QPoint document_point) { window.add_text_at(document_point, QRect()); }
+  // The parts of one text Size step, for the textscrub scenario (GitHub #700).
+  static void select_type_tool(MainWindow& window) {
+    if (window.type_tool_action_ != nullptr) {
+      window.type_tool_action_->trigger();
+    }
+  }
+  static void apply_text_size_to_editor(MainWindow& window, QTextEdit& editor, double points) {
+    window.apply_text_size_to_editor(editor, points);
+  }
+  static void relayout_text_editor(MainWindow& window, QTextEdit* editor) {
+    window.relayout_text_editor(editor, true);
+  }
+  static void schedule_text_editor_preview(MainWindow& window, QTextEdit* editor) {
+    window.schedule_text_editor_preview(editor);
+  }
+  static void update_text_editor_preview(MainWindow& window, QTextEdit* editor) {
+    window.update_text_editor_preview(editor);
+  }
+  static void refresh_text_color_button(MainWindow& window) { window.refresh_text_color_button(); }
+  static void refresh_document_info(MainWindow& window) { window.refresh_document_info(); }
+  static bool cmyk_proof(MainWindow& window) {
+    return window.active_session() != nullptr && window.active_session()->cmyk_proof;
+  }
+  static void set_document_cmyk_proof(MainWindow& window, bool enabled) { window.set_document_cmyk_proof(enabled); }
+  static void new_document(MainWindow& window, int width, int height, double ppi) {
+    window.reset_document(width, height, Qt::white, QStringLiteral("New document"), ppi);
+  }
+};
+
+}  // namespace patchy::ui
+
+namespace {
+
+using Clock = std::chrono::steady_clock;
+
+struct Candidate {
+  patchy::Layer* layer{nullptr};
+  patchy::LayerId layer_id{};
+  QRegion dirty_region;
+  QRect dirty_bounds;
+  std::int64_t dirty_area{0};
+  patchy::Rect moved_bounds{};
+  std::string name;
+};
+
+struct Metric {
+  std::string scenario;
+  std::string name;
+  std::int64_t dirty_area{0};
+  int dirty_rects{0};
+  double dirty_ms{0.0};
+  double full_ms{0.0};
+  bool identical{false};
+};
+
+QRect to_qrect(patchy::Rect rect) {
+  return QRect(rect.x, rect.y, rect.width, rect.height);
+}
+
+std::int64_t rect_area(QRect rect) {
+  return rect.isEmpty() ? 0 : static_cast<std::int64_t>(rect.width()) * static_cast<std::int64_t>(rect.height());
+}
+
+std::int64_t region_area(const QRegion& region) {
+  std::int64_t area = 0;
+  for (const auto& rect : region) {
+    area += rect_area(rect);
+  }
+  return area;
+}
+
+std::string clean_name(std::string name) {
+  for (auto& ch : name) {
+    if (ch == '\n' || ch == '\r' || ch == '\t' || ch == '"') {
+      ch = ' ';
+    }
+  }
+  if (name.size() > 100U) {
+    name.resize(100U);
+  }
+  return name;
+}
+
+void flatten_layers(std::vector<patchy::Layer>& layers, const std::string& prefix,
+                    std::vector<std::pair<patchy::Layer*, std::string>>& out) {
+  for (auto& layer : layers) {
+    auto name = prefix.empty() ? layer.name() : prefix + "/" + layer.name();
+    out.emplace_back(&layer, name);
+    flatten_layers(layer.children(), name, out);
+  }
+}
+
+bool images_equal_rgba(const QImage& left, const QImage& right) {
+  if (left.size() != right.size()) {
+    return false;
+  }
+  const auto left_rgba = left.convertToFormat(QImage::Format_RGBA8888);
+  const auto right_rgba = right.convertToFormat(QImage::Format_RGBA8888);
+  const auto row_bytes = static_cast<std::size_t>(left_rgba.width()) * 4U;
+  for (int y = 0; y < left_rgba.height(); ++y) {
+    if (std::memcmp(left_rgba.constScanLine(y), right_rgba.constScanLine(y), row_bytes) != 0) {
+      return false;
+    }
+  }
+  return true;
+}
+
+template <typename Callback>
+double elapsed_ms(Callback&& callback) {
+  const auto started = Clock::now();
+  callback();
+  return std::chrono::duration<double, std::milli>(Clock::now() - started).count();
+}
+
+void ensure_artifact_dir() {
+  std::filesystem::create_directories("test-artifacts");
+}
+
+void send_key(QWidget& widget, int key, Qt::KeyboardModifiers modifiers = Qt::NoModifier) {
+  QKeyEvent press(QEvent::KeyPress, key, modifiers);
+  QApplication::sendEvent(&widget, &press);
+  QKeyEvent release(QEvent::KeyRelease, key, modifiers);
+  QApplication::sendEvent(&widget, &release);
+  QApplication::processEvents();
+}
+
+patchy::ui::CanvasWidget* active_canvas(patchy::ui::MainWindow& window) {
+  if (auto* canvas = dynamic_cast<patchy::ui::CanvasWidget*>(window.centralWidget()); canvas != nullptr) {
+    return canvas;
+  }
+  if (auto* tabs = window.findChild<QTabWidget*>(QStringLiteral("documentTabs")); tabs != nullptr) {
+    return dynamic_cast<patchy::ui::CanvasWidget*>(tabs->currentWidget());
+  }
+  return nullptr;
+}
+
+std::filesystem::path perf_psd_path() {
+  const auto env_path = qgetenv("PATCHY_PERF_PSD");
+  if (!env_path.isEmpty()) {
+    return patchy::ui::to_filesystem_path(env_path);
+  }
+  return patchy::test::local_psd_fixture_path("Template.psd");
+}
+
+std::vector<Candidate> move_candidates(patchy::Document& document, QPoint delta, std::size_t max_count) {
+  const QRect canvas_rect(0, 0, document.width(), document.height());
+  std::vector<std::pair<patchy::Layer*, std::string>> flat;
+  flatten_layers(document.layers(), {}, flat);
+
+  std::vector<Candidate> candidates;
+  for (auto& [layer, name] : flat) {
+    if (layer == nullptr || !layer->visible() || layer->kind() != patchy::LayerKind::Pixel ||
+        layer->pixels().empty()) {
+      continue;
+    }
+    const auto old_bounds = layer->bounds();
+    if (old_bounds.empty()) {
+      continue;
+    }
+    const QRect old_rect = to_qrect(old_bounds);
+    if (old_rect == canvas_rect || clean_name(name) == "Background") {
+      continue;
+    }
+    const patchy::Rect moved_bounds{old_bounds.x + delta.x(), old_bounds.y + delta.y(), old_bounds.width,
+                                    old_bounds.height};
+    QRegion dirty;
+    dirty += to_qrect(patchy::layer_bounds_with_effects(*layer, old_bounds));
+    dirty += to_qrect(patchy::layer_bounds_with_effects(*layer, moved_bounds));
+    dirty = dirty.intersected(canvas_rect);
+    const auto area = region_area(dirty);
+    if (area <= 0) {
+      continue;
+    }
+    candidates.push_back(Candidate{layer, layer->id(), dirty, dirty.boundingRect(), area, moved_bounds, clean_name(name)});
+  }
+
+  std::sort(candidates.begin(), candidates.end(),
+            [](const Candidate& lhs, const Candidate& rhs) { return lhs.dirty_area > rhs.dirty_area; });
+  if (candidates.size() > max_count) {
+    candidates.resize(max_count);
+  }
+  return candidates;
+}
+
+void write_metrics(const std::vector<Metric>& metrics) {
+  ensure_artifact_dir();
+  {
+    std::ofstream csv("test-artifacts/dirty_rect_perf.csv");
+    csv << "scenario,name,dirty_area,dirty_rects,dirty_ms,full_ms,identical\n";
+    csv << std::fixed << std::setprecision(3);
+    for (const auto& metric : metrics) {
+      csv << '"' << metric.scenario << '"' << ',' << '"' << metric.name << '"' << ',' << metric.dirty_area << ','
+          << metric.dirty_rects << ',' << metric.dirty_ms << ',' << metric.full_ms << ','
+          << (metric.identical ? "true" : "false") << '\n';
+    }
+  }
+  {
+    std::ofstream json("test-artifacts/dirty_rect_perf.json");
+    json << std::fixed << std::setprecision(3);
+    json << "{\n  \"metrics\": [\n";
+    for (std::size_t index = 0; index < metrics.size(); ++index) {
+      const auto& metric = metrics[index];
+      json << "    {\"scenario\": \"" << metric.scenario << "\", \"name\": \"" << metric.name
+           << "\", \"dirty_area\": " << metric.dirty_area << ", \"dirty_rects\": " << metric.dirty_rects
+           << ", \"dirty_ms\": " << metric.dirty_ms << ", \"full_ms\": " << metric.full_ms
+           << ", \"identical\": " << (metric.identical ? "true" : "false") << "}";
+      json << (index + 1U == metrics.size() ? "\n" : ",\n");
+    }
+    json << "  ]\n}\n";
+  }
+}
+
+void collect_dirty_move_metrics(patchy::Document& document, const std::vector<Candidate>& candidates,
+                                std::string_view scenario, std::vector<Metric>& metrics) {
+  CHECK(!candidates.empty());
+  const auto base_full = patchy::ui::qimage_from_document(document, true).convertToFormat(QImage::Format_RGBA8888);
+  const bool strict = qEnvironmentVariableIsSet("PATCHY_PERF_STRICT");
+
+  for (const auto& candidate : candidates) {
+    CHECK(candidate.layer != nullptr);
+    const auto old_bounds = candidate.layer->bounds();
+    std::vector<patchy::ui::RenderedDocumentPatch> patches;
+    double dirty_ms = elapsed_ms([&] {
+      patches = patchy::ui::qimage_patches_from_document_region_with_layer_bounds(
+          document, candidate.dirty_region, true, {{candidate.layer->id(), candidate.moved_bounds}});
+      for (auto& patch : patches) {
+        patch.image = patch.image.convertToFormat(QImage::Format_RGBA8888);
+      }
+    });
+
+    auto patched = base_full.copy();
+    {
+      QPainter painter(&patched);
+      painter.setCompositionMode(QPainter::CompositionMode_Source);
+      for (const auto& patch : patches) {
+        painter.drawImage(patch.document_rect.topLeft(), patch.image);
+      }
+    }
+
+    QImage full_final;
+    candidate.layer->set_bounds(candidate.moved_bounds);
+    const double full_ms = elapsed_ms([&] {
+      full_final = patchy::ui::qimage_from_document(document, true).convertToFormat(QImage::Format_RGBA8888);
+    });
+    candidate.layer->set_bounds(old_bounds);
+
+    const bool identical = images_equal_rgba(patched, full_final);
+    CHECK(identical);
+    if (strict) {
+      CHECK(dirty_ms < full_ms);
+    }
+    metrics.push_back(Metric{std::string(scenario), candidate.name, candidate.dirty_area,
+                             candidate.dirty_region.rectCount(), dirty_ms, full_ms, identical});
+    std::cout << "[PERF] " << scenario << ' ' << candidate.name << " dirty_ms=" << dirty_ms
+              << " full_ms=" << full_ms << " area=" << candidate.dirty_area
+              << " rects=" << candidate.dirty_region.rectCount() << '\n';
+  }
+}
+
+void collect_cold_dirty_move_metric(patchy::Document& document, const Candidate& candidate,
+                                    std::string_view scenario, std::vector<Metric>& metrics) {
+  CHECK(candidate.layer != nullptr);
+  const auto old_bounds = candidate.layer->bounds();
+  std::vector<patchy::ui::RenderedDocumentPatch> patches;
+  double dirty_ms = elapsed_ms([&] {
+    patches = patchy::ui::qimage_patches_from_document_region_with_layer_bounds(
+        document, candidate.dirty_region, true, {{candidate.layer->id(), candidate.moved_bounds}});
+    for (auto& patch : patches) {
+      patch.image = patch.image.convertToFormat(QImage::Format_RGBA8888);
+    }
+  });
+
+  const auto base_full = patchy::ui::qimage_from_document(document, true).convertToFormat(QImage::Format_RGBA8888);
+  auto patched = base_full.copy();
+  {
+    QPainter painter(&patched);
+    painter.setCompositionMode(QPainter::CompositionMode_Source);
+    for (const auto& patch : patches) {
+      painter.drawImage(patch.document_rect.topLeft(), patch.image);
+    }
+  }
+
+  QImage full_final;
+  candidate.layer->set_bounds(candidate.moved_bounds);
+  const double full_ms = elapsed_ms([&] {
+    full_final = patchy::ui::qimage_from_document(document, true).convertToFormat(QImage::Format_RGBA8888);
+  });
+  candidate.layer->set_bounds(old_bounds);
+
+  const bool identical = images_equal_rgba(patched, full_final);
+  CHECK(identical);
+  metrics.push_back(Metric{std::string(scenario), candidate.name, candidate.dirty_area,
+                           candidate.dirty_region.rectCount(), dirty_ms, full_ms, identical});
+  std::cout << "[PERF] " << scenario << ' ' << candidate.name << " dirty_ms=" << dirty_ms
+            << " full_ms=" << full_ms << " area=" << candidate.dirty_area
+            << " rects=" << candidate.dirty_region.rectCount() << '\n';
+}
+
+void template_psd_dirty_move_perf_if_available() {
+  const auto path = perf_psd_path();
+  if (!std::filesystem::exists(path)) {
+    std::cout << "[SKIP] Template PSD missing: " << path.string() << '\n';
+    return;
+  }
+
+  auto document = patchy::psd::DocumentIo::read_file(path);
+  std::vector<Metric> metrics;
+  const auto cold_nudge_candidates = move_candidates(document, QPoint(1, 0), 1);
+  CHECK(!cold_nudge_candidates.empty());
+  collect_cold_dirty_move_metric(document, cold_nudge_candidates.front(), "cold_nudge_1px", metrics);
+  collect_dirty_move_metrics(document, move_candidates(document, QPoint(16, 16), 5), "move_16px", metrics);
+  collect_dirty_move_metrics(document, move_candidates(document, QPoint(1, 0), 5), "nudge_1px", metrics);
+
+  write_metrics(metrics);
+}
+
+void template_psd_ui_keyboard_nudge_perf_if_available() {
+  const auto path = perf_psd_path();
+  if (!std::filesystem::exists(path)) {
+    return;
+  }
+
+  auto document = patchy::psd::DocumentIo::read_file(path);
+  const auto candidates = move_candidates(document, QPoint(1, 0), 1);
+  CHECK(!candidates.empty());
+  const auto layer_id = candidates.front().layer_id;
+  const auto layer_name = candidates.front().name;
+
+  patchy::ui::MainWindow window;
+  window.resize(1200, 800);
+  window.add_document_session(std::move(document), QStringLiteral("Template perf"),
+                              QString::fromStdString(path.string()));
+  auto* canvas = active_canvas(window);
+  CHECK(canvas != nullptr);
+  canvas->set_tool(patchy::ui::CanvasTool::Move);
+  canvas->set_auto_select_layer(false);
+  canvas->set_show_transform_controls(false);
+  canvas->set_selected_layer_ids({layer_id});
+  window.show();
+  QApplication::processEvents();
+  canvas->force_refresh();
+  QApplication::processEvents();
+
+  const auto before = canvas->render_cache_diagnostics();
+  const auto elapsed = elapsed_ms([&] {
+    send_key(*canvas, Qt::Key_Right);
+    QApplication::processEvents();
+  });
+  const auto after = canvas->render_cache_diagnostics();
+  std::cout << "[PERF_UI_NUDGE_1PX] " << layer_name << " elapsed_ms=" << elapsed
+            << " full_refresh_delta=" << (after.full_refreshes - before.full_refreshes)
+            << " dirty_batches_delta=" << (after.dirty_region_batches - before.dirty_region_batches)
+            << " dirty_rects_delta=" << (after.dirty_region_rects - before.dirty_region_rects)
+            << " dirty_pixels_delta=" << (after.dirty_region_pixels - before.dirty_region_pixels) << '\n';
+}
+
+// Zoom-step latency on a very large document (the 70 Mpx table tent PSB): each
+// step times the synchronous zoom + repaint cycle after the initial composite has
+// settled, printing render-diagnostics deltas so a full recomposite per step (the
+// July 2026 slow-zoom report) is attributable from the output.
+void tent_psb_zoom_step_perf_if_available() {
+  const auto path = patchy::test::local_psd_fixture_path("PSBtest/10cm table tent.psb");
+  if (!std::filesystem::exists(path)) {
+    std::cout << "[SKIP] PSBtest/10cm table tent.psb missing\n";
+    return;
+  }
+
+  patchy::ui::MainWindow window;
+  window.resize(1600, 1000);
+  if (qEnvironmentVariableIsSet("PATCHY_PERF_ONSCREEN")) {
+    window.showMaximized();
+  } else {
+    window.show();
+  }
+  QApplication::processEvents();
+  // The real user open path (import notices, canvas aid settings, link checks).
+  patchy::ui::MainWindowTestAccess::open_document_path(window, QString::fromStdString(path.string()));
+  QApplication::processEvents();
+  auto* canvas = active_canvas(window);
+  CHECK(canvas != nullptr);
+  canvas->set_tool(patchy::ui::CanvasTool::Move);
+  QApplication::processEvents();
+  canvas->force_refresh();
+  QApplication::processEvents();
+  // Settle the initial async composite before measuring steps.
+  const auto settle_started = Clock::now();
+  while (!canvas->render_settled() &&
+         std::chrono::duration<double>(Clock::now() - settle_started).count() < 60.0) {
+    canvas->repaint();
+    QApplication::processEvents();
+  }
+
+  // PATCHY_PERF_ZOOM_SELECTION=1 zooms with an active selection: the marching-ants
+  // outline retraces at device resolution on every zoom change below 100%.
+  if (qEnvironmentVariableIsSet("PATCHY_PERF_ZOOM_SELECTION")) {
+    canvas->select_all();
+    QApplication::processEvents();
+  }
+
+  // PATCHY_PERF_ZOOM_BG=1 reproduces the July 2026 slow-zoom report: the Move tool's
+  // passive transform box around the tent's 70 Mpx BG layer used to rescan the whole
+  // alpha channel on every repaint.
+  if (qEnvironmentVariableIsSet("PATCHY_PERF_ZOOM_BG")) {
+    auto& doc = patchy::ui::MainWindowTestAccess::document(window);
+    for (const auto& layer : std::as_const(doc).layers()) {
+      if (layer.name() == "BG") {
+        doc.set_active_layer(layer.id());
+        canvas->set_selected_layer_ids({layer.id()});
+        break;
+      }
+    }
+    canvas->set_show_transform_controls(true);
+    QApplication::processEvents();
+  }
+
+  // PATCHY_PERF_ZOOM_ROTATION=<degrees> sweeps a rotated view (docs/view-navigation-rotation.md):
+  // the rotated draw path in place of the upright pixel-aligned and deep-zoom renderers.
+  if (qEnvironmentVariableIsSet("PATCHY_PERF_ZOOM_ROTATION")) {
+    canvas->set_view_rotation(qEnvironmentVariable("PATCHY_PERF_ZOOM_ROTATION").toDouble());
+  }
+
+  // Start where a user starts on a huge document: fit-to-view (mip territory),
+  // then sweep up through 100% into the deep-zoom pixel renderer and back.
+  canvas->fit_to_view();
+  canvas->repaint();
+  QApplication::processEvents();
+  std::cout << "[PERF_ZOOM] start zoom=" << canvas->zoom() << " dpr=" << canvas->devicePixelRatioF()
+            << " canvas_size=" << canvas->width() << "x" << canvas->height() << '\n';
+  for (int direction = 0; direction < 2; ++direction) {
+    const double factor = direction == 0 ? 1.25 : 1.0 / 1.25;
+    for (int step = 0; step < 26; ++step) {
+      const auto before = canvas->render_cache_diagnostics();
+      double paint_ms = 0.0;
+      const auto elapsed = elapsed_ms([&] {
+        canvas->zoom_at_widget_point(QPointF(canvas->width() / 2.0, canvas->height() / 2.0), factor);
+        paint_ms = elapsed_ms([&] { canvas->repaint(); });
+        QApplication::processEvents();
+      });
+      const auto after = canvas->render_cache_diagnostics();
+      std::cout << "[PERF_ZOOM] " << (direction == 0 ? "in " : "out") << " step=" << step
+                << " zoom=" << canvas->zoom() << " elapsed_ms=" << elapsed << " paint_ms=" << paint_ms
+                << " full_refresh_delta=" << (after.full_refreshes - before.full_refreshes)
+                << " dirty_batches_delta=" << (after.dirty_region_batches - before.dirty_region_batches)
+                << '\n';
+    }
+  }
+}
+
+#ifdef Q_OS_WIN
+// PATCHY_PERF_SAMPLER=1: a diagnostic sampling profiler for the scenarios in
+// this binary. A worker suspends the MAIN thread every ~10 ms, walks its
+// stack, and aggregates identical stacks; the destructor prints the hottest
+// ones. Addresses are collected while suspended and symbolized after resume
+// (dbghelp under a suspended peer risks the loader lock). Diagnostic only.
+class MainThreadSampler {
+ public:
+  MainThreadSampler() {
+    process_ = GetCurrentProcess();
+    main_thread_ = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_QUERY_INFORMATION,
+                              FALSE, GetCurrentThreadId());
+    // dbghelp accepts one SymInitialize per process; later samplers (one per
+    // measured phase) reuse it or they would print raw addresses.
+    static const bool symbols_initialized = [] {
+      SymSetOptions(SYMOPT_UNDNAME | SYMOPT_DEFERRED_LOADS);
+      return SymInitialize(GetCurrentProcess(), nullptr, TRUE) != FALSE;
+    }();
+    symbols_ready_ = symbols_initialized;
+    if (main_thread_ != nullptr) {
+      worker_ = std::thread([this] { run(); });
+    }
+  }
+  MainThreadSampler(const MainThreadSampler&) = delete;
+  MainThreadSampler& operator=(const MainThreadSampler&) = delete;
+  ~MainThreadSampler() {
+    stop_ = true;
+    if (worker_.joinable()) {
+      worker_.join();
+    }
+    dump();
+    if (main_thread_ != nullptr) {
+      CloseHandle(main_thread_);
+    }
+  }
+
+ private:
+  void run() {
+    while (!stop_) {
+      sample();
+      std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+  }
+
+  void sample() {
+    DWORD64 addresses[26] = {};
+    int depth = 0;
+    if (SuspendThread(main_thread_) == static_cast<DWORD>(-1)) {
+      return;
+    }
+    CONTEXT context = {};
+    context.ContextFlags = CONTEXT_CONTROL | CONTEXT_INTEGER;
+    if (GetThreadContext(main_thread_, &context) != FALSE) {
+      STACKFRAME64 frame;
+      const DWORD machine = init_stack_walk_frame(context, frame);
+      while (depth < 26) {
+        if (StackWalk64(machine, process_, main_thread_, &frame, &context, nullptr,
+                        SymFunctionTableAccess64, SymGetModuleBase64, nullptr) == FALSE ||
+            frame.AddrPC.Offset == 0) {
+          break;
+        }
+        addresses[depth++] = frame.AddrPC.Offset;
+      }
+    }
+    ResumeThread(main_thread_);
+    if (depth == 0) {
+      return;
+    }
+    std::string key;
+    for (int i = 0; i < depth; ++i) {
+      key += symbol_name(addresses[i]);
+      key += '\n';
+    }
+    ++stacks_[key];
+    ++samples_;
+  }
+
+  std::string symbol_name(DWORD64 address) {
+    if (!symbols_ready_) {
+      std::ostringstream raw;
+      raw << "0x" << std::hex << address;
+      return raw.str();
+    }
+    alignas(SYMBOL_INFO) char storage[sizeof(SYMBOL_INFO) + 512] = {};
+    auto* symbol = reinterpret_cast<SYMBOL_INFO*>(storage);
+    symbol->SizeOfStruct = sizeof(SYMBOL_INFO);
+    symbol->MaxNameLen = 511;
+    DWORD64 displacement = 0;
+    if (SymFromAddr(process_, address, &displacement, symbol) == FALSE) {
+      std::ostringstream raw;
+      raw << "0x" << std::hex << address;
+      return raw.str();
+    }
+    return symbol->Name;
+  }
+
+  void dump() {
+    std::vector<std::pair<int, const std::string*>> ranked;
+    ranked.reserve(stacks_.size());
+    for (const auto& [stack, count] : stacks_) {
+      ranked.emplace_back(count, &stack);
+    }
+    std::sort(ranked.begin(), ranked.end(),
+              [](const auto& lhs, const auto& rhs) { return lhs.first > rhs.first; });
+    std::cout << "[SAMPLER] total_samples=" << samples_ << " unique_stacks=" << stacks_.size() << '\n';
+    const auto top = std::min<std::size_t>(ranked.size(), 8U);
+    for (std::size_t index = 0; index < top; ++index) {
+      std::cout << "[SAMPLER] ---- stack #" << (index + 1) << " samples=" << ranked[index].first << '\n';
+      std::istringstream lines(*ranked[index].second);
+      std::string line;
+      while (std::getline(lines, line)) {
+        std::cout << "[SAMPLER]   " << line << '\n';
+      }
+    }
+  }
+
+  HANDLE process_{nullptr};
+  HANDLE main_thread_{nullptr};
+  bool symbols_ready_{false};
+  std::atomic<bool> stop_{false};
+  std::thread worker_;
+  std::map<std::string, int> stacks_;
+  int samples_{0};
+};
+
+// The main thread's handle, opened in main() for the scenario watchdog below.
+HANDLE g_main_thread_handle = nullptr;
+
+// One-shot main-thread stack for the scenario watchdog: when a scenario stalls, the
+// watchdog thread suspends the main thread, walks it, and prints the frames after the
+// resume (symbolizing under a suspended peer risks the loader lock, as in the sampler).
+// A hang then names its blocked frame instead of leaving a silent process.
+void print_main_thread_stack() {
+  if (g_main_thread_handle == nullptr) {
+    return;
+  }
+  HANDLE process = GetCurrentProcess();
+  SymSetOptions(SYMOPT_UNDNAME | SYMOPT_DEFERRED_LOADS);
+  SymInitialize(process, nullptr, TRUE);  // FALSE when the sampler already did; lookups still work.
+  DWORD64 addresses[48] = {};
+  int depth = 0;
+  if (SuspendThread(g_main_thread_handle) == static_cast<DWORD>(-1)) {
+    std::fprintf(stderr, "  main thread stack: SuspendThread failed\n");
+    return;
+  }
+  CONTEXT context = {};
+  context.ContextFlags = CONTEXT_CONTROL | CONTEXT_INTEGER;
+  if (GetThreadContext(g_main_thread_handle, &context) != FALSE) {
+    STACKFRAME64 frame;
+    const DWORD machine = init_stack_walk_frame(context, frame);
+    while (depth < 48) {
+      if (StackWalk64(machine, process, g_main_thread_handle, &frame, &context, nullptr,
+                      SymFunctionTableAccess64, SymGetModuleBase64, nullptr) == FALSE ||
+          frame.AddrPC.Offset == 0) {
+        break;
+      }
+      addresses[depth++] = frame.AddrPC.Offset;
+    }
+  }
+  ResumeThread(g_main_thread_handle);
+  std::fprintf(stderr, "  main thread stack (%d frames):\n", depth);
+  for (int i = 0; i < depth; ++i) {
+    alignas(SYMBOL_INFO) char storage[sizeof(SYMBOL_INFO) + 512] = {};
+    auto* symbol = reinterpret_cast<SYMBOL_INFO*>(storage);
+    symbol->SizeOfStruct = sizeof(SYMBOL_INFO);
+    symbol->MaxNameLen = 511;
+    DWORD64 displacement = 0;
+    if (SymFromAddr(process, addresses[i], &displacement, symbol) != FALSE) {
+      std::fprintf(stderr, "    %s+0x%llx\n", symbol->Name, static_cast<unsigned long long>(displacement));
+    } else {
+      std::fprintf(stderr, "    0x%llx\n", static_cast<unsigned long long>(addresses[i]));
+    }
+  }
+  std::fflush(stderr);
+}
+#endif
+
+// Names the windows open when a scenario stalls (the UI runner does the same): a
+// modal dialog nobody answers is the usual cause. Built on the GUI thread, which a
+// modal exec() still serves; a GUI thread that never answers is busy or deadlocked.
+void report_open_windows() {
+  auto listing = std::make_shared<std::promise<std::string>>();
+  auto answer = listing->get_future();
+  QMetaObject::invokeMethod(
+      qApp,
+      [listing] {
+        std::string text;
+        for (auto* widget : QApplication::topLevelWidgets()) {
+          if (!widget->isVisible()) {
+            continue;
+          }
+          text += std::string("  open window: ") + widget->metaObject()->className() + " objectName='" +
+                  widget->objectName().toStdString() + "' title='" + widget->windowTitle().toStdString() + "'" +
+                  (widget->isModal() ? " modal" : "") + '\n';
+        }
+        if (auto* modal = QApplication::activeModalWidget(); modal != nullptr) {
+          text += std::string("  active modal: ") + modal->metaObject()->className() + " objectName='" +
+                  modal->objectName().toStdString() + "'\n";
+        }
+        listing->set_value(text.empty() ? std::string("  no visible windows\n") : text);
+      },
+      Qt::QueuedConnection);
+  if (answer.wait_for(std::chrono::seconds(5)) == std::future_status::ready) {
+    std::fputs(answer.get().c_str(), stderr);
+  } else {
+    std::fputs("  the GUI thread did not answer within 5 s: busy or deadlocked, not waiting in an event loop\n", stderr);
+  }
+#ifdef Q_OS_WIN
+  print_main_thread_stack();
+#endif
+}
+
+// Layers-panel and layer-style-dialog latency on a deep imported document (the
+// Quintavius Affinity trading-card template: ~440 layers in ten stacked card
+// folders). Times the full-row-rebuild paths a user hits constantly: folder
+// collapse/expand and opening/closing the Layer Style dialog without changes.
+// Run with PATCHY_UI_PROFILE=1 for the per-phase breakdown lines.
+void quintavius_layer_panel_perf_if_available() {
+  const auto path = patchy::test::local_format_fixture_path(
+      "af-spike/web_samples2", "Quintavius_map-of-noo__Frame.afphoto");
+  if (!std::filesystem::exists(path)) {
+    std::cout << "[SKIP] Quintavius afphoto fixture missing: " << path.string() << '\n';
+    return;
+  }
+
+#ifdef Q_OS_WIN
+  std::unique_ptr<MainThreadSampler> sampler;
+  if (qEnvironmentVariableIsSet("PATCHY_PERF_SAMPLER")) {
+    sampler = std::make_unique<MainThreadSampler>();
+  }
+#endif
+  patchy::ui::MainWindow window;
+  window.resize(1600, 1000);
+  if (qEnvironmentVariableIsSet("PATCHY_PERF_ONSCREEN")) {
+    window.showMaximized();
+  } else {
+    window.show();
+  }
+  QApplication::processEvents();
+  const auto open_ms = elapsed_ms([&] {
+    patchy::ui::MainWindowTestAccess::open_document_path(window,
+                                                         QString::fromStdString(path.string()));
+    QApplication::processEvents();
+  });
+  auto* canvas = active_canvas(window);
+  CHECK(canvas != nullptr);
+  const auto settle_started = Clock::now();
+  while (!canvas->render_settled() &&
+         std::chrono::duration<double>(Clock::now() - settle_started).count() < 60.0) {
+    canvas->repaint();
+    QApplication::processEvents();
+  }
+
+  auto& doc = patchy::ui::MainWindowTestAccess::document(window);
+  std::function<int(const patchy::Layer&)> descendant_count = [&](const patchy::Layer& layer) {
+    int count = 0;
+    for (const auto& child : layer.children()) {
+      count += 1 + descendant_count(child);
+    }
+    return count;
+  };
+  const patchy::Layer* big_group = nullptr;
+  int big_group_descendants = 0;
+  for (const auto& layer : std::as_const(doc).layers()) {
+    if (layer.kind() != patchy::LayerKind::Group) {
+      continue;
+    }
+    const auto count = descendant_count(layer);
+    if (count > big_group_descendants) {
+      big_group_descendants = count;
+      big_group = &layer;
+    }
+  }
+  CHECK(big_group != nullptr);
+  const auto group_id = big_group->id();
+  const auto group_name = clean_name(big_group->name());
+
+  // Activate a pixel layer deep in the biggest folder, like a user clicking a
+  // card element before styling it.
+  std::function<const patchy::Layer*(const patchy::Layer&)> first_pixel =
+      [&](const patchy::Layer& layer) -> const patchy::Layer* {
+    if (layer.kind() == patchy::LayerKind::Pixel && !layer.pixels().empty()) {
+      return &layer;
+    }
+    for (const auto& child : layer.children()) {
+      if (const auto* found = first_pixel(child); found != nullptr) {
+        return found;
+      }
+    }
+    return nullptr;
+  };
+  const auto* style_target = first_pixel(*big_group);
+  CHECK(style_target != nullptr);
+  doc.set_active_layer(style_target->id());
+  patchy::ui::MainWindowTestAccess::refresh_layer_list(window);
+  QApplication::processEvents();
+
+  const auto rebuild_ms = elapsed_ms([&] {
+    patchy::ui::MainWindowTestAccess::refresh_layer_list(window);
+    QApplication::processEvents();
+  });
+  const auto collapse_ms = elapsed_ms([&] {
+    patchy::ui::MainWindowTestAccess::toggle_layer_folder_expanded(window, group_id);
+    QApplication::processEvents();
+  });
+  const auto expand_ms = elapsed_ms([&] {
+    patchy::ui::MainWindowTestAccess::toggle_layer_folder_expanded(window, group_id);
+    QApplication::processEvents();
+  });
+
+  // Open the Layer Style dialog and close it without touching anything; the
+  // repeating timer stands in for the user's Cancel click.
+  QTimer dismisser;
+  dismisser.setInterval(50);
+  bool dismissed = false;
+  QObject::connect(&dismisser, &QTimer::timeout, &window, [&] {
+    for (auto* top_level : QApplication::topLevelWidgets()) {
+      auto* dialog = qobject_cast<QDialog*>(top_level);
+      if (dialog != nullptr && dialog->isVisible() &&
+          dialog->objectName() == QStringLiteral("patchyLayerStyleDialog")) {
+        dismissed = true;
+        dialog->reject();
+      }
+    }
+  });
+  dismisser.start();
+  const auto style_dialog_ms = elapsed_ms([&] {
+    patchy::ui::MainWindowTestAccess::edit_active_layer_style(window);
+    QApplication::processEvents();
+  });
+  dismisser.stop();
+  CHECK(dismissed);
+
+  std::cout << "[PERF_LAYER_PANEL] open_ms=" << open_ms << " rebuild_ms=" << rebuild_ms
+            << " collapse_ms=" << collapse_ms << " expand_ms=" << expand_ms
+            << " style_dialog_cancel_ms=" << style_dialog_ms << " group=\"" << group_name
+            << "\" descendants=" << big_group_descendants
+            << " style_layer=\"" << clean_name(style_target->name()) << "\"\n";
+}
+
+// Mouse events for the interaction scenarios (the visual suite's helper lives in
+// its own support TU; this binary only needs the plain form).
+void send_mouse(QWidget& widget, QEvent::Type type, QPoint position, Qt::MouseButton button,
+                Qt::MouseButtons buttons, Qt::KeyboardModifiers modifiers = Qt::NoModifier) {
+  QMouseEvent event(type, QPointF(position), QPointF(widget.mapToGlobal(position)), button, buttons, modifiers);
+  QApplication::sendEvent(&widget, &event);
+}
+
+// First fully opaque pixel of a rgba8 layer inside its opaque extent inset by
+// `inset` document pixels, scanning outward from the middle row, as a
+// document-space point. The inset keeps a press there inside the Move tool's
+// passive transform box rather than on one of its edge handles (a handle grab
+// starts Free Transform instead of a move). nullopt when nothing qualifies.
+std::optional<QPoint> opaque_document_point(const patchy::Layer& layer, int inset) {
+  const auto& pixels = layer.pixels();
+  if (pixels.empty() || pixels.format().bit_depth != patchy::BitDepth::UInt8 || pixels.format().channels < 4) {
+    return std::nullopt;
+  }
+  const auto extent = patchy::visible_alpha_local_bounds(layer);
+  if (!extent.has_value()) {
+    return std::nullopt;
+  }
+  const QRect scan(extent->x + inset, extent->y + inset, extent->width - 2 * inset, extent->height - 2 * inset);
+  if (scan.isEmpty()) {
+    return std::nullopt;
+  }
+  for (int dy = 0; dy < scan.height(); ++dy) {
+    const auto y = scan.top() + (scan.height() / 2 + dy) % scan.height();
+    for (int x = scan.left(); x <= scan.right(); ++x) {
+      if (pixels.pixel(x, y)[3] >= 200) {
+        return QPoint(layer.bounds().x + x, layer.bounds().y + y);
+      }
+    }
+  }
+  return std::nullopt;
+}
+
+// Layer-selection and move-start latency on a document with thousands of
+// layers (Little-Everywhere-fixed.psd: 2600x2100 px, 7229 layers; September
+// 2026 report: selecting a layer and starting a Move-tool drag each stalled
+// about two seconds). Times a Layers-panel row click, a canvas auto-select
+// click, and the press / first frame / release of a Move-tool drag, with
+// render-diagnostics deltas. PATCHY_UI_PROFILE=1 adds the per-phase lines and
+// PATCHY_PERF_SAMPLER=1 samples only the measured interactions: the sampler
+// starts after the open has settled so the load cannot swamp the stacks.
+void many_layers_select_and_move_perf_if_available() {
+  // PATCHY_PERF_MANYLAYERS_PSD=<path> points the scenario at another document
+  // (a styled poster, say); the default is the 2056-layer file.
+  const auto env_path = qgetenv("PATCHY_PERF_MANYLAYERS_PSD");
+  const auto path = env_path.isEmpty() ? patchy::test::local_psd_fixture_path("Little-Everywhere-fixed.psd")
+                                       : patchy::ui::to_filesystem_path(env_path);
+  if (!std::filesystem::exists(path)) {
+    std::cout << "[SKIP] many-layers fixture missing: " << path.string() << '\n';
+    return;
+  }
+
+  patchy::ui::MainWindow window;
+  window.resize(1600, 1000);
+  if (qEnvironmentVariableIsSet("PATCHY_PERF_ONSCREEN")) {
+    window.showMaximized();
+  } else {
+    window.show();
+  }
+  QApplication::processEvents();
+  const auto open_ms = elapsed_ms([&] {
+    patchy::ui::MainWindowTestAccess::open_document_path(window, QString::fromStdString(path.string()));
+    QApplication::processEvents();
+  });
+  auto* canvas = active_canvas(window);
+  CHECK(canvas != nullptr);
+  const auto settle_started = Clock::now();
+  while (!canvas->render_settled() &&
+         std::chrono::duration<double>(Clock::now() - settle_started).count() < 120.0) {
+    canvas->repaint();
+    QApplication::processEvents();
+  }
+  auto* layer_list = window.findChild<QListWidget*>(QStringLiteral("layerList"));
+  CHECK(layer_list != nullptr);
+
+  // Visible pixel leaves (visible ancestors too), bottom to top.
+  auto& doc = patchy::ui::MainWindowTestAccess::document(window);
+  std::vector<const patchy::Layer*> leaves;
+  int layer_count = 0;
+  int styled_count = 0;
+  std::function<void(const std::vector<patchy::Layer>&, bool)> collect =
+      [&](const std::vector<patchy::Layer>& layers, bool ancestors_visible) {
+        for (const auto& layer : layers) {
+          ++layer_count;
+          if (layer.layer_style().effects_visible && !layer.layer_style().empty()) {
+            ++styled_count;
+          }
+          const bool visible = ancestors_visible && layer.visible();
+          if (layer.kind() == patchy::LayerKind::Group) {
+            collect(layer.children(), visible);
+          } else if (visible && layer.kind() == patchy::LayerKind::Pixel && !layer.pixels().empty()) {
+            leaves.push_back(&layer);
+          }
+        }
+      };
+  collect(std::as_const(doc).layers(), true);
+  CHECK(!leaves.empty());
+
+  std::map<patchy::LayerId, QListWidgetItem*> rows;
+  for (int row = 0; row < layer_list->count(); ++row) {
+    auto* item = layer_list->item(row);
+    rows[static_cast<patchy::LayerId>(item->data(patchy::ui::kLayerIdRole).toULongLong())] = item;
+  }
+  // Panel target: a leaf with a row, from the middle of the stack. Canvas
+  // target: the topmost leaf with an opaque pixel, so nothing occludes it.
+  std::vector<const patchy::Layer*> leaves_with_rows;
+  for (const auto* leaf : leaves) {
+    if (rows.contains(leaf->id())) {
+      leaves_with_rows.push_back(leaf);
+    }
+  }
+  CHECK(!leaves_with_rows.empty());
+  const auto* panel_target = leaves_with_rows[leaves_with_rows.size() / 2];
+  const patchy::Layer* canvas_target = nullptr;
+  std::optional<QPoint> canvas_point;
+  // 40 document px keeps the press clear of the passive box's handles at any
+  // zoom above 25%.
+  for (auto it = leaves.rbegin(); it != leaves.rend() && !canvas_point.has_value(); ++it) {
+    if (patchy::layer_effectively_locks_position(std::as_const(doc).layers(), (*it)->id())) {
+      continue;  // the Move tool skips these, so the click would land below
+    }
+    canvas_point = opaque_document_point(**it, 40);
+    canvas_target = *it;
+  }
+  CHECK(canvas_point.has_value());
+
+  // One sampler per measured phase so each dump attributes that phase alone.
+#ifdef Q_OS_WIN
+  std::unique_ptr<MainThreadSampler> sampler;
+  const bool sampling = qEnvironmentVariableIsSet("PATCHY_PERF_SAMPLER");
+  const auto begin_phase = [&] {
+    if (sampling) {
+      sampler = std::make_unique<MainThreadSampler>();
+    }
+  };
+  const auto end_phase = [&](const char* name) {
+    if (sampler) {
+      std::cout << "[SAMPLER_PHASE] " << name << '\n';
+      sampler.reset();
+    }
+  };
+#else
+  const auto begin_phase = [] {};
+  const auto end_phase = [](const char*) {};
+#endif
+
+  // 0. Optional compositor profile: PATCHY_PERF_RENDER_PHASE=1 renders the
+  //    whole document once on this thread (set PATCHY_RENDER_SINGLE_THREADED=1
+  //    too so the sampler sees the compositor rather than a worker wait).
+  double full_render_ms = 0.0;
+  if (qEnvironmentVariableIsSet("PATCHY_PERF_RENDER_PHASE")) {
+    begin_phase();
+    full_render_ms = elapsed_ms([&] {
+      const auto image = patchy::ui::qimage_from_document(std::as_const(doc), true);
+      CHECK(!image.isNull());
+    });
+    end_phase("full_render");
+    std::cout << "[PERF_MANY_LAYERS_RENDER] full_render_ms=" << full_render_ms << '\n';
+  }
+
+  // 1. Layers-panel row click.
+  begin_phase();
+  const auto select_row_ms = elapsed_ms([&] {
+    layer_list->setCurrentItem(rows[panel_target->id()], QItemSelectionModel::ClearAndSelect);
+    QApplication::processEvents();
+  });
+  end_phase("select_row");
+
+  // 2. Canvas auto-select click on the topmost layer's opaque pixel.
+  canvas->set_tool(patchy::ui::CanvasTool::Move);
+  canvas->set_auto_select_layer(true);
+  canvas->set_show_transform_controls(true);
+  QApplication::processEvents();
+  const auto click_position = canvas->widget_position_for_document_point(*canvas_point);
+  begin_phase();
+  const auto click_ms = elapsed_ms([&] {
+    send_mouse(*canvas, QEvent::MouseButtonPress, click_position, Qt::LeftButton, Qt::LeftButton);
+    send_mouse(*canvas, QEvent::MouseButtonRelease, click_position, Qt::LeftButton, Qt::NoButton);
+    QApplication::processEvents();
+  });
+  end_phase("canvas_click");
+  const auto active_after_click = doc.active_layer_id();
+  // The drag moves whatever the click activated (a masked or occluding layer
+  // can win the hit test over the picked leaf); its bounds are the move check.
+  CHECK(active_after_click.has_value());
+  const auto* drag_target = std::as_const(doc).find_layer(*active_after_click);
+  CHECK(drag_target != nullptr);
+  const auto drag_target_bounds_before = drag_target->bounds();
+
+  // 3. Move-tool drag of that layer: press, first frame past the drag
+  //    threshold, a second frame, release (each timed on its own).
+  const auto before = canvas->render_cache_diagnostics();
+  begin_phase();
+  const auto press_ms = elapsed_ms([&] {
+    send_mouse(*canvas, QEvent::MouseButtonPress, click_position, Qt::LeftButton, Qt::LeftButton);
+    QApplication::processEvents();
+  });
+  end_phase("move_press");
+  // A press inside the box must start a move, never a transform session.
+  CHECK(!canvas->free_transform_active());
+  // Six frames: the live path's per-frame cost, and whether the slow-frame
+  // latch (proxy/base build) engages and what that costs.
+  constexpr int kDragFrames = 6;
+  std::vector<double> frame_ms;
+  QPoint drag_position = click_position;
+  const auto preview_started = Clock::now();
+  begin_phase();
+  for (int frame = 1; frame <= kDragFrames; ++frame) {
+    drag_position = click_position + QPoint(30 * frame, 20 * frame);
+    frame_ms.push_back(elapsed_ms([&] {
+      send_mouse(*canvas, QEvent::MouseMove, drag_position, Qt::NoButton, Qt::LeftButton);
+      QApplication::processEvents();
+      canvas->repaint();
+    }));
+  }
+  end_phase("move_frames");
+  // Report immediate feedback separately from a cold background preview.
+  const auto settle_canvas = [&] {
+    const auto deadline = Clock::now() + std::chrono::seconds(120);
+    while (!canvas->render_settled() && Clock::now() < deadline) {
+      QApplication::processEvents();
+    }
+    CHECK(canvas->render_settled());
+  };
+  settle_canvas();
+  const auto preview_ready_ms = std::chrono::duration<double, std::milli>(Clock::now() - preview_started).count();
+  begin_phase();
+  const auto release_ms = elapsed_ms([&] {
+    send_mouse(*canvas, QEvent::MouseButtonRelease, drag_position, Qt::LeftButton, Qt::NoButton);
+    QApplication::processEvents();
+  });
+  end_phase("move_release");
+  // A second drag of the same layer: the retained caches and warm style masks
+  // are what a user hits on every move after the first.
+  begin_phase();
+  const auto press2_ms = elapsed_ms([&] {
+    send_mouse(*canvas, QEvent::MouseButtonPress, drag_position, Qt::LeftButton, Qt::LeftButton);
+    QApplication::processEvents();
+  });
+  std::vector<double> frame2_ms;
+  const auto drag2_origin = drag_position;
+  for (int frame = 1; frame <= kDragFrames; ++frame) {
+    drag_position = drag2_origin - QPoint(30 * frame, 20 * frame);
+    frame2_ms.push_back(elapsed_ms([&] {
+      send_mouse(*canvas, QEvent::MouseMove, drag_position, Qt::NoButton, Qt::LeftButton);
+      QApplication::processEvents();
+      canvas->repaint();
+    }));
+  }
+  const auto release2_ms = elapsed_ms([&] {
+    send_mouse(*canvas, QEvent::MouseButtonRelease, drag_position, Qt::LeftButton, Qt::NoButton);
+    QApplication::processEvents();
+  });
+  end_phase("move2");
+  const auto exact_settle_ms = elapsed_ms(settle_canvas);
+  std::ostringstream frames2;
+  for (std::size_t index = 0; index < frame2_ms.size(); ++index) {
+    frames2 << (index == 0 ? "" : "/") << frame2_ms[index];
+  }
+  const auto after = canvas->render_cache_diagnostics();
+  const auto* moved_target = std::as_const(doc).find_layer(*active_after_click);
+  const bool moved = moved_target != nullptr && (moved_target->bounds().x != drag_target_bounds_before.x ||
+                                                 moved_target->bounds().y != drag_target_bounds_before.y);
+  std::ostringstream frames;
+  for (std::size_t index = 0; index < frame_ms.size(); ++index) {
+    frames << (index == 0 ? "" : "/") << frame_ms[index];
+  }
+
+  std::cout << "[PERF_MANY_LAYERS] file=\"" << path.filename().string() << "\" layers=" << layer_count << " visible_pixel_leaves=" << leaves.size()
+            << " rows=" << layer_list->count() << " open_ms=" << open_ms << " select_row_ms=" << select_row_ms
+            << " canvas_click_ms=" << click_ms << " move_press_ms=" << press_ms
+            << " move_frames_ms=" << frames.str() << " move_release_ms=" << release_ms
+            << " move2_press_ms=" << press2_ms << " move2_frames_ms=" << frames2.str()
+            << " move2_release_ms=" << release2_ms << " styled_layers=" << styled_count
+            << " preview_ready_ms=" << preview_ready_ms << " exact_settle_ms=" << exact_settle_ms
+            << " full_refresh_delta=" << (after.full_refreshes - before.full_refreshes)
+            << " proxy_previews_delta=" << (after.move_proxy_previews - before.move_proxy_previews)
+            << " outline_previews_delta=" << (after.move_outline_previews - before.move_outline_previews)
+            << " panel_target=\"" << clean_name(panel_target->name()) << "\" canvas_target=\""
+            << clean_name(canvas_target->name()) << "\" active_after_click="
+            << (active_after_click.has_value() ? std::to_string(*active_after_click) : std::string("none"))
+            << " (canvas_target_id=" << canvas_target->id() << ") drag_target=\""
+            << (moved_target != nullptr ? clean_name(moved_target->name()) : std::string("?")) << "\" moved="
+            << (moved ? 1 : 0) << '\n';
+  CHECK(moved);
+  if (qEnvironmentVariableIsSet("PATCHY_PERF_VERIFY_FINAL")) {
+    const auto capture = [canvas] {
+      QImage image(canvas->size(), QImage::Format_ARGB32_Premultiplied);
+      image.fill(Qt::transparent);
+      canvas->render(&image);
+      return image;
+    };
+    const auto committed = capture();
+    canvas->force_refresh();
+    settle_canvas();
+    const bool identical = images_equal_rgba(committed, capture());
+    std::cout << "[PERF_FINAL_RENDER_CHECK] matches_full_refresh=" << (identical ? 1 : 0) << '\n';
+    CHECK(identical);
+  }
+}
+
+// Free Transform rotate-drag cost with and without a layer mask (GitHub #13
+// and #15: "rotating a layer with a mask causes severe lag" / "massive CPU
+// usage", reported on a 12-thread laptop). Synthetic, so it runs on any
+// machine: a noise layer covering 60% of the canvas is rotated by dragging the
+// rotate handle, plain (the cheap rotated-blit preview), with a linked
+// canvas-sized reveal-all mask (must stay on the blit), and with a painted
+// mask (the composited-patch preview), timing every mouse-move plus its repaint
+// and then the commit. PATCHY_RENDER_THREADS=4 prices the low-core case.
+//
+// The ceilings are relative or latch-backed so machine load cannot flake them:
+// the reveal-all mask never leaves the blit path (no proxy, frames within a
+// small factor of the unmasked drag), and every configuration's median frame
+// stays under the 100 ms live-frame latch, which the proxy guarantees for the
+// composited cases once a frame runs over it.
+void masked_layer_rotate_perf() {
+  struct Size {
+    int width;
+    int height;
+  };
+  constexpr double kLiveFrameLatchMs = 100.0;  // live_preview_frame_latch_ms default
+  for (const auto size : {Size{1920, 1080}, Size{4000, 3000}}) {
+    double unmasked_median_ms = 0.0;
+    // 0 = no mask, 1 = reveal-all mask (what Add Layer Mask creates), 2 = a
+    // painted mask hiding the layer's right third.
+    for (const int masked : {0, 1, 2}) {
+      patchy::Document document(size.width, size.height, patchy::PixelFormat::rgba8());
+      patchy::PixelBuffer backdrop(size.width, size.height, patchy::PixelFormat::rgba8());
+      backdrop.clear(255);
+      document.add_layer(patchy::Layer(document.allocate_layer_id(), "Backdrop", std::move(backdrop)));
+
+      const int layer_width = size.width * 6 / 10;
+      const int layer_height = size.height * 6 / 10;
+      patchy::PixelBuffer noise(layer_width, layer_height, patchy::PixelFormat::rgba8());
+      std::uint64_t seed = 0x9E3779B97F4A7C15ULL;
+      for (int y = 0; y < layer_height; ++y) {
+        auto row = noise.row(y);
+        for (int x = 0; x < layer_width; ++x) {
+          seed += 0x9E3779B97F4A7C15ULL;
+          auto z = seed;
+          z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ULL;
+          z = (z ^ (z >> 27)) * 0x94D049BB133111EBULL;
+          z ^= z >> 31;
+          auto* pixel = row.data() + static_cast<std::size_t>(x) * 4U;
+          pixel[0] = static_cast<std::uint8_t>(z);
+          pixel[1] = static_cast<std::uint8_t>(z >> 8);
+          pixel[2] = static_cast<std::uint8_t>(z >> 16);
+          pixel[3] = 255;
+        }
+      }
+      patchy::Layer layer(document.allocate_layer_id(), "Rotated", std::move(noise));
+      layer.set_bounds(patchy::Rect{(size.width - layer_width) / 2, (size.height - layer_height) / 2, layer_width,
+                                    layer_height});
+      const auto layer_id = layer.id();
+      if (masked != 0) {
+        patchy::PixelBuffer mask(size.width, size.height, patchy::PixelFormat::gray8());
+        mask.clear(255);
+        if (masked == 2) {
+          for (int y = 0; y < size.height; ++y) {
+            auto row = mask.row(y);
+            std::fill(row.begin() + size.width * 6 / 10, row.end(), std::uint8_t{0});
+          }
+        }
+        layer.set_mask(patchy::LayerMask{patchy::Rect{0, 0, size.width, size.height}, std::move(mask), 255, false});
+      }
+      document.add_layer(std::move(layer));
+
+      patchy::ui::MainWindow window;
+      window.resize(1600, 1000);
+      if (qEnvironmentVariableIsSet("PATCHY_PERF_ONSCREEN")) {
+        window.showMaximized();
+      } else {
+        window.show();
+      }
+      QApplication::processEvents();
+      window.add_document_session(std::move(document), QStringLiteral("Mask Rotate Perf"));
+      QApplication::processEvents();
+      auto* canvas = active_canvas(window);
+      CHECK(canvas != nullptr);
+      const auto settle_started = Clock::now();
+      while (!canvas->render_settled() &&
+             std::chrono::duration<double>(Clock::now() - settle_started).count() < 60.0) {
+        canvas->repaint();
+        QApplication::processEvents();
+      }
+      auto* layer_list = window.findChild<QListWidget*>(QStringLiteral("layerList"));
+      CHECK(layer_list != nullptr);
+      for (int row = 0; row < layer_list->count(); ++row) {
+        auto* item = layer_list->item(row);
+        if (static_cast<patchy::LayerId>(item->data(patchy::ui::kLayerIdRole).toULongLong()) == layer_id) {
+          layer_list->clearSelection();
+          layer_list->setCurrentItem(item);
+          item->setSelected(true);
+        }
+      }
+      QApplication::processEvents();
+
+      auto* transform_action = window.findChild<QAction*>(QStringLiteral("editFreeTransformAction"));
+      CHECK(transform_action != nullptr);
+      transform_action->trigger();
+      QApplication::processEvents();
+      CHECK(canvas->free_transform_active());
+
+      const auto bounds = std::as_const(patchy::ui::MainWindowTestAccess::document(window)).find_layer(layer_id)->bounds();
+      const auto top_center =
+          canvas->widget_position_for_document_point(QPoint(bounds.x + bounds.width / 2, bounds.y));
+      const auto start = top_center + QPoint(0, -32);
+      const auto before = canvas->render_cache_diagnostics();
+      // PATCHY_PERF_SAMPLER=1 attributes the press + drag frames of each
+      // configuration separately (one sampler per phase, Windows only).
+#ifdef Q_OS_WIN
+      std::unique_ptr<MainThreadSampler> sampler;
+      if (qEnvironmentVariableIsSet("PATCHY_PERF_SAMPLER")) {
+        sampler = std::make_unique<MainThreadSampler>();
+      }
+#endif
+      const auto press_ms = elapsed_ms([&] {
+        send_mouse(*canvas, QEvent::MouseButtonPress, start, Qt::LeftButton, Qt::LeftButton);
+        canvas->repaint();
+      });
+      constexpr int kFrames = 40;
+      std::vector<double> frames;
+      frames.reserve(kFrames);
+      for (int frame = 1; frame <= kFrames; ++frame) {
+        const auto point = start + QPoint(frame * 6, frame * 2);
+        frames.push_back(elapsed_ms([&] {
+          send_mouse(*canvas, QEvent::MouseMove, point, Qt::NoButton, Qt::LeftButton);
+          canvas->repaint();
+        }));
+      }
+      const auto release_ms = elapsed_ms([&] {
+        send_mouse(*canvas, QEvent::MouseButtonRelease, start + QPoint(kFrames * 6, kFrames * 2), Qt::LeftButton,
+                   Qt::NoButton);
+        canvas->repaint();
+      });
+      const auto after = canvas->render_cache_diagnostics();
+#ifdef Q_OS_WIN
+      if (sampler) {
+        std::cout << "[SAMPLER_PHASE] maskrotate " << size.width << 'x' << size.height << " masked=" << masked
+                  << " press+drag+release\n";
+        sampler.reset();
+      }
+#endif
+      const auto commit_ms = elapsed_ms([&] {
+        send_key(*canvas, Qt::Key_Return);
+        const auto commit_started = Clock::now();
+        canvas->repaint();
+        while (!canvas->render_settled() &&
+               std::chrono::duration<double>(Clock::now() - commit_started).count() < 60.0) {
+          QApplication::processEvents();
+        }
+        CHECK(canvas->render_settled());
+      });
+      CHECK(!canvas->free_transform_active());
+
+      auto sorted = frames;
+      std::sort(sorted.begin(), sorted.end());
+      double total = 0.0;
+      for (const auto value : frames) {
+        total += value;
+      }
+      std::cout << std::fixed << std::setprecision(1) << "[PERF] maskrotate " << size.width << 'x' << size.height
+                << " masked=" << masked << " press_ms=" << press_ms << " first_frame_ms=" << frames.front()
+                << " frame_avg_ms=" << total / kFrames << " frame_median_ms=" << sorted[sorted.size() / 2]
+                << " frame_max_ms=" << sorted.back() << " release_ms=" << release_ms
+                << " commit_ms=" << commit_ms
+                << " proxy_latched=" << (after.transform_proxy_previews - before.transform_proxy_previews)
+                << " threads=" << patchy::hardware_worker_threads() << '\n';
+      const auto median_ms = sorted[sorted.size() / 2];
+      const auto proxy_latched = after.transform_proxy_previews - before.transform_proxy_previews;
+      CHECK(median_ms < kLiveFrameLatchMs);
+      if (masked == 0) {
+        unmasked_median_ms = median_ms;
+      } else if (masked == 1) {
+        CHECK(proxy_latched == 0);
+        CHECK(median_ms <= unmasked_median_ms * 3.0 + 4.0);
+      }
+    }
+  }
+}
+
+// Free Transform resize of a shape layer with a layer clipped to it (GitHub
+// #398: "resizing a clipped shape is not smooth"). An ellipse shape layer is
+// scaled up by dragging its top-right corner handle, alone (the cheap blit),
+// with a canvas-sized noise layer clipped to it, and with that clipped layer
+// plus a 0% fill on the shape (the clipped content shows only through the
+// shape). Each mouse-move plus its repaint is timed. PATCHY_RENDER_THREADS=4
+// prices the low-core case.
+void clipped_shape_resize_perf() {
+  struct Size {
+    int width;
+    int height;
+  };
+  for (const auto size : {Size{1920, 1080}, Size{4000, 3000}}) {
+    double alone_median_ms = 0.0;
+    // 0 = shape alone, 1 = a layer clipped to it, 2 = clipped with the
+    // shape's fill at 0%.
+    for (const int config : {0, 1, 2}) {
+      patchy::Document document(size.width, size.height, patchy::PixelFormat::rgba8());
+      patchy::PixelBuffer backdrop(size.width, size.height, patchy::PixelFormat::rgba8());
+      backdrop.clear(255);
+      document.add_layer(patchy::Layer(document.allocate_layer_id(), "Backdrop", std::move(backdrop)));
+
+      patchy::LiveShapeParams params;
+      params.kind = patchy::LiveShapeKind::Ellipse;
+      params.left = size.width * 0.3;
+      params.top = size.height * 0.3;
+      params.right = size.width * 0.7;
+      params.bottom = size.height * 0.6;
+      patchy::VectorShapeContent shape;
+      shape.path.subpaths = patchy::generate_live_shape_subpaths(params);
+      shape.fill.color = {40, 140, 190};
+      patchy::Layer shape_layer(document.allocate_layer_id(), "Ellipse", patchy::LayerKind::Pixel);
+      shape_layer.set_vector_shape(std::move(shape));
+      patchy::update_vector_shape_raster(shape_layer, patchy::Rect::from_size(size.width, size.height), nullptr);
+      if (config == 2) {
+        shape_layer.set_fill_opacity(0.0F);
+      }
+      const auto shape_id = shape_layer.id();
+      document.add_layer(std::move(shape_layer));
+
+      if (config != 0) {
+        patchy::PixelBuffer noise(size.width, size.height, patchy::PixelFormat::rgba8());
+        std::uint64_t seed = 0x9E3779B97F4A7C15ULL;
+        for (int y = 0; y < size.height; ++y) {
+          auto row = noise.row(y);
+          for (int x = 0; x < size.width; ++x) {
+            seed += 0x9E3779B97F4A7C15ULL;
+            auto z = seed;
+            z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ULL;
+            z = (z ^ (z >> 27)) * 0x94D049BB133111EBULL;
+            z ^= z >> 31;
+            auto* pixel = row.data() + static_cast<std::size_t>(x) * 4U;
+            pixel[0] = static_cast<std::uint8_t>(z);
+            pixel[1] = static_cast<std::uint8_t>(z >> 8);
+            pixel[2] = static_cast<std::uint8_t>(z >> 16);
+            pixel[3] = 255;
+          }
+        }
+        patchy::Layer clipped(document.allocate_layer_id(), "Clipped", std::move(noise));
+        clipped.set_clipped(true);
+        document.add_layer(std::move(clipped));
+      }
+
+      patchy::ui::MainWindow window;
+      window.resize(1600, 1000);
+      if (qEnvironmentVariableIsSet("PATCHY_PERF_ONSCREEN")) {
+        window.showMaximized();
+      } else {
+        window.show();
+      }
+      QApplication::processEvents();
+      window.add_document_session(std::move(document), QStringLiteral("Clipped Shape Perf"));
+      QApplication::processEvents();
+      auto* canvas = active_canvas(window);
+      CHECK(canvas != nullptr);
+      const auto settle_started = Clock::now();
+      while (!canvas->render_settled() &&
+             std::chrono::duration<double>(Clock::now() - settle_started).count() < 60.0) {
+        canvas->repaint();
+        QApplication::processEvents();
+      }
+      auto* layer_list = window.findChild<QListWidget*>(QStringLiteral("layerList"));
+      CHECK(layer_list != nullptr);
+      for (int row = 0; row < layer_list->count(); ++row) {
+        auto* item = layer_list->item(row);
+        if (static_cast<patchy::LayerId>(item->data(patchy::ui::kLayerIdRole).toULongLong()) == shape_id) {
+          layer_list->clearSelection();
+          layer_list->setCurrentItem(item);
+          item->setSelected(true);
+        }
+      }
+      QApplication::processEvents();
+
+      auto* transform_action = window.findChild<QAction*>(QStringLiteral("editFreeTransformAction"));
+      CHECK(transform_action != nullptr);
+      transform_action->trigger();
+      QApplication::processEvents();
+      CHECK(canvas->free_transform_active());
+
+      const auto bounds =
+          std::as_const(patchy::ui::MainWindowTestAccess::document(window)).find_layer(shape_id)->bounds();
+      const auto start = canvas->widget_position_for_document_point(QPoint(bounds.x + bounds.width, bounds.y));
+      const auto before = canvas->render_cache_diagnostics();
+      const auto press_ms = elapsed_ms([&] {
+        send_mouse(*canvas, QEvent::MouseButtonPress, start, Qt::LeftButton, Qt::LeftButton);
+        canvas->repaint();
+      });
+      constexpr int kFrames = 40;
+      std::vector<double> frames;
+      frames.reserve(kFrames);
+      for (int frame = 1; frame <= kFrames; ++frame) {
+        const auto point = start + QPoint(frame * 5, -frame * 2);
+        frames.push_back(elapsed_ms([&] {
+          send_mouse(*canvas, QEvent::MouseMove, point, Qt::NoButton, Qt::LeftButton);
+          canvas->repaint();
+        }));
+      }
+      const auto release_ms = elapsed_ms([&] {
+        send_mouse(*canvas, QEvent::MouseButtonRelease, start + QPoint(kFrames * 5, -kFrames * 2), Qt::LeftButton,
+                   Qt::NoButton);
+        canvas->repaint();
+      });
+      const auto after = canvas->render_cache_diagnostics();
+      const auto commit_ms = elapsed_ms([&] {
+        send_key(*canvas, Qt::Key_Return);
+        const auto commit_started = Clock::now();
+        canvas->repaint();
+        while (!canvas->render_settled() &&
+               std::chrono::duration<double>(Clock::now() - commit_started).count() < 60.0) {
+          QApplication::processEvents();
+        }
+        CHECK(canvas->render_settled());
+      });
+      CHECK(!canvas->free_transform_active());
+
+      auto sorted = frames;
+      std::sort(sorted.begin(), sorted.end());
+      double total = 0.0;
+      for (const auto value : frames) {
+        total += value;
+      }
+      const auto median_ms = sorted[sorted.size() / 2];
+      std::cout << std::fixed << std::setprecision(1) << "[PERF] clipshape " << size.width << 'x' << size.height
+                << " config=" << (config == 0 ? "alone" : config == 1 ? "clipped" : "clipped_fill0")
+                << " press_ms=" << press_ms << " first_frame_ms=" << frames.front()
+                << " frame_avg_ms=" << total / kFrames << " frame_median_ms=" << median_ms
+                << " frame_max_ms=" << sorted.back() << " release_ms=" << release_ms << " commit_ms=" << commit_ms
+                << " proxy_latched=" << (after.transform_proxy_previews - before.transform_proxy_previews)
+                << " threads=" << patchy::hardware_worker_threads() << '\n';
+      if (config == 0) {
+        alone_median_ms = median_ms;
+      } else {
+        // The clipped base keeps the unclipped drag's cost class.
+        CHECK(median_ms <= alone_median_ms * 3.0 + 8.0);
+      }
+    }
+  }
+}
+
+// Pick (Eyedropper) drag on a 6000x4000 document with several layers (GitHub #478: the
+// Pick tool lagged behind the pointer while dragging). Each frame is one mouse move plus
+// the paint and whatever else it queued (the loupe, color panels and status bar),
+// for several Size and Layer choices; then a 120-move burst posted at once, as Wayland
+// queues a fast pointer, with the drag move coalescing off and on. PATCHY_PERF_SAMPLER=1
+// samples each case's frames (Windows).
+void pick_drag_perf() {
+  constexpr int kWidth = 6000;
+  constexpr int kHeight = 4000;
+  patchy::Document document(kWidth, kHeight, patchy::PixelFormat::rgba8());
+  for (int index = 0; index < 5; ++index) {
+    patchy::PixelBuffer pixels(kWidth, kHeight, patchy::PixelFormat::rgba8());
+    auto bytes = pixels.data();
+    for (int y = 0; y < kHeight; ++y) {
+      auto* row = bytes.data() + static_cast<std::size_t>(y) * kWidth * 4;
+      for (int x = 0; x < kWidth; ++x) {
+        row[x * 4 + 0] = static_cast<std::uint8_t>((x * (index + 1)) / 24);
+        row[x * 4 + 1] = static_cast<std::uint8_t>((y * (index + 2)) / 16);
+        row[x * 4 + 2] = static_cast<std::uint8_t>((x + y) * (index + 3) / 40);
+        row[x * 4 + 3] = index == 0 ? 255 : static_cast<std::uint8_t>(96 + ((x / 50 + y / 50 + index) % 3) * 64);
+      }
+    }
+    patchy::Layer layer(document.allocate_layer_id(), index == 0 ? "Background" : "Layer " + std::to_string(index),
+                        std::move(pixels));
+    if (index > 0) {
+      layer.set_opacity(0.8F);
+    }
+    document.add_layer(std::move(layer));
+  }
+
+  patchy::ui::MainWindow window;
+  window.resize(1600, 1000);
+  if (qEnvironmentVariableIsSet("PATCHY_PERF_ONSCREEN")) {
+    window.showMaximized();
+  } else {
+    window.show();
+  }
+  QApplication::processEvents();
+  window.add_document_session(std::move(document), QStringLiteral("Pick drag"));
+  auto* canvas = active_canvas(window);
+  CHECK(canvas != nullptr);
+  if (canvas == nullptr) {
+    return;
+  }
+  canvas->fit_to_view();
+  for (auto* action : window.findChildren<QAction*>()) {
+    if (action->text() == QStringLiteral("Pick")) {
+      action->trigger();
+      break;
+    }
+  }
+  const auto settle = [canvas] {
+    QApplication::processEvents();
+    const auto started = Clock::now();
+    while (!canvas->render_settled() && std::chrono::duration<double>(Clock::now() - started).count() < 60.0) {
+      canvas->repaint();
+      QApplication::processEvents();
+    }
+  };
+  settle();
+  CHECK(canvas->tool() == patchy::ui::CanvasTool::Eyedropper);
+
+  struct Case {
+    const char* name;
+    int size;
+    patchy::SampleLayers layers;
+  };
+  const Case cases[] = {
+      {"point_all", 1, patchy::SampleLayers::AllLayers},
+      {"avg11_all", 11, patchy::SampleLayers::AllLayers},
+      {"avg101_all", 101, patchy::SampleLayers::AllLayers},
+      {"avg11_below", 11, patchy::SampleLayers::CurrentAndBelow},
+      {"point_current", 1, patchy::SampleLayers::CurrentLayer},
+  };
+  const auto start = canvas->widget_position_for_document_point(QPoint(kWidth / 4, kHeight / 4));
+  for (const auto& entry : cases) {
+    canvas->set_eyedropper_sample_size(entry.size);
+    canvas->set_eyedropper_sample_layers(entry.layers);
+    settle();
+    constexpr int kFrames = 60;
+#ifdef Q_OS_WIN
+    std::unique_ptr<MainThreadSampler> sampler;
+    if (qEnvironmentVariableIsSet("PATCHY_PERF_SAMPLER")) {
+      sampler = std::make_unique<MainThreadSampler>();
+    }
+#endif
+    const auto press_ms = elapsed_ms([&] {
+      send_mouse(*canvas, QEvent::MouseButtonPress, start, Qt::LeftButton, Qt::LeftButton);
+      canvas->repaint();
+      QApplication::processEvents();
+    });
+    std::vector<double> frames;
+    for (int frame = 1; frame <= kFrames; ++frame) {
+      const auto point = start + QPoint(frame * 7, frame * 3);
+      frames.push_back(elapsed_ms([&] {
+        send_mouse(*canvas, QEvent::MouseMove, point, Qt::NoButton, Qt::LeftButton);
+        // The paint the move asked for (the loupe and outline regions), not a full repaint.
+        QApplication::processEvents();
+      }));
+    }
+    const auto release_ms = elapsed_ms([&] {
+      send_mouse(*canvas, QEvent::MouseButtonRelease, start + QPoint(kFrames * 7, kFrames * 3), Qt::LeftButton,
+                 Qt::NoButton);
+      canvas->repaint();
+      QApplication::processEvents();
+    });
+#ifdef Q_OS_WIN
+    if (sampler) {
+      std::cout << "[SAMPLER_PHASE] pickdrag " << entry.name << '\n';
+      sampler.reset();
+    }
+#endif
+    auto sorted = frames;
+    std::sort(sorted.begin(), sorted.end());
+    double total = 0.0;
+    for (const auto value : frames) {
+      total += value;
+    }
+    std::cout << std::fixed << std::setprecision(2) << "[PERF] pickdrag case=" << entry.name
+              << " press_ms=" << press_ms << " frame_avg_ms=" << total / kFrames
+              << " frame_median_ms=" << sorted[sorted.size() / 2] << " frame_max_ms=" << sorted.back()
+              << " release_ms=" << release_ms << '\n';
+    settle();
+  }
+
+  // A burst of queued moves (11 by 11, All Layers): the time until the canvas has read
+  // them and painted, with the drag move coalescing off and on.
+  canvas->set_eyedropper_sample_size(11);
+  canvas->set_eyedropper_sample_layers(patchy::SampleLayers::AllLayers);
+  for (const bool coalescing : {false, true}) {
+    constexpr int kBurst = 120;
+    canvas->set_drag_move_coalescing_for_testing(coalescing ? patchy::ui::CanvasWidget::DragMoveCoalescing::AllMoves
+                                                            : patchy::ui::CanvasWidget::DragMoveCoalescing::Off);
+    settle();
+    send_mouse(*canvas, QEvent::MouseButtonPress, start, Qt::LeftButton, Qt::LeftButton);
+    canvas->repaint();
+    QApplication::processEvents();
+    const auto before = canvas->render_cache_diagnostics();
+    QPoint last = start;
+    for (int move = 1; move <= kBurst; ++move) {
+      last = start + QPoint(move * 3, move);
+      QApplication::postEvent(canvas, new QMouseEvent(QEvent::MouseMove, QPointF(last),
+                                                      QPointF(canvas->mapToGlobal(last)), Qt::NoButton,
+                                                      Qt::LeftButton, Qt::NoModifier));
+    }
+    const auto burst_ms = elapsed_ms([&] {
+      QApplication::processEvents();
+      QApplication::processEvents();
+      QApplication::processEvents();
+    });
+    const auto coalesced = canvas->render_cache_diagnostics().drag_moves_coalesced - before.drag_moves_coalesced;
+    send_mouse(*canvas, QEvent::MouseButtonRelease, last, Qt::LeftButton, Qt::NoButton);
+    QApplication::processEvents();
+    std::cout << std::fixed << std::setprecision(1) << "[PERF] pickdrag gesture=burst coalescing="
+              << (coalescing ? "on" : "off") << " moves=" << kBurst << " applied=" << (kBurst - coalesced)
+              << " burst_ms=" << burst_ms << '\n';
+  }
+  canvas->set_drag_move_coalescing_for_testing(patchy::ui::CanvasWidget::DragMoveCoalescing::Default);
+}
+
+// Move-tool drag and Free Transform corner drag of a text layer against a pixel layer
+// holding the same raster (GitHub issues 207, 443, 444: dragging or resizing a small
+// text layer on a 1280x720 document stuttered on a Linux laptop). Each frame is one
+// mouse move plus a synchronous repaint. PATCHY_PERF_TEXTDRAG_TEXT sets the text,
+// PATCHY_PERF_SAMPLER=1 samples each case's frames (Windows).
+void text_layer_drag_perf() {
+  struct Timing {
+    double press_ms{0.0};
+    double first_ms{0.0};
+    double avg_ms{0.0};
+    double median_ms{0.0};
+    double max_ms{0.0};
+    double release_ms{0.0};
+    double commit_ms{0.0};
+  };
+  const auto settle = [](patchy::ui::CanvasWidget& canvas) {
+    QApplication::processEvents();
+    const auto started = Clock::now();
+    while (!canvas.render_settled() && std::chrono::duration<double>(Clock::now() - started).count() < 30.0) {
+      canvas.repaint();
+      QApplication::processEvents();
+    }
+  };
+  const auto drag = [&](patchy::ui::CanvasWidget& canvas, QPoint start, QPoint step, const char* label) {
+    constexpr int kFrames = 40;
+    Timing timing;
+#ifdef Q_OS_WIN
+    std::unique_ptr<MainThreadSampler> sampler;
+    if (qEnvironmentVariableIsSet("PATCHY_PERF_SAMPLER")) {
+      sampler = std::make_unique<MainThreadSampler>();
+    }
+#endif
+    timing.press_ms = elapsed_ms([&] {
+      send_mouse(canvas, QEvent::MouseButtonPress, start, Qt::LeftButton, Qt::LeftButton);
+      canvas.repaint();
+    });
+    std::vector<double> frames;
+    for (int frame = 1; frame <= kFrames; ++frame) {
+      const auto point = start + step * frame;
+      frames.push_back(elapsed_ms([&] {
+        send_mouse(canvas, QEvent::MouseMove, point, Qt::NoButton, Qt::LeftButton);
+        canvas.repaint();
+        // Whatever the move queued (panels, status bar) runs before the next move, as
+        // in the real event loop.
+        QApplication::processEvents();
+      }));
+    }
+    timing.release_ms = elapsed_ms([&] {
+      send_mouse(canvas, QEvent::MouseButtonRelease, start + step * kFrames, Qt::LeftButton, Qt::NoButton);
+      canvas.repaint();
+    });
+#ifdef Q_OS_WIN
+    if (sampler) {
+      std::cout << "[SAMPLER_PHASE] textdrag " << label << '\n';
+      sampler.reset();
+    }
+#else
+    (void)label;
+#endif
+    auto sorted = frames;
+    std::sort(sorted.begin(), sorted.end());
+    double total = 0.0;
+    for (const auto value : frames) {
+      total += value;
+    }
+    timing.first_ms = frames.front();
+    timing.avg_ms = total / kFrames;
+    timing.median_ms = sorted[sorted.size() / 2];
+    timing.max_ms = sorted.back();
+    return timing;
+  };
+  const auto print = [](const char* kind, const char* gesture, const Timing& timing,
+                        const patchy::ui::CanvasRenderCacheDiagnostics& before,
+                        const patchy::ui::CanvasRenderCacheDiagnostics& after) {
+    std::cout << std::fixed << std::setprecision(1) << "[PERF] textdrag layer=" << kind << " gesture=" << gesture
+              << " press_ms=" << timing.press_ms << " first_frame_ms=" << timing.first_ms
+              << " frame_avg_ms=" << timing.avg_ms << " frame_median_ms=" << timing.median_ms
+              << " frame_max_ms=" << timing.max_ms << " release_ms=" << timing.release_ms
+              << " commit_ms=" << timing.commit_ms
+              << " move_proxy=" << (after.move_proxy_previews - before.move_proxy_previews)
+              << " transform_proxy=" << (after.transform_proxy_previews - before.transform_proxy_previews)
+              << " threads=" << patchy::hardware_worker_threads() << '\n';
+  };
+  const auto text = qEnvironmentVariableIsSet("PATCHY_PERF_TEXTDRAG_TEXT")
+                        ? qEnvironmentVariable("PATCHY_PERF_TEXTDRAG_TEXT")
+                        : QStringLiteral("Type");
+
+  patchy::ui::MainWindow window;
+  window.resize(1600, 1000);
+  if (qEnvironmentVariableIsSet("PATCHY_PERF_ONSCREEN")) {
+    window.showMaximized();
+  } else {
+    window.show();
+  }
+  QApplication::processEvents();
+  patchy::ui::MainWindowTestAccess::new_document(window, 1280, 720, 72.0);
+  auto* canvas = active_canvas(window);
+  CHECK(canvas != nullptr);
+  if (canvas == nullptr) {
+    return;
+  }
+  canvas->fit_to_view();
+  settle(*canvas);
+  patchy::ui::MainWindowTestAccess::add_text_at(window, QPoint(200, 120));
+  QApplication::processEvents();
+  auto* editor = canvas->findChild<QTextEdit*>(QStringLiteral("inlineTextEditor"));
+  CHECK(editor != nullptr);
+  if (editor == nullptr) {
+    return;
+  }
+  editor->selectAll();
+  editor->textCursor().insertText(text);
+  QApplication::processEvents();
+  send_key(*editor, Qt::Key_Return, Qt::ControlModifier);
+  settle(*canvas);
+  const auto text_id = std::as_const(patchy::ui::MainWindowTestAccess::document(window)).active_layer_id();
+  CHECK(text_id.has_value());
+  if (!text_id.has_value()) {
+    return;
+  }
+
+  // The pixel twin: the text layer's raster as a plain layer, in a second document
+  // session opened after the text case (a new session becomes the current tab).
+  patchy::Document twin(1280, 720, patchy::PixelFormat::rgba8());
+  {
+    const auto* text_layer = std::as_const(patchy::ui::MainWindowTestAccess::document(window)).find_layer(*text_id);
+    CHECK(text_layer != nullptr);
+    if (text_layer == nullptr) {
+      return;
+    }
+    patchy::PixelBuffer backdrop(1280, 720, patchy::PixelFormat::rgba8());
+    backdrop.clear(255);
+    twin.add_layer(patchy::Layer(twin.allocate_layer_id(), "Background", std::move(backdrop)));
+    auto pixels = text_layer->pixels();
+    patchy::Layer copy(twin.allocate_layer_id(), "Pixels", std::move(pixels));
+    copy.set_bounds(text_layer->bounds());
+    twin.add_layer(std::move(copy));
+  }
+  for (const bool is_text : {true, false}) {
+    if (!is_text) {
+      window.add_document_session(std::move(twin), QStringLiteral("Pixel twin"));
+      auto* twin_canvas = active_canvas(window);
+      CHECK(twin_canvas != nullptr && twin_canvas != canvas);
+      if (twin_canvas == nullptr || twin_canvas == canvas) {
+        return;
+      }
+      canvas = twin_canvas;
+      canvas->fit_to_view();
+      settle(*canvas);
+    }
+    auto* target = canvas;
+    const char* kind = is_text ? "text" : "pixel";
+    const auto layer_id = *std::as_const(patchy::ui::MainWindowTestAccess::document(window)).active_layer_id();
+    const auto bounds_of = [&] {
+      return std::as_const(patchy::ui::MainWindowTestAccess::document(window)).find_layer(layer_id)->bounds();
+    };
+
+    target->set_tool(patchy::ui::CanvasTool::Move);
+    settle(*target);
+    auto bounds = bounds_of();
+    auto before = target->render_cache_diagnostics();
+    auto timing = drag(*target, target->widget_position_for_document_point(
+                                    QPoint(bounds.x + bounds.width / 2, bounds.y + bounds.height / 2)),
+                       QPoint(6, 2), is_text ? "text_move" : "pixel_move");
+    timing.commit_ms = elapsed_ms([&] { settle(*target); });
+    print(kind, "move", timing, before, target->render_cache_diagnostics());
+
+    // A burst of queued moves, as Wayland delivers a fast pointer behind a slow frame
+    // (GitHub #443): 120 moves posted at once, then the time until the canvas has
+    // applied and painted them, with the drag move coalescing on and off.
+    for (const bool coalescing : {false, true}) {
+      constexpr int kBurst = 120;
+      target->set_drag_move_coalescing_for_testing(coalescing ? patchy::ui::CanvasWidget::DragMoveCoalescing::AllMoves
+                                                              : patchy::ui::CanvasWidget::DragMoveCoalescing::Off);
+      bounds = bounds_of();
+      const auto start = target->widget_position_for_document_point(
+          QPoint(bounds.x + bounds.width / 2, bounds.y + bounds.height / 2));
+      send_mouse(*target, QEvent::MouseButtonPress, start, Qt::LeftButton, Qt::LeftButton);
+      send_mouse(*target, QEvent::MouseMove, start + QPoint(8, 0), Qt::NoButton, Qt::LeftButton);
+      target->repaint();
+      before = target->render_cache_diagnostics();
+      for (int move = 1; move <= kBurst; ++move) {
+        const auto position = start + QPoint(8 + move, move / 4);
+        QApplication::postEvent(target, new QMouseEvent(QEvent::MouseMove, QPointF(position),
+                                                        QPointF(target->mapToGlobal(position)), Qt::NoButton,
+                                                        Qt::LeftButton, Qt::NoModifier));
+      }
+      const auto burst_ms = elapsed_ms([&] {
+        QApplication::processEvents();
+        QApplication::processEvents();
+        target->repaint();
+      });
+      const auto coalesced = target->render_cache_diagnostics().drag_moves_coalesced - before.drag_moves_coalesced;
+      send_mouse(*target, QEvent::MouseButtonRelease, start + QPoint(8 + kBurst, kBurst / 4), Qt::LeftButton,
+                 Qt::NoButton);
+      settle(*target);
+      std::cout << std::fixed << std::setprecision(1) << "[PERF] textdrag layer=" << kind
+                << " gesture=move_burst coalescing=" << (coalescing ? "on" : "off") << " moves=" << kBurst
+                << " applied=" << (kBurst - coalesced) << " burst_ms=" << burst_ms << '\n';
+    }
+    target->set_drag_move_coalescing_for_testing(patchy::ui::CanvasWidget::DragMoveCoalescing::Default);
+
+    auto* transform_action = window.findChild<QAction*>(QStringLiteral("editFreeTransformAction"));
+    CHECK(transform_action != nullptr);
+    if (transform_action == nullptr) {
+      return;
+    }
+    transform_action->trigger();
+    settle(*target);
+    CHECK(target->free_transform_active());
+    bounds = bounds_of();
+    before = target->render_cache_diagnostics();
+    timing = drag(*target, target->widget_position_for_document_point(
+                               QPoint(bounds.x + bounds.width, bounds.y + bounds.height)),
+                  QPoint(5, 3), is_text ? "text_scale" : "pixel_scale");
+    const auto after = target->render_cache_diagnostics();
+    timing.commit_ms = elapsed_ms([&] {
+      send_key(*target, Qt::Key_Return);
+      settle(*target);
+    });
+    CHECK(!target->free_transform_active());
+    print(kind, "scale", timing, before, after);
+  }
+}
+
+// Records a live drag on a real window system for the *_live scenarios: each window-system
+// move's queueing delay against its compositor timestamp, and each repaint's lag behind the
+// newest move it had seen.
+class LiveDragRecorder : public QObject {
+ public:
+  bool button_down{false};
+  bool released{false};
+  int moves{0};
+  int paints{0};
+  std::vector<double> move_delay_ms;
+  std::vector<double> paint_lag_ms;
+  std::vector<double> paint_gap_ms;
+  double last_paint_ms{-1.0};
+  double last_move_timestamp_ms{-1.0};
+  double first_move_ms{-1.0};
+  double release_ms{-1.0};
+  double release_timestamp_ms{-1.0};
+  QPointF last_move_position;
+  // Called on every repaint during the drag, after the lag is recorded.
+  std::function<void()> on_paint;
+
+ protected:
+  bool eventFilter(QObject* watched, QEvent* event) override {
+    // steady_clock is CLOCK_MONOTONIC on Linux, the clock Wayland input timestamps use.
+    const auto now = static_cast<double>(
+        std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now().time_since_epoch()).count());
+    const auto since = [now](ulong stamp) {
+      return static_cast<double>(static_cast<std::int32_t>(
+          static_cast<std::uint32_t>(static_cast<std::uint64_t>(now)) - static_cast<std::uint32_t>(stamp)));
+    };
+    switch (event->type()) {
+      case QEvent::MouseButtonPress:
+        button_down = true;
+        break;
+      case QEvent::MouseMove:
+        if (button_down && event->spontaneous()) {
+          const auto delay = since(static_cast<QMouseEvent*>(event)->timestamp());
+          ++moves;
+          if (first_move_ms < 0.0) {
+            first_move_ms = now;
+          }
+          move_delay_ms.push_back(delay);
+          last_move_timestamp_ms = now - delay;
+          last_move_position = static_cast<QMouseEvent*>(event)->position();
+        }
+        break;
+      case QEvent::MouseButtonRelease:
+        if (button_down) {
+          button_down = false;
+          released = true;
+          release_ms = now;
+          release_timestamp_ms = now - since(static_cast<QMouseEvent*>(event)->timestamp());
+        }
+        break;
+      case QEvent::Paint:
+        if (button_down && last_move_timestamp_ms >= 0.0) {
+          ++paints;
+          paint_lag_ms.push_back(now - last_move_timestamp_ms);
+          if (last_paint_ms >= 0.0) {
+            paint_gap_ms.push_back(now - last_paint_ms);
+          }
+          last_paint_ms = now;
+          if (on_paint) {
+            on_paint();
+          }
+        }
+        break;
+      default:
+        break;
+    }
+    return QObject::eventFilter(watched, event);
+  }
+};
+
+std::string live_summary(std::vector<double> values) {
+  std::ostringstream text;
+  if (values.empty()) {
+    text << "n=0";
+    return text.str();
+  }
+  std::sort(values.begin(), values.end());
+  text << std::fixed << std::setprecision(1) << "median=" << values[values.size() / 2]
+       << " p95=" << values[std::min(values.size() - 1, values.size() * 95 / 100)] << " max=" << values.back();
+  return text.str();
+}
+
+// Live drag timing on a real window system (GitHub #207, #443, #444), for a headless
+// Wayland compositor driven by a virtual pointer (docs/interactive-previews.md, "Drag
+// move coalescing"). Shows a full-screen window with one text layer under the Move
+// tool, writes the text's screen position to PATCHY_PERF_LIVE_READY (a file the driver
+// waits for), then runs the event loop until the drag's release has been handled or
+// PATCHY_PERF_LIVE_SECONDS pass. Window-system moves carry the compositor's
+// CLOCK_MONOTONIC timestamps, so each move's queueing delay and each repaint's lag
+// behind the newest move it had seen are measured. PATCHY_PERF_LIVE_COALESCE=off
+// turns the drag move coalescing off for the before-the-fix baseline.
+void text_layer_live_drag_perf() {
+  using Recorder = LiveDragRecorder;
+  const auto summary = [](std::vector<double> values) { return live_summary(std::move(values)); };
+
+  patchy::ui::MainWindow window;
+  window.showFullScreen();
+  QApplication::processEvents();
+  patchy::ui::MainWindowTestAccess::new_document(window, 1280, 720, 72.0);
+  auto* canvas = active_canvas(window);
+  CHECK(canvas != nullptr);
+  if (canvas == nullptr) {
+    return;
+  }
+  const auto coalesce_off = qEnvironmentVariable("PATCHY_PERF_LIVE_COALESCE") == QStringLiteral("off");
+  if (coalesce_off) {
+    canvas->set_drag_move_coalescing_for_testing(patchy::ui::CanvasWidget::DragMoveCoalescing::Off);
+  }
+  canvas->fit_to_view();
+  patchy::ui::MainWindowTestAccess::add_text_at(window, QPoint(200, 120));
+  QApplication::processEvents();
+  auto* editor = canvas->findChild<QTextEdit*>(QStringLiteral("inlineTextEditor"));
+  CHECK(editor != nullptr);
+  if (editor == nullptr) {
+    return;
+  }
+  send_key(*editor, Qt::Key_Return, Qt::ControlModifier);
+  canvas->set_tool(patchy::ui::CanvasTool::Move);
+  const auto settle_started = Clock::now();
+  while (std::chrono::duration<double>(Clock::now() - settle_started).count() < 3.0) {
+    QApplication::processEvents();
+  }
+  const auto text_id = std::as_const(patchy::ui::MainWindowTestAccess::document(window)).active_layer_id();
+  CHECK(text_id.has_value());
+  if (!text_id.has_value()) {
+    return;
+  }
+  const auto bounds =
+      std::as_const(patchy::ui::MainWindowTestAccess::document(window)).find_layer(*text_id)->bounds();
+  const auto center = canvas->widget_position_for_document_point(
+      QPoint(bounds.x + bounds.width / 2, bounds.y + bounds.height / 2));
+  const auto screen = canvas->mapTo(&window, center);
+  Recorder recorder;
+  canvas->installEventFilter(&recorder);
+  const auto ready_path = qEnvironmentVariable("PATCHY_PERF_LIVE_READY");
+  if (!ready_path.isEmpty()) {
+    QFile ready(ready_path);
+    if (ready.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
+      ready.write(QStringLiteral("%1 %2 %3 %4\n")
+                      .arg(screen.x())
+                      .arg(screen.y())
+                      .arg(window.width())
+                      .arg(window.height())
+                      .toUtf8());
+    }
+  }
+  std::cout << "[LIVE] ready x=" << screen.x() << " y=" << screen.y() << " window=" << window.width() << 'x'
+            << window.height() << " platform=" << QGuiApplication::platformName().toStdString() << std::endl;
+  const auto seconds = qEnvironmentVariableIsSet("PATCHY_PERF_LIVE_SECONDS")
+                           ? qEnvironmentVariableIntValue("PATCHY_PERF_LIVE_SECONDS")
+                           : 60;
+  const auto started = Clock::now();
+  while (!recorder.released && std::chrono::duration<double>(Clock::now() - started).count() < seconds) {
+    QApplication::processEvents(QEventLoop::WaitForMoreEvents, 50);
+  }
+  const auto drained = elapsed_ms([&] {
+    for (int pass = 0; pass < 5; ++pass) {
+      QApplication::processEvents();
+    }
+  });
+  canvas->removeEventFilter(&recorder);
+  const auto diagnostics = canvas->render_cache_diagnostics();
+  const auto layer_after =
+      std::as_const(patchy::ui::MainWindowTestAccess::document(window)).find_layer(*text_id)->bounds();
+  std::cout << std::fixed << std::setprecision(1) << "[PERF] textdrag_live coalescing=" << (coalesce_off ? "off" : "on")
+            << " released=" << recorder.released << " moves=" << recorder.moves << " paints=" << recorder.paints
+            << " coalesced=" << diagnostics.drag_moves_coalesced
+            << " drag_ms=" << (recorder.release_ms - recorder.first_move_ms)
+            << " release_delay_ms=" << (recorder.release_ms - recorder.release_timestamp_ms)
+            << " moved_by=" << (layer_after.x - bounds.x) << ',' << (layer_after.y - bounds.y)
+            << " drain_ms=" << drained << '\n'
+            << "[PERF] textdrag_live move_delay_ms " << summary(recorder.move_delay_ms) << '\n'
+            << "[PERF] textdrag_live paint_lag_ms " << summary(recorder.paint_lag_ms) << '\n'
+            << "[PERF] textdrag_live paint_gap_ms " << summary(recorder.paint_gap_ms) << '\n';
+}
+
+// Live canvas drags on a real window system, for the headless Wayland rig and
+// scripts/dev/wayland-popups/live-canvas-drag.sh (GitHub #678 follow-up, #705; docs/
+// interactive-previews.md, "Drag move coalescing"). PATCHY_PERF_CANVASDRAG_KIND picks one:
+//   shape     a noisy 3600x5400 "photo" (PATCHY_PERF_CANVASDRAG_DOC=WxH) with a pentagon
+//             shape over it, viewed fit to the window, dragged with Path Select
+//   gradient  a 1280x720 document (PATCHY_PERF_CANVASDRAG_DOC=WxH; GitHub #714: 3580x5370)
+//             with a Gradient Fill layer made by a Gradient tool drag in Fill Layer mode,
+//             its end handle dragged with the Gradient tool. PATCHY_GRADIENT_VIEW_PREVIEW=0
+//             previews through the document, as every preview did before #714
+//   pathtransform  the shape document, the pentagon moved inside Path Select's transform box
+// Writes the press point to PATCHY_PERF_LIVE_READY like textdrag_live and measures each
+// window-system move's queueing delay, each repaint's lag behind the newest move, and on
+// each repaint how far the dragged thing sits from the pointer (lag_px).
+// PATCHY_PERF_LIVE_COALESCE=off turns the drag move coalescing off (the baseline).
+void canvas_live_drag_perf() {
+  const auto kind = qEnvironmentVariable("PATCHY_PERF_CANVASDRAG_KIND", QStringLiteral("shape"));
+  const bool gradient = kind == QStringLiteral("gradient");
+  patchy::ui::MainWindow window;
+  window.showFullScreen();
+  QApplication::processEvents();
+  patchy::LayerId dragged_id = 0;
+  int width = gradient ? 1280 : 3600;
+  int height = gradient ? 720 : 5400;
+  if (const auto size = qEnvironmentVariable("PATCHY_PERF_CANVASDRAG_DOC").split(QLatin1Char('x'));
+      size.size() == 2 && size[0].toInt() > 0 && size[1].toInt() > 0) {
+    width = size[0].toInt();
+    height = size[1].toInt();
+  }
+  if (gradient) {
+    patchy::ui::MainWindowTestAccess::new_document(window, width, height, 72.0);
+  } else {
+    patchy::Document document(width, height, patchy::PixelFormat::rgba8());
+    patchy::PixelBuffer photo(width, height, patchy::PixelFormat::rgba8());
+    std::uint64_t state = 0x678;
+    for (int y = 0; y < height; ++y) {
+      auto* row = photo.pixel(0, y);
+      for (int x = 0; x < width; ++x) {
+        state = state * 6364136223846793005ULL + 1442695040888963407ULL;
+        const auto noise = static_cast<int>((state >> 59U) & 31U);
+        row[x * 4 + 0] = static_cast<std::uint8_t>(std::min(255, 60 + x * 120 / width + noise));
+        row[x * 4 + 1] = static_cast<std::uint8_t>(std::min(255, 50 + y * 100 / height + noise));
+        row[x * 4 + 2] = static_cast<std::uint8_t>(std::min(255, 40 + noise));
+        row[x * 4 + 3] = 255;
+      }
+    }
+    document.add_layer(patchy::Layer(document.allocate_layer_id(), "Background", std::move(photo)));
+    patchy::LiveShapeParams params;
+    params.kind = patchy::LiveShapeKind::Polygon;
+    // His video's pentagon: about two thirds of the photo, its left corner past the canvas
+    // edge. PATCHY_PERF_CANVASDRAG_SHAPE=left,top,right,bottom (fractions) sets another.
+    std::array<double, 4> box{-0.25, 0.22, 0.7, 0.88};
+    if (const auto parts = qEnvironmentVariable("PATCHY_PERF_CANVASDRAG_SHAPE").split(QLatin1Char(','));
+        parts.size() == 4) {
+      for (std::size_t i = 0; i < box.size(); ++i) {
+        box[i] = parts[static_cast<qsizetype>(i)].toDouble();
+      }
+    }
+    params.left = width * box[0];
+    params.top = height * box[1];
+    params.right = width * box[2];
+    params.bottom = height * box[3];
+    params.polygon_sides = 5;
+    patchy::populate_live_shape_box_corners(params);
+    patchy::VectorShapeContent shape;
+    shape.path.subpaths = patchy::generate_live_shape_subpaths(params);
+    shape.origination.push_back(params);
+    shape.fill.kind = patchy::VectorFillKind::Solid;
+    shape.fill.color = {140, 128, 128};
+    patchy::Layer layer(document.allocate_layer_id(), "Polygon 1", patchy::LayerKind::Pixel);
+    layer.metadata()[patchy::kLayerMetadataVectorShape] = "1";
+    layer.set_vector_shape(std::move(shape));
+    patchy::update_vector_shape_raster(layer, patchy::Rect::from_size(width, height),
+                                       &std::as_const(document).metadata().patterns);
+    dragged_id = layer.id();
+    document.add_layer(std::move(layer));
+    window.add_document_session(std::move(document), QStringLiteral("Canvas Drag Perf"));
+  }
+  QApplication::processEvents();
+  auto* canvas = active_canvas(window);
+  CHECK(canvas != nullptr);
+  if (canvas == nullptr) {
+    return;
+  }
+  const auto coalesce_off = qEnvironmentVariable("PATCHY_PERF_LIVE_COALESCE") == QStringLiteral("off");
+  if (coalesce_off) {
+    canvas->set_drag_move_coalescing_for_testing(patchy::ui::CanvasWidget::DragMoveCoalescing::Off);
+  }
+  canvas->fit_to_view();
+  const auto settle = [](double seconds) {
+    const auto started = Clock::now();
+    while (std::chrono::duration<double>(Clock::now() - started).count() < seconds) {
+      QApplication::processEvents();
+    }
+  };
+  settle(1.0);
+  using Part = patchy::ui::CanvasWidget::GradientHandlePart;
+  using PartKind = patchy::ui::CanvasWidget::GradientHandlePartKind;
+  QPointF press;
+  QPointF press_document;
+  if (gradient) {
+    canvas->set_tool(patchy::ui::CanvasTool::Gradient);
+    canvas->set_gradient_tool_mode(patchy::ui::GradientToolMode::FillLayer);
+    QApplication::processEvents();
+    const auto from = canvas->widget_position_for_document_point(QPoint(width * 100 / 1280, height * 650 / 720));
+    const auto to = canvas->widget_position_for_document_point(QPoint(width * 1180 / 1280, height * 100 / 720));
+    send_mouse(*canvas, QEvent::MouseButtonPress, from, Qt::LeftButton, Qt::LeftButton);
+    for (int step = 1; step <= 10; ++step) {
+      send_mouse(*canvas, QEvent::MouseMove, from + (to - from) * step / 10, Qt::NoButton, Qt::LeftButton);
+    }
+    send_mouse(*canvas, QEvent::MouseButtonRelease, to, Qt::LeftButton, Qt::NoButton);
+    settle(2.0);
+    const auto end = canvas->gradient_fill_handle_widget_position(Part{PartKind::End, -1});
+    CHECK(end.has_value());
+    if (!end.has_value()) {
+      return;
+    }
+    press = *end;
+  } else {
+    auto* layer_list = window.findChild<QListWidget*>(QStringLiteral("layerList"));
+    CHECK(layer_list != nullptr);
+    for (int row = 0; layer_list != nullptr && row < layer_list->count(); ++row) {
+      auto* item = layer_list->item(row);
+      if (static_cast<patchy::LayerId>(item->data(patchy::ui::kLayerIdRole).toULongLong()) == dragged_id) {
+        layer_list->clearSelection();
+        layer_list->setCurrentItem(item);
+        item->setSelected(true);
+      }
+    }
+    canvas->set_tool(patchy::ui::CanvasTool::PathSelect);
+    if (kind == QStringLiteral("pathtransform")) {
+      // The transform box (Ctrl+T with a path tool): a press inside it moves the shape, and
+      // every step re-rasterizes the layer.
+      QApplication::processEvents();
+      CHECK(canvas->begin_path_transform());
+    }
+    const auto& document = std::as_const(patchy::ui::MainWindowTestAccess::document(window));
+    press_document = QPointF(document.width() * 0.4, document.height() * 0.55);
+    press = QPointF(canvas->widget_position_for_document_point(press_document.toPoint()));
+    settle(3.0);
+  }
+  const auto first_anchor = [&window, dragged_id] {
+    const auto* layer = std::as_const(patchy::ui::MainWindowTestAccess::document(window)).find_layer(dragged_id);
+    const auto* shape = layer != nullptr ? layer->vector_shape() : nullptr;
+    if (shape == nullptr || shape->path.subpaths.empty() || shape->path.subpaths.front().anchors.empty()) {
+      return QPointF();
+    }
+    const auto& point = shape->path.subpaths.front().anchors.front();
+    return QPointF(point.anchor_x, point.anchor_y);
+  };
+  const auto anchor_before = first_anchor();
+  LiveDragRecorder recorder;
+  std::vector<double> lag_px;
+  int stale_paints = 0;  // repaints that showed a composite older than the document
+  recorder.on_paint = [&] {
+    if (!canvas->render_settled()) {
+      ++stale_paints;
+    }
+    const auto dragged =
+        gradient ? canvas->gradient_fill_handle_widget_position(Part{PartKind::End, -1}).value_or(QPointF())
+                 : canvas->widget_position_f(press_document + (first_anchor() - anchor_before));
+    lag_px.push_back(QLineF(dragged, recorder.last_move_position).length());
+  };
+  canvas->installEventFilter(&recorder);
+  const auto screen = canvas->mapTo(&window, press.toPoint());
+  if (const auto ready_path = qEnvironmentVariable("PATCHY_PERF_LIVE_READY"); !ready_path.isEmpty()) {
+    QFile ready(ready_path);
+    if (ready.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
+      ready.write(QStringLiteral("%1 %2 %3 %4\n")
+                      .arg(screen.x())
+                      .arg(screen.y())
+                      .arg(window.width())
+                      .arg(window.height())
+                      .toUtf8());
+    }
+  }
+  std::cout << "[LIVE] ready kind=" << kind.toStdString() << " x=" << screen.x() << " y=" << screen.y()
+            << " window=" << window.width() << 'x' << window.height()
+            << " platform=" << QGuiApplication::platformName().toStdString() << " qt=" << qVersion() << std::endl;
+  const auto seconds = qEnvironmentVariableIsSet("PATCHY_PERF_LIVE_SECONDS")
+                           ? qEnvironmentVariableIntValue("PATCHY_PERF_LIVE_SECONDS")
+                           : 60;
+  const auto before = canvas->render_cache_diagnostics();
+  const auto started = Clock::now();
+  while (!recorder.released && std::chrono::duration<double>(Clock::now() - started).count() < seconds) {
+    QApplication::processEvents(QEventLoop::WaitForMoreEvents, 50);
+  }
+  const auto drained = elapsed_ms([&] {
+    for (int pass = 0; pass < 5; ++pass) {
+      QApplication::processEvents();
+    }
+  });
+  canvas->removeEventFilter(&recorder);
+  const auto after = canvas->render_cache_diagnostics();
+  std::cout << std::fixed << std::setprecision(1) << "[PERF] canvasdrag_live kind=" << kind.toStdString()
+            << " coalescing=" << (coalesce_off ? "off" : "on") << " released=" << recorder.released
+            << " moves=" << recorder.moves << " paints=" << recorder.paints << " stale_paints=" << stale_paints
+            << " coalesced=" << (after.drag_moves_coalesced - before.drag_moves_coalesced)
+            << " path_drag_applies=" << (after.path_drag_applies - before.path_drag_applies)
+            << " view_previews=" << (after.gradient_view_previews - before.gradient_view_previews)
+            << " composites="
+            << (after.full_refreshes + after.intermediate_refreshes - before.full_refreshes -
+                before.intermediate_refreshes)
+            << " drag_ms=" << (recorder.release_ms - recorder.first_move_ms)
+            << " release_delay_ms=" << (recorder.release_ms - recorder.release_timestamp_ms)
+            << " drain_ms=" << drained << '\n'
+            << "[PERF] canvasdrag_live move_delay_ms " << live_summary(recorder.move_delay_ms) << '\n'
+            << "[PERF] canvasdrag_live paint_lag_ms " << live_summary(recorder.paint_lag_ms) << '\n'
+            << "[PERF] canvasdrag_live paint_gap_ms " << live_summary(recorder.paint_gap_ms) << '\n'
+            << "[PERF] canvasdrag_live lag_px " << live_summary(lag_px) << '\n';
+}
+
+// Text Size scrub during a live text edit (GitHub #700): a new document, the Type tool,
+// one word typed and all selected, then the Size label of the options bar dragged. Run
+// once for point text and once for a dragged text box.
+//   split     each part of one size step called by itself (40 steps of 2.25 pt)
+//   scrub     the same steps as real moves on the Size label, each followed by a repaint
+//   burst     120 queued moves, applied one by one and with the scrub move coalescing
+// PATCHY_PERF_TEXTSCRUB_DOC=WxH@PPI sets the document (default 1920x1080@72),
+// PATCHY_PERF_TEXTSCRUB_TEXT the word, PATCHY_PERF_TEXTSCRUB_FONT the family.
+// `textscrub_live` instead waits for a real pointer on a real window system (the headless
+// sway rig, scripts/dev/wayland-popups/live-scrub.sh): it writes the Size label's screen
+// position to PATCHY_PERF_LIVE_READY and measures each window-system move's queueing
+// delay, the values the field took and the gaps between them, and the canvas repaints.
+// PATCHY_PERF_LIVE_COALESCE=off turns the scrub move coalescing off (the baseline),
+// PATCHY_PERF_TEXTSCRUB_KIND=point picks point text (default box).
+struct TextScrubSession {
+  patchy::ui::CanvasWidget* canvas{nullptr};
+  QTextEdit* editor{nullptr};
+  QDoubleSpinBox* size{nullptr};
+  QLabel* label{nullptr};
+};
+
+std::optional<TextScrubSession> start_text_scrub_session(patchy::ui::MainWindow& window, bool box) {
+  int width = 1920;
+  int height = 1080;
+  double ppi = 72.0;
+  if (const auto spec = qEnvironmentVariable("PATCHY_PERF_TEXTSCRUB_DOC"); !spec.isEmpty()) {
+    const auto size_and_ppi = spec.split(QLatin1Char('@'));
+    const auto size = size_and_ppi.value(0).split(QLatin1Char('x'));
+    width = std::max(16, size.value(0).toInt());
+    height = std::max(16, size.value(1).toInt());
+    if (size_and_ppi.size() > 1) {
+      ppi = std::max(1.0, size_and_ppi.value(1).toDouble());
+    }
+  }
+  patchy::ui::MainWindowTestAccess::new_document(window, width, height, ppi);
+  TextScrubSession session;
+  session.canvas = active_canvas(window);
+  CHECK(session.canvas != nullptr);
+  if (session.canvas == nullptr) {
+    return std::nullopt;
+  }
+  session.canvas->fit_to_view();
+  QApplication::processEvents();
+  patchy::ui::MainWindowTestAccess::select_type_tool(window);
+  QApplication::processEvents();
+  if (const auto family = qEnvironmentVariable("PATCHY_PERF_TEXTSCRUB_FONT"); !family.isEmpty()) {
+    if (auto* fonts = window.findChild<QFontComboBox*>(QStringLiteral("textFontCombo")); fonts != nullptr) {
+      fonts->setCurrentFont(QFont(family));
+      QApplication::processEvents();
+    }
+  }
+  const auto at = [&](int x, int y) { return session.canvas->widget_position_for_document_point(QPoint(x, y)); };
+  const auto start = at(width / 10, height / 6);
+  send_mouse(*session.canvas, QEvent::MouseButtonPress, start, Qt::LeftButton, Qt::LeftButton);
+  if (box) {
+    const auto end = at(width * 8 / 10, height * 8 / 10);
+    send_mouse(*session.canvas, QEvent::MouseMove, (start + end) / 2, Qt::NoButton, Qt::LeftButton);
+    send_mouse(*session.canvas, QEvent::MouseMove, end, Qt::NoButton, Qt::LeftButton);
+    send_mouse(*session.canvas, QEvent::MouseButtonRelease, end, Qt::LeftButton, Qt::NoButton);
+  } else {
+    send_mouse(*session.canvas, QEvent::MouseButtonRelease, start, Qt::LeftButton, Qt::NoButton);
+  }
+  const auto wait = [](int ms) {
+    const auto started = Clock::now();
+    while (std::chrono::duration<double, std::milli>(Clock::now() - started).count() < ms) {
+      QApplication::processEvents(QEventLoop::AllEvents, 10);
+    }
+  };
+  wait(200);
+  session.editor = session.canvas->findChild<QTextEdit*>(QStringLiteral("inlineTextEditor"));
+  session.size = window.findChild<QDoubleSpinBox*>(QStringLiteral("textSizeSpin"));
+  CHECK(session.editor != nullptr);
+  CHECK(session.size != nullptr);
+  if (session.editor == nullptr || session.size == nullptr) {
+    return std::nullopt;
+  }
+  for (auto* label : window.findChildren<QLabel*>()) {
+    if (label->isVisible() && label->buddy() == nullptr && label->property("optionLabel").toBool() &&
+        label->text() == QStringLiteral("Size")) {
+      session.label = label;
+    }
+  }
+  CHECK(session.label != nullptr);
+  if (session.label == nullptr) {
+    return std::nullopt;
+  }
+  const auto text = qEnvironmentVariableIsSet("PATCHY_PERF_TEXTSCRUB_TEXT")
+                        ? qEnvironmentVariable("PATCHY_PERF_TEXTSCRUB_TEXT")
+                        : QStringLiteral("Type");
+  session.editor->textCursor().insertText(text);
+  wait(100);
+  session.editor->selectAll();
+  session.size->setValue(139.0);
+  wait(200);
+  session.editor->selectAll();
+  return session;
+}
+
+void text_size_scrub_perf() {
+  const auto summary = [](std::vector<double> values) {
+    std::ostringstream text;
+    if (values.empty()) {
+      text << "n=0";
+      return text.str();
+    }
+    double total = 0.0;
+    for (const auto value : values) {
+      total += value;
+    }
+    std::sort(values.begin(), values.end());
+    text << std::fixed << std::setprecision(2) << "avg=" << total / static_cast<double>(values.size())
+         << " median=" << values[values.size() / 2] << " max=" << values.back();
+    return text.str();
+  };
+  constexpr int kSteps = 40;
+  constexpr double kStepPoints = 2.25;  // nine pixels of pointer travel at 0.25 pt a pixel
+  for (const bool box : {false, true}) {
+    patchy::ui::MainWindow window;
+    window.resize(1600, 1000);
+    if (qEnvironmentVariableIsSet("PATCHY_PERF_ONSCREEN")) {
+      window.showMaximized();
+    } else {
+      window.show();
+    }
+    QApplication::processEvents();
+    const auto session = start_text_scrub_session(window, box);
+    if (!session.has_value()) {
+      return;
+    }
+    auto* canvas = session->canvas;
+    auto* editor = session->editor;
+    auto* size = session->size;
+    const char* kind = box ? "box" : "point";
+    const auto& doc = std::as_const(patchy::ui::MainWindowTestAccess::document(window));
+    std::cout << "[PERF] textscrub kind=" << kind << " document=" << doc.width() << 'x' << doc.height() << " ppi="
+              << doc.print_settings().horizontal_ppi << " zoom=" << canvas->zoom() << " font=\""
+              << editor->currentFont().family().toStdString() << "\" editor=" << editor->width() << 'x'
+              << editor->height() << " platform=" << QGuiApplication::platformName().toStdString()
+              << " threads=" << patchy::hardware_worker_threads() << '\n';
+
+    // Each part of a size step by itself, in the order apply_text_size_to_active_editor
+    // and the field's valueChanged run them.
+    std::vector<double> apply_ms, relayout_ms, schedule_ms, preview_ms, color_ms, info_ms, paint_ms, step_ms;
+    for (int step = 1; step <= kSteps; ++step) {
+      const double points = 139.0 + kStepPoints * step;
+      const auto started = Clock::now();
+      apply_ms.push_back(elapsed_ms(
+          [&] { patchy::ui::MainWindowTestAccess::apply_text_size_to_editor(window, *editor, points); }));
+      relayout_ms.push_back(
+          elapsed_ms([&] { patchy::ui::MainWindowTestAccess::relayout_text_editor(window, editor); }));
+      schedule_ms.push_back(
+          elapsed_ms([&] { patchy::ui::MainWindowTestAccess::schedule_text_editor_preview(window, editor); }));
+      preview_ms.push_back(
+          elapsed_ms([&] { patchy::ui::MainWindowTestAccess::update_text_editor_preview(window, editor); }));
+      color_ms.push_back(elapsed_ms([&] { patchy::ui::MainWindowTestAccess::refresh_text_color_button(window); }));
+      info_ms.push_back(elapsed_ms([&] { patchy::ui::MainWindowTestAccess::refresh_document_info(window); }));
+      paint_ms.push_back(elapsed_ms([&] {
+        canvas->repaint();
+        QApplication::processEvents();
+      }));
+      step_ms.push_back(std::chrono::duration<double, std::milli>(Clock::now() - started).count());
+    }
+    std::cout << "[PERF] textscrub kind=" << kind << " split apply_text_size " << summary(apply_ms) << '\n'
+              << "[PERF] textscrub kind=" << kind << " split relayout " << summary(relayout_ms) << '\n'
+              << "[PERF] textscrub kind=" << kind << " split schedule_preview " << summary(schedule_ms) << '\n'
+              << "[PERF] textscrub kind=" << kind << " split preview_render " << summary(preview_ms) << '\n'
+              << "[PERF] textscrub kind=" << kind << " split color_button " << summary(color_ms) << '\n'
+              << "[PERF] textscrub kind=" << kind << " split document_info " << summary(info_ms) << '\n'
+              << "[PERF] textscrub kind=" << kind << " split repaint_and_events " << summary(paint_ms) << '\n'
+              << "[PERF] textscrub kind=" << kind << " split whole_step " << summary(step_ms) << '\n';
+
+    // The same steps as real moves on the Size label.
+    size->setValue(139.0);
+    QApplication::processEvents();
+    int values = 0;
+    const auto counter =
+        QObject::connect(size, &QDoubleSpinBox::valueChanged, size, [&values](double) { ++values; });
+    auto* label = session->label;
+    const auto origin = label->rect().center();
+    const int drag_start = QApplication::startDragDistance();
+    send_mouse(*label, QEvent::MouseButtonPress, origin, Qt::LeftButton, Qt::LeftButton);
+    send_mouse(*label, QEvent::MouseMove, origin + QPoint(drag_start, 0), Qt::NoButton, Qt::LeftButton);
+    QApplication::processEvents();
+    values = 0;
+    std::vector<double> move_ms;
+    for (int step = 1; step <= kSteps; ++step) {
+      move_ms.push_back(elapsed_ms([&] {
+        send_mouse(*label, QEvent::MouseMove, origin + QPoint(drag_start + step * 9, 0), Qt::NoButton,
+                   Qt::LeftButton);
+        canvas->repaint();
+        QApplication::processEvents();
+      }));
+    }
+    const auto release_ms = elapsed_ms([&] {
+      send_mouse(*label, QEvent::MouseButtonRelease, origin + QPoint(drag_start + kSteps * 9, 0), Qt::LeftButton,
+                 Qt::NoButton);
+      canvas->repaint();
+      QApplication::processEvents();
+    });
+    std::cout << "[PERF] textscrub kind=" << kind << " scrub moves=" << kSteps << " values=" << values
+              << " size_pt=" << size->value() << " move_ms " << summary(move_ms) << " release_ms=" << release_ms
+              << '\n';
+
+    // One-pixel moves, a quarter point each: the text has whole pixels, so the steps that
+    // land on the pixel size it already has leave the session alone.
+    {
+      size->setValue(139.0);
+      QApplication::processEvents();
+      send_mouse(*label, QEvent::MouseButtonPress, origin, Qt::LeftButton, Qt::LeftButton);
+      send_mouse(*label, QEvent::MouseMove, origin + QPoint(drag_start, 0), Qt::NoButton, Qt::LeftButton);
+      QApplication::processEvents();
+      values = 0;
+      constexpr int kFineMoves = 120;
+      const auto marks = [&] { return editor->property("patchy.caretLayoutGeneration").toInt(); };
+      const auto marks_before = marks();
+      std::vector<double> fine_ms;
+      for (int step = 1; step <= kFineMoves; ++step) {
+        fine_ms.push_back(elapsed_ms([&] {
+          send_mouse(*label, QEvent::MouseMove, origin + QPoint(drag_start + step, 0), Qt::NoButton,
+                     Qt::LeftButton);
+          canvas->repaint();
+          QApplication::processEvents();
+        }));
+      }
+      const auto session_marks = marks() - marks_before;
+      send_mouse(*label, QEvent::MouseButtonRelease, origin + QPoint(drag_start + kFineMoves, 0), Qt::LeftButton,
+                 Qt::NoButton);
+      QApplication::processEvents();
+      std::cout << "[PERF] textscrub kind=" << kind << " fine_scrub moves=" << kFineMoves << " values=" << values
+                << " session_marks=" << session_marks << " size_pt=" << size->value() << " text_px="
+                << editor->property("patchy.documentTextSize").toInt() << " move_ms " << summary(fine_ms) << '\n';
+    }
+
+    // A burst of queued moves, as Wayland delivers a fast pointer behind a slow step.
+    for (const bool coalescing : {false, true}) {
+      constexpr int kBurst = 120;
+      patchy::ui::set_scrub_move_coalescing_for_testing(coalescing ? patchy::ui::ScrubMoveCoalescing::AllMoves
+                                                                   : patchy::ui::ScrubMoveCoalescing::Off);
+      size->setValue(139.0);
+      QApplication::processEvents();
+      send_mouse(*label, QEvent::MouseButtonPress, origin, Qt::LeftButton, Qt::LeftButton);
+      send_mouse(*label, QEvent::MouseMove, origin + QPoint(drag_start, 0), Qt::NoButton, Qt::LeftButton);
+      QApplication::processEvents();
+      canvas->repaint();
+      values = 0;
+      // Each move is built when its turn in the queue comes: a scrub reads the global
+      // position, and on Qt 6.8 mouse events built up front share their point with the
+      // pointing device, so a posted batch reports the wrong global positions.
+      for (int move = 1; move <= kBurst; ++move) {
+        const auto position = origin + QPoint(drag_start + move * 3, 0);
+        QMetaObject::invokeMethod(
+            label, [label, position] { send_mouse(*label, QEvent::MouseMove, position, Qt::NoButton, Qt::LeftButton); },
+            Qt::QueuedConnection);
+      }
+      const auto burst_ms = elapsed_ms([&] {
+        QApplication::processEvents();
+        QApplication::processEvents();
+        canvas->repaint();
+      });
+      const int applied = values;
+      const double burst_points = size->value();
+      send_mouse(*label, QEvent::MouseButtonRelease, origin + QPoint(drag_start + kBurst * 3, 0), Qt::LeftButton,
+                 Qt::NoButton);
+      QApplication::processEvents();
+      std::cout << std::fixed << std::setprecision(2) << "[PERF] textscrub kind=" << kind
+                << " burst coalescing=" << (coalescing ? "on" : "off") << " moves=" << kBurst << " applied="
+                << applied << " size_pt=" << burst_points << " after_release_pt=" << size->value() << " text_px="
+                << editor->property("patchy.documentTextSize").toInt() << " burst_ms=" << burst_ms << '\n';
+    }
+    patchy::ui::set_scrub_move_coalescing_for_testing(patchy::ui::ScrubMoveCoalescing::Default);
+    QObject::disconnect(counter);
+    send_key(*editor, Qt::Key_Escape);
+    QApplication::processEvents();
+  }
+}
+
+void text_size_scrub_live_perf() {
+  class Recorder : public QObject {
+   public:
+    QWidget* canvas{nullptr};
+    bool button_down{false};
+    bool released{false};
+    int moves{0};
+    int paints{0};
+    std::vector<double> move_delay_ms;
+    std::vector<double> paint_gap_ms;
+    double last_paint_ms{-1.0};
+    double first_move_ms{-1.0};
+    double release_ms{-1.0};
+    double release_timestamp_ms{-1.0};
+
+    static double now_ms() {
+      // steady_clock is CLOCK_MONOTONIC on Linux, the clock Wayland input timestamps use.
+      return static_cast<double>(
+          std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now().time_since_epoch()).count());
+    }
+
+   protected:
+    bool eventFilter(QObject* watched, QEvent* event) override {
+      const auto now = now_ms();
+      const auto since = [now](ulong stamp) {
+        return static_cast<double>(static_cast<std::int32_t>(
+            static_cast<std::uint32_t>(static_cast<std::uint64_t>(now)) - static_cast<std::uint32_t>(stamp)));
+      };
+      if (watched == canvas) {
+        if (event->type() == QEvent::Paint && button_down && first_move_ms >= 0.0) {
+          ++paints;
+          if (last_paint_ms >= 0.0) {
+            paint_gap_ms.push_back(now - last_paint_ms);
+          }
+          last_paint_ms = now;
+        }
+        return QObject::eventFilter(watched, event);
+      }
+      switch (event->type()) {
+        case QEvent::MouseButtonPress:
+          button_down = true;
+          break;
+        case QEvent::MouseMove:
+          if (button_down && event->spontaneous()) {
+            ++moves;
+            if (first_move_ms < 0.0) {
+              first_move_ms = now;
+            }
+            move_delay_ms.push_back(since(static_cast<QMouseEvent*>(event)->timestamp()));
+          }
+          break;
+        case QEvent::MouseButtonRelease:
+          if (button_down) {
+            button_down = false;
+            released = true;
+            release_ms = now;
+            release_timestamp_ms = now - since(static_cast<QMouseEvent*>(event)->timestamp());
+          }
+          break;
+        default:
+          break;
+      }
+      return QObject::eventFilter(watched, event);
+    }
+  };
+  const auto summary = [](std::vector<double> values) {
+    std::ostringstream text;
+    if (values.empty()) {
+      text << "n=0";
+      return text.str();
+    }
+    std::sort(values.begin(), values.end());
+    text << std::fixed << std::setprecision(1) << "median=" << values[values.size() / 2]
+         << " p95=" << values[std::min(values.size() - 1, values.size() * 95 / 100)] << " max=" << values.back();
+    return text.str();
+  };
+
+  patchy::ui::MainWindow window;
+  window.showFullScreen();
+  QApplication::processEvents();
+  const bool box = qEnvironmentVariable("PATCHY_PERF_TEXTSCRUB_KIND") != QStringLiteral("point");
+  const auto session = start_text_scrub_session(window, box);
+  if (!session.has_value()) {
+    return;
+  }
+  const auto coalesce_off = qEnvironmentVariable("PATCHY_PERF_LIVE_COALESCE") == QStringLiteral("off");
+  if (coalesce_off) {
+    patchy::ui::set_scrub_move_coalescing_for_testing(patchy::ui::ScrubMoveCoalescing::Off);
+  }
+  auto* size = session->size;
+  auto* label = session->label;
+  Recorder recorder;
+  recorder.canvas = session->canvas;
+  label->installEventFilter(&recorder);
+  session->canvas->installEventFilter(&recorder);
+  std::vector<double> value_gap_ms;
+  double last_value_ms = -1.0;
+  int values = 0;
+  QObject::connect(size, &QDoubleSpinBox::valueChanged, size, [&](double) {
+    const auto now = Recorder::now_ms();
+    ++values;
+    if (last_value_ms >= 0.0) {
+      value_gap_ms.push_back(now - last_value_ms);
+    }
+    last_value_ms = now;
+  });
+  const auto coalesced_before = patchy::ui::scrub_moves_coalesced_for_testing();
+  const auto screen = label->mapTo(&window, label->rect().center());
+  const auto ready_path = qEnvironmentVariable("PATCHY_PERF_LIVE_READY");
+  if (!ready_path.isEmpty()) {
+    QFile ready(ready_path);
+    if (ready.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
+      ready.write(QStringLiteral("%1 %2 %3 %4\n")
+                      .arg(screen.x())
+                      .arg(screen.y())
+                      .arg(window.width())
+                      .arg(window.height())
+                      .toUtf8());
+    }
+  }
+  std::cout << "[LIVE] ready x=" << screen.x() << " y=" << screen.y() << " window=" << window.width() << 'x'
+            << window.height() << " platform=" << QGuiApplication::platformName().toStdString() << std::endl;
+  const auto seconds = qEnvironmentVariableIsSet("PATCHY_PERF_LIVE_SECONDS")
+                           ? qEnvironmentVariableIntValue("PATCHY_PERF_LIVE_SECONDS")
+                           : 60;
+  const auto started = Clock::now();
+  while (!recorder.released && std::chrono::duration<double>(Clock::now() - started).count() < seconds) {
+    QApplication::processEvents(QEventLoop::WaitForMoreEvents, 50);
+  }
+  const auto drained = elapsed_ms([&] {
+    for (int pass = 0; pass < 5; ++pass) {
+      QApplication::processEvents();
+    }
+  });
+  std::cout << std::fixed << std::setprecision(1) << "[PERF] textscrub_live kind=" << (box ? "box" : "point")
+            << " coalescing=" << (coalesce_off ? "off" : "on") << " released=" << recorder.released
+            << " moves=" << recorder.moves << " values=" << values
+            << " coalesced=" << (patchy::ui::scrub_moves_coalesced_for_testing() - coalesced_before)
+            << " paints=" << recorder.paints << " scrub_ms=" << (recorder.release_ms - recorder.first_move_ms)
+            << " release_delay_ms=" << (recorder.release_ms - recorder.release_timestamp_ms)
+            << " size_pt=" << size->value() << " drain_ms=" << drained << '\n'
+            << "[PERF] textscrub_live move_delay_ms " << summary(recorder.move_delay_ms) << '\n'
+            << "[PERF] textscrub_live value_gap_ms " << summary(value_gap_ms) << '\n'
+            << "[PERF] textscrub_live paint_gap_ms " << summary(recorder.paint_gap_ms) << '\n';
+}
+
+// PDF open and export timing (September 2026 report: an 86 MB, 85-page scanned
+// PDF took minutes to open and saved as 700 MB). The file comes from argv[2],
+// else PATCHY_PERF_PDF, else local-test-fixtures/pdf; PATCHY_PERF_PDF_PAGES
+// caps the page count (default 8, "all" for every page). PATCHY_UI_PROFILE=1
+// adds the per-stage lines from the import and export code itself.
+std::filesystem::path perf_pdf_path(int argc, char* argv[]) {
+  if (argc > 2) {
+    return patchy::ui::to_filesystem_path(QString::fromLocal8Bit(argv[2]));
+  }
+  const auto env_path = qgetenv("PATCHY_PERF_PDF");
+  if (!env_path.isEmpty()) {
+    return patchy::ui::to_filesystem_path(env_path);
+  }
+  return patchy::test::local_format_fixture_path("pdf", "C2_Kyoto_House_Plans_Compressed.pdf");
+}
+
+int perf_pdf_page_cap() {
+  const auto value = qgetenv("PATCHY_PERF_PDF_PAGES");
+  if (value.isEmpty()) {
+    return 8;
+  }
+  if (value == "all") {
+    return 1 << 20;
+  }
+  return std::max(1, value.toInt());
+}
+
+// The import dialog and the open path persist settings and recent files; keep a perf
+// run out of the real user store.
+void isolate_perf_settings() {
+  ensure_artifact_dir();
+  patchy::ui::set_app_settings_root(QStringLiteral("test-artifacts/perf-settings"));
+}
+
+void drive_perf_dialog(const std::shared_ptr<std::function<bool()>>& step, int attempts = 200000) {
+  QTimer::singleShot(25, [step, attempts] {
+    if ((*step)()) {
+      return;
+    }
+    if (attempts > 0) {
+      drive_perf_dialog(step, attempts - 1);
+    }
+  });
+}
+
+int pdf_page_count(const QString& path) {
+#ifdef PATCHY_PERF_HAVE_QPDF
+  QPdfDocument pdf;
+  if (pdf.load(path) == QPdfDocument::Error::None) {
+    return pdf.pageCount();
+  }
+#else
+  (void)path;
+#endif
+  return 1;
+}
+
+void pdf_open_perf_if_available(int argc, char* argv[]) {
+  const auto fs_path = perf_pdf_path(argc, argv);
+  if (!std::filesystem::exists(fs_path)) {
+    std::cout << "[SKIP] pdf fixture missing: " << fs_path.string() << '\n';
+    return;
+  }
+  if (!patchy::ui::pdf_import_is_available()) {
+    std::cout << "[SKIP] this build has no Qt PDF\n";
+    return;
+  }
+  isolate_perf_settings();
+  const QString path = patchy::ui::to_qstring(fs_path);
+  const int total_pages = pdf_page_count(path);
+  const int pages = std::min(total_pages, perf_pdf_page_cap());
+  std::cout << "[PERF] pdfopen file_bytes=" << QFileInfo(path).size() << " total_pages=" << total_pages
+            << " measured_pages=" << pages << '\n';
+
+  // PATCHY_PERF_PDF_GUI_ONLY=1 runs only the real open at the end (a big merge needs the memory).
+  const bool gui_only = qEnvironmentVariableIsSet("PATCHY_PERF_PDF_GUI_ONLY");
+#ifdef PATCHY_PERF_HAVE_QPDF
+  if (!gui_only) {
+    QPdfDocument pdf;
+    const auto load_ms = elapsed_ms([&] { (void)pdf.load(path); });
+    std::cout << "[PERF] pdfopen qpdf_load ms=" << load_ms << '\n';
+    double thumbs_ms = 0.0;
+    for (int page = 0; page < pages; ++page) {
+      const QSizeF points = pdf.pagePointSize(page);
+      const int width = std::max(1, static_cast<int>(std::lround(96.0 * points.width() / points.height())));
+      thumbs_ms += elapsed_ms([&] { (void)pdf.render(page, QSize(width, 96)); });
+    }
+    std::cout << "[PERF] pdfopen thumbnails pages=" << pages << " ms=" << thumbs_ms
+              << " per_page_ms=" << thumbs_ms / pages << " projected_all_pages_ms=" << thumbs_ms / pages * total_pages
+              << '\n';
+    // Where a full-size render spends its time: one page at full, half, and quarter
+    // size, with and without smoothing, run twice so the second pass is warm.
+    const QSizeF points = pdf.pagePointSize(0);
+    const QSize full(static_cast<int>(std::lround(points.width() / 72.0 * 300.0)),
+                     static_cast<int>(std::lround(points.height() / 72.0 * 300.0)));
+    QPdfDocumentRenderOptions aliased;
+    aliased.setRenderFlags(QPdfDocumentRenderOptions::RenderFlag::ImageAliased |
+                           QPdfDocumentRenderOptions::RenderFlag::TextAliased |
+                           QPdfDocumentRenderOptions::RenderFlag::PathAliased);
+    for (int pass = 0; pass < 2; ++pass) {
+      const auto full_ms = elapsed_ms([&] { (void)pdf.render(0, full); });
+      const auto aliased_ms = elapsed_ms([&] { (void)pdf.render(0, full, aliased); });
+      const auto half_ms = elapsed_ms([&] { (void)pdf.render(0, full / 2); });
+      const auto quarter_ms = elapsed_ms([&] { (void)pdf.render(0, full / 4); });
+      const auto other_ms = elapsed_ms([&] { (void)pdf.render(std::min(1, total_pages - 1), full); });
+      std::cout << "[PERF] pdfopen render_variants pass=" << pass << " full_ms=" << full_ms
+                << " full_aliased_ms=" << aliased_ms << " half_ms=" << half_ms << " quarter_ms=" << quarter_ms
+                << " other_page_full_ms=" << other_ms << '\n';
+    }
+    QImage scratch;
+    const auto alloc_ms = elapsed_ms([&] {
+      scratch = QImage(full, QImage::Format_ARGB32_Premultiplied);
+      scratch.fill(Qt::transparent);
+    });
+    std::cout << "[PERF] pdfopen alloc_fill_full_argb ms=" << alloc_ms << '\n';
+  }
+#endif
+
+  if (!gui_only) {
+    QFile file(path);
+    CHECK(file.open(QIODevice::ReadOnly));
+    QByteArray bytes;
+    const auto read_ms = elapsed_ms([&] { bytes = file.readAll(); });
+    std::cout << "[PERF] pdfopen read_file ms=" << read_ms << '\n';
+    const std::span<const std::uint8_t> span(reinterpret_cast<const std::uint8_t*>(bytes.constData()),
+                                             static_cast<std::size_t>(bytes.size()));
+    double vector_ms = 0.0;
+    int failed = 0;
+    int layers = 0;
+    for (int page = 0; page < pages; ++page) {
+      patchy::pdf::VectorReadOptions options;
+      options.page = page;
+      options.pixels_per_point = 300.0 / 72.0;
+      vector_ms += elapsed_ms([&] {
+        try {
+          const auto result = patchy::pdf::read_page_as_vectors(span, options);
+          layers += static_cast<int>(result.document.layers().size());
+        } catch (const std::exception&) {
+          ++failed;
+        }
+      });
+    }
+    std::cout << "[PERF] pdfopen vector_reader pages=" << pages << " ms=" << vector_ms
+              << " per_page_ms=" << vector_ms / pages << " failed_pages=" << failed << " layers=" << layers << '\n';
+  }
+
+  if (!gui_only) {
+    patchy::ui::PdfImportOptions options;
+    for (int page = 0; page < pages; ++page) {
+      options.pages.push_back(page);
+    }
+    options.separate_documents = true;
+    QString error;
+    std::optional<patchy::ui::PdfImportResult> result;
+    const auto raster_ms =
+        elapsed_ms([&] { result = patchy::ui::load_pdf_document(path, options, QString(), &error); });
+    CHECK(result.has_value());
+    std::cout << "[PERF] pdfopen raster_import pages=" << pages << " ms=" << raster_ms
+              << " per_page_ms=" << raster_ms / pages << '\n';
+  }
+
+  // The real thing: File > Open through the import dialog with its stored defaults
+  // (editable, separate documents), the first `pages` pages selected.
+  // PATCHY_PERF_PDF_TARGET=documents|layers|artboards picks "Pages become" and
+  // PATCHY_PERF_PDF_PPI the resolution. A 5 ms timer measures how long the UI thread goes
+  // without an event-loop turn after the dialog is accepted (the stalls a user sees as a
+  // frozen window) and records which progress dialogs come up.
+  {
+    patchy::ui::MainWindow window;
+    window.resize(1600, 1000);
+    window.show();
+    QApplication::processEvents();
+    const auto started = Clock::now();
+    const auto since_start = [started] {
+      return std::chrono::duration<double, std::milli>(Clock::now() - started).count();
+    };
+    const QString target = QString::fromLocal8Bit(qgetenv("PATCHY_PERF_PDF_TARGET"));
+    const QString ppi = QString::fromLocal8Bit(qgetenv("PATCHY_PERF_PDF_PPI"));
+    struct Stall {
+      double at_ms;
+      double gap_ms;
+    };
+    struct SeenDialog {
+      QPointer<QProgressDialog> dialog;
+      QString name;
+      QString first_label;
+      QString last_label;
+      int maximum{0};
+      double shown_at_ms{0.0};
+    };
+    auto stalls = std::make_shared<std::vector<Stall>>();
+    auto seen = std::make_shared<std::vector<SeenDialog>>();
+    auto last_tick_ms = std::make_shared<double>(-1.0);
+    QTimer watch;
+    watch.setInterval(5);
+    watch.setTimerType(Qt::PreciseTimer);
+    QObject::connect(&watch, &QTimer::timeout, &window, [=] {
+      const double now = since_start();
+      if (*last_tick_ms >= 0.0 && now - *last_tick_ms >= 200.0) {
+        stalls->push_back({*last_tick_ms, now - *last_tick_ms});
+      }
+      *last_tick_ms = now;
+      for (auto* widget : QApplication::topLevelWidgets()) {
+        auto* progress = qobject_cast<QProgressDialog*>(widget);
+        if (progress == nullptr || !progress->isVisible()) {
+          continue;
+        }
+        const auto found = std::find_if(seen->begin(), seen->end(), [progress](const SeenDialog& entry) {
+          return entry.dialog == progress;
+        });
+        if (found == seen->end()) {
+          seen->push_back({progress, progress->objectName(), progress->labelText(), progress->labelText(),
+                           progress->maximum(), now});
+        } else {
+          found->last_label = progress->labelText();
+          found->maximum = progress->maximum();
+        }
+      }
+    });
+    auto dialog_shown_ms = std::make_shared<double>(-1.0);
+    auto step = std::make_shared<std::function<bool()>>();
+    *step = [pages, started, dialog_shown_ms, target, ppi, last_tick_ms, &watch] {
+      QDialog* dialog = nullptr;
+      for (auto* widget : QApplication::topLevelWidgets()) {
+        if (widget->objectName() == QStringLiteral("pdfImportDialog") && widget->isVisible()) {
+          dialog = qobject_cast<QDialog*>(widget);
+        }
+      }
+      if (dialog == nullptr) {
+        return false;
+      }
+      *dialog_shown_ms = std::chrono::duration<double, std::milli>(Clock::now() - started).count();
+      auto* list = dialog->findChild<QListWidget*>(QStringLiteral("pdfImportPagesList"));
+      auto* import_button = dialog->findChild<QPushButton*>(QStringLiteral("pdfImportButton"));
+      if (list == nullptr || import_button == nullptr) {
+        return false;
+      }
+      list->clearSelection();
+      for (int row = 0; row < std::min(pages, list->count()); ++row) {
+        list->item(row)->setSelected(true);
+      }
+      if (auto* target_combo = dialog->findChild<QComboBox*>(QStringLiteral("pdfImportPagesTargetCombo"));
+          target_combo != nullptr && !target.isEmpty()) {
+        target_combo->setCurrentIndex(std::max(0, target_combo->findData(target)));
+      }
+      if (auto* resolution = dialog->findChild<QComboBox*>(QStringLiteral("pdfImportResolutionCombo"));
+          resolution != nullptr && !ppi.isEmpty()) {
+        resolution->setCurrentText(ppi);
+      }
+      if (auto* size_label = dialog->findChild<QLabel*>(QStringLiteral("pdfImportSizeLabel")); size_label != nullptr) {
+        std::cout << "[PERF] pdfopen size_label=\"" << clean_name(size_label->text().toStdString()) << "\"\n";
+      }
+      *last_tick_ms = -1.0;
+      watch.start();
+      import_button->click();
+      return true;
+    };
+    drive_perf_dialog(step);
+    const auto open_ms = elapsed_ms([&] {
+      patchy::ui::MainWindowTestAccess::open_document_path(window, path);
+      QApplication::processEvents();
+    });
+    // A very large canvas gets its first frame from a worker after the open returns: time
+    // until the picture is there, with the stall watch still running.
+    double first_frame_ms = open_ms;
+    if (auto* canvas = patchy::ui::MainWindowTestAccess::canvas(window); canvas != nullptr) {
+      const auto deadline = Clock::now() + std::chrono::minutes(15);
+      while (!canvas->render_settled() && Clock::now() < deadline) {
+        QApplication::processEvents(QEventLoop::AllEvents, 20);
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+      }
+      first_frame_ms = since_start();
+      QApplication::processEvents();
+    }
+    watch.stop();
+    // The last stretch has no tick after it when the open returns mid-stall.
+    if (*last_tick_ms >= 0.0 && since_start() - *last_tick_ms >= 200.0) {
+      stalls->push_back({*last_tick_ms, since_start() - *last_tick_ms});
+    }
+    std::cout << "[PERF] pdfopen gui_open pages=" << pages << " dialog_shown_ms=" << *dialog_shown_ms
+              << " total_ms=" << open_ms << " after_dialog_ms=" << open_ms - *dialog_shown_ms
+              << " after_dialog_per_page_ms=" << (open_ms - *dialog_shown_ms) / pages
+              << " first_frame_after_dialog_ms=" << first_frame_ms - *dialog_shown_ms << '\n';
+    CHECK(patchy::ui::MainWindowTestAccess::has_document(window));
+    if (!patchy::ui::MainWindowTestAccess::has_document(window)) {
+      return;
+    }
+    const auto& opened = std::as_const(patchy::ui::MainWindowTestAccess::document(window));
+    double longest = 0.0;
+    double stalled = 0.0;
+    for (const auto& stall : *stalls) {
+      longest = std::max(longest, stall.gap_ms);
+      stalled += stall.gap_ms;
+      std::cout << "[PERF] pdfopen ui_stall at_ms=" << stall.at_ms - *dialog_shown_ms << " gap_ms=" << stall.gap_ms
+                << '\n';
+    }
+    std::cout << "[PERF] pdfopen gui_open_result target=" << (target.isEmpty() ? "stored" : target.toStdString())
+              << " canvas=" << opened.width() << "x" << opened.height() << " top_layers=" << opened.layers().size()
+              << " stalls_over_200ms=" << stalls->size() << " longest_stall_ms=" << longest
+              << " stalled_total_ms=" << stalled << '\n';
+    for (const auto& entry : *seen) {
+      std::cout << "[PERF] pdfopen progress_dialog name=" << entry.name.toStdString()
+                << " shown_at_ms=" << entry.shown_at_ms - *dialog_shown_ms << " maximum=" << entry.maximum
+                << " first=\"" << clean_name(entry.first_label.toStdString()) << "\" last=\""
+                << clean_name(entry.last_label.toStdString()) << "\"\n";
+    }
+  }
+}
+
+void pdf_save_perf_if_available(int argc, char* argv[]) {
+  const auto fs_path = perf_pdf_path(argc, argv);
+  if (!std::filesystem::exists(fs_path)) {
+    std::cout << "[SKIP] pdf fixture missing: " << fs_path.string() << '\n';
+    return;
+  }
+  if (!patchy::ui::pdf_import_is_available()) {
+    std::cout << "[SKIP] this build has no Qt PDF\n";
+    return;
+  }
+  isolate_perf_settings();
+  const QString path = patchy::ui::to_qstring(fs_path);
+  const int total_pages = pdf_page_count(path);
+  const int pages = std::min(total_pages, perf_pdf_page_cap());
+
+  patchy::ui::PdfImportOptions import_options;
+  for (int page = 0; page < pages; ++page) {
+    import_options.pages.push_back(page);
+  }
+  import_options.separate_documents = true;
+  QString error;
+  auto imported = patchy::ui::load_pdf_document(path, import_options, QString(), &error);
+  CHECK(imported.has_value());
+  std::vector<const patchy::Document*> documents{&imported->document};
+  for (const auto& extra : imported->extra_documents) {
+    documents.push_back(&extra.document);
+  }
+  const double source_bytes_per_page = static_cast<double>(QFileInfo(path).size()) / total_pages;
+  std::cout << "[PERF] pdfsave pages=" << documents.size() << " source_bytes_per_page=" << source_bytes_per_page
+            << '\n';
+
+  struct Mode {
+    const char* name;
+    patchy::ui::PdfExportOptions options;
+  };
+  std::vector<Mode> modes;
+  // The dialog default (editable on, the "high" preset), then each preset flat.
+  {
+    // What an untouched import exports as: every page's original bytes.
+    patchy::ui::PdfExportOptions pass_through;
+    patchy::ui::apply_pdf_image_quality(QLatin1String(patchy::ui::kDefaultPdfImageQualityId), pass_through);
+    pass_through.editable_layers = true;
+    modes.push_back({"pass_through_default", pass_through});
+  }
+  for (const auto& preset : patchy::ui::pdf_image_quality_presets()) {
+    patchy::ui::PdfExportOptions options;
+    patchy::ui::apply_pdf_image_quality(QLatin1String(preset.id), options);
+    options.keep_original_image_data = false;  // time the encoders, not the pass-through
+    if (QLatin1String(preset.id) == QLatin1String(patchy::ui::kDefaultPdfImageQualityId)) {
+      auto editable = options;
+      editable.editable_layers = true;
+      modes.push_back({"editable_default", editable});
+    }
+    modes.push_back({preset.id, options});
+  }
+  for (const auto& mode : modes) {
+    const auto out = QStringLiteral("test-artifacts/perf_pdfsave_%1.pdf").arg(QLatin1String(mode.name));
+    QFile::remove(out);
+    std::vector<std::string> notices;
+    const auto ms = elapsed_ms([&] {
+      CHECK(patchy::ui::write_multipage_pdf_file(documents, out, mode.options, &notices));
+    });
+    const auto bytes = QFileInfo(out).size();
+    std::cout << "[PERF] pdfsave " << mode.name << " pages=" << documents.size() << " ms=" << ms
+              << " per_page_ms=" << ms / static_cast<double>(documents.size()) << " bytes=" << bytes
+              << " bytes_per_page=" << bytes / static_cast<qint64>(documents.size())
+              << " vs_source=" << (bytes / static_cast<double>(documents.size())) / source_bytes_per_page << "x\n";
+    if (!qEnvironmentVariableIsSet("PATCHY_PERF_PDF_KEEP")) {
+      QFile::remove(out);
+    }
+  }
+}
+
+}  // namespace
+
+// GitHub issue 165: fast brush strokes on a 4872x6836 image came out as straight
+// segments. Times what one mouse move and the following paint cost at fit zoom
+// and at 100%, for a small and a large brush; no fixture needed.
+// GitHub #200: a Warp Transform handle drag on a large image. A 6000x4000 noise
+// layer over a white backdrop; one corner handle drags at fit zoom and one interior
+// handle at 100%. Each frame is the mouse move plus its repaint. Asserts the frame
+// ceiling, prints the numbers, and saves a mid-drag and a resting capture per zoom.
+void warp_drag_perf() {
+  ensure_artifact_dir();
+  constexpr int kWidth = 6000;
+  constexpr int kHeight = 4000;
+  patchy::Document document(kWidth, kHeight, patchy::PixelFormat::rgba8());
+  patchy::PixelBuffer backdrop(kWidth, kHeight, patchy::PixelFormat::rgba8());
+  backdrop.clear(255);
+  document.add_layer(patchy::Layer(document.allocate_layer_id(), "Backdrop", std::move(backdrop)));
+  // Smooth bands plus noise: the captures show the bend, the noise keeps every
+  // sample distinct so no path can shortcut on flat color.
+  patchy::PixelBuffer art(kWidth, kHeight, patchy::PixelFormat::rgba8());
+  std::uint64_t seed = 0x9E3779B97F4A7C15ULL;
+  for (int y = 0; y < kHeight; ++y) {
+    auto row = art.row(y);
+    for (int x = 0; x < kWidth; ++x) {
+      seed += 0x9E3779B97F4A7C15ULL;
+      auto z = seed;
+      z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ULL;
+      z = (z ^ (z >> 27)) * 0x94D049BB133111EBULL;
+      z ^= z >> 31;
+      const bool band = ((x / 400) + (y / 400)) % 2 == 0;
+      auto* pixel = row.data() + static_cast<std::size_t>(x) * 4U;
+      pixel[0] = static_cast<std::uint8_t>((band ? 200 : 40) + (z & 31U));
+      pixel[1] = static_cast<std::uint8_t>((band ? 90 : 150) + ((z >> 8) & 31U));
+      pixel[2] = static_cast<std::uint8_t>((band ? 40 : 200) + ((z >> 16) & 31U));
+      pixel[3] = 255;
+    }
+  }
+  patchy::Layer layer(document.allocate_layer_id(), "Warped", std::move(art));
+  const auto layer_id = layer.id();
+  document.add_layer(std::move(layer));
+
+  patchy::ui::MainWindow window;
+  window.resize(1600, 1000);
+  if (qEnvironmentVariableIsSet("PATCHY_PERF_ONSCREEN")) {
+    window.showMaximized();
+  } else {
+    window.show();
+  }
+  QApplication::processEvents();
+  window.add_document_session(std::move(document), QStringLiteral("Warp Drag Perf"));
+  QApplication::processEvents();
+  auto* canvas = active_canvas(window);
+  CHECK(canvas != nullptr);
+  const auto settle = [canvas] {
+    const auto started = Clock::now();
+    while (!canvas->render_settled() && std::chrono::duration<double>(Clock::now() - started).count() < 60.0) {
+      canvas->repaint();
+      QApplication::processEvents();
+    }
+  };
+  settle();
+  auto* layer_list = window.findChild<QListWidget*>(QStringLiteral("layerList"));
+  CHECK(layer_list != nullptr);
+  for (int row = 0; row < layer_list->count(); ++row) {
+    auto* item = layer_list->item(row);
+    if (static_cast<patchy::LayerId>(item->data(patchy::ui::kLayerIdRole).toULongLong()) == layer_id) {
+      layer_list->clearSelection();
+      layer_list->setCurrentItem(item);
+      item->setSelected(true);
+    }
+  }
+  QApplication::processEvents();
+  auto* warp_action = window.findChild<QAction*>(QStringLiteral("editWarpTransformAction"));
+  CHECK(warp_action != nullptr);
+
+  struct Result {
+    std::string zoom;
+    double median_ms{0.0};
+    double release_ms{0.0};
+  };
+  std::vector<Result> results;
+  for (const bool fit : {true, false}) {
+    // Corner handle (index 3, top right) at fit; an interior handle (index 5) at
+    // 100%, centered in the view so the whole drag stays on screen.
+    const int handle = fit ? 3 : 5;
+    canvas->fit_to_view();
+    settle();
+    const auto setup_started = Clock::now();
+    warp_action->trigger();
+    QApplication::processEvents();
+    const auto begin_ms = std::chrono::duration<double, std::milli>(Clock::now() - setup_started).count();
+    CHECK(canvas->warp_transform_active());
+    if (!fit) {
+      const auto handle_point = canvas->warp_handle_document_position(handle).toPoint();
+      canvas->zoom_to_document_rect(QRect(handle_point - QPoint(400, 250), QSize(800, 500)));
+      canvas->set_zoom_centered(1.0);
+      settle();
+    }
+    const auto handle_widget = canvas->widget_position_f(canvas->warp_handle_document_position(handle)).toPoint();
+    const QPoint step = fit ? QPoint(5, 4) : QPoint(-6, 5);
+    send_mouse(*canvas, QEvent::MouseButtonPress, handle_widget, Qt::LeftButton, Qt::LeftButton);
+    canvas->repaint();
+    constexpr int kFrames = 30;
+    std::vector<double> frames;
+    frames.reserve(kFrames);
+    for (int frame = 1; frame <= kFrames; ++frame) {
+      frames.push_back(elapsed_ms([&] {
+        send_mouse(*canvas, QEvent::MouseMove, handle_widget + step * frame, Qt::NoButton, Qt::LeftButton);
+        canvas->repaint();
+      }));
+    }
+    const auto zoom_name = std::string(fit ? "fit" : "100");
+    CHECK(canvas->grab().save(QString::fromStdString("test-artifacts/warp_drag_" + zoom_name + "_drag.png")));
+    const auto release_ms = elapsed_ms([&] {
+      send_mouse(*canvas, QEvent::MouseButtonRelease, handle_widget + step * kFrames, Qt::LeftButton,
+                 Qt::NoButton);
+      canvas->repaint();
+    });
+    CHECK(canvas->grab().save(QString::fromStdString("test-artifacts/warp_drag_" + zoom_name + "_rest.png")));
+    const auto commit_ms = elapsed_ms([&] {
+      send_key(*canvas, Qt::Key_Return);
+      settle();
+    });
+    CHECK(!canvas->warp_transform_active());
+    CHECK(canvas->grab().save(QString::fromStdString("test-artifacts/warp_drag_" + zoom_name + "_commit.png")));
+
+    auto sorted = frames;
+    std::sort(sorted.begin(), sorted.end());
+    double total = 0.0;
+    for (const auto value : frames) {
+      total += value;
+    }
+    std::cout << std::fixed << std::setprecision(1) << "[PERF] warpdrag " << kWidth << 'x' << kHeight
+              << " zoom=" << zoom_name << " (" << canvas->zoom() << ") begin_ms=" << begin_ms
+              << " first_frame_ms=" << frames.front() << " frame_avg_ms=" << total / kFrames
+              << " frame_median_ms=" << sorted[sorted.size() / 2] << " frame_max_ms=" << sorted.back()
+              << " release_ms=" << release_ms << " commit_ms=" << commit_ms
+              << " threads=" << patchy::hardware_worker_threads() << '\n';
+    results.push_back(Result{zoom_name, sorted[sorted.size() / 2], release_ms});
+    // Undo the bake so the next zoom drags the same unwarped layer.
+    patchy::ui::MainWindowTestAccess::undo(window);
+    settle();
+  }
+  // Ceilings: a drag frame must stay interactive, and the resting render on release
+  // is one bounded pass.
+  constexpr double kFrameCeilingMs = 100.0;
+  constexpr double kReleaseCeilingMs = 1000.0;
+  for (const auto& result : results) {
+    if (result.median_ms >= kFrameCeilingMs || result.release_ms >= kReleaseCeilingMs) {
+      std::cout << "[FAIL] warpdrag zoom=" << result.zoom << " over its ceiling\n";
+    }
+    CHECK(result.median_ms < kFrameCeilingMs);
+    CHECK(result.release_ms < kReleaseCeilingMs);
+  }
+}
+
+// GitHub #298: Warp Transform on the reporter's 2560x1440 JPEG (a single opened flat
+// layer, local-test-fixtures/issue-298/sample-1mb.jpg from samplelib.com). Times the
+// whole flow per case: entering Warp, a corner drag pulled deep into the image (one
+// move plus repaint per frame), a burst of 30 queued moves, the release, and the
+// commit, and prints a digest of the committed layer. PATCHY_PERF_WARPPHOTO_CASE
+// runs one case.
+void warp_photo_perf_if_available() {
+  const auto path = patchy::test::local_format_fixture_path("issue-298", "sample-1mb.jpg");
+  if (!std::filesystem::exists(path)) {
+    std::cout << "[SKIP] local-test-fixtures/issue-298/sample-1mb.jpg missing\n";
+    return;
+  }
+  ensure_artifact_dir();
+  struct Result {
+    std::string name;
+    double median_ms{0.0};
+    double burst_ms{0.0};
+    double release_ms{0.0};
+  };
+  std::vector<Result> results;
+  // view_zoom 0 = fit. 66% is a fit view on a 2x HiDPI screen: the whole layer on
+  // screen at a device zoom above 50%, so the preview composites at full resolution.
+  // The recording enters Warp from Free Transform's options-bar toggle.
+  struct Case {
+    std::string name;
+    QSize window_size;
+    double view_zoom{0.0};
+    bool from_free_transform{false};
+  };
+  for (const auto& [name, window_size, view_zoom, from_free_transform] :
+       {Case{"fit_large", QSize(1600, 1000), 0.0, false}, Case{"fit_small", QSize(1000, 640), 0.0, false},
+        Case{"zoom66", QSize(1900, 1150), 0.66, false}, Case{"fit_small_from_ft", QSize(1000, 640), 0.0, true}}) {
+    if (const auto only = qEnvironmentVariable("PATCHY_PERF_WARPPHOTO_CASE");
+        !only.isEmpty() && only != QString::fromStdString(name)) {
+      continue;
+    }
+    patchy::ui::MainWindow window;
+    window.resize(window_size);
+    window.show();
+    QApplication::processEvents();
+    patchy::ui::MainWindowTestAccess::open_document_path(window, patchy::ui::to_qstring(path));
+    QApplication::processEvents();
+    auto* canvas = active_canvas(window);
+    CHECK(canvas != nullptr);
+    const auto settle = [canvas] {
+      const auto started = Clock::now();
+      while (!canvas->render_settled() && std::chrono::duration<double>(Clock::now() - started).count() < 60.0) {
+        canvas->repaint();
+        QApplication::processEvents();
+      }
+    };
+    canvas->fit_to_view();
+    if (view_zoom > 0.0) {
+      canvas->set_view_zoom_centered(view_zoom);
+    }
+    settle();
+    auto* warp_action = window.findChild<QAction*>(QStringLiteral("editWarpTransformAction"));
+    CHECK(warp_action != nullptr);
+    if (from_free_transform) {
+      auto* free_transform_action = window.findChild<QAction*>(QStringLiteral("editFreeTransformAction"));
+      CHECK(free_transform_action != nullptr);
+      free_transform_action->trigger();
+      QApplication::processEvents();
+      settle();
+      CHECK(canvas->free_transform_active());
+    }
+    auto* warp_toggle = window.findChild<QPushButton*>(QStringLiteral("transformWarpModeButton"));
+    CHECK(warp_toggle != nullptr);
+    const auto begin_ms = elapsed_ms([&] {
+      if (from_free_transform) {
+        warp_toggle->click();
+      } else {
+        warp_action->trigger();
+      }
+      QApplication::processEvents();
+      canvas->repaint();
+    });
+    CHECK(canvas->warp_transform_active());
+    // The top-left corner pulled toward the middle, as in the issue's recording.
+    const auto handle_widget = canvas->widget_position_f(canvas->warp_handle_document_position(0)).toPoint();
+    const QPoint step(12, 7);
+    send_mouse(*canvas, QEvent::MouseButtonPress, handle_widget, Qt::LeftButton, Qt::LeftButton);
+    canvas->repaint();
+    constexpr int kFrames = 30;
+    std::vector<double> frames;
+    frames.reserve(kFrames);
+    for (int frame = 1; frame <= kFrames; ++frame) {
+      frames.push_back(elapsed_ms([&] {
+        send_mouse(*canvas, QEvent::MouseMove, handle_widget + step * frame, Qt::NoButton, Qt::LeftButton);
+        canvas->repaint();
+      }));
+    }
+    // A burst: 30 moves queued at once, the way a fast pointer delivers them while a
+    // frame renders. It ends where the steady drag did (30 % 5 == 30 % 3 == 0), so
+    // the release and commit match the drag above.
+    const auto drag_end = handle_widget + step * kFrames;
+    const auto burst_ms = elapsed_ms([&] {
+      for (int move = 1; move <= 30; ++move) {
+        const auto position = drag_end + QPoint(move % 5, move % 3);
+        QApplication::postEvent(canvas, new QMouseEvent(QEvent::MouseMove, QPointF(position),
+                                                        QPointF(canvas->mapToGlobal(position)), Qt::NoButton,
+                                                        Qt::LeftButton, Qt::NoModifier));
+      }
+      QApplication::processEvents();
+      canvas->repaint();
+    });
+    CHECK(canvas->grab().save(QString::fromStdString("test-artifacts/warp_photo_" + name + "_drag.png")));
+    const auto release_ms = elapsed_ms([&] {
+      send_mouse(*canvas, QEvent::MouseButtonRelease, handle_widget + step * kFrames, Qt::LeftButton, Qt::NoButton);
+      canvas->repaint();
+    });
+    CHECK(canvas->grab().save(QString::fromStdString("test-artifacts/warp_photo_" + name + "_rest.png")));
+    const auto commit_ms = elapsed_ms([&] {
+      send_key(*canvas, Qt::Key_Return);
+      settle();
+    });
+    CHECK(!canvas->warp_transform_active());
+    CHECK(canvas->grab().save(QString::fromStdString("test-artifacts/warp_photo_" + name + "_commit.png")));
+    // FNV-1a over the committed layer: the commit must stay byte-identical across
+    // preview optimizations.
+    std::uint64_t digest = 0xCBF29CE484222325ULL;
+    {
+      const auto& document = std::as_const(patchy::ui::MainWindowTestAccess::document(window));
+      const auto active = document.active_layer_id();
+      CHECK(active.has_value());
+      const auto& pixels = document.find_layer(*active)->pixels();
+      for (std::int32_t y = 0; y < pixels.height(); ++y) {
+        for (const auto byte : pixels.row(y)) {
+          digest = (digest ^ byte) * 0x100000001B3ULL;
+        }
+      }
+    }
+    auto sorted = frames;
+    std::sort(sorted.begin(), sorted.end());
+    double total = 0.0;
+    for (const auto value : frames) {
+      total += value;
+    }
+    std::cout << std::fixed << std::setprecision(1) << "[PERF] warpphoto 2560x1440 case=" << name << " view_zoom="
+              << canvas->view_zoom() << " begin_ms=" << begin_ms << " first_frame_ms=" << frames.front()
+              << " frame_avg_ms=" << total / kFrames << " frame_median_ms=" << sorted[sorted.size() / 2]
+              << " frame_max_ms=" << sorted.back() << " burst30_ms=" << burst_ms << " release_ms=" << release_ms
+              << " commit_ms=" << commit_ms << " threads=" << patchy::hardware_worker_threads()
+              << " commit_digest=" << std::hex << digest
+              << std::dec << '\n';
+    results.push_back(Result{name, sorted[sorted.size() / 2], burst_ms, release_ms});
+  }
+  // Ceilings (16-thread laptop, October 2026: before the fix the 70% case took 75 ms
+  // a frame and 5.5 s to drain the burst, the fit cases 0.2 to 0.6 s; after, every
+  // frame is under 30 ms and every burst under 50 ms). A burst over its ceiling
+  // means each queued move renders again.
+  constexpr double kFrameCeilingMs = 100.0;
+  constexpr double kBurstCeilingMs = 250.0;
+  constexpr double kReleaseCeilingMs = 1000.0;
+  for (const auto& result : results) {
+    if (result.median_ms >= kFrameCeilingMs || result.burst_ms >= kBurstCeilingMs ||
+        result.release_ms >= kReleaseCeilingMs) {
+      std::cout << "[FAIL] warpphoto case=" << result.name << " over its ceiling\n";
+    }
+    CHECK(result.median_ms < kFrameCeilingMs);
+    CHECK(result.burst_ms < kBurstCeilingMs);
+    CHECK(result.release_ms < kReleaseCeilingMs);
+  }
+}
+
+// GitHub #314: dragging a gradient-filled shape lagged, and on Wayland the app stopped
+// responding for half a minute after the second drag (1280x720 document at 67.64%).
+// The recording drags with Path Select: each mouse move re-baked the shape's gradient
+// and recomposited its region before the next move was read. Synthetic, so it runs
+// anywhere: two rounded-rectangle shapes with a five-stop gradient on a white layer,
+// dragged twice with Path Select and with the Move tool. Each drag times 20 moves with a
+// repaint after each, then a burst of 30 queued moves (a fast pointer while a frame
+// renders), then the release. PATCHY_PERF_GRADIENTDRAG_CASE runs one case.
+void gradient_shape_drag_perf() {
+  ensure_artifact_dir();
+  const auto rounded_gradient_shape = [](patchy::Document& document, const std::string& name, double left,
+                                         double top, double right, double bottom) {
+    patchy::LiveShapeParams params;
+    params.kind = patchy::LiveShapeKind::RoundedRectangle;
+    params.left = left;
+    params.top = top;
+    params.right = right;
+    params.bottom = bottom;
+    params.corner_radii = {40.0, 40.0, 40.0, 40.0};
+    patchy::VectorShapeContent shape;
+    shape.path.subpaths = patchy::generate_live_shape_subpaths(params);
+    shape.fill.kind = patchy::VectorFillKind::Gradient;
+    shape.fill.gradient.color_stops = {{0.0F, {22, 24, 28}},
+                                       {0.3F, {90, 96, 112}},
+                                       {0.5F, {240, 242, 250}},
+                                       {0.75F, {150, 152, 160}},
+                                       {1.0F, {30, 32, 38}}};
+    shape.fill.gradient.alpha_stops = {{0.0F, 1.0F}, {1.0F, 1.0F}};
+    patchy::Layer layer(document.allocate_layer_id(), name, patchy::LayerKind::Pixel);
+    layer.metadata()[patchy::kLayerMetadataVectorShape] = "1";
+    layer.set_vector_shape(std::move(shape));
+    patchy::update_vector_shape_raster(layer, patchy::Rect::from_size(document.width(), document.height()),
+                                       &std::as_const(document).metadata().patterns);
+    return layer;
+  };
+  struct Result {
+    std::string name;
+    double median_ms{0.0};
+    double burst_ms{0.0};
+    double release_ms{0.0};
+  };
+  std::vector<Result> results;
+  for (const auto tool : {patchy::ui::CanvasTool::PathSelect, patchy::ui::CanvasTool::Move}) {
+    const std::string name = tool == patchy::ui::CanvasTool::PathSelect ? "path_select" : "move";
+    if (const auto only = qEnvironmentVariable("PATCHY_PERF_GRADIENTDRAG_CASE");
+        !only.isEmpty() && only != QString::fromStdString(name)) {
+      continue;
+    }
+    patchy::Document document(1280, 720, patchy::PixelFormat::rgba8());
+    patchy::PixelBuffer backdrop(1280, 720, patchy::PixelFormat::rgba8());
+    backdrop.clear(255);
+    document.add_layer(patchy::Layer(document.allocate_layer_id(), "Background", std::move(backdrop)));
+    document.add_layer(rounded_gradient_shape(document, "Rounded Rectangle 1", 120.0, 100.0, 560.0, 500.0));
+    auto dragged = rounded_gradient_shape(document, "Rounded Rectangle 2", 600.0, 340.0, 880.0, 620.0);
+    const auto dragged_id = dragged.id();
+    const auto bounds_before = dragged.bounds();
+    document.add_layer(std::move(dragged));
+
+    patchy::ui::MainWindow window;
+    window.resize(1600, 1000);
+    window.show();
+    QApplication::processEvents();
+    window.add_document_session(std::move(document), QStringLiteral("Gradient Drag Perf"));
+    QApplication::processEvents();
+    auto* canvas = active_canvas(window);
+    CHECK(canvas != nullptr);
+    const auto settle = [canvas] {
+      const auto started = Clock::now();
+      while (!canvas->render_settled() && std::chrono::duration<double>(Clock::now() - started).count() < 60.0) {
+        canvas->repaint();
+        QApplication::processEvents();
+      }
+    };
+    settle();
+    auto* layer_list = window.findChild<QListWidget*>(QStringLiteral("layerList"));
+    CHECK(layer_list != nullptr);
+    for (int row = 0; row < layer_list->count(); ++row) {
+      auto* item = layer_list->item(row);
+      if (static_cast<patchy::LayerId>(item->data(patchy::ui::kLayerIdRole).toULongLong()) == dragged_id) {
+        layer_list->clearSelection();
+        layer_list->setCurrentItem(item);
+        item->setSelected(true);
+      }
+    }
+    QApplication::processEvents();
+    canvas->set_view_zoom_centered(0.6764);
+    canvas->set_tool(tool);
+    QApplication::processEvents();
+    settle();
+
+    const auto before = canvas->render_cache_diagnostics();
+    std::vector<double> frames;
+    double burst_ms = 0.0;
+    double release_ms = 0.0;
+    // Two drags of the same shape, as in the recording: up and left, then back (about
+    // 440 x 220 document pixels each way at this zoom, staying on the canvas).
+    QPoint position = canvas->widget_position_for_document_point(QPoint(740, 480));
+    for (int drag = 0; drag < 2; ++drag) {
+      const QPoint step = drag == 0 ? QPoint(-6, -3) : QPoint(6, 3);
+      send_mouse(*canvas, QEvent::MouseButtonPress, position, Qt::LeftButton, Qt::LeftButton);
+      canvas->repaint();
+      for (int frame = 1; frame <= 20; ++frame) {
+        position += step;
+        frames.push_back(elapsed_ms([&] {
+          send_mouse(*canvas, QEvent::MouseMove, position, Qt::NoButton, Qt::LeftButton);
+          QApplication::processEvents();
+          canvas->repaint();
+        }));
+      }
+      burst_ms = std::max(burst_ms, elapsed_ms([&] {
+        for (int move = 1; move <= 30; ++move) {
+          position += step;
+          QApplication::postEvent(canvas, new QMouseEvent(QEvent::MouseMove, QPointF(position),
+                                                          QPointF(canvas->mapToGlobal(position)), Qt::NoButton,
+                                                          Qt::LeftButton, Qt::NoModifier));
+        }
+        QApplication::processEvents();
+        QApplication::processEvents();  // the queued drag apply runs on the next pass
+        canvas->repaint();
+      }));
+      release_ms = std::max(release_ms, elapsed_ms([&] {
+        send_mouse(*canvas, QEvent::MouseButtonRelease, position, Qt::LeftButton, Qt::NoButton);
+        QApplication::processEvents();
+        canvas->repaint();
+      }));
+      CHECK(canvas->grab().save(
+          QString::fromStdString("test-artifacts/gradient_drag_" + name + "_" + std::to_string(drag + 1) + ".png")));
+    }
+    settle();
+    const auto after = canvas->render_cache_diagnostics();
+    const auto& final_document = std::as_const(patchy::ui::MainWindowTestAccess::document(window));
+    const auto* moved = final_document.find_layer(dragged_id);
+    CHECK(moved != nullptr);
+    // Both drags travel the same distance, so the shape ends where it started.
+    if (moved != nullptr) {
+      CHECK(std::abs(moved->bounds().x - bounds_before.x) <= 2);
+      CHECK(std::abs(moved->bounds().y - bounds_before.y) <= 2);
+    }
+    auto sorted = frames;
+    std::sort(sorted.begin(), sorted.end());
+    double total = 0.0;
+    for (const auto value : frames) {
+      total += value;
+    }
+    std::cout << std::fixed << std::setprecision(1) << "[PERF] gradientdrag 1280x720 case=" << name
+              << " view_zoom=" << canvas->view_zoom() << " frame_avg_ms=" << total / static_cast<double>(frames.size())
+              << " frame_median_ms=" << sorted[sorted.size() / 2] << " frame_max_ms=" << sorted.back()
+              << " burst30_ms=" << burst_ms << " release_ms=" << release_ms
+              << " path_drag_applies=" << (after.path_drag_applies - before.path_drag_applies)
+              << " proxy_previews=" << (after.move_proxy_previews - before.move_proxy_previews)
+              << " threads=" << patchy::hardware_worker_threads() << '\n';
+    results.push_back(Result{name, sorted[sorted.size() / 2], burst_ms, release_ms});
+  }
+  // Ceilings: a burst over its ceiling means each queued move applies again.
+  constexpr double kFrameCeilingMs = 100.0;
+  constexpr double kBurstCeilingMs = 250.0;
+  constexpr double kReleaseCeilingMs = 1000.0;
+  for (const auto& result : results) {
+    if (result.median_ms >= kFrameCeilingMs || result.burst_ms >= kBurstCeilingMs ||
+        result.release_ms >= kReleaseCeilingMs) {
+      std::cout << "[FAIL] gradientdrag case=" << result.name << " over its ceiling\n";
+    }
+    CHECK(result.median_ms < kFrameCeilingMs);
+    CHECK(result.burst_ms < kBurstCeilingMs);
+    CHECK(result.release_ms < kReleaseCeilingMs);
+  }
+}
+
+// GitHub #678: dragging a pentagon shape over a 3500 px photo with a layer of thick
+// brush strokes under it lagged; the shape trailed the pointer and jumped to catch up.
+// The recording drags with Path Select (its anchors show). Synthetic, so it runs
+// anywhere: a 3500x2300 noisy gradient "photo", a canvas-sized layer of thick black
+// strokes, and a 1300 px pentagon shape on top, viewed fit to the window. Cases: the
+// shape dragged with Path Select and with the Move tool, and a pixel layer holding the
+// same raster dragged with the Move tool (the reference). Each drag times 20 moves with
+// a repaint after each, a burst of 30 queued moves, the release and the settle after it.
+// PATCHY_PERF_SHAPEDRAG_CASE runs one case.
+void shape_over_photo_drag_perf() {
+  ensure_artifact_dir();
+  constexpr int kWidth = 3500;
+  constexpr int kHeight = 2300;
+  const auto pentagon = [](patchy::Document& document) {
+    patchy::LiveShapeParams params;
+    params.kind = patchy::LiveShapeKind::Polygon;
+    params.left = 1700.0;
+    params.top = 500.0;
+    params.right = 3000.0;
+    params.bottom = 1800.0;
+    params.polygon_sides = 5;
+    patchy::populate_live_shape_box_corners(params);
+    patchy::VectorShapeContent shape;
+    shape.path.subpaths = patchy::generate_live_shape_subpaths(params);
+    shape.origination.push_back(params);
+    shape.fill.kind = patchy::VectorFillKind::Solid;
+    shape.fill.color = {140, 128, 128};
+    patchy::Layer layer(document.allocate_layer_id(), "Polygon 1", patchy::LayerKind::Pixel);
+    layer.metadata()[patchy::kLayerMetadataVectorShape] = "1";
+    layer.set_vector_shape(std::move(shape));
+    patchy::update_vector_shape_raster(layer, patchy::Rect::from_size(document.width(), document.height()),
+                                       &std::as_const(document).metadata().patterns);
+    return layer;
+  };
+  const auto build_document = [&](bool pixel_twin) {
+    patchy::Document document(kWidth, kHeight, patchy::PixelFormat::rgba8());
+    patchy::PixelBuffer photo(kWidth, kHeight, patchy::PixelFormat::rgba8());
+    std::uint64_t state = 0x678;
+    const auto next = [&state] {
+      state += 0x9E3779B97F4A7C15ULL;
+      auto z = state;
+      z = (z ^ (z >> 30U)) * 0xBF58476D1CE4E5B9ULL;
+      z = (z ^ (z >> 27U)) * 0x94D049BB133111EBULL;
+      return z ^ (z >> 31U);
+    };
+    for (int y = 0; y < kHeight; ++y) {
+      auto* row = photo.pixel(0, y);
+      for (int x = 0; x < kWidth; ++x) {
+        const auto noise = static_cast<int>(next() & 31U);
+        const auto grid = ((x / 40) % 6 == 0 || (y / 40) % 6 == 0) ? 90 : 0;
+        row[x * 4 + 0] = static_cast<std::uint8_t>(std::min(255, 60 + x * 120 / kWidth + noise + grid));
+        row[x * 4 + 1] = static_cast<std::uint8_t>(std::min(255, 50 + y * 100 / kHeight + noise + grid));
+        row[x * 4 + 2] = static_cast<std::uint8_t>(std::min(255, 40 + noise + grid));
+        row[x * 4 + 3] = 255;
+      }
+    }
+    document.add_layer(patchy::Layer(document.allocate_layer_id(), "Background", std::move(photo)));
+    // Thick scribbles: round stamps 90 px across along a few looping curves.
+    patchy::PixelBuffer strokes(kWidth, kHeight, patchy::PixelFormat::rgba8());
+    strokes.clear(0);
+    constexpr int kRadius = 45;
+    for (int curve = 0; curve < 6; ++curve) {
+      for (int step = 0; step < 2400; ++step) {
+        const double t = step * 0.0026;
+        const int cx = static_cast<int>(1750.0 + 1400.0 * std::sin(t * (1.3 + curve * 0.21) + curve));
+        const int cy = static_cast<int>(1150.0 + 900.0 * std::sin(t * (2.1 + curve * 0.17) + curve * 0.5));
+        for (int y = std::max(0, cy - kRadius); y < std::min(kHeight, cy + kRadius); ++y) {
+          for (int x = std::max(0, cx - kRadius); x < std::min(kWidth, cx + kRadius); ++x) {
+            if ((x - cx) * (x - cx) + (y - cy) * (y - cy) <= kRadius * kRadius) {
+              auto* px = strokes.pixel(x, y);
+              px[0] = px[1] = px[2] = 8;
+              px[3] = 255;
+            }
+          }
+        }
+      }
+    }
+    document.add_layer(patchy::Layer(document.allocate_layer_id(), "Layer 1", std::move(strokes)));
+    auto shape = pentagon(document);
+    if (pixel_twin) {
+      auto pixels = shape.pixels();
+      patchy::Layer copy(document.allocate_layer_id(), "Pixels", std::move(pixels));
+      copy.set_bounds(shape.bounds());
+      document.add_layer(std::move(copy));
+    } else {
+      document.add_layer(std::move(shape));
+    }
+    return document;
+  };
+  struct Case {
+    std::string name;
+    patchy::ui::CanvasTool tool;
+    bool pixel_twin;
+  };
+  const std::vector<Case> cases{{"path_select", patchy::ui::CanvasTool::PathSelect, false},
+                                {"move_shape", patchy::ui::CanvasTool::Move, false},
+                                {"move_pixel", patchy::ui::CanvasTool::Move, true}};
+  for (const auto& test_case : cases) {
+    if (const auto only = qEnvironmentVariable("PATCHY_PERF_SHAPEDRAG_CASE");
+        !only.isEmpty() && only != QString::fromStdString(test_case.name)) {
+      continue;
+    }
+    auto document = build_document(test_case.pixel_twin);
+    const auto dragged_id = std::as_const(document).layers().back().id();
+    const auto bounds_before = std::as_const(document).layers().back().bounds();
+
+    patchy::ui::MainWindow window;
+    window.resize(1600, 1000);
+    window.show();
+    QApplication::processEvents();
+    window.add_document_session(std::move(document), QStringLiteral("Shape Drag Perf"));
+    QApplication::processEvents();
+    auto* canvas = active_canvas(window);
+    CHECK(canvas != nullptr);
+    if (canvas == nullptr) {
+      return;
+    }
+    const auto settle = [canvas] {
+      const auto started = Clock::now();
+      while (!canvas->render_settled() && std::chrono::duration<double>(Clock::now() - started).count() < 60.0) {
+        canvas->repaint();
+        QApplication::processEvents();
+      }
+    };
+    canvas->fit_to_view();
+    settle();
+    auto* layer_list = window.findChild<QListWidget*>(QStringLiteral("layerList"));
+    CHECK(layer_list != nullptr);
+    for (int row = 0; layer_list != nullptr && row < layer_list->count(); ++row) {
+      auto* item = layer_list->item(row);
+      if (static_cast<patchy::LayerId>(item->data(patchy::ui::kLayerIdRole).toULongLong()) == dragged_id) {
+        layer_list->clearSelection();
+        layer_list->setCurrentItem(item);
+        item->setSelected(true);
+      }
+    }
+    QApplication::processEvents();
+    canvas->set_tool(test_case.tool);
+    QApplication::processEvents();
+    settle();
+
+    const auto before = canvas->render_cache_diagnostics();
+    std::vector<double> frames;
+    double burst_ms = 0.0;
+    double release_ms = 0.0;
+    double settle_ms = 0.0;
+    QPoint position = canvas->widget_position_for_document_point(QPoint(2350, 1200));
+    for (int drag = 0; drag < 2; ++drag) {
+      const QPoint step = drag == 0 ? QPoint(-6, -3) : QPoint(6, 3);
+      send_mouse(*canvas, QEvent::MouseButtonPress, position, Qt::LeftButton, Qt::LeftButton);
+      canvas->repaint();
+      for (int frame = 1; frame <= 20; ++frame) {
+        position += step;
+        frames.push_back(elapsed_ms([&] {
+          send_mouse(*canvas, QEvent::MouseMove, position, Qt::NoButton, Qt::LeftButton);
+          QApplication::processEvents();
+          canvas->repaint();
+        }));
+      }
+      burst_ms = std::max(burst_ms, elapsed_ms([&] {
+        for (int move = 1; move <= 30; ++move) {
+          position += step;
+          QApplication::postEvent(canvas, new QMouseEvent(QEvent::MouseMove, QPointF(position),
+                                                          QPointF(canvas->mapToGlobal(position)), Qt::NoButton,
+                                                          Qt::LeftButton, Qt::NoModifier));
+        }
+        QApplication::processEvents();
+        QApplication::processEvents();  // the queued drag apply runs on the next pass
+        canvas->repaint();
+      }));
+      release_ms = std::max(release_ms, elapsed_ms([&] {
+        send_mouse(*canvas, QEvent::MouseButtonRelease, position, Qt::LeftButton, Qt::NoButton);
+        QApplication::processEvents();
+        canvas->repaint();
+      }));
+      settle_ms = std::max(settle_ms, elapsed_ms([&] { settle(); }));
+      CHECK(canvas->grab().save(QString::fromStdString("test-artifacts/shape_drag_" + test_case.name + "_" +
+                                                       std::to_string(drag + 1) + ".png")));
+    }
+    const auto after = canvas->render_cache_diagnostics();
+    const auto& final_document = std::as_const(patchy::ui::MainWindowTestAccess::document(window));
+    const auto* moved = final_document.find_layer(dragged_id);
+    CHECK(moved != nullptr);
+    // Both drags travel the same distance, so the layer ends where it started.
+    if (moved != nullptr) {
+      CHECK(std::abs(moved->bounds().x - bounds_before.x) <= 3);
+      CHECK(std::abs(moved->bounds().y - bounds_before.y) <= 3);
+    }
+    auto sorted = frames;
+    std::sort(sorted.begin(), sorted.end());
+    double total = 0.0;
+    for (const auto value : frames) {
+      total += value;
+    }
+    std::cout << std::fixed << std::setprecision(1) << "[PERF] shapedrag 3500x2300 case=" << test_case.name
+              << " view_zoom=" << canvas->view_zoom() << " frame_avg_ms=" << total / static_cast<double>(frames.size())
+              << " frame_median_ms=" << sorted[sorted.size() / 2] << " frame_max_ms=" << sorted.back()
+              << " burst30_ms=" << burst_ms << " release_ms=" << release_ms << " settle_ms=" << settle_ms
+              << " path_drag_applies=" << (after.path_drag_applies - before.path_drag_applies)
+              << " path_drag_rerasters=" << (after.path_drag_rerasters - before.path_drag_rerasters)
+              << " proxy_previews=" << (after.move_proxy_previews - before.move_proxy_previews)
+              << " threads=" << patchy::hardware_worker_threads() << '\n';
+  }
+}
+
+// GitHub issue 296: Liquify drag latency on large layers. The workspace edits a proxy
+// whose longest edge is 720 px, so a drag frame should not grow with the layer; Apply
+// renders the full layer once. Drives the real dialog: the open time, each Warp brush
+// move plus its preview repaint at the default and the largest brush, and the Apply
+// render. Then a core breakdown on the proxy: one stroke segment and one proxy render.
+void liquify_drag_perf() {
+  struct Result {
+    std::string name;
+    double median_ms{0.0};
+    double apply_ms{0.0};
+  };
+  std::vector<Result> results;
+  for (const auto& [width, height] : {std::pair{4000, 3000}, std::pair{6000, 4000}}) {
+    patchy::PixelBuffer source(width, height, patchy::PixelFormat::rgba8());
+    std::uint64_t seed = 0x9E3779B97F4A7C15ULL;
+    for (int y = 0; y < height; ++y) {
+      auto row = source.row(y);
+      for (int x = 0; x < width; ++x) {
+        seed += 0x9E3779B97F4A7C15ULL;
+        auto z = seed;
+        z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ULL;
+        z = (z ^ (z >> 27)) * 0x94D049BB133111EBULL;
+        z ^= z >> 31;
+        const bool band = ((x / 400) + (y / 400)) % 2 == 0;
+        auto* pixel = row.data() + static_cast<std::size_t>(x) * 4U;
+        pixel[0] = static_cast<std::uint8_t>((band ? 200 : 40) + (z & 31U));
+        pixel[1] = static_cast<std::uint8_t>((band ? 90 : 150) + ((z >> 8) & 31U));
+        pixel[2] = static_cast<std::uint8_t>((band ? 40 : 200) + ((z >> 16) & 31U));
+        pixel[3] = 255;
+      }
+    }
+    const auto size_name = std::to_string(width) + "x" + std::to_string(height);
+    double open_ms = 0.0;
+    std::vector<std::pair<int, std::vector<double>>> brushes;
+    const auto opened = Clock::now();
+    QTimer::singleShot(0, [&] {
+      open_ms = std::chrono::duration<double, std::milli>(Clock::now() - opened).count();
+      QDialog* dialog = nullptr;
+      for (auto* widget : QApplication::topLevelWidgets()) {
+        if (widget->objectName() == QStringLiteral("liquifyDialog") && widget->isVisible()) {
+          dialog = qobject_cast<QDialog*>(widget);
+        }
+      }
+      auto* preview = dialog != nullptr ? dialog->findChild<QWidget*>(QStringLiteral("liquifyPreview")) : nullptr;
+      auto* size_spin = dialog != nullptr ? dialog->findChild<QSpinBox*>(QStringLiteral("liquifySizeSpin")) : nullptr;
+      if (preview == nullptr || size_spin == nullptr) {
+        std::cout << "[FAIL] liquifydrag: no Liquify dialog\n";
+        if (dialog != nullptr) {
+          dialog->reject();
+        }
+        return;
+      }
+      QApplication::processEvents();
+      for (const int brush : {size_spin->value(), 2000}) {
+        size_spin->setValue(brush);
+        const auto start = preview->rect().center() - QPoint(120, 60);
+        send_mouse(*preview, QEvent::MouseButtonPress, start, Qt::LeftButton, Qt::LeftButton);
+        preview->repaint();
+        std::vector<double> frames;
+        for (int frame = 1; frame <= 40; ++frame) {
+          frames.push_back(elapsed_ms([&] {
+            send_mouse(*preview, QEvent::MouseMove, start + QPoint(6, 3) * frame, Qt::NoButton, Qt::LeftButton);
+            preview->repaint();
+          }));
+        }
+        send_mouse(*preview, QEvent::MouseButtonRelease, start + QPoint(6, 3) * 40, Qt::LeftButton, Qt::NoButton);
+        brushes.emplace_back(brush, std::move(frames));
+      }
+      dialog->accept();
+    });
+    const auto mesh = patchy::ui::request_liquify(nullptr, source, patchy::Rect{0, 0, width, height}, QRegion{});
+    CHECK(mesh.has_value() && !mesh->is_identity());
+    if (!mesh.has_value()) {
+      continue;
+    }
+    std::optional<patchy::PixelBuffer> rendered;
+    const auto apply_ms = elapsed_ms([&] { rendered = mesh->render(source); });
+    CHECK(rendered.has_value());
+    for (const auto& [brush, frames] : brushes) {
+      auto sorted = frames;
+      std::sort(sorted.begin(), sorted.end());
+      double total = 0.0;
+      for (const auto value : frames) {
+        total += value;
+      }
+      std::cout << std::fixed << std::setprecision(1) << "[PERF] liquifydrag " << size_name << " brush=" << brush
+                << " open_ms=" << open_ms << " frame_avg_ms=" << total / static_cast<double>(frames.size())
+                << " frame_median_ms=" << sorted[sorted.size() / 2] << " frame_max_ms=" << sorted.back()
+                << " apply_ms=" << apply_ms << '\n';
+      results.push_back(Result{size_name + " brush=" + std::to_string(brush), sorted[sorted.size() / 2], apply_ms});
+    }
+  }
+
+  // Core breakdown on a 720x540 proxy: one Warp stroke segment (the mesh update for a
+  // 6 px move) and one proxy render, each the median of 40.
+  patchy::PixelBuffer proxy(720, 540, patchy::PixelFormat::rgba8());
+  proxy.clear(200);
+  for (const double size : {54.0, 360.0}) {
+    patchy::LiquifyMesh mesh(proxy.width(), proxy.height());
+    std::vector<double> strokes;
+    std::vector<double> renders;
+    for (int step = 0; step < 40; ++step) {
+      const double x = 200.0 + step * 6.0;
+      strokes.push_back(elapsed_ms(
+          [&] { mesh.apply_stroke(patchy::LiquifyTool::ForwardWarp, x, 200.0, x + 6.0, 203.0, size, 50, 50); }));
+      renders.push_back(elapsed_ms([&] { (void)mesh.render(proxy); }));
+    }
+    std::sort(strokes.begin(), strokes.end());
+    std::sort(renders.begin(), renders.end());
+    std::cout << std::fixed << std::setprecision(2) << "[PERF] liquifydrag core proxy=720x540 brush=" << size
+              << " stroke_median_ms=" << strokes[strokes.size() / 2]
+              << " render_median_ms=" << renders[renders.size() / 2] << '\n';
+  }
+
+  // Ceilings (M2 Ultra, October 2026: frames were 15 to 18 ms and Apply 0.5 to 1 s
+  // before #296, 2 to 4 ms and 14 to 20 ms after). A frame must leave room for a 60 Hz
+  // display on slower machines; Apply is one bounded pass.
+  constexpr double kFrameCeilingMs = 10.0;
+  constexpr double kApplyCeilingMs = 400.0;
+  for (const auto& result : results) {
+    if (result.median_ms >= kFrameCeilingMs || result.apply_ms >= kApplyCeilingMs) {
+      std::cout << "[FAIL] liquifydrag " << result.name << " over its ceiling\n";
+    }
+    CHECK(result.median_ms < kFrameCeilingMs);
+    CHECK(result.apply_ms < kApplyCeilingMs);
+  }
+}
+
+void big_brush_stroke_perf() {
+  ensure_artifact_dir();
+  const auto image_path = std::filesystem::absolute("test-artifacts/perf_brush_stroke_4872x6836.png");
+  if (!std::filesystem::exists(image_path)) {
+    QImage image(4872, 6836, QImage::Format_RGB32);
+    image.fill(Qt::white);
+    CHECK(image.save(patchy::ui::to_qstring(image_path)));
+  }
+  patchy::ui::MainWindow window;
+  window.resize(1600, 1000);
+  if (qEnvironmentVariableIsSet("PATCHY_PERF_ONSCREEN")) {
+    window.showMaximized();
+  } else {
+    window.show();
+  }
+  QApplication::processEvents();
+  patchy::ui::MainWindowTestAccess::open_document_path(window, patchy::ui::to_qstring(image_path));
+  QApplication::processEvents();
+  auto* canvas = active_canvas(window);
+  CHECK(canvas != nullptr);
+  const auto settle = [canvas] {
+    const auto started = Clock::now();
+    while (!canvas->render_settled() && std::chrono::duration<double>(Clock::now() - started).count() < 60.0) {
+      canvas->repaint();
+      QApplication::processEvents();
+    }
+  };
+  settle();
+  canvas->set_tool(patchy::ui::CanvasTool::Brush);
+  canvas->set_primary_color(Qt::black);
+  canvas->set_brush_opacity(100);
+  canvas->set_brush_softness(0);
+  // 0 is fit; 150% interpolates and 100% / 200% draw exact pixels (GitHub issue 210);
+  // 800% is the deep-zoom raster with the pixel grid (GitHub issue 239).
+  for (const double zoom : {0.0, 1.0, 1.5, 2.0, 8.0}) {
+    const auto label = zoom == 0.0 ? std::string("fit") : std::to_string(static_cast<int>(zoom * 100.0)) + "%";
+    for (const int brush_size : {40, 300}) {
+      if (zoom == 0.0) {
+        canvas->fit_to_view();
+      } else {
+        canvas->set_zoom_centered(zoom);
+      }
+      canvas->set_brush_size(brush_size);
+      settle();
+      if (brush_size == 40) {
+        std::vector<double> full_ms;
+        for (int index = 0; index < 20; ++index) {
+          full_ms.push_back(elapsed_ms([&] { canvas->repaint(); }));
+        }
+        std::sort(full_ms.begin(), full_ms.end());
+        std::cout << "[perf] full_view_paint " << label << " zoom=" << canvas->zoom() << " paint_ms median="
+                  << std::fixed << std::setprecision(2) << full_ms[full_ms.size() / 2] << " max=" << full_ms.back()
+                  << '\n';
+      }
+      const auto center = QPointF(canvas->width() / 2.0, canvas->height() / 2.0);
+      const auto radius = std::min(canvas->width(), canvas->height()) * 0.35;
+      const auto at = [&](int index) {
+        const auto angle = index * 0.25;
+        return QPointF(center.x() + radius * std::cos(angle), center.y() + radius * std::sin(angle));
+      };
+      const auto send = [canvas](QEvent::Type type, QPointF position, Qt::MouseButton button,
+                                 Qt::MouseButtons buttons) {
+        QMouseEvent event(type, position, canvas->mapToGlobal(position), button, buttons, Qt::NoModifier);
+        QApplication::sendEvent(canvas, &event);
+      };
+      send(QEvent::MouseButtonPress, at(0), Qt::LeftButton, Qt::LeftButton);
+      canvas->repaint();
+      std::vector<double> move_ms;
+      std::vector<double> paint_ms;
+#ifdef Q_OS_WIN
+      // PATCHY_PERF_SAMPLER=1 attributes the moves and paints of each case.
+      std::unique_ptr<MainThreadSampler> sampler;
+      if (qEnvironmentVariableIsSet("PATCHY_PERF_SAMPLER")) {
+        sampler = std::make_unique<MainThreadSampler>();
+      }
+#endif
+      for (int index = 1; index <= 60; ++index) {
+        move_ms.push_back(elapsed_ms([&] { send(QEvent::MouseMove, at(index), Qt::NoButton, Qt::LeftButton); }));
+        paint_ms.push_back(elapsed_ms([&] { canvas->repaint(); }));
+      }
+#ifdef Q_OS_WIN
+      if (sampler) {
+        std::cout << "[SAMPLER_PHASE] brush_stroke " << label << " size=" << brush_size << '\n';
+        sampler.reset();
+      }
+#endif
+      send(QEvent::MouseButtonRelease, at(60), Qt::LeftButton, Qt::NoButton);
+      QApplication::processEvents();
+      settle();
+      const auto summary = [](std::vector<double> values) {
+        std::sort(values.begin(), values.end());
+        std::ostringstream text;
+        text << std::fixed << std::setprecision(2) << "median=" << values[values.size() / 2]
+             << " max=" << values.back();
+        return text.str();
+      };
+      std::cout << "[perf] brush_stroke " << label << " zoom=" << canvas->zoom()
+                << " size=" << brush_size << " move_ms " << summary(move_ms) << " paint_ms " << summary(paint_ms)
+                << '\n';
+    }
+  }
+}
+
+// Process CPU time across all threads, in milliseconds.
+double process_cpu_ms() {
+#ifdef Q_OS_WIN
+  FILETIME created{};
+  FILETIME exited{};
+  FILETIME kernel{};
+  FILETIME user{};
+  if (GetProcessTimes(GetCurrentProcess(), &created, &exited, &kernel, &user) == 0) {
+    return 0.0;
+  }
+  const auto ticks = [](FILETIME time) {
+    return (static_cast<std::uint64_t>(time.dwHighDateTime) << 32U) | time.dwLowDateTime;
+  };
+  return static_cast<double>(ticks(kernel) + ticks(user)) / 10000.0;
+#else
+  return 1000.0 * static_cast<double>(std::clock()) / static_cast<double>(CLOCKS_PER_SEC);
+#endif
+}
+
+#ifdef Q_OS_WIN
+// CPU milliseconds per thread of this process, keyed by thread id, with each thread's
+// description (worker pools name their threads).
+std::map<DWORD, std::pair<double, std::string>> thread_cpu_ms() {
+  std::map<DWORD, std::pair<double, std::string>> result;
+  const auto snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+  if (snapshot == INVALID_HANDLE_VALUE) {
+    return result;
+  }
+  THREADENTRY32 entry{};
+  entry.dwSize = sizeof(entry);
+  for (auto ok = Thread32First(snapshot, &entry); ok != FALSE; ok = Thread32Next(snapshot, &entry)) {
+    if (entry.th32OwnerProcessID != GetCurrentProcessId()) {
+      continue;
+    }
+    const auto thread = OpenThread(THREAD_QUERY_LIMITED_INFORMATION, FALSE, entry.th32ThreadID);
+    if (thread == nullptr) {
+      continue;
+    }
+    FILETIME created{};
+    FILETIME exited{};
+    FILETIME kernel{};
+    FILETIME user{};
+    if (GetThreadTimes(thread, &created, &exited, &kernel, &user) != 0) {
+      const auto ticks = [](FILETIME time) {
+        return (static_cast<std::uint64_t>(time.dwHighDateTime) << 32U) | time.dwLowDateTime;
+      };
+      std::string name = entry.th32ThreadID == GetCurrentThreadId() ? "main" : "";
+      PWSTR description = nullptr;
+      if (SUCCEEDED(GetThreadDescription(thread, &description)) && description != nullptr) {
+        if (description[0] != L'\0') {
+          name += (name.empty() ? "" : " ") + QString::fromWCharArray(description).toStdString();
+        }
+        LocalFree(description);
+      }
+      result[entry.th32ThreadID] = {static_cast<double>(ticks(kernel) + ticks(user)) / 10000.0, name};
+    }
+    CloseHandle(thread);
+  }
+  CloseHandle(snapshot);
+  return result;
+}
+
+void print_busy_threads(const std::map<DWORD, std::pair<double, std::string>>& before,
+                        const std::map<DWORD, std::pair<double, std::string>>& after) {
+  for (const auto& [id, value] : after) {
+    const auto found = before.find(id);
+    const auto delta = value.first - (found == before.end() ? 0.0 : found->second.first);
+    if (delta >= 15.0) {
+      std::cout << "[perf]   thread " << id << " '" << value.second << "' cpu_ms=" << delta << '\n';
+    }
+  }
+}
+#endif
+
+// Counts what the event loop delivers while nobody touches the app: paints per widget
+// and timer events per timer owner (GitHub issue 135).
+class IdleEventCounter final : public QObject {
+ public:
+  bool eventFilter(QObject* watched, QEvent* event) override {
+    if (event->type() == QEvent::Paint) {
+      ++paints[describe(watched)];
+    } else if (event->type() == QEvent::Timer) {
+      auto owner = describe(watched);
+      if (const auto* timer = qobject_cast<QTimer*>(watched); timer != nullptr) {
+        owner += " " + std::to_string(timer->interval()) + "ms";
+      }
+      if (watched->parent() != nullptr) {
+        owner += " in " + describe(watched->parent());
+      }
+      ++timers[owner];
+    }
+    return false;
+  }
+
+  static int total(const std::map<std::string, int>& counts) {
+    int sum = 0;
+    for (const auto& [name, count] : counts) {
+      sum += count;
+    }
+    return sum;
+  }
+
+  static void print_top(const char* label, const std::map<std::string, int>& counts) {
+    std::vector<std::pair<int, std::string>> sorted;
+    for (const auto& [name, count] : counts) {
+      sorted.emplace_back(count, name);
+    }
+    std::sort(sorted.rbegin(), sorted.rend());
+    for (std::size_t index = 0; index < sorted.size() && index < 8U; ++index) {
+      std::cout << "[perf]   " << label << ' ' << sorted[index].first << "x " << clean_name(sorted[index].second)
+                << '\n';
+    }
+  }
+
+  std::map<std::string, int> paints;
+  std::map<std::string, int> timers;
+
+ private:
+  static std::string describe(const QObject* object) {
+    auto text = std::string(object->metaObject()->className());
+    if (!object->objectName().isEmpty()) {
+      text += "#" + object->objectName().toStdString();
+    }
+    return text;
+  }
+};
+
+void wait_event_loop_ms(int milliseconds) {
+  QEventLoop loop;
+  QTimer::singleShot(milliseconds, &loop, &QEventLoop::quit);
+  loop.exec();
+}
+
+// A fresh print-size document left alone with the Brush active must cost next to no CPU
+// (GitHub issue 135: fans spun up as soon as an A5 canvas was created).
+// PATCHY_PERF_IDLE_SECONDS sets the measured window (default 10).
+void idle_new_document_perf() {
+  isolate_perf_settings();
+  patchy::ui::MainWindow window;
+  window.resize(1600, 1000);
+  if (qEnvironmentVariableIsSet("PATCHY_PERF_ONSCREEN")) {
+    window.showMaximized();
+  } else {
+    window.show();
+  }
+  QApplication::processEvents();
+  const auto seconds = std::max(1, qEnvironmentVariableIntValue("PATCHY_PERF_IDLE_SECONDS"));
+  const auto window_ms = (qEnvironmentVariableIsSet("PATCHY_PERF_IDLE_SECONDS") ? seconds : 10) * 1000;
+  struct Case {
+    const char* name;
+    int width;
+    int height;
+    double ppi;
+  };
+  for (const auto& size : {Case{"A5_300ppi", 1748, 2480, 300.0}, Case{"A4_300ppi", 2480, 3508, 300.0},
+                           Case{"A5_72ppi", 420, 595, 72.0}}) {
+    const auto create_cpu = process_cpu_ms();
+    const auto create_ms = elapsed_ms([&] {
+      patchy::ui::MainWindowTestAccess::new_document(window, size.width, size.height, size.ppi);
+      QApplication::processEvents();
+    });
+    auto* canvas = active_canvas(window);
+    CHECK(canvas != nullptr);
+    if (canvas == nullptr) {
+      return;
+    }
+    canvas->fit_to_view();
+    canvas->set_tool(patchy::ui::CanvasTool::Brush);
+    // Creation-time work (first render, thumbnails, debounced refreshes) finishes first.
+    wait_event_loop_ms(2000);
+    const auto settle_cpu = process_cpu_ms() - create_cpu;
+    IdleEventCounter counter;
+    qApp->installEventFilter(&counter);
+#ifdef Q_OS_WIN
+    const auto threads_before = thread_cpu_ms();
+#endif
+#ifdef Q_OS_WIN
+    // PATCHY_PERF_SAMPLER=1 attributes the idle main thread's work.
+    std::unique_ptr<MainThreadSampler> sampler;
+    if (qEnvironmentVariableIsSet("PATCHY_PERF_SAMPLER")) {
+      sampler = std::make_unique<MainThreadSampler>();
+    }
+#endif
+    const auto cpu_before = process_cpu_ms();
+    const auto wall_ms = elapsed_ms([&] { wait_event_loop_ms(window_ms); });
+    const auto cpu_ms = process_cpu_ms() - cpu_before;
+#ifdef Q_OS_WIN
+    if (sampler) {
+      std::cout << "[SAMPLER_PHASE] idle " << size.name << '\n';
+      sampler.reset();
+    }
+#endif
+    qApp->removeEventFilter(&counter);
+    const auto percent = 100.0 * cpu_ms / wall_ms;
+    std::cout << std::fixed << std::setprecision(2) << "[PERF] idle " << size.name << ' ' << size.width << 'x'
+              << size.height << " create_ms=" << create_ms << " first_2s_cpu_ms=" << settle_cpu
+              << " idle_cpu_ms=" << cpu_ms << " wall_ms=" << wall_ms << " cpu_pct_one_core=" << percent
+              << " paints=" << IdleEventCounter::total(counter.paints)
+              << " timer_events=" << IdleEventCounter::total(counter.timers) << '\n';
+    IdleEventCounter::print_top("paint", counter.paints);
+    IdleEventCounter::print_top("timer", counter.timers);
+#ifdef Q_OS_WIN
+    print_busy_threads(threads_before, thread_cpu_ms());
+#endif
+  }
+  // The brush preset library's once-a-second change check (a folder listing), against the
+  // full content check it replaced.
+  auto& library = window.brush_automation_library();
+  const auto median_ms = [](const std::function<void()>& work) {
+    std::vector<double> times;
+    for (int index = 0; index < 20; ++index) {
+      times.push_back(elapsed_ms(work));
+    }
+    std::sort(times.begin(), times.end());
+    return times[times.size() / 2];
+  };
+  const auto check_ms = median_ms([&] { library.refresh_if_files_changed(); });
+  const auto full_ms = median_ms([&] { library.refresh(); });
+  std::cout << std::fixed << std::setprecision(2) << "[PERF] idle brush_library check_ms=" << check_ms
+            << " full_read_ms=" << full_ms << " tips=" << library.tips().size()
+            << " presets=" << library.presets().size() << '\n';
+}
+
+// Gaussian Blur and its sibling line filters on a 6000x4000 RGBA image (GitHub issue
+// 564: slow next to GIMP on large images). Times the RGBA8 primitive behind Filter >
+// Blur > Gaussian Blur, the Smart Filter and the preview at radii 0.5 (the calibrated
+// small kernel), 2, 20 (direct kernels) and 200 (the recursive filter), Unsharp Mask
+// (the straight-color pass) and the 16-bit float path. PATCHY_PERF_GAUSSIAN_SIZE=WxH
+// picks another size; PATCHY_RENDER_THREADS=<n> prices fewer cores.
+void gaussian_blur_perf() {
+  std::int32_t width = 6000;
+  std::int32_t height = 4000;
+  const auto size_text = qEnvironmentVariable("PATCHY_PERF_GAUSSIAN_SIZE");
+  if (const auto parts = size_text.split(QLatin1Char('x')); parts.size() == 2) {
+    width = std::max(1, parts[0].toInt());
+    height = std::max(1, parts[1].toInt());
+  }
+  patchy::PixelBuffer image(width, height, patchy::PixelFormat::rgba8());
+  {
+    std::uint64_t state = 564U;
+    auto bytes = image.data();
+    for (std::size_t index = 0; index < bytes.size(); index += 4U) {
+      state += 0x9E3779B97F4A7C15ULL;
+      auto z = state;
+      z = (z ^ (z >> 30U)) * 0xBF58476D1CE4E5B9ULL;
+      z = (z ^ (z >> 27U)) * 0x94D049BB133111EBULL;
+      z ^= z >> 31U;
+      const auto pixel = index / 4U;
+      const auto x = static_cast<std::int32_t>(pixel % static_cast<std::size_t>(width));
+      bytes[index] = static_cast<std::uint8_t>(z);
+      bytes[index + 1U] = static_cast<std::uint8_t>(z >> 8U);
+      bytes[index + 2U] = static_cast<std::uint8_t>(z >> 16U);
+      bytes[index + 3U] = x < width / 2 ? 255U : static_cast<std::uint8_t>(z >> 24U);
+    }
+  }
+  const auto bounds = patchy::Rect::from_size(width, height);
+  std::cout << "[PERF] gaussian image=" << width << 'x' << height
+            << " threads=" << patchy::hardware_worker_threads() << '\n';
+  const auto time_ms = [](auto&& work) {
+    const auto start = Clock::now();
+    work();
+    return std::chrono::duration<double, std::milli>(Clock::now() - start).count();
+  };
+  for (const auto radius : {0.5, 2.0, 20.0, 200.0}) {
+    std::uint64_t digest = 0;
+    const auto ms = time_ms([&] {
+      const auto result = patchy::render_photoshop_gaussian_blur(image, bounds, radius);
+      digest = std::accumulate(result.pixels.data().begin(), result.pixels.data().end(), std::uint64_t{0});
+    });
+    std::cout << "[PERF] gaussian rgba8 radius=" << radius << " ms=" << std::fixed << std::setprecision(1) << ms
+              << std::defaultfloat << std::setprecision(6) << " sum=" << digest << '\n';
+  }
+  for (const auto radius : {2.5, 20.0}) {
+    const auto ms = time_ms([&] {
+      (void)patchy::render_photoshop_unsharp_mask(image, bounds, 150.0, radius, 0);
+    });
+    std::cout << "[PERF] unsharp rgba8 radius=" << radius << " ms=" << std::fixed << std::setprecision(1) << ms
+              << std::defaultfloat << std::setprecision(6) << '\n';
+  }
+  auto deep = patchy::load_deep_image(image);
+  for (const auto radius : {2.0, 20.0, 200.0}) {
+    auto copy = deep;
+    const auto ms = time_ms([&] { patchy::deep_gaussian_blur(copy, radius, nullptr); });
+    std::cout << "[PERF] gaussian deep radius=" << radius << " ms=" << std::fixed << std::setprecision(1) << ms
+              << std::defaultfloat << std::setprecision(6) << '\n';
+  }
+}
+
+// GitHub issue 687 follow-up: Levels' Alt+drag clipping view on a large photo (6000 x 4000
+// by default, PATCHY_PERF_LEVELSCLIP_SIZE=WxH). Each black-handle move is timed from the
+// mouse event to the canvas showing the new clipping state at a probe on a gray ramp, with a
+// paint per poll, as a user sees it. Then the same drag with Preview unticked and no Alt
+// must render nothing: the canvas refresh and busy-notice counters must not move.
+void levels_clipping_drag_perf() {
+  isolate_perf_settings();
+#ifdef Q_OS_WIN
+  // A windowless run (ssh, offscreen) gets Windows power throttling after a few seconds of
+  // load: hybrid laptops move it to efficiency cores and every phase ran about three times
+  // slower from the second drag on. PATCHY_PERF_LEVELSCLIP_ECO=1 leaves it on.
+  if (!qEnvironmentVariableIsSet("PATCHY_PERF_LEVELSCLIP_ECO")) {
+    PROCESS_POWER_THROTTLING_STATE throttling{};
+    throttling.Version = PROCESS_POWER_THROTTLING_CURRENT_VERSION;
+    throttling.ControlMask = PROCESS_POWER_THROTTLING_EXECUTION_SPEED;
+    throttling.StateMask = 0;
+    (void)SetProcessInformation(GetCurrentProcess(), ProcessPowerThrottling, &throttling, sizeof(throttling));
+  }
+#endif
+  std::int32_t width = 6000;
+  std::int32_t height = 4000;
+  const auto size_text = qEnvironmentVariable("PATCHY_PERF_LEVELSCLIP_SIZE");
+  if (const auto parts = size_text.split(QLatin1Char('x')); parts.size() == 2) {
+    width = std::max(512, parts[0].toInt());
+    height = std::max(512, parts[1].toInt());
+  }
+  constexpr std::int32_t kRampRows = 300;
+  patchy::PixelBuffer pixels(width, height, patchy::PixelFormat::rgba8());
+  {
+    std::uint64_t state = 687U;
+    for (std::int32_t y = 0; y < height; ++y) {
+      auto* row = pixels.pixel(0, y);
+      for (std::int32_t x = 0; x < width; ++x, row += 4) {
+        if (y < kRampRows) {
+          const auto value = static_cast<std::uint8_t>((static_cast<std::int64_t>(x) * 256) / width);
+          row[0] = value;
+          row[1] = value;
+          row[2] = value;
+        } else {
+          state += 0x9E3779B97F4A7C15ULL;
+          auto z = state;
+          z = (z ^ (z >> 30U)) * 0xBF58476D1CE4E5B9ULL;
+          z = (z ^ (z >> 27U)) * 0x94D049BB133111EBULL;
+          z ^= z >> 31U;
+          row[0] = static_cast<std::uint8_t>(z);
+          row[1] = static_cast<std::uint8_t>(z >> 8U);
+          row[2] = static_cast<std::uint8_t>(z >> 16U);
+        }
+        row[3] = 255;
+      }
+    }
+  }
+  patchy::Document document(width, height, patchy::PixelFormat::rgba8());
+  auto& layer = document.add_pixel_layer("Photo", std::move(pixels));
+  document.set_active_layer(layer.id());
+
+  patchy::ui::MainWindow window;
+  window.resize(1600, 1000);
+  window.show();
+  window.add_document_session(std::move(document), QStringLiteral("Levels Clipping Perf"));
+  QApplication::processEvents();
+  auto* canvas = active_canvas(window);
+  CHECK(canvas != nullptr);
+  if (canvas == nullptr) {
+    return;
+  }
+  canvas->fit_to_view();
+  const auto settle = [&] {
+    const auto deadline = Clock::now() + std::chrono::seconds(30);
+    while (!canvas->render_settled() && Clock::now() < deadline) {
+      QApplication::processEvents(QEventLoop::AllEvents, 20);
+    }
+    wait_event_loop_ms(300);
+  };
+  settle();
+  // The middle of the ramp's value-100 band: black in the Shadows view once the black
+  // input passes 100, white while it is below.
+  const QPoint probe(static_cast<int>((static_cast<std::int64_t>(width) * 201) / 512), kRampRows / 2);
+  const auto probe_color = [&] {
+    const auto point = canvas->widget_position_for_document_point(probe);
+    return canvas->grab().toImage().pixelColor(point);
+  };
+  const std::function<bool(const QColor&)> dark = [](const QColor& color) {
+    return color.red() < 40 && color.green() < 40 && color.blue() < 40;
+  };
+  const std::function<bool(const QColor&)> light = [](const QColor& color) {
+    return color.red() > 215 && color.green() > 215 && color.blue() > 215;
+  };
+
+  bool inspected = false;
+  QTimer::singleShot(0, [&] {
+    QWidget* dialog = nullptr;
+    for (auto* widget : QApplication::topLevelWidgets()) {
+      if (widget->objectName() == QStringLiteral("patchyLevelsDialog") && widget->isVisible()) {
+        dialog = widget;
+      }
+    }
+    CHECK(dialog != nullptr);
+    if (dialog == nullptr) {
+      return;
+    }
+    auto* graph = dialog->findChild<QWidget*>(QStringLiteral("levelsInputGraph"));
+    auto* preview = dialog->findChild<QCheckBox*>(QStringLiteral("levelsPreviewCheck"));
+    CHECK(graph != nullptr && preview != nullptr);
+    if (graph == nullptr || preview == nullptr) {
+      dialog->close();
+      return;
+    }
+    const auto at = [&](int value) {
+      const auto graph_rect = QRect(0, 0, graph->width(), graph->height()).adjusted(8, 8, -8, -28);
+      return QPointF(static_cast<double>(graph_rect.left() + std::lround(value / 255.0 * (graph_rect.width() - 1))),
+                     static_cast<double>(graph_rect.center().y()));
+    };
+    const auto send = [&](QEvent::Type type, int value, Qt::MouseButton button, Qt::MouseButtons buttons,
+                          Qt::KeyboardModifiers modifiers) {
+      const auto local = at(value);
+      QMouseEvent event(type, local, graph->mapToGlobal(local), button, buttons, modifiers);
+      QApplication::sendEvent(graph, &event);
+    };
+    const auto press = [&](int value, Qt::KeyboardModifiers modifiers) {
+      send(QEvent::MouseButtonPress, value, Qt::LeftButton, Qt::LeftButton, modifiers);
+    };
+    const auto move = [&](int value, Qt::KeyboardModifiers modifiers) {
+      send(QEvent::MouseMove, value, Qt::NoButton, Qt::LeftButton, modifiers);
+    };
+    const auto release = [&](int value, Qt::KeyboardModifiers modifiers) {
+      send(QEvent::MouseButtonRelease, value, Qt::LeftButton, Qt::NoButton, modifiers);
+    };
+    // Waits for the probe to read as `want`, painting on every poll like the screen does;
+    // -1 when it never does within ten seconds.
+    const auto wait_for = [&](const std::function<bool(const QColor&)>& want) {
+      const auto start = Clock::now();
+      const auto deadline = start + std::chrono::seconds(10);
+      while (Clock::now() < deadline) {
+        QApplication::processEvents(QEventLoop::AllEvents, 5);
+        if (want(probe_color())) {
+          return std::chrono::duration<double, std::milli>(Clock::now() - start).count();
+        }
+      }
+      return -1.0;
+    };
+    const auto run_drag = [&](const char* label) {
+      press(60, Qt::AltModifier);
+      const auto first_ms = wait_for(light);
+      std::vector<double> moves;
+      for (int step = 0; step < 8; ++step) {
+        const bool to_dark = step % 2 == 0;
+        move(to_dark ? 140 : 60, Qt::AltModifier);
+        moves.push_back(wait_for(to_dark ? dark : light));
+      }
+      release(60, Qt::AltModifier);
+      auto sorted = moves;
+      std::sort(sorted.begin(), sorted.end());
+      const auto mean = std::accumulate(moves.begin(), moves.end(), 0.0) / static_cast<double>(moves.size());
+      std::cout << std::fixed << std::setprecision(1) << "[PERF] levelsclip " << label << ' ' << width << 'x'
+                << height << " threads=" << patchy::hardware_worker_threads() << " first_ms=" << first_ms
+                << " move_mean_ms=" << mean << " move_median_ms=" << sorted[sorted.size() / 2]
+                << " move_max_ms=" << sorted.back() << " moves=";
+      for (const auto ms : moves) {
+        std::cout << ms << ' ';
+      }
+#ifdef Q_OS_WIN
+      PROCESS_MEMORY_COUNTERS_EX memory{};
+      if (K32GetProcessMemoryInfo(GetCurrentProcess(), reinterpret_cast<PROCESS_MEMORY_COUNTERS*>(&memory),
+                                  sizeof(memory))) {
+        std::cout << "private_mb=" << memory.PrivateUsage / (1024 * 1024)
+                  << " working_set_mb=" << memory.WorkingSetSize / (1024 * 1024)
+                  << " page_faults=" << memory.PageFaultCount;
+      }
+#endif
+      std::cout << std::defaultfloat << std::setprecision(6) << '\n';
+      CHECK(first_ms >= 0.0);
+      CHECK(std::none_of(moves.begin(), moves.end(), [](double ms) { return ms < 0.0; }));
+    };
+
+    // PATCHY_PERF_LEVELSCLIP_PAUSE_MS idles between the drags, so a host that slows under
+    // sustained all-core load (a laptop past its turbo budget) can recover first.
+    const int pause_ms = std::max(0, qEnvironmentVariableIntValue("PATCHY_PERF_LEVELSCLIP_PAUSE_MS"));
+    // The process CPU an idle stretch costs: anything still running after a drag shows here.
+    const auto idle = [](int ms) {
+      const auto cpu_before = process_cpu_ms();
+      const auto wall = elapsed_ms([&] { wait_event_loop_ms(std::max(ms, 1000)); });
+      std::cout << std::fixed << std::setprecision(1) << "[PERF] levelsclip idle wall_ms=" << wall
+                << " cpu_ms=" << (process_cpu_ms() - cpu_before) << std::defaultfloat << std::setprecision(6)
+                << '\n';
+    };
+    run_drag("preview_on");
+    settle();
+    preview->setChecked(false);
+    settle();
+    idle(pause_ms);
+    run_drag("preview_off");
+    settle();
+    // Ticked again: tells a slower machine state (a laptop throttling) from a slower path.
+    preview->setChecked(true);
+    settle();
+    idle(pause_ms);
+    run_drag("preview_on_again");
+    settle();
+    preview->setChecked(false);
+    settle();
+
+    // Preview unticked, no Alt: the image does not change, so nothing may render.
+    const auto before = canvas->render_cache_diagnostics();
+    const auto plain_ms = elapsed_ms([&] {
+      press(60, Qt::NoModifier);
+      for (int step = 0; step < 8; ++step) {
+        move(step % 2 == 0 ? 140 : 60, Qt::NoModifier);
+        wait_event_loop_ms(60);
+        (void)probe_color();
+      }
+      release(60, Qt::NoModifier);
+      wait_event_loop_ms(400);
+    });
+    const auto after = canvas->render_cache_diagnostics();
+    const auto refreshes = (after.full_refreshes - before.full_refreshes) +
+                           (after.live_preview_async_refreshes - before.live_preview_async_refreshes) +
+                           (after.partial_patches - before.partial_patches);
+    const auto busy_frames = after.processing_overlay_frames - before.processing_overlay_frames;
+    std::cout << "[PERF] levelsclip preview_off_plain_drag refreshes=" << refreshes << " busy_frames=" << busy_frames
+              << " ms=" << plain_ms << '\n';
+    CHECK(refreshes == 0);
+    CHECK(busy_frames == 0);
+    inspected = true;
+    dialog->close();
+  });
+  if (auto* action = window.findChild<QAction*>(QStringLiteral("imageAdjustLevelsAction")); action != nullptr) {
+    action->trigger();
+  }
+  QApplication::processEvents();
+  CHECK(inspected);
+}
+
+// Ctrl+J over and over on a fresh document (GitHub issue 402: the UI lagged past about
+// 100 layers while the reporter duplicated a text layer). Each duplicate is timed as the
+// call itself plus the event loop and canvas settling after it, the way a held Ctrl+J
+// feels; the report gives the mean per bucket. PATCHY_PERF_DUP_COUNT (default 300) sets
+// how many copies, PATCHY_PERF_DUP_FILL=1 duplicates the full-canvas white Background
+// instead of a text layer, PATCHY_PERF_SAMPLER=1 samples the main thread per bucket.
+void duplicate_layer_perf() {
+  isolate_perf_settings();
+  patchy::ui::MainWindow window;
+  window.resize(1600, 1000);
+  if (qEnvironmentVariableIsSet("PATCHY_PERF_ONSCREEN")) {
+    window.showMaximized();
+  } else {
+    window.show();
+  }
+  QApplication::processEvents();
+  patchy::ui::MainWindowTestAccess::new_document(window, 1920, 1080, 72.0);
+  QApplication::processEvents();
+  auto* canvas = active_canvas(window);
+  CHECK(canvas != nullptr);
+  if (canvas == nullptr) {
+    return;
+  }
+  canvas->fit_to_view();
+  const auto settle = [&] {
+    // A key press returns to exec(), which runs the rows the rebuild retired with
+    // deleteLater(); this loop has no exec(), so it delivers them itself.
+    QCoreApplication::sendPostedEvents(nullptr, QEvent::DeferredDelete);
+    QApplication::processEvents();
+    const auto started = Clock::now();
+    while (!canvas->render_settled() && std::chrono::duration<double>(Clock::now() - started).count() < 30.0) {
+      canvas->repaint();
+      QApplication::processEvents();
+    }
+  };
+  settle();
+  if (!qEnvironmentVariableIsSet("PATCHY_PERF_DUP_FILL")) {
+    patchy::ui::MainWindowTestAccess::add_text_at(window, QPoint(200, 120));
+    QApplication::processEvents();
+    auto* editor = canvas->findChild<QTextEdit*>(QStringLiteral("inlineTextEditor"));
+    CHECK(editor != nullptr);
+    if (editor == nullptr) {
+      return;
+    }
+    editor->textCursor().insertText(QStringLiteral("NOT FOR YOU"));
+    QApplication::processEvents();
+    send_key(*editor, Qt::Key_Return, Qt::ControlModifier);
+    settle();
+    CHECK(canvas->findChild<QTextEdit*>(QStringLiteral("inlineTextEditor")) == nullptr ||
+          canvas->findChild<QTextEdit*>(QStringLiteral("inlineTextEditor"))->property("patchy.textEditorFinished").toBool());
+  }
+  const auto count = qEnvironmentVariableIsSet("PATCHY_PERF_DUP_COUNT")
+                         ? std::max(10, qEnvironmentVariableIntValue("PATCHY_PERF_DUP_COUNT"))
+                         : 300;
+  const auto initial_layers = std::as_const(patchy::ui::MainWindowTestAccess::document(window)).layers().size();
+  struct Bucket {
+    double call_ms{0.0};
+    double total_ms{0.0};
+    double worst_ms{0.0};
+    int samples{0};
+  };
+  Bucket bucket;
+#ifdef Q_OS_WIN
+  std::unique_ptr<MainThreadSampler> sampler;
+  const bool sample = qEnvironmentVariableIsSet("PATCHY_PERF_SAMPLER");
+  if (sample) {
+    sampler = std::make_unique<MainThreadSampler>();
+  }
+#endif
+  for (int index = 1; index <= count; ++index) {
+    const auto started = Clock::now();
+    patchy::ui::MainWindowTestAccess::duplicate_active_layer(window);
+    const auto call_ms = std::chrono::duration<double, std::milli>(Clock::now() - started).count();
+    settle();
+    const auto total_ms = std::chrono::duration<double, std::milli>(Clock::now() - started).count();
+    bucket.call_ms += call_ms;
+    bucket.total_ms += total_ms;
+    bucket.worst_ms = std::max(bucket.worst_ms, total_ms);
+    ++bucket.samples;
+    const bool report = index == 10 || index % 50 == 0 || index == count;
+    if (report) {
+      const auto layers = std::as_const(patchy::ui::MainWindowTestAccess::document(window)).layers().size();
+      std::cout << std::fixed << std::setprecision(2) << "[PERF] duplicate layers=" << layers
+                << " mean_call_ms=" << bucket.call_ms / bucket.samples
+                << " mean_total_ms=" << bucket.total_ms / bucket.samples << " worst_total_ms=" << bucket.worst_ms
+                << " samples=" << bucket.samples << '\n';
+#ifdef Q_OS_WIN
+      if (sampler) {
+        std::cout << "[SAMPLER_PHASE] duplicate up_to_" << layers << '\n';
+        sampler.reset();
+        if (index != count) {
+          sampler = std::make_unique<MainThreadSampler>();
+        }
+      }
+#endif
+      bucket = Bucket{};
+    }
+  }
+  CHECK(std::as_const(patchy::ui::MainWindowTestAccess::document(window)).layers().size() ==
+        initial_layers + static_cast<std::size_t>(count));
+}
+
+// One stroke per brush size and hardness on a fresh A5 300 ppi document (GitHub issue
+// 135: lag grew with the brush size). Moves are 12 widget px apart, a brisk stroke, or 3 px
+// apart ("slow"), the short steps a high-rate mouse delivers.
+void a5_brush_stroke_perf() {
+  isolate_perf_settings();
+  patchy::ui::MainWindow window;
+  window.resize(1600, 1000);
+  if (qEnvironmentVariableIsSet("PATCHY_PERF_ONSCREEN")) {
+    window.showMaximized();
+  } else {
+    window.show();
+  }
+  QApplication::processEvents();
+  patchy::ui::MainWindowTestAccess::new_document(window, 1748, 2480, 300.0);
+  QApplication::processEvents();
+  auto* canvas = active_canvas(window);
+  CHECK(canvas != nullptr);
+  if (canvas == nullptr) {
+    return;
+  }
+  const auto settle = [canvas] {
+    const auto started = Clock::now();
+    while (!canvas->render_settled() && std::chrono::duration<double>(Clock::now() - started).count() < 60.0) {
+      canvas->repaint();
+      QApplication::processEvents();
+    }
+  };
+  canvas->set_tool(patchy::ui::CanvasTool::Brush);
+  canvas->set_primary_color(Qt::black);
+  canvas->set_brush_opacity(100);
+  const auto send = [canvas](QEvent::Type type, QPointF position, Qt::MouseButton button, Qt::MouseButtons buttons) {
+    QMouseEvent event(type, position, canvas->mapToGlobal(position), button, buttons, Qt::NoModifier);
+    QApplication::sendEvent(canvas, &event);
+  };
+  struct Pass {
+    const char* label;
+    double zoom;
+    double step;
+  };
+  for (const auto& pass : {Pass{"fit", 0.0, 12.0}, Pass{"100%", 1.0, 12.0}, Pass{"100%_slow", 1.0, 3.0}}) {
+    const auto zoom = pass.zoom;
+    const std::string label = pass.label;
+    for (const int softness : {0, 100}) {
+      for (const int brush_size : {50, 300, 731}) {
+        if (zoom == 0.0) {
+          canvas->fit_to_view();
+        } else {
+          canvas->set_zoom_centered(zoom);
+        }
+        canvas->set_brush_size(brush_size);
+        canvas->set_brush_softness(softness);
+        settle();
+        const auto start = QPointF(canvas->width() * 0.2, canvas->height() * 0.5);
+        const auto at = [&](int index) {
+          return start + QPointF(pass.step * index, pass.step * 3.0 * std::sin(index * 0.15));
+        };
+        send(QEvent::MouseButtonPress, at(0), Qt::LeftButton, Qt::LeftButton);
+        canvas->repaint();
+        std::vector<double> move_ms;
+        std::vector<double> paint_ms;
+#ifdef Q_OS_WIN
+        // PATCHY_PERF_SAMPLER=1 attributes each case's moves and paints.
+        std::unique_ptr<MainThreadSampler> sampler;
+        if (qEnvironmentVariableIsSet("PATCHY_PERF_SAMPLER")) {
+          sampler = std::make_unique<MainThreadSampler>();
+        }
+#endif
+        const auto cpu_before = process_cpu_ms();
+        const auto stroke_ms = elapsed_ms([&] {
+          for (int index = 1; index <= 60; ++index) {
+            move_ms.push_back(elapsed_ms([&] { send(QEvent::MouseMove, at(index), Qt::NoButton, Qt::LeftButton); }));
+            paint_ms.push_back(elapsed_ms([&] { canvas->repaint(); }));
+          }
+        });
+        const auto stroke_cpu = process_cpu_ms() - cpu_before;
+#ifdef Q_OS_WIN
+        if (sampler) {
+          std::cout << "[SAMPLER_PHASE] a5brush " << label << " size=" << brush_size << " softness=" << softness
+                    << '\n';
+          sampler.reset();
+        }
+#endif
+        const auto release_ms = elapsed_ms([&] {
+          send(QEvent::MouseButtonRelease, at(60), Qt::LeftButton, Qt::NoButton);
+          QApplication::processEvents();
+          settle();
+        });
+        const auto summary = [](std::vector<double> values) {
+          std::sort(values.begin(), values.end());
+          double total = 0.0;
+          for (const auto value : values) {
+            total += value;
+          }
+          std::ostringstream text;
+          text << std::fixed << std::setprecision(2) << "avg=" << total / static_cast<double>(values.size())
+               << " median=" << values[values.size() / 2] << " max=" << values.back();
+          return text.str();
+        };
+        std::cout << std::fixed << std::setprecision(2) << "[PERF] a5brush " << label << " zoom=" << canvas->zoom()
+                  << " size=" << brush_size << " softness=" << softness << " stroke_ms=" << stroke_ms
+                  << " stroke_cpu_ms=" << stroke_cpu << " release_ms=" << release_ms << " move_ms "
+                  << summary(move_ms) << " paint_ms " << summary(paint_ms) << '\n';
+        patchy::ui::MainWindowTestAccess::undo(window);
+        settle();
+      }
+    }
+  }
+}
+
+// Clone Stamp strokes on the 3580x5370 photo GitHub issue 597 lagged on (204 and 529 px) and
+// the 858x619 image of its follow-up (93 px), hard and soft, at fit (2 widget px per move) and
+// 100% (12 px, "slow" 3 px). "burst" folds 8 extra positions into every move, the samples a
+// 1000 Hz mouse leaves behind a slow frame (each is its own stroke segment, issue 165).
+// press_ms is the stroke's mouse press through its first painted frame (the follow-up's lag at
+// stroke start), first after the Alt-click and again for a second stroke on the same source.
+// PATCHY_PERF_CLONE_FULL_WALK=1 turns the stamp's row spans and continued-segment skip off,
+// the walk before the fix.
+void clone_stamp_stroke_perf() {
+  isolate_perf_settings();
+  struct Case {
+    int width;
+    int height;
+    std::vector<int> sizes;
+    QPoint stroke_start;
+    QPoint source;
+  };
+  for (const auto& image_case : {Case{858, 619, {93}, QPoint(560, 300), QPoint(200, 260)},
+                                 Case{3580, 5370, {204, 529}, QPoint(2000, 2700), QPoint(900, 2600)}}) {
+    const auto image_path = std::filesystem::absolute(
+        "test-artifacts/perf_clone_stamp_" + std::to_string(image_case.width) + "x" +
+        std::to_string(image_case.height) + ".png");
+    {
+      std::filesystem::create_directories(image_path.parent_path());
+      QImage image(image_case.width, image_case.height, QImage::Format_RGB32);
+      for (int y = 0; y < image_case.height; ++y) {
+        auto* row = reinterpret_cast<QRgb*>(image.scanLine(y));
+        for (int x = 0; x < image_case.width; ++x) {
+          row[x] = qRgb((x / 7) % 256, (y / 9) % 256, ((x + y) / 13) % 256);
+        }
+      }
+      CHECK(image.save(patchy::ui::to_qstring(image_path)));
+    }
+    patchy::ui::MainWindow window;
+    window.resize(1600, 1000);
+    if (qEnvironmentVariableIsSet("PATCHY_PERF_ONSCREEN")) {
+      window.showMaximized();
+    } else {
+      window.show();
+    }
+    QApplication::processEvents();
+    patchy::ui::MainWindowTestAccess::open_document_path(window, patchy::ui::to_qstring(image_path));
+    QApplication::processEvents();
+    auto* canvas = active_canvas(window);
+    CHECK(canvas != nullptr);
+    if (canvas == nullptr) {
+      return;
+    }
+    const auto settle = [canvas] {
+      const auto started = Clock::now();
+      while (!canvas->render_settled() && std::chrono::duration<double>(Clock::now() - started).count() < 60.0) {
+        canvas->repaint();
+        QApplication::processEvents();
+      }
+    };
+    canvas->set_tool(patchy::ui::CanvasTool::Clone);
+    canvas->set_brush_opacity(100);
+    canvas->set_clone_stamp_skip_enabled_for_testing(!qEnvironmentVariableIsSet("PATCHY_PERF_CLONE_FULL_WALK"));
+    const auto send = [canvas](QEvent::Type type, QPointF position, Qt::MouseButton button, Qt::MouseButtons buttons,
+                               Qt::KeyboardModifiers modifiers = Qt::NoModifier) {
+      QMouseEvent event(type, position, canvas->mapToGlobal(position), button, buttons, modifiers);
+      QApplication::sendEvent(canvas, &event);
+    };
+    // A press as the event loop delivers it: the press, whatever it posted, then the frame.
+    const auto timed_press = [&](QPointF position) {
+      return elapsed_ms([&] {
+        send(QEvent::MouseButtonPress, position, Qt::LeftButton, Qt::LeftButton);
+        QApplication::processEvents();
+        canvas->repaint();
+      });
+    };
+    struct Pass {
+      const char* label;
+      double zoom;
+      double step;
+      int folded;
+    };
+    for (const auto& pass : {Pass{"fit", 0.0, 2.0, 0}, Pass{"fit_burst", 0.0, 2.0, 8}, Pass{"100%", 1.0, 12.0, 0},
+                             Pass{"100%_burst", 1.0, 12.0, 8}, Pass{"100%_slow", 1.0, 3.0, 0}}) {
+      const std::string label = pass.label;
+      for (const int softness : {0, 100}) {
+        for (const int brush_size : image_case.sizes) {
+          if (pass.zoom == 0.0) {
+            canvas->fit_to_view();
+          } else {
+            canvas->set_zoom_centered(pass.zoom);
+          }
+          canvas->set_brush_size(brush_size);
+          canvas->set_brush_softness(softness);
+          settle();
+          // Document points, so the source and the stroke land on the image at every zoom.
+          const auto start = QPointF(canvas->widget_position_for_document_point(image_case.stroke_start));
+          const auto at = [&](double index) {
+            return start + QPointF(pass.step * index, pass.step * 3.0 * std::sin(index * 0.15));
+          };
+          const auto source = QPointF(canvas->widget_position_for_document_point(image_case.source));
+          send(QEvent::MouseButtonPress, source, Qt::LeftButton, Qt::LeftButton, Qt::AltModifier);
+          send(QEvent::MouseButtonRelease, source, Qt::LeftButton, Qt::NoButton, Qt::AltModifier);
+          send(QEvent::MouseMove, at(0), Qt::NoButton, Qt::NoButton);
+          QApplication::processEvents();
+          canvas->repaint();
+          int current = 0;
+          canvas->set_coalesced_mouse_positions_provider([&](const QMouseEvent&) -> std::vector<QPointF> {
+            std::vector<QPointF> folded;
+            for (int sample = 1; sample <= pass.folded; ++sample) {
+              folded.push_back(at(current - 1 + static_cast<double>(sample) / (pass.folded + 1)));
+            }
+            return folded;
+          });
+          const auto press_ms = timed_press(at(0));
+          std::vector<double> move_ms;
+          std::vector<double> events_ms;
+          std::vector<double> paint_ms;
+          const auto cpu_before = process_cpu_ms();
+          const auto stroke_ms = elapsed_ms([&] {
+            for (int index = 1; index <= 60; ++index) {
+              current = index;
+              move_ms.push_back(
+                  elapsed_ms([&] { send(QEvent::MouseMove, at(index), Qt::NoButton, Qt::LeftButton); }));
+              events_ms.push_back(elapsed_ms([] { QApplication::processEvents(); }));
+              paint_ms.push_back(elapsed_ms([&] { canvas->repaint(); }));
+            }
+          });
+          const auto stroke_cpu = process_cpu_ms() - cpu_before;
+          const auto release_ms = elapsed_ms([&] {
+            send(QEvent::MouseButtonRelease, at(60), Qt::LeftButton, Qt::NoButton);
+            QApplication::processEvents();
+            settle();
+          });
+          canvas->set_coalesced_mouse_positions_provider({});
+          // A second stroke on the same source (Aligned keeps the offset): press, frame, release.
+          const auto second = at(0) + QPointF(0.0, 40.0);
+          send(QEvent::MouseMove, second, Qt::NoButton, Qt::NoButton);
+          QApplication::processEvents();
+          canvas->repaint();
+          const auto repeat_press_ms = timed_press(second);
+          send(QEvent::MouseButtonRelease, second, Qt::LeftButton, Qt::NoButton);
+          QApplication::processEvents();
+          settle();
+          const auto summary = [](std::vector<double> values) {
+            std::sort(values.begin(), values.end());
+            double total = 0.0;
+            for (const auto value : values) {
+              total += value;
+            }
+            std::ostringstream text;
+            text << std::fixed << std::setprecision(2) << "avg=" << total / static_cast<double>(values.size())
+                 << " median=" << values[values.size() / 2] << " max=" << values.back();
+            return text.str();
+          };
+          std::cout << std::fixed << std::setprecision(2) << "[PERF] clonestamp " << image_case.width << "x"
+                    << image_case.height << " " << label << " zoom=" << canvas->zoom() << " size=" << brush_size
+                    << " softness=" << softness << " segments_per_move=" << pass.folded + 1
+                    << " press_ms=" << press_ms << " repeat_press_ms=" << repeat_press_ms
+                    << " stroke_ms=" << stroke_ms << " stroke_cpu_ms=" << stroke_cpu
+                    << " release_ms=" << release_ms << " move_ms " << summary(move_ms) << " events_ms "
+                    << summary(events_ms) << " paint_ms "
+                    << summary(paint_ms) << '\n';
+          patchy::ui::MainWindowTestAccess::undo(window);
+          patchy::ui::MainWindowTestAccess::undo(window);
+          settle();
+        }
+      }
+    }
+    // A queue of 240 moves 3 px apart at 100%, as Wayland delivers a fast mouse (every motion,
+    // uncompressed), handled one by one ("off") and coalesced per event-loop pass ("on",
+    // every position still its own sample): until the canvas paints again and in total.
+    for (const int brush_size : image_case.sizes) {
+      for (const bool coalesce : {false, true}) {
+        canvas->set_zoom_centered(1.0);
+        canvas->set_brush_size(brush_size);
+        canvas->set_brush_softness(100);
+        canvas->set_drag_move_coalescing_for_testing(coalesce
+                                                         ? patchy::ui::CanvasWidget::DragMoveCoalescing::AllMoves
+                                                         : patchy::ui::CanvasWidget::DragMoveCoalescing::Off);
+        settle();
+        const auto start = QPointF(canvas->widget_position_for_document_point(image_case.stroke_start));
+        const auto at = [&](double index) { return start + QPointF(3.0 * index, 9.0 * std::sin(index * 0.15)); };
+        const auto source = QPointF(canvas->widget_position_for_document_point(image_case.source));
+        send(QEvent::MouseButtonPress, source, Qt::LeftButton, Qt::LeftButton, Qt::AltModifier);
+        send(QEvent::MouseButtonRelease, source, Qt::LeftButton, Qt::NoButton, Qt::AltModifier);
+        const auto press_ms = timed_press(at(0));
+        const auto coalesced_before = canvas->render_cache_diagnostics().drag_moves_coalesced;
+        for (int index = 1; index <= 240; ++index) {
+          QApplication::postEvent(canvas, new QMouseEvent(QEvent::MouseMove, at(index), canvas->mapToGlobal(at(index)),
+                                                          Qt::NoButton, Qt::LeftButton, Qt::NoModifier));
+        }
+        const auto drain_ms = elapsed_ms([] {
+          QApplication::processEvents();
+          QApplication::processEvents();
+        });
+        const auto frame_ms = elapsed_ms([canvas] { canvas->repaint(); });
+        const auto coalesced = canvas->render_cache_diagnostics().drag_moves_coalesced - coalesced_before;
+        send(QEvent::MouseButtonRelease, at(240), Qt::LeftButton, Qt::NoButton);
+        QApplication::processEvents();
+        settle();
+        std::cout << std::fixed << std::setprecision(2) << "[PERF] clonestamp " << image_case.width << "x"
+                  << image_case.height << " queued240 coalesce=" << (coalesce ? "on" : "off")
+                  << " size=" << brush_size << " softness=100 press_ms=" << press_ms << " drain_ms=" << drain_ms
+                  << " frame_ms=" << frame_ms << " moves_coalesced=" << coalesced << '\n';
+        patchy::ui::MainWindowTestAccess::undo(window);
+        settle();
+      }
+    }
+    canvas->set_drag_move_coalescing_for_testing(patchy::ui::CanvasWidget::DragMoveCoalescing::Default);
+  }
+}
+
+// Where a Clone Stamp or Healing Brush press spends its time on the 3580x5370 RGB JPEG
+// GitHub issue 597's third follow-up paused on at 529 px ("a lag at the beginning"): each
+// step of the press (CanvasWidget::last_retouch_press_timings), the event-loop pass after
+// it, the first frame, and the render-cache copy a shared source snapshot forces. All
+// Layers (the default, sharing the settled render cache) and Current Layer; median of 7.
+void clone_press_perf() {
+  isolate_perf_settings();
+  constexpr int kWidth = 3580;
+  constexpr int kHeight = 5370;
+  const auto image_path = std::filesystem::absolute("test-artifacts/perf_clone_press_3580x5370.jpg");
+  {
+    std::filesystem::create_directories(image_path.parent_path());
+    QImage image(kWidth, kHeight, QImage::Format_RGB32);
+    for (int y = 0; y < kHeight; ++y) {
+      auto* row = reinterpret_cast<QRgb*>(image.scanLine(y));
+      for (int x = 0; x < kWidth; ++x) {
+        row[x] = qRgb((x / 7) % 256, (y / 9) % 256, ((x + y) / 13) % 256);
+      }
+    }
+    CHECK(image.save(patchy::ui::to_qstring(image_path), "JPG", 92));
+  }
+  patchy::ui::MainWindow window;
+  window.resize(1600, 1000);
+  if (qEnvironmentVariableIsSet("PATCHY_PERF_ONSCREEN")) {
+    window.showMaximized();
+  } else {
+    window.show();
+  }
+  QApplication::processEvents();
+  patchy::ui::MainWindowTestAccess::open_document_path(window, patchy::ui::to_qstring(image_path));
+  QApplication::processEvents();
+  auto* canvas = active_canvas(window);
+  CHECK(canvas != nullptr);
+  if (canvas == nullptr) {
+    return;
+  }
+  const auto settle = [canvas] {
+    const auto started = Clock::now();
+    while (!canvas->render_settled() && std::chrono::duration<double>(Clock::now() - started).count() < 60.0) {
+      canvas->repaint();
+      QApplication::processEvents();
+    }
+  };
+  const auto send = [canvas](QEvent::Type type, QPointF position, Qt::MouseButton button, Qt::MouseButtons buttons,
+                             Qt::KeyboardModifiers modifiers = Qt::NoModifier) {
+    QMouseEvent event(type, position, canvas->mapToGlobal(position), button, buttons, modifiers);
+    QApplication::sendEvent(canvas, &event);
+  };
+  const auto median = [](std::vector<double> values) {
+    std::sort(values.begin(), values.end());
+    return values[values.size() / 2];
+  };
+  struct Mode {
+    const char* label;
+    patchy::ui::CanvasTool tool;
+    patchy::SampleLayers sample;
+  };
+  for (const auto& mode : {Mode{"clone_all_layers", patchy::ui::CanvasTool::Clone, patchy::SampleLayers::AllLayers},
+                           Mode{"clone_current_layer", patchy::ui::CanvasTool::Clone,
+                                patchy::SampleLayers::CurrentLayer},
+                           Mode{"healing_all_layers", patchy::ui::CanvasTool::Healing,
+                                patchy::SampleLayers::AllLayers}}) {
+    canvas->set_tool(mode.tool);
+    canvas->set_retouch_sample_layers(mode.sample);
+    canvas->set_brush_opacity(100);
+    canvas->set_brush_size(529);
+    canvas->set_brush_softness(100);
+    canvas->set_zoom_centered(1.0);
+    settle();
+    std::vector<double> begin_edit, history, source, setup, first_dab, layer_detach, preview, press_event, events,
+        frame, cache_detach, total;
+    for (int round = 0; round < 7; ++round) {
+      const auto start = QPointF(canvas->widget_position_for_document_point(QPoint(2000, 2700 + round * 20)));
+      const auto source_point = QPointF(canvas->widget_position_for_document_point(QPoint(1700, 2600)));
+      send(QEvent::MouseButtonPress, source_point, Qt::LeftButton, Qt::LeftButton, Qt::AltModifier);
+      send(QEvent::MouseButtonRelease, source_point, Qt::LeftButton, Qt::NoButton, Qt::AltModifier);
+      send(QEvent::MouseMove, start, Qt::NoButton, Qt::NoButton);
+      QApplication::processEvents();
+      canvas->repaint();
+      settle();
+      const auto before = canvas->render_cache_diagnostics();
+      double press_ms = 0.0;
+      double events_ms = 0.0;
+      double frame_ms = 0.0;
+      const auto total_ms = elapsed_ms([&] {
+        press_ms = elapsed_ms([&] { send(QEvent::MouseButtonPress, start, Qt::LeftButton, Qt::LeftButton); });
+        events_ms = elapsed_ms([] { QApplication::processEvents(); });
+        frame_ms = elapsed_ms([&] { canvas->repaint(); });
+      });
+      const auto after = canvas->render_cache_diagnostics();
+      const auto timings = canvas->last_retouch_press_timings();
+      begin_edit.push_back(timings.begin_edit_ms);
+      history.push_back(timings.history_ms);
+      source.push_back(timings.source_ms);
+      setup.push_back(timings.setup_ms);
+      first_dab.push_back(timings.first_dab_ms);
+      layer_detach.push_back(timings.layer_detach_ms);
+      preview.push_back(timings.preview_ms);
+      press_event.push_back(press_ms);
+      events.push_back(events_ms);
+      frame.push_back(frame_ms);
+      cache_detach.push_back(after.render_cache_patch_detach_ms - before.render_cache_patch_detach_ms);
+      total.push_back(total_ms);
+      send(QEvent::MouseButtonRelease, start, Qt::LeftButton, Qt::NoButton);
+      QApplication::processEvents();
+      settle();
+      patchy::ui::MainWindowTestAccess::undo(window);
+      settle();
+    }
+    std::cout << std::fixed << std::setprecision(2) << "[PERF] clonepress " << kWidth << "x" << kHeight << " "
+              << mode.label << " size=529 press_to_frame_ms=" << median(total) << " press_event_ms="
+              << median(press_event) << " (begin_edit_ms=" << median(begin_edit) << " history_ms=" << median(history)
+              << " source_ms=" << median(source) << " setup_ms=" << median(setup) << " first_dab_ms="
+              << median(first_dab) << " layer_detach_ms=" << median(layer_detach) << " preview_ms="
+              << median(preview) << ") events_ms=" << median(events) << " frame_ms=" << median(frame)
+              << " render_cache_detach_ms=" << median(cache_detach) << '\n';
+  }
+}
+
+// The toning and detail brushes (Dodge, Burn, Sponge, Blur, Sharpen, Smudge) on a
+// 3580x5370 RGB JPEG the size of GitHub issue 660's image (the #597 one): each step of a press
+// (CanvasWidget::last_retouch_press_timings), the first frame, a 60-move stroke at 100% with
+// its per-move cost, and a queue of 240 moves as Wayland delivers a fast mouse, handled one by
+// one ("off") and coalesced ("on"). Small and big brush; PATCHY_RENDER_THREADS=4 prices a
+// 4-core laptop.
+void toning_stroke_perf() {
+  isolate_perf_settings();
+  constexpr int kWidth = 3580;
+  constexpr int kHeight = 5370;
+  const auto image_path = std::filesystem::absolute("test-artifacts/perf_toning_3580x5370.jpg");
+  {
+    std::filesystem::create_directories(image_path.parent_path());
+    QImage image(kWidth, kHeight, QImage::Format_RGB32);
+    for (int y = 0; y < kHeight; ++y) {
+      auto* row = reinterpret_cast<QRgb*>(image.scanLine(y));
+      for (int x = 0; x < kWidth; ++x) {
+        row[x] = qRgb((x / 7) % 256, (y / 9) % 256, ((x + y) / 13) % 256);
+      }
+    }
+    CHECK(image.save(patchy::ui::to_qstring(image_path), "JPG", 92));
+  }
+  patchy::ui::MainWindow window;
+  window.resize(1600, 1000);
+  if (qEnvironmentVariableIsSet("PATCHY_PERF_ONSCREEN")) {
+    window.showMaximized();
+  } else {
+    window.show();
+  }
+  QApplication::processEvents();
+  patchy::ui::MainWindowTestAccess::open_document_path(window, patchy::ui::to_qstring(image_path));
+  QApplication::processEvents();
+  auto* canvas = active_canvas(window);
+  CHECK(canvas != nullptr);
+  if (canvas == nullptr) {
+    return;
+  }
+  const auto settle = [canvas] {
+    const auto started = Clock::now();
+    while (!canvas->render_settled() && std::chrono::duration<double>(Clock::now() - started).count() < 60.0) {
+      canvas->repaint();
+      QApplication::processEvents();
+    }
+  };
+  const auto send = [canvas](QEvent::Type type, QPointF position, Qt::MouseButton button, Qt::MouseButtons buttons,
+                             Qt::KeyboardModifiers modifiers = Qt::NoModifier) {
+    QMouseEvent event(type, position, canvas->mapToGlobal(position), button, buttons, modifiers);
+    QApplication::sendEvent(canvas, &event);
+  };
+  const auto summary = [](std::vector<double> values) {
+    std::sort(values.begin(), values.end());
+    double total = 0.0;
+    for (const auto value : values) {
+      total += value;
+    }
+    std::ostringstream text;
+    text << std::fixed << std::setprecision(2) << "avg=" << total / static_cast<double>(values.size())
+         << " median=" << values[values.size() / 2] << " max=" << values.back();
+    return text.str();
+  };
+  struct ToolCase {
+    const char* label;
+    patchy::ui::CanvasTool tool;
+  };
+  canvas->set_local_adjustment_strength(50);
+  for (const auto& tool_case : {ToolCase{"dodge", patchy::ui::CanvasTool::Dodge},
+                                ToolCase{"burn", patchy::ui::CanvasTool::Burn},
+                                ToolCase{"sponge", patchy::ui::CanvasTool::Sponge},
+                                ToolCase{"blur", patchy::ui::CanvasTool::BlurBrush},
+                                ToolCase{"sharpen", patchy::ui::CanvasTool::SharpenBrush},
+                                ToolCase{"smudge", patchy::ui::CanvasTool::Smudge}}) {
+    canvas->set_tool(tool_case.tool);
+    canvas->set_brush_opacity(50);
+    for (const int brush_size : {60, 400}) {
+      canvas->set_zoom_centered(1.0);
+      canvas->set_brush_size(brush_size);
+      canvas->set_brush_softness(50);
+      settle();
+      const auto start = QPointF(canvas->widget_position_for_document_point(QPoint(1700, 2600)));
+      const auto at = [&](double index) { return start + QPointF(6.0 * index, 18.0 * std::sin(index * 0.15)); };
+      send(QEvent::MouseMove, at(0), Qt::NoButton, Qt::NoButton);
+      QApplication::processEvents();
+      canvas->repaint();
+      settle();
+      const auto press_ms = elapsed_ms([&] { send(QEvent::MouseButtonPress, at(0), Qt::LeftButton, Qt::LeftButton); });
+      const auto timings = canvas->last_retouch_press_timings();
+      const auto frame_ms = elapsed_ms([&] {
+        QApplication::processEvents();
+        canvas->repaint();
+      });
+      std::vector<double> move_ms;
+      std::vector<double> paint_ms;
+      double first_move_ms = 0.0;
+      const auto cpu_before = process_cpu_ms();
+      const auto stroke_ms = elapsed_ms([&] {
+        for (int index = 1; index <= 60; ++index) {
+          const auto one = elapsed_ms([&] {
+            send(QEvent::MouseMove, at(index), Qt::NoButton, Qt::LeftButton);
+            QApplication::processEvents();
+          });
+          if (index == 1) {
+            first_move_ms = one;
+          } else {
+            move_ms.push_back(one);
+          }
+          paint_ms.push_back(elapsed_ms([&] { canvas->repaint(); }));
+        }
+      });
+      const auto stroke_cpu = process_cpu_ms() - cpu_before;
+      const auto release_ms = elapsed_ms([&] {
+        send(QEvent::MouseButtonRelease, at(60), Qt::LeftButton, Qt::NoButton);
+        QApplication::processEvents();
+        settle();
+      });
+      std::cout << std::fixed << std::setprecision(2) << "[PERF] toningstroke " << kWidth << "x" << kHeight << " "
+                << tool_case.label << " size=" << brush_size << " press_event_ms=" << press_ms
+                << " (begin_edit_ms=" << timings.begin_edit_ms << " history_ms=" << timings.history_ms
+                << " source_ms=" << timings.source_ms << " setup_ms=" << timings.setup_ms
+                << " first_dab_ms=" << timings.first_dab_ms << " layer_detach_ms=" << timings.layer_detach_ms
+                << " preview_ms=" << timings.preview_ms << ") first_frame_ms=" << frame_ms
+                << " first_move_ms=" << first_move_ms << " stroke_ms=" << stroke_ms
+                << " stroke_cpu_ms=" << stroke_cpu << " release_ms=" << release_ms << " move_ms "
+                << summary(move_ms) << " paint_ms " << summary(paint_ms) << '\n';
+      patchy::ui::MainWindowTestAccess::undo(window);
+      settle();
+      for (const bool coalesce : {false, true}) {
+        canvas->set_drag_move_coalescing_for_testing(coalesce
+                                                         ? patchy::ui::CanvasWidget::DragMoveCoalescing::AllMoves
+                                                         : patchy::ui::CanvasWidget::DragMoveCoalescing::Off);
+        const auto queued_at = [&](double index) {
+          return start + QPointF(3.0 * index, 9.0 * std::sin(index * 0.15));
+        };
+        send(QEvent::MouseMove, queued_at(0), Qt::NoButton, Qt::NoButton);
+        QApplication::processEvents();
+        settle();
+        const auto queued_press_ms =
+            elapsed_ms([&] { send(QEvent::MouseButtonPress, queued_at(0), Qt::LeftButton, Qt::LeftButton); });
+        const auto coalesced_before = canvas->render_cache_diagnostics().drag_moves_coalesced;
+        for (int index = 1; index <= 240; ++index) {
+          QApplication::postEvent(canvas, new QMouseEvent(QEvent::MouseMove, queued_at(index),
+                                                          canvas->mapToGlobal(queued_at(index)), Qt::NoButton,
+                                                          Qt::LeftButton, Qt::NoModifier));
+        }
+        const auto drain_ms = elapsed_ms([] {
+          QApplication::processEvents();
+          QApplication::processEvents();
+        });
+        const auto queued_frame_ms = elapsed_ms([canvas] { canvas->repaint(); });
+        const auto coalesced = canvas->render_cache_diagnostics().drag_moves_coalesced - coalesced_before;
+        send(QEvent::MouseButtonRelease, queued_at(240), Qt::LeftButton, Qt::NoButton);
+        QApplication::processEvents();
+        settle();
+        std::cout << std::fixed << std::setprecision(2) << "[PERF] toningstroke " << kWidth << "x" << kHeight << " "
+                  << tool_case.label << " queued240 coalesce=" << (coalesce ? "on" : "off") << " size=" << brush_size
+                  << " press_ms=" << queued_press_ms << " drain_ms=" << drain_ms << " frame_ms=" << queued_frame_ms
+                  << " moves_coalesced=" << coalesced << '\n';
+        patchy::ui::MainWindowTestAccess::undo(window);
+        settle();
+      }
+      canvas->set_drag_move_coalescing_for_testing(patchy::ui::CanvasWidget::DragMoveCoalescing::Default);
+    }
+  }
+}
+
+// GitHub issue 660, second report: a 775 px Dodge (Soft 12%, Strength 25%, Highlights, Protect
+// Tones on) on the 3580x5370 portrait lagged and kept painting after the pointer stopped. He
+// paints zoomed out to fit, where a screen pixel of pointer travel is several image pixels and
+// Wayland delivers every motion. Per tool, at fit and at 100%: the press, 60 sent moves of a few
+// screen pixels with their paint, and a queue of 240 one-or-two-pixel moves (coalesced as a
+// window system's are) until it has drained, with the segments the tool painted and the time it
+// spent in them (RenderCacheDiagnostics::toning_*). PATCHY_PERF_TONING_SIZE (775) and
+// PATCHY_PERF_TONING_TOOLS (dodge,burn,sponge,blur,sharpen,smudge) narrow it.
+void toning_big_brush_perf() {
+  isolate_perf_settings();
+  constexpr int kWidth = 3580;
+  constexpr int kHeight = 5370;
+  const auto image_path = std::filesystem::absolute("test-artifacts/perf_toning_3580x5370.jpg");
+  {
+    std::filesystem::create_directories(image_path.parent_path());
+    QImage image(kWidth, kHeight, QImage::Format_RGB32);
+    for (int y = 0; y < kHeight; ++y) {
+      auto* row = reinterpret_cast<QRgb*>(image.scanLine(y));
+      for (int x = 0; x < kWidth; ++x) {
+        row[x] = qRgb(128 + (x / 7) % 128, 128 + (y / 9) % 128, 128 + ((x + y) / 13) % 128);
+      }
+    }
+    CHECK(image.save(patchy::ui::to_qstring(image_path), "JPG", 92));
+  }
+  patchy::ui::MainWindow window;
+  window.resize(1600, 1000);
+  if (qEnvironmentVariableIsSet("PATCHY_PERF_ONSCREEN")) {
+    window.showMaximized();
+  } else {
+    window.show();
+  }
+  QApplication::processEvents();
+  patchy::ui::MainWindowTestAccess::open_document_path(window, patchy::ui::to_qstring(image_path));
+  QApplication::processEvents();
+  auto* canvas = active_canvas(window);
+  CHECK(canvas != nullptr);
+  if (canvas == nullptr) {
+    return;
+  }
+  const auto settle = [canvas] {
+    const auto started = Clock::now();
+    while (!canvas->render_settled() && std::chrono::duration<double>(Clock::now() - started).count() < 60.0) {
+      canvas->repaint();
+      QApplication::processEvents();
+    }
+  };
+  const auto send = [canvas](QEvent::Type type, QPointF position, Qt::MouseButton button, Qt::MouseButtons buttons) {
+    QMouseEvent event(type, position, canvas->mapToGlobal(position), button, buttons, Qt::NoModifier);
+    QApplication::sendEvent(canvas, &event);
+  };
+  const auto summary = [](std::vector<double> values) {
+    std::sort(values.begin(), values.end());
+    double total = 0.0;
+    for (const auto value : values) {
+      total += value;
+    }
+    std::ostringstream text;
+    text << std::fixed << std::setprecision(2) << "avg=" << total / static_cast<double>(values.size())
+         << " median=" << values[values.size() / 2] << " max=" << values.back();
+    return text.str();
+  };
+  const auto size = qEnvironmentVariableIsSet("PATCHY_PERF_TONING_SIZE")
+                        ? qEnvironmentVariableIntValue("PATCHY_PERF_TONING_SIZE")
+                        : 775;
+  const auto tools_filter = qEnvironmentVariable("PATCHY_PERF_TONING_TOOLS");
+  struct ToolCase {
+    const char* label;
+    patchy::ui::CanvasTool tool;
+  };
+  canvas->set_local_adjustment_strength(25);
+  canvas->set_local_tone_range(patchy::ui::CanvasWidget::LocalToneRange::Highlights);
+  canvas->set_local_protect_tones(true);
+  for (const auto& tool_case : {ToolCase{"dodge", patchy::ui::CanvasTool::Dodge},
+                                ToolCase{"burn", patchy::ui::CanvasTool::Burn},
+                                ToolCase{"sponge", patchy::ui::CanvasTool::Sponge},
+                                ToolCase{"blur", patchy::ui::CanvasTool::BlurBrush},
+                                ToolCase{"sharpen", patchy::ui::CanvasTool::SharpenBrush},
+                                ToolCase{"smudge", patchy::ui::CanvasTool::Smudge}}) {
+    if (!tools_filter.isEmpty() && !tools_filter.split(QLatin1Char(',')).contains(QString::fromLatin1(tool_case.label))) {
+      continue;
+    }
+    canvas->set_tool(tool_case.tool);
+    canvas->set_brush_opacity(25);
+    canvas->set_brush_size(size);
+    canvas->set_brush_softness(12);
+    for (const bool fit : {true, false}) {
+      if (fit) {
+        canvas->fit_to_view();
+      } else {
+        canvas->set_zoom_centered(1.0);
+      }
+      settle();
+      const auto start = QPointF(canvas->widget_position_for_document_point(QPoint(1700, 2400)));
+      const auto step = fit ? 4.0 : 12.0;
+      const auto at = [&](double index) { return start + QPointF(step * index, step * 3.0 * std::sin(index * 0.15)); };
+      send(QEvent::MouseMove, at(0), Qt::NoButton, Qt::NoButton);
+      QApplication::processEvents();
+      canvas->repaint();
+      settle();
+      const auto before = canvas->render_cache_diagnostics();
+      const auto press_ms = elapsed_ms([&] { send(QEvent::MouseButtonPress, at(0), Qt::LeftButton, Qt::LeftButton); });
+      std::vector<double> move_ms;
+      std::vector<double> paint_ms;
+      const auto stroke_ms = elapsed_ms([&] {
+        for (int index = 1; index <= 60; ++index) {
+          move_ms.push_back(elapsed_ms([&] {
+            send(QEvent::MouseMove, at(index), Qt::NoButton, Qt::LeftButton);
+            QApplication::processEvents();
+          }));
+          paint_ms.push_back(elapsed_ms([&] { canvas->repaint(); }));
+        }
+      });
+      const auto after_moves = canvas->render_cache_diagnostics();
+      send(QEvent::MouseButtonRelease, at(60), Qt::LeftButton, Qt::NoButton);
+      QApplication::processEvents();
+      settle();
+      std::cout << std::fixed << std::setprecision(2) << "[PERF] toningbig " << tool_case.label << " size=" << size
+                << (fit ? " fit" : " 100%") << " zoom=" << canvas->zoom() << " press_ms=" << press_ms
+                << " stroke_ms=" << stroke_ms << " segments=" << after_moves.toning_segments - before.toning_segments
+                << " segment_ms=" << after_moves.toning_segment_ms - before.toning_segment_ms
+                << " segment_mpx=" << (after_moves.toning_segment_pixels - before.toning_segment_pixels) / 1.0e6
+                << " move_ms " << summary(move_ms) << " paint_ms " << summary(paint_ms) << '\n';
+      patchy::ui::MainWindowTestAccess::undo(window);
+      settle();
+
+      // 240 moves a pixel or two apart, queued as a fast pointer queues them and coalesced per pass.
+      canvas->set_drag_move_coalescing_for_testing(patchy::ui::CanvasWidget::DragMoveCoalescing::AllMoves);
+      const auto queued_at = [&](double index) {
+        return start + QPointF(1.5 * index, 6.0 * std::sin(index * 0.05));
+      };
+      send(QEvent::MouseMove, queued_at(0), Qt::NoButton, Qt::NoButton);
+      QApplication::processEvents();
+      settle();
+      send(QEvent::MouseButtonPress, queued_at(0), Qt::LeftButton, Qt::LeftButton);
+      const auto queued_before = canvas->render_cache_diagnostics();
+      for (int index = 1; index <= 240; ++index) {
+        QApplication::postEvent(canvas, new QMouseEvent(QEvent::MouseMove, queued_at(index),
+                                                        canvas->mapToGlobal(queued_at(index)), Qt::NoButton,
+                                                        Qt::LeftButton, Qt::NoModifier));
+      }
+      int frames = 0;
+      const auto drain_ms = elapsed_ms([&] {
+        int idle = 0;
+        while (idle < 3 && frames < 2000) {
+          // Only what the strokes invalidated repaints (a forced full repaint would never go idle).
+          const auto pass_ms = elapsed_ms([&] { QApplication::processEvents(); });
+          ++frames;
+          idle = pass_ms < 1.0 ? idle + 1 : 0;
+        }
+      });
+      const auto queued_after = canvas->render_cache_diagnostics();
+      send(QEvent::MouseButtonRelease, queued_at(240), Qt::LeftButton, Qt::NoButton);
+      QApplication::processEvents();
+      settle();
+      std::cout << std::fixed << std::setprecision(2) << "[PERF] toningbig " << tool_case.label << " size=" << size
+                << (fit ? " fit" : " 100%") << " queued240 drain_ms=" << drain_ms << " frames=" << frames
+                << " segments=" << queued_after.toning_segments - queued_before.toning_segments
+                << " segment_ms=" << queued_after.toning_segment_ms - queued_before.toning_segment_ms
+                << " segment_mpx=" << (queued_after.toning_segment_pixels - queued_before.toning_segment_pixels) / 1.0e6
+                << " moves_coalesced=" << queued_after.drag_moves_coalesced - queued_before.drag_moves_coalesced
+                << '\n';
+      canvas->set_drag_move_coalescing_for_testing(patchy::ui::CanvasWidget::DragMoveCoalescing::Default);
+      patchy::ui::MainWindowTestAccess::undo(window);
+      settle();
+    }
+  }
+}
+
+// A big soft Brush with reduced Flow and Airbrush on a ~3500 px photo (GitHub issue 677:
+// Size 179, Opacity 100, Soft 13, Flow 12, Airbrush on). Each case paints a 60-move sent stroke,
+// real-time strokes (one move every 8 ms for a second, as a 125 Hz mouse sends them, 4 and 24
+// widget px apart) whose behind_ms is how long after the last move was due the canvas finished
+// painting (a busy event loop posts the moves late, so the lag counts from the schedule), and, with Airbrush, a held pointer for a second (build-up ticks). Each runs through
+// core paint_brush_dab ("core", the path before the issue) and the banded dab walk ("banded").
+// PATCHY_PERF_AIRBRUSH_SIZE overrides 179; PATCHY_PERF_AIRBRUSH_CASES picks cases (airbrush,
+// flow12, airbrush100, plain), PATCHY_PERF_AIRBRUSH_VARIANTS variants (core, banded).
+void airbrush_big_brush_perf() {
+  isolate_perf_settings();
+  constexpr int kWidth = 3500;
+  constexpr int kHeight = 2330;
+  const auto image_path = std::filesystem::absolute("test-artifacts/perf_airbrush_3500x2330.jpg");
+  {
+    std::filesystem::create_directories(image_path.parent_path());
+    QImage image(kWidth, kHeight, QImage::Format_RGB32);
+    for (int y = 0; y < kHeight; ++y) {
+      auto* row = reinterpret_cast<QRgb*>(image.scanLine(y));
+      for (int x = 0; x < kWidth; ++x) {
+        row[x] = qRgb(96 + (x / 5) % 128, 80 + (y / 7) % 128, 64 + ((x + y) / 11) % 128);
+      }
+    }
+    CHECK(image.save(patchy::ui::to_qstring(image_path), "JPG", 92));
+  }
+  patchy::ui::MainWindow window;
+  window.resize(1600, 1000);
+  if (qEnvironmentVariableIsSet("PATCHY_PERF_ONSCREEN")) {
+    window.showMaximized();
+  } else {
+    window.show();
+  }
+  QApplication::processEvents();
+  patchy::ui::MainWindowTestAccess::open_document_path(window, patchy::ui::to_qstring(image_path));
+  QApplication::processEvents();
+  auto* canvas = active_canvas(window);
+  CHECK(canvas != nullptr);
+  if (canvas == nullptr) {
+    return;
+  }
+  const auto settle = [canvas] {
+    const auto started = Clock::now();
+    while (!canvas->render_settled() && std::chrono::duration<double>(Clock::now() - started).count() < 60.0) {
+      canvas->repaint();
+      QApplication::processEvents();
+    }
+  };
+  const auto send = [canvas](QEvent::Type type, QPointF position, Qt::MouseButton button, Qt::MouseButtons buttons) {
+    QMouseEvent event(type, position, canvas->mapToGlobal(position), button, buttons, Qt::NoModifier);
+    QApplication::sendEvent(canvas, &event);
+  };
+  const auto summary = [](std::vector<double> values) {
+    std::sort(values.begin(), values.end());
+    double total = 0.0;
+    for (const auto value : values) {
+      total += value;
+    }
+    std::ostringstream text;
+    text << std::fixed << std::setprecision(2) << "avg=" << total / static_cast<double>(values.size())
+         << " median=" << values[values.size() / 2] << " max=" << values.back();
+    return text.str();
+  };
+  const auto size = qEnvironmentVariableIsSet("PATCHY_PERF_AIRBRUSH_SIZE")
+                        ? qEnvironmentVariableIntValue("PATCHY_PERF_AIRBRUSH_SIZE")
+                        : 179;
+  const auto cases_filter = qEnvironmentVariable("PATCHY_PERF_AIRBRUSH_CASES");
+  struct BrushCase {
+    const char* label;
+    int flow;
+    bool build_up;
+  };
+  canvas->set_tool(patchy::ui::CanvasTool::Brush);
+  canvas->set_brush_size(size);
+  canvas->set_brush_opacity(100);
+  canvas->set_brush_softness(13);
+  const auto diagnostics_line = [](const patchy::ui::CanvasRenderCacheDiagnostics& before,
+                                   const patchy::ui::CanvasRenderCacheDiagnostics& after) {
+    std::ostringstream text;
+    text << std::fixed << std::setprecision(2) << " dabs=" << after.brush_dabs - before.brush_dabs
+         << " dab_ms=" << after.brush_dab_ms - before.brush_dab_ms
+         << " ticks=" << after.airbrush_ticks - before.airbrush_ticks
+         << " tick_ms=" << after.airbrush_tick_ms - before.airbrush_tick_ms;
+    return text.str();
+  };
+  const auto variants_filter = qEnvironmentVariable("PATCHY_PERF_AIRBRUSH_VARIANTS");
+  for (const auto& brush_case : {BrushCase{"airbrush", 12, true}, BrushCase{"flow12", 12, false},
+                                 BrushCase{"airbrush100", 100, true}, BrushCase{"plain", 100, false}}) {
+    if (!cases_filter.isEmpty() &&
+        !cases_filter.split(QLatin1Char(',')).contains(QString::fromLatin1(brush_case.label))) {
+      continue;
+    }
+    canvas->set_brush_flow(brush_case.flow);
+    canvas->set_brush_build_up(brush_case.build_up);
+    for (const bool banded : {false, true}) {
+      const auto variant = banded ? QStringLiteral("banded") : QStringLiteral("core");
+      if (!variants_filter.isEmpty() && !variants_filter.split(QLatin1Char(',')).contains(variant)) {
+        continue;
+      }
+      canvas->set_banded_brush_dabs_enabled_for_testing(banded);
+      for (const bool fit : {true, false}) {
+        if (fit) {
+          canvas->fit_to_view();
+        } else {
+          canvas->set_zoom_centered(1.0);
+        }
+        settle();
+        std::ostringstream label_text;
+        label_text << "[PERF] airbrushbig " << brush_case.label << ' ' << variant.toStdString() << " size=" << size
+                   << (fit ? " fit" : " 100%")
+                   << std::fixed << std::setprecision(2) << " zoom=" << canvas->zoom();
+        const auto label = label_text.str();
+        const auto start = QPointF(canvas->widget_position_for_document_point(QPoint(1750, 1165))) -
+                           QPointF(fit ? 250.0 : 400.0, 0.0);
+
+        // 60 sent moves, a repaint after each.
+        {
+          const auto at = [&](double index) { return start + QPointF(8.0 * index, 30.0 * std::sin(index * 0.15)); };
+          send(QEvent::MouseMove, at(0), Qt::NoButton, Qt::NoButton);
+          QApplication::processEvents();
+          settle();
+          const auto before = canvas->render_cache_diagnostics();
+          const auto press_ms =
+              elapsed_ms([&] { send(QEvent::MouseButtonPress, at(0), Qt::LeftButton, Qt::LeftButton); });
+          std::vector<double> move_ms;
+          std::vector<double> paint_ms;
+          for (int index = 1; index <= 60; ++index) {
+            move_ms.push_back(elapsed_ms([&] { send(QEvent::MouseMove, at(index), Qt::NoButton, Qt::LeftButton); }));
+            paint_ms.push_back(elapsed_ms([&] { canvas->repaint(); }));
+          }
+          const auto after = canvas->render_cache_diagnostics();
+          send(QEvent::MouseButtonRelease, at(60), Qt::LeftButton, Qt::NoButton);
+          QApplication::processEvents();
+          std::cout << label << " sent60 press_ms=" << std::fixed << std::setprecision(2) << press_ms
+                    << diagnostics_line(before, after) << " move_ms " << summary(move_ms) << " paint_ms "
+                    << summary(paint_ms) << '\n';
+          patchy::ui::MainWindowTestAccess::undo(window);
+          settle();
+        }
+
+        // Real time: a move every 8 ms for a second, 4 or 24 widget px apart (back and forth over
+        // 600 px), with the event loop (timer ticks, repaints) running in between as it does for a
+        // real mouse.
+        for (const double step : {4.0, 24.0}) {
+          const auto at = [&](double index) {
+            const auto travel = std::fmod(step * index, 1200.0);
+            return start + QPointF(travel > 600.0 ? 1200.0 - travel : travel, 40.0 * std::sin(index * 0.05));
+          };
+          send(QEvent::MouseMove, at(0), Qt::NoButton, Qt::NoButton);
+          QApplication::processEvents();
+          settle();
+          const auto before = canvas->render_cache_diagnostics();
+          send(QEvent::MouseButtonPress, at(0), Qt::LeftButton, Qt::LeftButton);
+          const auto started = Clock::now();
+          constexpr int kMoves = 125;
+          for (int index = 1; index <= kMoves; ++index) {
+            const auto due = started + std::chrono::milliseconds(8 * index);
+            while (Clock::now() < due) {
+              QApplication::processEvents(QEventLoop::AllEvents, 1);
+            }
+            QApplication::postEvent(canvas, new QMouseEvent(QEvent::MouseMove, at(index),
+                                                            canvas->mapToGlobal(at(index)), Qt::NoButton,
+                                                            Qt::LeftButton, Qt::NoModifier));
+          }
+          // The moves still queued here are the paint trailing the cursor.
+          QApplication::sendPostedEvents(canvas, QEvent::MouseMove);
+          QApplication::processEvents();
+          const auto total_ms = std::chrono::duration<double, std::milli>(Clock::now() - started).count();
+          const auto behind_ms = total_ms - 8.0 * kMoves;
+          const auto after = canvas->render_cache_diagnostics();
+          send(QEvent::MouseButtonRelease, at(kMoves), Qt::LeftButton, Qt::NoButton);
+          QApplication::processEvents();
+          std::cout << label << " realtime125 step=" << step << " total_ms=" << std::fixed << std::setprecision(2)
+                    << total_ms << " behind_ms=" << behind_ms << diagnostics_line(before, after) << '\n';
+          patchy::ui::MainWindowTestAccess::undo(window);
+          settle();
+        }
+
+        // Held still for a second: Airbrush build-up ticks.
+        if (brush_case.build_up) {
+          send(QEvent::MouseMove, start, Qt::NoButton, Qt::NoButton);
+          QApplication::processEvents();
+          settle();
+          const auto before = canvas->render_cache_diagnostics();
+          send(QEvent::MouseButtonPress, start, Qt::LeftButton, Qt::LeftButton);
+          const auto started = Clock::now();
+          while (Clock::now() - started < std::chrono::milliseconds(1000)) {
+            QApplication::processEvents(QEventLoop::AllEvents, 5);
+          }
+          const auto after = canvas->render_cache_diagnostics();
+          send(QEvent::MouseButtonRelease, start, Qt::LeftButton, Qt::NoButton);
+          QApplication::processEvents();
+          std::cout << label << " hold1000" << diagnostics_line(before, after) << '\n';
+          patchy::ui::MainWindowTestAccess::undo(window);
+          settle();
+        }
+      }
+    }
+  }
+  canvas->set_banded_brush_dabs_enabled_for_testing(true);
+}
+
+// GitHub issue 677 follow-up: the Airbrush preset (Size 179, Opacity 100, Flow 100, Airbrush
+// on) at Soft 10% and Soft 100% on a ~3600 px photo shown at about 13% zoom, the fit of a
+// small window, where one screen pixel is about 8 image pixels. Fast zigzags at 3000 screen
+// px/s from a 125 Hz mouse (24 px a move) and a 1000 Hz one (3 px a move), 1.5 s each, the
+// event loop running between moves. behind_ms is how long after the last move was due the
+// canvas had painted everything; work_per_s is dab time per second of stroke. Variants:
+// "perdab" paints every dab as it is placed (the 1.30 path), "batched" paints queued dabs in
+// one pass. PATCHY_PERF_AIRBRUSH_ZOOM overrides 0.13, PATCHY_PERF_AIRBRUSH_SOFT the softness
+// list (10,100), PATCHY_PERF_AIRBRUSH_FLOW the Flow (100), PATCHY_PERF_AIRBRUSH_VARIANTS the
+// variants.
+void airbrush_zoomed_out_perf() {
+  isolate_perf_settings();
+  constexpr int kWidth = 3600;
+  constexpr int kHeight = 2400;
+  const auto image_path = std::filesystem::absolute("test-artifacts/perf_airbrush_3600x2400.jpg");
+  {
+    std::filesystem::create_directories(image_path.parent_path());
+    QImage image(kWidth, kHeight, QImage::Format_RGB32);
+    for (int y = 0; y < kHeight; ++y) {
+      auto* row = reinterpret_cast<QRgb*>(image.scanLine(y));
+      for (int x = 0; x < kWidth; ++x) {
+        row[x] = qRgb(96 + (x / 5) % 128, 80 + (y / 7) % 128, 64 + ((x + y) / 11) % 128);
+      }
+    }
+    CHECK(image.save(patchy::ui::to_qstring(image_path), "JPG", 92));
+  }
+  patchy::ui::MainWindow window;
+  window.resize(1600, 1000);
+  if (qEnvironmentVariableIsSet("PATCHY_PERF_ONSCREEN")) {
+    window.showMaximized();
+  } else {
+    window.show();
+  }
+  QApplication::processEvents();
+  patchy::ui::MainWindowTestAccess::open_document_path(window, patchy::ui::to_qstring(image_path));
+  QApplication::processEvents();
+  auto* canvas = active_canvas(window);
+  CHECK(canvas != nullptr);
+  if (canvas == nullptr) {
+    return;
+  }
+  const auto settle = [canvas] {
+    const auto started = Clock::now();
+    while (!canvas->render_settled() && std::chrono::duration<double>(Clock::now() - started).count() < 60.0) {
+      canvas->repaint();
+      QApplication::processEvents();
+    }
+  };
+  const auto send = [canvas](QEvent::Type type, QPointF position, Qt::MouseButton button, Qt::MouseButtons buttons) {
+    QMouseEvent event(type, position, canvas->mapToGlobal(position), button, buttons, Qt::NoModifier);
+    QApplication::sendEvent(canvas, &event);
+  };
+  const auto zoom = qEnvironmentVariableIsSet("PATCHY_PERF_AIRBRUSH_ZOOM")
+                        ? qEnvironmentVariable("PATCHY_PERF_AIRBRUSH_ZOOM").toDouble()
+                        : 0.13;
+  const auto flow = qEnvironmentVariableIsSet("PATCHY_PERF_AIRBRUSH_FLOW")
+                        ? qEnvironmentVariableIntValue("PATCHY_PERF_AIRBRUSH_FLOW")
+                        : 100;
+  auto softness_list = qEnvironmentVariable("PATCHY_PERF_AIRBRUSH_SOFT").split(QLatin1Char(','), Qt::SkipEmptyParts);
+  if (softness_list.isEmpty()) {
+    softness_list = {QStringLiteral("10"), QStringLiteral("100")};
+  }
+  const auto variants_filter = qEnvironmentVariable("PATCHY_PERF_AIRBRUSH_VARIANTS");
+  canvas->set_tool(patchy::ui::CanvasTool::Brush);
+  canvas->set_brush_size(179);
+  canvas->set_brush_opacity(100);
+  canvas->set_brush_flow(flow);
+  canvas->set_brush_build_up(true);
+  canvas->set_zoom_centered(zoom);
+  settle();
+  // The image's middle on screen; the zigzag stays on the image (about 470x310 widget px).
+  const auto center = QPointF(canvas->widget_position_for_document_point(QPoint(kWidth / 2, kHeight / 2)));
+  const auto half_width = 0.42 * kWidth * canvas->zoom();
+  const auto half_height = 0.40 * kHeight * canvas->zoom();
+  for (const auto& softness_text : softness_list) {
+    const auto softness = softness_text.toInt();
+    canvas->set_brush_softness(softness);
+    for (const bool batched : {false, true}) {
+      const auto variant = batched ? QStringLiteral("batched") : QStringLiteral("perdab");
+      if (!variants_filter.isEmpty() && !variants_filter.split(QLatin1Char(',')).contains(variant)) {
+        continue;
+      }
+      canvas->set_brush_dab_batching_enabled_for_testing(batched);
+      // Posted moves coalesce per pass as window-system moves do (1.30 did not coalesce Brush moves).
+      canvas->set_drag_move_coalescing_for_testing(batched ? patchy::ui::CanvasWidget::DragMoveCoalescing::AllMoves
+                                                           : patchy::ui::CanvasWidget::DragMoveCoalescing::Default);
+      for (const auto& rate : {std::pair{125, 24.0}, std::pair{1000, 3.0}}) {
+        const auto interval_us = 1000000 / rate.first;
+        const auto step = rate.second;
+        // Side to side over the image's width, drifting up and down over its height.
+        const auto at = [&](double index) {
+          const auto period = 4.0 * half_width;
+          const auto travel = std::fmod(step * index, period);
+          const auto x = travel < 2.0 * half_width ? travel - half_width : 3.0 * half_width - travel;
+          return center + QPointF(x, half_height * std::sin(index * step / 900.0));
+        };
+        send(QEvent::MouseMove, at(0), Qt::NoButton, Qt::NoButton);
+        QApplication::processEvents();
+        settle();
+        const auto before = canvas->render_cache_diagnostics();
+#ifdef Q_OS_WIN
+        // PATCHY_PERF_SAMPLER=1 (with PATCHY_RENDER_SINGLE_THREADED=1 to keep the dabs on the
+        // sampled thread) attributes each stroke.
+        auto sampler = qEnvironmentVariableIsSet("PATCHY_PERF_SAMPLER") ? std::make_unique<MainThreadSampler>()
+                                                                        : nullptr;
+#endif
+        send(QEvent::MouseButtonPress, at(0), Qt::LeftButton, Qt::LeftButton);
+        const auto started = Clock::now();
+        const int moves = 1500000 / interval_us;
+        for (int index = 1; index <= moves; ++index) {
+          const auto due = started + std::chrono::microseconds(static_cast<long long>(interval_us) * index);
+          while (Clock::now() < due) {
+            QApplication::processEvents(QEventLoop::AllEvents, 1);
+          }
+          QApplication::postEvent(canvas, new QMouseEvent(QEvent::MouseMove, at(index),
+                                                          canvas->mapToGlobal(at(index)), Qt::NoButton,
+                                                          Qt::LeftButton, Qt::NoModifier));
+        }
+        // The moves still queued here are the paint trailing the cursor.
+        QApplication::sendPostedEvents(canvas, QEvent::MouseMove);
+        QApplication::processEvents();
+        canvas->repaint();
+        const auto total_ms = std::chrono::duration<double, std::milli>(Clock::now() - started).count();
+        const auto behind_ms = total_ms - static_cast<double>(interval_us) * moves / 1000.0;
+        const auto after = canvas->render_cache_diagnostics();
+#ifdef Q_OS_WIN
+        sampler.reset();
+#endif
+        send(QEvent::MouseButtonRelease, at(moves), Qt::LeftButton, Qt::NoButton);
+        QApplication::processEvents();
+        const auto dabs = after.brush_dabs - before.brush_dabs;
+        const auto dab_ms = after.brush_dab_ms - before.brush_dab_ms;
+        std::cout << std::fixed << std::setprecision(2) << "[PERF] airbrushzoomed soft=" << softness
+                  << " flow=" << flow << ' ' << variant.toStdString() << " zoom=" << canvas->zoom()
+                  << " mouse_hz=" << rate.first << " step=" << step << " moves=" << moves
+                  << " total_ms=" << total_ms << " behind_ms=" << behind_ms << " dabs=" << dabs
+                  << " dab_ms=" << dab_ms << " per_dab_ms=" << (dabs > 0 ? dab_ms / dabs : 0.0)
+                  << " work_per_s=" << dab_ms / 1500.0
+                  << " ticks=" << after.airbrush_ticks - before.airbrush_ticks << '\n';
+        patchy::ui::MainWindowTestAccess::undo(window);
+        settle();
+      }
+    }
+  }
+  canvas->set_brush_dab_batching_enabled_for_testing(true);
+  canvas->set_drag_move_coalescing_for_testing(patchy::ui::CanvasWidget::DragMoveCoalescing::Default);
+}
+
+// A small 8-bit CMYK PSD painted with the Brush, in CMYK Proof and after leaving it,
+// against a plain RGB document of the same size (GitHub issue 220's second sample, ag-psd's
+// test/read/cmyk/src.psd). PATCHY_PERF_CMYK_PSD overrides the fixture path.
+void cmyk_brush_stroke_perf_if_available() {
+  const auto env_path = qEnvironmentVariable("PATCHY_PERF_CMYK_PSD");
+  const auto path = env_path.isEmpty()
+      ? patchy::test::local_format_fixture_path("cmyk-brush-perf", "ag-psd-cmyk-src.psd")
+      : patchy::ui::to_filesystem_path(env_path);
+  if (!std::filesystem::exists(path)) {
+    std::cout << "[SKIP] local-test-fixtures/cmyk-brush-perf/ag-psd-cmyk-src.psd missing\n";
+    return;
+  }
+  isolate_perf_settings();
+  {
+    // Both would block the interactive open (tests/ui/main.cpp turns them off the same way).
+    auto settings = patchy::ui::app_settings();
+    settings.setValue(QStringLiteral("imports/cmykProofOpenNotice"), false);
+    settings.setValue(QStringLiteral("imports/showMissingFontsDialog"), false);
+    settings.sync();
+  }
+  const auto rgb_path = std::filesystem::absolute("test-artifacts/perf_cmyk_brush_rgb_200.png");
+  {
+    QImage image(200, 200, QImage::Format_RGB32);
+    image.fill(Qt::white);
+    CHECK(image.save(patchy::ui::to_qstring(rgb_path)));
+  }
+  patchy::ui::MainWindow window;
+  window.resize(1600, 1000);
+  if (qEnvironmentVariableIsSet("PATCHY_PERF_ONSCREEN")) {
+    window.showMaximized();
+  } else {
+    window.show();
+  }
+  QApplication::processEvents();
+  const auto stroke = [&](const std::string& label, double radius_fraction = 0.3) {
+    auto* canvas = active_canvas(window);
+    CHECK(canvas != nullptr);
+    const auto settle = [canvas] {
+      const auto started = Clock::now();
+      while (!canvas->render_settled() && std::chrono::duration<double>(Clock::now() - started).count() < 60.0) {
+        canvas->repaint();
+        QApplication::processEvents();
+      }
+    };
+    canvas->set_tool(patchy::ui::CanvasTool::Brush);
+    canvas->set_primary_color(Qt::black);
+    canvas->set_brush_opacity(100);
+    canvas->set_brush_softness(0);
+    canvas->set_brush_size(12);
+    canvas->set_zoom_centered(3.0);
+    settle();
+    const auto center = QPointF(canvas->width() / 2.0, canvas->height() / 2.0);
+    const auto radius = 200.0 * canvas->zoom() * radius_fraction;
+    const auto at = [&](int index) {
+      const auto angle = index * 0.1;
+      return QPointF(center.x() + radius * std::cos(angle), center.y() + radius * std::sin(angle));
+    };
+    const auto send = [canvas](QEvent::Type type, QPointF position, Qt::MouseButton button, Qt::MouseButtons buttons) {
+      QMouseEvent event(type, position, canvas->mapToGlobal(position), button, buttons, Qt::NoModifier);
+      QApplication::sendEvent(canvas, &event);
+    };
+    std::vector<double> move_ms;
+    std::vector<double> paint_ms;
+    const auto stats_before = patchy::native_cmyk_render_stats();
+    const auto started = Clock::now();
+    send(QEvent::MouseButtonPress, at(0), Qt::LeftButton, Qt::LeftButton);
+    canvas->repaint();
+    for (int index = 1; index <= 60; ++index) {
+      move_ms.push_back(elapsed_ms([&] { send(QEvent::MouseMove, at(index), Qt::NoButton, Qt::LeftButton); }));
+      paint_ms.push_back(elapsed_ms([&] { canvas->repaint(); }));
+    }
+    send(QEvent::MouseButtonRelease, at(60), Qt::LeftButton, Qt::NoButton);
+    QApplication::processEvents();
+    settle();
+    const auto total = std::chrono::duration<double, std::milli>(Clock::now() - started).count();
+    const auto summary = [](std::vector<double> values) {
+      std::sort(values.begin(), values.end());
+      std::ostringstream text;
+      text << std::fixed << std::setprecision(2) << "median=" << values[values.size() / 2] << " max=" << values.back();
+      return text.str();
+    };
+    std::cout << "[perf] cmyk_brush " << label << " move_ms " << summary(move_ms) << " paint_ms "
+              << summary(paint_ms) << " stroke_total_ms=" << std::fixed << std::setprecision(1) << total << " transform_builds="
+              << patchy::native_cmyk_render_stats().transform_builds - stats_before.transform_builds
+              << " separated_px=" << patchy::native_cmyk_render_stats().separated_pixels - stats_before.separated_pixels
+              << std::endl;
+  };
+  patchy::ui::MainWindowTestAccess::open_document_path(window, patchy::ui::to_qstring(path));
+  QApplication::processEvents();
+  std::cout << "[perf] cmyk_brush opened cmyk_proof=" << patchy::ui::MainWindowTestAccess::cmyk_proof(window) << std::endl;
+  stroke("cmyk_proof");
+  stroke("cmyk_proof_second_stroke", 0.2);
+  // A fresh copy left in RGB mode before its first stroke.
+  const auto rgb_mode_copy = std::filesystem::absolute("test-artifacts/perf_cmyk_brush_rgb_mode.psd");
+  std::filesystem::copy_file(path, rgb_mode_copy, std::filesystem::copy_options::overwrite_existing);
+  patchy::ui::MainWindowTestAccess::open_document_path(window, patchy::ui::to_qstring(rgb_mode_copy));
+  QApplication::processEvents();
+  patchy::ui::MainWindowTestAccess::set_document_cmyk_proof(window, false);
+  QApplication::processEvents();
+  std::cout << "[perf] cmyk_brush copy cmyk_proof=" << patchy::ui::MainWindowTestAccess::cmyk_proof(window) << std::endl;
+  stroke("converted_to_rgb");
+  patchy::ui::MainWindowTestAccess::open_document_path(window, patchy::ui::to_qstring(rgb_path));
+  QApplication::processEvents();
+  stroke("plain_rgb_200");
+}
+
+
+// A Direct Select drag of one vector mask anchor (#447 follow-up): a 2000x3000
+// document, a canvas-filled layer whose Reveal All mask holds a 4-point curved
+// path, the mask targeted, plain and with Drop Shadow, Inner Shadow and Bevel.
+// Each mouse move, its queued path apply and the repaint are timed.
+void vector_mask_anchor_drag_perf() {
+  constexpr int kWidth = 2000;
+  constexpr int kHeight = 3000;
+  for (const auto& [effects, zoom] : std::array<std::pair<bool, double>, 4>{
+           {{false, 1.0}, {true, 1.0}, {false, 0.3}, {true, 0.3}}}) {
+    patchy::Document document(kWidth, kHeight, patchy::PixelFormat::rgba8());
+    patchy::PixelBuffer backdrop(kWidth, kHeight, patchy::PixelFormat::rgba8());
+    backdrop.clear(230);
+    document.add_layer(patchy::Layer(document.allocate_layer_id(), "Backdrop", std::move(backdrop)));
+    patchy::PixelBuffer paint(kWidth, kHeight, patchy::PixelFormat::rgba8());
+    for (int y = 0; y < kHeight; ++y) {
+      auto row = paint.row(y);
+      for (int x = 0; x < kWidth; ++x) {
+        auto* pixel = row.data() + static_cast<std::size_t>(x) * 4U;
+        pixel[0] = 230;
+        pixel[1] = 50;
+        pixel[2] = 40;
+        pixel[3] = 255;
+      }
+    }
+    patchy::Layer layer(document.allocate_layer_id(), "Paint", std::move(paint));
+    patchy::LayerVectorMask mask;
+    patchy::PathSubpath curve;
+    const std::array<std::array<double, 2>, 4> corners{{{400.0, 600.0}, {1600.0, 500.0}, {1500.0, 2400.0}, {500.0, 2500.0}}};
+    for (const auto& corner : corners) {
+      patchy::PathAnchor anchor;
+      anchor.anchor_x = corner[0];
+      anchor.anchor_y = corner[1];
+      anchor.in_x = corner[0] - 250.0;
+      anchor.in_y = corner[1] + 120.0;
+      anchor.out_x = corner[0] + 250.0;
+      anchor.out_y = corner[1] - 120.0;
+      anchor.smooth = true;
+      curve.anchors.push_back(anchor);
+    }
+    mask.path.subpaths.push_back(curve);
+    layer.set_vector_mask(std::move(mask));
+    patchy::update_vector_mask_raster(layer, patchy::Rect::from_size(kWidth, kHeight));
+    if (effects) {
+      patchy::LayerDropShadow shadow;
+      shadow.enabled = true;
+      shadow.distance = 20.0F;
+      shadow.size = 20.0F;
+      layer.layer_style().drop_shadows.push_back(shadow);
+      patchy::LayerInnerShadow inner;
+      inner.enabled = true;
+      layer.layer_style().inner_shadows.push_back(inner);
+      patchy::LayerBevelEmboss bevel;
+      bevel.enabled = true;
+      layer.layer_style().bevels.push_back(bevel);
+    }
+    document.add_layer(std::move(layer));
+
+    patchy::ui::MainWindow window;
+    window.resize(1600, 1000);
+    if (qEnvironmentVariableIsSet("PATCHY_PERF_ONSCREEN")) {
+      window.showMaximized();
+    } else {
+      window.show();
+    }
+    QApplication::processEvents();
+    window.add_document_session(std::move(document), QStringLiteral("Vector Mask Drag Perf"));
+    QApplication::processEvents();
+    auto* canvas = active_canvas(window);
+    CHECK(canvas != nullptr);
+    const auto settle = [&] {
+      const auto started = Clock::now();
+      while (!canvas->render_settled() && std::chrono::duration<double>(Clock::now() - started).count() < 60.0) {
+        canvas->repaint();
+        QApplication::processEvents();
+      }
+    };
+    settle();
+    {
+      // Frame the dragged anchor at about `zoom`.
+      QRect view(QPoint(0, 0), QSize(static_cast<int>(canvas->width() / zoom), static_cast<int>(canvas->height() / zoom)));
+      view.moveCenter(QPoint(1400, 800));
+      canvas->zoom_to_document_rect(view);
+    }
+    canvas->set_layer_edit_target(patchy::ui::CanvasWidget::LayerEditTarget::VectorMask);
+    canvas->set_tool(patchy::ui::CanvasTool::DirectSelect);
+    QApplication::processEvents();
+    settle();
+
+    const auto start = canvas->widget_position_for_document_point(QPoint(1600, 500));
+    CHECK(canvas->rect().contains(start));
+    const auto press_ms = elapsed_ms([&] {
+      send_mouse(*canvas, QEvent::MouseButtonPress, start, Qt::LeftButton, Qt::LeftButton);
+      QApplication::processEvents();
+      canvas->repaint();
+    });
+    constexpr int kFrames = 40;
+    std::vector<double> frames;
+    frames.reserve(kFrames);
+    for (int frame = 1; frame <= kFrames; ++frame) {
+      const auto point = start + QPoint(-frame * 3, frame * 2);  // widget pixels
+      frames.push_back(elapsed_ms([&] {
+        send_mouse(*canvas, QEvent::MouseMove, point, Qt::NoButton, Qt::LeftButton);
+        QApplication::processEvents();
+        canvas->repaint();
+      }));
+    }
+    const auto release_ms = elapsed_ms([&] {
+      send_mouse(*canvas, QEvent::MouseButtonRelease, start + QPoint(-kFrames * 3, kFrames * 2), Qt::LeftButton,
+                 Qt::NoButton);
+      QApplication::processEvents();
+      canvas->repaint();
+    });
+    const auto settle_ms = elapsed_ms(settle);
+    const auto* moved = std::as_const(patchy::ui::MainWindowTestAccess::document(window)).layers().back().vector_mask();
+    CHECK(moved != nullptr && std::abs(moved->path.subpaths[0].anchors[1].anchor_x - 1600.0) > 10.0);
+
+    auto sorted = frames;
+    std::sort(sorted.begin(), sorted.end());
+    double total = 0.0;
+    for (const auto value : frames) {
+      total += value;
+    }
+    std::cout << std::fixed << std::setprecision(1) << "[PERF] vectormaskdrag " << kWidth << 'x' << kHeight
+              << " effects=" << (effects ? "on" : "off") << " zoom=" << canvas->zoom() << " press_ms=" << press_ms
+              << " first_frame_ms=" << frames.front() << " frame_avg_ms=" << total / kFrames
+              << " frame_median_ms=" << sorted[sorted.size() / 2] << " frame_max_ms=" << sorted.back()
+              << " release_ms=" << release_ms << " settle_ms=" << settle_ms
+              << " threads=" << patchy::hardware_worker_threads() << '\n';
+  }
+}
+
+// The core tool strokes' speed budgets (moved out of patchy_core_tests, whose wall-clock
+// checks are hang guards only: docs/testing.md, "Failure and lifetime traps"). Each
+// workload runs three times on a fresh document; the median must stay under its budget,
+// which PATCHY_TEST_TIME_SCALE multiplies (time_budget_ms; Debug builds 4x). Run alone with
+// `patchy_perf_tests toolbudgets`; the default run includes it.
+void tool_budgets_perf() {
+  const auto blank_rgba = [](std::int32_t width, std::int32_t height) {
+    patchy::PixelBuffer pixels(width, height, patchy::PixelFormat::rgba8());
+    pixels.clear(0);
+    return pixels;
+  };
+  const auto white_rgb = [](std::int32_t width, std::int32_t height) {
+    patchy::PixelBuffer pixels(width, height, patchy::PixelFormat::rgb8());
+    pixels.clear(255);
+    return pixels;
+  };
+  const auto options_for = [](std::uint8_t r, std::uint8_t g, std::uint8_t b) {
+    patchy::EditOptions options;
+    options.primary = patchy::EditColor{r, g, b, 255};
+    options.secondary = patchy::EditColor{255, 255, 255, 255};
+    return options;
+  };
+  // `setup` builds the state outside the clock; `work` is timed.
+  const auto median_ms = [](const std::function<std::function<void()>()>& setup) {
+    std::vector<double> samples;
+    for (int run = 0; run < 3; ++run) {
+      auto work = setup();
+      const auto started = Clock::now();
+      work();
+      samples.push_back(std::chrono::duration<double, std::milli>(Clock::now() - started).count());
+    }
+    std::sort(samples.begin(), samples.end());
+    return samples[1];
+  };
+  int over_budget = 0;
+  const auto judge = [&over_budget](const char* name, double ms, double budget_ms) {
+    const auto budget = patchy::test::time_budget_ms(budget_ms);
+    const bool over = ms >= static_cast<double>(budget);
+    over_budget += over ? 1 : 0;
+    std::cout << std::fixed << std::setprecision(1) << "[PERF] toolbudgets " << name << ": " << ms
+              << " ms (budget " << budget << " ms)" << (over ? " OVER BUDGET" : "") << '\n';
+  };
+
+  // A 240 px round brush across a 1600 x 1000 layer (pixel_tools_tests).
+  judge("wide_brush_segment",
+        median_ms([&] {
+          auto document = std::make_shared<patchy::Document>(1600, 1000, patchy::PixelFormat::rgb8());
+          document->add_pixel_layer("Background", white_rgb(1600, 1000));
+          const auto id = document->add_pixel_layer("Paint", blank_rgba(1600, 1000)).id();
+          return std::function<void()>([document, id, options_for] {
+            auto options = options_for(20, 80, 230);
+            options.brush_size = 240;
+            CHECK(!patchy::paint_brush_segment(*document, id, 140, 500, 1460, 500, options, false).empty());
+          });
+        }),
+        1000);
+
+  // A filled 900 x 620 ellipse takes the direct fill, not 96 px dabs (pixel_tools_tests).
+  judge("filled_ellipse",
+        median_ms([&] {
+          auto document = std::make_shared<patchy::Document>(1200, 900, patchy::PixelFormat::rgb8());
+          const auto id = document->add_pixel_layer("Filled Ellipse", blank_rgba(1200, 900)).id();
+          return std::function<void()>([document, id, options_for] {
+            auto options = options_for(20, 150, 240);
+            options.fill_shapes = true;
+            options.brush_size = 96;
+            CHECK(!patchy::draw_ellipse(*document, id, patchy::Rect{120, 90, 900, 620}, options, false).empty());
+          });
+        }),
+        1000);
+
+  // A long stroke growing a 64 px pasted layer across a 3000 px canvas, exact and under a
+  // LayerGrowthReserve (pixel_tools_tests checks the bytes and the reallocation counts).
+  // Static, so the stroke lambda below may use it uncaptured: from_size takes a reference,
+  // which odr-uses it, and GCC 12 refuses an uncaptured automatic there.
+  static constexpr std::int32_t kSide = 3000;
+  const auto growth_setup = [&](bool reserved) {
+    auto document = std::make_shared<patchy::Document>(kSide, kSide, patchy::PixelFormat::rgb8());
+    auto pixels = blank_rgba(64, 64);
+    pixels.pixel(10, 10)[3] = 255;
+    patchy::Layer layer(document->allocate_layer_id(), "Pasted Layer", std::move(pixels));
+    layer.set_bounds(patchy::Rect{0, 0, 64, 64});
+    const auto id = layer.id();
+    document->add_layer(std::move(layer));
+    return std::function<void()>([document, id, reserved, options_for] {
+      std::optional<patchy::LayerGrowthReserve> reserve;
+      if (reserved) {
+        reserve.emplace(id, patchy::Rect::from_size(kSide, kSide));
+      }
+      auto options = options_for(200, 40, 40);
+      options.brush_size = 30;
+      double x = 32.0;
+      double y = 32.0;
+      while (x < kSide - 100) {
+        CHECK(!patchy::paint_brush_segment(*document, id, x, y, x + 4.0, y + 3.0, options, false).empty());
+        x += 4.0;
+        y += 3.0;
+      }
+      CHECK(!patchy::paint_brush_segment(*document, id, x, y, 600.0, 20.0, options, false).empty());
+      if (reserve) {
+        reserve->close(*document->find_layer(id));
+      }
+    });
+  };
+  judge("small_layer_growth_exact", median_ms([&] { return growth_setup(false); }), 8000);
+  judge("small_layer_growth_reserved", median_ms([&] { return growth_setup(true); }), 2000);
+
+  // Count 8 with scatter, size and angle jitter along a 420 px stroke (brush_engine_tests).
+  judge("scattered_count_8_stroke",
+        median_ms([&] {
+          auto document = std::make_shared<patchy::Document>(512, 128, patchy::PixelFormat::rgb8());
+          document->add_pixel_layer("Background", white_rgb(512, 128));
+          const auto id = document->add_pixel_layer("Paint", blank_rgba(512, 128)).id();
+          patchy::BrushTip block;
+          block.width = 64;
+          block.height = 64;
+          block.mask.assign(64U * 64U, 255);
+          auto scaled = std::make_shared<patchy::ScaledBrushTip>(
+              patchy::make_scaled_brush_tip(patchy::build_brush_tip_mips(block), 64));
+          return std::function<void()>([document, id, scaled, options_for] {
+            auto options = options_for(0, 0, 0);
+            options.brush_size = 64;
+            options.brush_tip = scaled.get();
+            options.brush_tip_spacing = 0.25;
+            options.brush_dynamics.count = 8;
+            options.brush_dynamics.scatter = 1.0;
+            options.brush_dynamics.size_jitter = 0.5;
+            options.brush_dynamics.angle_jitter = 1.0;
+            options.brush_dynamics.seed = 42;
+            patchy::BrushTipStrokeState state;
+            CHECK(!patchy::paint_brush_segment(*document, id, 40.0, 64.0, 460.0, 64.0, options, false, state).empty());
+          });
+        }),
+        1000);
+
+  // A 500 px stamp tip, mip build included, across a 1600 px layer (brush_engine_tests).
+  judge("large_stamp_stroke",
+        median_ms([&] {
+          auto document = std::make_shared<patchy::Document>(1600, 1000, patchy::PixelFormat::rgb8());
+          document->add_pixel_layer("Background", white_rgb(1600, 1000));
+          const auto id = document->add_pixel_layer("Paint", blank_rgba(1600, 1000)).id();
+          auto tip = std::make_shared<patchy::BrushTip>();
+          tip->width = 500;
+          tip->height = 500;
+          tip->mask.assign(500U * 500U, 0);
+          for (std::int32_t y = 0; y < 500; ++y) {
+            for (std::int32_t x = 0; x < 500; ++x) {
+              if ((x - 250) * (x - 250) + (y - 250) * (y - 250) <= 240 * 240) {
+                tip->mask[static_cast<std::size_t>(y) * 500U + static_cast<std::size_t>(x)] = 255;
+              }
+            }
+          }
+          return std::function<void()>([document, id, tip, options_for] {
+            const auto scaled = patchy::make_scaled_brush_tip(patchy::build_brush_tip_mips(*tip), 500);
+            auto options = options_for(30, 60, 200);
+            options.brush_size = 500;
+            options.brush_tip = &scaled;
+            options.brush_tip_spacing = 0.25;
+            patchy::BrushTipStrokeState state;
+            CHECK(!patchy::paint_brush_segment(*document, id, 250.0, 500.0, 1450.0, 500.0, options, false, state)
+                       .empty());
+          });
+        }),
+        1000);
+
+  if (over_budget > 0) {
+    throw std::runtime_error("toolbudgets: " + std::to_string(over_budget) + " workload(s) over budget");
+  }
+}
+
+// Per-move cost of every canvas drag and the Type tool's box handles (the Wayland drag rule's
+// audit, docs/interactive-previews-drag-coalescing.md "The November 2026 audit"). Wayland
+// delivers every pointer motion, so a drag whose move does real work queues moves on Linux
+// unless it coalesces. Each case presses (or clicks, for the hover-driven lassos), sends 40
+// moves one by one (sent moves never coalesce, so this is the uncoalesced cost) and prints the
+// handler time per move and the repaint after it, on a 3600x5400 noisy photo with a pentagon
+// shape layer. `burst` lines post 60 moves at once and time the drain with the coalescing off
+// and on. PATCHY_PERF_DRAGAUDIT_CASES=name,name runs only those cases ("bursts" is one).
+void drag_audit_perf() {
+  constexpr int kWidth = 3600;
+  constexpr int kHeight = 5400;
+  patchy::Document document(kWidth, kHeight, patchy::PixelFormat::rgba8());
+  patchy::PixelBuffer photo(kWidth, kHeight, patchy::PixelFormat::rgba8());
+  std::uint64_t state = 0x2056;
+  for (int y = 0; y < kHeight; ++y) {
+    auto* row = photo.pixel(0, y);
+    for (int x = 0; x < kWidth; ++x) {
+      state = state * 6364136223846793005ULL + 1442695040888963407ULL;
+      const auto noise = static_cast<int>((state >> 59U) & 31U);
+      // Soft blobs give the edge-snapping tools something to follow.
+      const auto blob = ((x / 300 + y / 300) % 2) * 70;
+      row[x * 4 + 0] = static_cast<std::uint8_t>(std::min(255, 60 + blob + x * 60 / kWidth + noise));
+      row[x * 4 + 1] = static_cast<std::uint8_t>(std::min(255, 50 + blob + y * 60 / kHeight + noise));
+      row[x * 4 + 2] = static_cast<std::uint8_t>(std::min(255, 40 + noise));
+      row[x * 4 + 3] = 255;
+    }
+  }
+  document.add_layer(patchy::Layer(document.allocate_layer_id(), "Background", std::move(photo)));
+  patchy::LiveShapeParams params;
+  params.kind = patchy::LiveShapeKind::Polygon;
+  params.left = kWidth * 0.2;
+  params.top = kHeight * 0.25;
+  params.right = kWidth * 0.75;
+  params.bottom = kHeight * 0.75;
+  params.polygon_sides = 5;
+  patchy::populate_live_shape_box_corners(params);
+  patchy::VectorShapeContent shape;
+  shape.path.subpaths = patchy::generate_live_shape_subpaths(params);
+  shape.origination.push_back(params);
+  shape.fill.kind = patchy::VectorFillKind::Solid;
+  shape.fill.color = {140, 128, 128};
+  patchy::Layer shape_layer(document.allocate_layer_id(), "Polygon 1", patchy::LayerKind::Pixel);
+  shape_layer.metadata()[patchy::kLayerMetadataVectorShape] = "1";
+  shape_layer.set_vector_shape(std::move(shape));
+  patchy::update_vector_shape_raster(shape_layer, patchy::Rect::from_size(kWidth, kHeight),
+                                     &std::as_const(document).metadata().patterns);
+  const auto shape_id = shape_layer.id();
+  const auto background_id = document.layers().front().id();
+  document.add_layer(std::move(shape_layer));
+
+  patchy::ui::MainWindow window;
+  window.resize(1600, 1000);
+  window.show();
+  QApplication::processEvents();
+  window.add_document_session(std::move(document), QStringLiteral("Drag audit"));
+  auto* canvas = active_canvas(window);
+  CHECK(canvas != nullptr);
+  if (canvas == nullptr) {
+    return;
+  }
+  canvas->fit_to_view();
+  const auto settle = [canvas] {
+    QApplication::processEvents();
+    const auto started = Clock::now();
+    while (!canvas->render_settled() && std::chrono::duration<double>(Clock::now() - started).count() < 60.0) {
+      canvas->repaint();
+      QApplication::processEvents();
+    }
+  };
+  const auto select_layer = [&window](patchy::LayerId id) {
+    auto* layer_list = window.findChild<QListWidget*>(QStringLiteral("layerList"));
+    CHECK(layer_list != nullptr);
+    if (layer_list == nullptr) {
+      return;
+    }
+    for (int row = 0; row < layer_list->count(); ++row) {
+      auto* item = layer_list->item(row);
+      if (static_cast<patchy::LayerId>(item->data(patchy::ui::kLayerIdRole).toULongLong()) == id) {
+        layer_list->clearSelection();
+        layer_list->setCurrentItem(item);
+        item->setSelected(true);
+      }
+    }
+    QApplication::processEvents();
+  };
+  settle();
+  std::cout << "[PERF] dragaudit zoom=" << std::fixed << std::setprecision(3) << canvas->zoom()
+            << " threads=" << patchy::hardware_worker_threads() << '\n';
+
+  const auto only = qEnvironmentVariable("PATCHY_PERF_DRAGAUDIT_CASES").split(QLatin1Char(','), Qt::SkipEmptyParts);
+  const auto wanted = [&only](const char* name) { return only.isEmpty() || only.contains(QLatin1String(name)); };
+  const auto widget_at = [canvas](QPoint document_point) {
+    return canvas->widget_position_for_document_point(document_point);
+  };
+  const auto click = [canvas](QPoint widget_point) {
+    send_mouse(*canvas, QEvent::MouseButtonPress, widget_point, Qt::LeftButton, Qt::LeftButton);
+    send_mouse(*canvas, QEvent::MouseButtonRelease, widget_point, Qt::LeftButton, Qt::NoButton);
+    QApplication::processEvents();
+  };
+  const auto drag_and_release = [canvas](QPoint from, QPoint to) {
+    send_mouse(*canvas, QEvent::MouseButtonPress, from, Qt::LeftButton, Qt::LeftButton);
+    for (int step = 1; step <= 8; ++step) {
+      send_mouse(*canvas, QEvent::MouseMove, from + (to - from) * step / 8, Qt::NoButton, Qt::LeftButton);
+    }
+    send_mouse(*canvas, QEvent::MouseButtonRelease, to, Qt::LeftButton, Qt::NoButton);
+    QApplication::processEvents();
+  };
+  const auto report = [](const char* name, std::vector<double> handler, std::vector<double> paint) {
+    if (handler.empty()) {
+      std::cout << "[PERF] dragaudit case=" << name << " skipped\n";
+      return;
+    }
+    const auto total = std::accumulate(handler.begin(), handler.end(), 0.0);
+    std::sort(handler.begin(), handler.end());
+    std::sort(paint.begin(), paint.end());
+    std::cout << std::fixed << std::setprecision(2) << "[PERF] dragaudit case=" << name
+              << " move_median_ms=" << handler[handler.size() / 2]
+              << " move_p90_ms=" << handler[handler.size() * 9 / 10] << " move_max_ms=" << handler.back()
+              << " move_total_ms=" << total << " paint_median_ms=" << (paint.empty() ? 0.0 : paint[paint.size() / 2])
+              << '\n';
+  };
+  constexpr int kMoves = 40;
+  // Presses at `from` (unless `pressed` is false: a hover-driven gesture already started),
+  // sends kMoves moves toward `to` and times each, then Escape and the release.
+  const auto measure = [&](const char* name, QPoint from, QPoint to, bool pressed,
+                           Qt::KeyboardModifiers modifiers = Qt::NoModifier, bool escape = true) {
+    if (pressed) {
+      send_mouse(*canvas, QEvent::MouseButtonPress, from, Qt::LeftButton, Qt::LeftButton, modifiers);
+    }
+    QApplication::processEvents();
+    std::vector<double> handler;
+    std::vector<double> paint;
+    for (int move = 1; move <= kMoves; ++move) {
+      const auto point = from + (to - from) * move / kMoves;
+      handler.push_back(elapsed_ms([&] {
+        send_mouse(*canvas, QEvent::MouseMove, point, Qt::NoButton, pressed ? Qt::LeftButton : Qt::NoButton,
+                   modifiers);
+      }));
+      paint.push_back(elapsed_ms([&] { canvas->repaint(); }));
+      QApplication::processEvents();
+    }
+    if (escape) {
+      send_key(*canvas, Qt::Key_Escape);
+    }
+    if (pressed) {
+      send_mouse(*canvas, QEvent::MouseButtonRelease, to, Qt::LeftButton, Qt::NoButton, modifiers);
+    }
+    report(name, std::move(handler), std::move(paint));
+    settle();
+    canvas->clear_selection();
+    QApplication::processEvents();
+  };
+  // A burst of kBurst moves posted at once, as Wayland queues a fast pointer, drained with the
+  // drag move coalescing off (every move applied, the cost before the audit's fixes) and on.
+  // `prepare` starts the gesture's session (a path transform box, a lasso's first click).
+  constexpr int kBurst = 60;
+  const auto measure_burst = [&](const char* name, QPoint from, QPoint to, bool pressed,
+                                 const std::function<bool()>& prepare) {
+    double drained[2] = {0.0, 0.0};
+    int coalesced = 0;
+    for (const auto on : {false, true}) {
+      canvas->set_drag_move_coalescing_for_testing(on ? patchy::ui::CanvasWidget::DragMoveCoalescing::AllMoves
+                                                      : patchy::ui::CanvasWidget::DragMoveCoalescing::Off);
+      if (prepare && !prepare()) {
+        std::cout << "[PERF] dragaudit burst=" << name << " skipped\n";
+        return;
+      }
+      if (pressed) {
+        send_mouse(*canvas, QEvent::MouseButtonPress, from, Qt::LeftButton, Qt::LeftButton);
+      }
+      QApplication::processEvents();
+      const auto before = canvas->render_cache_diagnostics().drag_moves_coalesced;
+      for (int move = 1; move <= kBurst; ++move) {
+        const auto point = from + (to - from) * move / kBurst;
+        QApplication::postEvent(canvas, new QMouseEvent(QEvent::MouseMove, QPointF(point),
+                                                        QPointF(canvas->mapToGlobal(point)), Qt::NoButton,
+                                                        pressed ? Qt::LeftButton : Qt::NoButton, Qt::NoModifier));
+      }
+      drained[on ? 1 : 0] = elapsed_ms([&] {
+        for (int pass = 0; pass < 4; ++pass) {
+          QApplication::processEvents();
+        }
+        canvas->repaint();
+      });
+      if (on) {
+        coalesced = canvas->render_cache_diagnostics().drag_moves_coalesced - before;
+      }
+      send_key(*canvas, Qt::Key_Escape);
+      if (pressed) {
+        send_mouse(*canvas, QEvent::MouseButtonRelease, to, Qt::LeftButton, Qt::NoButton);
+      }
+      settle();
+      canvas->clear_selection();
+    }
+    canvas->set_drag_move_coalescing_for_testing(patchy::ui::CanvasWidget::DragMoveCoalescing::Default);
+    std::cout << std::fixed << std::setprecision(1) << "[PERF] dragaudit burst=" << name << " moves=" << kBurst
+              << " every_move_ms=" << drained[0] << " coalesced_ms=" << drained[1] << " coalesced=" << coalesced
+              << '\n';
+  };
+  using patchy::ui::CanvasTool;
+  const auto use_tool = [&](CanvasTool tool) {
+    canvas->set_tool(tool);
+    QApplication::processEvents();
+  };
+  const auto a = widget_at(QPoint(500, 600));
+  const auto b = widget_at(QPoint(3000, 4800));
+
+  select_layer(background_id);
+  if (wanted("marquee")) {
+    use_tool(CanvasTool::Marquee);
+    measure("marquee", a, b, true);
+  }
+  if (wanted("ellipse_marquee")) {
+    use_tool(CanvasTool::EllipticalMarquee);
+    measure("ellipse_marquee", a, b, true);
+  }
+  if (wanted("marquee_resize")) {
+    use_tool(CanvasTool::Marquee);
+    drag_and_release(widget_at(QPoint(600, 600)), widget_at(QPoint(2400, 3600)));
+    measure("marquee_resize", widget_at(QPoint(2400, 3600)), b, true, Qt::NoModifier, false);
+  }
+  if (wanted("selection_move")) {
+    use_tool(CanvasTool::Marquee);
+    drag_and_release(widget_at(QPoint(600, 600)), widget_at(QPoint(2400, 3600)));
+    measure("selection_move", widget_at(QPoint(1500, 2100)), widget_at(QPoint(2300, 3300)), true,
+            Qt::NoModifier, false);
+  }
+  if (wanted("ellipse_selection_move")) {
+    use_tool(CanvasTool::EllipticalMarquee);
+    drag_and_release(widget_at(QPoint(600, 600)), widget_at(QPoint(2400, 3600)));
+    use_tool(CanvasTool::Marquee);
+    measure("ellipse_selection_move", widget_at(QPoint(1500, 2100)), widget_at(QPoint(2300, 3300)), true,
+            Qt::NoModifier, false);
+  }
+  if (wanted("lasso")) {
+    use_tool(CanvasTool::Lasso);
+    measure("lasso", a, b, true);
+  }
+  if (wanted("polygon_lasso_hover")) {
+    use_tool(CanvasTool::PolygonLasso);
+    click(a);
+    measure("polygon_lasso_hover", a, b, false);
+  }
+  if (wanted("magnetic_lasso_hover")) {
+    use_tool(CanvasTool::MagneticLasso);
+    click(a);
+    measure("magnetic_lasso_hover", a, widget_at(QPoint(1700, 1800)), false);
+  }
+  if (wanted("quick_select")) {
+    use_tool(CanvasTool::QuickSelect);
+    canvas->set_quick_select_size(120);
+    measure("quick_select", a, b, true);
+  }
+  if (wanted("red_eye")) {
+    use_tool(CanvasTool::RedEye);
+    measure("red_eye", a, widget_at(QPoint(1500, 1600)), true);
+  }
+  if (wanted("patch")) {
+    use_tool(CanvasTool::Marquee);
+    drag_and_release(widget_at(QPoint(600, 600)), widget_at(QPoint(1400, 1400)));
+    use_tool(CanvasTool::PatchTool);
+    measure("patch", widget_at(QPoint(1000, 1000)), widget_at(QPoint(2000, 2600)), true);
+  }
+  if (wanted("spot_heal")) {
+    use_tool(CanvasTool::SpotHealing);
+    canvas->set_brush_size(300);
+    measure("spot_heal", a, b, true);
+  }
+  for (const auto& [name, tool] : {std::pair{"brush", CanvasTool::Brush}, std::pair{"mixer", CanvasTool::MixerBrush},
+                                   std::pair{"pattern_stamp", CanvasTool::PatternStamp},
+                                   std::pair{"clone", CanvasTool::Clone}}) {
+    if (!wanted(name)) {
+      continue;
+    }
+    use_tool(tool);
+    canvas->set_brush_size(300);
+    if (tool == CanvasTool::Clone) {
+      // The source: an Alt click.
+      send_mouse(*canvas, QEvent::MouseButtonPress, widget_at(QPoint(300, 300)), Qt::LeftButton, Qt::LeftButton,
+                 Qt::AltModifier);
+      send_mouse(*canvas, QEvent::MouseButtonRelease, widget_at(QPoint(300, 300)), Qt::LeftButton, Qt::NoButton,
+                 Qt::AltModifier);
+      QApplication::processEvents();
+    }
+    measure(name, a, b, true, Qt::NoModifier, false);
+  }
+  if (wanted("gradient_pixels")) {
+    use_tool(CanvasTool::Gradient);
+    canvas->set_gradient_tool_mode(patchy::ui::GradientToolMode::Pixels);
+    measure("gradient_pixels", a, b, true);
+  }
+  if (wanted("gradient_fill_layer")) {
+    use_tool(CanvasTool::Gradient);
+    canvas->set_gradient_tool_mode(patchy::ui::GradientToolMode::FillLayer);
+    measure("gradient_fill_layer", a, b, true);
+    canvas->set_gradient_tool_mode(patchy::ui::GradientToolMode::Pixels);
+  }
+  if (wanted("rectangle_shape")) {
+    use_tool(CanvasTool::Rectangle);
+    canvas->set_vector_tool_mode(patchy::ui::VectorToolMode::Shape);
+    measure("rectangle_shape", a, b, true);
+  }
+  if (wanted("pen_handle")) {
+    use_tool(CanvasTool::Pen);
+    canvas->set_vector_tool_mode(patchy::ui::VectorToolMode::Shape);
+    click(a);
+    measure("pen_handle", widget_at(QPoint(1500, 1500)), widget_at(QPoint(2500, 2200)), true);
+  }
+  if (wanted("path_transform")) {
+    select_layer(shape_id);
+    use_tool(CanvasTool::PathSelect);
+    if (canvas->begin_path_transform()) {
+      QApplication::processEvents();
+      measure("path_transform", widget_at(QPoint(kWidth / 2, kHeight / 2)),
+              widget_at(QPoint(kWidth / 2 + 600, kHeight / 2 + 500)), true);
+      canvas->cancel_path_transform();
+    } else {
+      report("path_transform", {}, {});
+    }
+    measure_burst("path_transform", widget_at(QPoint(kWidth / 2, kHeight / 2)),
+                  widget_at(QPoint(kWidth / 2 + 600, kHeight / 2 + 500)), true, [&] {
+                    canvas->cancel_path_transform();
+                    QApplication::processEvents();
+                    return canvas->begin_path_transform();
+                  });
+    canvas->cancel_path_transform();
+    select_layer(background_id);
+  }
+  if (wanted("bursts")) {
+    use_tool(CanvasTool::EllipticalMarquee);
+    measure_burst("ellipse_marquee", a, b, true, {});
+    use_tool(CanvasTool::MagneticLasso);
+    measure_burst("magnetic_lasso_hover", a, widget_at(QPoint(1700, 1800)), false, [&] {
+      click(a);
+      return true;
+    });
+    use_tool(CanvasTool::MixerBrush);
+    canvas->set_brush_size(300);
+    measure_burst("mixer", a, b, true, {});
+    use_tool(CanvasTool::PatternStamp);
+    measure_burst("pattern_stamp", a, b, true, {});
+    use_tool(CanvasTool::Pan);
+    measure_burst("pan", widget_at(QPoint(1800, 2700)), widget_at(QPoint(1800, 2700)) + QPoint(200, 160), true, {});
+    canvas->fit_to_view();
+    settle();
+    use_tool(CanvasTool::RotateView);
+    measure_burst("rotate_view", widget_at(QPoint(2600, 2700)), widget_at(QPoint(1800, 3700)), true, {});
+    canvas->set_view_rotation(0.0);
+    settle();
+    use_tool(CanvasTool::Zoom);
+    canvas->set_zoom_scrubby(true);
+    measure_burst("zoom_scrub", widget_at(QPoint(1800, 2700)), widget_at(QPoint(1800, 2700)) + QPoint(200, 0), true,
+                  [&] {
+                    canvas->fit_to_view();
+                    settle();
+                    return true;
+                  });
+    canvas->set_zoom_scrubby(false);
+    canvas->fit_to_view();
+    settle();
+  }
+  if (wanted("rotate_view")) {
+    use_tool(CanvasTool::RotateView);
+    measure("rotate_view", widget_at(QPoint(2600, 2700)), widget_at(QPoint(1800, 3700)), true, Qt::NoModifier,
+            false);
+    canvas->set_view_rotation(0.0);
+    settle();
+  }
+  if (wanted("spot_heal_900")) {
+    use_tool(CanvasTool::SpotHealing);
+    canvas->set_brush_size(900);
+    measure("spot_heal_900", a, b, true);
+  }
+  if (wanted("text_create")) {
+    patchy::ui::MainWindowTestAccess::select_type_tool(window);
+    QApplication::processEvents();
+    measure("text_create", a, widget_at(QPoint(3000, 2000)), true);
+    send_key(*canvas, Qt::Key_Escape);
+    settle();
+  }
+  if (wanted("text_box_resize")) {
+    patchy::ui::MainWindowTestAccess::select_type_tool(window);
+    QApplication::processEvents();
+    drag_and_release(a, widget_at(QPoint(2400, 1800)));
+    settle();
+    auto* editor = canvas->findChild<QTextEdit*>(QStringLiteral("inlineTextEditor"));
+    if (editor != nullptr) {
+      QString story;
+      for (int sentence = 0; sentence < 40; ++sentence) {
+        story += QStringLiteral("The quick brown fox jumps over the lazy dog near the river bank. ");
+      }
+      editor->setPlainText(story);
+      settle();
+    }
+    auto* handle =
+        canvas->findChild<QWidget*>(QStringLiteral("textBoxResizeHandleBottomRight"), Qt::FindDirectChildrenOnly);
+    if (editor == nullptr || handle == nullptr || !handle->isVisible()) {
+      report("text_box_resize", {}, {});
+    } else {
+      const auto start_global = handle->mapToGlobal(handle->rect().center());
+      const auto send_handle = [handle](QEvent::Type type, QPoint global, Qt::MouseButton button,
+                                        Qt::MouseButtons buttons) {
+        QMouseEvent event(type, QPointF(handle->mapFromGlobal(global)), QPointF(global), button, buttons,
+                          Qt::NoModifier);
+        QApplication::sendEvent(handle, &event);
+      };
+      send_handle(QEvent::MouseButtonPress, start_global, Qt::LeftButton, Qt::LeftButton);
+      std::vector<double> handler;
+      std::vector<double> paint;
+      for (int move = 1; move <= kMoves; ++move) {
+        const auto global = start_global + QPoint(-move * 4, move * 3);
+        handler.push_back(
+            elapsed_ms([&] { send_handle(QEvent::MouseMove, global, Qt::NoButton, Qt::LeftButton); }));
+        paint.push_back(elapsed_ms([&] { canvas->repaint(); }));
+        QApplication::processEvents();
+      }
+      send_handle(QEvent::MouseButtonRelease, start_global + QPoint(-kMoves * 4, kMoves * 3), Qt::LeftButton,
+                  Qt::NoButton);
+      report("text_box_resize", std::move(handler), std::move(paint));
+      double drained[2] = {0.0, 0.0};
+      for (const auto on : {false, true}) {
+        patchy::ui::set_slider_drag_coalescing_all_moves_for_testing(on);
+        const auto begin = handle->mapToGlobal(handle->rect().center());
+        send_handle(QEvent::MouseButtonPress, begin, Qt::LeftButton, Qt::LeftButton);
+        // Sent in one go, as a queue drains in one pass: with the switch on, the coalescing
+        // records sent moves too (a move posted behind the box's first preview finds the
+        // session re-laid out in this offscreen harness).
+        drained[on ? 1 : 0] = elapsed_ms([&] {
+          for (int move = 1; move <= kBurst; ++move) {
+            send_handle(QEvent::MouseMove, begin + QPoint(on ? move * 3 : -move * 3, move * 2), Qt::NoButton,
+                        Qt::LeftButton);
+          }
+          for (int pass = 0; pass < 4; ++pass) {
+            QApplication::processEvents();
+          }
+          canvas->repaint();
+        });
+        send_handle(QEvent::MouseButtonRelease, begin + QPoint(on ? kBurst * 3 : -kBurst * 3, kBurst * 2),
+                    Qt::LeftButton, Qt::NoButton);
+        QApplication::processEvents();
+      }
+      patchy::ui::set_slider_drag_coalescing_all_moves_for_testing(false);
+      std::cout << std::fixed << std::setprecision(1) << "[PERF] dragaudit burst=text_box_resize moves=" << kBurst
+                << " every_move_ms=" << drained[0] << " coalesced_ms=" << drained[1] << '\n';
+    }
+    send_key(*canvas, Qt::Key_Escape);
+    settle();
+  }
+  if (wanted("ruler")) {
+    use_tool(CanvasTool::Ruler);
+    measure("ruler", a, b, true, Qt::NoModifier, false);
+  }
+  if (wanted("pan")) {
+    use_tool(CanvasTool::Pan);
+    measure("pan", widget_at(QPoint(1800, 2700)), widget_at(QPoint(1800, 2700)) + QPoint(200, 160), true,
+            Qt::NoModifier, false);
+    canvas->fit_to_view();
+    settle();
+  }
+  if (wanted("zoom_scrub")) {
+    use_tool(CanvasTool::Zoom);
+    canvas->set_zoom_scrubby(true);
+    measure("zoom_scrub", widget_at(QPoint(1800, 2700)), widget_at(QPoint(1800, 2700)) + QPoint(200, 0), true,
+            Qt::NoModifier, false);
+    canvas->set_zoom_scrubby(false);
+    canvas->fit_to_view();
+    settle();
+  }
+  if (wanted("guide")) {
+    use_tool(CanvasTool::Move);
+    canvas->add_guide(patchy::GuideOrientation::Vertical, 1800 * 32);
+    settle();
+    measure("guide", widget_at(QPoint(1800, 2700)), widget_at(QPoint(2600, 2700)), true, Qt::NoModifier, false);
+  }
+}
+
+int main(int argc, char* argv[]) {
+  patchy::test::suppress_crash_dialogs();
+#ifdef Q_OS_WIN
+  g_main_thread_handle = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_QUERY_INFORMATION, FALSE,
+                                    GetCurrentThreadId());
+#endif
+  // PATCHY_PERF_ONSCREEN=1 keeps the platform window real so paint timings include
+  // the native raster backend and device pixel ratio.
+  if (!qEnvironmentVariableIsSet("PATCHY_PERF_ONSCREEN")) {
+    qputenv("QT_QPA_PLATFORM", QByteArray("offscreen"));
+  }
+  QApplication app(argc, argv);
+  const auto finish_workers = qScopeGuard([] { patchy::ui::wait_for_tracked_background_workers(); });
+  // Shared by every scenario: the user's settings store stays untouched (an interactive
+  // Patchy may be open), and the two open-time notices that would block an unattended
+  // open stay off, as in tests/ui/main.cpp. Before October 25, 2026 only the cmykbrush
+  // scenario did this, so the default run sat in the Missing Fonts dialog of the
+  // Quintavius document on any box whose fonts the offscreen platform cannot see.
+  isolate_perf_settings();
+  {
+    auto settings = patchy::ui::app_settings();
+    settings.setValue(QStringLiteral("imports/cmykProofOpenNotice"), false);
+    settings.setValue(QStringLiteral("imports/showMissingFontsDialog"), false);
+    settings.setValue(QStringLiteral("imports/showMissingLinksDialog"), false);
+    settings.setValue(QStringLiteral("imports/afImageLayers"), QStringLiteral("smart"));  // no Affinity question
+    settings.setValue(QStringLiteral("text/warnMissingFontsOnTransform"), false);
+    settings.setValue(QStringLiteral("updates/checkOnStartup"), false);
+    settings.sync();
+  }
+  // Every scenario runs under the suites' watchdog (15 minutes here; the scenarios open
+  // 70 Mpx documents and time whole drags): a stalled scenario prints its name, the
+  // open windows and the main thread's stack, then exits 124 (October 25, 2026: a
+  // default run sat silently for two hours in a modal dialog nobody could see).
+  patchy::test::TestWatchdog watchdog(patchy::test::test_timeout_seconds(900), report_open_windows);
+  const auto run_scenario = [&watchdog](const char* name, auto&& scenario) {
+    watchdog.begin(name);
+    scenario();
+    watchdog.end();
+    std::cout << std::flush;
+  };
+  try {
+    if (argc > 1 && std::string_view(argv[1]) == "zoom") {
+      run_scenario("zoom", tent_psb_zoom_step_perf_if_available);
+      return 0;
+    }
+    if (argc > 1 && std::string_view(argv[1]) == "layerpanel") {
+      run_scenario("layerpanel", quintavius_layer_panel_perf_if_available);
+      return 0;
+    }
+    if (argc > 1 && std::string_view(argv[1]) == "brushstroke") {
+      run_scenario("brushstroke", big_brush_stroke_perf);
+      return 0;
+    }
+    if (argc > 1 && std::string_view(argv[1]) == "toolbudgets") {
+      run_scenario("toolbudgets", tool_budgets_perf);
+      return 0;
+    }
+    if (argc > 1 && std::string_view(argv[1]) == "idle") {
+      run_scenario("idle", idle_new_document_perf);
+      return 0;
+    }
+    if (argc > 1 && std::string_view(argv[1]) == "a5brush") {
+      run_scenario("a5brush", a5_brush_stroke_perf);
+      return 0;
+    }
+    if (argc > 1 && std::string_view(argv[1]) == "clonestamp") {
+      run_scenario("clonestamp", clone_stamp_stroke_perf);
+      return 0;
+    }
+    if (argc > 1 && std::string_view(argv[1]) == "clonepress") {
+      run_scenario("clonepress", clone_press_perf);
+      return 0;
+    }
+    if (argc > 1 && std::string_view(argv[1]) == "toningstroke") {
+      run_scenario("toningstroke", toning_stroke_perf);
+      return 0;
+    }
+    if (argc > 1 && std::string_view(argv[1]) == "toningbig") {
+      run_scenario("toningbig", toning_big_brush_perf);
+      return 0;
+    }
+    if (argc > 1 && std::string_view(argv[1]) == "airbrushbig") {
+      run_scenario("airbrushbig", airbrush_big_brush_perf);
+      return 0;
+    }
+    if (argc > 1 && std::string_view(argv[1]) == "airbrushzoomed") {
+      run_scenario("airbrushzoomed", airbrush_zoomed_out_perf);
+      return 0;
+    }
+    if (argc > 1 && std::string_view(argv[1]) == "cmykbrush") {
+      run_scenario("cmykbrush", cmyk_brush_stroke_perf_if_available);
+      return 0;
+    }
+    if (argc > 1 && std::string_view(argv[1]) == "maskrotate") {
+      run_scenario("maskrotate", masked_layer_rotate_perf);
+      return 0;
+    }
+    if (argc > 1 && std::string_view(argv[1]) == "clipshape") {
+      run_scenario("clipshape", clipped_shape_resize_perf);
+      return 0;
+    }
+    if (argc > 1 && std::string_view(argv[1]) == "textdrag_live") {
+      run_scenario("textdrag_live", text_layer_live_drag_perf);
+      return 0;
+    }
+    if (argc > 1 && std::string_view(argv[1]) == "canvasdrag_live") {
+      run_scenario("canvasdrag_live", canvas_live_drag_perf);
+      return 0;
+    }
+    if (argc > 1 && std::string_view(argv[1]) == "dragaudit") {
+      run_scenario("dragaudit", drag_audit_perf);
+      return 0;
+    }
+    if (argc > 1 && std::string_view(argv[1]) == "pickdrag") {
+      run_scenario("pickdrag", pick_drag_perf);
+      return 0;
+    }
+    if (argc > 1 && std::string_view(argv[1]) == "textdrag") {
+      run_scenario("textdrag", text_layer_drag_perf);
+      return 0;
+    }
+    if (argc > 1 && std::string_view(argv[1]) == "textscrub") {
+      run_scenario("textscrub", text_size_scrub_perf);
+      return 0;
+    }
+    if (argc > 1 && std::string_view(argv[1]) == "textscrub_live") {
+      run_scenario("textscrub_live", text_size_scrub_live_perf);
+      return 0;
+    }
+    if (argc > 1 && std::string_view(argv[1]) == "vectormaskdrag") {
+      run_scenario("vectormaskdrag", vector_mask_anchor_drag_perf);
+      return 0;
+    }
+    if (argc > 1 && std::string_view(argv[1]) == "shapedrag") {
+      run_scenario("shapedrag", shape_over_photo_drag_perf);
+      return 0;
+    }
+    if (argc > 1 && std::string_view(argv[1]) == "warpdrag") {
+      run_scenario("warpdrag", warp_drag_perf);
+      return 0;
+    }
+    if (argc > 1 && std::string_view(argv[1]) == "warpphoto") {
+      run_scenario("warpphoto", warp_photo_perf_if_available);
+      return 0;
+    }
+    if (argc > 1 && std::string_view(argv[1]) == "gradientdrag") {
+      run_scenario("gradientdrag", gradient_shape_drag_perf);
+      return 0;
+    }
+    if (argc > 1 && std::string_view(argv[1]) == "liquifydrag") {
+      run_scenario("liquifydrag", liquify_drag_perf);
+      return 0;
+    }
+    // Explicit only: Levels' Alt+drag clipping view on a 6000x4000 photo (GitHub issue 687).
+    if (argc > 1 && std::string_view(argv[1]) == "levelsclip") {
+      run_scenario("levelsclip", levels_clipping_drag_perf);
+      return 0;
+    }
+    // Explicit only: a 6000x4000 image through every Gaussian line filter (GitHub issue 564).
+    if (argc > 1 && std::string_view(argv[1]) == "gaussian") {
+      run_scenario("gaussian", gaussian_blur_perf);
+      return 0;
+    }
+    if (argc > 1 && std::string_view(argv[1]) == "duplicate") {
+      run_scenario("duplicate", duplicate_layer_perf);
+      return 0;
+    }
+    if (argc > 1 && std::string_view(argv[1]) == "manylayers") {
+      run_scenario("manylayers", many_layers_select_and_move_perf_if_available);
+      return 0;
+    }
+    // Explicit only: launches the app a dozen times (docs/startup-performance.md).
+    if (argc > 1 && std::string_view(argv[1]) == "startup") {
+      return patchy::perf::run_startup_scenario();
+    }
+    // Explicit only (never part of the default run): minutes on the 85-page fixture.
+    if (argc > 1 && std::string_view(argv[1]) == "pdfopen") {
+      run_scenario("pdfopen", [&] { pdf_open_perf_if_available(argc, argv); });
+      return 0;
+    }
+    if (argc > 1 && std::string_view(argv[1]) == "pdfsave") {
+      run_scenario("pdfsave", [&] { pdf_save_perf_if_available(argc, argv); });
+      return 0;
+    }
+    run_scenario("toolbudgets", tool_budgets_perf);
+    run_scenario("template_dirty_move", template_psd_dirty_move_perf_if_available);
+    run_scenario("template_keyboard_nudge", template_psd_ui_keyboard_nudge_perf_if_available);
+    run_scenario("zoom", tent_psb_zoom_step_perf_if_available);
+    run_scenario("layerpanel", quintavius_layer_panel_perf_if_available);
+    run_scenario("manylayers", many_layers_select_and_move_perf_if_available);
+    run_scenario("maskrotate", masked_layer_rotate_perf);
+    run_scenario("clipshape", clipped_shape_resize_perf);
+    run_scenario("textdrag", text_layer_drag_perf);
+    run_scenario("warpdrag", warp_drag_perf);
+    run_scenario("warpphoto", warp_photo_perf_if_available);
+    run_scenario("gradientdrag", gradient_shape_drag_perf);
+    run_scenario("liquifydrag", liquify_drag_perf);
+  } catch (const std::exception& error) {
+    std::cerr << "[FAIL] " << error.what() << '\n';
+    return 1;
+  }
+  return 0;
+}

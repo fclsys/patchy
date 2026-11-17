@@ -1,0 +1,123 @@
+#pragma once
+
+#include "core/document.hpp"
+
+#include <filesystem>
+#include <cstdint>
+#include <functional>
+#include <memory>
+#include <optional>
+#include <span>
+#include <string>
+#include <string_view>
+#include <vector>
+
+namespace patchy {
+class CmykWorkingSpace;
+}
+
+namespace patchy::psd {
+
+struct ReadOptions {
+  bool preserve_unknown_blocks{true};
+  bool prefer_flat_composite{false};
+  bool retain_flat_composite{false};
+  // When set, the reader appends plain-English import notes (smart-object handling,
+  // etc.) for the UI's import-notices dialog.
+  std::vector<std::string>* notices{nullptr};
+  // A 16 or 32-bit file keeps its bit depth (docs/high-bit-depth-formats.md) instead of
+  // converting to 8 bits. Unset follows the deep-editing gate (deep_editing_enabled()).
+  std::optional<bool> keep_bit_depth{};
+};
+
+struct WriteOptions {
+  bool large_document{false};
+  // Layered saves retain imported 8/16-bit CMYK/gray/Lab when all layer color content
+  // is unchanged. False explicitly requests the RGB conversion path (CMYK Proof included).
+  bool preserve_source_color_mode{true};
+  // CMYK Proof (docs/cmyk.md): a layered save the source mode does not keep writes an 8 or
+  // 16-bit CMYK file with its layers, separated with this space's intent and black point
+  // compensation through an imported CMYK file's own profile, else this space's profile,
+  // which it embeds. Layers it cannot write in CMYK make the whole file RGB
+  // (layered_save_color_mode says why). Ignored without a profile.
+  std::shared_ptr<const CmykWorkingSpace> cmyk_proof{};
+  // Called on the writing thread as the save advances (the Saving dialog): (0, total, "")
+  // before the composite, (i, total, name) as top-level layer i (an artboard, say) is
+  // encoded, (total, total, "") before the bytes are assembled. Never changes the output.
+  std::function<void(int done, int total, const std::string& label)> progress{};
+  // Encodes the save's thumbnail (image resource 1036, docs/file-info-save-stamp.md "Thumbnails"):
+  // called on the writing thread with thumbnail_pixels of the composite, returns JFIF bytes
+  // (empty for none). When set, the document's earlier thumbnails (1033, 1036) are never
+  // written. Unset (recovery snapshots, the byte canaries), they pass through as before.
+  std::function<std::vector<std::uint8_t>(const PixelBuffer& thumbnail)> encode_thumbnail{};
+};
+
+// Photoshop's thumbnail limit: the longest side of image resource 1036.
+inline constexpr std::int32_t kThumbnailMaxSide = 160;
+
+// The image a save's thumbnail shows: `composite` (RGB or RGBA at any depth, straight
+// alpha, display-encoded) box-averaged to fit `max_side` (never enlarged), RGB8, over white
+// where `transparency` (one byte per composite pixel; empty for none) or the buffer's own
+// alpha is below 255. Integer math: the same bytes on every toolchain.
+[[nodiscard]] PixelBuffer thumbnail_pixels(const PixelBuffer& composite, std::span<const std::uint8_t> transparency,
+                                           std::int32_t max_side = kThumbnailMaxSide);
+// Image resource 1036 for a JFIF thumbnail of `width` x `height` (format 1, kJpegRGB, 24 bits).
+[[nodiscard]] std::vector<std::uint8_t> thumbnail_resource(std::int32_t width, std::int32_t height,
+                                                           std::span<const std::uint8_t> jfif);
+
+// The color mode a layered save writes.
+struct LayeredSaveColorMode {
+  // The PSD header mode: 3 RGB, 4 CMYK, or an imported file's own mode.
+  std::uint16_t mode{3};
+  // With WriteOptions::cmyk_proof and an RGB file: why the file cannot be CMYK, an English
+  // "QObject"-context source string for the UI to translate. Null otherwise.
+  const char* rgb_reason{nullptr};
+};
+
+// The adjustment-layer blocks the reader parses into native adjustment settings (levl,
+// curv, hue2, ... vibA). One list for the writer's regenerate rule and the open report's
+// known-block check, so a newly modeled kind is never reported as unknown data.
+[[nodiscard]] bool is_native_adjustment_block_key(std::string_view key) noexcept;
+
+// Per-layer tagged blocks the reader understands: the ones it parses into the layer model
+// (names, locks, color labels, blending options, knockout, effects, text, vector and fill
+// content, smart objects, artboards, native adjustments) and Photoshop's routine
+// bookkeeping it keeps byte for byte (layer id, name source, version, metadata, effects
+// reference point). The open report counts every other key as unknown data (GitHub issue
+// 559: every Photoshop layer listed about nine "unknown" blocks).
+[[nodiscard]] bool is_understood_layer_block_key(std::string_view key) noexcept;
+
+// The same for the document-level tagged blocks the reader keeps in
+// DocumentMetadata::unknown_psd_resources: text engine data, patterns, masks and merged
+// transparency, artboard settings, annotations (Photoshop writes Patt and FMsk into
+// every file; GitHub issue 559).
+[[nodiscard]] bool is_understood_global_block_key(std::string_view key) noexcept;
+
+class DocumentIo {
+public:
+  [[nodiscard]] static bool can_read(std::span<const std::uint8_t> bytes) noexcept;
+  [[nodiscard]] static Document read(std::span<const std::uint8_t> bytes, ReadOptions options = {});
+  [[nodiscard]] static Document read_file(const std::filesystem::path& path, ReadOptions options = {});
+  // The ICC profile image resource a read file carried (empty without one).
+  [[nodiscard]] static std::vector<std::uint8_t> source_icc_profile(const Document& document);
+  // Exactly the color mode write_layered_rgb8 with `options` writes: the imported file's own
+  // (unchanged CMYK, gray, Lab or duotone content, docs/psd-native-color.md), CMYK for a CMYK
+  // Proof save (docs/cmyk.md), else RGB.
+  [[nodiscard]] static LayeredSaveColorMode layered_save_color_mode(const Document& document,
+                                                                    WriteOptions options = {});
+  // layered_save_color_mode is not RGB.
+  [[nodiscard]] static bool layered_save_keeps_source_color_mode(const Document& document,
+                                                                 WriteOptions options = {});
+
+  [[nodiscard]] static std::vector<std::uint8_t> write_flat_rgb8(const Document& document,
+                                                                 WriteOptions options = {});
+  static void write_flat_rgb8_file(const Document& document, const std::filesystem::path& path,
+                                   WriteOptions options = {});
+
+  [[nodiscard]] static std::vector<std::uint8_t> write_layered_rgb8(const Document& document,
+                                                                    WriteOptions options = {});
+  static void write_layered_rgb8_file(const Document& document, const std::filesystem::path& path,
+                                      WriteOptions options = {});
+};
+
+}  // namespace patchy::psd

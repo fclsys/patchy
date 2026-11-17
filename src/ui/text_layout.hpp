@@ -1,0 +1,412 @@
+#pragma once
+
+// Text line layout: the single geometric authority for a laid-out text object.
+//
+// The rasterizer draws a text layer by walking a *line plan* - one QTextLine per
+// visual line, each with the origin it is drawn at - rather than letting
+// QTextDocument place the lines itself, because Photoshop's leading model moves
+// baselines away from Qt's natural spacing. Caret geometry, selection geometry
+// and mouse hit-testing must read the SAME plan, or the highlight sits on one
+// layout while the glyphs sit on another (the pre-August-2026 bug: the caret
+// path used Qt's natural block origins and never set photoshop_layout at all).
+//
+// TextLineGeometry is that shared reader. Build it from the same QTextDocument
+// and the same `boxed` / `photoshop_layout` flags the render pass uses and its
+// answers are guaranteed to agree with the drawn glyphs.
+//
+// Lifetime: QTextLine is a handle into the QTextLayout owned by the document's
+// blocks. Every type here is valid only while the document that produced it is
+// alive and has not been laid out again. Build, use, discard.
+//
+// Document construction lives in text_document.cpp; text_render.cpp owns the
+// render plan and raster pass. The owning plan keeps its document alive for every
+// line handle. See docs/text-tool-layout.md.
+
+#include <QFont>
+#include <QPointF>
+#include <QRectF>
+#include <QTextCharFormat>
+#include <QTextFormat>
+
+#include <optional>
+#include <utility>
+#include <vector>
+
+class QTextBlock;
+class QTextCharFormat;
+class QTextDocument;
+class QTextLine;
+
+#include <QTextLine>
+
+namespace patchy::ui {
+
+// Char/block format properties carrying the Photoshop text model through a QTextDocument.
+// Runs v3 records the unrounded size because QFont pixel sizes are ints and leading math
+// needs the fractional value.
+inline constexpr int kTextDisplayFamilyFormatProperty = QTextFormat::UserProperty + 31;
+inline constexpr int kTextLeadingFormatProperty = QTextFormat::UserProperty + 32;
+inline constexpr int kTextAutoLeadingFormatProperty = QTextFormat::UserProperty + 33;
+inline constexpr int kTextTrackingFormatProperty = QTextFormat::UserProperty + 34;
+inline constexpr int kTextExactSizeFormatProperty = QTextFormat::UserProperty + 35;
+// Block property: paragraph auto-leading fraction (Photoshop default 1.2).
+inline constexpr int kTextBlockAutoLeadFractionProperty = QTextFormat::UserProperty + 36;
+// Character-panel glyph scales (runs v3): width x horizontal, height x vertical. The glyph
+// pixel size folds the vertical scale in; leading math stays FontSize-based, so the exact-size
+// property intentionally excludes it.
+inline constexpr int kTextHorizontalScaleFormatProperty = QTextFormat::UserProperty + 37;
+inline constexpr int kTextVerticalScaleFormatProperty = QTextFormat::UserProperty + 38;
+// Photoshop's faux bold (runs v4): a synthetic embolden of the run's own face, never a request
+// for the family's real bold face. Carried as a flag and turned into a glyph-outline stroke by
+// apply_faux_bold_to_document at render time, so it follows later colour and size edits.
+inline constexpr int kTextFauxBoldFormatProperty = QTextFormat::UserProperty + 39;
+// The face (OpenType subfamily) a run asks for, for the styles bold+italic cannot name ("Demi",
+// "Black", "Book"). Kept as its own property because QFont::styleName does not survive the
+// HTML round trip the editor documents go through. Runs v5.
+inline constexpr int kTextStyleNameFormatProperty = QTextFormat::UserProperty + 40;
+
+// Photoshop's faux bold adds this fraction of the em to every advance and strokes the glyph
+// outline with a pen of the same width, capped at kFauxBoldMaxStrokePixels: from about 37px up
+// the ink grows by one pixel (half a pixel per side) whatever the size, while the advances keep
+// growing with the em. Fitted to Photoshop 2026 captures of Arial, Arial Bold, Arial Black and
+// Georgia Italic at 12-200px (docs/text-render-calibration.md, "Faux bold is not the bold face").
+inline constexpr double kFauxBoldAdvanceEmFraction = 0.027;
+inline constexpr double kFauxBoldMaxStrokePixels = 1.0;
+
+// Photoshop's faux italic (runs v6): a synthetic slant of the run's own face. Unlike faux bold
+// it cannot be expressed through QFont at all -- setStyle(QFont::StyleOblique) resolves to the
+// family's REAL Italic face when one exists (measured on Arial: same styleName, identical ink) --
+// so the renderer shears the drawn line instead.
+inline constexpr int kTextFauxItalicFormatProperty = QTextFormat::UserProperty + 41;
+
+// Horizontal offset per unit of height above the baseline, i.e. tan of the slant angle. 12
+// degrees, matching Photoshop's synthetic slant.
+inline constexpr double kFauxItalicSlant = 0.2126;
+
+// Vertical type only (runs v7): Roman glyphs of this run lie rotated 90 degrees along the
+// column instead of standing upright (Photoshop's "Standard Vertical Roman Alignment",
+// /BaselineDirection 2). CJK glyphs stay upright either way.
+inline constexpr int kTextRotatedRomanFormatProperty = QTextFormat::UserProperty + 42;
+// Baseline shift in the same scaled engine pixels as kTextExactSizeFormatProperty.
+inline constexpr int kTextBaselineShiftFormatProperty = QTextFormat::UserProperty + 43;
+
+// Character-panel styles (runs v9 column 16, GitHub issue 346). Flags only, like faux bold: the
+// editor document keeps the run's text, case and size, and build_text_render_document turns them
+// into drawing (apply_text_character_styles_to_document). Caps: 1 Small Caps, 2 All Caps;
+// baseline: 1 superscript, 2 subscript; the rest are bools.
+inline constexpr int kTextFontCapsFormatProperty = QTextFormat::UserProperty + 44;
+inline constexpr int kTextFontBaselineFormatProperty = QTextFormat::UserProperty + 45;
+inline constexpr int kTextUnderlineFormatProperty = QTextFormat::UserProperty + 46;
+inline constexpr int kTextStrikethroughFormatProperty = QTextFormat::UserProperty + 47;
+inline constexpr int kTextOrdinalsFormatProperty = QTextFormat::UserProperty + 48;
+inline constexpr int kTextFractionsFormatProperty = QTextFormat::UserProperty + 49;
+// Render documents only. QTextCharFormat cannot carry OpenType features (Qt 6.8), so a fragment
+// whose features change its glyphs (smcp, ordn, frac) lists their tags here (QStringList), is laid
+// out with its advance corrected to the featured width through extra letter spacing, and is drawn
+// from its own featured shaping (draw_featured_glyph_runs). The second property keeps the letter
+// spacing the fragment had before that correction, which the featured shaping uses.
+inline constexpr int kTextRenderFeaturesFormatProperty = QTextFormat::UserProperty + 50;
+inline constexpr int kTextRenderBaseLetterSpacingFormatProperty = QTextFormat::UserProperty + 51;
+// Render documents only: the families a fragment is drawn in when its Photoshop language has its
+// own forms in the font (QStringList, text_language_font_families), the same way as the features.
+inline constexpr int kTextRenderLanguageFamiliesFormatProperty = QTextFormat::UserProperty + 63;
+// Block property: Photoshop's paragraph composer (paragraph runs v5, Txt2 /35), set only when a
+// paragraph is not World-Ready (1, the default): 0 is the Latin and East Asian composer.
+inline constexpr int kTextBlockComposerProperty = QTextFormat::UserProperty + 52;
+// The other OpenType toggles of the Character panel (runs v9 column 16), flags like the six
+// above. Standard Ligatures is on by default, so its property records it turned OFF.
+inline constexpr int kTextLigaturesOffFormatProperty = QTextFormat::UserProperty + 53;
+inline constexpr int kTextContextualAlternatesFormatProperty = QTextFormat::UserProperty + 54;
+inline constexpr int kTextDiscretionaryLigaturesFormatProperty = QTextFormat::UserProperty + 55;
+inline constexpr int kTextSwashFormatProperty = QTextFormat::UserProperty + 56;
+inline constexpr int kTextStylisticAlternatesFormatProperty = QTextFormat::UserProperty + 57;
+inline constexpr int kTextTitlingAlternatesFormatProperty = QTextFormat::UserProperty + 58;
+// Block property: where a justified paragraph (Qt::AlignJustify) puts its last line in a text
+// box or area. Qt always leaves it flush left; Photoshop also centres it, sets it right, or
+// spreads it across the frame like the other lines (TextJustifyLastLine; absent is Left).
+inline constexpr int kTextBlockJustifyLastLineProperty = QTextFormat::UserProperty + 59;
+// Photoshop's hyphenation and spelling language of a run (Txt2 /38 numbering, runs v9 column 16
+// token `language:<n>`), absent when the run has none. Typed text inherits it from the
+// character before it like any other format; nothing renders from it (GitHub issue 682).
+inline constexpr int kTextLanguageFormatProperty = QTextFormat::UserProperty + 60;
+// Photoshop's Middle Eastern character settings of a run (digit set, diacritic offsets, mark
+// distance, Justification Alternates) as their runs v9 column 16 tokens ("digits:2,diacx:-100"),
+// absent when every one is at its default. Kept through edits like the language; nothing
+// renders from them (GitHub issue 683).
+inline constexpr int kTextMiddleEasternFormatProperty = QTextFormat::UserProperty + 61;
+// Block property: the paragraph's kept Photoshop settings (Hyphenate, the hyphenation settings,
+// the Kashida width, the Every-line composer) as their paragraph runs v6 column 11 tokens
+// ("hyphenate,kashida:0,everyline"), absent
+// when every one is at its default. A paragraph split by Return inherits it with the block
+// format; nothing renders from it (GitHub issue 683).
+inline constexpr int kTextBlockPhotoshopSettingsProperty = QTextFormat::UserProperty + 62;
+
+enum class TextJustifyLastLine { Left = 0, Center = 1, Right = 2, All = 3 };
+
+// One visual line as the renderer draws it: the line, the origin it is drawn at, and the
+// rect it is clipped to. `block_position` is the owning block's document position, which
+// QTextLine alone cannot recover (its lineNumber() is an index within its own block's
+// layout); TextLineGeometry needs it to convert between block-relative and document
+// positions. The render pass ignores it.
+[[nodiscard]] TextJustifyLastLine text_justify_last_line(const QTextBlockFormat& format);
+
+// Photoshop's justify modes in a text box or area (PS 2026 renders of issue 672's file and
+// single-line probes, docs/text-tool-alignment.md "Justify modes"): Qt lays out the last line of a
+// justified paragraph flush left; Justify Last Centered and Right move it by half or all of
+// its line's slack, which is what this returns for that line (0 for every other line; mirrored
+// in a right-to-left paragraph, whose last line Qt sets flush right). Point text sets every
+// justify mode flush left, so callers apply it to box and area lines only.
+[[nodiscard]] double justified_last_line_shift(const QTextBlock& block, const QTextLine& line);
+
+// Justify All spreads the last line too, a lone word letter by letter: QTextLayout's forced
+// justification on each such block. Box and area documents only (point text stays flush left).
+// The flag cannot be cleared again, so call it on a freshly built document. A paragraph holding
+// a cursive script (Arabic, Syriac, ...) is never forced: Qt would pull its letters apart.
+void apply_justify_all_to_document(QTextDocument& document);
+
+// Justifies right-to-left paragraphs and paragraphs holding a cursive script by their word
+// spaces alone, as Photoshop does (GitHub issue 683). Qt's own justification falls short there:
+// a right-to-left line ends one trailing space short of the frame's right edge, and a cursive
+// script gets its slack between letters (or all of it in the one space after a Latin word), so
+// Justify All tore an Arabic last line apart. Every justified line of such a paragraph (the last
+// one too under Justify All) gets its slack as extra advance on its word spaces. A laid-out
+// box document only: area text places its own lines, point text is never justified.
+void apply_word_space_justification_to_document(QTextDocument& document);
+
+struct BoxTextLineRenderItem {
+  QTextLine line;
+  QPointF block_origin;
+  QRectF clip_rect;
+  int block_position{0};
+};
+
+struct BoxTextRenderPlan {
+  QRectF local_rect;
+  std::vector<BoxTextLineRenderItem> lines;
+  // The frame hid one or more lines of the story (the Type tool's overflow marker, issue 631).
+  bool hidden_lines{false};
+};
+
+struct PhotoshopTextLayoutPlan {
+  std::vector<BoxTextLineRenderItem> lines;
+  QRectF ink_rect;  // union of the repositioned line rects (line-box based, pre-bleed)
+  bool valid{false};
+  bool hidden_lines{false};  // an area contour hid part of the story (area_text_layout_plan only)
+};
+
+struct PhotoshopLineMetrics {
+  double leading{0.0};         // max effective leading among the line's chars
+  double first_baseline{0.0};  // box text: max ascender ("d" height) x size among the line's chars
+};
+
+// The font's ascender as Photoshop measures it, a fraction of the em: the top of the lowercase
+// "d" outline (the OS/2 typographic ascender for a face without one). Photoshop puts the first
+// baseline of box (paragraph) text at box top + this x size, rounded to a whole pixel (PS 2026
+// COM sweep over eight faces and four sizes: Calibri's "d" sits 7% of the em below its typo
+// ascender and Segoe UI's above it, and both land on the "d"; docs/text-render-calibration.md).
+// Qt's ascent() is the much larger usWinAscent. Cached per face.
+[[nodiscard]] double photoshop_ascender_fraction(const QFont& font);
+
+// The fractional font size a Photoshop-layout char format contributes to leading math.
+[[nodiscard]] double photoshop_char_exact_size(const QTextCharFormat& format);
+
+// Photoshop effective leading of one char format: the fixed value, or auto leading =
+// paragraph auto-leading fraction x font size.
+[[nodiscard]] double photoshop_char_leading(const QTextCharFormat& format, double paragraph_fraction);
+
+// Char formats intersecting one visual line, folded into the line's leading metrics. An empty
+// line (blank paragraph) has no fragments and uses the block's char format.
+[[nodiscard]] PhotoshopLineMetrics photoshop_line_metrics(const QTextBlock& block, const QTextLine& line,
+                                                          double paragraph_fraction);
+
+// Photoshop's Warp Text reference box for a laid-out document, in its layout space (the box a
+// warped layer's TySh carries in its four-float tail). Photoshop recomputes this box from its
+// own layout on open and raises "Some text layers might need to be updated" when the stored one
+// is more than about a pixel off (Photoshop 2025 and 2026), so it is derived the way Photoshop
+// lays it out: the lines' advance extents (tracking between glyphs only), top = first baseline
+// - (em + cap height) / 2, bottom = last baseline (Photoshop leading) + the font's head yMin.
+// Box text keeps the frame and only raises its top: cap height - (em + cap height) / 2 above it.
+// nullopt for an empty document. Calibrated on 45 Windows fonts in docs/warp-text.md.
+[[nodiscard]] std::optional<QRectF> photoshop_warp_box(const QTextDocument& document, bool boxed, QRectF frame);
+
+// Box text keeps a line only while its BASELINE is inside the frame (Photoshop 2026, Arial
+// 24 px: the second line, baseline 45.98 px below the box top, shows in a 46 px box and hides
+// in a 45 px one; descenders overhang). Every later line hides with it, as the overflow does.
+// Patchy deviates for the story's first line, which always draws: a text layer with no pixels
+// could not be clicked again (GitHub issue 621). The Type tool marks a box that hides lines on
+// its bottom right handle instead (issue 631).
+[[nodiscard]] bool box_text_line_overflows_frame(qreal line_top, qreal line_ascent, qreal frame_bottom,
+                                                 bool first_line);
+
+// Every visible line (box_text_line_overflows_frame against `frame_bottom`) that intersects
+// `gate_rect` from above, clipped with the given bleeds. Whole LINES are gated, never raster
+// rows: a line whose baseline fits draws completely, descenders past the frame included.
+// `hidden_lines`, when given, is set to whether the frame hid any line.
+[[nodiscard]] std::vector<BoxTextLineRenderItem> boxed_text_line_render_items(const QTextDocument& document,
+                                                                             QRectF gate_rect, qreal frame_bottom,
+                                                                             qreal top_bleed, qreal bottom_bleed,
+                                                                             qreal horizontal_bleed,
+                                                                             bool* hidden_lines = nullptr);
+
+// `keep_overflow_lines` keeps the lines past the frame too (TextToolSettings::keep_overflow_lines).
+[[nodiscard]] BoxTextRenderPlan boxed_text_render_plan(const QTextDocument& document, const QFont& font,
+                                                       QRectF frame_rect,
+                                                       std::optional<QRectF> requested_local_rect,
+                                                       bool keep_overflow_lines = false);
+
+// Lay the document's lines out with Photoshop's leading model: the first line keeps Qt's
+// natural position for point text (the anchor machinery aligns rasters by the first line) or
+// sits the ascender below the box top for box text; every following baseline advances by the
+// *entered* line's max leading (auto = paragraph fraction x size) plus paragraph spacing.
+// Line x positions are Qt's own (alignment against the layout width) less each centred or
+// right-aligned line's share of the tracking Qt adds after its last glyph, plus, for a paragraph's
+// last line under the World-Ready composer, its share of the kern between its last glyph and a
+// space.
+[[nodiscard]] PhotoshopTextLayoutPlan photoshop_text_layout_plan(const QTextDocument& document, bool boxed);
+
+// Union of the INK boxes of every glyph a line draws (QRawFont::boundingRect per glyph, the
+// font's design bounds at the pixel size, so side bearings and overshoots count), translated to
+// the origin the line is drawn at. Qt's line rect is the ADVANCE box: a negative left side bearing
+// (script and italic faces), ink past the last advance, or an accent above the ascent all lie
+// outside it, and a raster sized from it cuts them off. A stretched face (Character-panel
+// horizontal scale) widens each box about its glyph origin by the stretch, because the
+// DirectWrite engine's glyph boxes ignore the stretch its advances apply; faux bold adds half its
+// stroke; faux italic adds the descender lean. Null when the line has no glyphs.
+[[nodiscard]] QRectF line_glyph_ink_rect(const QTextBlock& block, const QTextLine& line, QPointF block_origin);
+
+// The same union over positioned line items, or over the document's natural layout (the
+// drawContents path).
+[[nodiscard]] QRectF line_items_glyph_ink_rect(const QTextDocument& document,
+                                               const std::vector<BoxTextLineRenderItem>& lines);
+[[nodiscard]] QRectF document_glyph_ink_rect(const QTextDocument& document);
+
+// ---- Vertical (tategaki) text ----
+//
+// Photoshop's Vertical Type model, calibrated against PS 2026 renders and DOM read-backs
+// (local-test-fixtures/psd/ps2026_vtext, September 2026):
+// - Every glyph stands UPRIGHT (Latin included: "Hello" stacks H, e, l, l, o) in a cell one em
+//   tall (FontSize x vertical glyph scale); whitespace advances by its horizontal width (a 32 px
+//   Arial space is 8.9 px of column). Tracking adds FontSize x tracking/1000 after every cell
+//   except a column's last.
+// - The glyph is centred on the column axis horizontally; vertically the font's ascent+descent
+//   box is centred in the cell (Arial's 1.117 em box hangs 0.06 em past both cell edges, MS
+//   Gothic's 1.0 em box fills it), i.e. baseline = cell top + (em - (asc + desc)) / 2 + asc.
+// - Columns advance LEFT by the entered column's max effective leading (auto = paragraph
+//   fraction x FontSize), with the same per-column rule horizontal lines use for baselines.
+// - Point text anchors the first column's axis at the transform translation, the column run's
+//   top / middle / bottom for left / center / right justification. Box text puts the first
+//   column against the frame's RIGHT edge and wraps by cell count at the frame height.
+// The document is laid out horizontally with NoWrap (one QTextLine per paragraph) purely for
+// shaping and per-character formats; the plan below re-places each grapheme cluster into its
+// cell and the renderer draws the cluster's glyph runs there. Layout space: (0, 0) is the
+// top-left of the cell union for point text and the frame's top-left for box text.
+struct VerticalTextCell {
+  int position{0};       // document position of the cell's first character
+  int length{1};         // characters in the cell (one grapheme cluster)
+  double top{0.0};       // cell top in layout space
+  double advance{0.0};   // cell height: the em, or a space's horizontal advance
+  double gap{0.0};       // tracking gap after the cell (0 after a column's last cell)
+  double baseline{0.0};  // glyph baseline y in layout space
+  double glyph_start{0.0};  // the cluster's horizontal extent in its QTextLine (cursorToX)
+  double glyph_end{0.0};    // ... minus the letter spacing Qt appends after it
+  // Roman glyph lying rotated 90 degrees along the column (run flag, never a CJK cluster):
+  // the cell advances by the glyph's HORIZONTAL width and the renderer rotates it.
+  bool rotated{false};
+  QTextCharFormat format;
+};
+
+struct VerticalTextColumn {
+  QTextLine line;
+  int block_position{0};
+  double axis{0.0};     // column centre x in layout space
+  double em{0.0};       // column width: the largest cell em
+  double leading{0.0};  // the column's max effective leading (its pitch from the previous column)
+  double top{0.0};      // y of the first cell (or of the caret in an empty column)
+  int start{0};         // document positions covered [start, end)
+  int end{0};
+  bool last_in_block{false};
+  std::vector<VerticalTextCell> cells;
+};
+
+struct VerticalTextLayoutPlan {
+  std::vector<VerticalTextColumn> columns;
+  QRectF cell_rect;  // union of the cell boxes (box text: the frame united with them)
+  QPointF anchor;    // Photoshop's transform anchor in layout space (see above)
+  bool valid{false};
+
+  // Shift every coordinate (the renderer pads the cell union by a bleed on each side).
+  void translate(double dx, double dy);
+};
+
+// `box_width`/`box_height` are the frame dims for box text (ignored for point text).
+[[nodiscard]] VerticalTextLayoutPlan vertical_text_layout_plan(const QTextDocument& document, bool boxed,
+                                                               double box_width, double box_height);
+
+// Caret, selection and hit-test geometry over the line plan the renderer draws, in the
+// document's own coordinate space. Read the file header comment on lifetime.
+class TextLineGeometry {
+public:
+  // `photoshop_layout` must match what the render pass was given, so the lines are the same
+  // ones the glyphs came from. Falls back to the document's natural lines when the Photoshop
+  // plan does not apply, which is exactly what the renderer falls back to.
+  [[nodiscard]] static TextLineGeometry build(const QTextDocument& document, bool boxed, bool photoshop_layout);
+
+  // Lines already positioned by a render pass (the boxed plan's clipped items, say). The
+  // items must carry the origins they were drawn at.
+  [[nodiscard]] static TextLineGeometry from_lines(const QTextDocument& document,
+                                                   const std::vector<BoxTextLineRenderItem>& lines);
+
+  // Vertical text: caret bars run ACROSS the column (em wide, thin), selections are column
+  // strips, and a click resolves to the nearest column by x and the nearest cell edge by y.
+  [[nodiscard]] static TextLineGeometry from_vertical_plan(const QTextDocument& document,
+                                                           const VerticalTextLayoutPlan& plan);
+
+  [[nodiscard]] bool empty() const noexcept {
+    return lines_.empty() && columns_.empty();
+  }
+
+  [[nodiscard]] bool vertical() const noexcept {
+    return vertical_;
+  }
+
+  // Union of the positioned line boxes, in document space. This is how tall the text actually
+  // is; QTextDocument::size() reports Qt's natural layout, which is shorter than the Photoshop
+  // one whenever leading exceeds the natural line spacing.
+  [[nodiscard]] QRectF bounding_rect() const;
+
+  // Zero-width caret rect (height = ascent + descent, centred in the line box) for a
+  // character position. Empty when the position cannot be placed.
+  [[nodiscard]] QRectF caret_rect(int position) const;
+
+  // One rect per visual line covered by [start, end).
+  [[nodiscard]] std::vector<QRectF> selection_rects(int start, int end) const;
+
+  // Nearest character position to a point. Clamps to the first/last line vertically and to
+  // the line ends horizontally, so a click anywhere always lands somewhere sensible.
+  [[nodiscard]] int position_at(QPointF local_point) const;
+
+  // Document positions [start, end) of the visual line (vertical text: the column) that
+  // holds `position`, resolved the way caret_rect resolves it. The paragraph separator is
+  // never included. Empty when the geometry has no lines.
+  [[nodiscard]] std::optional<std::pair<int, int>> line_range_at(int position) const;
+
+private:
+  struct Line {
+    QTextLine line;
+    QPointF block_origin;
+    int block_position{0};
+    int block_length{1};
+  };
+
+  std::vector<Line> lines_;
+  std::vector<VerticalTextColumn> columns_;
+  QRectF vertical_rect_;
+  bool vertical_{false};
+  int maximum_position_{0};
+
+  [[nodiscard]] QRectF vertical_caret_rect(int position) const;
+  [[nodiscard]] std::vector<QRectF> vertical_selection_rects(int start, int end) const;
+  [[nodiscard]] int vertical_position_at(QPointF local_point) const;
+};
+
+}  // namespace patchy::ui

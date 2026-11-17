@@ -1,0 +1,32 @@
+#!/bin/sh
+# The Patchy AppImage's entry point (docs/appimage.md). The AppImage runtime mounts the
+# image, sets APPDIR to the mount and APPIMAGE to the .AppImage file, and runs this script.
+#
+#   PatchyLinux.AppImage [files...]          starts Patchy
+#   PatchyLinux.AppImage patchy-mcp [args]   starts the MCP connector
+#
+# A symlink to the AppImage named patchy-mcp also starts the connector. The connector is
+# usr/bin/patchy in its connector mode (--mcp-connector); there is no second binary. The
+# connector argument is kAppImageConnectorArgument in src/support/cli_flags.hpp;
+# Help > Set up AI Control prints this form. The patchy binary accepts it too inside any
+# AppImage, so the form also works in AppImages repackaged with another AppRun.
+HERE="${APPDIR:-$(dirname "$(readlink -f "$0")")}"
+
+if [ "${1:-}" = "patchy-mcp" ]; then
+  shift
+  exec "$HERE/usr/bin/patchy" --mcp-connector "$@"
+fi
+case "$(basename "${ARGV0:-}")" in
+  patchy-mcp) exec "$HERE/usr/bin/patchy" --mcp-connector "$@" ;;
+esac
+# Qt loads its desktop-portal theme on its own only inside Flatpak and Snap. Ask for it so
+# file dialogs are the desktop's own (GNOME's, KDE's) instead of Qt's widget dialog
+# (GitHub issue 156); it wraps the theme Qt would pick anyway and falls back to Qt's
+# dialog where no portal runs. A theme the user set wins. PATCHY_APPRUN_SET_PLATFORMTHEME
+# tells Patchy to leave this choice out of a companion app's environment
+# (kAppRunSetPlatformThemeVariable in src/ui/appimage_environment.hpp).
+if [ -z "${QT_QPA_PLATFORMTHEME:-}" ]; then
+  export QT_QPA_PLATFORMTHEME=xdgdesktopportal
+  export PATCHY_APPRUN_SET_PLATFORMTHEME=1
+fi
+exec "$HERE/usr/bin/patchy" "$@"

@@ -1,0 +1,113 @@
+# Tool options that survive a restart
+
+Read this before adding an options-bar control or a tool. The next launch selects the tool that was active at quit and every options bar shows the values it had, the way Photoshop keeps tool options (GitHub issue 254). Settings keys are permanent identifiers (AGENTS.md invariants): never rename one, and never reuse a retired key for a different meaning. Tool behaviors live in [tools.md](tools.md), the palette in [tool-palette.md](tool-palette.md), the brush engine in [brushes.md](brushes.md).
+
+## How it works
+
+- **Load once, at the first canvas.** Startup opens on the start panel with no document, and the options bar needs a canvas to apply values to, so `MainWindow::load_tool_settings` (main_window_tool_options.cpp) runs when the first document session arrives (`startup_tool_settings_pending_`), followed by `sync_tool_option_controls_from_canvas`. Until then `save_tool_settings` writes nothing: a save before the load would overwrite the stored values with the defaults donor's. Every later canvas inherits the window's mirrors (`add_document_session` and `activate_document_canvas`).
+- **Save on change, debounced.** Controls call `schedule_save_tool_settings` (250 ms) or `save_tool_settings`; the close event flushes a pending save. Nothing runs per repaint.
+- **Written by the control.** Auto-Select, its target and Transform Controls write their key from their own toggle, never from `save_tool_settings`: a click with the start panel up (no canvas to save from) still counts, and a canvas flag set directly (tests, the stress harness) never leaks. Transform Controls is app-wide: a click sets every open canvas, and the checkbox reads the key at startup, so the start panel and the first New Document show the stored state (GitHub issue 351 follow-up; `ui_move_transform_controls_persist_across_windows`, `ui_move_transform_controls_survive_new_document`).
+- **The active tool** is stored as its hotkey command id (`tools/activeTool`, "tools.elliptical_marquee"; `tool_hotkey_id` in main_window_shared.hpp), never an enum index. `restore_startup_tool_selection` (constructor, after `create_actions`) checks the palette button and gives the flyout that member's face while the start panel shows; the first canvas then runs `activate_tool` so the group handler does the real switch (Eraser values, status hint). An unknown or missing token is Brush, the palette's built-in default.
+- **Tools work with no document** (local-008, as in Photoshop). Palette tools and the flyout cycle commands are `register_tool_action`, not document actions: `update_document_action_state` disables them only under a preview dialog's edit lock, and `command_works_without_document` accepts them (`kWorksWithoutDocumentProperty`). With no canvas the group handler still sets `current_tool_`, the per-tool selection edge values, the Eraser/Brush settings set and the options bar, and writes only `tools/activeTool` (`save_active_tool_setting`; the full save needs a canvas). The next canvas takes `current_tool_` in `activate_document_canvas`, which also applies the active Brush or Eraser values; at startup the pending load runs first, then `activate_tool`. Test: `ui_tools_work_with_no_document_open`.
+- **Foreground and background colors** are one application-wide pair (GitHub issue 339), held by MainWindow (`foreground_color_`, `background_color_`). Each canvas keeps a working copy because its tools paint from it: `activate_document_canvas` hands the pair to the incoming canvas (`apply_active_colors_to_canvas`), and `stash_active_colors` reads a changed copy back on `refresh_color_buttons` (every color command ends there), on a document switch and when the active document closes. So a new document, a switched-to document and the home screen after Close All all show the same pair. A palette document snaps its copy; that snap is not a change of the pair (`canvas_applied_*`). Quick Mask's black and white are never stashed. The pair is written as soon as it changes (`tools/foregroundColor`, `tools/backgroundColor`, "#rrggbb": canvas colors are 8-bit, `edit_color`) and read in the constructor, before the start panel shows; a missing or unreadable key is black over white.
+- **Malformed keys.** `stored_int` reads a number only when it parses, clamped to the control's range; `stored_bool` accepts true/false/1/0. Anything else, and a tip or preset id the library no longer holds, is the default. A stored tip falls back to Round inside `set_active_brush_tip` without re-applying the tip's imported ABR flow and Airbrush over the stored values.
+- **Tests:** `ui_active_tool_and_options_restore_on_next_launch` (three windows from one store: tool, flyout member, Brush, Eraser and Marquee values), `ui_tool_settings_fall_back_on_missing_or_malformed_keys`, `ui_startup_restores_stored_brush_and_gradient_settings`, `ui_colors_survive_closing_last_document_and_carry_to_new_documents`, `ui_colors_restore_on_next_launch`. The suite shares one settings store, so `cleanup_after_visual_test` (tests/ui/ui_test_support.cpp) clears `tools/activeTool`, the brush keys and the color pair around every test; a test that builds a second window inside itself sees the first window's saves, which is the behavior under test.
+
+## Deliberately not restored
+
+Anything a user would read as "the tool is broken" on a fresh launch starts from its default:
+
+- An in-progress Free Transform, Warp, Crop box or text edit (the Free Transform fields, pivot, link, interpolation mode aside, the Warp style and bend, the Crop W/H size fields).
+- Quick Mask mode and a temporary tool (the spacebar Hand, the Alt eyedropper, the Zoom modifier): canvas state, never written.
+- The selection combine mode (New/Add/Subtract/Intersect), the vector Combine operation (New Layer/Add/Subtract/...), the Patch tool's Mode and Transparent (retired keys `tools/patchMode` and `tools/patchTransparent`, [healing.md](healing.md)), Content-Aware Move's Mode (never stored, [content-aware-move.md](content-aware-move.md)), the Align To choice (retired `tools/alignTo`, [alignment.md](alignment.md)).
+- The Marquee and shape Style rows (Normal/Fixed Ratio/Fixed Size with their W/H): a persisted Fixed Size silently resizes the first drag.
+- Round and Square brush dynamics (session values, [brush-dynamics.md](brush-dynamics.md)), the Mixer "useful combinations" row (derived from Wet/Load/Mix).
+- The Type tool's font, style, size, color, alignment and orientation: they mirror the selected text layer; a new layer takes the application font, as the installed face it resolves to (never a generic name such as Linux's "Sans Serif"). Remembering the last-used type style is a separate feature.
+
+## Inventory
+
+Every options-bar control, in bar order. "Before" is the state before issue 254. Keys under `tools/` unless noted.
+
+| Tool | Control (object name) | Key | Before | After |
+|---|---|---|---|---|
+| all | active tool (`tool*Action`, flyout member) | `activeTool` | no | yes |
+| all | foreground and background colors (`foregroundColorButton`, `backgroundColorButton`) | `foregroundColor`, `backgroundColor` | no | yes (issue 339) |
+| Move | Auto-Select (`moveAutoSelectCheck`) | `moveAutoSelect` | yes | yes |
+| Move | Auto-Select target (`moveAutoSelectTargetCombo`) | `moveAutoSelectTarget` | yes | yes |
+| Move | Transform Controls (`moveShowTransformControlsCheck`) | `showTransformControls` | yes | yes |
+| Move | Snap (`moveSnapCheck`) | `view/snapEnabled` (View > Snap) | yes | yes |
+| Move | Align / Distribute buttons, Align To | commands; `alignTo` retired | no | no (session) |
+| Free Transform | Pivot, link, Apply/Cancel, Warp style/bend | none | no | no (session) |
+| Free Transform | Interpolation (`freeTransformInterpolationCombo`) | `transformInterpolation` | yes | yes |
+| Marquee, Lasso, Polygonal, Wand, Quick, Object | selection mode (`selection*ModeAction`) | none | no | no (session) |
+| Marquee, Elliptical, Lasso, Polygonal, Magnetic, Wand, Quick, Object, Content-Aware Move | Feather (`selectionFeatherSpin`) | `<tool>Feather` per tool | yes (Content-Aware Move: new, issue 599) | yes |
+| same, Quick Select aside | Anti-alias (`selectionAntiAliasCheck`) | `<tool>AntiAlias` per tool | yes | yes |
+| Marquee | Radius (`selectionCornerRadiusSpin`) | `marqueeCornerRadius` | no | yes |
+| Marquee, Elliptical | Style, W, H (`selectionStyleCombo`, `selectionRatio*`, `selectionFixed*`) | none | no | no (session) |
+| Magnetic Lasso | Width, Contrast, Frequency (`magneticLasso*Spin`) | `magneticLassoWidth`, `...EdgeContrast`, `...Frequency` | yes | yes |
+| Magic Wand | Tolerance, Contiguous, Sample All Layers | `wandTolerance`, `wandContiguous`, `wandSampleAllLayers` | yes | yes |
+| Magic Wand | Sample (`wandSampleSizeCombo`, GitHub issue 435; its own setting, not the Pick tool's Size) | `wandSampleSize` (Point Sample when missing) | yes | yes |
+| Quick Select | Size, Sample All Layers, Enhance Edge | `quickSelectSize`, `...SampleAllLayers`, `...EnhanceEdge` | yes | yes |
+| Object Selection | Sample All Layers, Model | `objectSelectSampleAllLayers`, `objectSelectModel` | yes | yes |
+| Crop | Preset list (`cropPresetCombo`: the style and the ratio W/H it sets), Delete Cropped Pixels, Delete Layers | `cropStyle`, `cropRatioWidth`, `cropRatioHeight`, `cropDeletePixels`, `cropDeleteLayers` | yes | yes |
+| Crop | saved presets (Save Preset / Delete Preset in the Preset list; [crop-tool.md](crop-tool.md)) | `cropUserPresets` (JSON) | new (issue 696) | yes |
+| Crop | Crop options popup: Show Cropped Area, shield on, color, opacity (`cropOptionsButton`) | `cropShowCroppedArea`, `cropShieldEnabled`, `cropShieldColor`, `cropShieldOpacity` | no | yes |
+| Crop | Crop options popup: Move Image Under Crop Box (`cropMoveImageAction`; [crop-tool.md](crop-tool.md#move-image-under-crop-box)) | `cropMoveImageUnderBox` | new (issue 699) | yes |
+| Crop | Size W/H, the Preset list's shown row, the swap buttons, Apply/Cancel | none (live box; row derived) | no | no (session) |
+| Ruler | line, X/Y/W/H/A/L1/L2 readout, Straighten Layer, Straighten Image, Clear | none (view overlay) | new (issue 331) | no (session) |
+| Perspective Crop | Show Grid (`perspectiveCropShowGridCheck`) | `perspectiveCropShowGrid` | new (issue 328) | yes |
+| Perspective Crop | W, H, Resolution, Front Image, Clear, Turn, Apply/Cancel (`perspectiveCrop*`) | none | new (issue 328) | no (session) |
+| Crop | Overlay, Turn Overlay, Always / While Dragging (`cropOverlayCombo`; `cropOverlayTurnAction` and the show choice in the Crop options menu) | `cropOverlay` (token), `cropOverlayOrientation`, `cropOverlayShow` | new (issue 325) | yes |
+| Artboard | Size preset, W, H, Background, Auto-nest | `artboardWidth`, `artboardHeight`, `artboardBackground`, `artboardBackgroundColor`, `artboardAutoNest` | yes | yes |
+| Brush family | Preset (`brushPresetCombo`, built-in presets) | `brushPreset` | no | yes |
+| Brush family | Size (`brushSizeSpin`, slider) | `brushSize` | no | yes |
+| Brush | Mode (`brushModeCombo`) | `brushMode` | yes | yes |
+| Brush family | Opacity (`brushOpacitySpin`) | `brushOpacity` | no | yes |
+| Brush family | Soft (`brushSoftnessSpin`) | `brushSoftness` | no | yes |
+| Brush, Pattern Stamp | Flow (`brushFlowSpin`) | `brushFlow` | no | yes |
+| Brush | Airbrush (`brushAirbrushCheck`) | `brushAirbrush` | no | yes |
+| Brush, Mixer, Eraser | Smooth and its four options | `brushSmoothing`, `...PulledString`, `...CatchUp`, `...CatchUpEnd`, `...ZoomAdjust` | yes | yes |
+| Brush | Show Outline, Show Overlay and Overlay Opacity (`brushOutlineAction`, `brushOverlayAction`, `brushOverlayOpacitySpin` in the Smoothing gear) | `brushOutline`, `brushOverlay`, `brushOverlayOpacity` | new (issue 517) | yes |
+| Brush, Mixer, Pattern Stamp, Eraser, Color Replacement, Background Eraser | Tip (`BrushTipPicker`) | `brushTip` | no | yes |
+| Brush | Dynamics button | per-tip sidecar; Round/Square session | sidecar | sidecar |
+| Eraser, Background Eraser | Size, Opacity, Soft (own set; the Background Eraser shows Size and Soft and shares them) | `eraserSize` (before), `eraserOpacity`, `eraserSoftness` | size only | yes |
+| Mixer Brush | Wet, Load, Mix, Flow, Sample All Layers | `mixerWet`, `mixerLoad`, `mixerMix`, `mixerFlow`, `mixerSampleAllLayers` | yes | yes |
+| Pattern Stamp | Pattern (by pattern id), Aligned | `patternStampPatternId`, `patternStampAligned` | yes | yes |
+| Clone | Aligned | `cloneAligned` | yes | yes |
+| Clone, Healing, Spot Healing, Patch, Content-Aware Move | Sample (`retouchSampleLayersCombo`: Current Layer, Current & Below, All Layers) | `retouchSampleLayers` (token; the older bool `retouchSampleAllLayers` is still written and maps on first read) | yes | yes |
+| Clone, Healing, Spot Healing, Patch, Content-Aware Move | Ignore Adjustment Layers (`retouchIgnoreAdjustmentsCheck`) | `retouchIgnoreAdjustments` | yes | yes |
+| Healing | Diffusion | `healingDiffusion` | yes | yes |
+| Healing | Mode (`healingModeCombo`) | `healingMode` (token) | yes | yes |
+| Patch | Mode, Transparent | retired keys | no | no (session) |
+| Content-Aware Move | Mode (`contentAwareMoveModeCombo`) | none | no | no (session) |
+| Content-Aware Move | Destination (`contentAwareMoveDestinationCombo`: Current Layer, New Layer) | `contentAwareMoveDestination` (token) | new (issue 599) | yes |
+| Content-Aware Move | Object Selection (`contentAwareMoveObjectSelectionCheck`; builds with the Object Selection model only) | `contentAwareMoveObjectSelection` (default off) | new (issue 599) | yes |
+| Color Replacement | Mode, Sampling, Limits (`colorReplaceModeCombo`, `colorReplaceSamplingCombo`, `colorReplaceLimitsCombo`; tokens, [color-replacement.md](color-replacement.md)) | `colorReplaceMode`, `colorReplaceSampling`, `colorReplaceLimits` | new (issue 720) | yes |
+| Color Replacement | Tolerance, Anti-alias (`colorReplaceToleranceSpin`, `colorReplaceAntiAliasCheck`); Size and Soft are the Brush family's | `colorReplaceTolerance`, `colorReplaceAntiAlias` | new (issue 720) | yes |
+| Background Eraser | Sampling, Limits, Tolerance (`backgroundEraserSamplingCombo`, `backgroundEraserLimitsCombo`, `backgroundEraserToleranceSpin`; tokens, [eraser-tools.md](eraser-tools.md)) | `backgroundEraserSampling`, `backgroundEraserLimits`, `backgroundEraserTolerance` | new (issue 727) | yes |
+| Magic Eraser | Tolerance, Anti-alias, Contiguous, Sample All Layers, Opacity (`magicEraserToleranceSpin`, `magicEraserAntiAliasCheck`, `magicEraserContiguousCheck`, `magicEraserSampleAllLayersCheck`, `magicEraserOpacitySpin`) | `magicEraserTolerance`, `magicEraserAntiAlias`, `magicEraserContiguous`, `magicEraserSampleAllLayers`, `magicEraserOpacity` | new (issue 727) | yes |
+| Red Eye | Pupil Size, Darken Amount (`redEyePupilSizeSpin`/`Slider`, `redEyeDarkenAmountSpin`/`Slider`) | `redEyePupilSize`, `redEyeDarkenAmount` | new (issue 370) | yes |
+| Dodge, Burn | Strength, Range, Protect Tones | `localAdjustmentStrength`, `localToneRange`, `localProtectTones` | yes | yes |
+| Smudge | Strength (`smudgeStrengthSpin`, 0..100, default 50; replaces Opacity on its bar) | `smudgeStrength` | new (issue 675) | yes |
+| Sponge | Mode, Vibrance | `spongeMode`, `spongeVibrance` | yes | yes |
+| Gradient | Method, Opacity, Reverse, gradient stops | `gradientMethod`, `gradientOpacity`, `gradientReverse`, `gradientUseCustomStops`, `gradientStops`, `gradientDefinition` (two tracks; [gradients.md](gradients.md#grd-files)) | yes | yes |
+| Gradient | Mode (`gradientModeCombo`: Pixels, Fill Layer; [gradients.md](gradients.md#gradient-tool-fill-layer-mode)) | `gradientMode` (token) | new (issue 580) | yes |
+| Fill | Opacity, Soft, Tol, Contiguous | `fillOpacity`, `fillSoftness`, `fillTolerance`, `fillContiguous` | yes | yes |
+| Line, Rect, Ellipse, Pen, Polygon, Custom Shape | Mode (Shape/Path/Pixels) | `vectorToolMode` | yes | yes |
+| same | Fill and Stroke paint (by pattern/gradient id), Stroke width (0 = off; stored as Stroke on plus the last real width), Line weight. Shape and Pixels modes share them (GitHub issue 716) | `vectorFill*`, `vectorStroke*`, `vectorLineWeight` | yes | yes |
+| same, Path/Direct Select | Combine (`vectorCombineCombo`) | none | no | no (session) |
+| Line | arrowheads (`lineArrow*Button`) | `lineArrowStart`, `lineArrowEnd` | yes | yes |
+| Rect, Ellipse, Polygon, Custom Shape | Fill only / Stroke only / Both (`shapeDraw*Button`; GitHub issue 716) | none of their own: they are the fill's none and the stroke's switch (`vectorFillKind`, `vectorStrokeEnabled`). `shapeFill` is still written (true while a fill is drawn) | yes | yes |
+| same | stroke alignment (`vectorStrokeAlignCombo`) | `vectorStrokeAlign` (token: `inside`, `center`, `outside`; absent is Inside). `vectorFillFollowsForeground` and `vectorStrokeFollowsForeground` belong to one unreleased build: read once (a part that painted in the foreground color becomes that color) and written false | new (issue 716) | yes |
+| same (Pixels) | Opacity, Soft (`shapePixelOpacitySpin`, `shapePixelSoftSpin`) | the brush family's `brushOpacity`, `brushSoftness` (mirrors of those fields) | no | yes |
+| Rectangle | Radius (`shapeCornerRadiusSpin`) | `shapeCornerRadius` | yes | yes |
+| Rect, Ellipse, Custom Shape (every mode) | Style, its ratio pair and its pixel pair (`shapeStyleCombo`, `shapeRatio*`, `shapeFixed*`); the pixel pair also edits the selected or pending shape's size, on the Polygon too | none | no | no (session) |
+| Pen | Auto Add/Delete | `penAutoAddDelete` | yes | yes |
+| Polygon | Sides, Star inset | `polygonSides`, `polygonStarInset` | yes | yes |
+| Custom Shape | Shape (by shape id) | `customShapeId` | yes | yes |
+| Type | Font, Style, Size, Color, alignment, orientation | none | no | no (layer state) |
+| Type | Smoothing (`textSmoothingCombo`) | `textSmoothing` | yes | yes |
+| Pick | Size, Layer, Sets, Show Sample Ring | `eyedropperSampleSize`, `eyedropperSampleLayers` (five-way token; the older bool `eyedropperSampleAllLayers` is still written and maps on first read), `eyedropperPicksBackground`, `eyedropperShowSampleRing` | yes | yes |
+| Zoom | Zoom In/Out, Scrubby | `zoomToolZoomsOut`, `zoomScrubby` | yes | yes |
+
+The keys the May 2026 brush reset retired (`brushSize`, `brushOpacity`, `brushSoftness`, `brushTip`, `brushPreset`, `eraserOpacity`, `eraserSoftness`) carry their old meaning and are back in use; `brushBuildUp` stays retired, `brushAirbrush` replaces it.

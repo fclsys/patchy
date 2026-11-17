@@ -1,0 +1,103 @@
+# The stay-open Shape Appearance window
+
+Split from [vector-tools-appearance.md](vector-tools-appearance.md), which holds the rows themselves (paint, stroke, geometry, Edge), the modal dialog and its worker-thread preview.
+
+## The stay-open window
+
+Every entry point calls `MainWindow::edit_active_shape_appearance()`, which shows the Shape
+Appearance window (GitHub issue 694): `ShapeAppearancePanel` (`src/ui/shape_appearance_panel.*`)
+owning one `BrushToolWindow` named `shapeAppearanceWindow`. It is a floating tool window with no
+nested event loop and no edit lock, so the document stays editable while it is open: draw,
+select, undo, switch or close documents. Its rows are a page (`shapeAppearanceBody`) built by
+`build_shape_appearance_body` in `Live` mode: Reset and Close, no OK, Cancel or Preview.
+`edit_active_shape_appearance_modal` keeps the modal dialog (`shapeAppearanceDialog`, the same
+rows in `Modal` mode, under the preview-dialog edit lock) for the options bar's color and
+pattern pickers and the dialogs the window's own rows open.
+
+Layer > New Fill Layer > Gradient... and Pattern... (and the Layers panel's button menu,
+`create_fill_layer_with_appearance`) open this window too: the layer is made at once as one
+undo step, "New fill layer", and its settings open here, each change an undo step of its own
+as when editing. Undo takes the new layer away; there is no Cancel. The command used to run
+the modal dialog, whose edit lock refused the new gradient's handles on the canvas (GitHub
+#714 follow-up). Gradient... also switches to the Gradient tool, which shows the fill's
+handles whatever the Show handles box says. Under automation the window does not open and
+the layer keeps its defaults. Test: `ui_new_gradient_fill_layer_opens_the_stay_open_settings`.
+
+Rules, each pinned in `tests/ui/shape_appearance_panel_tests.cpp`:
+
+- **No pointers between events.** The panel keeps a session id and layer ids
+  (`ShapeAppearanceTarget`), and the host resolves them again on every use. A run keeps copies
+  of the target layers, never pointers.
+- **Following the selection.** `sync()` runs from `refresh_layer_controls`,
+  `refresh_options_bar` and when the edit lock is taken or released. The target is
+  `editable_selected_shape_layer_ids()`. The page key is the session id, the ids, each layer's
+  render and content revision, the selected count and the field units; a changed key builds a
+  new page from the layers (the rows depend on the target: gradient rows, a line's rows, the
+  batch summary, the Fill Layer Settings title), keeps the scroll position, and grows the window
+  only when the page needs it. Fields are never refilled in place.
+- **Row styles never name the host.** The rows are built into the modal dialog and into the
+  window's page, so a style rule for a row selects the row's own widget (a property or its
+  object name) and is appended to the host's sheet. A rule that begins
+  `QDialog#shapeAppearanceDialog` matches nothing in the window, where the widget then takes
+  the app sheet's look (GitHub issue 723: the chain buttons drew as 34 px frameless tool
+  buttons, cut off by their 24 px brackets).
+- **The button row ends the window.** The page's own layout has no bottom margin inside the
+  window (the chrome's 12 px is the margin under Reset and Close), and the window's size grip
+  sits in the window's corner over that margin, outside the layout
+  (`BrushToolWindow::set_size_grip_in_corner`): a grip row of its own under the page left the
+  buttons floating above the bottom edge. The room between the last section and the row is
+  the Density note's (it is kept while the note is hidden, so scrubbing Density below 100%
+  does not resize the window). Opening fits the window to its page (`size_window_for_page`),
+  unless the user sized the window: the window property `shapeAppearanceAutoSize` holds the last size the window's own
+  code gave it (the fit, a page or a paint kind that needed more room), a size that differs
+  is the user's, and `shapeAppearance/windowUserSized` carries that to the next launch. A
+  user's size is only ever grown; height the user adds goes to the page, above the row. An
+  open window never shrinks when a shorter page replaces a taller one.
+  `ui_shape_appearance_window_ends_with_its_button_row` pins the margin on every page.
+- **A page is never deleted under its own handler.** The rebuild is deferred to the event loop
+  and waits (`rebuild_blocked`) while the page is applying a change, while a dialog a row opened
+  is running, and while any modal window, popup or child dialog of the window is up.
+  `BrushToolWindow::replace_body` hides the old page, takes it out of the window and deletes it
+  later.
+- **Unavailable.** With no document, another dialog holding the edit lock, a Free Transform,
+  Warp or path transform running, or no editable shape layer selected, the page stays but is
+  disabled under a one-line reason, and `apply_live_shape_appearance_edit` applies nothing. It
+  also refuses a change from a page built for other layers.
+- **One undo step per gesture.** The first value of a gesture goes through
+  `commit_shape_appearance_edit` (the options bar's path: the undo step "Shape appearance" is
+  pushed before the first write) and opens a `ShapeAppearanceLiveRun`. Later values of the same
+  property rewrite the same layers from the run's copies (`write_live_shape_appearance_step`),
+  with no new step. The run ends on another property, after 600 ms without a value, when a
+  target's revisions show something else changed it, and in
+  `finish_pending_shape_appearance_edit()`, which every history, selection, document and tab
+  transition already calls; the edit lock and the first preview of a gradient handle drag end it
+  too. The document never holds a change that is not in history, so there is nothing to restore.
+- **Each run carries its own edits.** When a run ends the page is rebased
+  (`ShapeAppearanceBody::rebase`): the edits captured so far are dropped and later ones are
+  captured against the layers as they are now, so a run replays only its own operations.
+- **Bake cost.** A run's values are baked on the UI thread. A large full-canvas gradient fill
+  takes the draft bake while the run lasts (`update_gradient_fill_draft_raster`, as the Gradient
+  tool's handle drags do) and the run's end bakes the last value exactly. Measured November
+  2026 on an i9-12900KS at 4000 x 3000: 24 ms per value on a Gradient Fill layer, 90 ms on a
+  gradient shape with a path (an exact bake; the modal dialog bakes on a worker).
+  `ui_shape_appearance_window_step_timing` prints both.
+- **Dialogs the rows open** (the color pickers, the Gradient Manager, the Shapes Manager) have
+  their own OK and Cancel, so they run through `run_shape_appearance_panel_child_dialog` as the
+  modal edit does: the document locked, changes as previews, one undo step on OK, the layers put
+  back on Cancel. The lock is also what keeps the selection, and with it the page, in place
+  under the row's handler.
+- **Show handles.** A box under the fill's Gradient rows and one under the stroke's
+  (`shapeFillGradientHandlesCheck`, `shapeStrokeGradientHandlesCheck`), so each shows only
+  while its paint is a gradient. While the window is open and one is ticked, the canvas shows
+  that gradient's handles under the other tools
+  ([gradients-fill-handles-other-tools.md](gradients-fill-handles-other-tools.md#under-other-tools)). One gradient has
+  handles at a time: ticking a box unticks the other, unticking the ticked one turns the
+  handles off, and with only one gradient on the shape that one's box is the ticked one
+  (`sync_handle_checks` in the builder, the canvas's own rule). The state is the window's
+  (`shapeAppearance/showGradientHandles`, on by default, and
+  `shapeAppearance/gradientHandlesOnStroke`), so every page starts from it;
+  `MainWindow::sync_shape_appearance_gradient_handles` reads it when a box is toggled, the
+  window is shown or hidden, and from `sync_shape_appearance_panel`.
+- **Window.** Keys no field takes go to the canvas and the main window's shortcuts work while
+  it is active (`BrushToolWindow`). The main window's close hides it; it does not come back at
+  the next launch. Under automation (`unattended_automation`) it does not open.

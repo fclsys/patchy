@@ -1,0 +1,870 @@
+#pragma once
+
+#include <QJsonObject>
+#include <QJsonArray>
+#include <QJsonValue>
+#include <QImage>
+#include "ui/canvas_types.hpp"
+#include "ui/script_stroke.hpp"
+#include "ui/text_paragraph_metrics.hpp"
+#include "ui/text_document.hpp"
+
+#include "core/document.hpp"
+#include "core/layer.hpp"
+#include "core/layer_alignment.hpp"
+#include "core/text_path.hpp"
+#include "core/perspective_planes.hpp"
+#include "core/resample.hpp"
+
+#include <QColor>
+#include <QSize>
+#include <QElapsedTimer>
+#include <QFont>
+#include <QImage>
+#include <QJSValue>
+#include <QObject>
+#include <QPoint>
+#include <QPointer>
+#include <QRect>
+#include <QRegion>
+#include <QString>
+#include <QStringList>
+
+#include <array>
+#include <atomic>
+#include <chrono>
+#include <condition_variable>
+#include <cstdint>
+#include <functional>
+
+class QTextEdit;
+#include <map>
+#include <memory>
+#include <mutex>
+#include <optional>
+#include <set>
+#include <thread>
+#include <vector>
+
+class QDialog;
+class QJSEngine;
+class QTimer;
+
+namespace patchy {
+class FilterRegistry;
+struct ColorRangeOptions;
+struct FilterInvocation;
+}  // namespace patchy
+
+namespace patchy::ui {
+
+class CanvasWidget;
+class MainWindow;
+class ScriptCanvasWindow;
+class PatternLibrary;
+class GradientLibrary;
+class CustomShapeLibrary;
+class McpActivity;
+
+// Interrupts a STUCK script from a helper thread: the UI thread arms an
+// inactivity window around every evaluate()/callback invocation, and every
+// host API call the script makes feeds the watchdog (lock-free). The timeout
+// callback (QJSEngine::setInterrupted, documented thread-safe) fires only when
+// a script has shown NO sign of life - no pixel write, file operation, or
+// console output - for the whole window, so an hours-long batch that keeps
+// working never trips it while `while (true) {}` still dies.
+class ScriptWatchdog {
+public:
+  explicit ScriptWatchdog(std::function<void()> on_timeout);
+  ~ScriptWatchdog();
+
+  void arm(std::chrono::milliseconds timeout);
+  void disarm();
+  // Proof of life: called from every hot service entry point. A relaxed
+  // atomic store only - the watchdog thread reads it when its deadline
+  // passes and keeps sleeping instead of firing.
+  void feed() noexcept {
+    last_activity_ms_.store(steady_now_ms(), std::memory_order_relaxed);
+  }
+
+private:
+  [[nodiscard]] static std::int64_t steady_now_ms() noexcept {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(
+               std::chrono::steady_clock::now().time_since_epoch())
+        .count();
+  }
+
+  std::function<void()> on_timeout_;
+  std::mutex mutex_;
+  std::condition_variable cv_;
+  std::chrono::steady_clock::time_point deadline_{};
+  std::chrono::milliseconds timeout_{};
+  std::atomic<std::int64_t> last_activity_ms_{0};
+  bool armed_{false};
+  bool quit_{false};
+  std::thread thread_;
+};
+
+// The JavaScript scripting engine host: owns the per-run QJSEngine, the timer
+// registry (setTimeout/setInterval/requestAnimationFrame), the watchdog, the
+// run lifecycle (one active run; it stays live until the synchronous evaluation
+// AND every timer and script canvas window are done), the one-undo-entry-per-run
+// snapshot rule, and the coalesced canvas/panel refresh. The API wrapper objects
+// (script_api.hpp) reach MainWindow only through the service methods here; they
+// hold session ids + LayerIds, never pointers (sessions close and the layers
+// vector reallocates). See docs/scripting.md.
+struct PdfExportOptions;
+struct ImageSaveOptions;
+struct ScriptScan;
+
+class ScriptEngineHost : public QObject {
+  Q_OBJECT
+
+public:
+  explicit ScriptEngineHost(MainWindow& window);
+  ~ScriptEngineHost() override;
+
+  struct RunOptions {
+    // Display name for errors, the undo label, and the history panel.
+    QString name;
+    // Source file path; empty for editor-buffer runs. include() resolves
+    // relative paths against the running script's directory.
+    QString path;
+    // Raw "key=value" tokens (CLI --script-arg), surfaced as patchy.args.
+    QStringList args;
+    // CLI-originated run (forwarded or unattended): interactive helpers use
+    // their automation behavior (alert logs, dialogs answer with defaults)
+    // even when a GUI instance executes the script.
+    bool unattended{false};
+  };
+
+  // Starts a run (false when one is already active). Errors and console output
+  // go to message_sink; completion is announced through run_state_changed.
+  bool run_source(const QString& source, RunOptions options);
+  bool run_file(const QString& path, QStringList args = {}, bool unattended = false);
+  // User stop: interrupts a stuck synchronous phase and tears down timers and
+  // script windows. Safe to call when no run is active.
+  void stop_active_run();
+  [[nodiscard]] bool run_active() const noexcept { return run_ != nullptr; }
+  [[nodiscard]] bool unattended_run() const;
+  [[nodiscard]] QString active_run_name() const;
+
+  enum class MessageKind { Log, Warn, Error };
+  // The last messages (bounded), kept so the editor dialog can show output that
+  // happened while it was closed (menu/CLI runs).
+  [[nodiscard]] const QStringList& message_backlog() const noexcept { return message_backlog_; }
+  [[nodiscard]] bool last_run_had_error() const noexcept { return last_run_had_error_; }
+  void set_connector_mode(bool enabled) { connector_mode_ = enabled; }
+  [[nodiscard]] bool connector_mode() const { return connector_mode_; }
+  void set_connector_progress_callback(std::function<void()> callback) { connector_progress_callback_ = std::move(callback); }
+  // Safe from the protocol input thread, including while JS runs a tight loop.
+  void interrupt_from_any_thread();
+  void clear_external_interrupt();
+  [[nodiscard]] QJsonValue last_result() const { return last_result_; }
+  [[nodiscard]] bool session_modified(std::int64_t id) const;
+  [[nodiscard]] bool session_can_undo(std::int64_t id, bool redo = false) const;
+  bool restore_session_history(std::int64_t id, bool redo);
+  // `refresh_brushes` false skips re-reading the brush folders: companion event polling runs
+  // every half second and must stay off the disk (docs/companions.md#events).
+  QJsonObject automation_state(bool refresh_brushes = true) const;
+  [[nodiscard]] QString automation_fingerprint(bool refresh_brushes = true) const;
+  [[nodiscard]] bool automation_ready() const;
+  // True while a canvas processing wait pumps events with a worker reading the live
+  // document: automation that would edit it (an MCP call, a script timer or callback)
+  // waits for the next event-loop turn instead (docs/ai-control.md#processing-waits).
+  [[nodiscard]] bool document_processing_wait_active() const;
+  QImage render_preview(std::int64_t id, const QJsonObject& options, QJsonObject* metadata);
+  void draw_strokes(std::int64_t session_id, LayerId layer_id, const QJSValue& strokes);
+  std::vector<ScriptStroke> parse_brush_strokes(const QJSValue& input);
+  Q_INVOKABLE QJSValue scriptBrushCall(const QString& method, const QJSValue& args);
+
+signals:
+  // Console output and errors (kind is int(MessageKind)); listeners: the editor
+  // dialog pane and the CLI output-file capture.
+  void message_emitted(int kind, const QString& text);
+  // Fired when a run starts and when it fully completes (poll run_active()).
+  void run_state_changed();
+  void painting_progress(const QString& description);
+
+public:
+
+  // --- services for the API wrappers and script canvas windows ---
+  [[nodiscard]] MainWindow& window() noexcept { return window_; }
+  [[nodiscard]] QJSEngine* engine() noexcept { return engine_.get(); }
+  // Throws a JS error out of the currently executing script code.
+  void throw_js_error(const QString& message);
+
+  [[nodiscard]] std::vector<std::int64_t> session_ids() const;
+  [[nodiscard]] std::int64_t active_session_id() const;  // 0 = none
+  [[nodiscard]] Document* session_document(std::int64_t session_id) noexcept;
+  [[nodiscard]] const Document* session_document_const(std::int64_t session_id) const noexcept;
+  [[nodiscard]] QString session_title(std::int64_t session_id) const;
+  [[nodiscard]] QString session_file_path(std::int64_t session_id) const;
+  [[nodiscard]] QStringList session_import_notes(std::int64_t session_id) const;
+  [[nodiscard]] bool session_cmyk_proof(std::int64_t session_id) const;
+  // Empty on success, else why CMYK Proof was refused.
+  [[nodiscard]] QString set_session_cmyk_proof(std::int64_t session_id, bool enabled);
+  std::int64_t open_document_file(const QString& path);  // 0 on failure
+  // An empty `title` is "Untitled".
+  std::int64_t create_document(int width, int height, const QString& title = {});
+  // doc.saveAs / doc.exportAs. `options` set = the script's explicit choices overlaid on
+  // the per-document defaults (see save_options_for_session); nullopt keeps today's
+  // defaults-or-remembered path. export_copy writes a copy without retargeting the session.
+  // (No default arguments: ImageSaveOptions is only forward-declared here.)
+  bool save_session_to_path(std::int64_t session_id, const QString& path, std::optional<ImageSaveOptions> options,
+                            bool export_copy);
+  // The ImageSaveOptions a scripted save starts from: the user's persisted defaults plus
+  // the per-document adjustments (DDS source shape, BMP palette depth, ICO sizes, CUR
+  // hotspot, WebP loop count). Activates the session. Nullopt when it is gone.
+  [[nodiscard]] std::optional<ImageSaveOptions> save_options_for_session(std::int64_t session_id);
+  // patchy.scripts: the script library (docs/scripting.md "Script hotkeys"). rescan
+  // registers freshly written files; the hotkey calls read and write the Preferences
+  // override under the script's command id ("" clears it, restoring the @hotkey default).
+  ScriptScan rescan_script_library();
+  [[nodiscard]] QString script_hotkey(const QString& relative_path) const;
+  bool set_script_hotkey(const QString& relative_path, const QString& sequence_text, QString* error);
+  // Writes `source` at <user scripts>/<relative_path> (a ".js" path below the folder)
+  // and rescans. False with *error set for a bad path or a write failure.
+  bool install_script(const QString& relative_path, const QString& source, QString* error);
+  bool export_session_animated_png(std::int64_t session_id, const QString& path, const ImageSaveOptions& options,
+                                   QString* error);
+  bool export_session_animated_webp(std::int64_t session_id, const QString& path,
+                                    const ImageSaveOptions& options, QString* error);
+  // app.exportPdf: the sessions as the pages of one PDF, in order. False with *error
+  // set when a session is gone or the writer refuses.
+  bool export_sessions_to_pdf(const std::vector<std::int64_t>& session_ids, const QString& path,
+                              const PdfExportOptions& options, QString* error);
+  // doc.exportArtboards: File > Export > Artboards to Files without its dialogs. Each
+  // file is `prefix` (default "<document name> - ") + the artboard's name; a taken name
+  // gets " 2", " 3" unless `overwrite`. The written paths in order, or nullopt with
+  // *error set (an unsupported format, a gone document, a write failure).
+  std::optional<QStringList> export_artboards(std::int64_t session_id, const std::vector<LayerId>& artboard_ids,
+                                              const QString& folder, const QString& extension,
+                                              const std::optional<QString>& prefix, bool overwrite, QString* error);
+  bool close_session(std::int64_t session_id);
+  void activate_session(std::int64_t session_id);
+  // layer.duplicate(targetDocument): copies the layers into another open
+  // session above its active layer (same coordinates, or centered when the
+  // sizes differ). Returns the new root ids top to bottom, empty with *error
+  // set on refusal; the target's undo rides this run's snapshot.
+  std::vector<LayerId> duplicate_layers_to_session(std::int64_t source_session_id, std::vector<LayerId> ids,
+                                                   std::int64_t target_session_id, QString* error);
+  // doc.importFilesAsLayers(paths): every file becomes a layer above the
+  // active layer (MainWindow::add_files_as_layers). All or nothing: a file that
+  // cannot be read leaves the document untouched with *error set. Returns the
+  // new root ids top to bottom; the mutation rides this run's snapshot.
+  std::vector<LayerId> import_files_as_layers(std::int64_t session_id, const QStringList& paths, QString* error);
+  // doc.addSmartObject(path, options): the file becomes a smart-object layer on
+  // top (MainWindow::place_file_as_smart_object), embedded or linked. nullopt with
+  // *error set on refusal (an empty *error means the run was stopped). The
+  // mutation rides this run's snapshot.
+  struct SmartObjectParams {
+    bool linked{false};
+    std::optional<double> x;
+    std::optional<double> y;
+    std::optional<double> width;
+    std::optional<double> height;
+    std::optional<double> scale;
+    QString name;
+  };
+  std::optional<LayerId> add_smart_object(std::int64_t session_id, const QString& path,
+                                          const SmartObjectParams& params, QString* error);
+  // layer.updateSmartObject(): Update Smart Object Content for a linked layer.
+  // Returns how many layers were re-rendered (every layer sharing the source); 0
+  // with *error set on refusal.
+  int update_smart_object(std::int64_t session_id, LayerId layer_id, QString* error);
+  // layer.rerenderSmartObject(): the embedded counterpart, rendering from the stored bytes.
+  int rerender_smart_object(std::int64_t session_id, LayerId layer_id, QString* error);
+  // layer.getSmartObject(): nullopt for layers that are not smart objects.
+  struct SmartObjectInfo {
+    bool linked{false};
+    QString file_name;
+    QString path;           // linked: the resolved file, or the stored absolute path when missing
+    QString relative_path;  // linked: the stored path relative to the document's folder
+    bool missing{false};
+    bool changed{false};
+    QString source_id;
+    double width{0.0};
+    double height{0.0};
+    double resolution{72.0};
+    std::array<double, 8> quad{};
+  };
+  [[nodiscard]] std::optional<SmartObjectInfo> smart_object_info(std::int64_t session_id, LayerId layer_id) const;
+  // layer.moveTo on a smart object with a supported Smart Filter stack: the
+  // stack renders in document space, so the layer re-renders at its new place
+  // (the Move tool's commit rule). False when the render failed.
+  bool rerender_moved_smart_filters(std::int64_t session_id, LayerId layer_id);
+
+  // Undo integration: the FIRST mutation a run makes to a session pushes one
+  // "Script: <name>" snapshot; later mutations in the same run ride it, so the
+  // whole run undoes in one step. Returns false when the session is gone.
+  bool prepare_mutation(std::int64_t session_id);
+  // Scripts can opt out of the undo snapshot for speed (app.undoEnabled = false;
+  // per-run state, default on). Off = mutations from that point cannot be
+  // undone; sessions are still marked modified so closing protects the work.
+  [[nodiscard]] bool undo_enabled() const noexcept;
+  void set_undo_enabled(bool enabled) noexcept;
+  // Coalesced refresh (flushed once per event-loop turn): pixel changes mark the
+  // canvas dirty (empty rect = whole canvas); structure changes also rebuild the
+  // layer panel and action states.
+  void note_pixels_changed(std::int64_t session_id, const QRect& dirty_document_rect, bool completed = true);
+  void note_structure_changed(std::int64_t session_id);
+  void note_vector_changed(std::int64_t session_id, const QRect& dirty = {}, bool structure = false);
+  PatternLibrary& vector_pattern_library();
+  GradientLibrary& vector_gradient_library();
+  CustomShapeLibrary& vector_custom_shape_library();
+  void activate_document_path(std::int64_t session_id, DocumentPathId path_id);
+  QJsonObject vector_target(std::int64_t session_id) const;
+  void select_vector_path(std::int64_t session_id, const VectorPath& path,
+                          double feather, bool antialias, const QString& operation);
+  VectorPath selection_vector_path(std::int64_t session_id, double tolerance) const;
+  // doc.selection.selectSubject / objectSelect (script_ai_selection.cpp): one network solve
+  // from one prompt, combined with the selection. Returns the error for the script, empty
+  // on success.
+  struct AutomaticSelectionRequest {
+    enum class Kind {
+      Subject,
+      Background,
+      Box,
+      Point
+    };
+    Kind kind{Kind::Subject};
+    QRect box;
+    QPointF point;
+    int operation{0};  // 0 replace, 1 add, 2 subtract, 3 intersect (subject/background only)
+    bool sample_all_layers{true};
+    double feather{0.0};
+    bool antialias{true};
+  };
+  QString automatic_select(std::int64_t session_id, const AutomaticSelectionRequest& request);
+  // layer.removeBackground(): the subject matte as `layer_id`'s mask. Error text, empty on success.
+  QString remove_background(std::int64_t session_id, LayerId layer_id, bool sample_all_layers);
+
+  // Palette-mode write constraint for script pixel writes (setPixels/fill are
+  // tool-like writes and snap; filters deliberately stay advisory, matching the
+  // interactive behavior). No-ops when palette mode is off.
+  void palette_snap_buffer(std::int64_t session_id, PixelBuffer& pixels);
+  bool set_session_palette(std::int64_t session_id, std::vector<RgbColor> colors,
+                           bool enabled, std::uint8_t alpha_threshold, std::vector<std::string> names);
+  [[nodiscard]] QColor palette_snap_color(std::int64_t session_id, QColor color) const;
+
+  // Selection, through the session's canvas.
+  void select_all(std::int64_t session_id);
+  void deselect(std::int64_t session_id);
+  void select_region(std::int64_t session_id, const QRegion& region);
+  // Select > Smooth and Select > Feather on the session's selection (GitHub issue 614).
+  void smooth_selection(std::int64_t session_id, int radius);
+  void feather_selection(std::int64_t session_id, double radius);
+  // doc.selection.selectColorRange (script_color_range.cpp, docs/color-range.md): the mask of
+  // the merged image or the active layer, combined with the selection (`operation`: 0 replace,
+  // 1 add, 2 subtract, 3 intersect). Returns the error for the script, empty on success.
+  QString select_color_range(std::int64_t session_id, const ColorRangeOptions& options, int operation,
+                             bool sample_all_layers);
+  [[nodiscard]] QRegion selection_region(std::int64_t session_id) const;
+  [[nodiscard]] bool has_selection(std::int64_t session_id) const;
+  // The selection's gray8 coverage over `rect` (0 outside it), and the selection replaced by a
+  // gray8 coverage plane at `bounds`; an all-zero plane deselects (script_pixel_io.cpp).
+  [[nodiscard]] PixelBuffer selection_coverage(std::int64_t session_id, QRect rect) const;
+  void set_selection_coverage(std::int64_t session_id, QRect bounds, const PixelBuffer& coverage);
+  // `pixels` (a layer buffer positioned at `bounds`) with alpha 0 outside the
+  // session's selection; unchanged without a selection.
+  [[nodiscard]] PixelBuffer pixels_limited_to_selection(std::int64_t session_id, const PixelBuffer& pixels,
+                                                        Rect bounds) const;
+  // True when the session's selection has soft (partial) coverage: a feather or an
+  // anti-aliased Object Selection edge.
+  [[nodiscard]] bool selection_has_soft_coverage(std::int64_t session_id) const;
+  // Blends `result` toward `original` (both at `bounds`) by that soft coverage, the way
+  // destructive filters do; a no-op for a hard selection.
+  void blend_by_selection_coverage(std::int64_t session_id, PixelBuffer& result, const PixelBuffer& original,
+                                   Rect bounds) const;
+  // Edit > Remove Object on the session's selection through its canvas; the
+  // layer must be the document's active layer. The pixel edit rides this
+  // run's undo snapshot. False (with a JS error thrown) on refusal.
+  bool remove_object_in_selection(std::int64_t session_id, LayerId layer_id, bool content_aware, int attempt,
+                                  int tone_match, int feather, bool* used_content_aware, int* source,
+                                  int* source_count, std::int64_t* patches, int* attempt_used);
+  // The Red Eye tool on the session's active layer through its canvas: a click at `point`
+  // or the box `box` (document pixels). Rides this run's undo snapshot. False (with a JS
+  // error thrown) when refused or when no red was found.
+  bool red_eye(std::int64_t session_id, LayerId layer_id, QPoint point, std::optional<QRect> box, int pupil_size,
+               int darken_amount, std::int64_t* pupil_pixels, QRect* changed);
+  // The Color Replacement tool on the session's active layer through its canvas: one stroke
+  // with a round tip. Rides this run's undo snapshot. False (with a JS error thrown) when
+  // refused; `changed` is empty when no pixel matched.
+  bool color_replace(std::int64_t session_id, LayerId layer_id, const ColorReplaceScriptStroke& stroke,
+                     QRect* changed);
+  // The Background Eraser (one stroke with a round tip) and the Magic Eraser (one click) on
+  // the session's active layer through its canvas. They ride this run's undo snapshot. False
+  // (with a JS error thrown) when refused; `changed` is empty when nothing was erased.
+  // `background` is the color a transparency-locked layer is erased to.
+  bool erase_background(std::int64_t session_id, LayerId layer_id, const BackgroundEraserScriptStroke& stroke,
+                        QRect* changed);
+  bool magic_erase(std::int64_t session_id, LayerId layer_id, QPoint point, const MagicEraserOptions& options,
+                   const QColor& background, QRect* changed);
+  // The checks those two share before they reach the canvas: the document and the layer still
+  // exist, and the layer is the document's active one. Null (with a JS error naming
+  // `function` thrown) when one fails.
+  [[nodiscard]] CanvasWidget* eraser_call_canvas(std::int64_t session_id, LayerId layer_id, const char* function);
+  // patchy.perspective (script_perspective.cpp, docs/perspective-planes.md): the document's
+  // session planes, a layer's pixels as straight RGBA8 (active document only), and one
+  // edit on the active document's `layer_id` through `plane`, written as Filter >
+  // Perspective Planes writes it and riding this run's undo snapshot. perspective_edit
+  // returns the written layer, nullopt when nothing changed or (with a JS error) refused.
+  [[nodiscard]] std::optional<std::vector<PerspectivePlane>> perspective_planes(std::int64_t session_id);
+  bool set_perspective_planes(std::int64_t session_id, std::vector<PerspectivePlane> planes);
+  [[nodiscard]] std::optional<PixelBuffer> perspective_source_pixels(std::int64_t session_id, LayerId layer_id);
+  [[nodiscard]] bool perspective_layer_can_place(std::int64_t session_id, LayerId layer_id);
+  // The visible layers under and over `layer_id` (Clone's Sample choice), active document only.
+  [[nodiscard]] std::pair<PixelBuffer, PixelBuffer> perspective_sample_layers(std::int64_t session_id, LayerId layer_id);
+  std::optional<LayerId> perspective_edit(
+      std::int64_t session_id, LayerId layer_id, const PlaneQuad& plane, bool onto_layer,
+      const std::function<bool(PerspectiveCanvas&, const PlaneGeometry&, QString&)>& edit);
+  // Layer > Arrange > Align / Distribute over `root_ids` (empty = the
+  // session's layer selection) through its canvas, riding this run's undo
+  // snapshot. Returns the number of layers moved; -1 with a JS error thrown
+  // on refusal (no movable unit, fewer than three units to distribute).
+  // layer.transform (GitHub issue 225): Free Transform through the session's canvas
+  // (the interactive per-type rules) as part of the run's undo snapshot. `matrix` maps
+  // the layer box ([a, b, c, d, e, f]: x' = a x + c y + e, y' = b x + d y + f); `quad`
+  // places its corners. Returns false with a JS error thrown on refusal.
+  bool transform_layer(std::int64_t session_id, LayerId layer_id, const std::optional<std::array<double, 6>>& matrix,
+                       const std::optional<std::array<std::array<double, 2>, 4>>& quad,
+                       std::optional<ResampleMethod> interpolation);
+  int align_layers(std::int64_t session_id, const std::vector<LayerId>& root_ids, AlignEdge edge,
+                   bool align_to_canvas);
+  int distribute_layers(std::int64_t session_id, const std::vector<LayerId>& root_ids, DistributeMode mode);
+
+  // Text layers, driven through the real inline-editor pipeline (the
+  // cli_append_text_to_text_layers technique) so rasters render normally.
+  // One formatted run of a text layer. The layer-level values apply unless the run overrides
+  // them; `text` may contain "\n", which starts a new paragraph inside the same layer.
+  struct TextRunParams {
+    QString text;
+    QString family;               // empty = the layer's
+    double size_px{0.0};          // <= 0 = the layer's; document pixels
+    std::optional<bool> bold;
+    std::optional<bool> italic;
+    QColor color;                 // invalid = the layer's
+    // Character-panel styles (GitHub issue 346); unset = the layer's. caps 0 none, 1 small,
+    // 2 all; script 0 none, 1 superscript, 2 subscript.
+    std::optional<int> caps;
+    std::optional<int> script;
+    std::optional<bool> underline;
+    std::optional<bool> strikethrough;
+    std::optional<bool> ordinals;
+    std::optional<bool> fractions;
+    std::optional<bool> ligatures;
+    std::optional<bool> contextual_alternates;
+    std::optional<bool> discretionary_ligatures;
+    std::optional<bool> swash;
+    std::optional<bool> stylistic_alternates;
+    std::optional<bool> titling_alternates;
+  };
+  struct TextLayerParams {
+    QString text;
+    std::vector<TextRunParams> runs;  // when non-empty, the layer's content instead of `text`
+    QString family;      // empty = current default
+    // Text height in DOCUMENT pixels (<= 0 = current default). The editor
+    // font must be set in editor pixels (document px * canvas zoom); a
+    // point-sized font here commits at a zoom-dependent size.
+    double size_px{0.0};
+    bool bold{false};
+    bool italic{false};
+    QColor color;        // invalid = current default
+    QPoint position{0, 0};
+    QString orientation;  // "horizontal" / "vertical"; empty = horizontal
+    QString direction;    // "auto" / "ltr" / "rtl"; empty = auto
+    QSize box;            // valid = a paragraph text box of that size at `position` (wrapping)
+    std::optional<VectorPath> area;  // text-owned contour in document pixels
+    std::optional<TextPathFrame> path;  // text along this contour (document pixels) and its range
+    QString align;        // "left" / "center" / "right" / "justify"; empty = the default
+    TextParagraphMetrics paragraph;  // indents and spacing in document px; unset fields keep the defaults
+  };
+  // A stored run read back in text order (see text_layer_runs).
+  struct TextRunInfo {
+    QString text;
+    QString family;
+    QString style;   // the recorded face beyond bold/italic ("Black", "Demi"), or empty
+    double size{0.0};
+    bool bold{false};
+    bool italic{false};
+    QString color;   // #rrggbb
+    TextCharacterStyles styles;
+  };
+  std::optional<LayerId> add_text_layer(std::int64_t session_id, const TextLayerParams& params);
+  bool set_text_layer_text(std::int64_t session_id, LayerId layer_id, const QString& text);
+  // Replaces the layer's content with the runs, each typed in its own format on top of the
+  // first character's; the same hidden session `text` uses.
+  // `api` is the name font warnings are reported under ("layer.text" passes its own).
+  bool set_text_layer_runs(std::int64_t session_id, LayerId layer_id, const std::vector<TextRunParams>& runs,
+                           const char* api = "layer.setTextRuns");
+  // The layer's runs as stored (sizes in document pixels before any layer transform); a layer
+  // with no run data reports one run from its layer-level values.
+  [[nodiscard]] std::vector<TextRunInfo> text_layer_runs(std::int64_t session_id, LayerId layer_id) const;
+  // The paragraph text box size, invalid for point text.
+  [[nodiscard]] QSize text_layer_box(std::int64_t session_id, LayerId layer_id) const;
+  bool set_text_layer_area(std::int64_t session_id, LayerId layer_id, const std::optional<VectorPath>& area);
+  // The contour and range a text layer runs along, in document pixels; nullopt makes it box text.
+  bool set_text_layer_path(std::int64_t session_id, LayerId layer_id, const std::optional<TextPathFrame>& frame);
+  // The first paragraph's alignment name ("left" when nothing is recorded); the setter aligns
+  // every paragraph.
+  [[nodiscard]] QString text_layer_align(std::int64_t session_id, LayerId layer_id) const;
+  bool set_text_layer_align(std::int64_t session_id, LayerId layer_id, const QString& align);
+  // The first paragraph's indents and spacing in document pixels (every field set, 0 when
+  // nothing is recorded); the setter merges the given fields into every paragraph.
+  [[nodiscard]] TextParagraphMetrics text_layer_paragraph(std::int64_t session_id, LayerId layer_id) const;
+  bool set_text_layer_paragraph(std::int64_t session_id, LayerId layer_id, const TextParagraphMetrics& metrics);
+  [[nodiscard]] QString text_layer_text(std::int64_t session_id, LayerId layer_id) const;
+  // Vertical type and paragraph direction, through the same hidden session as `text`.
+  [[nodiscard]] QString text_layer_orientation(std::int64_t session_id, LayerId layer_id) const;
+  bool set_text_layer_orientation(std::int64_t session_id, LayerId layer_id, const QString& orientation);
+  [[nodiscard]] QString text_layer_direction(std::int64_t session_id, LayerId layer_id) const;
+  // Lays the layer out again from its stored text and commits the result, changing nothing
+  // else: the pixels a PSD carried for the layer are replaced by Patchy's own render.
+  bool rerender_text_layer(std::int64_t session_id, LayerId layer_id);
+  // The layer's primary font family as stored (the requested name, even when it is not installed).
+  [[nodiscard]] QString text_layer_font(std::int64_t session_id, LayerId layer_id) const;
+  bool set_text_layer_direction(std::int64_t session_id, LayerId layer_id, const QString& direction);
+  [[nodiscard]] bool layer_is_text_layer(std::int64_t session_id, LayerId layer_id) const;
+  // Runs `edit` in a hidden text session and commits it. Afterwards the console gets a warning,
+  // under the name `api`, for every font the layer cannot be drawn in, including one the session
+  // had to substitute on the way in (an edit moves a missing family onto the face Qt draws it
+  // with, so the committed layer no longer names it). `requested_fonts` are the families the
+  // edit itself names, on top of the ones the layer already used.
+  bool edit_text_layer_session(std::int64_t session_id, LayerId layer_id, const char* api,
+                               const std::function<void(QTextEdit&)>& edit,
+                               const QStringList& requested_fonts = {});
+
+  // Filter application onto a layer's pixel buffer by registry id.
+  bool apply_filter_to_layer(std::int64_t session_id, LayerId layer_id, const QString& filter_id,
+                             const QJSValue& params);
+  // Filter > Camera Raw Filter's settings (GitHub issue 392) on a layer, limited to the
+  // session's selection like the menu command.
+  bool apply_camera_raw_filter_to_layer(std::int64_t session_id, LayerId layer_id, const QJSValue& settings);
+  // Smart Filters on a smart object (layer.smartFilters and friends; script_smart_filters.cpp,
+  // docs/scripting.md). Each edit goes through MainWindow::commit_smart_filter_stack_edit,
+  // the Layers panel's and the settings dialogs' commit, and rides this run's snapshot;
+  // refusals throw a JS error. Indexes are execution order (0 runs first).
+  struct SmartFilterEntryChanges {
+    std::optional<bool> visible;
+    std::optional<double> opacity;  // 0..1
+    std::optional<BlendMode> blend_mode;
+  };
+  [[nodiscard]] QJSValue smart_filters_to_js(std::int64_t session_id, LayerId layer_id);
+  [[nodiscard]] bool smart_filters_visible(std::int64_t session_id, LayerId layer_id);
+  void set_smart_filters_visible(std::int64_t session_id, LayerId layer_id, bool visible);
+  // Returns the new entry's index, or -1 after throwing.
+  int add_smart_filter(std::int64_t session_id, LayerId layer_id, const QString& filter_id,
+                       const QJSValue& params, const QJSValue& options);
+  void set_smart_filter(std::int64_t session_id, LayerId layer_id, int index, const QJSValue& changes);
+  void remove_smart_filter(std::int64_t session_id, LayerId layer_id, int index);
+  void move_smart_filter(std::int64_t session_id, LayerId layer_id, int from, int to);
+  void clear_smart_filters(std::int64_t session_id, LayerId layer_id);
+  // Legacy Photoshop plug-in by identifier (patchy.plugins.list()), limited to
+  // the session's selection; the dialog is skipped for unattended runs.
+  bool apply_legacy_plugin_to_layer(std::int64_t session_id, LayerId layer_id, const QString& plugin_id,
+                                    bool show_dialog, const QString& capture_dialog_path = QString());
+  // A G'MIC library filter by id (patchy.gmic.list()) on a layer, limited to the
+  // session's selection and part of the run's undo entry. Returns the number of
+  // layers the filter added, or throws.
+  QJSValue apply_gmic_to_layer(std::int64_t session_id, LayerId layer_id, const QString& filter_id,
+                               const QJSValue& values, const QJSValue& options);
+  // The offered G'MIC filters with their parameters, as script objects.
+  [[nodiscard]] QJSValue gmic_filter_list();
+  // The plug-in files the last scan saw, as script objects.
+  [[nodiscard]] QJSValue legacy_plugin_list();
+  // Rescans the plug-in folders (patchy.plugins.rescan / folders setter).
+  void rescan_legacy_plugins();
+  // Every GEGL filter offered, as script objects (script_gegl_filters.cpp, docs/gegl-filters.md).
+  [[nodiscard]] QJSValue gegl_filter_list();
+
+  // Interactive helpers (suppressed for unattended runs - CLI automation mode
+  // or a forwarded --run-script: alert logs instead, prompt returns its
+  // default, pickers return empty, showDialog/showOptions answer with the
+  // effective defaults). Each pauses the watchdog while its dialog is up.
+  void show_alert(const QString& text);
+  [[nodiscard]] QString show_prompt(const QString& text, const QString& default_value, bool* accepted);
+  [[nodiscard]] QString choose_folder(const QString& title);
+  [[nodiscard]] QString choose_open_file(const QString& title, const QString& filter);
+  [[nodiscard]] QString choose_save_file(const QString& title, const QString& filter);
+  // Declarative form dialog (patchy.ui.showDialog): builds widgets from the
+  // spec's field list, returns a values object, or null when cancelled.
+  [[nodiscard]] QJSValue show_form_dialog(const QJSValue& spec);
+  // patchy.ui.showOptions: showDialog plus the standard options behavior -
+  // field defaults are overridden by matching patchy.args values (coerced by
+  // field type), and unattended runs skip the dialog entirely, returning the
+  // effective values (docs/scripting.md "Script options").
+  [[nodiscard]] QJSValue show_options_dialog(const QJSValue& spec);
+
+  // patchy.ui.playTone / patchy.ui.playSound: synthesized blips and .wav
+  // playback through sound_effects (per-OS fire-and-forget backends,
+  // PATCHY_NO_SOUND=1 opt-out). play_sound_file resolves relative paths the
+  // include() way and throws a JS error for missing/oversized/non-WAV files.
+  void play_tone(double frequency_hz, int duration_ms, double volume, const QString& wave);
+  void play_sound_file(const QString& path);
+
+  // app.runCommand / app.commandIds: registered app actions by their stable
+  // HotkeyRegistry command id. run_app_command returns false for unknown or
+  // currently disabled commands.
+  bool run_app_command(const QString& command_id);
+  [[nodiscard]] QStringList app_command_ids() const;
+
+  // UI staging (patchy.ui.setWindowSize/setSidePanelWidth/captureWindow):
+  // resize the main window, set the right dock stack width, and save a PNG of
+  // the main window through the --screenshot machinery. Built for automation
+  // that captures the app (the README shot scripts); captures never raise or
+  // focus the window.
+  void set_window_size(int width, int height);
+  void set_side_panel_width(int width);
+  bool capture_window_to_file(const QString& path);
+  // patchy.ui.setStatusMessage: the status bar line (progress readouts, and
+  // staging a clean "Ready" before a capture).
+  void set_status_message(const QString& message);
+  // patchy.ui.expandPanel/collapsePanel/closePanel/panelState: the right column's
+  // panels by their permanent script names ("layers", "properties", ...; see
+  // script_side_panel_names). Expanding is the Window menu's show: reopen, bring
+  // the tab to the front, expand. Unknown names throw.
+  void expand_side_panel(const QString& name);
+  void collapse_side_panel(const QString& name);
+  void close_side_panel(const QString& name);
+  [[nodiscard]] QJSValue side_panel_state(const QString& name);
+  // The panel id for a script name; throws (returning "") when the name is unknown.
+  [[nodiscard]] QString side_panel_id(const QString& name);
+  // patchy.ui.zoom / patchy.ui.fitOnScreen: the active document's canvas view
+  // in percent (0 with no document). Setting throws with no document and
+  // clamps like the status bar; fitting settles pending layout first so an
+  // earlier setWindowSize has reached the canvas. Window captures see the
+  // view; document previews never do. Available in connector sessions.
+  [[nodiscard]] double view_zoom_percent() const;
+  void set_view_zoom_percent(double percent);
+  [[nodiscard]] double view_rotation_degrees() const;
+  void set_view_rotation_degrees(double degrees);
+  // The active 32-bit document's preview exposure (stops), set through the status bar's
+  // Exposure box so the canvas repaints as for a user edit. Setting throws without one.
+  [[nodiscard]] double view_preview_exposure() const;
+  void set_view_preview_exposure(double stops);
+  // View > Proof Colors / Gamut Warning (docs/cmyk.md). Setting one on without a CMYK
+  // profile leaves it off, as the menu does.
+  [[nodiscard]] bool view_proof_colors() const;
+  void set_view_proof_colors(bool enabled);
+  [[nodiscard]] bool view_gamut_warning() const;
+  void set_view_gamut_warning(bool enabled);
+  // View > Pixel Grid, the saved preference (GitHub issue 239).
+  [[nodiscard]] bool view_pixel_grid() const;
+  void set_view_pixel_grid(bool enabled);
+  // patchy.ui.toolPalette: Customize Tool Palette's choice as a plain object, and a
+  // partial update of it (unknown ids or layouts throw).
+  [[nodiscard]] QJSValue tool_palette_state();
+  void set_tool_palette_state(const QJSValue& state);
+  void fit_view_on_screen();
+  // patchy.ui.viewCenter / zoomTo / zoomToRect: where the active document's view looks, in
+  // document pixels (docs/view-navigation.md, "Scripted view placement"). The getter returns
+  // null with no document; the setters throw then. Arguments are validated by ScriptUiObject.
+  [[nodiscard]] QJSValue view_center();
+  void set_view_center(QPointF document_point);
+  void zoom_view_to(QPointF document_point, double percent);
+  void zoom_view_to_rect(QRectF document_rect, double margin_per_side);
+  void present_script_view(int delay_ms = 0, bool slow_hold = false);
+  [[nodiscard]] bool slow_mode() const;
+  [[nodiscard]] bool slow_mode_available() const;
+  void set_slow_mode(bool enabled);
+  Q_SIGNAL void slow_mode_changed(bool enabled);
+  [[nodiscard]] bool paused() const;
+  [[nodiscard]] bool manual_edit_pause() const;
+  void set_paused(bool paused);
+  Q_SIGNAL void paused_changed(bool paused);
+  // API scopes park only after native locals and temporary tool state unwind.
+  void begin_api_call();
+  void end_api_call();
+  void pause_at_edit_boundary();
+  void keep_alive_for_ui();
+  bool resize_session_image(std::int64_t session_id, int width, int height, ResampleMethod method);
+  // The activeLayer setter's reveal: expand collapsed ancestor folders and
+  // (when the session is the active one) select + scroll the row into view.
+  void reveal_layer_row(std::int64_t session_id, LayerId layer_id);
+
+  // Closes the busy overlay and the app-modal stop panel, and restarts the
+  // burst clock so they do not immediately return. Call it immediately BEFORE
+  // creating a script canvas window: a window shown while an application-modal
+  // window is up is born blocked by it, and a blocked window never receives a
+  // key event again on wasm (docs/wasm.md).
+  void dismiss_busy_indicator();
+
+  // Script canvas windows join the run lifecycle: the run stays live while any
+  // window is open, and stopping the run closes them.
+  void adopt_canvas_window(ScriptCanvasWindow* window);
+  void canvas_window_closed(ScriptCanvasWindow* window);
+  // The surface of the most recently opened still-open script canvas window
+  // (the Script Manager's Set Icon capture source); null when none is open.
+  [[nodiscard]] QImage active_canvas_window_image() const;
+
+  // JS bridge (bound behind the bootstrap prelude; not for direct script use).
+  Q_INVOKABLE int scriptSetTimer(const QJSValue& callback, int interval_ms, bool repeat);
+  Q_INVOKABLE void scriptClearTimer(int timer_id);
+  Q_INVOKABLE void consoleEmit(int kind, const QString& text);
+  Q_INVOKABLE void scriptSetResult(const QString& json);
+  Q_INVOKABLE void includeScript(const QString& path);
+  // True while an include()d file's top-level code runs (patchy.isMainScript
+  // is its negation - the `if __name__ == "__main__"` pattern).
+  Q_INVOKABLE bool scriptIsIncluded() const;
+
+  // Runs a stored JS callback under the watchdog with error trapping. Used by
+  // the timer registry and the canvas windows so every entry into script code
+  // shares one guard path. Returns false when the callback errored (the run is
+  // then finishing; callers must not run further script code).
+  bool call_script_callback(QJSValue callback, const QJSValueList& args);
+
+private:
+  // applyFilter's parameter parsing: the normalized invocation of a catalog filter for
+  // `params`, or nullopt after throwing (an unknown id or key, rejected values).
+  std::optional<FilterInvocation> script_filter_invocation(const FilterRegistry& registry, const QString& filter_id,
+                                                           const QJSValue& params);
+  // Appends `normalized` to a smart object's Smart Filters (addSmartFilter, and applyFilter
+  // on a smart object). Returns the new index, or -1 after throwing.
+  int add_smart_filter_invocation(std::int64_t session_id, LayerId layer_id, const FilterRegistry& registry,
+                                  const FilterInvocation& normalized, const char* api,
+                                  const SmartFilterEntryChanges& changes);
+  bool connector_mode_{false};
+  QPointer<McpActivity> script_activity_;
+  bool presenting_view_{false};
+  bool slow_mode_{false};
+  bool waiting_for_resume_{false};
+  int api_call_depth_{0};
+  [[nodiscard]] bool manual_edit_in_progress() const;
+  void wait_while_paused();
+  void begin_manual_pause();
+  void finish_manual_pause();
+  QJsonArray pause_history_state() const;
+  void complete_mutation(std::int64_t session_id);
+  bool refresh_script_view(bool force = false);
+  std::function<void()> connector_progress_callback_;
+  mutable std::mutex interrupt_mutex_;
+  std::atomic<bool> external_interrupt_{false};
+  QJsonValue last_result_;
+  struct ScriptRun {
+    QString name;
+    QStringList include_dir_stack;
+    // Depth of nested include() evaluations (0 = top-level script code).
+    int include_depth{0};
+    std::set<std::int64_t> snapshotted_sessions;
+    std::set<std::int64_t> undo_group_sessions;
+    std::set<std::int64_t> pending_mutations;
+    std::set<std::int64_t> slow_mutations;
+    std::map<std::int64_t, std::size_t> undo_steps;
+    bool undo_enabled{true};
+    std::map<int, QTimer*> timers;
+    int next_timer_id{1};
+    std::vector<QPointer<ScriptCanvasWindow>> windows;
+    bool sync_running{false};
+    // True while a stored JS callback executes (timer tick, window event); the
+    // engine must not be destroyed from inside either, so stop/finish requests
+    // arriving then are deferred.
+    bool in_callback{false};
+    bool stop_requested{false};
+    bool paused{false};
+    std::optional<QJsonArray> paused_documents;
+    bool finishing{false};
+    bool had_error{false};
+    // CLI-originated run (RunOptions.unattended).
+    bool unattended{false};
+    // patchy.args parsed to key -> value (showOptions override merge).
+    std::map<QString, QString> args;
+    // Busy indicator (pump_progress_indicator): measures the CURRENT
+    // synchronous execution burst (the main evaluate or one callback), so a
+    // long-running game of short frame callbacks never trips it.
+    QElapsedTimer burst_clock;
+    // Whole-run wall clock (the stop panel's elapsed display).
+    QElapsedTimer run_clock;
+    qint64 last_pump_ms{0};
+    qint64 last_preview_ms{-50};
+    bool busy_active{false};
+    QPointer<CanvasWidget> busy_canvas;
+    // Stop-panel confirm: undo the run's snapshots after it finishes.
+    bool undo_after_stop{false};
+  };
+
+  struct PendingRefresh {
+    bool palette{false};
+    QRegion dirty;
+    bool full_canvas{false};
+    bool structure{false};
+    bool paths{false};
+  };
+
+  // RAII: disarms the watchdog while a modal interactive helper (alert,
+  // prompt, pickers, showDialog, runCommand) blocks in a nested event loop,
+  // and re-arms it with a FRESH timeout on exit. Without this, a user who
+  // thinks at a dialog for longer than the timeout gets the script
+  // interrupted the moment it resumes.
+  struct ModalWatchdogPause {
+    explicit ModalWatchdogPause(ScriptEngineHost& host);
+    ~ModalWatchdogPause();
+    ModalWatchdogPause(const ModalWatchdogPause&) = delete;
+    ModalWatchdogPause& operator=(const ModalWatchdogPause&) = delete;
+    ScriptEngineHost& host_;
+    bool rearm_{false};
+  };
+
+  void install_bindings(const RunOptions& options);
+  // Shared showDialog/showOptions body: parse fields, optionally merge
+  // patchy.args over the defaults, answer with the effective values when
+  // unattended, else build and exec the form dialog.
+  [[nodiscard]] QJSValue run_form_dialog(const QJSValue& spec, bool merge_args);
+  void report_error(const QJSValue& error);
+  void emit_message(MessageKind kind, const QString& text);
+  // Console warnings (never a dialog) for the fonts in `asked` the layer was not drawn in.
+  void report_text_fonts(const QString& api, std::int64_t session_id, LayerId layer_id, const QStringList& asked);
+  [[nodiscard]] std::chrono::milliseconds watchdog_timeout() const;
+  // True when interactive helpers must answer without UI: app-wide CLI
+  // automation, or this run arrived via --run-script (forwarded included).
+  // Automatic busy indicator: called from the hot service entry points. It
+  // feeds the inactivity watchdog unconditionally; for GUI-interactive runs,
+  // once the current synchronous burst exceeds the 0.5 s threshold it shows
+  // the active canvas's animated processing overlay plus the app-modal stop
+  // panel and pumps events (throttled; the modality gate means only the
+  // panel's Stop button takes input). end_progress_indicator() closes both
+  // when the burst ends.
+  void pump_progress_indicator();
+  void end_progress_indicator();
+  // True while the run owns a script canvas window that is still on screen.
+  [[nodiscard]] bool has_open_canvas_window() const;
+  // The stop panel's Stop button: confirmation popup ("Stop 'name'?" with an
+  // optional undo-the-changes checkbox), then interrupt.
+  void confirm_stop_from_panel();
+  // Deferred completion check: a run may complete from inside a JS callback, and
+  // the engine cannot be destroyed while it is executing.
+  void schedule_completion_check();
+  void check_run_completion();
+  void finish_run();
+  void teardown_run_resources();
+  void schedule_refresh_flush();
+  void flush_pending_refresh();
+  [[nodiscard]] QString resolve_include_path(const QString& path) const;
+  // The session's canvas (nullptr when the session is gone); MainWindow access
+  // stays inside host members (the friend grant does not reach free helpers).
+  [[nodiscard]] CanvasWidget* session_canvas(std::int64_t session_id) const;
+
+  MainWindow& window_;
+  std::unique_ptr<QJSEngine> engine_;
+  std::unique_ptr<ScriptRun> run_;
+  std::unique_ptr<ScriptWatchdog> watchdog_;
+  QPointer<QDialog> stop_panel_;    // ScriptStopPanel (cpp-local type)
+  QPointer<QDialog> stop_confirm_;  // non-blocking "Stop 'name'?" question
+  std::map<std::int64_t, PendingRefresh> pending_refresh_;
+  QStringList message_backlog_;
+  bool last_run_had_error_{false};
+  bool refresh_flush_scheduled_{false};
+  bool completion_check_scheduled_{false};
+};
+
+class ScriptApiCall {
+public:
+  explicit ScriptApiCall(ScriptEngineHost& host) : host_(host) { host_.begin_api_call(); }
+  ~ScriptApiCall() { host_.end_api_call(); }
+  ScriptApiCall(const ScriptApiCall&) = delete;
+  ScriptApiCall& operator=(const ScriptApiCall&) = delete;
+private:
+  ScriptEngineHost& host_;
+};
+
+}  // namespace patchy::ui

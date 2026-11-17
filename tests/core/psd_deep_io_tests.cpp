@@ -1,0 +1,826 @@
+#include "core/psd_source_colors.hpp"
+#include "formats/acv_curves_io.hpp"
+#include "formats/bmp_document_io.hpp"
+#include "formats/aseprite_document_io.hpp"
+#include "formats/ico_document_io.hpp"
+#include "formats/ilbm_document_io.hpp"
+#include "formats/pcx_document_io.hpp"
+#include "formats/tga_document_io.hpp"
+#include "psd/psd_binary.hpp"
+#include <array>
+#include <bit>
+#include <cctype>
+#include <chrono>
+#include <exception>
+#include <fstream>
+#include <iomanip>
+#include <iterator>
+#include <limits>
+#include <numeric>
+#include <optional>
+#include <span>
+#include <sstream>
+#include <stdexcept>
+#include <string_view>
+#include <tuple>
+#include <unordered_set>
+#include <utility>
+// 16/32-bit PSD/PSB reading and writing at the file's depth (docs/high-bit-depth-formats.md,
+// Phase 2): the reader keeps the samples, the writer emits them back, and the 8-bit
+// reading of the same file is exactly the deep reading narrowed.
+#include "color/color_management.hpp"
+#include "core/document.hpp"
+#include "core/adjustment_layer.hpp"
+#include "core/document_depth.hpp"
+#include "core/pixel_depth.hpp"
+#include "core/smart_object.hpp"
+#include "core/vector_raster.hpp"
+#include "local_psd_fixtures.hpp"
+#include "core_test_support.hpp"
+#include "psd/psd_document_io.hpp"
+#include "psd/psd_filter_effects.hpp"
+#include "psd_test_support.hpp"
+#include "render/compositor.hpp"
+#include "test_harness.hpp"
+#include <algorithm>
+#include <cmath>
+#include <cstdint>
+#include <cstdlib>
+#include <cstring>
+#include <filesystem>
+#include <functional>
+#include <iostream>
+#include <set>
+#include <string>
+#include <vector>
+
+namespace {
+
+using namespace patchy;
+
+bool same_bytes(const PixelBuffer& a, const PixelBuffer& b) {
+  return a.format() == b.format() && a.width() == b.width() && a.height() == b.height() &&
+         std::memcmp(a.data().data(), b.data().data(), a.byte_size()) == 0;
+}
+
+std::vector<const Layer*> flat_layers(const Document& document) {
+  std::vector<const Layer*> out;
+  const std::function<void(const std::vector<Layer>&)> walk = [&](const std::vector<Layer>& layers) {
+    for (const auto& layer : layers) {
+      out.push_back(&layer);
+      walk(layer.children());
+    }
+  };
+  walk(document.layers());
+  return out;
+}
+
+// A 16 or 32-bit document whose samples are not representable at 8 bits: a fine
+// gradient layer with a gradient mask over a background, plus a saved channel.
+Document make_deep_document(BitDepth depth) {
+  Document document(64, 32, PixelFormat::rgb8());
+  PixelBuffer background(64, 32, PixelFormat::rgba8());
+  PixelBuffer top(64, 32, PixelFormat::rgba8());
+  document.add_pixel_layer("Background", background);
+  document.add_pixel_layer("Top", top);
+  convert_document_depth(document, depth);
+  const auto domain = deep_domain_for(depth);
+  std::vector<float> row(64 * 4);
+  for (int y = 0; y < 32; ++y) {
+    for (int x = 0; x < 64; ++x) {
+      auto* p = &row[static_cast<std::size_t>(x) * 4U];
+      p[0] = 3.3F + x * 3.9F;
+      p[1] = 250.0F - y * 7.1F;
+      p[2] = 17.25F + (x + y) * 1.3F;
+      p[3] = 255.0F;
+    }
+    store_rgba_row(document.layers()[0].pixels(), y, 0, 64, domain, row);
+    for (int x = 0; x < 64; ++x) {
+      row[static_cast<std::size_t>(x) * 4U + 3U] = 40.5F + x * 2.7F;
+    }
+    store_rgba_row(document.layers()[1].pixels(), y, 0, 64, domain, row);
+  }
+  LayerMask mask;
+  mask.bounds = Rect::from_size(64, 32);
+  mask.pixels = PixelBuffer(64, 32, with_bit_depth(PixelFormat::gray8(), depth));
+  std::vector<float> coverage(64);
+  for (int y = 0; y < 32; ++y) {
+    for (int x = 0; x < 64; ++x) {
+      coverage[static_cast<std::size_t>(x)] = x * 3.99F + 0.37F;
+    }
+    store_coverage_row(mask.pixels, y, 0, 64, coverage);
+  }
+  document.layers()[1].set_mask(mask);
+  PixelBuffer saved(64, 32, with_bit_depth(PixelFormat::gray8(), depth));
+  for (int y = 0; y < 32; ++y) {
+    for (int x = 0; x < 64; ++x) {
+      coverage[static_cast<std::size_t>(x)] = 255.0F - x * 1.11F - y;
+    }
+    store_coverage_row(saved, y, 0, 64, coverage);
+  }
+  document.add_channel(DocumentChannel(document.allocate_channel_id(), "Alpha 1", DocumentChannelKind::Alpha, saved));
+  return document;
+}
+
+std::uint16_t header_depth(const std::vector<std::uint8_t>& bytes) {
+  return static_cast<std::uint16_t>((bytes[22] << 8) | bytes[23]);
+}
+
+void deep_round_trip(BitDepth depth, bool large_document) {
+  const auto original = make_deep_document(depth);
+  CHECK(document_depth_problems(original).empty());
+  const auto bytes = psd::DocumentIo::write_layered_rgb8(original, psd::WriteOptions{large_document});
+  CHECK(header_depth(bytes) == (depth == BitDepth::Float32 ? 32 : 16));
+  psd::ReadOptions options;
+  options.keep_bit_depth = true;
+  const auto read = psd::DocumentIo::read(bytes, options);
+  CHECK(document_bit_depth(read) == depth);
+  CHECK(document_depth_problems(read).empty());
+  CHECK(read.layers().size() == 2);
+  for (std::size_t i = 0; i < 2; ++i) {
+    CHECK(same_bytes(read.layers()[i].pixels(), original.layers()[i].pixels()));
+  }
+  CHECK(read.layers()[1].mask().has_value());
+  CHECK(same_bytes(read.layers()[1].mask()->pixels, original.layers()[1].mask()->pixels));
+  CHECK(read.channels().size() == 1);
+  CHECK(same_bytes(read.channels()[0].pixels(), original.channels()[0].pixels()));
+
+  // Read the same bytes the old way: 8 bits, and exactly the deep pixels narrowed.
+  psd::ReadOptions shallow_options;
+  shallow_options.keep_bit_depth = false;
+  const auto shallow = psd::DocumentIo::read(bytes, shallow_options);
+  CHECK(document_bit_depth(shallow) == BitDepth::UInt8);
+  for (std::size_t i = 0; i < 2; ++i) {
+    CHECK(same_bytes(shallow.layers()[i].pixels(),
+                     convert_pixel_buffer_depth(read.layers()[i].pixels(), BitDepth::UInt8, SampleKind::Color)));
+  }
+}
+
+// The stored composite is the deep compositor's flatten at the document's depth, not
+// an 8-bit flatten widened: other readers (and Patchy's flat reading) see every bit.
+void deep_composite_keeps_depth(BitDepth depth) {
+  const auto original = make_deep_document(depth);
+  const auto expected = Compositor{}.flatten_rgba_deep(original);
+  const auto domain = deep_domain_for(depth);
+  for (const bool flat : {false, true}) {
+    const auto bytes = flat ? psd::DocumentIo::write_flat_rgb8(original) : psd::DocumentIo::write_layered_rgb8(original);
+    psd::ReadOptions options;
+    options.keep_bit_depth = true;
+    options.prefer_flat_composite = true;
+    const auto read = psd::DocumentIo::read(bytes, options);
+    CHECK(document_bit_depth(read) == depth);
+    CHECK(!read.layers().empty());
+    const auto& pixels = read.layers()[0].pixels();
+    CHECK(pixels.width() == expected.width() && pixels.height() == expected.height());
+    std::vector<float> mine(static_cast<std::size_t>(expected.width()) * 4U);
+    std::vector<float> theirs(mine.size());
+    double worst = 0.0;
+    for (std::int32_t y = 0; y < expected.height(); ++y) {
+      load_rgba_row(pixels, y, 0, expected.width(), domain, mine);
+      load_rgba_row(expected, y, 0, expected.width(), domain, theirs);
+      for (std::size_t i = 0; i < mine.size(); ++i) {
+        if (i % 4U != 3U) {
+          worst = std::max(worst, static_cast<double>(std::abs(mine[i] - theirs[i])));
+        }
+      }
+    }
+    // Exact for floats; within rounding for 16 bits (one 16-bit step is 1/257).
+    CHECK(worst <= (depth == BitDepth::Float32 ? 1e-4 : 0.5 / 257.0 + 1e-4));
+  }
+}
+
+void psd_deep_composite_is_written_at_depth() {
+  deep_composite_keeps_depth(BitDepth::UInt16);
+  deep_composite_keeps_depth(BitDepth::Float32);
+}
+
+void psd_deep_16_bit_document_round_trips_exactly() {
+  deep_round_trip(BitDepth::UInt16, false);
+  deep_round_trip(BitDepth::UInt16, true);
+}
+
+void psd_deep_32_bit_document_round_trips_exactly() {
+  deep_round_trip(BitDepth::Float32, false);
+  deep_round_trip(BitDepth::Float32, true);
+}
+
+void psd_deep_gate_off_reads_8_bit_as_before() {
+  const auto bytes = psd::DocumentIo::write_layered_rgb8(make_deep_document(BitDepth::UInt16));
+  set_deep_editing_override(false);
+  const auto document = psd::DocumentIo::read(bytes);
+  set_deep_editing_override(std::nullopt);
+  CHECK(document_bit_depth(document) == BitDepth::UInt8);
+  CHECK(document.layers()[0].pixels().format().bit_depth == BitDepth::UInt8);
+  set_deep_editing_override(true);
+  const auto deep = psd::DocumentIo::read(bytes);
+  set_deep_editing_override(std::nullopt);
+  CHECK(document_bit_depth(deep) == BitDepth::UInt16);
+}
+
+// Raw native planes keep this independent of Patchy's RGB writer. A layered file
+// and its composite carry the same fine ramp, alpha and source profile.
+std::vector<std::uint8_t> color_mode_ramp16(std::uint16_t mode, std::span<const std::uint8_t> profile,
+                                         bool eight_bit = false) {
+  using namespace patchy::test;
+  const std::uint16_t colors = mode == 4 ? 4 : mode == 1 ? 1 : 3;
+  psd::BigEndianWriter resources;
+  if (!profile.empty()) {
+    write_ascii4(resources, "8BIM");
+    resources.write_u16(1039);
+    resources.write_u16(0);  // empty Pascal name, padded to even
+    resources.write_u32(static_cast<std::uint32_t>(profile.size()));
+    resources.write_bytes(profile);
+    if (profile.size() % 2U != 0U) resources.write_u8(0);
+  }
+  std::vector<std::vector<std::uint8_t>> planes;
+  for (std::uint16_t c = 0; c <= colors; ++c) {
+    psd::BigEndianWriter plane;
+    for (std::uint16_t x = 0; x < 64; ++x) {
+      if (eight_bit) {
+        plane.write_u8(c == colors ? static_cast<std::uint8_t>(180U + x)
+                        : c == 0 ? static_cast<std::uint8_t>(80U + x) : c == 3 ? 255 : 128);
+      } else plane.write_u16(c == colors ? static_cast<std::uint16_t>(40000U + x)
+                     : c == 0 ? static_cast<std::uint16_t>(30000U + x)
+                     : c == 3 ? 65535 : 32896);
+    }
+    planes.push_back(plane.bytes());
+  }
+  psd::BigEndianWriter info;
+  info.write_u16(0xFFFF);  // one layer, merged transparency present
+  info.write_u32(0); info.write_u32(0); info.write_u32(1); info.write_u32(64);
+  info.write_u16(static_cast<std::uint16_t>(colors + 1U));
+  for (std::uint16_t c = 0; c <= colors; ++c) {
+    info.write_u16(c == colors ? 0xFFFF : c);
+    info.write_u32(eight_bit ? 66 : 130);  // compression marker + 64 samples
+  }
+  write_ascii4(info, "8BIM"); write_ascii4(info, "norm");
+  info.write_u8(255); info.write_u8(0); info.write_u8(8); info.write_u8(0);
+  info.write_u32(12);  // empty mask, blending ranges and name
+  info.write_u32(0); info.write_u32(0); info.write_u32(0);
+  for (const auto& plane : planes) {
+    info.write_u16(0);
+    info.write_bytes(plane);
+  }
+  psd::BigEndianWriter layer_mask;
+  if (eight_bit) {
+    layer_mask.write_u32(static_cast<std::uint32_t>(info.bytes().size()));
+    layer_mask.write_bytes(info.bytes());
+    layer_mask.write_u32(0);
+  } else {
+    layer_mask.write_u32(0); layer_mask.write_u32(0);
+    write_ascii4(layer_mask, "8BIM"); write_ascii4(layer_mask, "Lr16");
+    layer_mask.write_u32(static_cast<std::uint32_t>(info.bytes().size()));
+    layer_mask.write_bytes(info.bytes());
+    while (layer_mask.bytes().size() % 4U != 0U) layer_mask.write_u8(0);
+  }
+  psd::BigEndianWriter file;
+  psd::write_header(file, psd::Header{false, static_cast<std::uint16_t>(colors + 1U), 1, 64,
+                                   static_cast<std::uint16_t>(eight_bit ? 8 : 16), mode});
+  file.write_u32(0);
+  file.write_u32(static_cast<std::uint32_t>(resources.bytes().size()));
+  file.write_bytes(resources.bytes());
+  file.write_u32(static_cast<std::uint32_t>(layer_mask.bytes().size()));
+  file.write_bytes(layer_mask.bytes());
+  file.write_u16(0);
+  for (const auto& plane : planes) file.write_bytes(plane);
+  return file.bytes();
+}
+
+void psd_deep_color_conversions_keep_sub_byte_samples_and_alpha() {
+  const auto cmyk_source = psd::DocumentIo::read_file(
+      patchy::test::committed_psd_fixture_path("photoshop-cmyk-style-colors.psd"));
+  const auto cmyk_profile = patchy::test::test_image_resource_payload(
+      cmyk_source.metadata().raw_psd_image_resources, 1039);
+  CHECK(cmyk_profile.has_value());
+  const auto gray_profile = patchy::test::test_linear_gray_icc_profile();
+  for (const auto mode : std::array<std::uint16_t, 4>{1, 4, 7, 9}) {
+    for (const bool with_profile : {false, true}) {
+      if (with_profile && mode != 1 && mode != 4) continue;
+      const auto profile = !with_profile ? std::span<const std::uint8_t>{}
+                           : mode == 1 ? std::span<const std::uint8_t>(gray_profile)
+                                       : std::span<const std::uint8_t>(*cmyk_profile);
+      const auto bytes = color_mode_ramp16(mode, profile);
+      const auto assumed_cmyk = mode == 4 && !with_profile
+          ? CmykToRgbTransform::from_icc_profile(default_cmyk_profile()) : std::nullopt;
+      // Untagged Grayscale reads through the assumed Dot Gain 20% profile.
+      const auto assumed_gray = mode == 1 && !with_profile
+          ? GrayToRgbTransform::from_icc_profile(assumed_gray_profile()) : std::nullopt;
+      for (const bool flat : {false, true}) {
+        psd::ReadOptions options;
+        options.keep_bit_depth = true;
+        options.prefer_flat_composite = flat;
+        const auto document = psd::DocumentIo::read(bytes, options);
+        CHECK(document_bit_depth(document) == BitDepth::UInt16);
+        CHECK(document.layers().size() == 1);
+        const auto& layer = document.layers()[0];
+        const auto& pixels = layer.pixels();
+        CHECK(pixels.format().bit_depth == BitDepth::UInt16);
+        std::set<int> values;
+        for (int x = 0; x < 64; ++x) {
+          const auto pixel = load_pixel(pixels.format(), pixels.pixel(x, 0));
+          const auto red = static_cast<int>(std::lround(pixel[0] * 257.0F));
+          values.insert(red);
+          if ((mode == 4 || mode == 7) && !with_profile && !assumed_cmyk)
+            CHECK(red == 30000 + x);
+          if (assumed_gray) {
+            const auto gray = static_cast<std::uint16_t>(30000 + x);
+            std::array<std::uint16_t, 3> expected{};
+            assumed_gray->convert16(&gray, expected.data(), 1);
+            CHECK(red == expected[0]);
+          }
+          if (assumed_cmyk) {
+            const std::array<std::uint16_t, 4> inks{static_cast<std::uint16_t>(30000 + x), 32896, 32896, 65535};
+            std::array<std::uint16_t, 3> expected{};
+            assumed_cmyk->convert16(inks.data(), expected.data(), 1);
+            CHECK(red == expected[0]);
+          }
+          if (mode == 1 && with_profile) {
+            const auto expected = static_cast<int>(std::lround(srgb_encode((30000.0 + x) / 65535.0) * 65535.0));
+            CHECK(std::abs(red - expected) <= 8);
+          }
+          const auto alpha = flat ? coverage_at(layer.mask()->pixels, x, 0) * 65535.0F : pixel[3] * 257.0F;
+          CHECK(std::abs(alpha - (40000.0F + x)) < 0.1F);
+        }
+        // All 64 input samples round to the SAME byte. A deep conversion must
+        // preserve a gradient instead of producing one repeated output value.
+        CHECK(values.size() > 24U);
+        psd::WriteOptions rgb_options;
+        rgb_options.preserve_source_color_mode = false;
+        const auto saved = psd::DocumentIo::write_layered_rgb8(document, rgb_options);
+        options.prefer_flat_composite = false;
+        const auto reopened = psd::DocumentIo::read(saved, options);
+        const auto& saved_pixels = reopened.layers()[0].pixels();
+        for (int x = 0; x < 64; ++x) {
+          CHECK(load_pixel(saved_pixels.format(), saved_pixels.pixel(x, 0)) ==
+                load_pixel(pixels.format(), pixels.pixel(x, 0)));
+        }
+      }
+    }
+  }
+}
+
+void psd_deep_native_colors_survive_saves_but_never_shadow_edits() {
+  const auto mode_of = [](const auto& bytes) { return (bytes[24] << 8U) | bytes[25]; };
+  psd::ReadOptions read;
+  read.keep_bit_depth = true;
+  for (const auto& [eight_bit, mode] : std::array<std::pair<bool, std::uint16_t>, 6>{
+           {{false, std::uint16_t{1}}, {false, std::uint16_t{4}}, {false, std::uint16_t{9}},
+            {true, std::uint16_t{1}}, {true, std::uint16_t{4}}, {true, std::uint16_t{9}}}}) {
+    const auto original = psd::DocumentIo::read(color_mode_ramp16(mode, {}, eight_bit), read);
+    for (const bool large : {false, true}) {
+      psd::WriteOptions write;
+      write.large_document = large;
+      auto document = original;
+      document.layers()[0].set_name("Renamed");
+      // UI import preparation reads through mutable accessors. Revision churn
+      // alone must not convert an otherwise untouched document to RGB.
+      (void)document.layers()[0].pixels();
+      (void)document.layers()[0].metadata();
+      (void)document.layers()[0].children();
+      const auto bytes = psd::DocumentIo::write_layered_rgb8(document, write);
+      CHECK(mode_of(bytes) == mode);
+      const auto reopened = psd::DocumentIo::read(bytes, read);
+      CHECK(reopened.layers()[0].name() == "Renamed");
+      CHECK(reopened.layers()[0].psd_native_colors()->planes == original.layers()[0].psd_native_colors()->planes);
+      CHECK(same_bytes(reopened.layers()[0].pixels(), original.layers()[0].pixels()));
+      // Mutating a deep sample must discard source-plane reuse, including when
+      // the edited document shares all its storage with an undo snapshot.
+      document.layers()[0].pixels().pixel(0, 0)[0] ^= 0x40;
+      const auto edited = psd::DocumentIo::write_layered_rgb8(document, write);
+      CHECK(mode_of(edited) == 3);
+      const auto edited_read = psd::DocumentIo::read(edited, read);
+      CHECK(same_bytes(edited_read.layers()[0].pixels(), std::as_const(document).layers()[0].pixels()));
+      document = original;
+      CHECK(mode_of(psd::DocumentIo::write_layered_rgb8(document, write)) == mode);
+      // A layer pasted from a separately imported color space cannot inherit
+      // this document's native profile, even when both files name the same mode.
+      const auto other = psd::DocumentIo::read(color_mode_ramp16(mode, {}, eight_bit), read);
+      document.add_layer(other.layers()[0].clone_with_id(document.allocate_layer_id()));
+      CHECK(mode_of(psd::DocumentIo::write_layered_rgb8(document, write)) == 3);
+      if (mode == 4) {
+        auto crowded = original;
+        for (int i = 0; i < 52; ++i) {
+          crowded.add_channel(DocumentChannel(crowded.allocate_channel_id(), "Alpha " + std::to_string(i),
+              DocumentChannelKind::Alpha, PixelBuffer(64, 1, with_bit_depth(PixelFormat::gray8(),
+                  eight_bit ? BitDepth::UInt8 : BitDepth::UInt16))));
+        }
+        // With merged transparency, 52 saved channels fit RGB's 56-channel
+        // limit but not CMYK's. Keep saving successfully through RGB.
+        const auto crowded_bytes = psd::DocumentIo::write_layered_rgb8(crowded, write);
+        CHECK(mode_of(crowded_bytes) == 3);
+        CHECK(psd::DocumentIo::read(crowded_bytes, read).channels().size() == 52);
+      }
+    }
+  }
+}
+
+// A flat CMYK PSD as Photoshop saves a one-layer document: no layer records, only the
+// merged image (GitHub issue 220). A 64-pixel ink ramp, 8 or 16 bits.
+std::vector<std::uint8_t> flat_cmyk_ramp(bool eight_bit, std::span<const std::uint8_t> profile) {
+  using namespace patchy::test;
+  psd::BigEndianWriter resources;
+  if (!profile.empty()) {
+    write_ascii4(resources, "8BIM");
+    resources.write_u16(1039);
+    resources.write_u16(0);  // empty Pascal name, padded to even
+    resources.write_u32(static_cast<std::uint32_t>(profile.size()));
+    resources.write_bytes(profile);
+    if (profile.size() % 2U != 0U) resources.write_u8(0);
+  }
+  psd::BigEndianWriter file;
+  psd::write_header(file, psd::Header{false, 4, 1, 64, static_cast<std::uint16_t>(eight_bit ? 8 : 16), 4});
+  file.write_u32(0);
+  file.write_u32(static_cast<std::uint32_t>(resources.bytes().size()));
+  file.write_bytes(resources.bytes());
+  file.write_u32(0);  // no layer and mask information
+  file.write_u16(0);  // raw
+  for (std::uint16_t c = 0; c < 4; ++c) {
+    for (std::uint16_t x = 0; x < 64; ++x) {
+      const auto ink = c == 0 ? 60U + x * 3U : c == 1 ? 250U - x * 2U : c == 2 ? 255U : 230U;
+      if (eight_bit) file.write_u8(static_cast<std::uint8_t>(ink));
+      else file.write_u16(static_cast<std::uint16_t>(ink * 257U + (c == 0 ? x : 0U)));
+    }
+  }
+  return file.bytes();
+}
+
+void psd_flat_cmyk_saves_its_inks_while_unchanged() {
+  const auto mode_of = [](const auto& bytes) { return (bytes[24] << 8U) | bytes[25]; };
+  const auto cmyk_source = psd::DocumentIo::read_file(
+      patchy::test::committed_psd_fixture_path("photoshop-cmyk-style-colors.psd"));
+  const auto tagged = patchy::test::test_image_resource_payload(cmyk_source.metadata().raw_psd_image_resources, 1039);
+  CHECK(tagged.has_value());
+  psd::ReadOptions read;
+  read.keep_bit_depth = true;
+  for (const bool eight_bit : {true, false}) {
+    for (const bool with_profile : {false, true}) {
+      const auto profile = with_profile ? std::span<const std::uint8_t>(*tagged) : std::span<const std::uint8_t>{};
+      const auto original = psd::DocumentIo::read(flat_cmyk_ramp(eight_bit, profile), read);
+      CHECK(original.layers().size() == 1);
+      const auto& background = original.layers().front();
+      CHECK(background.psd_native_colors() != nullptr && background.psd_native_colors()->flat_composite);
+      CHECK(psd::DocumentIo::source_icc_profile(original) ==
+            std::vector<std::uint8_t>(profile.begin(), profile.end()));
+      // The flat preview stays the reader's conversion: the inks are kept for saves only.
+      if (eight_bit) {
+        CHECK(same_bytes(Compositor{}.flatten_rgb8(original), background.pixels()));
+      }
+      CHECK(psd::DocumentIo::layered_save_keeps_source_color_mode(original));
+      for (const bool large : {false, true}) {
+        psd::WriteOptions write;
+        write.large_document = large;
+        auto document = original;
+        (void)document.layers()[0].pixels();  // revision churn alone keeps the inks
+        CHECK(psd::DocumentIo::layered_save_keeps_source_color_mode(document, write));
+        const auto bytes = psd::DocumentIo::write_layered_rgb8(document, write);
+        CHECK(mode_of(bytes) == 4);
+        const auto reopened = psd::DocumentIo::read(bytes, read);
+        CHECK(reopened.layers().size() == 1);
+        CHECK(reopened.layers()[0].psd_native_colors() != nullptr);
+        CHECK(reopened.layers()[0].psd_native_colors()->planes == background.psd_native_colors()->planes);
+        CHECK(psd::DocumentIo::source_icc_profile(reopened) == psd::DocumentIo::source_icc_profile(original));
+        if (eight_bit) {
+          // The layer record converts the same inks the same way. Its preview then goes
+          // through the layered CMYK compositor, whose rounding may differ slightly.
+          const auto& before_pixels = background.pixels();
+          const auto& after_pixels = reopened.layers()[0].pixels();
+          const auto before_render = Compositor{}.flatten_rgb8(original);
+          const auto after_render = Compositor{}.flatten_rgb8(reopened);
+          int render_difference = 0;
+          for (int x = 0; x < 64; ++x) {
+            for (int c = 0; c < 3; ++c) {
+              CHECK(before_pixels.pixel(x, 0)[c] == after_pixels.pixel(x, 0)[c]);
+              render_difference = std::max(render_difference,
+                  std::abs(int{before_render.pixel(x, 0)[c]} - int{after_render.pixel(x, 0)[c]}));
+            }
+          }
+          std::cout << "[INFO] flat CMYK reopened render differs by at most " << render_difference << '\n';
+          CHECK(render_difference <= 3);
+        }
+        // An edited pixel needs RGB, and the predicate says so before the save.
+        document.layers()[0].pixels().pixel(3, 0)[0] ^= 0x40;
+        CHECK(!psd::DocumentIo::layered_save_keeps_source_color_mode(document, write));
+        CHECK(mode_of(psd::DocumentIo::write_layered_rgb8(document, write)) == 3);
+        psd::WriteOptions rgb = write;
+        rgb.preserve_source_color_mode = false;
+        CHECK(!psd::DocumentIo::layered_save_keeps_source_color_mode(original, rgb));
+      }
+    }
+  }
+}
+
+void psd_cmyk_smart_objects_preserve_inks_and_invalidate_changed_sources() {
+  const auto original = psd::DocumentIo::read_file(patchy::test::source_root_path() /
+      "test-fixtures/psd/cmyk-render/smart-gradient.psd");
+  const auto mode = [](const auto& bytes) { return (bytes[24] << 8U) | bytes[25]; };
+  const auto placed = std::find_if(original.layers().begin(), original.layers().end(),
+      [](const auto& layer) { return layer_is_smart_object(layer); });
+  CHECK(placed != original.layers().end());
+  const auto id = placed->id();
+  for (const bool large : {false, true}) {
+    psd::WriteOptions options;
+    options.large_document = large;
+    auto doc = original;
+    doc.find_layer(id)->set_name("Renamed placement");
+    const auto bytes = psd::DocumentIo::write_layered_rgb8(doc, options);
+    CHECK(mode(bytes) == 4);
+    const auto reopened = psd::DocumentIo::read(bytes);
+    const auto* after = patchy::test::find_layer_named(reopened.layers(), "Renamed placement");
+    CHECK(after != nullptr);
+    CHECK(layer_is_smart_object(*after));
+    CHECK(after->psd_native_colors()->planes == placed->psd_native_colors()->planes);
+    const auto uuid = smart_object_source_uuid(*placed);
+    CHECK(*reopened.metadata().smart_objects.find(uuid)->file_bytes ==
+          *original.metadata().smart_objects.find(uuid)->file_bytes);
+    // The per-layer metadata can stay identical while the document-level
+    // payload changes. Never reuse the original ink preview in that case.
+    doc.metadata().smart_objects.find(uuid)->dirty = true;
+    CHECK(mode(psd::DocumentIo::write_layered_rgb8(doc, options)) == 4);
+    doc = original;
+    mark_layer_smart_object_block_dirty(*doc.find_layer(id));
+    CHECK(mode(psd::DocumentIo::write_layered_rgb8(doc, options)) == 4);
+    doc = original;
+    doc.find_layer(id)->pixels().pixel(0, 0)[0] ^= 0x80;
+    const auto edited_bytes = psd::DocumentIo::write_layered_rgb8(doc, options);
+    CHECK(mode(edited_bytes) == 4);
+    const auto edited = psd::DocumentIo::read(edited_bytes);
+    CHECK(edited.find_layer(id)->psd_native_colors()->planes != placed->psd_native_colors()->planes);
+    doc = original;  // Undo restores provenance as well as the original pixels.
+    CHECK(mode(psd::DocumentIo::write_layered_rgb8(doc, options)) == 4);
+  }
+}
+
+void psd_duotone_preserves_inks_and_regenerates_colored_gradient_if_available() {
+  const auto path = test::local_format_fixture_path("psd-tools/tests/psd_files/colormodes", "4x4_8bit_duotone.psd");
+  patchy::test::skip_unless_exists(path);
+  const auto original = psd::DocumentIo::read_file(path);
+  CHECK(original.metadata().psd_native_color_space != nullptr);
+  const auto colors = original.metadata().psd_native_color_space->duotone_colors;
+  CHECK(colors != nullptr);
+  if (!colors) return;
+  auto regenerated = original;
+  for (auto& layer : regenerated.layers()) {
+    if (layer.vector_shape()) update_vector_shape_raster(layer, Rect::from_size(4, 4), nullptr);
+  }
+  const auto rgb = Compositor{}.flatten_rgb8(regenerated);
+  CHECK(rgb.pixel(0, 0)[1] > rgb.pixel(0, 0)[0] + 10);
+  CHECK(rgb.pixel(0, 0)[2] > rgb.pixel(0, 0)[0] + 10);
+  for (const bool psb : {false, true}) {
+    psd::WriteOptions options; options.large_document = psb;
+    const auto bytes = psd::DocumentIo::write_layered_rgb8(original, options);
+    CHECK(bytes[24] == 0 && bytes[25] == 8);
+    const auto reopened = psd::DocumentIo::read(bytes);
+    CHECK(reopened.metadata().raw_psd_color_mode_data == original.metadata().raw_psd_color_mode_data);
+    for (std::size_t i = 0; i < original.layers().size(); ++i) {
+      if (!original.layers()[i].vector_shape()) {
+        CHECK(reopened.layers()[i].psd_native_colors()->planes == original.layers()[i].psd_native_colors()->planes);
+      } else {
+        // Native fills retain their descriptor instead of obsolete cached planes.
+        CHECK(reopened.layers()[i].vector_shape() != nullptr);
+        CHECK(reopened.layers()[i].vector_shape()->fill.native_gray != nullptr);
+      }
+    }
+    CHECK(same_bytes(Compositor{}.flatten_rgb8(reopened), Compositor{}.flatten_rgb8(original)));
+  }
+}
+
+void psd_cmyk_smart_filter_saves_preserve_native_and_convert_authored_caches() {
+  for (const auto bits : {8, 16}) {
+    psd::ReadOptions read;
+    read.keep_bit_depth = true;
+    const auto original = psd::DocumentIo::read_file(patchy::test::source_root_path() /
+        ("test-fixtures/psd/cmyk-render/smart-filtered-" + std::to_string(bits) + ".psd"), read);
+    const auto placed = std::find_if(original.layers().begin(), original.layers().end(),
+        [](const auto& layer) { return layer_is_smart_object(layer); });
+    CHECK(placed != original.layers().end());
+    const auto uuid = smart_object_placed_uuid(*placed);
+    const auto& original_store = original.metadata().smart_filter_effects;
+    CHECK(original_store.find_unique(uuid)->native_color_space != nullptr);
+    for (const bool large : {false, true}) {
+      psd::WriteOptions options;
+      options.large_document = large;
+      const auto bytes = psd::DocumentIo::write_layered_rgb8(original, options);
+      CHECK(bytes[25] == 4 && bytes[23] == bits);
+      const auto reopened = psd::DocumentIo::read(bytes, read);
+      CHECK(psd::serialize_filter_effects_block(reopened.metadata().smart_filter_effects.blocks.front()) ==
+            psd::serialize_filter_effects_block(original_store.blocks.front()));
+      auto edited = original;
+      const auto rgb = convert_pixel_buffer_depth(placed->pixels(), BitDepth::UInt8, SampleKind::Color);
+      const auto authored = psd::author_filter_effects_record(uuid, Rect::from_size(original.width(), original.height()),
+          rgb, placed->bounds(), placed->smart_filter_stack()->mask);
+      CHECK(authored.has_value());
+      CHECK(edited.metadata().smart_filter_effects.upsert_authored(*authored));
+      mark_layer_smart_object_block_dirty(*edited.find_layer(placed->id()));
+      const auto edited_bytes = psd::DocumentIo::write_layered_rgb8(edited, options);
+      CHECK(edited_bytes[25] == 4 && edited_bytes[23] == bits);
+      const auto after = psd::DocumentIo::read(edited_bytes, read);
+      const auto* cache = after.metadata().smart_filter_effects.find_unique(uuid);
+      CHECK(cache != nullptr && cache->semantic_supported() && cache->native_color_space != nullptr);
+      CHECK(cache->mask->bounds.x == authored->mask->bounds.x && cache->mask->bounds.y == authored->mask->bounds.y);
+      CHECK(cache->mask->bounds.width == authored->mask->bounds.width && cache->mask->bounds.height == authored->mask->bounds.height);
+      CHECK(*cache->mask->samples == *authored->mask->samples);
+      // Saving must not mutate the live/undo cache, and a subsequent save must
+      // preserve the converted record rather than converting its inks again.
+      CHECK(edited.metadata().smart_filter_effects.find_unique(uuid)->native_color_space == nullptr);
+      const auto again = psd::DocumentIo::read(psd::DocumentIo::write_layered_rgb8(after, options), read);
+      CHECK(psd::serialize_filter_effects_block(after.metadata().smart_filter_effects.blocks.front()) ==
+            psd::serialize_filter_effects_block(again.metadata().smart_filter_effects.blocks.front()));
+    }
+  }
+}
+
+void psd_deep_non_rgb_gradients_and_adjustments_keep_native_color_if_available() {
+  const auto root = patchy::test::local_fixtures_root() / "psd-tools" / "tests" / "psd_files";
+  patchy::test::skip_unless_exists(root);
+  psd::ReadOptions read;
+  read.keep_bit_depth = true;
+  for (const auto* name : {"colormodes/4x4_16bit_cmyk.psd", "colormodes/4x4_16bit_grayscale.psd",
+                          "colormodes/4x4_16bit_lab.psd", "adjustments/posterize_16bits_cmyk.psd",
+                          "adjustments/posterize_16bits_grayscale.psd", "adjustments/threshold_16bits_grayscale.psd",
+                          "adjustments/curves_cmyk.psd", "adjustments/posterize_grayscale.psd",
+                          "gradients/noise-gradient-cmyk.psd", "gradients/noise-gradient-grayscale.psd",
+                          "gradients/noise-gradient-lab.psd", "blend-modes/cmyk-blend-modes.psd",
+                          "blend-modes/gray-blend-modes.psd"}) {
+    const auto document = psd::DocumentIo::read_file(root / name, read);
+    const auto saved = psd::DocumentIo::write_layered_rgb8(document);
+    const auto reopened = psd::DocumentIo::read(saved, read);
+    CHECK(reopened.metadata().values.at("psd.color_mode") == document.metadata().values.at("psd.color_mode"));
+    CHECK(patchy::test::test_image_resource_payload(reopened.metadata().raw_psd_image_resources, 1039) ==
+          patchy::test::test_image_resource_payload(document.metadata().raw_psd_image_resources, 1039));
+    const auto before = flat_layers(document);
+    const auto after = flat_layers(reopened);
+    CHECK(before.size() == after.size());
+    for (std::size_t i = 0; i < before.size(); ++i) {
+      CHECK(before[i]->kind() == after[i]->kind());
+      CHECK(after[i]->psd_native_colors() != nullptr);
+      // Photoshop rebuilds vector/fill previews from the preserved descriptors;
+      // the writer deliberately leaves their cached color channels empty.
+      if (!layer_is_vector_shape(*before[i])) {
+        CHECK(before[i]->psd_native_colors()->planes == after[i]->psd_native_colors()->planes);
+      }
+      for (const auto& block : before[i]->unknown_psd_blocks()) {
+        if (block.key != "GdFl" && block.key != "post" && block.key != "thrs") continue;
+        const auto& blocks = after[i]->unknown_psd_blocks();
+        const auto found = std::find_if(blocks.begin(), blocks.end(), [&](const auto& candidate) {
+          return candidate.key == block.key && candidate.payload == block.payload;
+        });
+        CHECK(found != blocks.end());
+      }
+    }
+    for (const auto* layer : before) {
+      auto settings = adjustment_settings_from_layer(*layer);
+      if (!settings) continue;
+      auto edited = document;
+      if (settings->kind == AdjustmentKind::Posterize) settings->posterize.levels = 7;
+      else if (settings->kind == AdjustmentKind::Threshold) settings->threshold.level = 81;
+      else continue;
+      configure_adjustment_layer(*edited.find_layer(layer->id()), *settings);
+      const auto edited_read = psd::DocumentIo::read(psd::DocumentIo::write_layered_rgb8(edited), read);
+      CHECK(edited_read.metadata().values.at("psd.color_mode") == "RGB");
+      const auto edited_layers = flat_layers(edited_read);
+      const auto index = static_cast<std::size_t>(std::find(before.begin(), before.end(), layer) - before.begin());
+      const auto actual = adjustment_settings_from_layer(*edited_layers[index]);
+      CHECK(actual.has_value());
+      if (settings->kind == AdjustmentKind::Posterize) CHECK(actual->posterize.levels == 7);
+      else CHECK(actual->threshold.level == 81);
+      break;
+    }
+  }
+}
+
+// Photoshop-made files from scripts/dev/deep/make_deep_fixtures.py: every scene and
+// depth the corpus has. The deep reading narrows to exactly the 8-bit reading (which
+// the existing suites pin against Photoshop), keeps samples 8 bits cannot hold, and
+// survives Patchy's own deep write.
+void psd_deep_photoshop_corpus_reads_and_round_trips_if_available() {
+  const auto root = patchy::test::local_fixtures_root() / "deep";
+  patchy::test::skip_unless_exists(root / "manifest.json");
+  int checked = 0;
+  for (const auto& scene : std::filesystem::directory_iterator(root)) {
+    if (!scene.is_directory()) {
+      continue;
+    }
+    for (const auto* depth_name : {"16", "32"}) {
+      const auto path = scene.path() / depth_name / (scene.path().filename().string() + "-" + depth_name + ".psd");
+      if (!std::filesystem::exists(path)) {
+        continue;
+      }
+      const auto depth = std::string(depth_name) == "32" ? BitDepth::Float32 : BitDepth::UInt16;
+      psd::ReadOptions deep_options;
+      deep_options.keep_bit_depth = true;
+      const auto deep = psd::DocumentIo::read_file(path, deep_options);
+      psd::ReadOptions shallow_options;
+      shallow_options.keep_bit_depth = false;
+      const auto shallow = psd::DocumentIo::read_file(path, shallow_options);
+      CHECK(document_bit_depth(deep) == depth);
+      if (!document_depth_problems(deep).empty()) {
+        std::cerr << path.string() << ": " << document_depth_problems(deep).front() << '\n';
+        CHECK(false);
+      }
+      const auto deep_layers = flat_layers(deep);
+      const auto shallow_layers = flat_layers(shallow);
+      CHECK(deep_layers.size() == shallow_layers.size());
+      for (std::size_t i = 0; i < deep_layers.size(); ++i) {
+        const auto& deep_pixels = deep_layers[i]->pixels();
+        const auto& shallow_pixels = shallow_layers[i]->pixels();
+        if (deep_pixels.empty() || shallow_pixels.format().bit_depth != BitDepth::UInt8) {
+          continue;
+        }
+        const auto narrowed = convert_pixel_buffer_depth(deep_pixels, BitDepth::UInt8, SampleKind::Color);
+        if (!same_bytes(narrowed, shallow_pixels)) {
+          std::cerr << path.string() << ": layer '" << deep_layers[i]->name() << "' narrows differently\n";
+          CHECK(false);
+        }
+      }
+      const auto bytes = psd::DocumentIo::write_layered_rgb8(deep);
+      CHECK(header_depth(bytes) == (depth == BitDepth::Float32 ? 32 : 16));
+      const auto reread = psd::DocumentIo::read(bytes, deep_options);
+      const auto reread_layers = flat_layers(reread);
+      CHECK(reread_layers.size() == deep_layers.size());
+      for (std::size_t i = 0; i < deep_layers.size() && i < reread_layers.size(); ++i) {
+        if (deep_layers[i]->kind() == LayerKind::Pixel && !deep_layers[i]->pixels().empty() &&
+            deep_layers[i]->vector_shape() == nullptr &&
+            !same_bytes(reread_layers[i]->pixels(), deep_layers[i]->pixels())) {
+          std::cerr << path.string() << ": layer '" << deep_layers[i]->name() << "' changed on resave\n";
+          CHECK(false);
+        }
+      }
+      ++checked;
+    }
+  }
+  std::cout << "  deep corpus documents checked: " << checked << '\n';
+  CHECK(checked > 0);
+}
+
+}  // namespace
+
+// Photoshop 2026 refuses to open a 32-bit file with a layer in Color Burn, Linear Burn,
+// Screen, Color Dodge, Overlay, the Lights, Hard Mix or Exclusion, and its conversion
+// to 32 bits sets them to Normal (probed over COM, October 2026). Patchy converts the
+// same way, and the writer never writes them at 32 bits.
+void psd_deep_32_bit_blend_modes_follow_photoshop() {
+  for (int index = static_cast<int>(BlendMode::Normal); index <= static_cast<int>(BlendMode::Dissolve); ++index) {
+    const auto mode = static_cast<BlendMode>(index);
+    CHECK(blend_mode_supported_at_depth(mode, BitDepth::UInt8));
+    CHECK(blend_mode_supported_at_depth(mode, BitDepth::UInt16));
+  }
+  for (const auto mode : {BlendMode::Screen, BlendMode::Overlay, BlendMode::ColorBurn, BlendMode::LinearBurn,
+                          BlendMode::ColorDodge, BlendMode::SoftLight, BlendMode::HardLight, BlendMode::VividLight,
+                          BlendMode::LinearLight, BlendMode::PinLight, BlendMode::HardMix, BlendMode::Exclusion}) {
+    CHECK(!blend_mode_supported_at_depth(mode, BitDepth::Float32));
+  }
+  for (const auto mode : {BlendMode::Normal, BlendMode::Dissolve, BlendMode::Darken, BlendMode::Multiply,
+                          BlendMode::DarkerColor, BlendMode::Lighten, BlendMode::LinearDodge, BlendMode::LighterColor,
+                          BlendMode::Difference, BlendMode::Subtract, BlendMode::Divide, BlendMode::Hue,
+                          BlendMode::Saturation, BlendMode::Color, BlendMode::Luminosity, BlendMode::PassThrough}) {
+    CHECK(blend_mode_supported_at_depth(mode, BitDepth::Float32));
+  }
+
+  auto document = make_deep_document(BitDepth::UInt16);
+  document.layers()[0].set_blend_mode(BlendMode::Multiply);
+  document.layers()[1].set_blend_mode(BlendMode::Overlay);
+  auto sixteen = document;
+  convert_document_depth(sixteen, BitDepth::UInt8);
+  CHECK(sixteen.layers()[1].blend_mode() == BlendMode::Overlay);
+  convert_document_depth(document, BitDepth::Float32);
+  CHECK(document.layers()[0].blend_mode() == BlendMode::Multiply);
+  CHECK(document.layers()[1].blend_mode() == BlendMode::Normal);
+
+  // A mode set after the conversion (an older layer pasted in, a hand edit) is written as
+  // Normal so Photoshop still opens the file; 16 bits keep it.
+  document.layers()[1].set_blend_mode(BlendMode::Screen);
+  psd::ReadOptions options;
+  options.keep_bit_depth = true;
+  const auto read = psd::DocumentIo::read(psd::DocumentIo::write_layered_rgb8(document), options);
+  CHECK(read.layers()[0].blend_mode() == BlendMode::Multiply);
+  CHECK(read.layers()[1].blend_mode() == BlendMode::Normal);
+  auto deep16 = make_deep_document(BitDepth::UInt16);
+  deep16.layers()[1].set_blend_mode(BlendMode::Screen);
+  const auto read16 = psd::DocumentIo::read(psd::DocumentIo::write_layered_rgb8(deep16), options);
+  CHECK(read16.layers()[1].blend_mode() == BlendMode::Screen);
+}
+
+std::vector<patchy::test::TestCase> psd_deep_io_tests() {
+  return {
+      {"psd_deep_composite_is_written_at_depth", psd_deep_composite_is_written_at_depth},
+      {"psd_deep_16_bit_document_round_trips_exactly", psd_deep_16_bit_document_round_trips_exactly},
+      {"psd_deep_32_bit_document_round_trips_exactly", psd_deep_32_bit_document_round_trips_exactly},
+      {"psd_deep_gate_off_reads_8_bit_as_before", psd_deep_gate_off_reads_8_bit_as_before},
+      {"psd_deep_color_conversions_keep_sub_byte_samples_and_alpha",
+       psd_deep_color_conversions_keep_sub_byte_samples_and_alpha},
+      {"psd_deep_native_colors_survive_saves_but_never_shadow_edits",
+       psd_deep_native_colors_survive_saves_but_never_shadow_edits},
+      {"psd_flat_cmyk_saves_its_inks_while_unchanged", psd_flat_cmyk_saves_its_inks_while_unchanged},
+      {"psd_cmyk_smart_objects_preserve_inks_and_invalidate_changed_sources",
+       psd_cmyk_smart_objects_preserve_inks_and_invalidate_changed_sources},
+      {"psd_duotone_preserves_inks_and_regenerates_colored_gradient_if_available",
+       psd_duotone_preserves_inks_and_regenerates_colored_gradient_if_available},
+      {"psd_cmyk_smart_filter_saves_preserve_native_and_convert_authored_caches",
+       psd_cmyk_smart_filter_saves_preserve_native_and_convert_authored_caches},
+      {"psd_deep_non_rgb_gradients_and_adjustments_keep_native_color_if_available",
+       psd_deep_non_rgb_gradients_and_adjustments_keep_native_color_if_available},
+      {"psd_deep_32_bit_blend_modes_follow_photoshop", psd_deep_32_bit_blend_modes_follow_photoshop},
+      {"psd_deep_photoshop_corpus_reads_and_round_trips_if_available",
+       psd_deep_photoshop_corpus_reads_and_round_trips_if_available},
+  };
+}

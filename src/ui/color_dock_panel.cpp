@@ -1,0 +1,827 @@
+#include "ui/color_dock_panel.hpp"
+
+#include "color/color_management.hpp"
+#include "ui/action_icons.hpp"
+#include "ui/background_pick_cursor.hpp"
+#include "ui/color_panel.hpp"
+#include "ui/dialog_utils.hpp"
+#include "ui/hdr_color_controls.hpp"
+#include "ui/modifier_names.hpp"
+#include "ui/theme_palette.hpp"
+#include "ui/tool_palette_footer.hpp"
+#include "ui/unit_spin_box.hpp"
+
+#include <QAction>
+#include <QActionGroup>
+#include <QEvent>
+#include <QGridLayout>
+#include <QHBoxLayout>
+#include <QImage>
+#include <QLabel>
+#include <QLineEdit>
+#include <QMenu>
+#include <QMouseEvent>
+#include <QPainter>
+#include <QPen>
+#include <QSignalBlocker>
+#include <QSizePolicy>
+#include <QSpinBox>
+#include <QStackedWidget>
+#include <QToolButton>
+#include <QVBoxLayout>
+
+#include <algorithm>
+#include <cmath>
+
+namespace patchy::ui {
+
+namespace {
+
+// The well, laid out by hand like the tool palette's: the foreground swatch over the
+// background swatch, swap glyph in the free upper-right corner, default glyph in the
+// free lower-left one.
+constexpr int kWellWidth = 42;
+constexpr int kWellHeight = 44;
+constexpr int kFieldMinimum = 72;
+// The cube's field and strip may get shorter than wide: with the hex and RGB row under
+// them (GitHub issue 577) the cube still needs no more height than a slider view, so
+// switching to one can shrink the section.
+constexpr int kFieldMinimumHeight = 40;
+constexpr int kTrackHeight = 14;
+
+constexpr std::array<ColorDockPanel::View, 4> kViews = {
+    ColorDockPanel::View::HueCube, ColorDockPanel::View::RgbSliders, ColorDockPanel::View::HsbSliders,
+    ColorDockPanel::View::CmykSliders};
+
+int view_index(ColorDockPanel::View view) { return static_cast<int>(view); }
+int channel_index(ColorDockPanel::Channel channel) { return static_cast<int>(channel); }
+// Cyan..Black as 0..3.
+std::size_t ink_index(ColorDockPanel::Channel channel) {
+  return static_cast<std::size_t>(channel_index(channel) - channel_index(ColorDockPanel::Channel::Cyan));
+}
+bool is_ink(ColorDockPanel::Channel channel) {
+  return channel_index(channel) >= channel_index(ColorDockPanel::Channel::Cyan);
+}
+
+// 0..100 percent from 0..255 and back; every percent survives the round trip.
+int percent_from_byte(int value) { return static_cast<int>(std::lround(value * 100.0 / 255.0)); }
+int byte_from_percent(int percent) { return static_cast<int>(std::lround(std::clamp(percent, 0, 100) * 2.55)); }
+
+// "RRGGBB" or "#RRGGBB": a value complete enough to apply while it is typed or pasted.
+bool is_whole_hex(const QString& text) {
+  const auto digits = QStringView(text).trimmed();
+  const auto hex = digits.startsWith(QLatin1Char('#')) ? digits.mid(1) : digits;
+  const auto is_hex_digit = [](QChar c) {
+    return (c >= QLatin1Char('0') && c <= QLatin1Char('9')) || (c >= QLatin1Char('a') && c <= QLatin1Char('f')) ||
+           (c >= QLatin1Char('A') && c <= QLatin1Char('F'));
+  };
+  return hex.size() == 6 && std::all_of(hex.begin(), hex.end(), is_hex_digit);
+}
+
+}  // namespace
+
+// One channel's slider: the color across the channel's range with the other channels
+// held, and a two-tone line at the foreground's value, like the hue strip's. A press
+// or drag sets the channel.
+class ColorChannelTrack final : public QWidget {
+public:
+  ColorChannelTrack(ColorDockPanel& panel, ColorDockPanel::Channel channel, QWidget* parent)
+      : QWidget(parent), panel_(panel), channel_(channel) {
+    setCursor(Qt::PointingHandCursor);
+    setMinimumSize(48, kTrackHeight);
+    setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Fixed);
+    setFocusPolicy(Qt::NoFocus);
+  }
+
+  [[nodiscard]] QSize sizeHint() const override { return {120, kTrackHeight}; }
+
+protected:
+  void paintEvent(QPaintEvent* event) override {
+    Q_UNUSED(event);
+    const int track_width = std::max(1, width());
+    const int maximum = ColorDockPanel::channel_maximum(channel_);
+    QImage track(track_width, 1, QImage::Format_RGB32);
+    auto* scanline = reinterpret_cast<QRgb*>(track.scanLine(0));
+    for (int x = 0; x < track_width; ++x) {
+      scanline[x] = panel_.channel_color(channel_, rounded_scaled_channel(x, track_width - 1, maximum)).rgb();
+    }
+    QPainter painter(this);
+    painter.drawImage(rect(), track);
+    painter.setPen(QPen(theme().field_border, 1));
+    painter.drawRect(rect().adjusted(0, 0, -1, -1));
+
+    // The marker reads over any color, as the hue strip's does.
+    const double marker_x =
+        static_cast<double>(panel_.channel_value(channel_)) / std::max(1, maximum) * (track_width - 1);
+    painter.setRenderHint(QPainter::Antialiasing);
+    painter.setPen(QPen(QColor(0, 0, 0), 3.0));
+    painter.drawLine(QPointF(marker_x, 0.0), QPointF(marker_x, height() - 1.0));
+    painter.setPen(QPen(QColor(245, 245, 245), 1.0));
+    painter.drawLine(QPointF(marker_x, 0.0), QPointF(marker_x, height() - 1.0));
+  }
+
+  void mousePressEvent(QMouseEvent* event) override {
+    if (event->button() == Qt::LeftButton) {
+      panel_.begin_channel_drag();
+      set_from_x(event->position().toPoint().x());
+      event->accept();
+      return;
+    }
+    QWidget::mousePressEvent(event);
+  }
+
+  void mouseMoveEvent(QMouseEvent* event) override {
+    if ((event->buttons() & Qt::LeftButton) != 0) {
+      set_from_x(event->position().toPoint().x());
+      event->accept();
+      return;
+    }
+    QWidget::mouseMoveEvent(event);
+  }
+
+  void mouseReleaseEvent(QMouseEvent* event) override {
+    if (event->button() == Qt::LeftButton) {
+      panel_.end_channel_drag();
+      event->accept();
+      return;
+    }
+    QWidget::mouseReleaseEvent(event);
+  }
+
+private:
+  void set_from_x(int x) {
+    const int track_width = std::max(1, width());
+    panel_.set_channel(channel_, rounded_scaled_channel(std::clamp(x, 0, track_width - 1), track_width - 1,
+                                                        ColorDockPanel::channel_maximum(channel_)));
+  }
+
+  ColorDockPanel& panel_;
+  ColorDockPanel::Channel channel_;
+};
+
+ColorDockPanel::ColorDockPanel(QAction* swap_colors, QAction* default_colors, QWidget* parent) : QWidget(parent) {
+  setObjectName(QStringLiteral("colorPanel"));
+  // A click in the field or the strip (both NoFocus) gives the PANEL the focus rather than
+  // whatever container above it accepts click focus, so MainWindow can tell a pick here from
+  // clicking off an open text session, which commits it (GitHub issue 371).
+  setFocusPolicy(Qt::ClickFocus);
+
+  auto* well = new QWidget(this);
+  well->setObjectName(QStringLiteral("colorPanelWell"));
+  well->setFixedSize(kWellWidth, kWellHeight);
+  background_chip_ = new ColorWellSwatch(well);
+  background_chip_->setObjectName(QStringLiteral("colorPanelBackgroundChip"));
+  background_chip_->setText(QStringLiteral("BG"));
+  background_chip_->move(16, 18);
+  foreground_chip_ = new ColorWellSwatch(well);
+  foreground_chip_->setObjectName(QStringLiteral("colorPanelForegroundChip"));
+  foreground_chip_->setText(QStringLiteral("FG"));
+  foreground_chip_->move(2, 4);
+  foreground_chip_->raise();
+  swap_ = new ColorWellGlyphButton(ColorWellGlyphButton::Glyph::Swap, well);
+  swap_->setObjectName(QStringLiteral("colorPanelSwapButton"));
+  swap_->setDefaultAction(swap_colors);
+  swap_->move(26, 2);
+  default_ = new ColorWellGlyphButton(ColorWellGlyphButton::Glyph::Default, well);
+  default_->setObjectName(QStringLiteral("colorPanelDefaultButton"));
+  default_->setDefaultAction(default_colors);
+  default_->move(0, 28);
+
+  // The views (GitHub issue 404) are picked from the settings gear, which MainWindow puts
+  // at the right end of the panel's title row (PanelSpec::header_widget). It is the only
+  // place to switch them.
+  settings_button_ = new QToolButton(this);
+  settings_button_->setObjectName(QStringLiteral("colorPanelSettingsButton"));
+  settings_button_->setIcon(simple_icon(QStringLiteral("gear")));
+  settings_button_->setIconSize(QSize(14, 14));
+  settings_button_->setFixedSize(18, 18);
+  settings_button_->setToolButtonStyle(Qt::ToolButtonIconOnly);
+  settings_button_->setPopupMode(QToolButton::InstantPopup);
+  settings_button_->setFocusPolicy(Qt::NoFocus);
+  view_menu_ = new QMenu(settings_button_);
+  view_menu_->setObjectName(QStringLiteral("colorPanelViewMenu"));
+  view_group_ = new QActionGroup(this);
+  view_group_->setExclusive(true);
+  const std::array<const char*, kViewCount> action_names = {
+      "colorPanelViewHueCubeAction", "colorPanelViewRgbSlidersAction", "colorPanelViewHsbSlidersAction",
+      "colorPanelViewCmykSlidersAction"};
+  for (const auto view : kViews) {
+    auto* action = new QAction(this);
+    action->setObjectName(QString::fromLatin1(action_names[static_cast<std::size_t>(view_index(view))]));
+    action->setCheckable(true);
+    action->setMenuRole(QAction::NoRole);
+    view_group_->addAction(action);
+    view_menu_->addAction(action);
+    connect(action, &QAction::triggered, this, [this, view] { set_view(view); });
+    view_actions_[static_cast<std::size_t>(view_index(view))] = action;
+  }
+  view_actions_[0]->setChecked(true);
+  settings_button_->setMenu(view_menu_);
+
+  // The Hue Cube.
+  auto* cube = new QWidget(this);
+  cube->setObjectName(QStringLiteral("colorPanelHueCubeView"));
+  field_ = new ColorPlaneWidget(*this, cube);
+  field_->setObjectName(QStringLiteral("colorPanelField"));
+  field_->setMinimumSize(kFieldMinimum, kFieldMinimumHeight);
+  field_->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Expanding);
+  field_->setFocusPolicy(Qt::NoFocus);
+  hue_strip_ = new HueSliderWidget(*this, cube);
+  hue_strip_->setObjectName(QStringLiteral("colorPanelHueStrip"));
+  hue_strip_->setMinimumSize(HueSliderWidget::kDefaultWidth, kFieldMinimumHeight);
+  hue_strip_->setSizePolicy(QSizePolicy::Fixed, QSizePolicy::Expanding);
+  hue_strip_->setFocusPolicy(Qt::NoFocus);
+  // Alt over either shows the background cursor, and a right press does too (a right
+  // pick sets the background). The Foreground Color window does the same through its
+  // background pick handler; the other picker windows edit one color and do neither.
+  field_cursor_ = new BackgroundPickCursor(field_, true);
+  hue_strip_cursor_ = new BackgroundPickCursor(hue_strip_, true);
+  auto* cube_row = new QHBoxLayout;
+  cube_row->setContentsMargins(0, 0, 0, 0);
+  cube_row->setSpacing(8);
+  cube_row->addWidget(field_, 1);
+  cube_row->addWidget(hue_strip_);
+  // The foreground as numbers under the cube (GitHub issue 577): a hex field that typing or
+  // Ctrl+V replaces, like the color window's HTML field, and R, G, B boxes. Each commit of a
+  // value is one pick of the foreground; showing a color never is one. The "#" is a label
+  // before the field, so the field holds and copies the bare digits.
+  auto* hex_label = new QLabel(QStringLiteral("#"), cube);
+  hex_label->setObjectName(QStringLiteral("colorPanelHexLabel"));
+  hex_edit_ = new QLineEdit(cube);
+  hex_edit_->setObjectName(QStringLiteral("colorPanelHexEdit"));
+  hex_edit_->setMinimumWidth(hex_edit_->fontMetrics().horizontalAdvance(QStringLiteral("DDDDDD")) + 12);
+  hex_label->setBuddy(hex_edit_);
+  select_all_on_focus(*hex_edit_);
+  connect(hex_edit_, &QLineEdit::textEdited, this, [this] { apply_hex_text(false); });
+  connect(hex_edit_, &QLineEdit::editingFinished, this, [this] { apply_hex_text(true); });
+  auto* input_row = new QHBoxLayout;
+  input_row->setContentsMargins(0, 0, 0, 0);
+  input_row->setSpacing(4);
+  input_row->addWidget(hex_label);
+  input_row->addWidget(hex_edit_, 1);
+  static constexpr std::array<const char*, 3> rgb_names = {"Red", "Green", "Blue"};
+  for (std::size_t index = 0; index < cube_rgb_spins_.size(); ++index) {
+    const auto channel = static_cast<Channel>(index);
+    const auto name = QString::fromLatin1(rgb_names[index]);
+    auto* label = new QLabel(cube);
+    label->setObjectName(QStringLiteral("colorPanelCube%1Label").arg(name));
+    auto* spin = new QSpinBox(cube);
+    spin->setObjectName(QStringLiteral("colorPanelCube%1Spin").arg(name));
+    spin->setRange(0, 255);
+    spin->setButtonSymbols(QAbstractSpinBox::NoButtons);
+    spin->setAlignment(Qt::AlignRight | Qt::AlignVCenter);
+    // A typed number applies on Return or focus out, not per keystroke.
+    spin->setKeyboardTracking(false);
+    select_all_on_focus(*spin);
+    connect(spin, qOverload<int>(&QSpinBox::valueChanged), this,
+            [this, channel](int level) { set_channel(channel, level); });
+    cube_rgb_labels_[index] = label;
+    cube_rgb_spins_[index] = spin;
+    input_row->addSpacing(index == 0 ? 4 : 2);
+    input_row->addWidget(label);
+    input_row->addWidget(spin);
+  }
+  auto* cube_layout = new QVBoxLayout(cube);
+  cube_layout->setContentsMargins(0, 0, 0, 0);
+  cube_layout->setSpacing(6);
+  cube_layout->addLayout(cube_row, 1);
+  cube_layout->addLayout(input_row);
+
+  views_ = new QStackedWidget(this);
+  views_->setObjectName(QStringLiteral("colorPanelViews"));
+  views_->addWidget(cube);
+  auto* rgb = build_slider_page(Channel::Red, 3);
+  rgb->setObjectName(QStringLiteral("colorPanelRgbSlidersView"));
+  views_->addWidget(rgb);
+  auto* hsb = build_slider_page(Channel::Hue, 3);
+  hsb->setObjectName(QStringLiteral("colorPanelHsbSlidersView"));
+  views_->addWidget(hsb);
+  auto* cmyk = build_slider_page(Channel::Cyan, 4);
+  cmyk->setObjectName(QStringLiteral("colorPanelCmykSlidersView"));
+  views_->addWidget(cmyk);
+  // The stack's size hints take every page but an Ignored one; each view asks only for
+  // its own (set_view moves this).
+  for (auto* page : {rgb, hsb, cmyk}) {
+    page->setSizePolicy(QSizePolicy::Ignored, QSizePolicy::Ignored);
+  }
+
+  well_column_ = new QVBoxLayout;
+  well_column_->setContentsMargins(0, 0, 0, 0);
+  well_column_->setSpacing(4);
+  well_column_->addWidget(well);
+  well_column_->addStretch(1);
+  auto* row = new QHBoxLayout;
+  row->setContentsMargins(0, 0, 0, 0);
+  row->setSpacing(8);
+  row->addLayout(well_column_);
+  row->addWidget(views_, 1);
+  hdr_controls_ = new HdrColorControls(HdrColorControls::Form::Compact, this);
+  hdr_controls_->setObjectName(QStringLiteral("colorPanelHdrControls"));
+  hdr_controls_->hide();
+  auto* layout = new QVBoxLayout(this);
+  layout->setContentsMargins(8, 8, 8, 8);
+  layout->setSpacing(6);
+  layout->addLayout(row, 1);
+  layout->addWidget(hdr_controls_);
+  update_cmyk();
+  refresh_channel_views();
+  retranslate();
+}
+
+QWidget* ColorDockPanel::build_slider_page(Channel first, int rows) {
+  auto* page = new QWidget(this);
+  auto* grid = new QGridLayout(page);
+  grid->setContentsMargins(0, 0, 0, 0);
+  grid->setHorizontalSpacing(6);
+  grid->setVerticalSpacing(4);
+  grid->setColumnStretch(1, 1);
+  // Object names (colorPanelRedTrack, colorPanelCyanSpin...), never translated.
+  static constexpr std::array<const char*, kChannelCount> names = {
+      "Red", "Green", "Blue", "Hue", "Saturation", "Brightness", "Cyan", "Magenta", "Yellow", "Black"};
+  for (int row = 0; row < rows; ++row) {
+    const auto channel = static_cast<Channel>(channel_index(first) + row);
+    const auto index = static_cast<std::size_t>(channel_index(channel));
+    const auto name = QString::fromLatin1(names[index]);
+    auto* label = new QLabel(page);
+    label->setObjectName(QStringLiteral("colorPanel%1Label").arg(name));
+    auto* track = new ColorChannelTrack(*this, channel, page);
+    track->setObjectName(QStringLiteral("colorPanel%1Track").arg(name));
+    QSpinBox* spin = nullptr;
+    if (channel == Channel::Hue) {
+      spin = new UnitIntSpinBox(SpinUnit::Degrees, page);
+    } else if (channel == Channel::Saturation || channel == Channel::Brightness || is_ink(channel)) {
+      spin = new UnitIntSpinBox(SpinUnit::Percent, page);
+    } else {
+      spin = new QSpinBox(page);
+    }
+    spin->setObjectName(QStringLiteral("colorPanel%1Spin").arg(name));
+    spin->setRange(0, channel_maximum(channel));
+    spin->setAlignment(Qt::AlignRight | Qt::AlignVCenter);
+    connect(spin, qOverload<int>(&QSpinBox::valueChanged), this,
+            [this, channel](int level) { set_channel(channel, level); });
+    channel_labels_[index] = label;
+    channel_tracks_[index] = track;
+    channel_spins_[index] = spin;
+    grid->addWidget(label, row, 0);
+    grid->addWidget(track, row, 1);
+    grid->addWidget(spin, row, 2);
+  }
+  // Spare height goes below the rows.
+  grid->setRowStretch(rows, 1);
+  return page;
+}
+
+void ColorDockPanel::set_view(View view) {
+  view_actions_[static_cast<std::size_t>(view_index(view))]->setChecked(true);
+  if (view == view_) {
+    return;
+  }
+  view_ = view;
+  views_->setCurrentIndex(view_index(view));
+  for (int index = 0; index < views_->count(); ++index) {
+    views_->widget(index)->setSizePolicy(index == view_index(view) ? QSizePolicy::Preferred : QSizePolicy::Ignored,
+                                         index == view_index(view) ? QSizePolicy::Preferred : QSizePolicy::Ignored);
+  }
+  refresh_channel_views();
+  emit view_changed(view);
+}
+
+QString ColorDockPanel::view_token(View view) {
+  switch (view) {
+    case View::HueCube:
+      return QStringLiteral("hueCube");
+    case View::RgbSliders:
+      return QStringLiteral("rgbSliders");
+    case View::HsbSliders:
+      return QStringLiteral("hsbSliders");
+    case View::CmykSliders:
+      return QStringLiteral("cmykSliders");
+  }
+  return QStringLiteral("hueCube");
+}
+
+std::optional<ColorDockPanel::View> ColorDockPanel::view_from_token(const QString& token) {
+  for (const auto view : kViews) {
+    if (token == view_token(view)) {
+      return view;
+    }
+  }
+  return std::nullopt;
+}
+
+int ColorDockPanel::fitted_height() const {
+  if (view_ == View::HueCube) {
+    return 0;
+  }
+  const auto margins = layout()->contentsMargins();
+  const auto* page = views_->currentWidget();
+  const int hdr = hdr_controls_->isVisibleTo(this) ? hdr_controls_->sizeHint().height() + layout()->spacing() : 0;
+  return margins.top() + margins.bottom() + hdr +
+         std::max(well_column_->sizeHint().height(), page->layout()->sizeHint().height());
+}
+
+bool ColorDockPanel::set_hdr_controls_visible(bool visible) {
+  if (hdr_controls_->isVisibleTo(this) == visible) {
+    return false;
+  }
+  hdr_controls_->setVisible(visible);
+  return true;
+}
+
+QAction* ColorDockPanel::view_action(View view) const {
+  return view_actions_[static_cast<std::size_t>(view_index(view))];
+}
+
+QWidget* ColorDockPanel::channel_track(Channel channel) const {
+  return channel_tracks_[static_cast<std::size_t>(channel_index(channel))];
+}
+
+QSpinBox* ColorDockPanel::channel_spin(Channel channel) const {
+  return channel_spins_[static_cast<std::size_t>(channel_index(channel))];
+}
+
+QSpinBox* ColorDockPanel::cube_rgb_spin(Channel channel) const {
+  const auto index = static_cast<std::size_t>(channel_index(channel));
+  return index < cube_rgb_spins_.size() ? cube_rgb_spins_[index] : nullptr;
+}
+
+int ColorDockPanel::channel_value(Channel channel) const {
+  switch (channel) {
+    case Channel::Red:
+      return rgb_.red();
+    case Channel::Green:
+      return rgb_.green();
+    case Channel::Blue:
+      return rgb_.blue();
+    case Channel::Hue:
+      return hue_;
+    case Channel::Saturation:
+      return percent_from_byte(saturation_);
+    case Channel::Brightness:
+      return percent_from_byte(value_);
+    case Channel::Cyan:
+    case Channel::Magenta:
+    case Channel::Yellow:
+    case Channel::Black:
+      return cmyk_[ink_index(channel)];
+  }
+  return 0;
+}
+
+int ColorDockPanel::channel_maximum(Channel channel) {
+  switch (channel) {
+    case Channel::Hue:
+      return 359;
+    case Channel::Saturation:
+    case Channel::Brightness:
+    case Channel::Cyan:
+    case Channel::Magenta:
+    case Channel::Yellow:
+    case Channel::Black:
+      return 100;
+    default:
+      return 255;
+  }
+}
+
+QColor ColorDockPanel::channel_color(Channel channel, int level) const {
+  switch (channel) {
+    case Channel::Red:
+      return QColor(level, rgb_.green(), rgb_.blue());
+    case Channel::Green:
+      return QColor(rgb_.red(), level, rgb_.blue());
+    case Channel::Blue:
+      return QColor(rgb_.red(), rgb_.green(), level);
+    case Channel::Hue:
+      return QColor::fromHsv(std::clamp(level, 0, 359), saturation_, value_);
+    case Channel::Saturation:
+      return QColor::fromHsv(hue_, byte_from_percent(level), value_);
+    case Channel::Brightness:
+      return QColor::fromHsv(hue_, saturation_, byte_from_percent(level));
+    case Channel::Cyan:
+    case Channel::Magenta:
+    case Channel::Yellow:
+    case Channel::Black: {
+      auto cmyk = cmyk_;
+      cmyk[ink_index(channel)] = std::clamp(level, 0, 100);
+      return color_from_cmyk(cmyk);
+    }
+  }
+  return rgb_;
+}
+
+QColor ColorDockPanel::color_from_cmyk(const std::array<int, 4>& cmyk) const {
+  const auto space = cmyk_space_ != nullptr ? cmyk_space_ : working_cmyk_space();
+  const auto rgb = space->rgb_from_cmyk({static_cast<double>(cmyk[0]), static_cast<double>(cmyk[1]),
+                                         static_cast<double>(cmyk[2]), static_cast<double>(cmyk[3])});
+  return QColor(rgb.red, rgb.green, rgb.blue);
+}
+
+void ColorDockPanel::update_cmyk() {
+  auto space = working_cmyk_space();
+  if (space == cmyk_space_ && cmyk_color_.isValid() && cmyk_color_.rgb() == rgb_.rgb()) {
+    return;
+  }
+  // The Color Picker window's conversion and rounding, so both show the same numbers.
+  const auto ink = space->cmyk_from_rgb({static_cast<std::uint8_t>(rgb_.red()),
+                                         static_cast<std::uint8_t>(rgb_.green()),
+                                         static_cast<std::uint8_t>(rgb_.blue())});
+  cmyk_ = {static_cast<int>(std::lround(ink.cyan)), static_cast<int>(std::lround(ink.magenta)),
+           static_cast<int>(std::lround(ink.yellow)), static_cast<int>(std::lround(ink.black))};
+  cmyk_color_ = rgb_;
+  cmyk_space_ = std::move(space);
+}
+
+void ColorDockPanel::working_cmyk_space_changed() {
+  cmyk_color_ = QColor();
+  update_cmyk();
+  refresh_channel_views();
+}
+
+void ColorDockPanel::set_channel(Channel channel, int level) {
+  level = std::clamp(level, 0, channel_maximum(channel));
+  if (level == channel_value(channel)) {
+    return;
+  }
+  QColor color;
+  switch (channel) {
+    case Channel::Red:
+    case Channel::Green:
+    case Channel::Blue:
+      color = channel_color(channel, level);
+      take_slider_color(color);
+      break;
+    case Channel::Cyan:
+    case Channel::Magenta:
+    case Channel::Yellow:
+    case Channel::Black:
+      // The inks stay as set: they are the source of this color.
+      cmyk_[ink_index(channel)] = level;
+      color = color_from_cmyk(cmyk_);
+      cmyk_color_ = color;
+      take_slider_color(color);
+      break;
+    case Channel::Hue:
+      hue_ = level;
+      color = QColor::fromHsv(hue_, saturation_, value_);
+      break;
+    case Channel::Saturation:
+      saturation_ = byte_from_percent(level);
+      color = QColor::fromHsv(hue_, saturation_, value_);
+      break;
+    case Channel::Brightness:
+      value_ = byte_from_percent(level);
+      color = QColor::fromHsv(hue_, saturation_, value_);
+      break;
+  }
+  produce_foreground(color);
+  field_->update();
+  hue_strip_->update();
+  emit_pick(color);
+}
+
+void ColorDockPanel::take_slider_color(QColor color) {
+  int color_hue = 0;
+  int color_saturation = 0;
+  int color_value = 0;
+  color.getHsv(&color_hue, &color_saturation, &color_value);
+  // A gray has no hue: keep the one shown. Black has no saturation either.
+  if (color_hue >= 0) {
+    hue_ = std::clamp(color_hue, 0, 359);
+  }
+  if (color_value > 0) {
+    saturation_ = std::clamp(color_saturation, 0, 255);
+  }
+  value_ = std::clamp(color_value, 0, 255);
+}
+
+void ColorDockPanel::begin_channel_drag() {
+  picking_ = true;
+  pick_background_ = false;
+}
+
+void ColorDockPanel::end_channel_drag() {
+  end_field_pick();
+}
+
+void ColorDockPanel::set_colors(QColor foreground, QColor background) {
+  foreground_chip_->set_color(foreground);
+  background_chip_->set_color(background);
+  // A foreground drag owns the field until its release; the canvas may hand back a
+  // palette-snapped color, which must not move the crosshair under the pointer.
+  if (picking_ && !pick_background_) {
+    return;
+  }
+  if (foreground.rgb() != produced_foreground_.rgb() || !produced_foreground_.isValid()) {
+    adopt_foreground(foreground);
+  }
+}
+
+void ColorDockPanel::adopt_foreground(QColor color) {
+  if (!color.isValid()) {
+    return;
+  }
+  int color_hue = 0;
+  int color_saturation = 0;
+  int color_value = 0;
+  color.getHsv(&color_hue, &color_saturation, &color_value);
+  // A gray has no hue: keep the field on the one it showed.
+  const auto new_hue = color_hue >= 0 ? std::clamp(color_hue, 0, 359) : hue_;
+  const auto new_saturation = std::clamp(color_saturation, 0, 255);
+  const auto new_value = std::clamp(color_value, 0, 255);
+  produce_foreground(color);
+  if (new_hue == hue_ && new_saturation == saturation_ && new_value == value_) {
+    return;
+  }
+  const bool hue_changed = new_hue != hue_;
+  hue_ = new_hue;
+  saturation_ = new_saturation;
+  value_ = new_value;
+  field_->update();
+  if (hue_changed) {
+    hue_strip_->update();
+  }
+  refresh_channel_views();
+}
+
+void ColorDockPanel::produce_foreground(QColor color) {
+  produced_foreground_ = color;
+  rgb_ = QColor(color.rgb());
+  update_cmyk();
+  refresh_channel_views();
+}
+
+void ColorDockPanel::refresh_channel_views() {
+  // Signals blocked: showing a value is not an edit, so nothing loops back.
+  for (std::size_t index = 0; index < channel_spins_.size(); ++index) {
+    if (auto* spin = channel_spins_[index]; spin != nullptr) {
+      const QSignalBlocker blocker(spin);
+      spin->setValue(channel_value(static_cast<Channel>(index)));
+    }
+    if (auto* track = channel_tracks_[index]; track != nullptr && track->isVisible()) {
+      track->update();
+    }
+  }
+  for (std::size_t index = 0; index < cube_rgb_spins_.size(); ++index) {
+    if (auto* spin = cube_rgb_spins_[index]; spin != nullptr) {
+      const QSignalBlocker blocker(spin);
+      spin->setValue(channel_value(static_cast<Channel>(index)));
+    }
+  }
+  show_hex(false);
+}
+
+void ColorDockPanel::show_hex(bool force) {
+  if (hex_edit_ == nullptr) {
+    return;
+  }
+  // Text being typed that already names the foreground stays as typed, so applying a
+  // whole value never rewrites the field under the caret.
+  if (!force && hex_edit_->hasFocus()) {
+    const auto typed = parse_panel_color(hex_edit_->text());
+    if (typed.isValid() && QColor(typed.rgb()).rgb() == rgb_.rgb()) {
+      return;
+    }
+  }
+  const QSignalBlocker blocker(hex_edit_);
+  hex_edit_->setText(rgb_.name(QColor::HexRgb).mid(1).toUpper());
+}
+
+void ColorDockPanel::apply_hex_text(bool finished) {
+  auto text = hex_edit_->text();
+  // A typed or pasted "#" comes out at once; the caret keeps its place among the digits.
+  if (text.contains(QLatin1Char('#'))) {
+    const auto caret = hex_edit_->cursorPosition() - text.left(hex_edit_->cursorPosition()).count(QLatin1Char('#'));
+    text.remove(QLatin1Char('#'));
+    const QSignalBlocker blocker(hex_edit_);
+    hex_edit_->setText(text);
+    hex_edit_->setCursorPosition(static_cast<int>(caret));
+  }
+  const auto parsed = finished || is_whole_hex(text) ? parse_panel_color(text) : QColor();
+  if (parsed.isValid()) {
+    // The stored foreground is opaque RGB: a "#RRGGBBAA" entry's alpha is dropped.
+    const QColor color(parsed.red(), parsed.green(), parsed.blue());
+    if (color.rgb() != rgb_.rgb()) {
+      take_slider_color(color);
+      produce_foreground(color);
+      field_->update();
+      hue_strip_->update();
+      emit_pick(color);
+    }
+  }
+  if (finished) {
+    show_hex(true);
+  }
+}
+
+bool ColorDockPanel::begin_field_pick(Qt::KeyboardModifiers modifiers, Qt::MouseButton button) {
+  if (button != Qt::LeftButton && button != Qt::RightButton) {
+    return false;
+  }
+  // Decided once per press from the press event itself: releasing Alt mid-drag keeps
+  // setting the background, as the Pick tool's Alt-click does.
+  picking_ = true;
+  pick_background_ = button == Qt::RightButton || (modifiers & Qt::AltModifier) != 0;
+  return true;
+}
+
+void ColorDockPanel::end_field_pick() {
+  const bool was_picking = picking_;
+  picking_ = false;
+  pick_background_ = false;
+  if (was_picking) {
+    emit pick_finished();
+  }
+}
+
+void ColorDockPanel::emit_pick(QColor color) {
+  emit color_picked(color, picking_ && pick_background_);
+}
+
+void ColorDockPanel::set_saturation_value_from_point(QPoint point, QSize size) {
+  // The same mapping as the picker window's field, edges snapping to 0 and 255.
+  const auto max_x = std::max(1, size.width() - 1);
+  const auto max_y = std::max(1, size.height() - 1);
+  const int x = std::clamp(point.x(), 0, max_x);
+  const int y = std::clamp(point.y(), 0, max_y);
+  const int saturation = x <= 2 ? 0 : (x >= max_x - 2 ? 255 : rounded_scaled_channel(x, max_x, 255));
+  const int value = y <= 2 ? 255 : (y >= max_y - 2 ? 0 : 255 - rounded_scaled_channel(y, max_y, 255));
+  const auto color = QColor::fromHsv(hue_, saturation, value);
+  if (picking_ && pick_background_) {
+    // The background takes the color under the pointer; the field keeps showing the
+    // foreground.
+    emit_pick(color);
+    return;
+  }
+  saturation_ = saturation;
+  value_ = value;
+  produce_foreground(color);
+  field_->update();
+  emit_pick(color);
+}
+
+void ColorDockPanel::set_hue_from_point(QPoint point, QSize size) {
+  const auto max_y = std::max(1, size.height() - 1);
+  const int hue = rounded_scaled_channel(std::clamp(point.y(), 0, max_y), max_y, 359);
+  if (picking_ && pick_background_) {
+    // The color under the pointer: the strip shows each hue at full strength.
+    emit_pick(QColor::fromHsv(hue, 255, 255));
+    return;
+  }
+  hue_ = hue;
+  const auto color = QColor::fromHsv(hue_, saturation_, value_);
+  produce_foreground(color);
+  field_->update();
+  hue_strip_->update();
+  emit_pick(color);
+}
+
+void ColorDockPanel::changeEvent(QEvent* event) {
+  QWidget::changeEvent(event);
+  if (event->type() == QEvent::LanguageChange) {
+    retranslate();
+  }
+}
+
+void ColorDockPanel::retranslate() {
+  const auto hint = resolve_modifier_names(
+      tr("Click or drag to set the foreground color. Right-click, right-drag, %ALT%-click or %ALT%-drag to set the background color."));
+  field_->setToolTip(hint);
+  hue_strip_->setToolTip(hint);
+  settings_button_->setToolTip(tr("Color panel settings"));
+  settings_button_->setAccessibleName(tr("Color panel settings"));
+  const std::array<QString, kViewCount> view_names = {tr("Hue Cube"), tr("RGB Sliders"), tr("HSB Sliders"),
+                                                       tr("CMYK Sliders")};
+  for (std::size_t index = 0; index < view_names.size(); ++index) {
+    view_actions_[index]->setText(view_names[index]);
+    view_actions_[index]->setToolTip(view_names[index]);
+  }
+  // One-letter row labels, the channel's name in the tooltip.
+  const std::array<QString, kChannelCount> letters = {
+      tr("R", "Red channel"), tr("G", "Green channel"), tr("B", "Blue channel"), tr("H", "Hue"),
+      tr("S", "Saturation"),  tr("B", "Brightness"),    tr("C", "Cyan ink"),     tr("M", "Magenta ink"),
+      tr("Y", "Yellow ink"),  tr("K", "Black ink")};
+  const std::array<QString, kChannelCount> names = {
+      tr("Red"),        tr("Green"), tr("Blue"),    tr("Hue"),    tr("Saturation"),
+      tr("Brightness"), tr("Cyan"),  tr("Magenta"), tr("Yellow"), tr("Black")};
+  for (std::size_t index = 0; index < channel_labels_.size(); ++index) {
+    if (channel_labels_[index] == nullptr) {
+      continue;
+    }
+    channel_labels_[index]->setText(letters[index]);
+    channel_labels_[index]->setToolTip(names[index]);
+    channel_tracks_[index]->setToolTip(names[index]);
+    channel_spins_[index]->setToolTip(names[index]);
+    channel_spins_[index]->setAccessibleName(names[index]);
+  }
+  for (std::size_t index = 0; index < cube_rgb_spins_.size(); ++index) {
+    cube_rgb_labels_[index]->setText(letters[index]);
+    cube_rgb_labels_[index]->setToolTip(names[index]);
+    cube_rgb_spins_[index]->setToolTip(names[index]);
+    cube_rgb_spins_[index]->setAccessibleName(names[index]);
+  }
+  hex_edit_->setToolTip(tr("Foreground color as hexadecimal (#RRGGBB). Type or paste a value or a color name."));
+  hex_edit_->setAccessibleName(tr("Foreground color hex value"));
+}
+
+}  // namespace patchy::ui

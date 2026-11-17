@@ -1,0 +1,92 @@
+#pragma once
+
+// Internal to the .xcf reader (src/formats/xcf_*.cpp; docs/xcf.md): shared between the
+// structure reader, the text-layer mapping and the container unwrapping. Do not include
+// it elsewhere (the reader's own tests excepted).
+
+#include "core/layer.hpp"
+#include "formats/xcf_document_io.hpp"
+#include "support/decode_budget.hpp"
+
+#include <array>
+#include <cstdint>
+#include <optional>
+#include <span>
+#include <stdexcept>
+#include <string>
+#include <string_view>
+#include <utility>
+#include <vector>
+
+namespace patchy::xcf::detail {
+
+// A structural read failure. Its text never reaches users (DocumentIo::read turns it into
+// a translated message); PATCHY_XCF_TRACE prints it.
+class ImportError : public std::runtime_error {
+public:
+  using std::runtime_error::runtime_error;
+};
+
+// A well-formed file past the size limits: its own message, not "damaged".
+class SizeLimitError : public ImportError {
+public:
+  using ImportError::ImportError;
+};
+
+void trace(const std::string& message);
+
+// The element count of a width x height float plane with `channels` floats per pixel (the
+// blur bake's RGBA working copy, the clip-to-backdrop alpha plane), formed in 64 bits.
+// Throws SizeLimitError past `max_pixels` or `max_bytes` (kMaxDecodePixels32 and
+// kMaxBufferBytes32 model wasm32, where the plain size_t product wraps).
+[[nodiscard]] inline std::size_t checked_float_plane(std::int64_t width, std::int64_t height, std::uint64_t channels,
+                                                     std::uint64_t max_bytes = kMaxBufferBytes,
+                                                     std::uint64_t max_pixels = kMaxDecodePixels) {
+  const auto pixels = checked_pixel_count(width, height, max_pixels);
+  const auto floats = pixels.has_value() ? checked_multiply(*pixels, channels) : std::nullopt;
+  if (!floats.has_value() || !checked_buffer_bytes(*floats, sizeof(float), max_bytes).has_value()) {
+    throw SizeLimitError("a " + std::to_string(width) + " x " + std::to_string(height) + " working plane");
+  }
+  return static_cast<std::size_t>(*floats);
+}
+
+// Decompressed-size ceiling for a wrapped file and for the bzip2/xz decoders.
+inline constexpr std::uint64_t kMaxUnwrappedBytes = 16ULL << 30U;
+
+// bzip2 and xz streams, Patchy's own decoders (xcf_unwrap.cpp), up to `limit` bytes.
+// Throw ImportError on damage and SizeLimitError past the limit.
+[[nodiscard]] std::vector<std::uint8_t> decompress_bzip2(std::span<const std::uint8_t> bytes, std::uint64_t limit);
+[[nodiscard]] std::vector<std::uint8_t> decompress_xz(std::span<const std::uint8_t> bytes, std::uint64_t limit);
+[[nodiscard]] std::vector<std::uint8_t> decompress_gzip(std::span<const std::uint8_t> bytes, std::uint64_t limit);
+
+// The top-level (key value) forms of a serialized GimpConfig, in order: ("range", "all"),
+// ("hue", "0.25"), ... A value that is itself a list comes back empty.
+[[nodiscard]] std::vector<std::pair<std::string, std::string>> parse_config_forms(std::string_view text);
+
+// A GeglColor (its babl format name and its little-endian sample bytes) as sRGB-encoded
+// RGBA in 0..1: RGB and gray in any curve (premultiplied forms too), HSV, HSL, CIE Lab and
+// LCH(ab), in u8, u16, float or double (Lab and LCH in float or double). An embedded
+// profile is not read: the values are taken as sRGB. nullopt for another format.
+[[nodiscard]] std::optional<std::array<double, 4>> gegl_color_to_srgb(std::string_view format,
+                                                                      std::span<const std::uint8_t> bytes);
+
+// What the text mapping needs from the reader.
+struct TextLayerContext {
+  double ppi{72.0};
+  std::int32_t layer_width{0};
+  std::int32_t layer_height{0};
+};
+
+enum class TextImport : std::uint8_t {
+  Editable,         // patchy.text.* written; GIMP's raster stays until the text is edited
+  OutlineRedrawn,   // editable; the outline becomes a Stroke style when MainWindow redraws it
+  Unreadable,       // nothing Patchy can edit: a pixel layer
+  OutlineUnsupported,  // a pattern or dashed outline: a pixel layer
+};
+
+// Writes the patchy.text.* metadata for a GIMP text layer onto `layer` (its pixels stay
+// GIMP's raster). An outlined layer also gets kLayerMetadataXcfPendingOutline.
+[[nodiscard]] TextImport apply_text_parasite(const TextParasite& parasite, const TextLayerContext& context,
+                                             Layer& layer);
+
+}  // namespace patchy::xcf::detail

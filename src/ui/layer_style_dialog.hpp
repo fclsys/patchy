@@ -1,0 +1,93 @@
+#pragma once
+
+#include "core/layer.hpp"
+#include "core/pattern_resource.hpp"
+#include "ui/appearance_edits.hpp"
+
+#include <QString>
+
+#include <functional>
+#include <optional>
+
+class QWidget;
+
+namespace patchy::ui {
+
+class PatternLibrary;
+class StyleLibrary;
+class GradientLibrary;
+class ContourLibrary;
+
+struct LayerStyleSettings {
+  int opacity{100};
+  BlendMode blend_mode{BlendMode::Normal};
+  LayerStyle style;
+  LayerBlendIf blend_if;
+  // Malformed, non-RGB, or otherwise unknown native payloads remain raw until
+  // the user explicitly chooses to replace them with editable RGB defaults.
+  bool replace_unsupported_blend_if{false};
+  int fill_opacity{100};
+  // Advanced Blending "Channels" (kRestrict* bits; set = excluded). Ignored on
+  // commit when the layer preserves an unsupported native 'brst' payload.
+  std::uint8_t restricted_channels{0};
+  // Advanced Blending "Knockout": 0 None, 1 Shallow, 2 Deep (the native 'knko'
+  // mode). Ignored on commit when the layer preserves an unknown 'knko' payload.
+  std::uint8_t knockout{0};
+  std::shared_ptr<const AppearanceEdits<LayerStyleSettings>> edits{};
+  bool preview_enabled{true};
+  bool opacity_edited{false};
+  bool fill_opacity_edited{false};
+};
+
+// The effect pages the dialog can open on (the Layers panel footer's Layer
+// Styles menu), in the dialog's category order.
+enum class LayerStyleEffect {
+  BevelEmboss,
+  Stroke,
+  InnerShadow,
+  InnerGlow,
+  Satin,
+  ColorOverlay,
+  GradientOverlay,
+  PatternOverlay,
+  OuterGlow,
+  DropShadow
+};
+
+// Forgets every effect's Save as Default values (the layerStyle/effectDefaults
+// settings group), so new effects start from the built-in defaults again.
+void clear_stored_layer_style_effect_defaults();
+
+// document_patterns (optional) lists the document's embedded pattern tiles.
+// pattern_library adds the persistent folder-aware user presets and enables the
+// Pattern Manager buttons. The dialog can add a transient document resource
+// when a chosen library pattern has the same Photoshop id as different embedded
+// pixels. MainWindow snapshots the store around the dialog so cancel stays
+// clean. style_library enables the Styles page's preset browser (apply on
+// click, New Style..., Manage Styles...); null leaves the page present but
+// inert. open_pattern_as_image is forwarded to the Pattern Manager's "Open as
+// Image" button; the caller must DEFER the actual document creation until this
+// dialog has closed (the preview-dialog edit lock forbids
+// add_document_session). start_effect opens the dialog on that effect's
+// start_effect_index instance and, with enable_start_effect, turns it on exactly as
+// ticking its category checkbox would (the Layers panel's effect rows open a hidden
+// effect without showing it). contour_library lists the user's saved contours in the
+// contour pickers and enables their Library menu (New, Rename, Delete, Load and Save
+// of Photoshop .shc files); null leaves the pickers with the built-in shapes, Custom
+// and the contour editor.
+[[nodiscard]] std::optional<LayerStyleSettings> request_layer_style_settings(
+    QWidget* parent, const Layer& layer,
+    std::function<void(const LayerStyleSettings&)> preview_changed = {},
+    PatternStore* document_patterns = nullptr,
+    PatternLibrary* pattern_library = nullptr,
+    StyleLibrary* style_library = nullptr,
+    std::function<void(const QString& name, const PixelBuffer& tile)> open_pattern_as_image = {},
+    GradientLibrary* gradient_library = nullptr,
+    RgbColor foreground = RgbColor{0, 0, 0},
+    RgbColor background = RgbColor{255, 255, 255},
+    const AppearanceDialogContext<LayerStyleSettings>* batch = nullptr,
+    BitDepth document_depth = BitDepth::UInt8,
+    std::optional<LayerStyleEffect> start_effect = std::nullopt, std::size_t start_effect_index = 0,
+    bool enable_start_effect = true, ContourLibrary* contour_library = nullptr);
+
+}  // namespace patchy::ui

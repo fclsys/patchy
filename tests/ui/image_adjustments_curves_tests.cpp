@@ -1,0 +1,5769 @@
+#include <QStatusBar>
+
+#include "ui/canvas_widget.hpp"
+#include "ui/color_panel.hpp"
+#include "ui/qt_paths.hpp"
+#include "core/adjustment_layer.hpp"
+#include "core/layer_tree.hpp"
+#include "ui/dialog_utils.hpp"
+#include "ui/curves_editor.hpp"
+#include "ui/adjustment_presets.hpp"
+#include "ui/curves_presets.hpp"
+#include "ui/filter_workflows.hpp"
+#include "ui/tool_cursors.hpp"
+#include "core/document_depth.hpp"
+#include "core/pixel_depth.hpp"
+#include "formats/acv_curves_io.hpp"
+#include "formats/document_flatten.hpp"
+#include "formats/bmp_document_io.hpp"
+#include "formats/aseprite_document_io.hpp"
+#include "formats/ico_document_io.hpp"
+#include "formats/tga_document_io.hpp"
+#include "ui/main_window.hpp"
+#include "psd/psd_document_io.hpp"
+#include "render/compositor.hpp"
+#include "test_harness.hpp"
+#include "unicode_path_names.hpp"
+#include "local_psd_fixtures.hpp"
+#include "formats/af_document_io.hpp"
+#include <QAction>
+#include <QAbstractButton>
+#include <QApplication>
+#include <QCheckBox>
+#include <QComboBox>
+#include <QDialog>
+#include <QDoubleSpinBox>
+#include <QFile>
+#include <QFileDialog>
+#include <QFileInfo>
+#include <QFormLayout>
+#include <QFontMetrics>
+#include <QImage>
+#include <QKeySequence>
+#include <QItemSelectionModel>
+#include <QLabel>
+#include <QLineEdit>
+#include <QListWidget>
+#include <QMenu>
+#include <QMouseEvent>
+#include <QPainter>
+#include <QPen>
+#include <QPixmap>
+#include <QProgressDialog>
+#include <QPushButton>
+#include <QRadioButton>
+#include <QScrollBar>
+#include <QScrollArea>
+#include <QSpinBox>
+#include <QTabBar>
+#include <QTabWidget>
+#include <QTimer>
+#include <QToolButton>
+#include <QWidget>
+#include <algorithm>
+#include <atomic>
+#include <array>
+#include <cstdint>
+#include <cmath>
+#include <cstdlib>
+#include <cstring>
+#include <exception>
+#include <filesystem>
+#include <fstream>
+#include <functional>
+#include <iostream>
+#include <limits>
+#include <memory>
+#include <optional>
+#include <span>
+#include <stdexcept>
+#include <string>
+#include <string_view>
+#include <utility>
+#include <vector>
+#include "ui_test_access.hpp"
+#include "ui_test_groups.hpp"
+#include "ui_test_support.hpp"
+
+namespace {
+
+using namespace patchy::test::ui;
+
+void ui_image_adjustments_menu_applies_active_layer_filters() {
+  patchy::ui::MainWindow window;
+  show_window(window);
+  auto* canvas = require_canvas(window);
+  auto* layer_list = window.findChild<QListWidget*>(QStringLiteral("layerList"));
+  auto* tabs = window.findChild<QTabWidget*>(QStringLiteral("documentTabs"));
+  CHECK(layer_list != nullptr);
+  CHECK(tabs != nullptr);
+
+  canvas->set_primary_color(QColor(10, 120, 240));
+  use_solid_fill_settings(canvas);
+  require_action(window, "layerFillForegroundAction")->trigger();
+  QApplication::processEvents();
+  CHECK(color_close(canvas_pixel(*canvas, QPoint(40, 40)), QColor(10, 120, 240), 6));
+  require_action_by_text(window, QStringLiteral("Brush"))->trigger();
+  canvas->set_brush_size(24);
+  canvas->set_primary_color(QColor(240, 20, 20));
+
+  bool saw_live_filter_preview = false;
+  bool canvas_zoomed_with_dialog_open = false;
+  bool canvas_panned_with_dialog_open = false;
+  bool saw_filter_edit_lock = false;
+  const auto zoom_before_dialog = canvas->zoom();
+  QTimer::singleShot(0, guarded([&] {
+    for (auto* widget : QApplication::topLevelWidgets()) {
+      if (widget->objectName() != QStringLiteral("patchyFilterDialog")) {
+        continue;
+      }
+      auto* dialog = qobject_cast<QDialog*>(widget);
+      CHECK(dialog != nullptr);
+      CHECK(!dialog->isModal());
+      CHECK(dialog->windowModality() == Qt::NonModal);
+      CHECK(window.isEnabled());
+      CHECK(canvas->edit_locked());
+      CHECK(!layer_list->isEnabled());
+      CHECK(!tabs->tabBar()->isEnabled());
+      CHECK(!require_action(window, "layerNewAction")->isEnabled());
+      CHECK(!require_action(window, "layerFillForegroundAction")->isEnabled());
+      CHECK(require_action(window, "viewZoomInAction")->isEnabled());
+      auto* amount = dialog->findChild<QSpinBox*>(QStringLiteral("filterAmountSpin"));
+      CHECK(amount != nullptr);
+      CHECK(amount->value() == 100);
+      process_events_for(120);
+      const auto preview_pixel = canvas_pixel(*canvas, QPoint(40, 40));
+      saw_live_filter_preview = std::abs(preview_pixel.red() - preview_pixel.green()) <= 2 &&
+                                std::abs(preview_pixel.green() - preview_pixel.blue()) <= 2;
+      const auto preview_pixel_before_edit = canvas_pixel(*canvas, QPoint(40, 40));
+      drag(*canvas, canvas->widget_position_for_document_point(QPoint(40, 40)),
+           canvas->widget_position_for_document_point(QPoint(58, 58)));
+      const auto preview_pixel_after_edit = canvas_pixel(*canvas, QPoint(40, 40));
+      saw_filter_edit_lock = color_close(preview_pixel_after_edit, preview_pixel_before_edit, 2);
+      send_wheel(*canvas, QPoint(300, 240), 120, Qt::AltModifier);
+      canvas_zoomed_with_dialog_open = canvas->zoom() > zoom_before_dialog;
+      const auto origin_before_pan = canvas->widget_position_for_document_point(QPoint(0, 0));
+      send_mouse(*canvas, QEvent::MouseButtonPress, QPoint(300, 240), Qt::MiddleButton, Qt::MiddleButton);
+      send_mouse(*canvas, QEvent::MouseMove, QPoint(318, 252), Qt::NoButton, Qt::MiddleButton);
+      send_mouse(*canvas, QEvent::MouseButtonRelease, QPoint(318, 252), Qt::MiddleButton, Qt::NoButton);
+      canvas_panned_with_dialog_open = canvas->widget_position_for_document_point(QPoint(0, 0)) != origin_before_pan;
+      dialog->reject();
+      return;
+    }
+    CHECK(false);
+  }));
+  require_action(window, "imageAdjustDesaturateAction")->trigger();
+  CHECK(saw_live_filter_preview);
+  CHECK(canvas_zoomed_with_dialog_open);
+  CHECK(canvas_panned_with_dialog_open);
+  CHECK(saw_filter_edit_lock);
+  CHECK(!canvas->edit_locked());
+  CHECK(layer_list->isEnabled());
+  CHECK(tabs->tabBar()->isEnabled());
+  CHECK(color_close(canvas_pixel(*canvas, QPoint(40, 40)), QColor(10, 120, 240), 6));
+
+  // Invert applies at once with no settings dialog, as one undo step (#411).
+  bool saw_invert_dialog = false;
+  QTimer::singleShot(0, [&] {
+    for (auto* widget : QApplication::topLevelWidgets()) {
+      if (widget->objectName() == QStringLiteral("patchyFilterDialog") && widget->isVisible()) {
+        saw_invert_dialog = true;
+        if (auto* dialog = qobject_cast<QDialog*>(widget); dialog != nullptr) {
+          dialog->reject();
+        }
+      }
+    }
+  });
+  const auto undo_depth_before_invert = patchy::ui::MainWindowTestAccess::active_session_undo_depth(window);
+  require_action(window, "imageAdjustInvertAction")->trigger();
+  QApplication::processEvents();
+  CHECK(!saw_invert_dialog);
+  CHECK(color_close(canvas_pixel(*canvas, QPoint(40, 40)), QColor(245, 135, 15), 8));
+  CHECK(patchy::ui::MainWindowTestAccess::active_session_undo_depth(window) == undo_depth_before_invert + 1U);
+  require_hotkey_action(window, QStringLiteral("edit.undo"))->trigger();
+  QApplication::processEvents();
+  CHECK(color_close(canvas_pixel(*canvas, QPoint(40, 40)), QColor(10, 120, 240), 6));
+  require_hotkey_action(window, QStringLiteral("edit.redo"))->trigger();
+  QApplication::processEvents();
+  CHECK(color_close(canvas_pixel(*canvas, QPoint(40, 40)), QColor(245, 135, 15), 8));
+
+  accept_filter_dialog();
+  require_action(window, "imageAdjustDesaturateAction")->trigger();
+  QApplication::processEvents();
+  const auto gray = canvas_pixel(*canvas, QPoint(40, 40));
+  CHECK(std::abs(gray.red() - gray.green()) <= 2);
+  CHECK(std::abs(gray.green() - gray.blue()) <= 2);
+  save_widget_artifact("ui_image_adjustments_invert_desaturate", *canvas);
+
+  canvas->set_primary_color(QColor(120, 70, 210));
+  require_action(window, "layerFillForegroundAction")->trigger();
+  QApplication::processEvents();
+  accept_filter_dialog({{QStringLiteral("filterBrightnessSpin"), 10},
+                        {QStringLiteral("filterContrastSpin"), 50}});
+  require_action(window, "imageAdjustBrightnessContrastAction")->trigger();
+  QApplication::processEvents();
+  CHECK(color_close(canvas_pixel(*canvas, QPoint(40, 40)), QColor(126, 51, 255), 6));
+
+  canvas->set_primary_color(QColor(50, 50, 50));
+  canvas->set_secondary_color(QColor(180, 180, 180));
+  require_action_by_text(window, QStringLiteral("Gradient"))->trigger();
+  drag(*canvas, canvas->widget_position_for_document_point(QPoint(20, 90)),
+       canvas->widget_position_for_document_point(QPoint(260, 90)));
+  QApplication::processEvents();
+  CHECK(canvas_pixel(*canvas, QPoint(20, 90)).red() > 40);
+  CHECK(canvas_pixel(*canvas, QPoint(260, 90)).red() < 190);
+
+  require_action(window, "imageAdjustAutoContrastAction")->trigger();
+  QApplication::processEvents();
+  CHECK(canvas_pixel(*canvas, QPoint(20, 90)).red() < 12);
+  CHECK(canvas_pixel(*canvas, QPoint(260, 90)).red() > 242);
+  save_widget_artifact("ui_image_adjustments_auto_contrast", *canvas);
+
+  auto* edge_detect = require_action(window, "filterAction_patchy_filters_edge_detect");
+  CHECK(edge_detect->toolTip().contains(QStringLiteral("Edge Detect")));
+  accept_filter_dialog({{QStringLiteral("filterStrengthSpin"), 150}});
+  edge_detect->trigger();
+  QApplication::processEvents();
+  CHECK(canvas_pixel(*canvas, QPoint(140, 90)).red() < 80);
+  auto* history = window.findChild<QListWidget*>(QStringLiteral("historyList"));
+  CHECK(history != nullptr);
+  // The panel lists oldest-first; the highlighted current row names the latest action.
+  CHECK(history->currentItem() != nullptr);
+  CHECK(history->currentItem()->text().contains(QStringLiteral("Edge Detect")));
+  save_widget_artifact("ui_filter_edge_detect", *canvas);
+
+  auto* emboss = require_action(window, "filterAction_patchy_filters_emboss");
+  accept_filter_dialog({{QStringLiteral("filterAngleSpin"), 90},
+                        {QStringLiteral("filterHeightSpin"), 4},
+                        {QStringLiteral("filterDepthSpin"), 140}});
+  emboss->trigger();
+  QApplication::processEvents();
+  CHECK(window.findChild<QListWidget*>(QStringLiteral("historyList"))->currentItem()->text().contains(QStringLiteral("Emboss")));
+
+  canvas->set_primary_color(QColor(255, 0, 0));
+  canvas->set_secondary_color(QColor(0, 0, 255));
+  auto* clouds = require_action(window, "filterAction_patchy_filters_clouds");
+  bool changed_live_swatches_while_clouds_open = false;
+  QTimer::singleShot(0, guarded([&] {
+    auto* dialog = qobject_cast<QDialog*>(find_top_level_dialog(QStringLiteral("patchyFilterDialog")));
+    CHECK(dialog != nullptr);
+    const std::array values = {
+        std::pair{QStringLiteral("filterScaleSpin"), 48}, std::pair{QStringLiteral("filterDetailSpin"), 4},
+        std::pair{QStringLiteral("filterContrastSpin"), 60}, std::pair{QStringLiteral("filterSeedSpin"), 3}};
+    for (const auto& [object_name, value] : values) {
+      auto* spin = dialog->findChild<QSpinBox*>(object_name);
+      CHECK(spin != nullptr);
+      spin->setValue(value);
+    }
+    // The invocation captured red/blue when the command started. Changing the
+    // toolbar state before OK must not recolor the pending render.
+    canvas->set_primary_color(QColor(0, 255, 0));
+    canvas->set_secondary_color(QColor(255, 255, 0));
+    changed_live_swatches_while_clouds_open = true;
+    dialog->accept();
+  }));
+  clouds->trigger();
+  QApplication::processEvents();
+  CHECK(changed_live_swatches_while_clouds_open);
+  const auto cloud_pixel = canvas_pixel(*canvas, QPoint(40, 40));
+  CHECK(cloud_pixel.green() < 8);
+  CHECK(cloud_pixel.red() > 0);
+  CHECK(cloud_pixel.blue() > 0);
+  CHECK(std::abs(cloud_pixel.red() - cloud_pixel.blue()) > 4);
+  save_widget_artifact("ui_filter_clouds_foreground_background", *canvas);
+}
+
+void ui_image_adjustments_auto_trio_distinguishes_casts() {
+  patchy::ui::MainWindow window;
+  show_window(window);
+  auto* canvas = require_canvas(window);
+
+  // Warm-cast gradient: Auto Contrast must preserve the cast (composite
+  // stretch), Auto Tone and Auto Color must neutralize it (per-channel).
+  canvas->set_primary_color(QColor(80, 50, 40));
+  canvas->set_secondary_color(QColor(220, 190, 170));
+  require_action_by_text(window, QStringLiteral("Gradient"))->trigger();
+  drag(*canvas, canvas->widget_position_for_document_point(QPoint(20, 90)),
+       canvas->widget_position_for_document_point(QPoint(260, 90)));
+  QApplication::processEvents();
+  CHECK(color_close(canvas_pixel(*canvas, QPoint(20, 90)), QColor(80, 50, 40), 6));
+
+  auto* history = window.findChild<QListWidget*>(QStringLiteral("historyList"));
+  CHECK(history != nullptr);
+
+  // Composite stretch maps the merged clip points {40, 220} onto every
+  // channel: the dark end lands near (57, 14, 0), keeping red > green > blue.
+  require_action(window, "imageAdjustAutoContrastAction")->trigger();
+  QApplication::processEvents();
+  const auto contrast_dark = canvas_pixel(*canvas, QPoint(20, 90));
+  CHECK(contrast_dark.red() > 40);
+  CHECK(contrast_dark.red() < 80);
+  CHECK(contrast_dark.green() > contrast_dark.blue());
+  CHECK(contrast_dark.red() > contrast_dark.green());
+  CHECK(contrast_dark.blue() < 6);
+  require_action_by_text(window, QStringLiteral("Undo"))->trigger();
+  QApplication::processEvents();
+  CHECK(color_close(canvas_pixel(*canvas, QPoint(20, 90)), QColor(80, 50, 40), 6));
+
+  require_action(window, "imageAdjustAutoToneAction")->trigger();
+  QApplication::processEvents();
+  const auto tone_dark = canvas_pixel(*canvas, QPoint(20, 90));
+  const auto tone_light = canvas_pixel(*canvas, QPoint(260, 90));
+  CHECK(tone_dark.red() < 12);
+  CHECK(tone_dark.green() < 12);
+  CHECK(tone_dark.blue() < 12);
+  CHECK(tone_light.red() > 242);
+  CHECK(tone_light.green() > 242);
+  CHECK(tone_light.blue() > 242);
+  CHECK(history->currentItem() != nullptr);
+  CHECK(history->currentItem()->text().contains(QStringLiteral("Auto Tone")));
+  save_widget_artifact("ui_image_adjustments_auto_tone", *canvas);
+  require_action_by_text(window, QStringLiteral("Undo"))->trigger();
+  QApplication::processEvents();
+  CHECK(color_close(canvas_pixel(*canvas, QPoint(20, 90)), QColor(80, 50, 40), 6));
+
+  // Auto Color adds the midtone snap on top of the per-channel stretch. Every
+  // channel shares the same normalized profile here (the flat regions beside
+  // the drag skew all three means equally), so the snap gammas match and the
+  // midpoint must come out neutral. The exact 128 midtone target is pinned in
+  // the core suite, where the mean is constructed analytically.
+  require_action(window, "imageAdjustAutoColorAction")->trigger();
+  QApplication::processEvents();
+  const auto color_dark = canvas_pixel(*canvas, QPoint(20, 90));
+  const auto color_light = canvas_pixel(*canvas, QPoint(260, 90));
+  const auto color_mid = canvas_pixel(*canvas, QPoint(140, 90));
+  CHECK(color_dark.red() < 12);
+  CHECK(color_dark.green() < 12);
+  CHECK(color_dark.blue() < 12);
+  CHECK(color_light.red() > 242);
+  CHECK(color_light.green() > 242);
+  CHECK(color_light.blue() > 242);
+  CHECK(std::abs(color_mid.red() - color_mid.green()) <= 8);
+  CHECK(std::abs(color_mid.green() - color_mid.blue()) <= 8);
+  CHECK(history->currentItem() != nullptr);
+  CHECK(history->currentItem()->text().contains(QStringLiteral("Auto Color")));
+  save_widget_artifact("ui_image_adjustments_auto_color", *canvas);
+}
+
+void ui_auto_adjustments_apply_without_dialog() {
+  patchy::ui::MainWindow window;
+  show_window(window);
+  auto* canvas = require_canvas(window);
+
+  canvas->set_primary_color(QColor(80, 50, 40));
+  canvas->set_secondary_color(QColor(220, 190, 170));
+  require_action_by_text(window, QStringLiteral("Gradient"))->trigger();
+  drag(*canvas, canvas->widget_position_for_document_point(QPoint(20, 90)),
+       canvas->widget_position_for_document_point(QPoint(260, 90)));
+  QApplication::processEvents();
+  CHECK(color_close(canvas_pixel(*canvas, QPoint(20, 90)), QColor(80, 50, 40), 6));
+  const auto undo_depth_before = patchy::ui::MainWindowTestAccess::active_session_undo_depth(window);
+
+  // The autos apply immediately: no settings dialog may appear. A regression
+  // dialog is rejected so the test fails instead of hanging in its loop.
+  bool saw_settings_dialog = false;
+  QTimer::singleShot(0, [&] {
+    auto* dialog = qobject_cast<QDialog*>(find_top_level_dialog(QStringLiteral("patchyFilterDialog")));
+    saw_settings_dialog = dialog != nullptr;
+    if (dialog != nullptr) {
+      dialog->reject();
+    }
+  });
+  require_action(window, "imageAdjustAutoToneAction")->trigger();
+  QApplication::processEvents();
+  CHECK(!saw_settings_dialog);
+  const auto tone_dark = canvas_pixel(*canvas, QPoint(20, 90));
+  CHECK(tone_dark.red() < 12);
+  CHECK(tone_dark.green() < 12);
+  CHECK(tone_dark.blue() < 12);
+  CHECK(patchy::ui::MainWindowTestAccess::active_session_undo_depth(window) == undo_depth_before + 1);
+  auto* history = window.findChild<QListWidget*>(QStringLiteral("historyList"));
+  CHECK(history != nullptr);
+  CHECK(history->currentItem() != nullptr);
+  CHECK(history->currentItem()->text().contains(QStringLiteral("Auto Tone")));
+}
+
+void ui_auto_all_applies_three_autos_as_one_undo_step() {
+  patchy::ui::MainWindow window;
+  show_window(window);
+  auto* canvas = require_canvas(window);
+
+  canvas->set_primary_color(QColor(80, 50, 40));
+  canvas->set_secondary_color(QColor(220, 190, 170));
+  require_action_by_text(window, QStringLiteral("Gradient"))->trigger();
+  drag(*canvas, canvas->widget_position_for_document_point(QPoint(20, 90)),
+       canvas->widget_position_for_document_point(QPoint(260, 90)));
+  QApplication::processEvents();
+  CHECK(color_close(canvas_pixel(*canvas, QPoint(20, 90)), QColor(80, 50, 40), 6));
+
+  auto& document = patchy::ui::MainWindowTestAccess::document(window);
+  const auto active_layer_id = document.active_layer_id();
+  CHECK(active_layer_id.has_value());
+  const auto* layer = std::as_const(document).find_layer(*active_layer_id);
+  CHECK(layer != nullptr);
+  const auto original_pixels = layer->pixels();
+  const auto undo_depth_before = patchy::ui::MainWindowTestAccess::active_session_undo_depth(window);
+
+  // Reference: the three autos applied back to back. With no selection the
+  // one-recipe Auto All pass must match this byte for byte. An auto that made
+  // no changes pushes no undo entry, so unwind by the measured depth delta.
+  require_action(window, "imageAdjustAutoToneAction")->trigger();
+  QApplication::processEvents();
+  require_action(window, "imageAdjustAutoContrastAction")->trigger();
+  QApplication::processEvents();
+  require_action(window, "imageAdjustAutoColorAction")->trigger();
+  QApplication::processEvents();
+  layer = std::as_const(document).find_layer(*active_layer_id);
+  CHECK(layer != nullptr);
+  const auto sequential_pixels = layer->pixels();
+  CHECK(!std::equal(sequential_pixels.data().begin(), sequential_pixels.data().end(),
+                    original_pixels.data().begin()));
+  const auto sequential_depth = patchy::ui::MainWindowTestAccess::active_session_undo_depth(window);
+  CHECK(sequential_depth > undo_depth_before);
+  for (auto depth = sequential_depth; depth > undo_depth_before; --depth) {
+    require_action_by_text(window, QStringLiteral("Undo"))->trigger();
+    QApplication::processEvents();
+  }
+  layer = std::as_const(document).find_layer(*active_layer_id);
+  CHECK(layer != nullptr);
+  CHECK(std::equal(layer->pixels().data().begin(), layer->pixels().data().end(),
+                   original_pixels.data().begin()));
+
+  // One command, one undo step, same bytes as the sequential applications.
+  require_action(window, "imageAdjustAutoAllAction")->trigger();
+  QApplication::processEvents();
+  layer = std::as_const(document).find_layer(*active_layer_id);
+  CHECK(layer != nullptr);
+  CHECK(layer->pixels().data().size() == sequential_pixels.data().size());
+  CHECK(std::equal(layer->pixels().data().begin(), layer->pixels().data().end(),
+                   sequential_pixels.data().begin()));
+  CHECK(patchy::ui::MainWindowTestAccess::active_session_undo_depth(window) == undo_depth_before + 1);
+  auto* history = window.findChild<QListWidget*>(QStringLiteral("historyList"));
+  CHECK(history != nullptr);
+  CHECK(history->currentItem() != nullptr);
+  CHECK(history->currentItem()->text().contains(QStringLiteral("Auto All")));
+  require_action_by_text(window, QStringLiteral("Undo"))->trigger();
+  QApplication::processEvents();
+  layer = std::as_const(document).find_layer(*active_layer_id);
+  CHECK(layer != nullptr);
+  CHECK(std::equal(layer->pixels().data().begin(), layer->pixels().data().end(),
+                   original_pixels.data().begin()));
+
+  // A constant layer leaves every auto at identity: Auto All reports the
+  // no-change status and pushes no undo entry.
+  canvas->set_primary_color(QColor(128, 128, 128));
+  require_action(window, "layerFillForegroundAction")->trigger();
+  QApplication::processEvents();
+  const auto undo_depth_after_fill = patchy::ui::MainWindowTestAccess::active_session_undo_depth(window);
+  require_action(window, "imageAdjustAutoAllAction")->trigger();
+  QApplication::processEvents();
+  CHECK(window.statusBar()->currentMessage().contains(QStringLiteral("made no changes")));
+  CHECK(patchy::ui::MainWindowTestAccess::active_session_undo_depth(window) == undo_depth_after_fill);
+}
+
+void ui_image_adjustments_respect_active_selection() {
+  patchy::ui::MainWindow window;
+  show_window(window);
+  auto* canvas = require_canvas(window);
+
+  canvas->set_primary_color(QColor(20, 90, 220));
+  use_solid_fill_settings(canvas);
+  require_action(window, "layerFillForegroundAction")->trigger();
+  QApplication::processEvents();
+
+  require_action_by_text(window, QStringLiteral("Marquee"))->trigger();
+  drag(*canvas, canvas->widget_position_for_document_point(QPoint(40, 40)),
+       canvas->widget_position_for_document_point(QPoint(100, 100)));
+  QApplication::processEvents();
+  require_action(window, "imageAdjustInvertAction")->trigger();
+  QApplication::processEvents();
+  require_action(window, "editDeselectAction")->trigger();
+  QApplication::processEvents();
+
+  CHECK(color_close(canvas_pixel(*canvas, QPoint(70, 70)), QColor(235, 165, 35), 10));
+  CHECK(color_close(canvas_pixel(*canvas, QPoint(160, 70)), QColor(20, 90, 220), 10));
+  save_widget_artifact("ui_image_adjustment_selection_scope", *canvas);
+}
+
+void ui_direct_pixel_previews_preserve_floating_layer_bounds() {
+  patchy::Document document(180, 140, patchy::PixelFormat::rgba8());
+  document.add_pixel_layer("Background", solid_pixels(180, 140, patchy::PixelFormat::rgba8(), QColor(Qt::white)));
+  patchy::Layer floating_layer(document.allocate_layer_id(), "Floating Console",
+                               solid_pixels(44, 32, patchy::PixelFormat::rgba8(), QColor(96, 96, 96, 255)));
+  const auto floating_id = floating_layer.id();
+  const QRect floating_rect(70, 45, 44, 32);
+  floating_layer.set_bounds(
+      patchy::Rect{floating_rect.x(), floating_rect.y(), floating_rect.width(), floating_rect.height()});
+  document.add_layer(std::move(floating_layer));
+  document.set_active_layer(floating_id);
+
+  patchy::ui::MainWindow window;
+  window.add_document_session(std::move(document), QStringLiteral("Floating Levels"));
+  show_window(window);
+  auto* canvas = require_canvas(window);
+  const auto original_pixel = canvas_pixel(*canvas, QPoint(72, 47));
+  CHECK(color_close(original_pixel, QColor(96, 96, 96), 5));
+  CHECK(color_close(canvas_pixel(*canvas, QPoint(4, 4)), QColor(Qt::white), 5));
+  CHECK(canvas->active_layer_document_rect().has_value());
+  CHECK(canvas->active_layer_document_rect()->topLeft() == floating_rect.topLeft());
+
+  bool saw_levels_preview_with_bounds = false;
+  QTimer::singleShot(0, guarded([&] {
+    auto* dialog = find_top_level_dialog(QStringLiteral("patchyLevelsDialog"));
+    CHECK(dialog != nullptr);
+    auto* black = dialog->findChild<QSpinBox*>(QStringLiteral("levelsBlackInputSpin"));
+    auto* white = dialog->findChild<QSpinBox*>(QStringLiteral("levelsWhiteInputSpin"));
+    CHECK(black != nullptr);
+    CHECK(white != nullptr);
+    black->setValue(40);
+    white->setValue(140);
+    process_events_for(160);
+    const auto preview_rect = canvas->active_layer_document_rect();
+    CHECK(preview_rect.has_value());
+    saw_levels_preview_with_bounds = preview_rect->topLeft() == floating_rect.topLeft() &&
+                                     color_close(canvas_pixel(*canvas, QPoint(4, 4)), QColor(Qt::white), 5);
+    dialog->reject();
+  }));
+  require_action(window, "imageAdjustLevelsAction")->trigger();
+  QApplication::processEvents();
+  CHECK(saw_levels_preview_with_bounds);
+  CHECK(canvas->active_layer_document_rect().has_value());
+  CHECK(canvas->active_layer_document_rect()->topLeft() == floating_rect.topLeft());
+  CHECK(color_close(canvas_pixel(*canvas, QPoint(4, 4)), QColor(Qt::white), 5));
+  CHECK(color_close(canvas_pixel(*canvas, QPoint(72, 47)), original_pixel, 6));
+
+  accept_levels_dialog(40, 140, 100);
+  require_action(window, "imageAdjustLevelsAction")->trigger();
+  QApplication::processEvents();
+  CHECK(canvas->active_layer_document_rect().has_value());
+  CHECK(canvas->active_layer_document_rect()->topLeft() == floating_rect.topLeft());
+  CHECK(color_close(canvas_pixel(*canvas, QPoint(4, 4)), QColor(Qt::white), 5));
+  CHECK(!color_close(canvas_pixel(*canvas, QPoint(72, 47)), original_pixel, 8));
+
+  require_action(window, "imageAdjustInvertAction")->trigger();
+  QApplication::processEvents();
+  CHECK(canvas->active_layer_document_rect().has_value());
+  CHECK(canvas->active_layer_document_rect()->topLeft() == floating_rect.topLeft());
+  CHECK(color_close(canvas_pixel(*canvas, QPoint(4, 4)), QColor(Qt::white), 5));
+}
+
+void ui_levels_dialog_adjusts_selected_color_channel_on_transparent_layer() {
+  patchy::Document document(140, 100, patchy::PixelFormat::rgba8());
+  document.add_pixel_layer("Background", solid_pixels(140, 100, patchy::PixelFormat::rgba8(), QColor(Qt::white)));
+  auto strokes = solid_pixels(140, 100, patchy::PixelFormat::rgba8(), QColor(0, 0, 0, 0));
+  fill_pixel_rect(strokes, QRect(24, 24, 24, 16), QColor(0, 255, 0, 255));
+  fill_pixel_rect(strokes, QRect(64, 24, 24, 16), QColor(0, 0, 0, 255));
+  auto& paint = document.add_pixel_layer("Paint", std::move(strokes));
+  document.set_active_layer(paint.id());
+
+  patchy::ui::MainWindow window;
+  window.add_document_session(std::move(document), QStringLiteral("Levels Channels"));
+  show_window(window);
+  auto* canvas = require_canvas(window);
+  CHECK(color_close(canvas_pixel(*canvas, QPoint(30, 30)), QColor(0, 255, 0), 8));
+  CHECK(color_close(canvas_pixel(*canvas, QPoint(70, 30)), QColor(0, 0, 0), 8));
+  CHECK(color_close(canvas_pixel(*canvas, QPoint(110, 70)), QColor(Qt::white), 5));
+
+  auto* layer_list = window.findChild<QListWidget*>(QStringLiteral("layerList"));
+  CHECK(layer_list != nullptr);
+  const auto layer_count_before = layer_list->count();
+  bool saw_channel_preview = false;
+  QTimer::singleShot(0, guarded([&] {
+    auto* dialog = find_top_level_dialog(QStringLiteral("patchyLevelsDialog"));
+    CHECK(dialog != nullptr);
+    auto* channel = dialog->findChild<QTabBar*>(QStringLiteral("levelsChannelTabs"));
+    auto* black_output = dialog->findChild<QSpinBox*>(QStringLiteral("levelsBlackOutputSpin"));
+    CHECK(channel != nullptr);
+    CHECK(black_output != nullptr);
+    CHECK(channel->count() == 4);
+    CHECK(channel->tabText(0) == QStringLiteral("RGB"));
+    CHECK(channel->tabText(1) == QStringLiteral("Red"));
+    CHECK(channel->tabText(2) == QStringLiteral("Green"));
+    CHECK(channel->tabText(3) == QStringLiteral("Blue"));
+    channel->setCurrentIndex(1);
+    black_output->setValue(255);
+    process_events_for(180);
+    saw_channel_preview = color_close(canvas_pixel(*canvas, QPoint(30, 30)), QColor(255, 255, 0), 8) &&
+                          color_close(canvas_pixel(*canvas, QPoint(70, 30)), QColor(255, 0, 0), 8) &&
+                          color_close(canvas_pixel(*canvas, QPoint(110, 70)), QColor(Qt::white), 5);
+    save_widget_artifact("ui_levels_red_channel_transparent_layer", *canvas);
+    dialog->accept();
+  }));
+  require_action(window, "imageAdjustLevelsAction")->trigger();
+  QApplication::processEvents();
+
+  CHECK(saw_channel_preview);
+  CHECK(layer_list->count() == layer_count_before);
+  CHECK(color_close(canvas_pixel(*canvas, QPoint(30, 30)), QColor(255, 255, 0), 8));
+  CHECK(color_close(canvas_pixel(*canvas, QPoint(70, 30)), QColor(255, 0, 0), 8));
+  CHECK(color_close(canvas_pixel(*canvas, QPoint(110, 70)), QColor(Qt::white), 5));
+}
+
+void ui_levels_dialog_preserves_independent_channel_records() {
+  QTimer::singleShot(0, guarded([] {
+    auto* dialog = find_top_level_dialog(QStringLiteral("patchyLevelsDialog"));
+    CHECK(dialog != nullptr);
+    auto* channel = dialog->findChild<QTabBar*>(QStringLiteral("levelsChannelTabs"));
+    auto* black_input = dialog->findChild<QSpinBox*>(QStringLiteral("levelsBlackInputSpin"));
+    auto* black_output = dialog->findChild<QSpinBox*>(QStringLiteral("levelsBlackOutputSpin"));
+    CHECK(channel != nullptr);
+    CHECK(black_input != nullptr);
+    CHECK(black_output != nullptr);
+    CHECK(channel->tabText(channel->currentIndex()) == QStringLiteral("RGB"));
+    black_input->setValue(24);
+    channel->setCurrentIndex(1);
+    CHECK(channel->tabText(channel->currentIndex()) == QStringLiteral("Red"));
+    CHECK(black_input->value() == 0);
+    black_output->setValue(255);
+    channel->setCurrentIndex(0);
+    CHECK(black_input->value() == 24);
+    CHECK(black_output->value() == 0);
+    channel->setCurrentIndex(1);
+    CHECK(black_input->value() == 0);
+    CHECK(black_output->value() == 255);
+    dialog->accept();
+  }));
+
+  const auto result = patchy::ui::request_levels_settings(nullptr);
+  CHECK(result.has_value());
+  CHECK(result->black_input == 24);
+  CHECK(result->black_output == 0);
+  CHECK(result->red.black_input == 0);
+  CHECK(result->red.black_output == 255);
+  CHECK(result->green.black_input == 0);
+  CHECK(result->green.black_output == 0);
+}
+
+void ui_levels_dialog_channel_tabs_tint_the_histogram() {
+  // Issue 453: one click on a channel tab switches the record and the
+  // histogram, and a color channel's bars take its hue the way Curves tints
+  // them. Each 2x2 block is one color, so the box-averaged histograms are exact:
+  // the top band spreads red over 20..109, green over 140..229 and blue over
+  // 160..249 evenly, the bottom band piles onto 50..79, 170..199 and
+  // 200..229, which gives each channel a visible hump.
+  patchy::PixelBuffer pixels(360, 64, patchy::PixelFormat::rgb8());
+  for (std::int32_t y = 0; y < 64; ++y) {
+    for (std::int32_t x = 0; x < 360; ++x) {
+      auto* pixel = pixels.pixel(x, y);
+      const auto block = x / 2;
+      const bool top = y < 32;
+      pixel[0] = static_cast<std::uint8_t>(top ? 20 + block % 90 : 50 + block % 30);
+      pixel[1] = static_cast<std::uint8_t>(top ? 140 + (block * 7) % 90 : 170 + block % 30);
+      pixel[2] = static_cast<std::uint8_t>(top ? 160 + (block * 13) % 90 : 200 + block % 30);
+    }
+  }
+  const QColor plot(55, 55, 55);
+  const auto tinted = [&plot](patchy::CurvesChannel channel) {
+    const auto color = patchy::ui::channel_histogram_color(channel);
+    const auto alpha = color.alphaF();
+    const auto mix = [alpha](int top, int bottom) {
+      return static_cast<int>(std::lround(bottom + (top - bottom) * alpha));
+    };
+    return QColor(mix(color.red(), plot.red()), mix(color.green(), plot.green()), mix(color.blue(), plot.blue()));
+  };
+
+  bool inspected = false;
+  QTimer::singleShot(0, guarded([&] {
+    auto* dialog = find_top_level_dialog(QStringLiteral("patchyLevelsDialog"));
+    CHECK(dialog != nullptr);
+    auto* tabs = dialog->findChild<QTabBar*>(QStringLiteral("levelsChannelTabs"));
+    auto* graph = dialog->findChild<QWidget*>(QStringLiteral("levelsInputGraph"));
+    auto* black_input = dialog->findChild<QSpinBox*>(QStringLiteral("levelsBlackInputSpin"));
+    CHECK(tabs != nullptr);
+    CHECK(graph != nullptr);
+    CHECK(black_input != nullptr);
+    CHECK(dialog->findChild<QComboBox*>(QStringLiteral("levelsChannelCombo")) == nullptr);
+    CHECK(tabs->currentIndex() == 0);
+
+    // The graph's rect at the time of each read: the dialog may still settle its layout
+    // after the first pass.
+    const auto bar_pixel = [&](int bin) {
+      const auto graph_rect = QRect(0, 0, graph->width(), graph->height()).adjusted(8, 8, -8, -28);
+      const auto column = graph_rect.left() + (bin * graph_rect.width()) / 256;
+      return graph->grab().toImage().pixelColor(column, graph_rect.bottom() - 2);
+    };
+    const auto click_tab = [&](int index) {
+      const auto center = tabs->tabRect(index).center();
+      send_mouse(*tabs, QEvent::MouseButtonPress, center, Qt::LeftButton, Qt::LeftButton);
+      send_mouse(*tabs, QEvent::MouseButtonRelease, center, Qt::LeftButton, Qt::NoButton);
+      QApplication::processEvents();
+    };
+
+    // The composite keeps the neutral bars at every channel's bin.
+    CHECK(color_close(bar_pixel(60), QColor(218, 218, 218), 8));
+    CHECK(color_close(bar_pixel(150), QColor(218, 218, 218), 8));
+    black_input->setValue(30);
+
+    click_tab(1);
+    CHECK(tabs->currentIndex() == 1);
+    CHECK(black_input->value() == 0);
+    CHECK(color_close(bar_pixel(60), tinted(patchy::CurvesChannel::Red), 8));
+    CHECK(color_close(bar_pixel(150), plot, 8));
+    save_widget_artifact("ui_levels_dialog_red_channel_tab", *dialog);
+    black_input->setValue(12);
+
+    click_tab(2);
+    CHECK(tabs->currentIndex() == 2);
+    CHECK(color_close(bar_pixel(150), tinted(patchy::CurvesChannel::Green), 8));
+    CHECK(color_close(bar_pixel(60), plot, 8));
+
+    click_tab(3);
+    CHECK(color_close(bar_pixel(200), tinted(patchy::CurvesChannel::Blue), 8));
+
+    click_tab(0);
+    CHECK(black_input->value() == 30);
+    CHECK(color_close(bar_pixel(200), QColor(218, 218, 218), 8));
+    click_tab(1);
+    CHECK(black_input->value() == 12);
+    inspected = true;
+    dialog->accept();
+  }));
+  const auto result = patchy::ui::request_levels_settings(nullptr, {}, {}, &pixels);
+  CHECK(inspected);
+  CHECK(result.has_value());
+  CHECK(result->black_input == 30);
+  CHECK(result->red.black_input == 12);
+  CHECK(result->channel == patchy::LevelsChannel::Red);
+}
+
+void ui_histogram_display_ceiling_is_four_times_the_mean_non_empty_bin() {
+  // Pinned by Photoshop Levels dialog captures of synthetic histograms
+  // (September 2026): 65,536 samples over all 256 bins clip at 1,024; the same
+  // samples over 12 bins clip at 21,845; 40,000 samples over 122 bins (20 of
+  // them holding a single sample) clip at 1,311.
+  CHECK(patchy::ui::histogram_display_ceiling(0, 0) == 0.0);
+  CHECK(patchy::ui::histogram_display_ceiling(65536, 0) == 0.0);
+  CHECK(std::abs(patchy::ui::histogram_display_ceiling(65536, 256) - 1024.0) < 1e-9);
+  CHECK(std::abs(patchy::ui::histogram_display_ceiling(65536, 12) - 21845.333) < 0.01);
+  CHECK(std::abs(patchy::ui::histogram_display_ceiling(40000, 122) - 1311.475) < 0.01);
+
+  // Bars are linear up to the ceiling and clip there; the tallest bin does
+  // not set the scale.
+  const auto ceiling = patchy::ui::histogram_display_ceiling(65536, 256);
+  CHECK(patchy::ui::histogram_display_fraction(0, ceiling) == 0.0);
+  CHECK(patchy::ui::histogram_display_fraction(100, 0.0) == 0.0);
+  CHECK(std::abs(patchy::ui::histogram_display_fraction(256, ceiling) - 0.25) < 1e-9);
+  CHECK(std::abs(patchy::ui::histogram_display_fraction(512, ceiling) - 0.5) < 1e-9);
+  CHECK(std::abs(patchy::ui::histogram_display_fraction(819, ceiling) - 0.7998) < 0.001);
+  CHECK(patchy::ui::histogram_display_fraction(900, ceiling) < 1.0);
+  CHECK(patchy::ui::histogram_display_fraction(1024, ceiling) == 1.0);
+  CHECK(patchy::ui::histogram_display_fraction(8192, ceiling) == 1.0);
+}
+
+void ui_levels_histogram_clipped_linear_heights_and_auto_shared_sampler() {
+  // Of the 10,000 2x2 sample blocks, 9,000 sit at gray 60, 100 at gray 180 and
+  // 900 spread over grays 61..150 (10 blocks each), all block-aligned so
+  // averaging cannot mix them. The composite histogram then holds 30,000
+  // samples over 92 non-empty bins, so the display ceiling is
+  // 4 * 30,000 / 92 = 1,304: bin 60 (27,000) clips at full height and bin 180
+  // (300) draws at 23%.
+  patchy::PixelBuffer pixels(200, 100, patchy::PixelFormat::rgb8());
+  for (std::int32_t y = 0; y < 100; ++y) {
+    for (std::int32_t x = 0; x < 200; ++x) {
+      auto* pixel = pixels.pixel(x, y);
+      const auto block = (x / 2) + (y / 2) * 100;
+      std::uint8_t value = 60;
+      if (block % 100 == 0) {
+        value = 180;
+      } else if (block % 100 <= 9) {
+        value = static_cast<std::uint8_t>(61 + ((block / 100) * 9 + (block % 100 - 1)) % 90);
+      }
+      pixel[0] = value;
+      pixel[1] = value;
+      pixel[2] = value;
+    }
+  }
+
+  bool inspected = false;
+  QTimer::singleShot(0, guarded([&] {
+    auto* dialog = find_top_level_dialog(QStringLiteral("patchyLevelsDialog"));
+    CHECK(dialog != nullptr);
+    auto* graph = dialog->findChild<QWidget*>(QStringLiteral("levelsInputGraph"));
+    auto* black_input = dialog->findChild<QSpinBox*>(QStringLiteral("levelsBlackInputSpin"));
+    auto* white_input = dialog->findChild<QSpinBox*>(QStringLiteral("levelsWhiteInputSpin"));
+    auto* auto_button = dialog->findChild<QPushButton*>(QStringLiteral("levelsAutoButton"));
+    CHECK(graph != nullptr);
+    CHECK(black_input != nullptr);
+    CHECK(white_input != nullptr);
+    CHECK(auto_button != nullptr);
+
+    // Mirrors LevelsInputGraph's paint: graph_rect(), its column-to-bin mapping and its
+    // bar scale (the graph height less 8). At the 272x116 minimum that is one column per
+    // bin and a 72px scale; a larger dialog (macOS fonts) probes the same bars.
+    const auto image = graph->grab().toImage();
+    const auto graph_rect = QRect(0, 0, graph->width(), graph->height()).adjusted(8, 8, -8, -28);
+    CHECK(graph_rect.width() >= 256);
+    const auto column_for_bin = [&graph_rect](int bin) {
+      for (int x = 0; x < graph_rect.width(); ++x) {
+        const auto first = (x * 256) / graph_rect.width();
+        const auto last = std::max(((x + 1) * 256) / graph_rect.width(), first + 1);
+        if (bin >= first && bin < last) {
+          return graph_rect.left() + x;
+        }
+      }
+      return graph_rect.left();
+    };
+    const auto bar_scale = graph_rect.height() - 8;
+    const auto bottom = graph_rect.bottom();
+    // Bin 180 holds 300 of 30,000 samples: 23% of the ceiling, 17px of a 72px scale.
+    // A probe at 70% of that height must be inside the bar and one at 140% outside it
+    // (sqrt-of-max drew 7px of 72, and normalizing to the tallest bin would draw under 1px).
+    const auto column = column_for_bin(180);
+    const auto bar = static_cast<int>(std::round(0.23 * bar_scale));
+    CHECK(color_close(image.pixelColor(column, bottom - 2), QColor(218, 218, 218), 8));
+    CHECK(color_close(image.pixelColor(column, bottom - (bar * 7) / 10), QColor(218, 218, 218), 8));
+    CHECK(color_close(image.pixelColor(column, bottom - (bar * 14) / 10), QColor(55, 55, 55), 8));
+    // Bin 60 holds 27,000 samples, 20 times the ceiling: it clips to the full scale
+    // instead of stretching the graph.
+    const auto tall_column = column_for_bin(60);
+    CHECK(color_close(image.pixelColor(tall_column, bottom - (bar_scale * 5) / 6), QColor(218, 218, 218), 8));
+    CHECK(color_close(image.pixelColor(tall_column, bottom - (bar_scale - 2)), QColor(218, 218, 218), 8));
+    // A 30-sample bin draws 2% of the scale: visible as a baseline, not tall.
+    const auto floor_column = column_for_bin(100);
+    CHECK(color_close(image.pixelColor(floor_column, bottom - 1), QColor(218, 218, 218), 8));
+    CHECK(color_close(image.pixelColor(floor_column, bottom - 6), QColor(55, 55, 55), 8));
+
+    auto_button->click();
+    CHECK(black_input->value() == 60);
+    CHECK(white_input->value() == 180);
+    inspected = true;
+    dialog->reject();
+  }));
+  const auto result = patchy::ui::request_levels_settings(nullptr, {}, {}, &pixels);
+  CHECK(!result.has_value());
+  CHECK(inspected);
+}
+
+// The point on the Levels input graph that sets `value` (LevelsInputGraph::graph_rect and
+// x_for_value).
+QPoint levels_input_graph_point(const QWidget& graph, int value) {
+  const auto graph_rect = QRect(0, 0, graph.width(), graph.height()).adjusted(8, 8, -8, -28);
+  return QPoint(graph_rect.left() + static_cast<int>(std::lround(value / 255.0 * (graph_rect.width() - 1))),
+                graph_rect.center().y());
+}
+
+// GitHub issue 687: Alt held while the black or white input handle is dragged asks for that
+// end's clipping view, for the channel of the active tab. The gray handle, the output handles
+// and a drag without Alt never ask, and the view ends with Alt, the mouse button or the dialog.
+void ui_levels_alt_drag_input_handles_report_clipping() {
+  using Mode = patchy::ui::CurvesClippingMode;
+  patchy::ui::CurvesDialogHooks hooks;
+  std::vector<std::pair<std::optional<Mode>, patchy::CurvesChannel>> calls;
+  hooks.clipping_changed = [&](std::optional<Mode> mode, patchy::CurvesChannel channel) {
+    calls.emplace_back(mode, channel);
+  };
+  std::vector<bool> preview_states;
+  bool inspected = false;
+  QTimer::singleShot(0, guarded([&] {
+    auto* dialog = find_top_level_dialog(QStringLiteral("patchyLevelsDialog"));
+    CHECK(dialog != nullptr);
+    auto* graph = dialog->findChild<QWidget*>(QStringLiteral("levelsInputGraph"));
+    auto* output = dialog->findChild<QWidget*>(QStringLiteral("levelsOutputRange"));
+    auto* tabs = dialog->findChild<QTabBar*>(QStringLiteral("levelsChannelTabs"));
+    auto* black = dialog->findChild<QSpinBox*>(QStringLiteral("levelsBlackInputSpin"));
+    auto* gamma = dialog->findChild<QSpinBox*>(QStringLiteral("levelsGammaSpin"));
+    auto* white = dialog->findChild<QSpinBox*>(QStringLiteral("levelsWhiteInputSpin"));
+    auto* black_output = dialog->findChild<QSpinBox*>(QStringLiteral("levelsBlackOutputSpin"));
+    auto* preview = dialog->findChild<QCheckBox*>(QStringLiteral("levelsPreviewCheck"));
+    CHECK(graph != nullptr);
+    CHECK(output != nullptr);
+    CHECK(tabs != nullptr);
+    CHECK(black != nullptr);
+    CHECK(gamma != nullptr);
+    CHECK(white != nullptr);
+    CHECK(black_output != nullptr);
+    CHECK(preview != nullptr && preview->isChecked());
+
+    const auto press = [&](QWidget& widget, QPoint point, Qt::KeyboardModifiers modifiers) {
+      send_mouse(widget, QEvent::MouseButtonPress, point, Qt::LeftButton, Qt::LeftButton, modifiers);
+    };
+    const auto move = [&](QWidget& widget, QPoint point, Qt::KeyboardModifiers modifiers) {
+      send_mouse(widget, QEvent::MouseMove, point, Qt::NoButton, Qt::LeftButton, modifiers);
+    };
+    const auto release = [&](QWidget& widget, QPoint point, Qt::KeyboardModifiers modifiers) {
+      send_mouse(widget, QEvent::MouseButtonRelease, point, Qt::LeftButton, Qt::NoButton, modifiers);
+    };
+    const auto at = [&](int value) { return levels_input_graph_point(*graph, value); };
+    const auto last_is = [&](std::optional<Mode> mode, patchy::CurvesChannel channel) {
+      return !calls.empty() && calls.back().first == mode && calls.back().second == channel;
+    };
+
+    // A drag without Alt moves the handle and never asks.
+    press(*graph, at(2), Qt::NoModifier);
+    move(*graph, at(30), Qt::NoModifier);
+    release(*graph, at(30), Qt::NoModifier);
+    CHECK(black->value() >= 28 && black->value() <= 32);
+    CHECK(calls.empty());
+
+    // Alt + the black handle: Shadows, reported once however far the handle moves.
+    press(*graph, at(30), Qt::AltModifier);
+    CHECK(calls.size() == 1U);
+    CHECK(last_is(Mode::Shadows, patchy::CurvesChannel::Rgb));
+    move(*graph, at(60), Qt::AltModifier);
+    CHECK(black->value() >= 58 && black->value() <= 62);
+    CHECK(calls.size() == 1U);
+    // Alt let go mid-drag ends the view; the key event goes to another widget of the dialog.
+    send_key_release(*dialog, Qt::Key_Alt);
+    CHECK(calls.size() == 2U);
+    CHECK(last_is(std::nullopt, patchy::CurvesChannel::Rgb));
+    move(*graph, at(70), Qt::NoModifier);
+    CHECK(calls.size() == 2U);
+    // Alt pressed again brings it back, and so does a move that carries Alt.
+    send_key_press(*dialog, Qt::Key_Alt, Qt::AltModifier);
+    CHECK(calls.size() == 3U);
+    CHECK(last_is(Mode::Shadows, patchy::CurvesChannel::Rgb));
+    move(*graph, at(75), Qt::NoModifier);
+    CHECK(calls.size() == 4U);
+    CHECK(last_is(std::nullopt, patchy::CurvesChannel::Rgb));
+    move(*graph, at(80), Qt::AltModifier);
+    CHECK(calls.size() == 5U);
+    CHECK(last_is(Mode::Shadows, patchy::CurvesChannel::Rgb));
+    release(*graph, at(80), Qt::AltModifier);
+    CHECK(calls.size() == 6U);
+    CHECK(last_is(std::nullopt, patchy::CurvesChannel::Rgb));
+    CHECK(black->value() >= 78 && black->value() <= 82);
+    // Alt with no drag under way does nothing.
+    send_key_press(*dialog, Qt::Key_Alt, Qt::AltModifier);
+    send_key_release(*dialog, Qt::Key_Alt);
+    CHECK(calls.size() == 6U);
+
+    // Alt + the white handle: Highlights.
+    press(*graph, at(250), Qt::AltModifier);
+    CHECK(calls.size() == 7U);
+    CHECK(last_is(Mode::Highlights, patchy::CurvesChannel::Rgb));
+    move(*graph, at(200), Qt::AltModifier);
+    CHECK(white->value() >= 198 && white->value() <= 202);
+    release(*graph, at(200), Qt::AltModifier);
+    CHECK(calls.size() == 8U);
+    CHECK(last_is(std::nullopt, patchy::CurvesChannel::Rgb));
+
+    // Alt + the gray handle (halfway between black and white at gamma 1.00) and Alt + an
+    // output handle move their values and show no clipping.
+    const auto gamma_before = gamma->value();
+    press(*graph, at(140), Qt::AltModifier);
+    move(*graph, at(160), Qt::AltModifier);
+    release(*graph, at(160), Qt::AltModifier);
+    CHECK(gamma->value() != gamma_before);
+    CHECK(black->value() >= 78 && black->value() <= 82);
+    CHECK(white->value() >= 198 && white->value() <= 202);
+    const QPoint output_start(10, output->height() / 3);
+    press(*output, output_start, Qt::AltModifier);
+    move(*output, output_start + QPoint(40, 0), Qt::AltModifier);
+    release(*output, output_start + QPoint(40, 0), Qt::AltModifier);
+    CHECK(black_output->value() > 20);
+    CHECK(calls.size() == 8U);
+
+    // A color tab: the view is for that channel.
+    tabs->setCurrentIndex(1);
+    QApplication::processEvents();
+    CHECK(calls.size() == 8U);
+    press(*graph, at(2), Qt::AltModifier);
+    CHECK(last_is(Mode::Shadows, patchy::CurvesChannel::Red));
+    release(*graph, at(2), Qt::AltModifier);
+    CHECK(last_is(std::nullopt, patchy::CurvesChannel::Red));
+    tabs->setCurrentIndex(3);
+    QApplication::processEvents();
+    press(*graph, at(253), Qt::AltModifier);
+    CHECK(last_is(Mode::Highlights, patchy::CurvesChannel::Blue));
+    release(*graph, at(253), Qt::AltModifier);
+    CHECK(last_is(std::nullopt, patchy::CurvesChannel::Blue));
+    CHECK(calls.size() == 12U);
+
+    // The view reads the canvas, so the adjustment is previewed while it shows even with
+    // Preview unticked, and the unticked state returns after it.
+    preview->setChecked(false);
+    QApplication::processEvents();
+    CHECK(!preview_states.empty() && !preview_states.back());
+    preview_states.clear();
+    press(*graph, at(2), Qt::AltModifier);
+    CHECK(last_is(Mode::Shadows, patchy::CurvesChannel::Blue));
+    process_events_for(80);
+    CHECK(!preview_states.empty());
+    CHECK(std::all_of(preview_states.begin(), preview_states.end(), [](bool enabled) { return enabled; }));
+    release(*graph, at(2), Qt::AltModifier);
+    process_events_for(80);
+    CHECK(!preview_states.back());
+    preview->setChecked(true);
+
+    // Closing with the mouse still down on a handle ends the view.
+    press(*graph, at(253), Qt::AltModifier);
+    CHECK(last_is(Mode::Highlights, patchy::CurvesChannel::Blue));
+    inspected = true;
+    dialog->reject();
+  }));
+
+  const auto result = patchy::ui::request_levels_settings(
+      nullptr, [&](bool enabled, const patchy::ui::LevelsSettings&) { preview_states.push_back(enabled); }, {},
+      nullptr, hooks);
+  CHECK(!result.has_value());
+  CHECK(inspected);
+  CHECK(calls.size() == 16U);
+  CHECK(!calls.empty() && !calls.back().first.has_value());
+}
+
+// The same gesture through the main window (#687): the canvas shows the Curves clipping view
+// of the image as Levels leaves it, per channel on a color tab, and the normal preview returns
+// when Alt or the mouse button is let go and when the dialog closes mid-drag.
+void ui_levels_alt_drag_shows_canvas_clipping_view() {
+  // The committed street photo over a strip of three flat patches the checks read: dark
+  // (10, 20, 30), middle gray and bright (250, 240, 230).
+  QImage photo(patchy::ui::to_qstring(
+      patchy::test::committed_format_fixture_path("readme", "havana_vintage_car_cc0.jpg")));
+  CHECK(!photo.isNull());
+  if (photo.isNull()) {
+    return;
+  }
+  photo = photo.scaledToWidth(600, Qt::SmoothTransformation).convertToFormat(QImage::Format_RGBA8888);
+  constexpr int kStripHeight = 30;
+  const int width = photo.width();
+  const int height = photo.height() + kStripHeight;
+  patchy::PixelBuffer pixels(width, height, patchy::PixelFormat::rgba8());
+  for (int y = 0; y < photo.height(); ++y) {
+    std::memcpy(pixels.pixel(0, y), photo.constScanLine(y), static_cast<std::size_t>(width) * 4U);
+  }
+  const QRect dark_patch(0, photo.height(), width / 3, kStripHeight);
+  const QRect middle_patch(width / 3, photo.height(), width / 3, kStripHeight);
+  const QRect bright_patch(2 * (width / 3), photo.height(), width - 2 * (width / 3), kStripHeight);
+  fill_pixel_rect(pixels, dark_patch, QColor(10, 20, 30));
+  fill_pixel_rect(pixels, middle_patch, QColor(128, 128, 128));
+  fill_pixel_rect(pixels, bright_patch, QColor(250, 240, 230));
+  patchy::Document document(width, height, patchy::PixelFormat::rgba8());
+  auto& layer = document.add_pixel_layer("Photo", std::move(pixels));
+  document.set_active_layer(layer.id());
+
+  patchy::ui::MainWindow window;
+  window.add_document_session(std::move(document), QStringLiteral("Levels Clipping"));
+  show_window(window);
+  auto* canvas = require_canvas(window);
+  canvas->force_refresh();
+  QApplication::processEvents();
+  const auto dark = [&] { return canvas_pixel(*canvas, dark_patch.center()); };
+  const auto middle = [&] { return canvas_pixel(*canvas, middle_patch.center()); };
+  const auto bright = [&] { return canvas_pixel(*canvas, bright_patch.center()); };
+  CHECK(color_close(dark(), QColor(10, 20, 30), 4));
+  CHECK(color_close(bright(), QColor(250, 240, 230), 4));
+  CHECK(!canvas->curves_clipping_preview_mode().has_value());
+
+  using Mode = patchy::ui::CurvesClippingMode;
+  // The destructive preview renders on a worker: wait for the canvas to show `expected`.
+  const auto shows = [&](const std::function<QColor()>& read, QColor expected) {
+    for (int attempt = 0; attempt < 60; ++attempt) {
+      if (color_close(read(), expected, 6)) {
+        return true;
+      }
+      process_events_for(50);
+    }
+    return false;
+  };
+
+  bool inspected = false;
+  QTimer::singleShot(0, guarded([&] {
+    auto* dialog = find_top_level_dialog(QStringLiteral("patchyLevelsDialog"));
+    CHECK(dialog != nullptr);
+    auto* graph = dialog->findChild<QWidget*>(QStringLiteral("levelsInputGraph"));
+    auto* tabs = dialog->findChild<QTabBar*>(QStringLiteral("levelsChannelTabs"));
+    auto* black = dialog->findChild<QSpinBox*>(QStringLiteral("levelsBlackInputSpin"));
+    auto* white = dialog->findChild<QSpinBox*>(QStringLiteral("levelsWhiteInputSpin"));
+    CHECK(graph != nullptr);
+    CHECK(tabs != nullptr);
+    CHECK(black != nullptr);
+    CHECK(white != nullptr);
+    const auto press = [&](int value, Qt::KeyboardModifiers modifiers) {
+      send_mouse(*graph, QEvent::MouseButtonPress, levels_input_graph_point(*graph, value), Qt::LeftButton,
+                 Qt::LeftButton, modifiers);
+    };
+    const auto move = [&](int value, Qt::KeyboardModifiers modifiers) {
+      send_mouse(*graph, QEvent::MouseMove, levels_input_graph_point(*graph, value), Qt::NoButton, Qt::LeftButton,
+                 modifiers);
+    };
+    const auto release = [&](int value, Qt::KeyboardModifiers modifiers) {
+      send_mouse(*graph, QEvent::MouseButtonRelease, levels_input_graph_point(*graph, value), Qt::LeftButton,
+                 Qt::NoButton, modifiers);
+    };
+
+    // A drag without Alt keeps the normal preview.
+    press(2, Qt::NoModifier);
+    move(25, Qt::NoModifier);
+    CHECK(!canvas->curves_clipping_preview_mode().has_value());
+    release(25, Qt::NoModifier);
+    CHECK(!canvas->curves_clipping_preview_mode().has_value());
+
+    // Black handle at 25 with Alt: the dark patch's red and green are at or under the black
+    // point, so they clip to 0 and the Shadows view shows the patch blue on white.
+    press(25, Qt::AltModifier);
+    CHECK(canvas->curves_clipping_preview_mode() == Mode::Shadows);
+    CHECK(black->value() >= 23 && black->value() <= 27);
+    CHECK(shows(dark, QColor(0, 0, 255)));
+    CHECK(color_close(middle(), QColor(Qt::white), 6));
+    CHECK(color_close(bright(), QColor(Qt::white), 6));
+    // Further right every channel of the dark patch clips: black.
+    move(100, Qt::AltModifier);
+    CHECK(canvas->curves_clipping_preview_mode() == Mode::Shadows);
+    CHECK(shows(dark, QColor(Qt::black)));
+    CHECK(color_close(middle(), QColor(Qt::white), 6));
+    {
+      // The issue shot: the window with the dialog placed over its right side.
+      dialog->move(window.mapToGlobal(QPoint(window.width() - dialog->width() - 24, 150)));
+      QApplication::processEvents();
+      auto shot = capture_widget_artifact("ui_levels_alt_drag_shadow_clipping_window", window);
+      const auto dialog_shot = capture_widget_artifact("ui_levels_alt_drag_shadow_clipping_dialog", *dialog);
+      if (!shot.isNull() && !dialog_shot.isNull()) {
+        QPainter painter(&shot);
+        const QRectF target(QPointF(dialog->mapToGlobal(QPoint(0, 0)) - window.mapToGlobal(QPoint(0, 0))),
+                            QSizeF(dialog->size()));
+        painter.drawImage(target, dialog_shot);
+        painter.setPen(QPen(patchy::ui::theme().levels_graph_border, 1));
+        painter.drawRect(target.adjusted(-0.5, -0.5, 0.5, 0.5));
+        painter.end();
+        save_image_artifact("ui_levels_alt_drag_shadow_clipping", shot);
+      }
+    }
+
+    // Alt let go mid-drag: the normal preview (the gray patch darker, not the white of the
+    // clipping view); Alt again: the view is back.
+    send_key_release(*dialog, Qt::Key_Alt);
+    CHECK(!canvas->curves_clipping_preview_mode().has_value());
+    CHECK(shows(middle, QColor(46, 46, 46)));
+    send_key_press(*dialog, Qt::Key_Alt, Qt::AltModifier);
+    CHECK(canvas->curves_clipping_preview_mode() == Mode::Shadows);
+    CHECK(color_close(middle(), QColor(Qt::white), 6));
+    release(100, Qt::AltModifier);
+    CHECK(!canvas->curves_clipping_preview_mode().has_value());
+    CHECK(shows(middle, QColor(46, 46, 46)));
+
+    // White handle at 235 with Alt: the bright patch's red and green reach the white point
+    // and its blue does not, so the Highlights view shows it yellow on black.
+    press(253, Qt::AltModifier);
+    CHECK(canvas->curves_clipping_preview_mode() == Mode::Highlights);
+    move(235, Qt::AltModifier);
+    CHECK(white->value() >= 234 && white->value() <= 236);
+    CHECK(shows(bright, QColor(255, 255, 0)));
+    CHECK(color_close(dark(), QColor(Qt::black), 6));
+    CHECK(color_close(middle(), QColor(Qt::black), 6));
+    save_widget_artifact("ui_levels_alt_drag_highlight_clipping", *canvas);
+    release(235, Qt::AltModifier);
+    CHECK(!canvas->curves_clipping_preview_mode().has_value());
+
+    // The Red tab: only red is judged. With the composite back at its defaults and red's
+    // black handle at 100, the dark patch's red clips: cyan on white.
+    black->setValue(0);
+    white->setValue(255);
+    tabs->setCurrentIndex(1);
+    QApplication::processEvents();
+    press(2, Qt::AltModifier);
+    move(100, Qt::AltModifier);
+    CHECK(canvas->curves_clipping_preview_mode() == Mode::Shadows);
+    CHECK(shows(dark, QColor(0, 255, 255)));
+    CHECK(color_close(middle(), QColor(Qt::white), 6));
+    save_widget_artifact("ui_levels_alt_drag_red_shadow_clipping", *canvas);
+
+    // Escape with the mouse still down: the dialog and the view both go.
+    inspected = true;
+    dialog->reject();
+  }));
+  require_action(window, "imageAdjustLevelsAction")->trigger();
+  QApplication::processEvents();
+  CHECK(inspected);
+  CHECK(!canvas->curves_clipping_preview_mode().has_value());
+  CHECK(color_close(dark(), QColor(10, 20, 30), 4));
+  CHECK(color_close(middle(), QColor(128, 128, 128), 4));
+  CHECK(color_close(bright(), QColor(250, 240, 230), 4));
+}
+
+// The clipping view the canvas builds over worker bands (#687 follow-up) matches a plain
+// per-pixel reading of the rules in curves_clipping_preview.hpp, for every mode and
+// channel, with and without alpha, on one thread or several.
+void ui_curves_clipping_preview_bands_match_reference() {
+  using Mode = patchy::ui::CurvesClippingMode;
+  std::uint64_t state = 687U;
+  const auto next = [&state] {
+    state += 0x9E3779B97F4A7C15ULL;
+    auto z = state;
+    z = (z ^ (z >> 30U)) * 0xBF58476D1CE4E5B9ULL;
+    z = (z ^ (z >> 27U)) * 0x94D049BB133111EBULL;
+    return z ^ (z >> 31U);
+  };
+  // Mostly 0 and 255, so every clipping case shows up often.
+  const auto component = [&next] {
+    const auto z = next();
+    switch (z & 3U) {
+      case 0:
+        return 0;
+      case 1:
+        return 255;
+      default:
+        return static_cast<int>((z >> 8U) & 255U);
+    }
+  };
+  const auto make = [&](QImage::Format format) {
+    QImage image(301, 700, format);
+    for (int y = 0; y < image.height(); ++y) {
+      for (int x = 0; x < image.width(); ++x) {
+        image.setPixelColor(x, y, QColor(component(), component(), component(), component()));
+      }
+    }
+    return image;
+  };
+  const auto reference = [](const QImage& source, Mode mode, std::optional<patchy::CurvesChannel> channel) {
+    const bool has_alpha = source.hasAlphaChannel();
+    const auto format = has_alpha ? QImage::Format_RGBA8888 : QImage::Format_RGB888;
+    const auto normalized = source.convertToFormat(format);
+    const int background = mode == Mode::Shadows ? 255 : mode == Mode::Highlights ? 0 : 128;
+    const std::array<bool, 3> selected{
+        !channel || *channel == patchy::CurvesChannel::Rgb || *channel == patchy::CurvesChannel::Red,
+        !channel || *channel == patchy::CurvesChannel::Rgb || *channel == patchy::CurvesChannel::Green,
+        !channel || *channel == patchy::CurvesChannel::Rgb || *channel == patchy::CurvesChannel::Blue};
+    QImage result(normalized.size(), format);
+    const int stride = has_alpha ? 4 : 3;
+    for (int y = 0; y < normalized.height(); ++y) {
+      const auto* in = normalized.constScanLine(y);
+      auto* out = result.scanLine(y);
+      for (int x = 0; x < normalized.width(); ++x) {
+        for (int c = 0; c < 3; ++c) {
+          const int value = in[x * stride + c];
+          int shown = background;
+          if (selected[static_cast<std::size_t>(c)]) {
+            if (value == 0 && mode != Mode::Highlights) {
+              shown = 0;
+            } else if (value == 255 && mode != Mode::Shadows) {
+              shown = 255;
+            }
+          }
+          out[x * stride + c] = static_cast<uchar>(shown);
+        }
+        if (has_alpha) {
+          out[x * stride + 3] = in[x * stride + 3];
+        }
+      }
+    }
+    return result;
+  };
+
+  int compared = 0;
+  for (const auto format : {QImage::Format_RGBA8888, QImage::Format_RGB888, QImage::Format_ARGB32_Premultiplied}) {
+    const auto source = make(format);
+    for (const auto mode : {Mode::Shadows, Mode::Highlights, Mode::Both}) {
+      for (const auto channel : std::vector<std::optional<patchy::CurvesChannel>>{
+               std::nullopt, patchy::CurvesChannel::Rgb, patchy::CurvesChannel::Red, patchy::CurvesChannel::Green,
+               patchy::CurvesChannel::Blue}) {
+        const auto expected = reference(source, mode, channel);
+        CHECK(patchy::ui::render_curves_clipping_preview(source, mode, channel) == expected);
+        for (const int workers : {1, 2, 6, 64}) {
+          CHECK(patchy::ui::render_curves_clipping_preview(source, mode, channel, workers) == expected);
+          ++compared;
+        }
+      }
+    }
+  }
+  CHECK(compared == 3 * 3 * 5 * 4);
+}
+
+// With Preview unticked a Levels or Curves drag sends no preview at all (#687 follow-up):
+// the first unticked request takes the preview away and repeats would only redo that.
+// Levels' Alt clipping view still previews while it shows and goes when it ends.
+void ui_levels_and_curves_preview_off_drags_send_no_preview() {
+  patchy::ui::CurvesDialogHooks hooks;
+  hooks.clipping_changed = [](std::optional<patchy::ui::CurvesClippingMode>, patchy::CurvesChannel) {};
+  std::vector<bool> levels_states;
+  bool levels_inspected = false;
+  QTimer::singleShot(0, guarded([&] {
+    auto* dialog = find_top_level_dialog(QStringLiteral("patchyLevelsDialog"));
+    CHECK(dialog != nullptr);
+    auto* graph = dialog->findChild<QWidget*>(QStringLiteral("levelsInputGraph"));
+    auto* preview = dialog->findChild<QCheckBox*>(QStringLiteral("levelsPreviewCheck"));
+    auto* black = dialog->findChild<QSpinBox*>(QStringLiteral("levelsBlackInputSpin"));
+    CHECK(graph != nullptr);
+    CHECK(preview != nullptr && preview->isChecked());
+    CHECK(black != nullptr);
+    const auto at = [&](int value) { return levels_input_graph_point(*graph, value); };
+    const auto plain_drag = [&] {
+      send_mouse(*graph, QEvent::MouseButtonPress, at(black->value()), Qt::LeftButton, Qt::LeftButton);
+      for (const int value : {20, 45, 70, 30}) {
+        send_mouse(*graph, QEvent::MouseMove, at(value), Qt::NoButton, Qt::LeftButton);
+        process_events_for(50);
+      }
+      send_mouse(*graph, QEvent::MouseButtonRelease, at(30), Qt::LeftButton, Qt::NoButton);
+      process_events_for(80);
+    };
+    process_events_for(80);
+    levels_states.clear();
+
+    preview->setChecked(false);
+    process_events_for(80);
+    CHECK(levels_states == std::vector<bool>{false});
+    plain_drag();
+    black->setValue(12);
+    process_events_for(80);
+    CHECK(levels_states.size() == 1U);
+
+    // Alt: the clipping view previews while it shows, then the preview goes again.
+    send_mouse(*graph, QEvent::MouseButtonPress, at(black->value()), Qt::LeftButton, Qt::LeftButton,
+               Qt::AltModifier);
+    process_events_for(80);
+    CHECK(levels_states.size() >= 2U && levels_states.back());
+    send_mouse(*graph, QEvent::MouseMove, at(60), Qt::NoButton, Qt::LeftButton, Qt::AltModifier);
+    process_events_for(80);
+    send_mouse(*graph, QEvent::MouseButtonRelease, at(60), Qt::LeftButton, Qt::NoButton, Qt::AltModifier);
+    process_events_for(80);
+    CHECK(!levels_states.back());
+    const auto after_alt = levels_states.size();
+    plain_drag();
+    CHECK(levels_states.size() == after_alt);
+
+    preview->setChecked(true);
+    process_events_for(80);
+    CHECK(levels_states.back());
+    levels_inspected = true;
+    dialog->reject();
+  }));
+  const auto levels = patchy::ui::request_levels_settings(
+      nullptr, [&](bool enabled, const patchy::ui::LevelsSettings&) { levels_states.push_back(enabled); }, {},
+      nullptr, hooks);
+  CHECK(!levels.has_value());
+  CHECK(levels_inspected);
+
+  std::vector<bool> curves_states;
+  bool curves_inspected = false;
+  QTimer::singleShot(0, guarded([&] {
+    auto* dialog = find_top_level_dialog(QStringLiteral("patchyCurvesDialog"));
+    CHECK(dialog != nullptr);
+    auto* graph = dialog->findChild<QWidget*>(QStringLiteral("curvesGraph"));
+    auto* preview = dialog->findChild<QCheckBox*>(QStringLiteral("curvesPreviewCheck"));
+    CHECK(graph != nullptr);
+    CHECK(preview != nullptr && preview->isChecked());
+    process_events_for(80);
+    curves_states.clear();
+    preview->setChecked(false);
+    process_events_for(80);
+    CHECK(curves_states == std::vector<bool>{false});
+    click_curves_graph(*graph, 64, 40);
+    process_events_for(80);
+    click_curves_graph(*graph, 192, 220);
+    process_events_for(80);
+    CHECK(curves_states.size() == 1U);
+    preview->setChecked(true);
+    process_events_for(80);
+    CHECK(curves_states.size() == 2U && curves_states.back());
+    curves_inspected = true;
+    dialog->reject();
+  }));
+  const auto curves = patchy::ui::request_curves_settings(
+      nullptr, [&](bool enabled, const patchy::ui::CurvesSettings&) { curves_states.push_back(enabled); }, {}, {},
+      hooks);
+  CHECK(!curves.has_value());
+  CHECK(curves_inspected);
+}
+
+// Levels on an image large enough that its previews refresh the canvas in the background
+// (#687 follow-up), zoomed out so the view draws from mip levels. With Preview unticked a
+// plain handle drag leaves the canvas idle: no refresh, no busy notice. An Alt+drag shows
+// the clipping view with Preview ticked or not, and it follows the handle while the
+// background refreshes land.
+void ui_levels_large_image_alt_drag_follows_handle_and_preview_off_stays_idle() {
+  constexpr int kWidth = 1500;
+  constexpr int kHeight = 900;
+  patchy::PixelBuffer pixels(kWidth, kHeight, patchy::PixelFormat::rgba8());
+  const QRect dark_patch(0, 0, kWidth / 3, kHeight);
+  const QRect middle_patch(kWidth / 3, 0, kWidth / 3, kHeight);
+  const QRect bright_patch(2 * (kWidth / 3), 0, kWidth - 2 * (kWidth / 3), kHeight);
+  fill_pixel_rect(pixels, dark_patch, QColor(10, 20, 30));
+  fill_pixel_rect(pixels, middle_patch, QColor(128, 128, 128));
+  fill_pixel_rect(pixels, bright_patch, QColor(250, 240, 230));
+  patchy::Document document(kWidth, kHeight, patchy::PixelFormat::rgba8());
+  auto& layer = document.add_pixel_layer("Photo", std::move(pixels));
+  document.set_active_layer(layer.id());
+
+  patchy::ui::MainWindow window;
+  window.add_document_session(std::move(document), QStringLiteral("Levels Large Clipping"));
+  show_window(window);
+  auto* canvas = require_canvas(window);
+  canvas->fit_to_view();
+  canvas->force_refresh();
+  QApplication::processEvents();
+  CHECK(canvas->view_zoom() < 1.0);
+  const auto settle = [&] {
+    for (int attempt = 0; attempt < 200 && !canvas->render_settled(); ++attempt) {
+      process_events_for(25);
+    }
+    process_events_for(50);
+  };
+  settle();
+  const auto dark = [&] { return canvas_pixel(*canvas, dark_patch.center()); };
+  const auto middle = [&] { return canvas_pixel(*canvas, middle_patch.center()); };
+  const auto bright = [&] { return canvas_pixel(*canvas, bright_patch.center()); };
+  const auto shows = [&](const std::function<QColor()>& read, QColor expected) {
+    for (int attempt = 0; attempt < 100; ++attempt) {
+      if (color_close(read(), expected, 6)) {
+        return true;
+      }
+      process_events_for(40);
+    }
+    return false;
+  };
+  CHECK(color_close(middle(), QColor(128, 128, 128), 4));
+
+  using Mode = patchy::ui::CurvesClippingMode;
+  bool inspected = false;
+  QTimer::singleShot(0, guarded([&] {
+    auto* dialog = find_top_level_dialog(QStringLiteral("patchyLevelsDialog"));
+    CHECK(dialog != nullptr);
+    auto* graph = dialog->findChild<QWidget*>(QStringLiteral("levelsInputGraph"));
+    auto* preview = dialog->findChild<QCheckBox*>(QStringLiteral("levelsPreviewCheck"));
+    CHECK(graph != nullptr);
+    CHECK(preview != nullptr);
+    const auto send = [&](QEvent::Type type, int value, Qt::MouseButton button, Qt::MouseButtons buttons,
+                          Qt::KeyboardModifiers modifiers) {
+      send_mouse(*graph, type, levels_input_graph_point(*graph, value), button, buttons, modifiers);
+    };
+    settle();
+
+    // Preview unticked, no Alt: nothing renders and no busy notice runs.
+    preview->setChecked(false);
+    settle();
+    const auto before = canvas->render_cache_diagnostics();
+    send(QEvent::MouseButtonPress, 0, Qt::LeftButton, Qt::LeftButton, Qt::NoModifier);
+    for (const int value : {30, 90, 140, 60}) {
+      send(QEvent::MouseMove, value, Qt::NoButton, Qt::LeftButton, Qt::NoModifier);
+      process_events_for(60);
+    }
+    send(QEvent::MouseButtonRelease, 60, Qt::LeftButton, Qt::NoButton, Qt::NoModifier);
+    process_events_for(300);
+    const auto after = canvas->render_cache_diagnostics();
+    CHECK(after.full_refreshes == before.full_refreshes);
+    CHECK(after.live_preview_async_refreshes == before.live_preview_async_refreshes);
+    CHECK(after.partial_patches == before.partial_patches);
+    CHECK(after.processing_overlay_frames == before.processing_overlay_frames);
+    CHECK(!canvas->processing_overlay_visible());
+    CHECK(color_close(middle(), QColor(128, 128, 128), 4));
+
+    // Preview unticked, Alt: the clipping view shows and follows the handle (the middle
+    // patch clips once the black input passes 128), then the unadjusted image returns.
+    send(QEvent::MouseButtonPress, 60, Qt::LeftButton, Qt::LeftButton, Qt::AltModifier);
+    CHECK(canvas->curves_clipping_preview_mode() == Mode::Shadows);
+    CHECK(shows(dark, QColor(Qt::black)));
+    CHECK(shows(middle, QColor(Qt::white)));
+    send(QEvent::MouseMove, 150, Qt::NoButton, Qt::LeftButton, Qt::AltModifier);
+    CHECK(shows(middle, QColor(Qt::black)));
+    CHECK(color_close(bright(), QColor(Qt::white), 6));
+    send(QEvent::MouseMove, 90, Qt::NoButton, Qt::LeftButton, Qt::AltModifier);
+    CHECK(shows(middle, QColor(Qt::white)));
+    send(QEvent::MouseButtonRelease, 90, Qt::LeftButton, Qt::NoButton, Qt::AltModifier);
+    CHECK(!canvas->curves_clipping_preview_mode().has_value());
+    CHECK(shows(middle, QColor(128, 128, 128)));
+    CHECK(shows(dark, QColor(10, 20, 30)));
+
+    // Preview ticked: the same, through the background refreshes of the preview itself.
+    preview->setChecked(true);
+    settle();
+    const auto refreshes_before = canvas->render_cache_diagnostics().live_preview_async_refreshes;
+    send(QEvent::MouseButtonPress, 90, Qt::LeftButton, Qt::LeftButton, Qt::AltModifier);
+    CHECK(shows(middle, QColor(Qt::white)));
+    for (const int value : {110, 135, 150}) {
+      send(QEvent::MouseMove, value, Qt::NoButton, Qt::LeftButton, Qt::AltModifier);
+      process_events_for(20);
+    }
+    CHECK(shows(middle, QColor(Qt::black)));
+    send(QEvent::MouseMove, 60, Qt::NoButton, Qt::LeftButton, Qt::AltModifier);
+    CHECK(shows(middle, QColor(Qt::white)));
+    CHECK(shows(dark, QColor(Qt::black)));
+    CHECK(canvas->render_cache_diagnostics().live_preview_async_refreshes > refreshes_before);
+    send(QEvent::MouseButtonRelease, 60, Qt::LeftButton, Qt::NoButton, Qt::AltModifier);
+    CHECK(!canvas->curves_clipping_preview_mode().has_value());
+    inspected = true;
+    dialog->reject();
+  }));
+  require_action(window, "imageAdjustLevelsAction")->trigger();
+  QApplication::processEvents();
+  CHECK(inspected);
+  settle();
+  CHECK(color_close(middle(), QColor(128, 128, 128), 4));
+}
+
+void ui_hue_saturation_dialog_adjusts_selected_pixels() {
+  patchy::ui::MainWindow window;
+  show_window(window);
+  auto* canvas = require_canvas(window);
+
+  canvas->set_primary_color(QColor(255, 0, 0));
+  use_solid_fill_settings(canvas);
+  require_action(window, "layerFillForegroundAction")->trigger();
+  QApplication::processEvents();
+  CHECK(color_close(canvas_pixel(*canvas, QPoint(70, 70)), QColor(255, 0, 0), 8));
+
+  require_action_by_text(window, QStringLiteral("Marquee"))->trigger();
+  drag(*canvas, canvas->widget_position_for_document_point(QPoint(40, 40)),
+       canvas->widget_position_for_document_point(QPoint(120, 120)));
+  QApplication::processEvents();
+
+  bool saw_hue_preview = false;
+  QTimer::singleShot(0, guarded([&] {
+    for (auto* widget : QApplication::topLevelWidgets()) {
+      if (widget->objectName() != QStringLiteral("patchyHueSaturationDialog")) {
+        continue;
+      }
+      auto* dialog = qobject_cast<QDialog*>(widget);
+      CHECK(dialog != nullptr);
+      auto* hue = dialog->findChild<QSpinBox*>(QStringLiteral("hueSaturationHueSpin"));
+      CHECK(hue != nullptr);
+      hue->setValue(120);
+      process_events_for(120);
+      saw_hue_preview = color_close(canvas_pixel(*canvas, QPoint(70, 70)), QColor(0, 255, 0), 12);
+      dialog->reject();
+      return;
+    }
+    CHECK(false);
+  }));
+  require_action(window, "imageAdjustHueSaturationAction")->trigger();
+  QApplication::processEvents();
+  CHECK(saw_hue_preview);
+  CHECK(color_close(canvas_pixel(*canvas, QPoint(70, 70)), QColor(255, 0, 0), 12));
+
+  accept_hue_saturation_dialog(120, 0, 0);
+  require_action(window, "imageAdjustHueSaturationAction")->trigger();
+  QApplication::processEvents();
+  require_action(window, "editDeselectAction")->trigger();
+  QApplication::processEvents();
+
+  CHECK(color_close(canvas_pixel(*canvas, QPoint(70, 70)), QColor(0, 255, 0), 12));
+  CHECK(color_close(canvas_pixel(*canvas, QPoint(180, 70)), QColor(255, 0, 0), 12));
+  save_widget_artifact("ui_hue_saturation_selection", *canvas);
+}
+
+void check_adjustment_white_mask(const patchy::Layer& layer, int width, int height) {
+  CHECK(layer.kind() == patchy::LayerKind::Adjustment);
+  CHECK(layer.mask().has_value());
+  const auto& mask = *layer.mask();
+  CHECK(mask.bounds.x == 0 && mask.bounds.y == 0);
+  CHECK(mask.bounds.width == width && mask.bounds.height == height);
+  CHECK(mask.default_color == 255);
+  CHECK(!mask.disabled);
+  CHECK(mask.pixels.width() == width && mask.pixels.height() == height);
+  CHECK(mask.pixels.format() == patchy::PixelFormat::gray8());
+  CHECK(std::all_of(mask.pixels.data().begin(), mask.pixels.data().end(),
+                    [](std::uint8_t value) { return value == 255; }));
+}
+
+void ui_adjustment_layer_inserts_above_selection_with_white_mask() {
+  for (const bool nested : {false, true}) {
+    for (const bool multiple : {false, true}) {
+      patchy::Document source(48, 32, patchy::PixelFormat::rgba8());
+      patchy::Layer folder(source.allocate_layer_id(), "Folder", patchy::LayerKind::Group);
+      const auto folder_id = folder.id();
+      std::array<patchy::LayerId, 3> ids{};
+      const std::array<const char*, 3> names{"Lower", "Middle", "Upper"};
+      for (std::size_t index = 0; index < names.size(); ++index) {
+        patchy::Layer layer(source.allocate_layer_id(), names[index],
+                            solid_pixels(48, 32, patchy::PixelFormat::rgba8(), QColor(200, 40, 20)));
+        ids[index] = layer.id();
+        if (nested) folder.add_child(std::move(layer));
+        else source.add_layer(std::move(layer));
+      }
+      if (nested) source.add_layer(std::move(folder));
+      source.set_active_layer(ids[1]);
+
+      patchy::ui::MainWindow window;
+      window.add_document_session(std::move(source), QStringLiteral("Adjustment Placement"));
+      show_window(window);
+      auto* list = window.findChild<QListWidget*>(QStringLiteral("layerList"));
+      CHECK(list != nullptr);
+      auto& document = patchy::ui::MainWindowTestAccess::document(window);
+      const auto& read_only = std::as_const(document);
+      if (multiple) {
+        list->setCurrentItem(require_layer_item(*list, QStringLiteral("Lower")),
+                             QItemSelectionModel::ClearAndSelect);
+        require_layer_item(*list, QStringLiteral("Middle"))->setSelected(true);
+        CHECK(document.active_layer_id() == ids[0]);
+        CHECK(list->selectedItems().size() == 2);
+      }
+      const auto before = patchy::layer_tree_signature(read_only.layers());
+      const auto undo_before = patchy::ui::MainWindowTestAccess::active_session_undo_depth(window);
+      require_action(window, "layerNewInvertAdjustmentAction")->trigger();
+      QApplication::processEvents();
+      CHECK(document.active_layer_id().has_value());
+      const auto adjustment_id = *document.active_layer_id();
+      const auto check_created = [&] {
+        const auto& siblings = nested ? read_only.find_layer(folder_id)->children() : read_only.layers();
+        CHECK(siblings.size() == 4);
+        CHECK(siblings[0].id() == ids[0]);
+        CHECK(siblings[1].id() == ids[1]);
+        CHECK(siblings[2].id() == adjustment_id);
+        CHECK(siblings[3].id() == ids[2]);
+        check_adjustment_white_mask(siblings[2], 48, 32);
+        CHECK(document.active_layer_id() == adjustment_id);
+        auto* item = require_layer_item(*list, QStringLiteral("Invert"));
+        CHECK(list->row(item) + 1 == list->row(require_layer_item(*list, QStringLiteral("Middle"))));
+        CHECK(item->isSelected() && list->selectedItems().size() == 1);
+        auto* row = list->itemWidget(item);
+        CHECK(row != nullptr);
+        CHECK(row->findChild<QLabel*>(QStringLiteral("layerMaskThumbnail")) != nullptr);
+      };
+      check_created();
+      CHECK(patchy::ui::MainWindowTestAccess::active_session_undo_depth(window) == undo_before + 1);
+      patchy::ui::MainWindowTestAccess::undo(window);
+      CHECK(patchy::layer_tree_signature(read_only.layers()) == before);
+      patchy::ui::MainWindowTestAccess::redo(window);
+      check_created();
+    }
+  }
+}
+
+void ui_adjustment_layer_preview_uses_topmost_selection_and_cancels_cleanly() {
+  patchy::Document source(48, 32, patchy::PixelFormat::rgba8());
+  const auto lower_id = source.add_pixel_layer(
+      "Lower", solid_pixels(48, 32, patchy::PixelFormat::rgba8(), QColor(255, 0, 0))).id();
+  const auto middle_id = source.add_pixel_layer(
+      "Middle", solid_pixels(48, 32, patchy::PixelFormat::rgba8(), QColor(255, 0, 0))).id();
+  patchy::Layer upper(source.allocate_layer_id(), "Upper",
+                       solid_pixels(24, 32, patchy::PixelFormat::rgba8(), QColor(0, 0, 255)));
+  const auto upper_id = upper.id();
+  source.add_layer(std::move(upper));
+
+  patchy::ui::MainWindow window;
+  window.add_document_session(std::move(source), QStringLiteral("Adjustment Preview Placement"));
+  show_window(window);
+  auto* list = window.findChild<QListWidget*>(QStringLiteral("layerList"));
+  CHECK(list != nullptr);
+  auto& document = patchy::ui::MainWindowTestAccess::document(window);
+  const auto& read_only = std::as_const(document);
+  list->setCurrentItem(require_layer_item(*list, QStringLiteral("Lower")),
+                       QItemSelectionModel::ClearAndSelect);
+  require_layer_item(*list, QStringLiteral("Middle"))->setSelected(true);
+  CHECK(document.active_layer_id() == lower_id);
+  const auto before = patchy::layer_tree_signature(read_only.layers());
+  const auto undo_before = patchy::ui::MainWindowTestAccess::active_session_undo_depth(window);
+
+  const auto check_preview = [&] {
+    CHECK(read_only.layers().size() == 4);
+    CHECK(read_only.layers()[0].id() == lower_id);
+    CHECK(read_only.layers()[1].id() == middle_id);
+    CHECK(read_only.layers()[3].id() == upper_id);
+    check_adjustment_white_mask(read_only.layers()[2], 48, 32);
+    const auto composite = patchy::Compositor{}.flatten_rgb8(read_only);
+    CHECK(composite.pixel(8, 16)[0] == 0 && composite.pixel(8, 16)[2] == 255);
+    CHECK(composite.pixel(36, 16)[0] == 0 && composite.pixel(36, 16)[1] == 255);
+  };
+  for (const bool accept : {false, true}) {
+    bool drove_dialog = false;
+    QTimer::singleShot(0, [&] {
+      try {
+        auto* dialog = find_top_level_dialog(QStringLiteral("patchyHueSaturationDialog"));
+        CHECK(dialog != nullptr);
+        auto* hue = dialog->findChild<QSpinBox*>(QStringLiteral("hueSaturationHueSpin"));
+        auto* preview = dialog->findChild<QCheckBox*>(QStringLiteral("hueSaturationPreviewCheck"));
+        CHECK(hue != nullptr && preview != nullptr);
+        hue->setValue(120);
+        CHECK(process_events_until([&] { return read_only.layers().size() == 4; }, 3000));
+        check_preview();
+        CHECK(document.active_layer_id() == lower_id);
+        preview->setChecked(false);
+        CHECK(process_events_until([&] { return read_only.layers().size() == 3; }, 3000));
+        CHECK(patchy::layer_tree_signature(read_only.layers()) == before);
+        preview->setChecked(true);
+        CHECK(process_events_until([&] { return read_only.layers().size() == 4; }, 3000));
+        check_preview();
+        drove_dialog = true;
+        if (accept) dialog->accept();
+        else dialog->reject();
+      } catch (...) {
+        if (!patchy::ui::unwind_non_modal_dialog_loop(std::current_exception())) throw;
+      }
+    });
+    require_action(window, "layerNewHueSaturationAdjustmentAction")->trigger();
+    CHECK(drove_dialog);
+    if (accept) {
+      check_preview();
+      CHECK(document.active_layer_id() == read_only.layers()[2].id());
+      CHECK(patchy::ui::MainWindowTestAccess::active_session_undo_depth(window) == undo_before + 1);
+      patchy::ui::MainWindowTestAccess::undo(window);
+    } else {
+      CHECK(document.active_layer_id() == lower_id);
+      CHECK(list->selectedItems().size() == 2);
+      CHECK(patchy::ui::MainWindowTestAccess::active_session_undo_depth(window) == undo_before);
+    }
+    CHECK(patchy::layer_tree_signature(read_only.layers()) == before);
+  }
+}
+
+void ui_hue_saturation_creates_masked_adjustment_layer() {
+  patchy::ui::MainWindow window;
+  show_window(window);
+  auto* canvas = require_canvas(window);
+  auto* layer_list = window.findChild<QListWidget*>(QStringLiteral("layerList"));
+  CHECK(layer_list != nullptr);
+
+  canvas->set_primary_color(QColor(255, 0, 0));
+  use_solid_fill_settings(canvas);
+  require_action(window, "layerFillForegroundAction")->trigger();
+  QApplication::processEvents();
+
+  require_action_by_text(window, QStringLiteral("Marquee"))->trigger();
+  drag(*canvas, canvas->widget_position_for_document_point(QPoint(40, 40)),
+       canvas->widget_position_for_document_point(QPoint(120, 120)));
+  QApplication::processEvents();
+
+  bool saw_adjustment_layer_preview = false;
+  bool saw_adjustment_layer_edit_lock = false;
+  QTimer::singleShot(0, guarded([&] {
+    for (auto* widget : QApplication::topLevelWidgets()) {
+      if (widget->objectName() != QStringLiteral("patchyHueSaturationDialog")) {
+        continue;
+      }
+      auto* dialog = qobject_cast<QDialog*>(widget);
+      CHECK(dialog != nullptr);
+      CHECK(!dialog->isModal());
+      CHECK(dialog->windowModality() == Qt::NonModal);
+      CHECK(canvas->edit_locked());
+      CHECK(!layer_list->isEnabled());
+      CHECK(!require_action(window, "layerNewAction")->isEnabled());
+      auto* hue = dialog->findChild<QSpinBox*>(QStringLiteral("hueSaturationHueSpin"));
+      CHECK(hue != nullptr);
+      hue->setValue(120);
+      process_events_for(120);
+      saw_adjustment_layer_preview = color_close(canvas_pixel(*canvas, QPoint(70, 70)), QColor(0, 255, 0), 12);
+      const auto preview_pixel_before_edit = canvas_pixel(*canvas, QPoint(70, 70));
+      drag(*canvas, canvas->widget_position_for_document_point(QPoint(160, 40)),
+           canvas->widget_position_for_document_point(QPoint(220, 110)));
+      const auto preview_pixel_after_edit = canvas_pixel(*canvas, QPoint(70, 70));
+      saw_adjustment_layer_edit_lock = color_close(preview_pixel_after_edit, preview_pixel_before_edit, 2);
+      dialog->accept();
+      return;
+    }
+    CHECK(false);
+  }));
+  require_action(window, "layerNewHueSaturationAdjustmentAction")->trigger();
+  QApplication::processEvents();
+  CHECK(saw_adjustment_layer_preview);
+  CHECK(saw_adjustment_layer_edit_lock);
+  CHECK(!canvas->edit_locked());
+  CHECK(layer_list->isEnabled());
+
+  CHECK(layer_list->item(0) != nullptr);
+  CHECK(layer_list->item(0)->text() == QStringLiteral("Hue/Saturation"));
+  auto* adjustment_row = layer_list->itemWidget(layer_list->item(0));
+  CHECK(adjustment_row != nullptr);
+  CHECK(adjustment_row->findChild<QLabel*>(QStringLiteral("layerMaskThumbnail")) != nullptr);
+  auto* adjustment_thumbnail = adjustment_row->findChild<QLabel*>(QStringLiteral("layerContentThumbnail"));
+  CHECK(adjustment_thumbnail != nullptr);
+  const auto thumbnail_image = adjustment_thumbnail->pixmap(Qt::ReturnByValue).toImage();
+  CHECK(thumbnail_image.pixelColor(2, 2).lightness() < 220);
+  auto* details = adjustment_row->findChild<QLabel*>(QStringLiteral("layerRowDetails"));
+  CHECK(details != nullptr);
+  CHECK(details->text().contains(QStringLiteral("Normal")));
+  CHECK(details->text().contains(QStringLiteral("100%")));
+  CHECK(color_close(canvas_pixel(*canvas, QPoint(70, 70)), QColor(0, 255, 0), 12));
+
+  bool saw_initial_adjustment_settings = false;
+  bool saw_adjustment_edit_preview = false;
+  QTimer::singleShot(0, guarded([&] {
+    for (auto* widget : QApplication::topLevelWidgets()) {
+      if (widget->objectName() != QStringLiteral("patchyHueSaturationDialog")) {
+        continue;
+      }
+      auto* dialog = qobject_cast<QDialog*>(widget);
+      CHECK(dialog != nullptr);
+      auto* hue = dialog->findChild<QSpinBox*>(QStringLiteral("hueSaturationHueSpin"));
+      CHECK(hue != nullptr);
+      saw_initial_adjustment_settings = hue->value() == 120;
+      hue->setValue(-120);
+      process_events_for(120);
+      saw_adjustment_edit_preview = color_close(canvas_pixel(*canvas, QPoint(70, 70)), QColor(0, 0, 255), 20);
+      dialog->accept();
+      return;
+    }
+    CHECK(false);
+  }));
+  require_action(window, "layerEditAdjustmentAction")->trigger();
+  QApplication::processEvents();
+  CHECK(saw_initial_adjustment_settings);
+  CHECK(saw_adjustment_edit_preview);
+  CHECK(color_close(canvas_pixel(*canvas, QPoint(70, 70)), QColor(0, 0, 255), 20));
+  CHECK(color_close(canvas_pixel(*canvas, QPoint(180, 70)), QColor(255, 0, 0), 12));
+
+  layer_list->item(0)->setCheckState(Qt::Unchecked);
+  QApplication::processEvents();
+  CHECK(process_events_until([canvas] { return canvas->render_settled(); }, 10000));
+  CHECK(color_close(canvas_pixel(*canvas, QPoint(70, 70)), QColor(255, 0, 0), 12));
+  CHECK(color_close(canvas_pixel(*canvas, QPoint(180, 70)), QColor(255, 0, 0), 12));
+  save_widget_artifact("ui_hue_saturation_adjustment_layer", window);
+}
+
+void ui_hue_saturation_colorize_toggle_switches_ranges_and_creates_layer() {
+  patchy::ui::MainWindow window;
+  show_window(window);
+  auto* canvas = require_canvas(window);
+
+  canvas->set_primary_color(QColor(128, 128, 128));
+  use_solid_fill_settings(canvas);
+  require_action(window, "layerFillForegroundAction")->trigger();
+  QApplication::processEvents();
+
+  bool saw_master_ranges = false;
+  bool saw_colorize_ranges = false;
+  bool saw_colorize_preview = false;
+  QTimer::singleShot(0, guarded([&] {
+    for (auto* widget : QApplication::topLevelWidgets()) {
+      if (widget->objectName() != QStringLiteral("patchyHueSaturationDialog")) {
+        continue;
+      }
+      auto* dialog = qobject_cast<QDialog*>(widget);
+      CHECK(dialog != nullptr);
+      auto* hue = dialog->findChild<QSpinBox*>(QStringLiteral("hueSaturationHueSpin"));
+      auto* saturation = dialog->findChild<QSpinBox*>(QStringLiteral("hueSaturationSaturationSpin"));
+      auto* colorize = dialog->findChild<QCheckBox*>(QStringLiteral("hueSaturationColorizeCheck"));
+      CHECK(hue != nullptr);
+      CHECK(saturation != nullptr);
+      CHECK(colorize != nullptr);
+      saw_master_ranges = hue->minimum() == -180 && hue->maximum() == 180 && !colorize->isChecked();
+      colorize->setChecked(true);
+      saw_colorize_ranges = hue->minimum() == 0 && hue->maximum() == 360 && saturation->minimum() == 0 &&
+                            saturation->maximum() == 100 && saturation->value() == 25;
+      hue->setValue(203);
+      saturation->setValue(52);
+      process_events_for(150);
+      // Gray 128 colorized with (203, 52, 0): PS-calibrated (62, 141, 194).
+      saw_colorize_preview = color_close(canvas_pixel(*canvas, QPoint(70, 70)), QColor(62, 141, 194), 4);
+      dialog->accept();
+      return;
+    }
+    CHECK(false);
+  }));
+  require_action(window, "layerNewHueSaturationAdjustmentAction")->trigger();
+  QApplication::processEvents();
+  CHECK(saw_master_ranges);
+  CHECK(saw_colorize_ranges);
+  CHECK(saw_colorize_preview);
+  CHECK(color_close(canvas_pixel(*canvas, QPoint(70, 70)), QColor(62, 141, 194), 4));
+
+  // Re-editing restores the colorize state and values; unchecking returns the
+  // master ranges; cancelling leaves the layer untouched.
+  bool saw_restored = false;
+  bool saw_master_after_toggle_off = false;
+  QTimer::singleShot(0, guarded([&] {
+    for (auto* widget : QApplication::topLevelWidgets()) {
+      if (widget->objectName() != QStringLiteral("patchyHueSaturationDialog")) {
+        continue;
+      }
+      auto* dialog = qobject_cast<QDialog*>(widget);
+      CHECK(dialog != nullptr);
+      auto* hue = dialog->findChild<QSpinBox*>(QStringLiteral("hueSaturationHueSpin"));
+      auto* colorize = dialog->findChild<QCheckBox*>(QStringLiteral("hueSaturationColorizeCheck"));
+      CHECK(hue != nullptr);
+      CHECK(colorize != nullptr);
+      saw_restored = colorize->isChecked() && hue->value() == 203 && hue->maximum() == 360;
+      colorize->setChecked(false);
+      saw_master_after_toggle_off = hue->minimum() == -180 && hue->maximum() == 180 && hue->value() == 0;
+      dialog->reject();
+      return;
+    }
+    CHECK(false);
+  }));
+  require_action(window, "layerEditAdjustmentAction")->trigger();
+  QApplication::processEvents();
+  CHECK(saw_restored);
+  CHECK(saw_master_after_toggle_off);
+  CHECK(color_close(canvas_pixel(*canvas, QPoint(70, 70)), QColor(62, 141, 194), 4));
+  save_widget_artifact("ui_hue_saturation_colorize", window);
+}
+
+void ui_layer_clipping_menu_toggles_renders_and_undoes() {
+  patchy::ui::MainWindow window;
+  show_window(window);
+  auto* canvas = require_canvas(window);
+  auto& doc = patchy::ui::MainWindowTestAccess::document(window);
+
+  canvas->set_primary_color(QColor(255, 255, 255));
+  use_solid_fill_settings(canvas);
+  require_action(window, "layerFillForegroundAction")->trigger();
+  QApplication::processEvents();
+
+  patchy::Layer base(doc.allocate_layer_id(), "Base",
+                     solid_pixels(40, 30, patchy::PixelFormat::rgba8(), QColor(200, 40, 40, 255)));
+  base.set_bounds(patchy::Rect{20, 20, 40, 30});
+  doc.add_layer(std::move(base));
+  patchy::Layer member(doc.allocate_layer_id(), "Member",
+                       solid_pixels(doc.width(), doc.height(), patchy::PixelFormat::rgba8(),
+                                    QColor(20, 180, 60, 255)));
+  const auto member_id = member.id();
+  doc.add_layer(std::move(member));
+  doc.set_active_layer(member_id);
+  patchy::ui::MainWindowTestAccess::refresh_layer_ui(window);
+  canvas->document_changed(QRect(0, 0, doc.width(), doc.height()));
+  QApplication::processEvents();
+
+  auto* action = require_action(window, "layerClippingMaskAction");
+  CHECK(action->isEnabled());
+  CHECK(action->text() == QStringLiteral("Create Clipping Mask"));
+  CHECK(color_close(canvas_pixel(*canvas, QPoint(5, 5)), QColor(20, 180, 60), 6));
+
+  action->trigger();
+  QApplication::processEvents();
+  const auto* member_layer = doc.find_layer(member_id);
+  CHECK(member_layer != nullptr);
+  CHECK(member_layer->clipped());
+  CHECK(action->text() == QStringLiteral("Release Clipping Mask"));
+  CHECK(color_close(canvas_pixel(*canvas, QPoint(5, 5)), QColor(255, 255, 255), 6));
+  CHECK(color_close(canvas_pixel(*canvas, QPoint(30, 30)), QColor(20, 180, 60), 6));
+
+  auto* layer_list = window.findChild<QListWidget*>(QStringLiteral("layerList"));
+  CHECK(layer_list != nullptr);
+  auto* member_row = layer_list->itemWidget(layer_list->item(0));
+  CHECK(member_row != nullptr);
+  CHECK(member_row->findChild<QToolButton*>(QStringLiteral("layerClippingBadgeButton")) != nullptr);
+  auto* details = member_row->findChild<QLabel*>(QStringLiteral("layerRowDetails"));
+  CHECK(details != nullptr);
+  CHECK(details->text().contains(QStringLiteral("clipped")));
+
+  require_action_by_text(window, QStringLiteral("Undo"))->trigger();
+  QApplication::processEvents();
+  member_layer = doc.find_layer(member_id);
+  CHECK(member_layer != nullptr);
+  CHECK(!member_layer->clipped());
+  CHECK(color_close(canvas_pixel(*canvas, QPoint(5, 5)), QColor(20, 180, 60), 6));
+  member_row = layer_list->itemWidget(layer_list->item(0));
+  CHECK(member_row != nullptr);
+  CHECK(member_row->findChild<QToolButton*>(QStringLiteral("layerClippingBadgeButton")) == nullptr);
+
+  // Clicking the row badge releases the clip too.
+  action->trigger();
+  QApplication::processEvents();
+  CHECK(doc.find_layer(member_id)->clipped());
+  member_row = layer_list->itemWidget(layer_list->item(0));
+  CHECK(member_row != nullptr);
+  auto* clip_badge = member_row->findChild<QToolButton*>(QStringLiteral("layerClippingBadgeButton"));
+  CHECK(clip_badge != nullptr);
+  clip_badge->click();
+  QApplication::processEvents();
+  CHECK(!doc.find_layer(member_id)->clipped());
+  CHECK(color_close(canvas_pixel(*canvas, QPoint(5, 5)), QColor(20, 180, 60), 6));
+
+  // Group children repaint immediately too: a full-canvas magenta member inside
+  // a folder clips to the folder's small base, revealing the green below.
+  patchy::Layer folder(doc.allocate_layer_id(), "Folder", patchy::LayerKind::Group);
+  patchy::Layer group_base(doc.allocate_layer_id(), "Group Base",
+                           solid_pixels(30, 20, patchy::PixelFormat::rgba8(), QColor(60, 60, 200, 255)));
+  group_base.set_bounds(patchy::Rect{90, 60, 30, 20});
+  folder.add_child(std::move(group_base));
+  patchy::Layer group_member(doc.allocate_layer_id(), "Group Member",
+                             solid_pixels(doc.width(), doc.height(), patchy::PixelFormat::rgba8(),
+                                          QColor(220, 40, 200, 255)));
+  const auto group_member_id = group_member.id();
+  folder.add_child(std::move(group_member));
+  doc.add_layer(std::move(folder));
+  doc.set_active_layer(group_member_id);
+  patchy::ui::MainWindowTestAccess::refresh_layer_ui(window);
+  canvas->document_changed(QRect(0, 0, doc.width(), doc.height()));
+  QApplication::processEvents();
+  CHECK(color_close(canvas_pixel(*canvas, QPoint(5, 5)), QColor(220, 40, 200), 6));
+  CHECK(action->isEnabled());
+  action->trigger();
+  QApplication::processEvents();
+  CHECK(doc.find_layer(group_member_id)->clipped());
+  CHECK(color_close(canvas_pixel(*canvas, QPoint(5, 5)), QColor(20, 180, 60), 6));
+  CHECK(color_close(canvas_pixel(*canvas, QPoint(100, 70)), QColor(220, 40, 200), 6));
+  action->trigger();
+  QApplication::processEvents();
+  CHECK(color_close(canvas_pixel(*canvas, QPoint(5, 5)), QColor(220, 40, 200), 6));
+
+  // An adjustment above a folder clips to that folder, shows its badge, and
+  // repaints immediately when the clip is created or released.
+  patchy::Layer folder_base(doc.allocate_layer_id(), "Folder clip base", patchy::LayerKind::Group);
+  patchy::Layer folder_content(doc.allocate_layer_id(), "Folder content",
+      solid_pixels(30, 20, patchy::PixelFormat::rgba8(), QColor(60, 60, 200, 255)));
+  folder_content.set_bounds({140, 100, 30, 20});
+  folder_base.add_child(std::move(folder_content));
+  doc.add_layer(std::move(folder_base));
+  patchy::AdjustmentSettings invert;
+  invert.kind = patchy::AdjustmentKind::Invert;
+  patchy::Layer folder_adjustment(doc.allocate_layer_id(), "Folder invert", patchy::LayerKind::Adjustment);
+  folder_adjustment.set_bounds(patchy::Rect::from_size(doc.width(), doc.height()));
+  patchy::configure_adjustment_layer(folder_adjustment, invert);
+  const auto folder_adjustment_id = folder_adjustment.id();
+  doc.add_layer(std::move(folder_adjustment));
+  doc.set_active_layer(folder_adjustment_id);
+  patchy::ui::MainWindowTestAccess::refresh_layer_ui(window);
+  canvas->document_changed(QRect(0, 0, doc.width(), doc.height()));
+  QApplication::processEvents();
+  CHECK(action->isEnabled());
+  action->trigger();
+  QApplication::processEvents();
+  CHECK(doc.find_layer(folder_adjustment_id)->clipped());
+  CHECK(color_close(canvas_pixel(*canvas, QPoint(5, 5)), QColor(220, 40, 200), 6));
+  CHECK(color_close(canvas_pixel(*canvas, QPoint(150, 110)), QColor(195, 195, 55), 6));
+  member_row = layer_list->itemWidget(layer_list->item(0));
+  CHECK(member_row != nullptr);
+  CHECK(member_row->findChild<QToolButton*>(QStringLiteral("layerClippingBadgeButton")) != nullptr);
+  action->trigger();
+  QApplication::processEvents();
+  CHECK(!doc.find_layer(folder_adjustment_id)->clipped());
+  CHECK(color_close(canvas_pixel(*canvas, QPoint(5, 5)), QColor(35, 215, 55), 6));
+  save_widget_artifact("ui_layer_clipping_toggle", window);
+}
+
+void ui_generic_bg_clip_toggle_repaints_if_available() {
+  const auto path = patchy::test::local_psd_fixture_path("generic_bg.psd");
+  patchy::test::skip_unless_exists(path);
+
+  patchy::ui::MainWindow window;
+  show_window(window);
+  patchy::ui::MainWindowTestAccess::open_document_path(window, QString::fromStdString(path.string()));
+  QApplication::processEvents();
+  auto* canvas = patchy::ui::MainWindowTestAccess::canvas(window);
+  CHECK(canvas != nullptr);
+  auto& doc = patchy::ui::MainWindowTestAccess::document(window);
+
+  std::function<const patchy::Layer*(const std::vector<patchy::Layer>&, const std::string&)> find_named =
+      [&](const std::vector<patchy::Layer>& layers, const std::string& name) -> const patchy::Layer* {
+    for (const auto& layer : layers) {
+      if (layer.name() == name) {
+        return &layer;
+      }
+      if (const auto* found = find_named(layer.children(), name); found != nullptr) {
+        return found;
+      }
+    }
+    return nullptr;
+  };
+  const auto* hue_layer = find_named(doc.layers(), "Hue/Saturation 1");
+  CHECK(hue_layer != nullptr);
+  doc.set_active_layer(hue_layer->id());
+  patchy::ui::MainWindowTestAccess::refresh_layer_ui(window);
+  QApplication::processEvents();
+
+  // Colorized panels before clipping (PS-calibrated blue).
+  CHECK(color_close(canvas_pixel(*canvas, QPoint(150, 260)), QColor(61, 140, 193), 6));
+
+  // Clipping the adjustment onto Layer 10 must repaint immediately: the panels
+  // lose the colorize everywhere except over the base's footprint.
+  auto* action = require_action(window, "layerClippingMaskAction");
+  CHECK(action->isEnabled());
+  action->trigger();
+  QApplication::processEvents();
+  CHECK(doc.find_layer(hue_layer->id())->clipped());
+  const auto clipped_panel = canvas_pixel(*canvas, QPoint(150, 260));
+  CHECK(!color_close(clipped_panel, QColor(61, 140, 193), 6));
+
+  action->trigger();
+  QApplication::processEvents();
+  CHECK(!doc.find_layer(hue_layer->id())->clipped());
+  CHECK(color_close(canvas_pixel(*canvas, QPoint(150, 260)), QColor(61, 140, 193), 6));
+}
+
+void ui_view_layer_mask_menu_action_shows_and_selects_mask() {
+  patchy::ui::MainWindow window;
+  show_window(window);
+  auto* canvas = require_canvas(window);
+  auto& doc = patchy::ui::MainWindowTestAccess::document(window);
+  CHECK(doc.active_layer_id().has_value());
+  auto* layer = doc.find_layer(*doc.active_layer_id());
+  CHECK(layer != nullptr);
+
+  patchy::LayerMask mask;
+  mask.bounds = patchy::Rect::from_size(doc.width(), doc.height());
+  mask.pixels = patchy::PixelBuffer(doc.width(), doc.height(), patchy::PixelFormat::gray8());
+  mask.pixels.clear(255);
+  layer->set_mask(std::move(mask));
+  patchy::ui::MainWindowTestAccess::refresh_layer_ui(window);
+
+  auto* action = require_action(window, "layerViewMaskAction");
+  CHECK(action->isEnabled());
+  CHECK(!action->isChecked());
+
+  action->trigger();
+  QApplication::processEvents();
+  CHECK(canvas->mask_display_mode() == patchy::ui::CanvasWidget::MaskDisplayMode::Grayscale);
+  CHECK(canvas->layer_edit_target() == patchy::ui::CanvasWidget::LayerEditTarget::Mask);
+  CHECK(action->isChecked());
+
+  action->trigger();
+  QApplication::processEvents();
+  CHECK(canvas->mask_display_mode() == patchy::ui::CanvasWidget::MaskDisplayMode::None);
+  // The mask stays selected for editing after leaving the view, like Alt-click.
+  CHECK(canvas->layer_edit_target() == patchy::ui::CanvasWidget::LayerEditTarget::Mask);
+  CHECK(!action->isChecked());
+}
+
+void ui_alt_click_layer_boundary_toggles_clipping() {
+  patchy::ui::MainWindow window;
+  show_window(window);
+  auto* canvas = require_canvas(window);
+  auto& doc = patchy::ui::MainWindowTestAccess::document(window);
+
+  canvas->set_primary_color(QColor(255, 255, 255));
+  use_solid_fill_settings(canvas);
+  require_action(window, "layerFillForegroundAction")->trigger();
+  QApplication::processEvents();
+
+  patchy::Layer base(doc.allocate_layer_id(), "Base",
+                     solid_pixels(40, 30, patchy::PixelFormat::rgba8(), QColor(200, 40, 40, 255)));
+  base.set_bounds(patchy::Rect{20, 20, 40, 30});
+  doc.add_layer(std::move(base));
+  patchy::Layer member(doc.allocate_layer_id(), "Member",
+                       solid_pixels(doc.width(), doc.height(), patchy::PixelFormat::rgba8(),
+                                    QColor(20, 180, 60, 255)));
+  const auto member_id = member.id();
+  doc.add_layer(std::move(member));
+  patchy::ui::MainWindowTestAccess::refresh_layer_ui(window);
+  canvas->document_changed(QRect(0, 0, doc.width(), doc.height()));
+  QApplication::processEvents();
+
+  auto* layer_list = window.findChild<QListWidget*>(QStringLiteral("layerList"));
+  CHECK(layer_list != nullptr);
+  // Row 0 = Member (top), row 1 = Base: Alt-click their shared boundary.
+  const auto member_rect = layer_list->visualItemRect(layer_list->item(0));
+  const QPoint boundary(member_rect.center().x(), member_rect.bottom() - 1);
+  const auto send_alt_click = [layer_list, boundary] {
+    const QPointF pos(boundary);
+    QMouseEvent press(QEvent::MouseButtonPress, pos, layer_list->viewport()->mapToGlobal(boundary), Qt::LeftButton,
+                      Qt::LeftButton, Qt::AltModifier);
+    QApplication::sendEvent(layer_list->viewport(), &press);
+    QMouseEvent release(QEvent::MouseButtonRelease, pos, layer_list->viewport()->mapToGlobal(boundary),
+                        Qt::LeftButton, Qt::NoButton, Qt::AltModifier);
+    QApplication::sendEvent(layer_list->viewport(), &release);
+    QApplication::processEvents();
+  };
+
+  send_alt_click();
+  const auto* member_layer = doc.find_layer(member_id);
+  CHECK(member_layer != nullptr);
+  CHECK(member_layer->clipped());
+  CHECK(color_close(canvas_pixel(*canvas, QPoint(5, 5)), QColor(255, 255, 255), 6));
+
+  send_alt_click();
+  member_layer = doc.find_layer(member_id);
+  CHECK(member_layer != nullptr);
+  CHECK(!member_layer->clipped());
+  CHECK(color_close(canvas_pixel(*canvas, QPoint(5, 5)), QColor(20, 180, 60), 6));
+
+  // Alt-clicking the boundary above the top row's base does nothing when the
+  // layer below is the document bottom: pick the boundary between Base (row 1)
+  // and the background (row 2) with Base selected as the would-be member.
+  const auto base_rect = layer_list->visualItemRect(layer_list->item(1));
+  const QPoint base_boundary(base_rect.center().x(), base_rect.bottom() - 1);
+  const QPointF base_pos(base_boundary);
+  QMouseEvent press(QEvent::MouseButtonPress, base_pos, layer_list->viewport()->mapToGlobal(base_boundary),
+                    Qt::LeftButton, Qt::LeftButton, Qt::AltModifier);
+  QApplication::sendEvent(layer_list->viewport(), &press);
+  QMouseEvent release(QEvent::MouseButtonRelease, base_pos, layer_list->viewport()->mapToGlobal(base_boundary),
+                      Qt::LeftButton, Qt::NoButton, Qt::AltModifier);
+  QApplication::sendEvent(layer_list->viewport(), &release);
+  QApplication::processEvents();
+  const auto* base_layer = [&]() -> const patchy::Layer* {
+    for (const auto& doc_layer : doc.layers()) {
+      if (doc_layer.name() == "Base") {
+        return &doc_layer;
+      }
+    }
+    return nullptr;
+  }();
+  CHECK(base_layer != nullptr);
+  CHECK(base_layer->clipped());  // Base clips onto the background pixel layer
+}
+
+void ui_layer_clipping_action_enablement() {
+  patchy::ui::MainWindow window;
+  show_window(window);
+  auto& doc = patchy::ui::MainWindowTestAccess::document(window);
+  auto* action = require_action(window, "layerClippingMaskAction");
+
+  // The bottom layer has nothing below to clip to.
+  CHECK(!doc.layers().empty());
+  doc.set_active_layer(doc.layers().front().id());
+  patchy::ui::MainWindowTestAccess::refresh_layer_ui(window);
+  CHECK(!action->isEnabled());
+
+  // A pixel layer above the background can clip.
+  patchy::Layer top(doc.allocate_layer_id(), "Top",
+                    solid_pixels(8, 8, patchy::PixelFormat::rgba8(), QColor(10, 20, 30, 255)));
+  const auto top_id = top.id();
+  doc.add_layer(std::move(top));
+  doc.set_active_layer(top_id);
+  patchy::ui::MainWindowTestAccess::refresh_layer_ui(window);
+  CHECK(action->isEnabled());
+  CHECK(action->text() == QStringLiteral("Create Clipping Mask"));
+
+  // A folder cannot be a clipped member, but it can be the base below a layer.
+  patchy::Layer folder(doc.allocate_layer_id(), "Folder", patchy::LayerKind::Group);
+  folder.add_child(patchy::Layer(doc.allocate_layer_id(), "Inside",
+                                 solid_pixels(4, 4, patchy::PixelFormat::rgba8(), QColor(1, 2, 3, 255))));
+  const auto folder_id = folder.id();
+  doc.add_layer(std::move(folder));
+  patchy::Layer above_folder(doc.allocate_layer_id(), "Above",
+                             solid_pixels(4, 4, patchy::PixelFormat::rgba8(), QColor(9, 9, 9, 255)));
+  const auto above_id = above_folder.id();
+  doc.add_layer(std::move(above_folder));
+
+  doc.set_active_layer(folder_id);
+  patchy::ui::MainWindowTestAccess::refresh_layer_ui(window);
+  CHECK(!action->isEnabled());
+  doc.set_active_layer(above_id);
+  patchy::ui::MainWindowTestAccess::refresh_layer_ui(window);
+  CHECK(action->isEnabled());
+
+  // An already-clipped layer always offers Release.
+  doc.set_active_layer(top_id);
+  if (auto* top_layer = doc.find_layer(top_id); top_layer != nullptr) {
+    top_layer->set_clipped(true);
+  }
+  patchy::ui::MainWindowTestAccess::refresh_layer_ui(window);
+  CHECK(action->isEnabled());
+  CHECK(action->text() == QStringLiteral("Release Clipping Mask"));
+}
+
+void ui_adjustment_layer_thumbnails_show_type_symbols() {
+  patchy::Document document(120, 96, patchy::PixelFormat::rgba8());
+  auto add_adjustment_layer = [&document](const QString& name, const patchy::AdjustmentSettings& settings) {
+    patchy::Layer layer(document.allocate_layer_id(), name.toStdString(), patchy::LayerKind::Adjustment);
+    patchy::configure_adjustment_layer(layer, settings);
+    document.add_layer(std::move(layer));
+  };
+
+  patchy::AdjustmentSettings levels;
+  levels.kind = patchy::AdjustmentKind::Levels;
+  levels.levels = patchy::LevelsAdjustment{18, 232, 85};
+  add_adjustment_layer(QStringLiteral("Levels"), levels);
+
+  patchy::AdjustmentSettings curves;
+  curves.kind = patchy::AdjustmentKind::Curves;
+  curves.curves = patchy::curves_adjustment_from_legacy_outputs(36, 176, 245);
+  add_adjustment_layer(QStringLiteral("Curves"), curves);
+
+  patchy::AdjustmentSettings hue_saturation;
+  hue_saturation.kind = patchy::AdjustmentKind::HueSaturation;
+  hue_saturation.hue_saturation = patchy::HueSaturationAdjustment{35, 35, 10};
+  add_adjustment_layer(QStringLiteral("Hue/Saturation"), hue_saturation);
+
+  patchy::AdjustmentSettings color_balance;
+  color_balance.kind = patchy::AdjustmentKind::ColorBalance;
+  color_balance.color_balance = patchy::ColorBalanceAdjustment{45, -25, 35};
+  add_adjustment_layer(QStringLiteral("Color Balance"), color_balance);
+
+  patchy::AdjustmentSettings invert;
+  invert.kind = patchy::AdjustmentKind::Invert;
+  add_adjustment_layer(QStringLiteral("Invert"), invert);
+
+  patchy::AdjustmentSettings posterize;
+  posterize.kind = patchy::AdjustmentKind::Posterize;
+  posterize.posterize.levels = 5;
+  add_adjustment_layer(QStringLiteral("Posterize"), posterize);
+
+  patchy::AdjustmentSettings threshold;
+  threshold.kind = patchy::AdjustmentKind::Threshold;
+  threshold.threshold.level = 96;
+  add_adjustment_layer(QStringLiteral("Threshold"), threshold);
+
+  patchy::AdjustmentSettings brightness_contrast;
+  brightness_contrast.kind = patchy::AdjustmentKind::BrightnessContrast;
+  brightness_contrast.brightness_contrast = patchy::BrightnessContrastAdjustment{25, 40};
+  add_adjustment_layer(QStringLiteral("Brightness/Contrast"), brightness_contrast);
+
+  patchy::ui::MainWindow window;
+  window.add_document_session(std::move(document), QStringLiteral("Adjustment Thumbnails"));
+  show_window(window);
+  auto* layer_list = window.findChild<QListWidget*>(QStringLiteral("layerList"));
+  CHECK(layer_list != nullptr);
+
+  auto thumbnail_image = [layer_list](const QString& name) {
+    auto* item = require_layer_item(*layer_list, name);
+    CHECK(item != nullptr);
+    auto* row = layer_list->itemWidget(item);
+    CHECK(row != nullptr);
+    auto* thumbnail = row->findChild<QLabel*>(QStringLiteral("layerContentThumbnail"));
+    CHECK(thumbnail != nullptr);
+    // GitHub issue 492: the tooltip names the adjustment ("Curves adjustment layer").
+    CHECK(thumbnail->toolTip() == QStringLiteral("%1 adjustment layer").arg(name));
+    return thumbnail->pixmap(Qt::ReturnByValue).toImage();
+  };
+  const auto levels_image = thumbnail_image(QStringLiteral("Levels"));
+  const auto curves_image = thumbnail_image(QStringLiteral("Curves"));
+  const auto hue_saturation_image = thumbnail_image(QStringLiteral("Hue/Saturation"));
+  const auto color_balance_image = thumbnail_image(QStringLiteral("Color Balance"));
+  const auto invert_image = thumbnail_image(QStringLiteral("Invert"));
+  const auto posterize_image = thumbnail_image(QStringLiteral("Posterize"));
+  const auto threshold_image = thumbnail_image(QStringLiteral("Threshold"));
+  const auto brightness_contrast_image = thumbnail_image(QStringLiteral("Brightness/Contrast"));
+
+  auto vivid_pixels = [](const QImage& image) {
+    int count = 0;
+    for (int y = 0; y < image.height(); ++y) {
+      for (int x = 0; x < image.width(); ++x) {
+        const auto color = image.pixelColor(x, y);
+        const auto maximum = std::max({color.red(), color.green(), color.blue()});
+        const auto minimum = std::min({color.red(), color.green(), color.blue()});
+        if (maximum > 120 && maximum - minimum > 55) {
+          ++count;
+        }
+      }
+    }
+    return count;
+  };
+  auto non_black_pixels = [](const QImage& image) {
+    int count = 0;
+    for (int y = 0; y < image.height(); ++y) {
+      for (int x = 0; x < image.width(); ++x) {
+        const auto color = image.pixelColor(x, y);
+        if (color.red() + color.green() + color.blue() > 150) {
+          ++count;
+        }
+      }
+    }
+    return count;
+  };
+  auto differing_pixels = [](const QImage& left, const QImage& right) {
+    int count = 0;
+    for (int y = 0; y < std::min(left.height(), right.height()); ++y) {
+      for (int x = 0; x < std::min(left.width(), right.width()); ++x) {
+        const auto a = left.pixelColor(x, y);
+        const auto b = right.pixelColor(x, y);
+        if (std::abs(a.red() - b.red()) + std::abs(a.green() - b.green()) + std::abs(a.blue() - b.blue()) > 80) {
+          ++count;
+        }
+      }
+    }
+    return count;
+  };
+
+  const auto levels_vivid = vivid_pixels(levels_image);
+  const auto curves_vivid = vivid_pixels(curves_image);
+  const auto hue_saturation_vivid = vivid_pixels(hue_saturation_image);
+  const auto color_balance_vivid = vivid_pixels(color_balance_image);
+  const auto levels_non_black = non_black_pixels(levels_image);
+  const auto curves_non_black = non_black_pixels(curves_image);
+  const auto levels_curves_difference = differing_pixels(levels_image, curves_image);
+  const auto hue_color_balance_difference = differing_pixels(hue_saturation_image, color_balance_image);
+  const auto invert_non_black = non_black_pixels(invert_image);
+  const auto invert_color_balance_difference = differing_pixels(invert_image, color_balance_image);
+  const auto posterize_non_black = non_black_pixels(posterize_image);
+  const auto threshold_non_black = non_black_pixels(threshold_image);
+  const auto posterize_threshold_difference = differing_pixels(posterize_image, threshold_image);
+  const auto threshold_invert_difference = differing_pixels(threshold_image, invert_image);
+  CHECK(levels_vivid > 80);
+  CHECK(curves_vivid > 80);
+  CHECK(hue_saturation_vivid > 120);
+  CHECK(color_balance_vivid > 80);
+  CHECK(levels_non_black > 300);
+  CHECK(curves_non_black > 300);
+  CHECK(levels_curves_difference > 100);
+  CHECK(hue_color_balance_difference > 100);
+  CHECK(invert_non_black > 60);
+  CHECK(invert_color_balance_difference > 80);
+  CHECK(posterize_non_black > 60);
+  CHECK(threshold_non_black > 60);
+  CHECK(posterize_threshold_difference > 60);
+  // Threshold and Invert share the split-square motif but differ in the two
+  // triangles between the vertical and diagonal splits (~49 px).
+  CHECK(threshold_invert_difference > 30);
+  CHECK(non_black_pixels(brightness_contrast_image) > 60);
+  CHECK(differing_pixels(brightness_contrast_image, threshold_image) > 60);
+}
+
+void ui_invert_adjustment_layer_creates_without_dialog_and_reports_no_edit_settings() {
+  patchy::ui::MainWindow window;
+  show_window(window);
+  auto* canvas = require_canvas(window);
+  auto* layer_list = window.findChild<QListWidget*>(QStringLiteral("layerList"));
+  CHECK(layer_list != nullptr);
+
+  canvas->set_primary_color(QColor(255, 0, 0));
+  use_solid_fill_settings(canvas);
+  require_action(window, "layerFillForegroundAction")->trigger();
+  QApplication::processEvents();
+
+  require_action_by_text(window, QStringLiteral("Marquee"))->trigger();
+  drag(*canvas, canvas->widget_position_for_document_point(QPoint(40, 40)),
+       canvas->widget_position_for_document_point(QPoint(120, 120)));
+  QApplication::processEvents();
+
+  // Invert has no settings, so the action creates the layer without a dialog.
+  require_action(window, "layerNewInvertAdjustmentAction")->trigger();
+  QApplication::processEvents();
+
+  CHECK(layer_list->item(0) != nullptr);
+  CHECK(layer_list->item(0)->text() == QStringLiteral("Invert"));
+  auto* adjustment_row = layer_list->itemWidget(layer_list->item(0));
+  CHECK(adjustment_row != nullptr);
+  CHECK(adjustment_row->findChild<QLabel*>(QStringLiteral("layerMaskThumbnail")) != nullptr);
+  CHECK(color_close(canvas_pixel(*canvas, QPoint(70, 70)), QColor(0, 255, 255), 8));
+  CHECK(color_close(canvas_pixel(*canvas, QPoint(300, 300)), QColor(255, 0, 0), 8));
+
+  // Editing reports that there is nothing to edit instead of opening a dialog.
+  require_action(window, "layerEditAdjustmentAction")->trigger();
+  QApplication::processEvents();
+  CHECK(window.statusBar()->currentMessage() == QStringLiteral("Invert has no settings to edit"));
+
+  // Undo removes the adjustment layer, leaving the fill's Paint Layer and the
+  // Background, and restores the un-inverted red fill.
+  require_action_by_text(window, QStringLiteral("Undo"))->trigger();
+  QApplication::processEvents();
+  CHECK(layer_list->count() == 2);
+  CHECK(layer_list->item(0)->text() == QStringLiteral("Paint Layer"));
+  CHECK(color_close(canvas_pixel(*canvas, QPoint(70, 70)), QColor(255, 0, 0), 8));
+}
+
+void ui_exposure_adjustment_layer_creates_and_edits() {
+  patchy::ui::MainWindow window;
+  show_window(window);
+  auto* canvas = require_canvas(window);
+  auto* layer_list = window.findChild<QListWidget*>(QStringLiteral("layerList"));
+  CHECK(layer_list != nullptr);
+
+  canvas->set_primary_color(QColor(100, 100, 100));
+  use_solid_fill_settings(canvas);
+  require_action(window, "layerFillForegroundAction")->trigger();
+  QApplication::processEvents();
+
+  // Create: one stop up takes gray 100 to 137 (Photoshop's gamma 2.2 working curve),
+  // with a live preview.
+  bool saw_preview = false;
+  QTimer::singleShot(0, guarded([&] {
+    for (auto* widget : QApplication::topLevelWidgets()) {
+      if (widget->objectName() != QStringLiteral("patchyExposureDialog")) {
+        continue;
+      }
+      auto* dialog = qobject_cast<QDialog*>(widget);
+      CHECK(dialog != nullptr);
+      auto* exposure = dialog->findChild<QDoubleSpinBox*>(QStringLiteral("exposureValueSpin"));
+      auto* offset = dialog->findChild<QDoubleSpinBox*>(QStringLiteral("exposureOffsetSpin"));
+      auto* gamma = dialog->findChild<QDoubleSpinBox*>(QStringLiteral("exposureGammaSpin"));
+      CHECK(exposure != nullptr && offset != nullptr && gamma != nullptr);
+      CHECK(exposure->value() == 0.0);
+      CHECK(offset->value() == 0.0);
+      CHECK(gamma->value() == 1.0);
+      exposure->setValue(1.0);
+      process_events_for(120);
+      saw_preview = color_close(canvas_pixel(*canvas, QPoint(70, 70)), QColor(137, 137, 137), 6);
+      dialog->accept();
+      return;
+    }
+    CHECK(false);
+  }));
+  require_action(window, "layerNewExposureAdjustmentAction")->trigger();
+  QApplication::processEvents();
+  CHECK(saw_preview);
+  CHECK(layer_list->item(0) != nullptr);
+  CHECK(layer_list->item(0)->text() == QStringLiteral("Exposure"));
+  CHECK(color_close(canvas_pixel(*canvas, QPoint(70, 70)), QColor(137, 137, 137), 6));
+
+  // Edit: the dialog reopens with the stored value; zero restores the gray.
+  QTimer::singleShot(0, guarded([&] {
+    for (auto* widget : QApplication::topLevelWidgets()) {
+      if (widget->objectName() != QStringLiteral("patchyExposureDialog")) {
+        continue;
+      }
+      auto* dialog = qobject_cast<QDialog*>(widget);
+      CHECK(dialog != nullptr);
+      auto* exposure = dialog->findChild<QDoubleSpinBox*>(QStringLiteral("exposureValueSpin"));
+      CHECK(exposure != nullptr);
+      CHECK(exposure->value() == 1.0);
+      exposure->setValue(0.0);
+      process_events_for(120);
+      dialog->accept();
+      return;
+    }
+    CHECK(false);
+  }));
+  require_action(window, "layerEditAdjustmentAction")->trigger();
+  QApplication::processEvents();
+  CHECK(color_close(canvas_pixel(*canvas, QPoint(70, 70)), QColor(100, 100, 100), 6));
+}
+
+void ui_posterize_and_threshold_adjustment_layers_create_and_edit() {
+  patchy::ui::MainWindow window;
+  show_window(window);
+  auto* canvas = require_canvas(window);
+  auto* layer_list = window.findChild<QListWidget*>(QStringLiteral("layerList"));
+  CHECK(layer_list != nullptr);
+
+  canvas->set_primary_color(QColor(100, 100, 100));
+  use_solid_fill_settings(canvas);
+  require_action(window, "layerFillForegroundAction")->trigger();
+  QApplication::processEvents();
+
+  // Posterize create: levels 2 sends gray 100 to black, with a live preview.
+  bool saw_posterize_preview = false;
+  QTimer::singleShot(0, guarded([&] {
+    for (auto* widget : QApplication::topLevelWidgets()) {
+      if (widget->objectName() != QStringLiteral("patchyPosterizeDialog")) {
+        continue;
+      }
+      auto* dialog = qobject_cast<QDialog*>(widget);
+      CHECK(dialog != nullptr);
+      auto* levels = dialog->findChild<QSpinBox*>(QStringLiteral("posterizeLevelsSpin"));
+      CHECK(levels != nullptr);
+      CHECK(levels->value() == 4);
+      levels->setValue(2);
+      process_events_for(120);
+      saw_posterize_preview = color_close(canvas_pixel(*canvas, QPoint(70, 70)), QColor(0, 0, 0), 6);
+      dialog->accept();
+      return;
+    }
+    CHECK(false);
+  }));
+  require_action(window, "layerNewPosterizeAdjustmentAction")->trigger();
+  QApplication::processEvents();
+  CHECK(saw_posterize_preview);
+  CHECK(layer_list->item(0) != nullptr);
+  CHECK(layer_list->item(0)->text() == QStringLiteral("Posterize"));
+  CHECK(color_close(canvas_pixel(*canvas, QPoint(70, 70)), QColor(0, 0, 0), 6));
+
+  // Posterize edit: the dialog reopens with the stored value; 255 levels is a
+  // near-identity that restores the gray.
+  QTimer::singleShot(0, guarded([&] {
+    for (auto* widget : QApplication::topLevelWidgets()) {
+      if (widget->objectName() != QStringLiteral("patchyPosterizeDialog")) {
+        continue;
+      }
+      auto* dialog = qobject_cast<QDialog*>(widget);
+      CHECK(dialog != nullptr);
+      auto* levels = dialog->findChild<QSpinBox*>(QStringLiteral("posterizeLevelsSpin"));
+      CHECK(levels != nullptr);
+      CHECK(levels->value() == 2);
+      levels->setValue(255);
+      process_events_for(120);
+      dialog->accept();
+      return;
+    }
+    CHECK(false);
+  }));
+  require_action(window, "layerEditAdjustmentAction")->trigger();
+  QApplication::processEvents();
+  CHECK(color_close(canvas_pixel(*canvas, QPoint(70, 70)), QColor(100, 100, 100), 6));
+
+  // Threshold create on top: gray 100 has luminance 100, so level 99 turns it
+  // white.
+  bool saw_threshold_preview = false;
+  QTimer::singleShot(0, guarded([&] {
+    for (auto* widget : QApplication::topLevelWidgets()) {
+      if (widget->objectName() != QStringLiteral("patchyThresholdDialog")) {
+        continue;
+      }
+      auto* dialog = qobject_cast<QDialog*>(widget);
+      CHECK(dialog != nullptr);
+      auto* level = dialog->findChild<QSpinBox*>(QStringLiteral("thresholdLevelSpin"));
+      CHECK(level != nullptr);
+      CHECK(level->value() == 128);
+      level->setValue(99);
+      process_events_for(120);
+      saw_threshold_preview = color_close(canvas_pixel(*canvas, QPoint(70, 70)), QColor(255, 255, 255), 6);
+      dialog->accept();
+      return;
+    }
+    CHECK(false);
+  }));
+  require_action(window, "layerNewThresholdAdjustmentAction")->trigger();
+  QApplication::processEvents();
+  CHECK(saw_threshold_preview);
+  CHECK(layer_list->item(0) != nullptr);
+  CHECK(layer_list->item(0)->text() == QStringLiteral("Threshold"));
+  CHECK(color_close(canvas_pixel(*canvas, QPoint(70, 70)), QColor(255, 255, 255), 6));
+
+  // Threshold edit: level 101 sits above luminance 100 and flips it to black.
+  QTimer::singleShot(0, guarded([&] {
+    for (auto* widget : QApplication::topLevelWidgets()) {
+      if (widget->objectName() != QStringLiteral("patchyThresholdDialog")) {
+        continue;
+      }
+      auto* dialog = qobject_cast<QDialog*>(widget);
+      CHECK(dialog != nullptr);
+      auto* level = dialog->findChild<QSpinBox*>(QStringLiteral("thresholdLevelSpin"));
+      CHECK(level != nullptr);
+      CHECK(level->value() == 99);
+      level->setValue(101);
+      process_events_for(120);
+      dialog->accept();
+      return;
+    }
+    CHECK(false);
+  }));
+  require_action(window, "layerEditAdjustmentAction")->trigger();
+  QApplication::processEvents();
+  CHECK(color_close(canvas_pixel(*canvas, QPoint(70, 70)), QColor(0, 0, 0), 6));
+}
+
+void ui_brightness_contrast_adjustment_layer_creates_and_edits() {
+  patchy::ui::MainWindow window;
+  show_window(window);
+  auto* canvas = require_canvas(window);
+  auto* layer_list = window.findChild<QListWidget*>(QStringLiteral("layerList"));
+  CHECK(layer_list != nullptr);
+
+  canvas->set_primary_color(QColor(100, 100, 100));
+  use_solid_fill_settings(canvas);
+  require_action(window, "layerFillForegroundAction")->trigger();
+  QApplication::processEvents();
+
+  // Create with brightness +50 in the default modern mode: gray 100 maps to
+  // 137 (the calibrated Photoshop 2026 modern curve; the modern ranges are
+  // -150..150 / -50..100).
+  bool saw_preview = false;
+  QTimer::singleShot(0, guarded([&] {
+    for (auto* widget : QApplication::topLevelWidgets()) {
+      if (widget->objectName() != QStringLiteral("patchyBrightnessContrastDialog")) {
+        continue;
+      }
+      auto* dialog = qobject_cast<QDialog*>(widget);
+      CHECK(dialog != nullptr);
+      auto* brightness = dialog->findChild<QSpinBox*>(QStringLiteral("brightnessContrastBrightnessSpin"));
+      auto* contrast = dialog->findChild<QSpinBox*>(QStringLiteral("brightnessContrastContrastSpin"));
+      auto* use_legacy = dialog->findChild<QCheckBox*>(QStringLiteral("brightnessContrastUseLegacyCheck"));
+      CHECK(brightness != nullptr);
+      CHECK(contrast != nullptr);
+      CHECK(use_legacy != nullptr);
+      CHECK(brightness->value() == 0);
+      CHECK(contrast->value() == 0);
+      CHECK(!use_legacy->isChecked());
+      CHECK(brightness->minimum() == -150);
+      CHECK(brightness->maximum() == 150);
+      CHECK(contrast->minimum() == -50);
+      CHECK(contrast->maximum() == 100);
+      brightness->setValue(50);
+      process_events_for(120);
+      saw_preview = color_close(canvas_pixel(*canvas, QPoint(70, 70)), QColor(137, 137, 137), 6);
+      dialog->accept();
+      return;
+    }
+    CHECK(false);
+  }));
+  require_action(window, "layerNewBrightnessContrastAdjustmentAction")->trigger();
+  QApplication::processEvents();
+  CHECK(saw_preview);
+  CHECK(layer_list->item(0) != nullptr);
+  CHECK(layer_list->item(0)->text() == QStringLiteral("Brightness/Contrast"));
+  CHECK(color_close(canvas_pixel(*canvas, QPoint(70, 70)), QColor(137, 137, 137), 6));
+
+  // Edit: the stored value and mode reopen; switching to Use Legacy clamps the
+  // ranges to -100..100, and legacy contrast 100 thresholds at v + b >= 127,
+  // so brightness 0 sends gray 100 to black.
+  QTimer::singleShot(0, guarded([&] {
+    for (auto* widget : QApplication::topLevelWidgets()) {
+      if (widget->objectName() != QStringLiteral("patchyBrightnessContrastDialog")) {
+        continue;
+      }
+      auto* dialog = qobject_cast<QDialog*>(widget);
+      CHECK(dialog != nullptr);
+      auto* brightness = dialog->findChild<QSpinBox*>(QStringLiteral("brightnessContrastBrightnessSpin"));
+      auto* contrast = dialog->findChild<QSpinBox*>(QStringLiteral("brightnessContrastContrastSpin"));
+      auto* use_legacy = dialog->findChild<QCheckBox*>(QStringLiteral("brightnessContrastUseLegacyCheck"));
+      CHECK(brightness != nullptr);
+      CHECK(contrast != nullptr);
+      CHECK(use_legacy != nullptr);
+      CHECK(brightness->value() == 50);
+      CHECK(!use_legacy->isChecked());
+      use_legacy->setChecked(true);
+      process_events_for(60);
+      CHECK(brightness->minimum() == -100);
+      CHECK(brightness->maximum() == 100);
+      CHECK(contrast->minimum() == -100);
+      CHECK(contrast->maximum() == 100);
+      brightness->setValue(0);
+      contrast->setValue(100);
+      process_events_for(120);
+      dialog->accept();
+      return;
+    }
+    CHECK(false);
+  }));
+  require_action(window, "layerEditAdjustmentAction")->trigger();
+  QApplication::processEvents();
+  CHECK(color_close(canvas_pixel(*canvas, QPoint(70, 70)), QColor(0, 0, 0), 6));
+}
+
+void ui_levels_dialog_remaps_selected_tonal_range() {
+  patchy::ui::MainWindow window;
+  show_window(window);
+  auto* canvas = require_canvas(window);
+
+  canvas->set_primary_color(QColor(50, 50, 50));
+  canvas->set_secondary_color(QColor(180, 180, 180));
+  canvas->set_brush_opacity(100);
+  require_action_by_text(window, QStringLiteral("Gradient"))->trigger();
+  drag(*canvas, canvas->widget_position_for_document_point(QPoint(20, 90)),
+       canvas->widget_position_for_document_point(QPoint(260, 90)));
+  QApplication::processEvents();
+
+  const auto outside_before = canvas_pixel(*canvas, QPoint(320, 90));
+  CHECK(outside_before.red() >= 170);
+  CHECK(outside_before.red() <= 190);
+
+  require_action_by_text(window, QStringLiteral("Marquee"))->trigger();
+  drag(*canvas, canvas->widget_position_for_document_point(QPoint(20, 50)),
+       canvas->widget_position_for_document_point(QPoint(260, 130)));
+  QApplication::processEvents();
+
+  auto* layer_list = window.findChild<QListWidget*>(QStringLiteral("layerList"));
+  CHECK(layer_list != nullptr);
+  const auto layer_count_before = layer_list->count();
+
+  accept_levels_dialog(50, 180, 100);
+  require_action(window, "imageAdjustLevelsAction")->trigger();
+  QApplication::processEvents();
+  require_action(window, "editDeselectAction")->trigger();
+  QApplication::processEvents();
+
+  CHECK(layer_list->count() == layer_count_before);
+  CHECK(canvas_pixel(*canvas, QPoint(20, 90)).red() < 12);
+  CHECK(canvas_pixel(*canvas, QPoint(260, 90)).red() > 242);
+  CHECK(color_close(canvas_pixel(*canvas, QPoint(320, 90)), outside_before, 8));
+  save_widget_artifact("ui_levels_selection", *canvas);
+}
+
+void ui_curves_dialog_remaps_midtones_in_selection() {
+  patchy::ui::MainWindow window;
+  show_window(window);
+  auto* canvas = require_canvas(window);
+
+  canvas->set_primary_color(QColor(0, 0, 0));
+  canvas->set_secondary_color(QColor(255, 255, 255));
+  require_action_by_text(window, QStringLiteral("Gradient"))->trigger();
+  drag(*canvas, canvas->widget_position_for_document_point(QPoint(20, 90)),
+       canvas->widget_position_for_document_point(QPoint(260, 90)));
+  QApplication::processEvents();
+
+  const auto selected_before = canvas_pixel(*canvas, QPoint(140, 90));
+  const auto outside_before = canvas_pixel(*canvas, QPoint(320, 90));
+  CHECK(selected_before.red() > 110);
+  CHECK(selected_before.red() < 150);
+  CHECK(outside_before.red() > 245);
+
+  require_action_by_text(window, QStringLiteral("Marquee"))->trigger();
+  drag(*canvas, canvas->widget_position_for_document_point(QPoint(20, 50)),
+       canvas->widget_position_for_document_point(QPoint(260, 130)));
+  QApplication::processEvents();
+
+  auto* layer_list = window.findChild<QListWidget*>(QStringLiteral("layerList"));
+  CHECK(layer_list != nullptr);
+  const auto layer_count_before = layer_list->count();
+
+  accept_curves_dialog(0, 220, 255);
+  require_action(window, "imageAdjustCurvesAction")->trigger();
+  QApplication::processEvents();
+
+  CHECK(layer_list->count() == layer_count_before);
+  const auto selected_after = canvas_pixel(*canvas, QPoint(140, 90));
+  CHECK(selected_after.red() > selected_before.red() + 60);
+  CHECK(color_close(canvas_pixel(*canvas, QPoint(320, 90)), outside_before, 8));
+
+  require_action_by_text(window, QStringLiteral("Undo"))->trigger();
+  QApplication::processEvents();
+  CHECK(color_close(canvas_pixel(*canvas, QPoint(140, 90)), selected_before, 3));
+  CHECK(layer_list->count() == layer_count_before);
+
+  require_action(window, "editDeselectAction")->trigger();
+  QApplication::processEvents();
+  save_widget_artifact("ui_curves_selection", *canvas);
+}
+
+void ui_curves_editor_points_channels_keyboard_auto_and_reset() {
+  patchy::PixelBuffer rgb_source(2, 1, patchy::PixelFormat::rgb8());
+  auto* transparent_pixel = rgb_source.pixel(0, 0);
+  transparent_pixel[0] = 10;
+  transparent_pixel[1] = 20;
+  transparent_pixel[2] = 30;
+  auto* opaque_pixel = rgb_source.pixel(1, 0);
+  opaque_pixel[0] = 40;
+  opaque_pixel[1] = 80;
+  opaque_pixel[2] = 120;
+  const std::array<std::uint8_t, 2> external_alpha{0, 255};
+  const auto external_alpha_histograms =
+      patchy::ui::curves_histograms_from_pixels(&rgb_source, std::span<const std::uint8_t>(external_alpha));
+  CHECK(external_alpha_histograms.red[10] == 0U);
+  CHECK(external_alpha_histograms.green[20] == 0U);
+  CHECK(external_alpha_histograms.blue[30] == 0U);
+  CHECK(external_alpha_histograms.red[40] == 1U);
+  CHECK(external_alpha_histograms.green[80] == 1U);
+  CHECK(external_alpha_histograms.blue[120] == 1U);
+  CHECK(external_alpha_histograms.rgb[40] == 1U);
+  CHECK(external_alpha_histograms.rgb[80] == 1U);
+  CHECK(external_alpha_histograms.rgb[120] == 1U);
+  const std::array<std::uint8_t, 1> mismatched_alpha{255};
+  const auto mismatched_histograms =
+      patchy::ui::curves_histograms_from_pixels(&rgb_source, std::span<const std::uint8_t>(mismatched_alpha));
+  CHECK(std::accumulate(mismatched_histograms.rgb.begin(), mismatched_histograms.rgb.end(), std::uint64_t{0}) ==
+        0U);
+  CHECK(std::accumulate(mismatched_histograms.red.begin(), mismatched_histograms.red.end(), std::uint64_t{0}) ==
+        0U);
+
+  patchy::ui::CurvesEditorWidget editor;
+  editor.resize(460, 520);
+
+  patchy::ui::CurvesHistograms histograms;
+  histograms.rgb[20] = 10;
+  histograms.rgb[220] = 10;
+  histograms.red[16] = 8;
+  histograms.red[236] = 8;
+  editor.set_histograms(histograms);
+
+  patchy::CurvesAdjustment accepted;
+  int change_count = 0;
+  int finished_count = 0;
+  editor.adjustment_changed = [&](const patchy::CurvesAdjustment& adjustment, bool finished) {
+    accepted = adjustment;
+    ++change_count;
+    if (finished) {
+      ++finished_count;
+    }
+    editor.set_adjustment(adjustment);
+  };
+
+  editor.show();
+  QApplication::processEvents();
+  auto* graph = editor.findChild<QWidget*>(QStringLiteral("curvesGraph"));
+  auto* tabs = editor.findChild<QTabBar*>(QStringLiteral("curvesChannelTabs"));
+  auto* input = editor.findChild<QSpinBox*>(QStringLiteral("curvesInputSpin"));
+  auto* output = editor.findChild<QSpinBox*>(QStringLiteral("curvesOutputSpin"));
+  auto* auto_button = editor.findChild<QPushButton*>(QStringLiteral("curvesAutoButton"));
+  auto* reset_button = editor.findChild<QPushButton*>(QStringLiteral("curvesResetButton"));
+  CHECK(graph != nullptr);
+  CHECK(tabs != nullptr);
+  CHECK(input != nullptr);
+  CHECK(output != nullptr);
+  CHECK(auto_button != nullptr);
+  CHECK(reset_button != nullptr);
+  CHECK(auto_button->isEnabled());
+
+  click_curves_graph(*graph, 128, 200);
+  CHECK(accepted.rgb.size() == 3U);
+  CHECK(std::abs(input->value() - 128) <= 1);
+  CHECK(std::abs(output->value() - 200) <= 1);
+  send_key(*graph, Qt::Key_Up, Qt::ShiftModifier);
+  CHECK(output->value() >= 209);
+  input->setValue(120);
+  output->setValue(205);
+  const patchy::CurveControlPoint edited_rgb_point{120, 205};
+  CHECK(accepted.rgb[1] == edited_rgb_point);
+  send_key(*graph, Qt::Key_PageDown);
+  CHECK(input->value() == 255);
+  send_key(*graph, Qt::Key_PageUp);
+  CHECK(input->value() == 120);
+
+  graph->setFocus(Qt::OtherFocusReason);
+  QApplication::processEvents();
+  const auto selected_before_tab = editor.selected_point();
+  send_key(*graph, Qt::Key_Tab);
+  CHECK(editor.selected_point() == selected_before_tab);
+  CHECK(!graph->hasFocus());
+
+  tabs->setCurrentIndex(1);
+  QApplication::processEvents();
+  click_curves_graph(*graph, 80, 170);
+  CHECK(accepted.red.size() == 3U);
+  CHECK(accepted.rgb.size() == 3U);
+  send_key(*graph, Qt::Key_Delete);
+  CHECK(accepted.red.size() == 2U);
+
+  patchy::CurvesAdjustment display_curves;
+  display_curves.rgb = {{0, 12}, {64, 35}, {128, 205}, {255, 248}};
+  display_curves.red = {{0, 0}, {80, 210}, {255, 255}};
+  display_curves.green = {{0, 25}, {150, 60}, {255, 250}};
+  display_curves.blue = {{0, 255}, {120, 170}, {255, 0}};
+  editor.set_adjustment(display_curves);
+  accepted = editor.adjustment();
+  tabs->setCurrentIndex(0);
+  QApplication::processEvents();
+
+  drag(*graph, curves_graph_position(*graph, 0, 12), curves_graph_position(*graph, 22, 42));
+  CHECK(std::abs(accepted.rgb.front().input - 22) <= 1);
+  CHECK(std::abs(accepted.rgb.front().output - 42) <= 1);
+
+  reset_button->setFocus(Qt::OtherFocusReason);
+  QApplication::processEvents();
+  const auto graph_image = graph->grab().toImage();
+  int red_curve_pixels = 0;
+  int green_curve_pixels = 0;
+  int blue_curve_pixels = 0;
+  for (int y = 0; y < graph_image.height(); ++y) {
+    for (int x = 0; x < graph_image.width(); ++x) {
+      const auto color = graph_image.pixelColor(x, y);
+      if (color.red() > 85 && color.red() > color.green() + 25 && color.red() > color.blue() + 25) {
+        ++red_curve_pixels;
+      }
+      if (color.green() > 85 && color.green() > color.red() + 20 && color.green() > color.blue() + 15) {
+        ++green_curve_pixels;
+      }
+      if (color.blue() > 85 && color.blue() > color.red() + 20 && color.blue() > color.green() + 15) {
+        ++blue_curve_pixels;
+      }
+    }
+  }
+  CHECK(red_curve_pixels > 20);
+  CHECK(green_curve_pixels > 20);
+  CHECK(blue_curve_pixels > 20);
+  editor.grab().save(QStringLiteral("test-artifacts/ui_curves_editor.png"));
+
+  patchy::CurvesAdjustment capacity_curves;
+  capacity_curves.rgb.clear();
+  for (int index = 0; index < 17; ++index) {
+    const auto value = index * 15;
+    capacity_curves.rgb.push_back({value, value});
+  }
+  capacity_curves.rgb.push_back({255, 255});
+  editor.set_adjustment(capacity_curves);
+  accepted = editor.adjustment();
+  CHECK(accepted.rgb.size() == 18U);
+  click_curves_graph(*graph, 248, 40);
+  CHECK(accepted.rgb.size() == 19U);
+  const auto at_capacity = accepted.rgb;
+  click_curves_graph(*graph, 246, 140);
+  CHECK(accepted.rgb == at_capacity);
+
+  auto_button->click();
+  CHECK(accepted.rgb == patchy::CurveControlPoints({{20, 0}, {220, 255}}));
+  CHECK(finished_count > 0);
+
+  reset_button->click();
+  const patchy::CurveControlPoints identity{{0, 0}, {255, 255}};
+  CHECK(accepted.rgb == identity);
+  CHECK(accepted.red == identity);
+  CHECK(accepted.green == identity);
+  CHECK(accepted.blue == identity);
+  CHECK(change_count >= 9);
+  editor.hide();
+}
+
+void ui_curves_transient_canvas_read_is_non_mutating() {
+  patchy::Document document(32, 24, patchy::PixelFormat::rgba8());
+  document.add_pixel_layer("Sample", solid_pixels(32, 24, patchy::PixelFormat::rgba8(), QColor(90, 120, 150)));
+  const auto layer_id = document.layers().front().id();
+  const auto* original_layer = std::as_const(document).find_layer(layer_id);
+  CHECK(original_layer != nullptr);
+  const auto original_render_revision = original_layer->render_revision();
+  const auto original_content_revision = original_layer->content_revision();
+
+  patchy::ui::CanvasWidget canvas;
+  canvas.resize(320, 240);
+  canvas.set_document(&document);
+  canvas.fit_to_view();
+  canvas.set_edit_locked(true);
+  canvas.set_primary_color(QColor(12, 34, 56));
+  canvas.show();
+  QApplication::processEvents();
+
+  std::vector<patchy::ui::CanvasReadPhase> phases;
+  canvas.set_transient_read_interaction(
+      [&](const patchy::ui::CanvasReadGesture& gesture) { phases.push_back(gesture.phase); }, Qt::CrossCursor);
+  const auto from = canvas.widget_position_for_document_point(QPoint(8, 8));
+  const auto to = canvas.widget_position_for_document_point(QPoint(12, 5));
+  drag(canvas, from, to);
+  CHECK(phases.size() == 3U);
+  CHECK(phases[0] == patchy::ui::CanvasReadPhase::Press);
+  CHECK(phases[1] == patchy::ui::CanvasReadPhase::Drag);
+  CHECK(phases[2] == patchy::ui::CanvasReadPhase::Release);
+  send_key(canvas, Qt::Key_Escape);
+  CHECK(phases.size() == 4U);
+  CHECK(phases[3] == patchy::ui::CanvasReadPhase::Dismiss);
+  CHECK(canvas.primary_color() == QColor(12, 34, 56));
+  CHECK(canvas.has_transient_read_interaction());
+  const auto* unchanged_layer = std::as_const(document).find_layer(layer_id);
+  CHECK(unchanged_layer != nullptr);
+  CHECK(unchanged_layer->render_revision() == original_render_revision);
+  CHECK(unchanged_layer->content_revision() == original_content_revision);
+
+  canvas.set_curves_clipping_preview(patchy::ui::CurvesClippingMode::Both,
+                                     patchy::CurvesChannel::Rgb);
+  CHECK(canvas.curves_clipping_preview_mode() == patchy::ui::CurvesClippingMode::Both);
+  canvas.set_curves_clipping_preview(std::nullopt);
+  CHECK(!canvas.curves_clipping_preview_mode().has_value());
+  unchanged_layer = std::as_const(document).find_layer(layer_id);
+  CHECK(unchanged_layer != nullptr);
+  CHECK(unchanged_layer->render_revision() == original_render_revision);
+  CHECK(unchanged_layer->content_revision() == original_content_revision);
+
+  phases.clear();
+  send_mouse(canvas, QEvent::MouseButtonPress, from, Qt::LeftButton, Qt::LeftButton);
+  canvas.clear_transient_read_interaction();
+  CHECK(phases.size() == 2U);
+  CHECK(phases[0] == patchy::ui::CanvasReadPhase::Press);
+  CHECK(phases[1] == patchy::ui::CanvasReadPhase::Cancel);
+  CHECK(!canvas.has_transient_read_interaction());
+}
+
+void ui_curves_histograms_box_average_fills_missing_codes() {
+  // Sampling averages 2x2 blocks. A red checkerboard of 100/102 only ever
+  // shows code 100 under point decimation; box averaging lands on 101.
+  patchy::PixelBuffer quantized(550, 550, patchy::PixelFormat::rgb8());
+  for (std::int32_t y = 0; y < 550; ++y) {
+    for (std::int32_t x = 0; x < 550; ++x) {
+      auto* pixel = quantized.pixel(x, y);
+      pixel[0] = ((x + y) % 2 == 0) ? 100 : 102;
+      pixel[1] = 60;
+      pixel[2] = 200;
+    }
+  }
+  const auto histograms = patchy::ui::curves_histograms_from_pixels(&quantized);
+  const std::uint32_t blocks = 275U * 275U;
+  CHECK(histograms.red[101] == blocks);
+  CHECK(histograms.red[100] == 0U);
+  CHECK(histograms.red[102] == 0U);
+  CHECK(histograms.green[60] == blocks);
+  CHECK(histograms.blue[200] == blocks);
+  CHECK(histograms.rgb[101] == blocks);
+  CHECK(histograms.rgb[60] == blocks);
+  CHECK(histograms.rgb[200] == blocks);
+
+  // Transparent pixels stay out of the averages: blocks mixing one opaque
+  // red-33 pixel with three transparent red-7 pixels must bin at 33, and the
+  // fully transparent left half must contribute nothing at all.
+  patchy::PixelBuffer sparse(1024, 512, patchy::PixelFormat::rgba8());
+  for (std::int32_t y = 0; y < 512; ++y) {
+    for (std::int32_t x = 0; x < 1024; ++x) {
+      auto* pixel = sparse.pixel(x, y);
+      const bool opaque = x >= 512 && (x % 2 == 0) && (y % 2 == 0);
+      pixel[0] = opaque ? 33 : 7;
+      pixel[1] = 120;
+      pixel[2] = 220;
+      pixel[3] = opaque ? 255 : 0;
+    }
+  }
+  const auto sparse_histograms = patchy::ui::curves_histograms_from_pixels(&sparse);
+  const std::uint32_t opaque_blocks = 256U * 256U;
+  CHECK(sparse_histograms.red[33] == opaque_blocks);
+  CHECK(std::accumulate(sparse_histograms.red.begin(), sparse_histograms.red.end(), std::uint64_t{0}) ==
+        opaque_blocks);
+
+  // The kernel must stay light: a dark noisy channel keeps its spread instead
+  // of collapsing into a couple of towering bins. This texture cycles red over
+  // all sixteen dark codes block by block; a 10x10 kernel averages neighboring
+  // blocks together, collapsing it into bins 7-8 and crushing the display.
+  patchy::PixelBuffer noisy(512, 512, patchy::PixelFormat::rgb8());
+  for (std::int32_t y = 0; y < 512; ++y) {
+    for (std::int32_t x = 0; x < 512; ++x) {
+      auto* pixel = noisy.pixel(x, y);
+      pixel[0] = static_cast<std::uint8_t>(((x / 2) * 7 + (y / 2) * 13) % 16);
+      pixel[1] = 128;
+      pixel[2] = 128;
+    }
+  }
+  const auto noisy_histograms = patchy::ui::curves_histograms_from_pixels(&noisy);
+  const auto noisy_total =
+      std::accumulate(noisy_histograms.red.begin(), noisy_histograms.red.end(), std::uint64_t{0});
+  CHECK(noisy_total == 256U * 256U);
+  int populated_bins = 0;
+  std::uint32_t tallest_bin = 0;
+  for (const auto count : noisy_histograms.red) {
+    if (count > 0) {
+      ++populated_bins;
+    }
+    tallest_bin = std::max(tallest_bin, count);
+  }
+  CHECK(populated_bins == 16);
+  CHECK(tallest_bin * 2U < noisy_total);
+}
+
+void ui_curves_histogram_display_is_linear_and_clips() {
+  patchy::ui::CurvesEditorWidget editor;
+  editor.resize(460, 520);
+  // A floor of 100 in every bin but 220 (the background reference), a
+  // dominant spike of 47,300 at bin 128, full-ceiling bins at 0, 40 and 255
+  // and a half-ceiling bin at 200: 76,500 samples over 255 non-empty bins, so
+  // the ceiling is 4 * 76,500 / 255 = 1,200.
+  patchy::ui::CurvesHistograms histograms;
+  histograms.rgb.fill(100);
+  histograms.rgb[220] = 0;
+  histograms.rgb[128] = 47300;
+  histograms.rgb[0] = 1200;
+  histograms.rgb[255] = 1200;
+  histograms.rgb[40] = 1200;
+  histograms.rgb[200] = 600;
+  std::uint64_t total = 0;
+  for (const auto count : histograms.rgb) {
+    total += count;
+  }
+  CHECK(total == 76500);
+  editor.set_histograms(histograms);
+  editor.show();
+  QApplication::processEvents();
+
+  auto* graph = editor.findChild<QWidget*>(QStringLiteral("curvesGraph"));
+  CHECK(graph != nullptr);
+  const auto image = graph->grab().toImage();
+
+  // Mirrors CurvesGraphWidget::graph_rect() and draw_histogram's inset
+  // column-to-bin mapping.
+  const auto available = QRect(0, 0, graph->width(), graph->height()).adjusted(31, 10, -10, -28);
+  const auto side = std::max(1, std::min(available.width(), available.height()));
+  CHECK(side >= 258);
+  const QRect graph_rect(available.left() + (available.width() - side) / 2,
+                         available.top() + (available.height() - side) / 2, side, side);
+  const auto plot_left = graph_rect.left() + 1;
+  const auto plot_width = side - 2;
+  const auto column_for_bin = [&](int bin) {
+    for (int x = 0; x < plot_width; ++x) {
+      const auto first_bin = std::clamp((x * 256) / plot_width, 0, 255);
+      const auto last_bin = std::clamp(((x + 1) * 256) / plot_width, first_bin + 1, 256);
+      if (first_bin == bin && last_bin == bin + 1) {
+        return plot_left + x;
+      }
+    }
+    return -1;
+  };
+  const auto row_at = [&](double fraction) {
+    return graph_rect.bottom() - static_cast<int>(std::lround(fraction * (side - 1)));
+  };
+
+  // Clipping spikes in the endpoint bins draw as full-height columns just
+  // inside the frame instead of hiding under the border stroke.
+  const auto spike_row = row_at(0.90);
+  CHECK(!color_close(image.pixelColor(plot_left, spike_row),
+                     image.pixelColor(column_for_bin(220), spike_row), 6));
+  CHECK(!color_close(image.pixelColor(plot_left + plot_width - 1, spike_row),
+                     image.pixelColor(column_for_bin(220), spike_row), 6));
+
+  const auto tall_column = column_for_bin(40);
+  const auto short_column = column_for_bin(200);
+  const auto spike_column = column_for_bin(128);
+  const auto floor_column = column_for_bin(100);
+  const auto empty_column = column_for_bin(220);
+  CHECK(tall_column > 0);
+  CHECK(short_column > 0);
+  CHECK(spike_column > 0);
+  CHECK(floor_column > 0);
+  CHECK(empty_column > 0);
+
+  // A bin exactly at the ceiling fills its column, and the 40x taller spike
+  // clips to the same height instead of setting the scale (max-normalized
+  // display drew the ceiling bin at 2.5%).
+  CHECK(!color_close(image.pixelColor(tall_column, row_at(0.90)),
+                     image.pixelColor(empty_column, row_at(0.90)), 6));
+  CHECK(!color_close(image.pixelColor(spike_column, row_at(0.90)),
+                     image.pixelColor(empty_column, row_at(0.90)), 6));
+  // Linear below the ceiling, matching Photoshop's dialogs: the half-ceiling
+  // bin covers the 45% probe but not the 55% one (sqrt-of-max drew 11%, log
+  // drew 59%).
+  CHECK(!color_close(image.pixelColor(short_column, row_at(0.45)),
+                     image.pixelColor(empty_column, row_at(0.45)), 6));
+  CHECK(color_close(image.pixelColor(short_column, row_at(0.55)),
+                    image.pixelColor(empty_column, row_at(0.55)), 6));
+  // The 100-sample floor draws at 8%: above the baseline, under the 15% probe.
+  CHECK(!color_close(image.pixelColor(floor_column, row_at(0.04)),
+                     image.pixelColor(empty_column, row_at(0.04)), 6));
+  CHECK(color_close(image.pixelColor(floor_column, row_at(0.15)),
+                    image.pixelColor(empty_column, row_at(0.15)), 6));
+}
+
+double widget_fill_share(QWidget& widget, const QColor& target) {
+  const auto image = widget.grab().toImage();
+  if (image.width() <= 0 || image.height() <= 0) {
+    return 0.0;
+  }
+  int matches = 0;
+  for (int y = 0; y < image.height(); ++y) {
+    for (int x = 0; x < image.width(); ++x) {
+      if (color_close(image.pixelColor(x, y), target, 8)) {
+        ++matches;
+      }
+    }
+  }
+  return static_cast<double>(matches) / (static_cast<double>(image.width()) * image.height());
+}
+
+void ui_curves_canvas_tool_buttons_show_checked_state() {
+  patchy::ui::MainWindow window;
+  show_window(window);
+  auto* canvas = require_canvas(window);
+  canvas->set_primary_color(QColor(120, 90, 60));
+  use_solid_fill_settings(canvas);
+  require_action(window, "layerFillForegroundAction")->trigger();
+  QApplication::processEvents();
+
+  bool inspected = false;
+  QTimer::singleShot(0, guarded([&] {
+    auto* dialog = find_top_level_dialog(QStringLiteral("patchyCurvesDialog"));
+    CHECK(dialog != nullptr);
+    auto* black = dialog->findChild<QPushButton*>(QStringLiteral("curvesBlackPointButton"));
+    auto* white = dialog->findChild<QPushButton*>(QStringLiteral("curvesWhitePointButton"));
+    CHECK(black != nullptr && black->isEnabled());
+    CHECK(white != nullptr && white->isEnabled());
+    black->click();
+    CHECK(black->isChecked());
+    CHECK(!white->isChecked());
+    // Arming a picker must be visible: the checked button repaints with the
+    // accent fill while the unchecked sibling keeps the plain button skin.
+    CHECK(widget_fill_share(*black, patchy::ui::theme().accent_checked_bg) > 0.25);
+    CHECK(widget_fill_share(*white, patchy::ui::theme().accent_checked_bg) < 0.05);
+    inspected = true;
+    dialog->reject();
+  }));
+  require_action(window, "layerNewCurvesAdjustmentAction")->trigger();
+  QApplication::processEvents();
+  CHECK(inspected);
+}
+
+void ui_curves_canvas_tools_before_and_clipping_hooks() {
+  patchy::ui::CurvesDialogHooks hooks;
+  patchy::ui::CurvesCanvasMode active_mode = patchy::ui::CurvesCanvasMode::None;
+  std::function<void(const patchy::ui::CurvesCanvasSample&)> sample_changed;
+  int clear_count = 0;
+  std::vector<std::pair<std::optional<patchy::ui::CurvesClippingMode>, patchy::CurvesChannel>> clipping_calls;
+  hooks.set_canvas_mode = [&](patchy::ui::CurvesCanvasMode mode, auto callback) {
+    active_mode = mode;
+    sample_changed = std::move(callback);
+  };
+  hooks.clear_canvas_mode = [&] {
+    active_mode = patchy::ui::CurvesCanvasMode::None;
+    sample_changed = {};
+    ++clear_count;
+  };
+  hooks.clipping_changed = [&](std::optional<patchy::ui::CurvesClippingMode> mode,
+                               patchy::CurvesChannel channel) {
+    clipping_calls.emplace_back(mode, channel);
+  };
+
+  std::vector<bool> preview_states;
+  bool inspected = false;
+  QTimer::singleShot(0, guarded([&] {
+    auto* dialog = find_top_level_dialog(QStringLiteral("patchyCurvesDialog"));
+    CHECK(dialog != nullptr);
+    auto* editor = dialog->findChild<patchy::ui::CurvesEditorWidget*>(QStringLiteral("curvesEditor"));
+    auto* tabs = dialog->findChild<QTabBar*>(QStringLiteral("curvesChannelTabs"));
+    auto* targeted = dialog->findChild<QPushButton*>(QStringLiteral("curvesTargetedAdjustmentButton"));
+    auto* black = dialog->findChild<QPushButton*>(QStringLiteral("curvesBlackPointButton"));
+    auto* gray = dialog->findChild<QPushButton*>(QStringLiteral("curvesGrayPointButton"));
+    auto* white = dialog->findChild<QPushButton*>(QStringLiteral("curvesWhitePointButton"));
+    auto* reset = dialog->findChild<QPushButton*>(QStringLiteral("curvesResetButton"));
+    auto* before = dialog->findChild<QPushButton*>(QStringLiteral("curvesBeforeButton"));
+    auto* clipping = dialog->findChild<QPushButton*>(QStringLiteral("curvesClippingPreviewButton"));
+    CHECK(editor != nullptr);
+    CHECK(tabs != nullptr);
+    CHECK(targeted != nullptr && targeted->isEnabled());
+    CHECK(black != nullptr && black->isEnabled());
+    CHECK(gray != nullptr && gray->isEnabled());
+    CHECK(white != nullptr && white->isEnabled());
+    CHECK(reset != nullptr);
+    CHECK(before != nullptr && before->isEnabled());
+    CHECK(clipping != nullptr && clipping->isEnabled());
+
+    const auto send_sample = [&](QColor color, patchy::ui::CanvasReadPhase phase, int global_y) {
+      CHECK(static_cast<bool>(sample_changed));
+      const auto callback = sample_changed;
+      callback(patchy::ui::CurvesCanvasSample{
+          color, patchy::ui::CanvasReadGesture{QPoint(10, 10), QPoint(200, global_y), Qt::NoModifier, phase}});
+    };
+
+    targeted->click();
+    CHECK(active_mode == patchy::ui::CurvesCanvasMode::Targeted);
+    send_sample(QColor(100, 120, 140), patchy::ui::CanvasReadPhase::Press, 100);
+    send_sample({}, patchy::ui::CanvasReadPhase::Drag, 70);
+    send_sample({}, patchy::ui::CanvasReadPhase::Release, 70);
+    const auto targeted_points = editor->adjustment().rgb;
+    const auto targeted_point = std::find_if(targeted_points.begin(), targeted_points.end(),
+                                             [](const patchy::CurveControlPoint& point) {
+                                               return point.input == 117;
+                                             });
+    CHECK(targeted_point != targeted_points.end());
+    CHECK(targeted_point->output == 147);
+
+    black->click();
+    CHECK(active_mode == patchy::ui::CurvesCanvasMode::BlackPoint);
+    send_sample(QColor(20, 30, 40), patchy::ui::CanvasReadPhase::Press, 100);
+    white->click();
+    send_sample(QColor(220, 230, 240), patchy::ui::CanvasReadPhase::Press, 100);
+    gray->click();
+    send_sample(QColor(100, 110, 120), patchy::ui::CanvasReadPhase::Press, 100);
+    CHECK(editor->adjustment().red == patchy::CurveControlPoints({{20, 0}, {100, 128}, {220, 255}}));
+    CHECK(editor->adjustment().green == patchy::CurveControlPoints({{30, 0}, {110, 128}, {230, 255}}));
+    CHECK(editor->adjustment().blue == patchy::CurveControlPoints({{40, 0}, {120, 128}, {240, 255}}));
+
+    black->click();
+    send_sample(QColor(20, 30, 40), patchy::ui::CanvasReadPhase::Press, 100);
+    reset->click();
+    white->click();
+    send_sample(QColor(220, 230, 240), patchy::ui::CanvasReadPhase::Press, 100);
+    CHECK(editor->adjustment().red == patchy::CurveControlPoints({{0, 0}, {220, 255}}));
+    CHECK(editor->adjustment().green == patchy::CurveControlPoints({{0, 0}, {230, 255}}));
+    CHECK(editor->adjustment().blue == patchy::CurveControlPoints({{0, 0}, {240, 255}}));
+
+    preview_states.clear();
+    const auto center = before->rect().center();
+    send_mouse(*before, QEvent::MouseButtonPress, center, Qt::LeftButton, Qt::LeftButton);
+    send_mouse(*before, QEvent::MouseButtonRelease, center, Qt::LeftButton, Qt::NoButton);
+    CHECK(preview_states.size() >= 2U);
+    CHECK(std::find(preview_states.begin(), preview_states.end(), false) != preview_states.end());
+    CHECK(preview_states.back());
+
+    clipping->click();
+    CHECK(!clipping_calls.empty());
+    CHECK(clipping_calls.back().first == patchy::ui::CurvesClippingMode::Both);
+    CHECK(clipping_calls.back().second == patchy::CurvesChannel::Rgb);
+    tabs->setCurrentIndex(1);
+    QApplication::processEvents();
+    CHECK(clipping_calls.back().first == patchy::ui::CurvesClippingMode::Both);
+    CHECK(clipping_calls.back().second == patchy::CurvesChannel::Red);
+    clipping->click();
+    CHECK(!clipping_calls.back().first.has_value());
+
+    inspected = true;
+    send_sample({}, patchy::ui::CanvasReadPhase::Dismiss, 100);
+  }));
+
+  const auto result = patchy::ui::request_curves_settings(
+      nullptr,
+      [&](bool enabled, const patchy::ui::CurvesSettings&) { preview_states.push_back(enabled); },
+      {}, {}, hooks);
+  CHECK(!result.has_value());
+  CHECK(inspected);
+  CHECK(clear_count >= 1);
+  CHECK(active_mode == patchy::ui::CurvesCanvasMode::None);
+  CHECK(!clipping_calls.empty());
+  CHECK(!clipping_calls.back().first.has_value());
+}
+
+void ui_curves_canvas_sampler_reads_below_preview_and_escape_closes() {
+  patchy::ui::MainWindow window;
+  show_window(window);
+  auto* canvas = require_canvas(window);
+  canvas->set_primary_color(QColor(20, 30, 40));
+  use_solid_fill_settings(canvas);
+  require_action(window, "layerFillForegroundAction")->trigger();
+  QApplication::processEvents();
+
+  auto& document = patchy::ui::MainWindowTestAccess::document(window);
+  const auto base_id = document.active_layer_id();
+  CHECK(base_id.has_value());
+  const auto* base = std::as_const(document).find_layer(*base_id);
+  CHECK(base != nullptr);
+  const auto base_render_revision = base->render_revision();
+  const auto base_content_revision = base->content_revision();
+  const auto layer_count_before = document.layers().size();
+  const auto undo_before = patchy::ui::MainWindowTestAccess::active_session_undo_depth(window);
+  const auto primary_before = canvas->primary_color();
+
+  bool sampled_original_input = false;
+  bool escape_closed_dialog = false;
+  QTimer::singleShot(0, guarded([&] {
+    auto* dialog = find_top_level_dialog(QStringLiteral("patchyCurvesDialog"));
+    CHECK(dialog != nullptr);
+    auto* graph = dialog->findChild<QWidget*>(QStringLiteral("curvesGraph"));
+    auto* editor = dialog->findChild<patchy::ui::CurvesEditorWidget*>(QStringLiteral("curvesEditor"));
+    auto* black = dialog->findChild<QPushButton*>(QStringLiteral("curvesBlackPointButton"));
+    CHECK(graph != nullptr);
+    CHECK(editor != nullptr);
+    CHECK(black != nullptr && black->isEnabled());
+
+    // Make the live adjustment visibly remap the sampled tone. The canvas
+    // sampler must still read the unadjusted layer below the preview layer.
+    click_curves_graph(*graph, 20, 220);
+    process_events_for(200);
+    black->click();
+    CHECK(canvas->has_transient_read_interaction());
+    const auto canvas_point = canvas->widget_position_for_document_point(QPoint(80, 80));
+    send_mouse(*canvas, QEvent::MouseButtonPress, canvas_point, Qt::LeftButton, Qt::LeftButton);
+    send_mouse(*canvas, QEvent::MouseButtonRelease, canvas_point, Qt::LeftButton, Qt::NoButton);
+    const auto sampled = editor->adjustment();
+    sampled_original_input = sampled.red.front().input == 20 && sampled.green.front().input == 30 &&
+                             sampled.blue.front().input == 40;
+
+    send_key(*canvas, Qt::Key_Escape);
+    escape_closed_dialog = !dialog->isVisible();
+  }));
+  require_action(window, "layerNewCurvesAdjustmentAction")->trigger();
+  QApplication::processEvents();
+
+  CHECK(sampled_original_input);
+  CHECK(escape_closed_dialog);
+  CHECK(!canvas->has_transient_read_interaction());
+  CHECK(canvas->primary_color() == primary_before);
+  CHECK(document.layers().size() == layer_count_before);
+  CHECK(patchy::ui::MainWindowTestAccess::active_session_undo_depth(window) == undo_before);
+  base = std::as_const(document).find_layer(*base_id);
+  CHECK(base != nullptr);
+  CHECK(base->render_revision() == base_render_revision);
+  CHECK(base->content_revision() == base_content_revision);
+}
+
+bool shows_plain_eyedropper_cursor(const QWidget& widget) {
+  const auto cursor = widget.cursor();
+  const auto expected = patchy::ui::eyedropper_cursor();
+  return cursor.shape() == Qt::BitmapCursor && cursor.hotSpot() == expected.hotSpot() &&
+         cursor.pixmap().toImage() == expected.pixmap().toImage();
+}
+
+// The Levels and Curves black, gray and white point pickers show the plain eyedropper over
+// the canvas, and the active tool's brush outline gives way to it; turning the picker off or
+// closing the dialog brings the tool's cursor and outline back (GitHub issue 638).
+// The canvas around `hover` with the pointer the canvas set drawn on top: its pixmap for a
+// bitmap cursor, a plain cross for Qt's cross shape (a widget grab has no OS pointer).
+QImage canvas_crop_with_pointer(patchy::ui::CanvasWidget& canvas, QPoint hover) {
+  auto image = canvas.grab().toImage().convertToFormat(QImage::Format_ARGB32);
+  {
+    QPainter painter(&image);
+    const auto cursor = canvas.cursor();
+    if (cursor.shape() == Qt::BitmapCursor) {
+      painter.drawPixmap(hover - cursor.hotSpot(), cursor.pixmap());
+    } else if (cursor.shape() == Qt::CrossCursor) {
+      for (const auto& pen : {QPen(Qt::white, 3.0), QPen(Qt::black, 1.0)}) {
+        painter.setPen(pen);
+        painter.drawLine(hover - QPoint(10, 0), hover + QPoint(10, 0));
+        painter.drawLine(hover - QPoint(0, 10), hover + QPoint(0, 10));
+      }
+    }
+  }
+  return image.copy(QRect(hover - QPoint(160, 160), QSize(321, 321)).intersected(image.rect()));
+}
+
+void check_point_pickers_replace_brush_cursor(const char* action_name, const char* dialog_name,
+                                              std::array<const char*, 3> picker_names,
+                                              const char* artifact_name) {
+  patchy::ui::MainWindow window;
+  show_window(window);
+  auto* canvas = require_canvas(window);
+  canvas->set_primary_color(QColor(96, 140, 190));
+  use_solid_fill_settings(canvas);
+  require_action(window, "layerFillForegroundAction")->trigger();
+  QApplication::processEvents();
+  require_action_by_text(window, QStringLiteral("Brush"))->trigger();
+  QApplication::processEvents();
+  canvas->set_zoom_centered(1.0);
+  canvas->set_brush_size(250);  // too big for an OS cursor: the outline is painted on the canvas
+  QApplication::processEvents();
+  const auto hover = canvas->widget_position_for_document_point(QPoint(120, 120));
+  const auto settled_grab = [canvas] {
+    CHECK(process_events_until([canvas] { return canvas->render_settled(); }, 10000));
+    QApplication::processEvents();
+    return canvas->grab().toImage();
+  };
+  const auto leave = [canvas] {
+    QEvent event(QEvent::Leave);
+    QApplication::sendEvent(canvas, &event);
+  };
+  const auto hover_grab = [&] {
+    send_mouse(*canvas, QEvent::MouseMove, hover, Qt::NoButton, Qt::NoButton);
+    return settled_grab();
+  };
+
+  bool ran = false;
+  QImage baseline;
+  QTimer::singleShot(0, guarded([&] {
+    auto* dialog = find_top_level_dialog(QString::fromLatin1(dialog_name));
+    CHECK(dialog != nullptr);
+    if (dialog == nullptr) {
+      return;
+    }
+    std::array<QAbstractButton*, 3> pickers{};
+    for (std::size_t index = 0; index < pickers.size(); ++index) {
+      pickers[index] = dialog->findChild<QAbstractButton*>(QString::fromLatin1(picker_names[index]));
+      CHECK(pickers[index] != nullptr);
+      if (pickers[index] == nullptr) {
+        dialog->reject();
+        return;
+      }
+    }
+    process_events_for(150);
+    leave();
+    baseline = settled_grab();
+    // The Brush tool's outline shows over the canvas before a picker is on.
+    CHECK(hover_grab() != baseline);
+    CHECK(!shows_plain_eyedropper_cursor(*canvas));
+
+    for (auto* picker : pickers) {
+      picker->click();
+      const auto frame = hover_grab();
+      if (picker == pickers.front()) {
+        save_image_artifact(artifact_name, canvas_crop_with_pointer(*canvas, hover));
+      }
+      CHECK(canvas->has_transient_read_interaction());
+      CHECK(shows_plain_eyedropper_cursor(*canvas));
+      CHECK(frame == baseline);  // no brush outline, only the pointer
+    }
+    // Turning the picker off brings the tool back.
+    pickers.back()->click();
+    CHECK(!canvas->has_transient_read_interaction());
+    CHECK(!shows_plain_eyedropper_cursor(*canvas));
+    CHECK(hover_grab() != baseline);
+
+    // Closing the dialog with a picker on also ends it.
+    pickers.front()->click();
+    CHECK(shows_plain_eyedropper_cursor(*canvas));
+    ran = true;
+    dialog->reject();
+  }));
+  require_action(window, action_name)->trigger();
+  QApplication::processEvents();
+
+  CHECK(ran);
+  CHECK(!canvas->has_transient_read_interaction());
+  CHECK(!shows_plain_eyedropper_cursor(*canvas));
+  leave();
+  const auto after_close_baseline = settled_grab();
+  CHECK(hover_grab() != after_close_baseline);
+}
+
+void ui_levels_point_pickers_show_eyedropper_and_hide_brush_outline() {
+  check_point_pickers_replace_brush_cursor("imageAdjustLevelsAction", "patchyLevelsDialog",
+                                           {"levelsBlackPointButton", "levelsGrayPointButton",
+                                            "levelsWhitePointButton"},
+                                           "ui_levels_point_picker_cursor");
+}
+
+void ui_curves_point_pickers_show_eyedropper_and_hide_brush_outline() {
+  check_point_pickers_replace_brush_cursor("imageAdjustCurvesAction", "patchyCurvesDialog",
+                                           {"curvesBlackPointButton", "curvesGrayPointButton",
+                                            "curvesWhitePointButton"},
+                                           "ui_curves_point_picker_cursor");
+}
+
+void ui_curves_preset_thumbnails_apply_all_channels_and_track_custom() {
+  const auto presets = patchy::ui::builtin_curves_presets();
+  CHECK(presets.size() == 8U);
+  const std::array<QString, 8> expected_ids{
+      QStringLiteral("curves.default"),
+      QStringLiteral("curves.medium_contrast"),
+      QStringLiteral("curves.strong_contrast"),
+      QStringLiteral("curves.lift_shadows"),
+      QStringLiteral("curves.recover_highlights"),
+      QStringLiteral("curves.matte"),
+      QStringLiteral("curves.warm"),
+      QStringLiteral("curves.cool"),
+  };
+  for (std::size_t index = 0; index < presets.size(); ++index) {
+    CHECK(presets[index].id == expected_ids[index]);
+    CHECK(patchy::ui::find_curves_preset(presets[index].id) == &presets[index]);
+    CHECK(patchy::ui::find_curves_preset(presets[index].adjustment) == &presets[index]);
+    for (const auto channel : {patchy::CurvesChannel::Rgb, patchy::CurvesChannel::Red,
+                               patchy::CurvesChannel::Green, patchy::CurvesChannel::Blue}) {
+      const auto& channel_points = patchy::curve_points_for_channel(presets[index].adjustment, channel);
+      CHECK(channel_points.size() >= 2U);
+      CHECK(channel_points.size() <= 19U);
+      CHECK(patchy::normalized_curve_control_points(channel_points) == channel_points);
+    }
+    const auto thumbnail = patchy::ui::curves_adjustment_thumbnail(presets[index].adjustment);
+    CHECK(!thumbnail.isNull());
+    CHECK(thumbnail.size() == QSize(72, 48));
+  }
+  const auto default_thumbnail = patchy::ui::curves_adjustment_thumbnail(presets[0].adjustment);
+  const auto strong_thumbnail = patchy::ui::curves_adjustment_thumbnail(presets[2].adjustment);
+  const auto warm_thumbnail = patchy::ui::curves_adjustment_thumbnail(presets[6].adjustment);
+  const auto cool_thumbnail = patchy::ui::curves_adjustment_thumbnail(presets[7].adjustment);
+  CHECK(default_thumbnail != strong_thumbnail);
+  CHECK(warm_thumbnail != cool_thumbnail);
+
+  std::optional<patchy::ui::CurvesSettings> result;
+  bool inspected = false;
+  QTimer::singleShot(0, guarded([&] {
+    auto* dialog = find_top_level_dialog(QStringLiteral("patchyCurvesDialog"));
+    CHECK(dialog != nullptr);
+    // The Preset combo (#592 follow-up 3): Custom and the shipped presets, each with its
+    // thumbnail as the entry's icon.
+    auto* preset_combo = dialog->findChild<QComboBox*>(QStringLiteral("curvesPresetCombo"));
+    auto* editor = dialog->findChild<patchy::ui::CurvesEditorWidget*>(QStringLiteral("curvesEditor"));
+    auto* graph = dialog->findChild<QWidget*>(QStringLiteral("curvesGraph"));
+    CHECK(preset_combo != nullptr);
+    CHECK(editor != nullptr);
+    CHECK(graph != nullptr);
+    if (preset_combo == nullptr || editor == nullptr || graph == nullptr) {
+      dialog->reject();
+      return;
+    }
+    CHECK(preset_combo->count() == static_cast<int>(presets.size()) + 1);
+    CHECK(preset_combo->currentData().toString() == QStringLiteral("curves.default"));
+    for (int row = 0; row < preset_combo->count(); ++row) {
+      CHECK(!preset_combo->itemIcon(row).isNull());
+    }
+    const auto choose_preset = [preset_combo](const QString& id) {
+      const auto index = preset_combo->findData(id);
+      CHECK(index > 0);
+      preset_combo->setCurrentIndex(index);
+      Q_EMIT preset_combo->activated(index);
+      QApplication::processEvents();
+    };
+
+    choose_preset(QStringLiteral("curves.warm"));
+    CHECK(editor->adjustment() == presets[6].adjustment);
+    CHECK(editor->adjustment().red != editor->adjustment().blue);
+
+    click_curves_graph(*graph, 108, 183);
+    QApplication::processEvents();
+    CHECK(preset_combo->currentIndex() == 0);
+    CHECK(preset_combo->currentData().toString() == QStringLiteral("custom"));
+    CHECK(preset_combo->currentText() == QStringLiteral("Custom"));
+    CHECK(!preset_combo->itemIcon(0).isNull());
+
+    choose_preset(QStringLiteral("curves.strong_contrast"));
+    CHECK(editor->adjustment() == presets[2].adjustment);
+    dialog->grab().save(QStringLiteral("test-artifacts/ui_curves_presets.png"));
+    inspected = true;
+    dialog->accept();
+  }));
+  result = patchy::ui::request_curves_settings(nullptr);
+  CHECK(inspected);
+  CHECK(result.has_value());
+  CHECK(*result == presets[2].adjustment);
+}
+
+void ui_curves_destructive_and_adjustment_luts_match() {
+  patchy::PixelBuffer original(256, 1, patchy::PixelFormat::rgba8());
+  for (int value = 0; value < 256; ++value) {
+    auto* pixel = original.pixel(value, 0);
+    pixel[0] = static_cast<std::uint8_t>(value);
+    pixel[1] = static_cast<std::uint8_t>(255 - value);
+    pixel[2] = static_cast<std::uint8_t>((value * 37) & 0xff);
+    pixel[3] = static_cast<std::uint8_t>((value * 53) & 0xff);
+  }
+
+  patchy::CurvesAdjustment curves;
+  curves.rgb = {{0, 0}, {48, 22}, {128, 204}, {220, 214}, {255, 255}};
+  curves.red = {{8, 0}, {92, 148}, {248, 255}};
+  curves.green = {{0, 6}, {180, 158}, {255, 249}};
+  curves.blue = {{0, 255}, {116, 170}, {255, 0}};
+
+  auto destructive = original;
+  patchy::ui::apply_curves_to_pixels(destructive, patchy::Rect::from_size(256, 1), QRegion(), curves);
+
+  auto adjustment_pixels = original;
+  patchy::AdjustmentSettings settings;
+  settings.kind = patchy::AdjustmentKind::Curves;
+  settings.curves = curves;
+  patchy::apply_adjustment_to_pixels(adjustment_pixels, settings);
+  CHECK(destructive.data().size() == adjustment_pixels.data().size());
+  CHECK(std::equal(destructive.data().begin(), destructive.data().end(), adjustment_pixels.data().begin()));
+  for (int value = 0; value < 256; ++value) {
+    CHECK(destructive.pixel(value, 0)[3] == original.pixel(value, 0)[3]);
+  }
+}
+
+void ui_levels_destructive_transfer_is_lround_on_double() {
+  patchy::PixelBuffer ramp(256, 1, patchy::PixelFormat::rgba8());
+  for (int value = 0; value < 256; ++value) {
+    auto* pixel = ramp.pixel(value, 0);
+    pixel[0] = static_cast<std::uint8_t>(value);
+    pixel[1] = static_cast<std::uint8_t>(value);
+    pixel[2] = static_cast<std::uint8_t>(value);
+    pixel[3] = static_cast<std::uint8_t>((value * 53) & 0xff);
+  }
+  const auto original = ramp;
+
+  patchy::ui::LevelsSettings settings;
+  settings.black_input = 0;
+  settings.white_input = 45;
+  settings.gamma_percent = 121;
+  patchy::ui::apply_levels_to_pixels(ramp, patchy::Rect::from_size(256, 1), QRegion(), settings);
+
+  for (int value = 0; value < 256; ++value) {
+    // The destructive/preview transfer lrounds the double, deliberately NOT
+    // core's float rounding (levels_channel / build_adjustment_lut); the two
+    // differ by 1/255 on real inputs. Reference computed inline with the
+    // documented formula.
+    const auto gamma = 121.0 / 100.0;
+    const auto normalized = std::clamp(static_cast<double>(value) / 45.0, 0.0, 1.0);
+    const auto expected =
+        static_cast<std::uint8_t>(std::clamp(std::lround(std::pow(normalized, 1.0 / gamma) * 255.0), 0L, 255L));
+    const auto* pixel = ramp.pixel(value, 0);
+    CHECK(pixel[0] == expected);
+    CHECK(pixel[1] == expected);
+    CHECK(pixel[2] == expected);
+    CHECK(pixel[3] == original.pixel(value, 0)[3]);
+  }
+  // Canary against a future "dedupe" into core's LUT builders: core's float
+  // path gives 35 for input 4 under this record; the dialog transfer gives 34.
+  CHECK(ramp.pixel(4, 0)[0] == 34);
+}
+
+void ui_levels_parallel_path_matches_sequential() {
+  // Over 1 Mpx so the strip fan-out gate engages when no progress sink is
+  // given; a non-null progress forces the sequential span walk, so the two
+  // runs cover both paths and must agree byte for byte.
+  patchy::PixelBuffer original(1400, 800, patchy::PixelFormat::rgba8());
+  std::uint64_t state = 0x9e3779b97f4a7c15ull;
+  for (auto& byte : original.data()) {
+    state = state * 6364136223846793005ull + 1442695040888963407ull;
+    byte = static_cast<std::uint8_t>(state >> 56);
+  }
+
+  patchy::ui::LevelsSettings settings;
+  settings.black_input = 10;
+  settings.white_input = 240;
+  settings.gamma_percent = 82;
+  settings.red = {5, 250, 118, 2, 253};
+  settings.green = {0, 255, 104, 0, 255};
+  settings.blue = {12, 200, 95, 10, 245};
+
+  auto parallel = original;
+  patchy::ui::apply_levels_to_pixels(parallel, patchy::Rect::from_size(1400, 800), QRegion(), settings);
+
+  auto sequential = original;
+  int updates = 0;
+  patchy::FilterProgress progress;
+  progress.update = [&updates](int, int, patchy::FilterProgressStage) {
+    ++updates;
+    return true;
+  };
+  patchy::ui::apply_levels_to_pixels(sequential, patchy::Rect::from_size(1400, 800), QRegion(), settings, &progress);
+
+  CHECK(updates > 0);
+  CHECK(parallel.data().size() == sequential.data().size());
+  CHECK(std::equal(parallel.data().begin(), parallel.data().end(), sequential.data().begin()));
+}
+
+void ui_hue_saturation_parallel_path_matches_sequential() {
+  // Over 1 Mpx so the strip fan-out gate engages when no progress sink is
+  // given; a non-null progress forces the sequential span walk, so the two
+  // runs cover both paths and must agree byte for byte. No LUT exists for
+  // hue/saturation, so this pins the pure-per-pixel fan-out directly.
+  patchy::PixelBuffer original(1400, 800, patchy::PixelFormat::rgba8());
+  std::uint64_t state = 0x9e3779b97f4a7c15ull;
+  for (auto& byte : original.data()) {
+    state = state * 6364136223846793005ull + 1442695040888963407ull;
+    byte = static_cast<std::uint8_t>(state >> 56);
+  }
+
+  patchy::ui::HueSaturationSettings master;
+  master.hue_shift = 40;
+  master.saturation_delta = 25;
+  master.lightness_delta = -10;
+
+  patchy::ui::HueSaturationSettings colorize;
+  colorize.colorize = true;
+  colorize.colorize_hue = 200;
+  colorize.colorize_saturation = 50;
+
+  for (const auto& settings : {master, colorize}) {
+    auto parallel = original;
+    patchy::ui::apply_hue_saturation_to_pixels(parallel, patchy::Rect::from_size(1400, 800), QRegion(), settings);
+
+    auto sequential = original;
+    int updates = 0;
+    patchy::FilterProgress progress;
+    progress.update = [&updates](int, int, patchy::FilterProgressStage) {
+      ++updates;
+      return true;
+    };
+    patchy::ui::apply_hue_saturation_to_pixels(sequential, patchy::Rect::from_size(1400, 800), QRegion(), settings,
+                                               &progress);
+
+    CHECK(updates > 0);
+    CHECK(parallel.data().size() == sequential.data().size());
+    CHECK(std::equal(parallel.data().begin(), parallel.data().end(), sequential.data().begin()));
+  }
+}
+
+void ui_curves_acv_load_save_updates_editor_and_preview() {
+  ensure_artifact_dir();
+  const auto input_path =
+      QFileInfo(QStringLiteral("test-artifacts/ui-curves-load.acv")).absoluteFilePath();
+  const auto output_without_suffix =
+      QFileInfo(QStringLiteral("test-artifacts/ui-curves-saved")).absoluteFilePath();
+  const auto output_path = output_without_suffix + QStringLiteral(".acv");
+  QFile::remove(input_path);
+  QFile::remove(output_path);
+
+  patchy::CurvesAdjustment expected;
+  expected.rgb = {{0, 8}, {64, 35}, {128, 190}, {255, 245}};
+  expected.red = {{0, 20}, {80, 45}, {160, 225}, {255, 230}};
+  expected.green = {{0, 4}, {96, 120}, {220, 238}, {255, 250}};
+  expected.blue = {{0, 250}, {112, 160}, {255, 5}};
+  patchy::acv::write_file(patchy::ui::to_filesystem_path(input_path), expected);
+
+  QWidget parent;
+  parent.show();
+  QApplication::processEvents();
+  int preview_count = 0;
+  bool preview_enabled = false;
+  patchy::CurvesAdjustment preview_curves;
+  bool saw_load_dialog = false;
+  bool saw_save_dialog = false;
+  bool loaded_editor = false;
+
+  QTimer::singleShot(0, guarded([&] {
+    auto* dialog = qobject_cast<QDialog*>(find_top_level_dialog(QStringLiteral("patchyCurvesDialog")));
+    CHECK(dialog != nullptr);
+    auto* load = dialog->findChild<QPushButton*>(QStringLiteral("curvesImportPresetButton"));
+    auto* save = dialog->findChild<QPushButton*>(QStringLiteral("curvesExportPresetButton"));
+    auto* editor = dialog->findChild<patchy::ui::CurvesEditorWidget*>(QStringLiteral("curvesEditor"));
+    CHECK(load != nullptr);
+    CHECK(save != nullptr);
+    CHECK(editor != nullptr);
+    CHECK(load->text() == QStringLiteral("Import..."));
+    CHECK(save->text() == QStringLiteral("Export..."));
+
+    QTimer::singleShot(0, guarded([&] {
+      auto* file_dialog = qobject_cast<QFileDialog*>(
+          find_top_level_dialog(QStringLiteral("curvesPresetImportFileDialog")));
+      CHECK(file_dialog != nullptr);
+      CHECK(file_dialog->nameFilters().contains(QStringLiteral("Photoshop Curves Preset (*.acv)")));
+      saw_load_dialog = true;
+      file_dialog->selectFile(input_path);
+      static_cast<QDialog*>(file_dialog)->accept();
+    }));
+    load->click();
+    loaded_editor = editor->adjustment() == expected;
+
+    QTimer::singleShot(0, guarded([&] {
+      auto* file_dialog = qobject_cast<QFileDialog*>(
+          find_top_level_dialog(QStringLiteral("curvesPresetExportFileDialog")));
+      CHECK(file_dialog != nullptr);
+      saw_save_dialog = true;
+      file_dialog->selectFile(output_without_suffix);
+      static_cast<QDialog*>(file_dialog)->accept();
+    }));
+    save->click();
+    dialog->accept();
+  }));
+
+  const auto accepted = patchy::ui::request_curves_settings(
+      &parent,
+      [&](bool enabled, const patchy::ui::CurvesSettings& settings) {
+        ++preview_count;
+        preview_enabled = enabled;
+        preview_curves = settings;
+      });
+  CHECK(accepted.has_value());
+  CHECK(*accepted == expected);
+  CHECK(saw_load_dialog);
+  CHECK(saw_save_dialog);
+  CHECK(loaded_editor);
+  CHECK(preview_count > 0);
+  CHECK(preview_enabled);
+  CHECK(preview_curves == expected);
+  CHECK(QFileInfo::exists(output_path));
+  CHECK(patchy::acv::read_file(patchy::ui::to_filesystem_path(output_path)) == expected);
+  // Import also kept the file as a user preset, named after it.
+  const auto imported = patchy::ui::user_adjustment_preset_path(patchy::ui::AdjustmentPresetKind::Curves,
+                                                                QStringLiteral("ui-curves-load"));
+  CHECK(QFileInfo::exists(imported));
+  QFile::remove(imported);
+}
+
+void ui_curves_dialog_preview_toggle_and_cancel_restore_pixels() {
+  patchy::ui::MainWindow window;
+  show_window(window);
+  auto* canvas = require_canvas(window);
+
+  canvas->set_primary_color(QColor(128, 128, 128));
+  use_solid_fill_settings(canvas);
+  require_action(window, "layerFillForegroundAction")->trigger();
+  QApplication::processEvents();
+  const auto original = canvas_pixel(*canvas, QPoint(80, 80));
+  auto& document = patchy::ui::MainWindowTestAccess::document(window);
+  const auto active_layer_id = document.active_layer_id();
+  CHECK(active_layer_id.has_value());
+  const auto* original_layer = std::as_const(document).find_layer(*active_layer_id);
+  CHECK(original_layer != nullptr);
+  const auto original_render_revision = original_layer->render_revision();
+  const auto original_content_revision = original_layer->content_revision();
+  const auto original_bounds = original_layer->bounds();
+  const auto original_metadata = original_layer->metadata();
+  const auto original_pixels = original_layer->pixels();
+  const auto layer_is_exactly_original = [&] {
+    const auto* current = std::as_const(document).find_layer(*active_layer_id);
+    const auto current_bounds = current == nullptr ? patchy::Rect{} : current->bounds();
+    if (current == nullptr || current->render_revision() != original_render_revision ||
+        current->content_revision() != original_content_revision || current_bounds.x != original_bounds.x ||
+        current_bounds.y != original_bounds.y || current_bounds.width != original_bounds.width ||
+        current_bounds.height != original_bounds.height ||
+        current->metadata() != original_metadata || current->pixels().data().size() != original_pixels.data().size()) {
+      return false;
+    }
+    return std::equal(current->pixels().data().begin(), current->pixels().data().end(),
+                      original_pixels.data().begin());
+  };
+
+  auto* layer_list = window.findChild<QListWidget*>(QStringLiteral("layerList"));
+  CHECK(layer_list != nullptr);
+  const auto layer_count_before = layer_list->count();
+  const auto undo_depth_before = patchy::ui::MainWindowTestAccess::active_session_undo_depth(window);
+  bool preview_changed_pixels = false;
+  bool preview_off_restored = false;
+  bool preview_off_restored_exact_layer = false;
+  bool preview_reenabled = false;
+  QTimer::singleShot(0, guarded([&] {
+    auto* dialog = find_top_level_dialog(QStringLiteral("patchyCurvesDialog"));
+    CHECK(dialog != nullptr);
+    auto* graph = dialog->findChild<QWidget*>(QStringLiteral("curvesGraph"));
+    auto* preview = dialog->findChild<QCheckBox*>(QStringLiteral("curvesPreviewCheck"));
+    CHECK(graph != nullptr);
+    CHECK(preview != nullptr);
+    click_curves_graph(*graph, 128, 235);
+    process_events_for(300);
+    preview_changed_pixels = canvas_pixel(*canvas, QPoint(80, 80)).red() > original.red() + 70;
+
+    preview->setChecked(false);
+    process_events_for(200);
+    preview_off_restored = color_close(canvas_pixel(*canvas, QPoint(80, 80)), original, 2);
+    preview_off_restored_exact_layer = layer_is_exactly_original();
+
+    preview->setChecked(true);
+    process_events_for(300);
+    preview_reenabled = canvas_pixel(*canvas, QPoint(80, 80)).red() > original.red() + 70;
+    dialog->reject();
+  }));
+  require_action(window, "imageAdjustCurvesAction")->trigger();
+  QApplication::processEvents();
+
+  CHECK(preview_changed_pixels);
+  CHECK(preview_off_restored);
+  CHECK(preview_off_restored_exact_layer);
+  CHECK(preview_reenabled);
+  CHECK(color_close(canvas_pixel(*canvas, QPoint(80, 80)), original, 2));
+  CHECK(layer_is_exactly_original());
+  CHECK(layer_list->count() == layer_count_before);
+  CHECK(patchy::ui::MainWindowTestAccess::active_session_undo_depth(window) == undo_depth_before);
+}
+
+void ui_curves_destructive_apply_cancel_restores_exact_layer() {
+  patchy::ui::MainWindow window;
+  show_window(window);
+  auto* canvas = require_canvas(window);
+  canvas->set_primary_color(QColor(112, 136, 172));
+  use_solid_fill_settings(canvas);
+  require_action(window, "layerFillForegroundAction")->trigger();
+  QApplication::processEvents();
+
+  auto& document = patchy::ui::MainWindowTestAccess::document(window);
+  const auto active_layer_id = document.active_layer_id();
+  CHECK(active_layer_id.has_value());
+  const auto* original_layer = std::as_const(document).find_layer(*active_layer_id);
+  CHECK(original_layer != nullptr);
+  const auto original_render_revision = original_layer->render_revision();
+  const auto original_content_revision = original_layer->content_revision();
+  const auto original_bounds = original_layer->bounds();
+  const auto original_metadata = original_layer->metadata();
+  const auto original_pixels = original_layer->pixels();
+  const auto undo_depth_before = patchy::ui::MainWindowTestAccess::active_session_undo_depth(window);
+
+  bool saw_progress_dialog = false;
+  QTimer progress_canceller;
+  progress_canceller.setInterval(0);
+  QObject::connect(&progress_canceller, &QTimer::timeout, [&] {
+    auto* progress =
+        qobject_cast<QProgressDialog*>(find_top_level_dialog(QStringLiteral("adjustmentProgressDialog")));
+    if (progress == nullptr) {
+      return;
+    }
+    saw_progress_dialog = true;
+    progress->cancel();
+    progress_canceller.stop();
+  });
+
+  QTimer::singleShot(0, guarded([&] {
+    auto* dialog = find_top_level_dialog(QStringLiteral("patchyCurvesDialog"));
+    CHECK(dialog != nullptr);
+    auto* graph = dialog->findChild<QWidget*>(QStringLiteral("curvesGraph"));
+    CHECK(graph != nullptr);
+    click_curves_graph(*graph, 128, 230);
+    progress_canceller.start();
+    dialog->accept();
+  }));
+  require_action(window, "imageAdjustCurvesAction")->trigger();
+  progress_canceller.stop();
+  QApplication::processEvents();
+
+  CHECK(saw_progress_dialog);
+  const auto* restored_layer = std::as_const(document).find_layer(*active_layer_id);
+  CHECK(restored_layer != nullptr);
+  CHECK(restored_layer->render_revision() == original_render_revision);
+  CHECK(restored_layer->content_revision() == original_content_revision);
+  const auto restored_bounds = restored_layer->bounds();
+  CHECK(restored_bounds.x == original_bounds.x);
+  CHECK(restored_bounds.y == original_bounds.y);
+  CHECK(restored_bounds.width == original_bounds.width);
+  CHECK(restored_bounds.height == original_bounds.height);
+  CHECK(restored_layer->metadata() == original_metadata);
+  CHECK(restored_layer->pixels().data().size() == original_pixels.data().size());
+  CHECK(std::equal(restored_layer->pixels().data().begin(), restored_layer->pixels().data().end(),
+                   original_pixels.data().begin()));
+  CHECK(patchy::ui::MainWindowTestAccess::active_session_undo_depth(window) == undo_depth_before);
+}
+
+void ui_curves_adjustment_layer_preserves_rich_channels_and_undoes_one_edit() {
+  patchy::ui::MainWindow window;
+  show_window(window);
+  auto* canvas = require_canvas(window);
+  auto& document = patchy::ui::MainWindowTestAccess::document(window);
+
+  canvas->set_primary_color(QColor(96, 128, 168));
+  use_solid_fill_settings(canvas);
+  require_action(window, "layerFillForegroundAction")->trigger();
+  QApplication::processEvents();
+
+  const auto undo_before_create = patchy::ui::MainWindowTestAccess::active_session_undo_depth(window);
+  bool create_auto_enabled = false;
+  QTimer::singleShot(0, guarded([&] {
+    auto* dialog = find_top_level_dialog(QStringLiteral("patchyCurvesDialog"));
+    CHECK(dialog != nullptr);
+    auto* graph = dialog->findChild<QWidget*>(QStringLiteral("curvesGraph"));
+    auto* tabs = dialog->findChild<QTabBar*>(QStringLiteral("curvesChannelTabs"));
+    auto* auto_button = dialog->findChild<QPushButton*>(QStringLiteral("curvesAutoButton"));
+    CHECK(graph != nullptr);
+    CHECK(tabs != nullptr);
+    CHECK(auto_button != nullptr);
+    create_auto_enabled = auto_button->isEnabled();
+
+    click_curves_graph(*graph, 128, 190);
+    tabs->setCurrentIndex(1);
+    click_curves_graph(*graph, 96, 210);
+    tabs->setCurrentIndex(2);
+    click_curves_graph(*graph, 144, 72);
+    tabs->setCurrentIndex(3);
+    click_curves_graph(*graph, 200, 230);
+    dialog->accept();
+  }));
+  require_action(window, "layerNewCurvesAdjustmentAction")->trigger();
+  QApplication::processEvents();
+
+  CHECK(create_auto_enabled);
+  CHECK(patchy::ui::MainWindowTestAccess::active_session_undo_depth(window) == undo_before_create + 1U);
+  const auto adjustment_id = document.active_layer_id();
+  CHECK(adjustment_id.has_value());
+  const auto read_curves = [&document, adjustment_id] {
+    const auto* layer = std::as_const(document).find_layer(*adjustment_id);
+    CHECK(layer != nullptr);
+    CHECK(layer->kind() == patchy::LayerKind::Adjustment);
+    const auto settings = patchy::adjustment_settings_from_layer(*layer);
+    CHECK(settings.has_value());
+    CHECK(settings->kind == patchy::AdjustmentKind::Curves);
+    return settings->curves;
+  };
+
+  const auto created_curves = read_curves();
+  CHECK(created_curves.rgb.size() == 3U);
+  CHECK(created_curves.red.size() == 3U);
+  CHECK(created_curves.green.size() == 3U);
+  CHECK(created_curves.blue.size() == 3U);
+  const auto created_pixel = canvas_pixel(*canvas, QPoint(80, 80));
+  const auto undo_before_cancel = patchy::ui::MainWindowTestAccess::active_session_undo_depth(window);
+
+  bool edit_auto_enabled = false;
+  bool cancel_loaded_rich_point = false;
+  bool cancel_preview_changed = false;
+  QTimer::singleShot(0, guarded([&] {
+    auto* dialog = find_top_level_dialog(QStringLiteral("patchyCurvesDialog"));
+    CHECK(dialog != nullptr);
+    auto* graph = dialog->findChild<QWidget*>(QStringLiteral("curvesGraph"));
+    auto* tabs = dialog->findChild<QTabBar*>(QStringLiteral("curvesChannelTabs"));
+    auto* input = dialog->findChild<QSpinBox*>(QStringLiteral("curvesInputSpin"));
+    auto* output = dialog->findChild<QSpinBox*>(QStringLiteral("curvesOutputSpin"));
+    auto* auto_button = dialog->findChild<QPushButton*>(QStringLiteral("curvesAutoButton"));
+    CHECK(graph != nullptr);
+    CHECK(tabs != nullptr);
+    CHECK(input != nullptr);
+    CHECK(output != nullptr);
+    CHECK(auto_button != nullptr);
+    edit_auto_enabled = auto_button->isEnabled();
+
+    tabs->setCurrentIndex(1);
+    const auto red_point = created_curves.red[1];
+    click_curves_graph(*graph, red_point.input, red_point.output);
+    cancel_loaded_rich_point = input->value() == red_point.input && output->value() == red_point.output;
+    output->setValue(32);
+    process_events_for(120);
+    cancel_preview_changed = !color_close(canvas_pixel(*canvas, QPoint(80, 80)), created_pixel, 2);
+    dialog->reject();
+  }));
+  require_action(window, "layerEditAdjustmentAction")->trigger();
+  QApplication::processEvents();
+
+  CHECK(edit_auto_enabled);
+  CHECK(cancel_loaded_rich_point);
+  CHECK(cancel_preview_changed);
+  CHECK(read_curves() == created_curves);
+  CHECK(color_close(canvas_pixel(*canvas, QPoint(80, 80)), created_pixel, 2));
+  CHECK(patchy::ui::MainWindowTestAccess::active_session_undo_depth(window) == undo_before_cancel);
+
+  const auto undo_before_edit = patchy::ui::MainWindowTestAccess::active_session_undo_depth(window);
+  bool accept_loaded_rich_point = false;
+  QTimer::singleShot(0, guarded([&] {
+    auto* dialog = find_top_level_dialog(QStringLiteral("patchyCurvesDialog"));
+    CHECK(dialog != nullptr);
+    auto* graph = dialog->findChild<QWidget*>(QStringLiteral("curvesGraph"));
+    auto* tabs = dialog->findChild<QTabBar*>(QStringLiteral("curvesChannelTabs"));
+    auto* input = dialog->findChild<QSpinBox*>(QStringLiteral("curvesInputSpin"));
+    auto* output = dialog->findChild<QSpinBox*>(QStringLiteral("curvesOutputSpin"));
+    CHECK(graph != nullptr);
+    CHECK(tabs != nullptr);
+    CHECK(input != nullptr);
+    CHECK(output != nullptr);
+
+    tabs->setCurrentIndex(3);
+    const auto blue_point = created_curves.blue[1];
+    click_curves_graph(*graph, blue_point.input, blue_point.output);
+    accept_loaded_rich_point = input->value() == blue_point.input && output->value() == blue_point.output;
+    output->setValue(40);
+    dialog->accept();
+  }));
+  require_action(window, "layerEditAdjustmentAction")->trigger();
+  QApplication::processEvents();
+
+  CHECK(accept_loaded_rich_point);
+  CHECK(patchy::ui::MainWindowTestAccess::active_session_undo_depth(window) == undo_before_edit + 1U);
+  const auto edited_curves = read_curves();
+  CHECK(edited_curves.rgb == created_curves.rgb);
+  CHECK(edited_curves.red == created_curves.red);
+  CHECK(edited_curves.green == created_curves.green);
+  CHECK(edited_curves.blue.size() == 3U);
+  CHECK(edited_curves.blue[1].input == created_curves.blue[1].input);
+  CHECK(edited_curves.blue[1].output == 40);
+
+  require_action_by_text(window, QStringLiteral("Undo"))->trigger();
+  QApplication::processEvents();
+  CHECK(read_curves() == created_curves);
+  CHECK(color_close(canvas_pixel(*canvas, QPoint(80, 80)), created_pixel, 2));
+  CHECK(patchy::ui::MainWindowTestAccess::active_session_undo_depth(window) == undo_before_edit);
+}
+
+void ui_curves_legacy_metadata_cancel_and_undo_restore_exact_map() {
+  patchy::Document legacy_document(96, 72, patchy::PixelFormat::rgba8());
+  legacy_document.add_pixel_layer(
+      "Base", solid_pixels(96, 72, patchy::PixelFormat::rgba8(), QColor(86, 126, 168)));
+  patchy::Layer legacy_curves(legacy_document.allocate_layer_id(), "Legacy Curves",
+                              patchy::LayerKind::Adjustment);
+  legacy_curves.set_bounds(patchy::Rect::from_size(96, 72));
+  legacy_curves.metadata()[patchy::kLayerMetadataAdjustmentType] = "curves";
+  legacy_curves.metadata()[patchy::kLayerMetadataAdjustmentCurvesShadowOutput] = "14";
+  legacy_curves.metadata()[patchy::kLayerMetadataAdjustmentCurvesMidtoneOutput] = "171";
+  legacy_curves.metadata()[patchy::kLayerMetadataAdjustmentCurvesHighlightOutput] = "241";
+  legacy_curves.metadata()["patchy.test.legacy_curves_sentinel"] = "leave this metadata untouched";
+  const auto adjustment_id = legacy_curves.id();
+  legacy_document.add_layer(std::move(legacy_curves));
+  legacy_document.set_active_layer(adjustment_id);
+
+  patchy::ui::MainWindow window;
+  window.add_document_session(std::move(legacy_document), QStringLiteral("Legacy Curves Metadata"));
+  show_window(window);
+  auto& document = patchy::ui::MainWindowTestAccess::document(window);
+  const auto metadata_for_adjustment = [&document, adjustment_id] {
+    const auto* layer = std::as_const(document).find_layer(adjustment_id);
+    CHECK(layer != nullptr);
+    return layer->metadata();
+  };
+  const auto original_metadata = metadata_for_adjustment();
+  CHECK(original_metadata.size() == 5U);
+  CHECK(!original_metadata.contains(patchy::kLayerMetadataAdjustmentCurvesRgbPoints));
+  CHECK(!original_metadata.contains(patchy::kLayerMetadataAdjustmentCurvesRedPoints));
+  CHECK(!original_metadata.contains(patchy::kLayerMetadataAdjustmentCurvesGreenPoints));
+  CHECK(!original_metadata.contains(patchy::kLayerMetadataAdjustmentCurvesBluePoints));
+
+  const auto undo_before_cancel = patchy::ui::MainWindowTestAccess::active_session_undo_depth(window);
+  bool loaded_legacy_midpoint = false;
+  bool preview_added_rich_metadata = false;
+  QTimer::singleShot(0, guarded([&] {
+    auto* dialog = find_top_level_dialog(QStringLiteral("patchyCurvesDialog"));
+    CHECK(dialog != nullptr);
+    auto* graph = dialog->findChild<QWidget*>(QStringLiteral("curvesGraph"));
+    auto* input = dialog->findChild<QSpinBox*>(QStringLiteral("curvesInputSpin"));
+    auto* output = dialog->findChild<QSpinBox*>(QStringLiteral("curvesOutputSpin"));
+    CHECK(graph != nullptr);
+    CHECK(input != nullptr);
+    CHECK(output != nullptr);
+
+    click_curves_graph(*graph, 128, 171);
+    loaded_legacy_midpoint = input->value() == 128 && output->value() == 171;
+    output->setValue(218);
+    process_events_for(120);
+    const auto preview_metadata = metadata_for_adjustment();
+    preview_added_rich_metadata =
+        preview_metadata != original_metadata &&
+        preview_metadata.contains(patchy::kLayerMetadataAdjustmentCurvesRgbPoints) &&
+        preview_metadata.contains(patchy::kLayerMetadataAdjustmentCurvesRedPoints) &&
+        preview_metadata.contains(patchy::kLayerMetadataAdjustmentCurvesGreenPoints) &&
+        preview_metadata.contains(patchy::kLayerMetadataAdjustmentCurvesBluePoints);
+    dialog->reject();
+  }));
+  require_action(window, "layerEditAdjustmentAction")->trigger();
+  QApplication::processEvents();
+
+  CHECK(loaded_legacy_midpoint);
+  CHECK(preview_added_rich_metadata);
+  CHECK(metadata_for_adjustment() == original_metadata);
+  CHECK(patchy::ui::MainWindowTestAccess::active_session_undo_depth(window) == undo_before_cancel);
+
+  const auto undo_before_accept = patchy::ui::MainWindowTestAccess::active_session_undo_depth(window);
+  QTimer::singleShot(0, guarded([&] {
+    auto* dialog = find_top_level_dialog(QStringLiteral("patchyCurvesDialog"));
+    CHECK(dialog != nullptr);
+    auto* graph = dialog->findChild<QWidget*>(QStringLiteral("curvesGraph"));
+    auto* tabs = dialog->findChild<QTabBar*>(QStringLiteral("curvesChannelTabs"));
+    auto* output = dialog->findChild<QSpinBox*>(QStringLiteral("curvesOutputSpin"));
+    CHECK(graph != nullptr);
+    CHECK(tabs != nullptr);
+    CHECK(output != nullptr);
+
+    click_curves_graph(*graph, 128, 171);
+    output->setValue(205);
+    tabs->setCurrentIndex(1);
+    click_curves_graph(*graph, 96, 214);
+    dialog->accept();
+  }));
+  require_action(window, "layerEditAdjustmentAction")->trigger();
+  QApplication::processEvents();
+
+  CHECK(patchy::ui::MainWindowTestAccess::active_session_undo_depth(window) == undo_before_accept + 1U);
+  const auto accepted_metadata = metadata_for_adjustment();
+  CHECK(accepted_metadata != original_metadata);
+  CHECK(accepted_metadata.contains(patchy::kLayerMetadataAdjustmentCurvesRgbPoints));
+  CHECK(accepted_metadata.contains(patchy::kLayerMetadataAdjustmentCurvesRedPoints));
+  CHECK(accepted_metadata.contains(patchy::kLayerMetadataAdjustmentCurvesGreenPoints));
+  CHECK(accepted_metadata.contains(patchy::kLayerMetadataAdjustmentCurvesBluePoints));
+  const auto* accepted_layer = std::as_const(document).find_layer(adjustment_id);
+  CHECK(accepted_layer != nullptr);
+  const auto accepted_settings = patchy::adjustment_settings_from_layer(*accepted_layer);
+  CHECK(accepted_settings.has_value());
+  CHECK(accepted_settings->curves.rgb.size() == 3U);
+  CHECK(accepted_settings->curves.red.size() == 3U);
+
+  require_action_by_text(window, QStringLiteral("Undo"))->trigger();
+  QApplication::processEvents();
+  CHECK(metadata_for_adjustment() == original_metadata);
+  CHECK(patchy::ui::MainWindowTestAccess::active_session_undo_depth(window) == undo_before_accept);
+}
+
+void ui_curves_clipped_adjustment_reedit_disables_auto() {
+  patchy::Document clipped_document(96, 72, patchy::PixelFormat::rgba8());
+  clipped_document.add_pixel_layer(
+      "Clip Base", solid_pixels(96, 72, patchy::PixelFormat::rgba8(), QColor(96, 132, 174)));
+
+  patchy::AdjustmentSettings curves;
+  curves.kind = patchy::AdjustmentKind::Curves;
+  curves.curves.rgb = {{0, 0}, {128, 188}, {255, 255}};
+  patchy::Layer adjustment(clipped_document.allocate_layer_id(), "Clipped Curves",
+                           patchy::LayerKind::Adjustment);
+  adjustment.set_bounds(patchy::Rect::from_size(96, 72));
+  patchy::configure_adjustment_layer(adjustment, curves);
+  adjustment.set_clipped(true);
+  const auto adjustment_id = adjustment.id();
+  clipped_document.add_layer(std::move(adjustment));
+  clipped_document.set_active_layer(adjustment_id);
+
+  patchy::ui::MainWindow window;
+  window.add_document_session(std::move(clipped_document), QStringLiteral("Clipped Curves Auto"));
+  show_window(window);
+  auto& document = patchy::ui::MainWindowTestAccess::document(window);
+  const auto* original_layer = std::as_const(document).find_layer(adjustment_id);
+  CHECK(original_layer != nullptr);
+  CHECK(original_layer->clipped());
+  const auto original_metadata = original_layer->metadata();
+  const auto undo_before = patchy::ui::MainWindowTestAccess::active_session_undo_depth(window);
+
+  bool dialog_opened = false;
+  bool auto_disabled = false;
+  bool picker_disabled_style_visible = false;
+  QTimer::singleShot(0, guarded([&] {
+    auto* dialog = find_top_level_dialog(QStringLiteral("patchyCurvesDialog"));
+    CHECK(dialog != nullptr);
+    auto* auto_button = dialog->findChild<QPushButton*>(QStringLiteral("curvesAutoButton"));
+    CHECK(auto_button != nullptr);
+    dialog_opened = true;
+    auto_disabled = !auto_button->isEnabled();
+    auto* target_button = dialog->findChild<QPushButton*>(QStringLiteral("curvesTargetedAdjustmentButton"));
+    CHECK(target_button != nullptr);
+    CHECK(!target_button->isEnabled());
+    picker_disabled_style_visible =
+        widget_fill_share(*target_button, patchy::ui::theme().field_bg_disabled) > 0.25;
+    dialog->reject();
+  }));
+  require_action(window, "layerEditAdjustmentAction")->trigger();
+  QApplication::processEvents();
+
+  CHECK(dialog_opened);
+  CHECK(auto_disabled);
+  CHECK(picker_disabled_style_visible);
+  const auto* restored_layer = std::as_const(document).find_layer(adjustment_id);
+  CHECK(restored_layer != nullptr);
+  CHECK(restored_layer->clipped());
+  CHECK(restored_layer->metadata() == original_metadata);
+  CHECK(patchy::ui::MainWindowTestAccess::active_session_undo_depth(window) == undo_before);
+}
+
+// Affinity's Colour Balance imports onto Patchy's Photoshop-calibrated math at
+// 40% scale; the local corpus file then renders within about a level of
+// Affinity's own export (#250; skips where the corpus is absent).
+void ui_af_colour_balance_matches_affinity_render_if_available() {
+  const auto af_path = patchy::test::local_format_fixture_path("af-spike/corpus", "adjust-colourbalance.af");
+  const auto png_path = patchy::test::local_format_fixture_path("af-spike/corpus", "adjust-colourbalance.png");
+  patchy::test::skip_unless_exists(af_path);
+  patchy::test::skip_unless_exists(png_path);
+  const auto reference =
+      QImage(patchy::ui::to_qstring(png_path)).convertToFormat(QImage::Format_RGBA8888);
+  CHECK(!reference.isNull());
+  const auto flat = patchy::Compositor{}.flatten_rgb8(patchy::af::DocumentIo::read_file(af_path));
+  CHECK(flat.width() == reference.width());
+  CHECK(flat.height() == reference.height());
+  double sum = 0.0;
+  int worst = 0;
+  for (int y = 0; y < reference.height(); ++y) {
+    for (int x = 0; x < reference.width(); ++x) {
+      const auto* rendered = flat.pixel(x, y);
+      const auto expected = reference.pixelColor(x, y);
+      const std::array<int, 3> channels{expected.red(), expected.green(), expected.blue()};
+      for (std::size_t channel = 0; channel < channels.size(); ++channel) {
+        const auto difference = std::abs(static_cast<int>(rendered[channel]) - channels[channel]);
+        sum += difference;
+        worst = std::max(worst, difference);
+      }
+    }
+  }
+  const auto mean = sum / (3.0 * reference.width() * reference.height());
+  std::cout << "[INFO] Affinity Colour Balance render: mean " << mean << ", worst " << worst << '\n';
+  CHECK(mean < 1.0);
+  CHECK(worst <= 5);
+}
+
+// #250: an adjustment kind Patchy cannot apply yet shows a placeholder thumbnail whose
+// tooltip names the kind and says it is kept but not applied. Photoshop's Color and
+// Vibrance is the one such kind left. The local ag-psd sample (skipped where absent) now
+// opens with every adjustment applied, its legacy Vibrance layer included.
+void ui_adjustment_placeholders_name_their_kind_in_layers_panel() {
+  const auto placeholder_tooltips = [](patchy::ui::MainWindow& window) {
+    QStringList tooltips;
+    auto* layer_list = window.findChild<QListWidget*>(QStringLiteral("layerList"));
+    CHECK(layer_list != nullptr);
+    for (auto* label : layer_list->findChildren<QLabel*>()) {
+      if (label->toolTip().contains(QStringLiteral("cannot apply it yet"))) {
+        tooltips << label->toolTip();
+      }
+    }
+    return tooltips;
+  };
+  {
+    patchy::Document source(32, 24, patchy::PixelFormat::rgba8());
+    source.add_pixel_layer("Background", solid_pixels(32, 24, patchy::PixelFormat::rgba8(), QColor(90, 120, 150)));
+    patchy::Layer placeholder(source.allocate_layer_id(), "Color and Vibrance 1", patchy::LayerKind::Pixel);
+    placeholder.metadata()[patchy::kLayerMetadataAdjustmentPlaceholderKind] = "color_vibrance";
+    source.add_layer(std::move(placeholder));
+    patchy::ui::MainWindow window;
+    window.add_document_session(std::move(source), QStringLiteral("Placeholder"));
+    show_window(window);
+    const auto tooltips = placeholder_tooltips(window);
+    CHECK(tooltips.size() == 1);
+    CHECK(tooltips.front().startsWith(QStringLiteral("Color and Vibrance adjustment from Photoshop.")));
+  }
+
+  const auto sample = patchy::test::local_format_fixture_path("ag-psd-adjustments", "ag-psd-adjustments.psd");
+  patchy::test::skip_unless_exists(sample);
+  patchy::ui::MainWindow window;
+  show_window(window);
+  window.resize(window.width(), std::max(window.height(), 1000));
+  patchy::ui::MainWindowTestAccess::open_document_path(window, patchy::ui::to_qstring(sample));
+  QApplication::processEvents();
+  if (auto* layer_list = window.findChild<QListWidget*>(QStringLiteral("layerList")); layer_list != nullptr) {
+    save_widget_artifact("ui_adjustment_placeholders_layers_panel", *layer_list);
+  }
+  // Patchy's resave, for the Photoshop open check (docs/photoshop-com.md).
+  const auto resaved =
+      patchy::psd::DocumentIo::write_layered_rgb8(patchy::ui::MainWindowTestAccess::document(window));
+  ensure_artifact_dir();
+  QFile resave_file(QStringLiteral("test-artifacts/ag-psd-adjustments-patchy-resave.psd"));
+  CHECK(resave_file.open(QIODevice::WriteOnly));
+  CHECK(resave_file.write(reinterpret_cast<const char*>(resaved.data()), static_cast<qint64>(resaved.size())) ==
+        static_cast<qint64>(resaved.size()));
+  resave_file.close();
+  CHECK(placeholder_tooltips(window).isEmpty());
+  const auto& document = std::as_const(patchy::ui::MainWindowTestAccess::document(window));
+  bool found_vibrance = false;
+  for (const auto& layer : document.layers()) {
+    if (const auto settings = patchy::adjustment_settings_from_layer(layer);
+        settings.has_value() && settings->kind == patchy::AdjustmentKind::Vibrance) {
+      found_vibrance = true;
+      CHECK((settings->vibrance == patchy::VibranceAdjustment{21, -4}));
+    }
+  }
+  CHECK(found_vibrance);
+}
+
+// Both New Adjustment Layer menus (Layer > New Adjustment Layer and the Layers panel's
+// footer button) offer the kind (#250, #252).
+void check_adjustment_kind_in_both_menus(patchy::ui::MainWindow& window, const char* action_key,
+                                         const QString& menu_text) {
+  CHECK(window.findChild<QAction*>(QStringLiteral("layerNew") + QString::fromUtf8(action_key) +
+                                   QStringLiteral("Action")) != nullptr);
+  auto* footer = window.findChild<QMenu*>(QStringLiteral("layerNewAdjustmentButtonMenu"));
+  CHECK(footer != nullptr);
+  if (footer == nullptr) {
+    return;
+  }
+  const auto actions = footer->actions();
+  CHECK(std::any_of(actions.begin(), actions.end(),
+                    [&menu_text](const QAction* action) { return action->text() == menu_text; }));
+}
+
+// The Gradient Map dialog reuses the layer style gradient editor without its placement
+// controls (#250): it starts black to white, and the method and reverse it sets land on the
+// new adjustment layer.
+void ui_gradient_map_dialog_edits_gradient() {
+  patchy::Document source(32, 24, patchy::PixelFormat::rgba8());
+  source.add_pixel_layer("Paint", solid_pixels(32, 24, patchy::PixelFormat::rgba8(), QColor(200, 120, 40)));
+  patchy::ui::MainWindow window;
+  window.add_document_session(std::move(source), QStringLiteral("Map"));
+  show_window(window);
+  check_adjustment_kind_in_both_menus(window, "GradientMapAdjustment", QObject::tr("&Gradient Map..."));
+
+  bool dialog_checked = false;
+  QTimer::singleShot(0, guarded([&] {
+    auto* dialog = qobject_cast<QDialog*>(find_top_level_dialog(QStringLiteral("patchyGradientMapDialog")));
+    CHECK(dialog != nullptr);
+    if (dialog == nullptr) {
+      return;
+    }
+    auto* method = dialog->findChild<QComboBox*>(QStringLiteral("gradientMapInterpolationCombo"));
+    auto* reverse = dialog->findChild<QCheckBox*>(QStringLiteral("gradientMapReverseCheck"));
+    auto* style = dialog->findChild<QComboBox*>(QStringLiteral("gradientMapStyleCombo"));
+    auto* align = dialog->findChild<QCheckBox*>(QStringLiteral("gradientMapAlignCheck"));
+    auto* editor = dialog->findChild<QWidget*>(QStringLiteral("gradientMapStopsEditor"));
+    CHECK(method != nullptr && reverse != nullptr && editor != nullptr);
+    if (method == nullptr || reverse == nullptr || editor == nullptr) {
+      dialog->reject();
+      return;
+    }
+    CHECK(editor->isVisible());
+    // Placement has no meaning for a map, so those rows are gone.
+    CHECK(style == nullptr || !style->isVisible());
+    CHECK(align == nullptr || !align->isVisible());
+    method->setCurrentIndex(std::max(0, method->findData(static_cast<int>(patchy::GradientInterpolationMethod::Linear))));
+    reverse->setChecked(true);
+    QApplication::processEvents();
+    save_widget_artifact("ui_gradient_map_dialog", *dialog);
+    dialog_checked = true;
+    dialog->accept();
+  }));
+  require_action(window, "layerNewGradientMapAdjustmentAction")->trigger();
+  QApplication::processEvents();
+  CHECK(dialog_checked);
+
+  const auto& document = std::as_const(patchy::ui::MainWindowTestAccess::document(window));
+  CHECK(document.active_layer_id().has_value());
+  const auto* layer = document.find_layer(*document.active_layer_id());
+  CHECK(layer != nullptr);
+  if (layer == nullptr) {
+    return;
+  }
+  const auto settings = patchy::adjustment_settings_from_layer(*layer);
+  CHECK(settings.has_value());
+  CHECK(settings->kind == patchy::AdjustmentKind::GradientMap);
+  const auto& gradient = settings->gradient_map.gradient;
+  CHECK(gradient.interpolation == patchy::GradientInterpolationMethod::Linear);
+  CHECK(gradient.reverse);
+  CHECK(gradient.color_stops.size() == 2U);
+  CHECK((gradient.color_stops.front().color == patchy::RgbColor{0, 0, 0}));
+  CHECK((gradient.color_stops.back().color == patchy::RgbColor{255, 255, 255}));
+}
+
+// The Black & White dialog starts on Photoshop's weights without a tint; the weights and the
+// tint picked through Patchy's own color picker land on the new adjustment layer (#250).
+void ui_black_white_dialog_edits_weights_and_tint() {
+  patchy::Document source(32, 24, patchy::PixelFormat::rgba8());
+  source.add_pixel_layer("Paint", solid_pixels(32, 24, patchy::PixelFormat::rgba8(), QColor(200, 120, 40)));
+  patchy::ui::MainWindow window;
+  window.add_document_session(std::move(source), QStringLiteral("Gray"));
+  show_window(window);
+  check_adjustment_kind_in_both_menus(window, "BlackWhiteAdjustment", QObject::tr("Blac&k && White..."));
+
+  bool dialog_checked = false;
+  QTimer::singleShot(0, guarded([&] {
+    auto* dialog = qobject_cast<QDialog*>(find_top_level_dialog(QStringLiteral("patchyBlackWhiteDialog")));
+    CHECK(dialog != nullptr);
+    if (dialog == nullptr) {
+      return;
+    }
+    auto* reds = dialog->findChild<QSpinBox*>(QStringLiteral("blackWhiteRedsSpin"));
+    auto* magentas = dialog->findChild<QSpinBox*>(QStringLiteral("blackWhiteMagentasSpin"));
+    auto* tint = dialog->findChild<QCheckBox*>(QStringLiteral("blackWhiteTintCheck"));
+    auto* swatch = dialog->findChild<QPushButton*>(QStringLiteral("blackWhiteTintColorButton"));
+    CHECK(reds != nullptr && magentas != nullptr && tint != nullptr && swatch != nullptr);
+    if (reds == nullptr || magentas == nullptr || tint == nullptr || swatch == nullptr) {
+      dialog->reject();
+      return;
+    }
+    CHECK(reds->value() == 40 && magentas->value() == 80);
+    CHECK(reds->minimum() == -200 && reds->maximum() == 300);
+    CHECK(!tint->isChecked());
+    CHECK(!swatch->isEnabled());
+    reds->setValue(-120);
+    magentas->setValue(255);
+    tint->setChecked(true);
+    CHECK(swatch->isEnabled());
+    QTimer::singleShot(0, guarded([] {
+      auto* picker_dialog = find_top_level_dialog(QStringLiteral("patchyColorDialog"));
+      CHECK(picker_dialog != nullptr);
+      if (picker_dialog == nullptr) {
+        return;
+      }
+      CHECK(patchy::ui::apply_color_to_open_color_picker(QColor(40, 90, 220)));
+      picker_dialog->accept();
+    }));
+    swatch->click();
+    save_widget_artifact("ui_black_white_dialog", *dialog);
+    dialog_checked = true;
+    dialog->accept();
+  }));
+  require_action(window, "layerNewBlackWhiteAdjustmentAction")->trigger();
+  QApplication::processEvents();
+  CHECK(dialog_checked);
+
+  const auto& document = std::as_const(patchy::ui::MainWindowTestAccess::document(window));
+  CHECK(document.active_layer_id().has_value());
+  const auto* layer = document.find_layer(*document.active_layer_id());
+  CHECK(layer != nullptr);
+  if (layer == nullptr) {
+    return;
+  }
+  const auto settings = patchy::adjustment_settings_from_layer(*layer);
+  CHECK(settings.has_value());
+  CHECK(settings->kind == patchy::AdjustmentKind::BlackWhite);
+  CHECK(settings->black_white.reds == -120 && settings->black_white.magentas == 255);
+  CHECK(settings->black_white.greens == 40);
+  CHECK(settings->black_white.tint);
+  CHECK((settings->black_white.tint_color == patchy::RgbColor{40, 90, 220}));
+}
+
+// Layer > New Adjustment Layer > Color Lookup loads a .cube the user picks, here from a
+// Unicode path (the path rule for new file-reading entry points), and the table and the
+// file's name land on the new layer (#250).
+void ui_color_lookup_dialog_loads_a_lut_from_a_unicode_path() {
+  const auto dir = patchy::test::unicode_artifact_dir(u8"color-lookup");
+  const auto file = dir / std::filesystem::path(std::u8string(patchy::test::kUnicodeCombinedStem) + u8".cube");
+  {
+    std::ofstream out(file, std::ios::binary);
+    out << "LUT_3D_SIZE 2\n0 0 0\n1 0 0\n0 1 0\n1 1 0\n0 0 1\n1 0 1\n0 1 1\n0.5 0.25 0.1\n";
+  }
+  const auto file_name = patchy::ui::to_qstring(file.filename());
+
+  patchy::Document source(32, 24, patchy::PixelFormat::rgba8());
+  source.add_pixel_layer("Paint", solid_pixels(32, 24, patchy::PixelFormat::rgba8(), QColor(255, 255, 255)));
+  patchy::ui::MainWindow window;
+  window.add_document_session(std::move(source), QStringLiteral("Look"));
+  show_window(window);
+  check_adjustment_kind_in_both_menus(window, "ColorLookupAdjustment", QObject::tr("Color L&ookup..."));
+
+  bool dialog_checked = false;
+  QTimer::singleShot(0, guarded([&] {
+    auto* dialog = qobject_cast<QDialog*>(find_top_level_dialog(QStringLiteral("patchyColorLookupDialog")));
+    CHECK(dialog != nullptr);
+    if (dialog == nullptr) {
+      return;
+    }
+    auto* load = dialog->findChild<QPushButton*>(QStringLiteral("colorLookupLoadButton"));
+    auto* name = dialog->findChild<QLabel*>(QStringLiteral("colorLookupNameLabel"));
+    CHECK(load != nullptr && name != nullptr);
+    if (load == nullptr || name == nullptr) {
+      dialog->reject();
+      return;
+    }
+    QTimer::singleShot(0, guarded([&] {
+      auto* picker = qobject_cast<QFileDialog*>(find_top_level_dialog(QStringLiteral("colorLookupFileDialog")));
+      CHECK(picker != nullptr);
+      if (picker == nullptr) {
+        return;
+      }
+      picker->setDirectory(patchy::ui::to_qstring(dir));
+      if (auto* edit = picker->findChild<QLineEdit*>(QStringLiteral("fileNameEdit")); edit != nullptr) {
+        edit->setText(file_name);
+      }
+      QApplication::processEvents();
+      static_cast<QDialog*>(picker)->accept();
+    }));
+    load->click();
+    CHECK(name->toolTip() == file_name);
+    save_widget_artifact("ui_color_lookup_dialog", *dialog);
+    dialog_checked = true;
+    dialog->accept();
+  }));
+  require_action(window, "layerNewColorLookupAdjustmentAction")->trigger();
+  QApplication::processEvents();
+  CHECK(dialog_checked);
+
+  const auto& document = std::as_const(patchy::ui::MainWindowTestAccess::document(window));
+  CHECK(document.active_layer_id().has_value());
+  const auto* layer = document.find_layer(*document.active_layer_id());
+  CHECK(layer != nullptr);
+  if (layer != nullptr) {
+    const auto settings = patchy::adjustment_settings_from_layer(*layer);
+    CHECK(settings.has_value() && settings->kind == patchy::AdjustmentKind::ColorLookup);
+    CHECK(settings.has_value() && settings->color_lookup.table != nullptr);
+    CHECK(settings.has_value() && QString::fromStdString(settings->color_lookup.name) == file_name);
+    if (settings.has_value()) {
+      // White through the probe look is (0.5, 0.25, 0.1).
+      const auto white = patchy::apply_adjustment_to_color(patchy::RgbColor{255, 255, 255}, *settings);
+      CHECK((white == patchy::RgbColor{128, 64, 26}));
+    }
+  }
+  patchy::test::remove_test_scratch_tree(dir);
+}
+
+// The Selective Color dialog edits one color range at a time: the Colors combo picks it,
+// every range keeps its values, and the method and all ranges land on the new layer (#250).
+void ui_selective_color_dialog_edits_each_range() {
+  patchy::Document source(32, 24, patchy::PixelFormat::rgba8());
+  source.add_pixel_layer("Paint", solid_pixels(32, 24, patchy::PixelFormat::rgba8(), QColor(200, 120, 40)));
+  patchy::ui::MainWindow window;
+  window.add_document_session(std::move(source), QStringLiteral("Selective"));
+  show_window(window);
+  check_adjustment_kind_in_both_menus(window, "SelectiveColorAdjustment", QObject::tr("&Selective Color..."));
+
+  bool dialog_checked = false;
+  QTimer::singleShot(0, guarded([&] {
+    auto* dialog = qobject_cast<QDialog*>(find_top_level_dialog(QStringLiteral("patchySelectiveColorDialog")));
+    CHECK(dialog != nullptr);
+    if (dialog == nullptr) {
+      return;
+    }
+    auto* colors = dialog->findChild<QComboBox*>(QStringLiteral("selectiveColorRangeCombo"));
+    auto* cyan = dialog->findChild<QSpinBox*>(QStringLiteral("selectiveColorCyanSpin"));
+    auto* black = dialog->findChild<QSpinBox*>(QStringLiteral("selectiveColorBlackSpin"));
+    auto* absolute = dialog->findChild<QRadioButton*>(QStringLiteral("selectiveColorAbsoluteRadio"));
+    CHECK(colors != nullptr && cyan != nullptr && black != nullptr && absolute != nullptr);
+    if (colors == nullptr || cyan == nullptr || black == nullptr || absolute == nullptr) {
+      dialog->reject();
+      return;
+    }
+    CHECK(colors->count() == 9);
+    CHECK(!absolute->isChecked());
+    cyan->setValue(30);
+    colors->setCurrentIndex(7);  // Neutrals
+    CHECK(cyan->value() == 0);
+    black->setValue(20);
+    colors->setCurrentIndex(0);
+    CHECK(cyan->value() == 30);
+    absolute->setChecked(true);
+    save_widget_artifact("ui_selective_color_dialog", *dialog);
+    dialog_checked = true;
+    dialog->accept();
+  }));
+  require_action(window, "layerNewSelectiveColorAdjustmentAction")->trigger();
+  QApplication::processEvents();
+  CHECK(dialog_checked);
+
+  const auto& document = std::as_const(patchy::ui::MainWindowTestAccess::document(window));
+  CHECK(document.active_layer_id().has_value());
+  const auto* layer = document.find_layer(*document.active_layer_id());
+  CHECK(layer != nullptr);
+  if (layer == nullptr) {
+    return;
+  }
+  const auto settings = patchy::adjustment_settings_from_layer(*layer);
+  CHECK(settings.has_value() && settings->kind == patchy::AdjustmentKind::SelectiveColor);
+  if (settings.has_value()) {
+    CHECK(settings->selective_color.absolute);
+    CHECK((settings->selective_color.ranges[0] == patchy::SelectiveColorCorrection{30, 0, 0, 0}));
+    CHECK((settings->selective_color.ranges[7] == patchy::SelectiveColorCorrection{0, 0, 0, 20}));
+  }
+}
+
+// The Vibrance dialog has Photoshop's two sliders, both starting at zero, and both values
+// land on the new adjustment layer (#250).
+void ui_vibrance_dialog_sets_both_sliders() {
+  patchy::Document source(32, 24, patchy::PixelFormat::rgba8());
+  source.add_pixel_layer("Paint", solid_pixels(32, 24, patchy::PixelFormat::rgba8(), QColor(150, 120, 110)));
+  patchy::ui::MainWindow window;
+  window.add_document_session(std::move(source), QStringLiteral("Vibrance"));
+  show_window(window);
+  check_adjustment_kind_in_both_menus(window, "VibranceAdjustment", QObject::tr("&Vibrance..."));
+
+  bool dialog_checked = false;
+  QTimer::singleShot(0, guarded([&] {
+    auto* dialog = qobject_cast<QDialog*>(find_top_level_dialog(QStringLiteral("patchyVibranceDialog")));
+    CHECK(dialog != nullptr);
+    if (dialog == nullptr) {
+      return;
+    }
+    auto* vibrance = dialog->findChild<QSpinBox*>(QStringLiteral("vibranceAmountSpin"));
+    auto* saturation = dialog->findChild<QSpinBox*>(QStringLiteral("vibranceSaturationSpin"));
+    CHECK(vibrance != nullptr && saturation != nullptr);
+    if (vibrance == nullptr || saturation == nullptr) {
+      dialog->reject();
+      return;
+    }
+    CHECK(vibrance->value() == 0 && saturation->value() == 0);
+    CHECK(vibrance->minimum() == -100 && vibrance->maximum() == 100);
+    CHECK(saturation->minimum() == -100 && saturation->maximum() == 100);
+    vibrance->setValue(60);
+    saturation->setValue(-20);
+    save_widget_artifact("ui_vibrance_dialog", *dialog);
+    dialog_checked = true;
+    dialog->accept();
+  }));
+  require_action(window, "layerNewVibranceAdjustmentAction")->trigger();
+  QApplication::processEvents();
+  CHECK(dialog_checked);
+
+  const auto& document = std::as_const(patchy::ui::MainWindowTestAccess::document(window));
+  CHECK(document.active_layer_id().has_value());
+  const auto* layer = document.active_layer_id().has_value() ? document.find_layer(*document.active_layer_id())
+                                                             : nullptr;
+  CHECK(layer != nullptr);
+  if (layer == nullptr) {
+    return;
+  }
+  const auto settings = patchy::adjustment_settings_from_layer(*layer);
+  CHECK(settings.has_value() && settings->kind == patchy::AdjustmentKind::Vibrance);
+  if (settings.has_value()) {
+    CHECK((settings->vibrance == patchy::VibranceAdjustment{60, -20}));
+  }
+  if (auto* layer_list = window.findChild<QListWidget*>(QStringLiteral("layerList")); layer_list != nullptr) {
+    save_widget_artifact("ui_vibrance_layers_panel", *layer_list);
+  }
+}
+
+// The Photo Filter dialog starts on Photoshop's warming color at 25 % with Preserve
+// Luminosity on; its swatch opens Patchy's own picker, and the picked color, density and
+// checkbox all land on the new adjustment layer as Photoshop's Lab (#250).
+void ui_photo_filter_dialog_picks_color_and_density() {
+  patchy::Document source(32, 24, patchy::PixelFormat::rgba8());
+  source.add_pixel_layer("Paint", solid_pixels(32, 24, patchy::PixelFormat::rgba8(), QColor(200, 120, 40)));
+  patchy::ui::MainWindow window;
+  window.add_document_session(std::move(source), QStringLiteral("Filter"));
+  show_window(window);
+  check_adjustment_kind_in_both_menus(window, "PhotoFilterAdjustment", QObject::tr("Photo &Filter..."));
+
+  bool dialog_checked = false;
+  QTimer::singleShot(0, guarded([&] {
+    auto* dialog = qobject_cast<QDialog*>(find_top_level_dialog(QStringLiteral("patchyPhotoFilterDialog")));
+    CHECK(dialog != nullptr);
+    if (dialog == nullptr) {
+      return;
+    }
+    auto* swatch = dialog->findChild<QPushButton*>(QStringLiteral("photoFilterColorButton"));
+    auto* density = dialog->findChild<QSpinBox*>(QStringLiteral("photoFilterDensitySpin"));
+    auto* preserve = dialog->findChild<QCheckBox*>(QStringLiteral("photoFilterPreserveCheck"));
+    CHECK(swatch != nullptr && density != nullptr && preserve != nullptr);
+    if (swatch == nullptr || density == nullptr || preserve == nullptr) {
+      dialog->reject();
+      return;
+    }
+    CHECK(density->value() == 25);
+    CHECK(density->minimum() == 1 && density->maximum() == 100);
+    CHECK(preserve->isChecked());
+    density->setValue(63);
+    preserve->setChecked(false);
+    QTimer::singleShot(0, guarded([] {
+      auto* picker_dialog = find_top_level_dialog(QStringLiteral("patchyColorDialog"));
+      CHECK(picker_dialog != nullptr);
+      if (picker_dialog == nullptr) {
+        return;
+      }
+      CHECK(patchy::ui::apply_color_to_open_color_picker(QColor(40, 200, 120)));
+      picker_dialog->accept();
+    }));
+    swatch->click();
+    save_widget_artifact("ui_photo_filter_dialog", *dialog);
+    dialog_checked = true;
+    dialog->accept();
+  }));
+  require_action(window, "layerNewPhotoFilterAdjustmentAction")->trigger();
+  QApplication::processEvents();
+  CHECK(dialog_checked);
+
+  const auto& document = std::as_const(patchy::ui::MainWindowTestAccess::document(window));
+  CHECK(document.active_layer_id().has_value());
+  const auto* layer = document.find_layer(*document.active_layer_id());
+  CHECK(layer != nullptr);
+  if (layer == nullptr) {
+    return;
+  }
+  const auto settings = patchy::adjustment_settings_from_layer(*layer);
+  CHECK(settings.has_value());
+  CHECK(settings->kind == patchy::AdjustmentKind::PhotoFilter);
+  CHECK(settings->photo_filter.lab_l == 7157 && settings->photo_filter.lab_a == -5502 &&
+        settings->photo_filter.lab_b == 2828);
+  CHECK(settings->photo_filter.density == 63);
+  CHECK(!settings->photo_filter.preserve_luminosity);
+}
+
+// The Channel Mixer dialog edits one output row at a time: the Output Channel combo picks
+// red, green or blue and Monochrome switches the sliders to the gray row; every row keeps
+// its values, and all of them land on the new adjustment layer (#250).
+void ui_channel_mixer_dialog_edits_each_output_row() {
+  patchy::Document source(32, 24, patchy::PixelFormat::rgba8());
+  source.add_pixel_layer("Paint", solid_pixels(32, 24, patchy::PixelFormat::rgba8(), QColor(200, 120, 40)));
+  patchy::ui::MainWindow window;
+  window.add_document_session(std::move(source), QStringLiteral("Mixer"));
+  show_window(window);
+  check_adjustment_kind_in_both_menus(window, "ChannelMixerAdjustment", QObject::tr("Channel &Mixer..."));
+
+  bool dialog_checked = false;
+  QTimer::singleShot(0, guarded([&] {
+    auto* dialog = qobject_cast<QDialog*>(find_top_level_dialog(QStringLiteral("patchyChannelMixerDialog")));
+    CHECK(dialog != nullptr);
+    auto* output = dialog->findChild<QComboBox*>(QStringLiteral("channelMixerOutputCombo"));
+    auto* monochrome = dialog->findChild<QCheckBox*>(QStringLiteral("channelMixerMonochromeCheck"));
+    auto* red = dialog->findChild<QSpinBox*>(QStringLiteral("channelMixerRedSpin"));
+    auto* green = dialog->findChild<QSpinBox*>(QStringLiteral("channelMixerGreenSpin"));
+    auto* blue = dialog->findChild<QSpinBox*>(QStringLiteral("channelMixerBlueSpin"));
+    auto* constant = dialog->findChild<QSpinBox*>(QStringLiteral("channelMixerConstantSpin"));
+    CHECK(output != nullptr && monochrome != nullptr);
+    CHECK(red != nullptr && green != nullptr && blue != nullptr && constant != nullptr);
+    CHECK(output->count() == 3);
+    CHECK(!monochrome->isChecked());
+    const auto row_is = [&](int r, int g, int b, int c) {
+      return red->value() == r && green->value() == g && blue->value() == b && constant->value() == c;
+    };
+    const auto set_row = [&](int r, int g, int b, int c) {
+      red->setValue(r);
+      green->setValue(g);
+      blue->setValue(b);
+      constant->setValue(c);
+    };
+    CHECK(row_is(100, 0, 0, 0));  // Photoshop's identity for the red output
+    set_row(70, 20, 10, 0);
+    output->setCurrentIndex(1);
+    CHECK(row_is(0, 100, 0, 0));
+    set_row(-50, 150, 0, -45);
+    output->setCurrentIndex(0);
+    CHECK(row_is(70, 20, 10, 0));
+    monochrome->setChecked(true);
+    CHECK(!output->isEnabled());
+    CHECK(row_is(40, 40, 20, 0));  // Photoshop's monochrome default
+    set_row(33, 51, 17, -12);
+    monochrome->setChecked(false);
+    CHECK(row_is(70, 20, 10, 0));
+    monochrome->setChecked(true);
+    CHECK(row_is(33, 51, 17, -12));
+    save_widget_artifact("ui_channel_mixer_dialog", *dialog);
+    dialog_checked = true;
+    dialog->accept();
+  }));
+  require_action(window, "layerNewChannelMixerAdjustmentAction")->trigger();
+  QApplication::processEvents();
+  CHECK(dialog_checked);
+
+  const auto& document = std::as_const(patchy::ui::MainWindowTestAccess::document(window));
+  CHECK(document.active_layer_id().has_value());
+  const auto* layer = document.find_layer(*document.active_layer_id());
+  CHECK(layer != nullptr);
+  const auto settings = patchy::adjustment_settings_from_layer(*layer);
+  CHECK(settings.has_value());
+  CHECK(settings->kind == patchy::AdjustmentKind::ChannelMixer);
+  CHECK(settings->channel_mixer.monochrome);
+  CHECK((settings->channel_mixer.gray == patchy::ChannelMixerRow{33, 51, 17, -12}));
+  CHECK((settings->channel_mixer.red == patchy::ChannelMixerRow{70, 20, 10, 0}));
+  CHECK((settings->channel_mixer.green == patchy::ChannelMixerRow{-50, 150, 0, -45}));
+}
+
+// The Tone combo retargets the three sliders to Shadows, Midtones or
+// Highlights and keeps every range's values; Preserve Luminosity starts checked
+// for a new layer, as in Photoshop. All of it lands on the adjustment layer (#250).
+void ui_color_balance_dialog_tone_selector_edits_each_range() {
+  patchy::Document source(32, 24, patchy::PixelFormat::rgba8());
+  source.add_pixel_layer("Paint", solid_pixels(32, 24, patchy::PixelFormat::rgba8(), QColor(90, 120, 150)));
+  patchy::ui::MainWindow window;
+  window.add_document_session(std::move(source), QStringLiteral("Tones"));
+  show_window(window);
+
+  bool dialog_checked = false;
+  QTimer::singleShot(0, guarded([&] {
+    auto* dialog = qobject_cast<QDialog*>(find_top_level_dialog(QStringLiteral("patchyColorBalanceDialog")));
+    CHECK(dialog != nullptr);
+    auto* tone = dialog->findChild<QTabBar*>(QStringLiteral("colorBalanceToneTabs"));
+    auto* preserve = dialog->findChild<QCheckBox*>(QStringLiteral("colorBalancePreserveLuminosityCheck"));
+    auto* cyan_red = dialog->findChild<QSpinBox*>(QStringLiteral("colorBalanceCyanRedSpin"));
+    auto* magenta_green = dialog->findChild<QSpinBox*>(QStringLiteral("colorBalanceMagentaGreenSpin"));
+    auto* yellow_blue = dialog->findChild<QSpinBox*>(QStringLiteral("colorBalanceYellowBlueSpin"));
+    CHECK(tone != nullptr);
+    CHECK(preserve != nullptr);
+    CHECK(cyan_red != nullptr && magenta_green != nullptr && yellow_blue != nullptr);
+    CHECK(tone->count() == 3);
+    CHECK(tone->currentIndex() == 1);  // Midtones
+    CHECK(preserve->isChecked());
+    const auto set_triple = [&](int a, int b, int c) {
+      cyan_red->setValue(a);
+      magenta_green->setValue(b);
+      yellow_blue->setValue(c);
+    };
+    const auto triple_is = [&](int a, int b, int c) {
+      return cyan_red->value() == a && magenta_green->value() == b && yellow_blue->value() == c;
+    };
+    set_triple(16, -21, 33);
+    tone->setCurrentIndex(0);
+    CHECK(triple_is(0, 0, 0));
+    set_triple(-40, 25, 60);
+    tone->setCurrentIndex(2);
+    CHECK(triple_is(0, 0, 0));
+    set_triple(38, 35, 38);
+    tone->setCurrentIndex(1);
+    CHECK(triple_is(16, -21, 33));
+    tone->setCurrentIndex(0);
+    CHECK(triple_is(-40, 25, 60));
+    preserve->setChecked(false);
+    save_widget_artifact("ui_color_balance_tone_dialog", *dialog);
+    dialog_checked = true;
+    dialog->accept();
+  }));
+  require_action(window, "layerNewColorBalanceAdjustmentAction")->trigger();
+  QApplication::processEvents();
+  CHECK(dialog_checked);
+
+  const auto& document = std::as_const(patchy::ui::MainWindowTestAccess::document(window));
+  CHECK(document.active_layer_id().has_value());
+  const auto* layer = document.find_layer(*document.active_layer_id());
+  CHECK(layer != nullptr);
+  const auto settings = patchy::adjustment_settings_from_layer(*layer);
+  CHECK(settings.has_value());
+  CHECK(settings->kind == patchy::AdjustmentKind::ColorBalance);
+  CHECK((settings->color_balance.shadows == patchy::ColorBalanceTone{-40, 25, 60}));
+  CHECK((settings->color_balance.tone(patchy::ColorBalanceToneRange::Midtones) ==
+         patchy::ColorBalanceTone{16, -21, 33}));
+  CHECK((settings->color_balance.highlights == patchy::ColorBalanceTone{38, 35, 38}));
+  CHECK(!settings->color_balance.preserve_luminosity);
+}
+
+void ui_color_balance_dialog_adjusts_selected_pixels() {
+  patchy::ui::MainWindow window;
+  show_window(window);
+  auto* canvas = require_canvas(window);
+
+  canvas->set_primary_color(QColor(128, 128, 128));
+  use_solid_fill_settings(canvas);
+  require_action(window, "layerFillForegroundAction")->trigger();
+  QApplication::processEvents();
+
+  require_action_by_text(window, QStringLiteral("Marquee"))->trigger();
+  drag(*canvas, canvas->widget_position_for_document_point(QPoint(40, 40)),
+       canvas->widget_position_for_document_point(QPoint(120, 120)));
+  QApplication::processEvents();
+
+  accept_color_balance_dialog(50, -40, 30);
+  require_action(window, "imageAdjustColorBalanceAction")->trigger();
+  QApplication::processEvents();
+  require_action(window, "editDeselectAction")->trigger();
+  QApplication::processEvents();
+
+  // Midtones (50, -40, 30) with Preserve Luminosity (on for a new Color Balance) on gray
+  // 128: per-channel gammas of 1.37, 0.73 and 1.19 (Photoshop's Color Balance).
+  const auto adjusted = canvas_pixel(*canvas, QPoint(70, 70));
+  CHECK(color_close(adjusted, QColor(154, 99, 143), 1));
+  CHECK(color_close(canvas_pixel(*canvas, QPoint(180, 70)), QColor(128, 128, 128), 8));
+  save_widget_artifact("ui_color_balance_selection", *canvas);
+}
+
+}  // namespace
+
+
+void ui_levels_exception_restores_preview_pixels_and_unlocks_edits() {
+  patchy::Document source(48,32,patchy::PixelFormat::rgba8());
+  source.add_pixel_layer("Paint", solid_pixels(48,32,patchy::PixelFormat::rgba8(), QColor(40,60,80)));
+  patchy::ui::MainWindow window;
+  window.add_document_session(std::move(source), QStringLiteral("Unwind"));
+  show_window(window);
+  auto& document = patchy::ui::MainWindowTestAccess::document(window);
+  const auto original = std::as_const(document).layers().front().pixels();
+  bool saw_preview = false;
+  QTimer::singleShot(0, [&] {
+    try {
+      auto* dialog = patchy::test::ui::find_top_level_dialog(QStringLiteral("patchyLevelsDialog"));
+      CHECK(dialog != nullptr);
+      auto* black = dialog->findChild<QSpinBox*>(QStringLiteral("levelsBlackOutputSpin"));
+      CHECK(black != nullptr);
+      black->setValue(200);
+      CHECK(process_events_until([&] {
+        return std::as_const(document).layers().front().pixels().pixel(0,0)[0] > 100;
+      }, 3000));
+      saw_preview = true;
+      throw std::runtime_error("levels unwind regression");
+    } catch (...) {
+      if (!patchy::ui::unwind_non_modal_dialog_loop(std::current_exception())) throw;
+    }
+  });
+  bool unwound = false;
+  // Exercise the caller's unwind without sending the intentional exception
+  // through QAction's Qt signal-dispatch frames (unsupported on macOS).
+  try { patchy::ui::MainWindowTestAccess::levels_dialog(window); }
+  catch (const std::runtime_error& error) {
+    if (std::string(error.what()) != "levels unwind regression") throw;
+    unwound = true;
+  }
+  CHECK(saw_preview && unwound);
+  process_events_for(200);
+  const auto& after = std::as_const(document).layers().front().pixels();
+  CHECK(std::equal(original.data().begin(), original.data().end(), after.data().begin(), after.data().end()));
+  CHECK(patchy::ui::MainWindowTestAccess::active_session_undo_depth(window) == 0);
+  CHECK(require_action(window, "imageAdjustLevelsAction")->isEnabled());
+}
+
+// Image > Adjustments for the kinds that used to exist only as adjustment layers (#528):
+// each command opens the kind's adjustment-layer dialog and writes the layer's transfer
+// into the active pixel layer, so the result equals the flattened adjustment layer of the
+// same dialog settings, in one undo step.
+namespace {
+
+constexpr std::int32_t kDirectAdjustmentWidth = 48;
+constexpr std::int32_t kDirectAdjustmentHeight = 32;
+
+patchy::PixelBuffer direct_adjustment_source_pixels() {
+  patchy::PixelBuffer pixels(kDirectAdjustmentWidth, kDirectAdjustmentHeight, patchy::PixelFormat::rgba8());
+  for (std::int32_t y = 0; y < kDirectAdjustmentHeight; ++y) {
+    for (std::int32_t x = 0; x < kDirectAdjustmentWidth; ++x) {
+      auto* px = pixels.pixel(x, y);
+      px[0] = static_cast<std::uint8_t>(x * 255 / (kDirectAdjustmentWidth - 1));
+      px[1] = static_cast<std::uint8_t>(y * 255 / (kDirectAdjustmentHeight - 1));
+      px[2] = static_cast<std::uint8_t>((x * 37 + y * 71) % 256);
+      px[3] = 255;
+    }
+  }
+  return pixels;
+}
+
+struct DirectAdjustmentCase {
+  const char* direct_action;
+  const char* layer_action;
+  const char* dialog_name;
+  // Moves the dialog off its defaults (null keeps them).
+  std::function<void(QDialog&)> edit;
+};
+
+bool run_adjustment_dialog_action(patchy::ui::MainWindow& window, const char* action,
+                                  const DirectAdjustmentCase& adjustment) {
+  bool dialog_seen = false;
+  QTimer::singleShot(0, guarded([&] {
+    auto* dialog = qobject_cast<QDialog*>(find_top_level_dialog(QString::fromLatin1(adjustment.dialog_name)));
+    CHECK(dialog != nullptr);
+    if (dialog == nullptr) {
+      return;
+    }
+    if (adjustment.edit) {
+      adjustment.edit(*dialog);
+    }
+    process_events_for(80);
+    dialog_seen = true;
+    dialog->accept();
+  }));
+  require_action(window, action)->trigger();
+  QApplication::processEvents();
+  return dialog_seen;
+}
+
+// The flattened document of an adjustment layer over the source, from the same dialog edits.
+patchy::PixelBuffer adjustment_layer_reference(const DirectAdjustmentCase& adjustment) {
+  patchy::Document source(kDirectAdjustmentWidth, kDirectAdjustmentHeight, patchy::PixelFormat::rgba8());
+  source.add_pixel_layer("Paint", direct_adjustment_source_pixels());
+  patchy::ui::MainWindow window;
+  window.add_document_session(std::move(source), QStringLiteral("Layer"));
+  show_window(window);
+  CHECK(run_adjustment_dialog_action(window, adjustment.layer_action, adjustment));
+  const auto& document = std::as_const(patchy::ui::MainWindowTestAccess::document(window));
+  CHECK(document.active_layer_id().has_value());
+  if (document.active_layer_id().has_value()) {
+    const auto* layer = document.find_layer(*document.active_layer_id());
+    CHECK(layer != nullptr && patchy::adjustment_settings_from_layer(*layer).has_value());
+  }
+  return patchy::flatten_document_rgba8(document);
+}
+
+int max_rgb_difference(const patchy::PixelBuffer& lhs, const patchy::PixelBuffer& rhs) {
+  int worst = 0;
+  for (std::int32_t y = 0; y < kDirectAdjustmentHeight; ++y) {
+    for (std::int32_t x = 0; x < kDirectAdjustmentWidth; ++x) {
+      const auto* a = lhs.pixel(x, y);
+      const auto* b = rhs.pixel(x, y);
+      for (int channel = 0; channel < 3; ++channel) {
+        worst = std::max(worst, std::abs(int{a[channel]} - int{b[channel]}));
+      }
+    }
+  }
+  return worst;
+}
+
+void check_direct_adjustment_matches_layer(const DirectAdjustmentCase& adjustment) {
+  const auto source_pixels = direct_adjustment_source_pixels();
+  const auto expected = adjustment_layer_reference(adjustment);
+
+  patchy::Document source(kDirectAdjustmentWidth, kDirectAdjustmentHeight, patchy::PixelFormat::rgba8());
+  source.add_pixel_layer("Paint", source_pixels);
+  patchy::ui::MainWindow window;
+  window.add_document_session(std::move(source), QStringLiteral("Direct"));
+  show_window(window);
+  CHECK(run_adjustment_dialog_action(window, adjustment.direct_action, adjustment));
+  auto& document = patchy::ui::MainWindowTestAccess::document(window);
+  CHECK(std::as_const(document).layers().size() == 1);
+  const auto& after = std::as_const(document).layers().front().pixels();
+  CHECK(after.width() == kDirectAdjustmentWidth && after.height() == kDirectAdjustmentHeight);
+  CHECK(after.format() == patchy::PixelFormat::rgba8());
+  if (after.width() != kDirectAdjustmentWidth || after.height() != kDirectAdjustmentHeight ||
+      expected.width() != kDirectAdjustmentWidth || expected.height() != kDirectAdjustmentHeight) {
+    return;
+  }
+  CHECK(!patchy::ui::pixel_buffers_equal(after, source_pixels));
+  const auto difference = max_rgb_difference(after, expected);
+  if (difference != 0) {
+    std::cerr << adjustment.direct_action << ": max difference to the adjustment layer " << difference << '\n';
+  }
+  CHECK(difference == 0);
+  CHECK(patchy::ui::MainWindowTestAccess::active_session_undo_depth(window) == 1);
+  patchy::ui::MainWindowTestAccess::undo(window);
+  QApplication::processEvents();
+  CHECK(patchy::ui::pixel_buffers_equal(std::as_const(document).layers().front().pixels(), source_pixels));
+}
+
+void set_spin(QDialog& dialog, const char* name, int value) {
+  auto* spin = dialog.findChild<QSpinBox*>(QString::fromLatin1(name));
+  CHECK(spin != nullptr);
+  if (spin != nullptr) {
+    spin->setValue(value);
+  }
+}
+
+// "Only Master works" (#588): a hue-range edit previews on the layer while the dialog is
+// open, and OK changes the layer's pixels (no adjustment layer), exactly as an adjustment
+// layer with the same settings renders. Color Balance takes the same route (#591).
+void ui_hue_saturation_range_edits_preview_and_apply_to_pixels() {
+  {
+    patchy::Document source(32, 24, patchy::PixelFormat::rgba8());
+    source.add_pixel_layer("Paint", solid_pixels(32, 24, patchy::PixelFormat::rgba8(), QColor(220, 40, 40)));
+    patchy::ui::MainWindow window;
+    window.add_document_session(std::move(source), QStringLiteral("Reds"));
+    show_window(window);
+    auto& document = patchy::ui::MainWindowTestAccess::document(window);
+    const auto original = std::as_const(document).layers().front().pixels();
+    bool saw_preview = false;
+    QTimer::singleShot(0, guarded([&] {
+      auto* dialog = qobject_cast<QDialog*>(find_top_level_dialog(QStringLiteral("patchyHueSaturationDialog")));
+      CHECK(dialog != nullptr);
+      if (dialog == nullptr) {
+        return;
+      }
+      auto* range = dialog->findChild<QComboBox*>(QStringLiteral("hueSaturationRangeCombo"));
+      CHECK(range != nullptr);
+      if (range != nullptr) {
+        range->setCurrentIndex(1);  // Reds
+      }
+      set_spin(*dialog, "hueSaturationHueSpin", 120);
+      saw_preview = process_events_until(
+          [&] {
+            const auto* pixel = std::as_const(document).layers().front().pixels().pixel(5, 5);
+            return pixel[1] > pixel[0];
+          },
+          3000);
+      dialog->accept();
+    }));
+    require_action(window, "imageAdjustHueSaturationAction")->trigger();
+    QApplication::processEvents();
+    CHECK(saw_preview);
+    CHECK(std::as_const(document).layers().size() == 1);
+    const auto* pixel = std::as_const(document).layers().front().pixels().pixel(5, 5);
+    CHECK(pixel[1] > pixel[0]);
+    CHECK(!patchy::ui::pixel_buffers_equal(std::as_const(document).layers().front().pixels(), original));
+    CHECK(patchy::ui::MainWindowTestAccess::active_session_undo_depth(window) == 1);
+  }
+
+  check_direct_adjustment_matches_layer({"imageAdjustHueSaturationAction", "layerNewHueSaturationAdjustmentAction",
+                                         "patchyHueSaturationDialog", [](QDialog& dialog) {
+                                           auto* range = dialog.findChild<QComboBox*>(
+                                               QStringLiteral("hueSaturationRangeCombo"));
+                                           CHECK(range != nullptr);
+                                           if (range == nullptr) {
+                                             return;
+                                           }
+                                           range->setCurrentIndex(1);
+                                           set_spin(dialog, "hueSaturationHueSpin", -40);
+                                           set_spin(dialog, "hueSaturationSaturationSpin", 30);
+                                           range->setCurrentIndex(5);
+                                           set_spin(dialog, "hueSaturationLightnessSpin", -20);
+                                         }});
+  check_direct_adjustment_matches_layer({"imageAdjustColorBalanceAction", "layerNewColorBalanceAdjustmentAction",
+                                         "patchyColorBalanceDialog", [](QDialog& dialog) {
+                                           set_spin(dialog, "colorBalanceCyanRedSpin", 35);
+                                           auto* tabs = dialog.findChild<QTabBar*>(
+                                               QStringLiteral("colorBalanceToneTabs"));
+                                           CHECK(tabs != nullptr);
+                                           if (tabs != nullptr) {
+                                             tabs->setCurrentIndex(0);
+                                           }
+                                           set_spin(dialog, "colorBalanceYellowBlueSpin", -25);
+                                         }});
+}
+
+void set_double_spin(QDialog& dialog, const char* name, double value) {
+  auto* spin = dialog.findChild<QDoubleSpinBox*>(QString::fromLatin1(name));
+  CHECK(spin != nullptr);
+  if (spin != nullptr) {
+    spin->setValue(value);
+  }
+}
+
+}  // namespace
+
+// Black & White also gets the reporter's Ctrl+Shift+Alt+B, honours a selection, and keeps a
+// 16-bit layer at 16 bits within one level of the 8-bit result.
+void ui_image_adjustments_black_white_matches_adjustment_layer() {
+  const DirectAdjustmentCase black_white{"imageAdjustBlackWhiteAction", "layerNewBlackWhiteAdjustmentAction",
+                                         "patchyBlackWhiteDialog", [](QDialog& dialog) {
+                                           set_spin(dialog, "blackWhiteRedsSpin", -50);
+                                           set_spin(dialog, "blackWhiteBluesSpin", 140);
+                                         }};
+  check_direct_adjustment_matches_layer(black_white);
+
+  {
+    patchy::ui::MainWindow window;
+    show_window(window);
+    CHECK(require_action(window, "imageAdjustBlackWhiteAction")->shortcut() ==
+          QKeySequence(Qt::CTRL | Qt::SHIFT | Qt::ALT | Qt::Key_B));
+    if (auto* menu = window.findChild<QMenu*>(QStringLiteral("imageAdjustmentsMenu")); menu != nullptr) {
+      menu->popup(window.mapToGlobal(QPoint(40, 40)));
+      process_events_for(80);
+      save_widget_artifact("ui_image_adjustments_menu", *menu);
+      menu->hide();
+    }
+  }
+
+  // A selection over the left half leaves the right half untouched.
+  {
+    const auto source_pixels = direct_adjustment_source_pixels();
+    patchy::Document source(kDirectAdjustmentWidth, kDirectAdjustmentHeight, patchy::PixelFormat::rgba8());
+    source.add_pixel_layer("Paint", source_pixels);
+    patchy::ui::MainWindow window;
+    window.add_document_session(std::move(source), QStringLiteral("Selection"));
+    show_window(window);
+    auto* canvas = require_canvas(window);
+    patchy::PixelBuffer coverage(kDirectAdjustmentWidth / 2, kDirectAdjustmentHeight, patchy::PixelFormat::gray8());
+    coverage.clear(255);
+    canvas->set_selection_from_coverage(QRect(0, 0, kDirectAdjustmentWidth / 2, kDirectAdjustmentHeight), coverage);
+    CHECK(run_adjustment_dialog_action(window, "imageAdjustBlackWhiteAction", {nullptr, nullptr,
+                                                                               "patchyBlackWhiteDialog", {}}));
+    const auto& after = std::as_const(patchy::ui::MainWindowTestAccess::document(window)).layers().front().pixels();
+    const auto* inside = after.pixel(5, 20);
+    CHECK(inside[0] == inside[1] && inside[1] == inside[2]);
+    const auto* outside = after.pixel(40, 20);
+    const auto* original = source_pixels.pixel(40, 20);
+    CHECK(std::equal(outside, outside + 4, original));
+  }
+
+  // 16 bits: the layer stays 16-bit, turns neutral, and matches the 8-bit adjustment layer.
+  {
+    const DirectAdjustmentCase defaults{"imageAdjustBlackWhiteAction", "layerNewBlackWhiteAdjustmentAction",
+                                        "patchyBlackWhiteDialog", {}};
+    const auto expected = adjustment_layer_reference(defaults);
+    patchy::Document source(kDirectAdjustmentWidth, kDirectAdjustmentHeight, patchy::PixelFormat::rgba8());
+    source.add_pixel_layer("Paint", direct_adjustment_source_pixels());
+    patchy::convert_document_depth(source, patchy::BitDepth::UInt16);
+    patchy::ui::MainWindow window;
+    window.add_document_session(std::move(source), QStringLiteral("Deep"));
+    show_window(window);
+    CHECK(run_adjustment_dialog_action(window, "imageAdjustBlackWhiteAction", defaults));
+    const auto& document = std::as_const(patchy::ui::MainWindowTestAccess::document(window));
+    const auto& after = document.layers().front().pixels();
+    CHECK(after.format().bit_depth == patchy::BitDepth::UInt16);
+    bool neutral = true;
+    for (std::int32_t y = 0; y < after.height(); ++y) {
+      for (std::int32_t x = 0; x < after.width(); ++x) {
+        const auto value = patchy::load_pixel(after.format(), after.pixel(x, y));
+        neutral = neutral && std::abs(value[0] - value[1]) < 1e-3F && std::abs(value[1] - value[2]) < 1e-3F;
+      }
+    }
+    CHECK(neutral);
+    const auto flattened = patchy::flatten_document_rgba8(document);
+    CHECK(flattened.width() == kDirectAdjustmentWidth && flattened.height() == kDirectAdjustmentHeight);
+    if (flattened.width() == kDirectAdjustmentWidth && flattened.height() == kDirectAdjustmentHeight &&
+        expected.width() == kDirectAdjustmentWidth) {
+      CHECK(max_rgb_difference(flattened, expected) <= 1);
+    }
+  }
+}
+
+// The Black & White dialog's presets, hue chips, measurement and tint (#528): on a photo it shows
+// each slider's hue next to its gray and how much of the image each slider acts on; a neutral
+// preset sets the six weights and clears Tint, a tinted one also ticks Tint and sets its color;
+// Hue and Saturation follow the swatch and edit the tint color, and are off without Tint; and
+// Image > Adjustments with a tinted preset still matches the adjustment layer of that preset.
+namespace {
+
+std::vector<QAbstractButton*> black_white_preset_tiles(QDialog& dialog) {
+  std::vector<QAbstractButton*> tiles;
+  for (auto* button : dialog.findChildren<QAbstractButton*>()) {
+    if (button->property("patchy.presetId").isValid()) {
+      tiles.push_back(button);
+    }
+  }
+  return tiles;
+}
+
+QAbstractButton* black_white_preset_tile(QDialog& dialog, const QString& id) {
+  return dialog.findChild<QAbstractButton*>(QStringLiteral("blackWhitePreset_") +
+                                            (id.isEmpty() ? QStringLiteral("custom") : id));
+}
+
+// The checked tile's preset id ("" for Custom), or "none".
+QString checked_black_white_preset(QDialog& dialog) {
+  for (auto* tile : black_white_preset_tiles(dialog)) {
+    if (tile->isChecked()) {
+      return tile->property("patchy.presetId").toString();
+    }
+  }
+  return QStringLiteral("none");
+}
+
+void click_black_white_preset(QDialog& dialog, const QString& id) {
+  auto* tile = black_white_preset_tile(dialog, id);
+  CHECK(tile != nullptr);
+  if (tile != nullptr) {
+    tile->click();
+    QApplication::processEvents();
+  }
+}
+
+}  // namespace
+
+void ui_black_white_dialog_presets_and_measurement() {
+  const std::array<const char*, 6> keys{"Reds", "Yellows", "Greens", "Cyans", "Blues", "Magentas"};
+
+  // A photo: chips, meters and the scrolling preset strip with its two sections, captured in
+  // both schemes.
+  {
+    patchy::ui::MainWindow window;
+    show_window(window);
+    const auto photo = patchy::test::committed_format_fixture_path("readme", "havana_vintage_car_cc0.jpg");
+    patchy::ui::MainWindowTestAccess::open_document_path(window, patchy::ui::to_qstring(photo));
+    bool dialog_checked = false;
+    QTimer::singleShot(0, guarded([&] {
+      auto* dialog = qobject_cast<QDialog*>(find_top_level_dialog(QStringLiteral("patchyBlackWhiteDialog")));
+      CHECK(dialog != nullptr);
+      if (dialog == nullptr) {
+        return;
+      }
+      process_events_for(120);
+      for (const auto scheme : {patchy::ui::ColorSchemePreference::Dark, patchy::ui::ColorSchemePreference::Light}) {
+        ColorSchemeRestorer restore(scheme);
+        process_events_for(60);
+        save_widget_artifact(scheme == patchy::ui::ColorSchemePreference::Dark ? "ui_black_white_dialog_photo_dark"
+                                                                                : "ui_black_white_dialog_photo_light",
+                             *dialog);
+      }
+      CHECK(black_white_preset_tiles(*dialog).size() == 22);
+      CHECK(checked_black_white_preset(*dialog) == QStringLiteral("black_white.default"));
+      auto* strip = dialog->findChild<QScrollArea*>(QStringLiteral("blackWhitePresetStrip"));
+      CHECK(strip != nullptr && strip->verticalScrollBar()->isVisible() && strip->verticalScrollBar()->maximum() > 0);
+      CHECK(dialog->findChild<QLabel*>(QStringLiteral("blackWhitePresetNeutralHeader")) != nullptr);
+      CHECK(dialog->findChild<QLabel*>(QStringLiteral("blackWhitePresetTintedHeader")) != nullptr);
+      // No note under the strip (#528 follow-up 2): each bar's tooltip says what it shows, and
+      // every field label ends with a colon.
+      CHECK(dialog->findChild<QLabel*>(QStringLiteral("blackWhiteInfluenceNote")) == nullptr);
+      auto* form = dialog->findChild<QFormLayout*>();
+      CHECK(form != nullptr);
+      for (const auto* key : keys) {
+        CHECK(dialog->findChild<QWidget*>(QStringLiteral("blackWhite%1Chip").arg(QLatin1String(key))) != nullptr);
+        auto* meter = dialog->findChild<QWidget*>(QStringLiteral("blackWhite%1Influence").arg(QLatin1String(key)));
+        CHECK(meter != nullptr && meter->toolTip().startsWith(QStringLiteral("The bar shows how much of this image")));
+        auto* spin = dialog->findChild<QSpinBox*>(QStringLiteral("blackWhite%1Spin").arg(QLatin1String(key)));
+        auto* caption = form != nullptr && spin != nullptr ? form->labelForField(spin->parentWidget()) : nullptr;
+        CHECK(caption != nullptr);
+        if (auto* text = qobject_cast<QLabel*>(caption)) {
+          CHECK(text->text() == QLatin1String(key) + QStringLiteral(":"));
+        }
+      }
+      for (const auto& [name, caption_text] : {std::pair{"blackWhiteTintHueSpin", "Hue:"},
+                                               std::pair{"blackWhiteTintSaturationSpin", "Saturation:"}}) {
+        auto* spin = dialog->findChild<QSpinBox*>(QString::fromLatin1(name));
+        auto* caption = form != nullptr && spin != nullptr ? qobject_cast<QLabel*>(form->labelForField(spin->parentWidget()))
+                                                           : nullptr;
+        CHECK(caption != nullptr && caption->text() == QString::fromLatin1(caption_text));
+        CHECK(spin != nullptr && !spin->accessibleName().endsWith(QLatin1Char(':')));
+      }
+      dialog_checked = true;
+      dialog->reject();
+    }));
+    require_action(window, "imageAdjustBlackWhiteAction")->trigger();
+    QApplication::processEvents();
+    CHECK(dialog_checked);
+  }
+
+  // Presets and the tint: a neutral preset clears Tint, a tinted one sets it; Hue and Saturation
+  // follow the swatch and set the color, and the accepted layer holds that color.
+  {
+    patchy::Document source(kDirectAdjustmentWidth, kDirectAdjustmentHeight, patchy::PixelFormat::rgba8());
+    source.add_pixel_layer("Paint", direct_adjustment_source_pixels());
+    patchy::ui::MainWindow window;
+    window.add_document_session(std::move(source), QStringLiteral("Presets"));
+    show_window(window);
+    int expected_saturation = -1;
+    bool dialog_checked = false;
+    QTimer::singleShot(0, guarded([&] {
+      auto* dialog = qobject_cast<QDialog*>(find_top_level_dialog(QStringLiteral("patchyBlackWhiteDialog")));
+      CHECK(dialog != nullptr);
+      if (dialog == nullptr) {
+        return;
+      }
+      auto* tint = dialog->findChild<QCheckBox*>(QStringLiteral("blackWhiteTintCheck"));
+      auto* swatch = dialog->findChild<QPushButton*>(QStringLiteral("blackWhiteTintColorButton"));
+      auto* hue = dialog->findChild<QSpinBox*>(QStringLiteral("blackWhiteTintHueSpin"));
+      auto* saturation = dialog->findChild<QSpinBox*>(QStringLiteral("blackWhiteTintSaturationSpin"));
+      auto* hue_slider = dialog->findChild<QWidget*>(QStringLiteral("blackWhiteTintHueSlider"));
+      CHECK(tint != nullptr && swatch != nullptr && hue != nullptr && saturation != nullptr && hue_slider != nullptr);
+      if (tint == nullptr || swatch == nullptr || hue == nullptr || saturation == nullptr || hue_slider == nullptr) {
+        dialog->reject();
+        return;
+      }
+      // Off without Tint; the sliders show the default tint color.
+      CHECK(!tint->isChecked() && !hue->isEnabled() && !saturation->isEnabled() && !hue_slider->isEnabled());
+      const auto default_tint = patchy::black_white_tint_hue_saturation(patchy::BlackWhiteAdjustment{}.tint_color);
+      CHECK(hue->value() == default_tint.hue && saturation->value() == default_tint.saturation);
+
+      tint->setChecked(true);
+      CHECK(hue->isEnabled() && saturation->isEnabled() && hue_slider->isEnabled());
+      click_black_white_preset(*dialog, QStringLiteral("black_white.glowing_foliage"));
+      const std::array<int, 6> expected{10, 190, 170, -30, -60, -40};
+      for (std::size_t index = 0; index < keys.size(); ++index) {
+        auto* spin = dialog->findChild<QSpinBox*>(QStringLiteral("blackWhite%1Spin").arg(QLatin1String(keys[index])));
+        CHECK(spin != nullptr && spin->value() == expected[index]);
+      }
+      CHECK(!tint->isChecked() && !hue->isEnabled());
+      CHECK(checked_black_white_preset(*dialog) == QStringLiteral("black_white.glowing_foliage"));
+      set_spin(*dialog, "blackWhiteRedsSpin", 11);
+      CHECK(checked_black_white_preset(*dialog).isEmpty());  // Custom
+      set_spin(*dialog, "blackWhiteRedsSpin", 10);
+      CHECK(checked_black_white_preset(*dialog) == QStringLiteral("black_white.glowing_foliage"));
+
+      click_black_white_preset(*dialog, QStringLiteral("black_white.tinted.sepia"));
+      const auto sepia = patchy::black_white_tint_hue_saturation(patchy::RgbColor{162, 128, 86});
+      CHECK(tint->isChecked() && hue->isEnabled() && saturation->isEnabled());
+      CHECK(hue->value() == sepia.hue && saturation->value() == sepia.saturation);
+      CHECK(checked_black_white_preset(*dialog) == QStringLiteral("black_white.tinted.sepia"));
+
+      // Swatch -> sliders.
+      QTimer::singleShot(0, guarded([] {
+        auto* picker_dialog = find_top_level_dialog(QStringLiteral("patchyColorDialog"));
+        CHECK(picker_dialog != nullptr);
+        if (picker_dialog == nullptr) {
+          return;
+        }
+        CHECK(patchy::ui::apply_color_to_open_color_picker(QColor(40, 90, 220)));
+        picker_dialog->accept();
+      }));
+      swatch->click();
+      QApplication::processEvents();
+      const auto picked = patchy::black_white_tint_hue_saturation(patchy::RgbColor{40, 90, 220});
+      CHECK(hue->value() == picked.hue && saturation->value() == picked.saturation);
+      CHECK(checked_black_white_preset(*dialog).isEmpty());  // a changed tint is Custom
+
+      // Sliders -> color.
+      hue->setValue(200);
+      QApplication::processEvents();
+      expected_saturation = saturation->value();
+      dialog_checked = true;
+      dialog->accept();
+    }));
+    require_action(window, "layerNewBlackWhiteAdjustmentAction")->trigger();
+    QApplication::processEvents();
+    CHECK(dialog_checked);
+    const auto& document = std::as_const(patchy::ui::MainWindowTestAccess::document(window));
+    const auto* layer = document.active_layer_id().has_value() ? document.find_layer(*document.active_layer_id())
+                                                               : nullptr;
+    CHECK(layer != nullptr);
+    if (layer != nullptr) {
+      const auto settings = patchy::adjustment_settings_from_layer(*layer);
+      CHECK(settings.has_value() && settings->black_white.tint);
+      CHECK(settings.has_value() &&
+            (settings->black_white.tint_color == patchy::black_white_tint_color(200, expected_saturation)));
+      CHECK(settings.has_value() && settings->black_white.reds == 40 && settings->black_white.magentas == 80);
+    }
+  }
+
+  check_direct_adjustment_matches_layer({"imageAdjustBlackWhiteAction", "layerNewBlackWhiteAdjustmentAction",
+                                         "patchyBlackWhiteDialog", [](QDialog& dialog) {
+                                           click_black_white_preset(dialog, QStringLiteral("black_white.tinted.cyanotype"));
+                                         }});
+}
+
+// Every Black & White preset name is readable in full (#528 follow-up): on a portrait and a
+// landscape image, and in German, each tile holds its whole name on at most two lines and the
+// tiles keep one size whatever the image's aspect; the strip scrolls for the rest.
+namespace {
+
+void check_black_white_preset_labels_fit(QDialog& dialog, const char* context) {
+  const auto tiles = black_white_preset_tiles(dialog);
+  CHECK(tiles.size() == 22);
+  auto* strip = dialog.findChild<QScrollArea*>(QStringLiteral("blackWhitePresetStrip"));
+  CHECK(strip != nullptr && strip->verticalScrollBar()->maximum() > 0);
+  QSize first_size;
+  for (auto* tile : tiles) {
+    const QFontMetrics metrics(tile->font());
+    const auto rect = tile->rect();
+    const auto text = tile->text();
+    const auto width = rect.width() - 8;
+    const auto box = metrics.boundingRect(QRect(0, 0, width, 100000), Qt::AlignHCenter | Qt::TextWordWrap, text);
+    const bool fits = box.width() <= width && box.height() <= 2 * metrics.lineSpacing() &&
+                      rect.height() >= 48 + 2 * metrics.lineSpacing();
+    if (!fits) {
+      std::cerr << context << ": preset \"" << text.toStdString() << "\" needs " << box.width() << "x"
+                << box.height() << " in a " << rect.width() << "x" << rect.height() << " tile\n";
+    }
+    CHECK(fits);
+    if (first_size.isEmpty()) {
+      first_size = rect.size();
+    }
+    CHECK(rect.size() == first_size);
+  }
+  // The strip shows whole tiles across: five columns plus the scroll bar.
+  if (strip != nullptr && !tiles.empty()) {
+    CHECK(strip->viewport()->width() >= 5 * tiles.front()->width());
+  }
+}
+
+// Runs `check` on the Black & White dialog Image > Adjustments opens for `pixels`.
+void with_black_white_dialog(const patchy::PixelBuffer& pixels, const std::function<void(QDialog&)>& check) {
+  patchy::Document source(pixels.width(), pixels.height(), patchy::PixelFormat::rgba8());
+  source.add_pixel_layer("Photo", pixels);
+  patchy::ui::MainWindow window;
+  window.add_document_session(std::move(source), QStringLiteral("Aspect"));
+  show_window(window);
+  bool dialog_checked = false;
+  QTimer::singleShot(0, guarded([&] {
+    auto* dialog = qobject_cast<QDialog*>(find_top_level_dialog(QStringLiteral("patchyBlackWhiteDialog")));
+    CHECK(dialog != nullptr);
+    if (dialog == nullptr) {
+      return;
+    }
+    process_events_for(120);
+    check(*dialog);
+    dialog_checked = true;
+    dialog->reject();
+  }));
+  require_action(window, "imageAdjustBlackWhiteAction")->trigger();
+  QApplication::processEvents();
+  CHECK(dialog_checked);
+}
+
+// A crop of the committed street photo, as RGBA.
+patchy::PixelBuffer black_white_photo_crop(QRect crop) {
+  QImage photo(patchy::ui::to_qstring(
+      patchy::test::committed_format_fixture_path("readme", "havana_vintage_car_cc0.jpg")));
+  CHECK(!photo.isNull());
+  photo = photo.copy(crop).scaled(crop.size() / 4, Qt::IgnoreAspectRatio, Qt::SmoothTransformation)
+              .convertToFormat(QImage::Format_RGBA8888);
+  patchy::PixelBuffer pixels(photo.width(), photo.height(), patchy::PixelFormat::rgba8());
+  for (int y = 0; y < photo.height(); ++y) {
+    std::memcpy(pixels.pixel(0, y), photo.constScanLine(y), static_cast<std::size_t>(photo.width()) * 4U);
+  }
+  return pixels;
+}
+
+}  // namespace
+
+void ui_black_white_preset_labels_fit_any_aspect_and_language() {
+  const auto portrait = black_white_photo_crop(QRect(1100, 100, 900, 1800));
+  const auto landscape = black_white_photo_crop(QRect(0, 200, 3000, 1500));
+  with_black_white_dialog(portrait, [](QDialog& dialog) {
+    save_widget_artifact("ui_black_white_dialog_portrait_dark", dialog);
+    check_black_white_preset_labels_fit(dialog, "portrait");
+  });
+  with_black_white_dialog(landscape, [](QDialog& dialog) {
+    save_widget_artifact("ui_black_white_dialog_landscape_dark", dialog);
+    check_black_white_preset_labels_fit(dialog, "landscape");
+    // Scrolled to the Tinted section with Sepia picked.
+    auto* strip = dialog.findChild<QScrollArea*>(QStringLiteral("blackWhitePresetStrip"));
+    auto* header = dialog.findChild<QLabel*>(QStringLiteral("blackWhitePresetTintedHeader"));
+    CHECK(strip != nullptr && header != nullptr);
+    if (strip != nullptr && header != nullptr) {
+      click_black_white_preset(dialog, QStringLiteral("black_white.tinted.sepia"));
+      strip->verticalScrollBar()->setValue(header->y());
+      process_events_for(120);
+      save_widget_artifact("ui_black_white_dialog_tinted_dark", dialog);
+      CHECK(strip->verticalScrollBar()->value() > 0);
+    }
+  });
+  // Very tall and very wide synthetic images.
+  with_black_white_dialog(solid_pixels(8, 200, patchy::PixelFormat::rgba8(), QColor(200, 80, 40)),
+                          [](QDialog& dialog) { check_black_white_preset_labels_fit(dialog, "tall"); });
+  with_black_white_dialog(solid_pixels(300, 6, patchy::PixelFormat::rgba8(), QColor(40, 120, 200)),
+                          [](QDialog& dialog) { check_black_white_preset_labels_fit(dialog, "wide"); });
+  {
+    LanguageRestorer restore_language;
+    CHECK(patchy::ui::LocalizationManager::instance().set_language(QStringLiteral("de"), false));
+    QApplication::processEvents();
+    with_black_white_dialog(portrait, [](QDialog& dialog) {
+      save_widget_artifact("ui_black_white_dialog_portrait_de", dialog);
+      check_black_white_preset_labels_fit(dialog, "German portrait");
+    });
+  }
+}
+
+void ui_image_adjustments_vibrance_matches_adjustment_layer() {
+  check_direct_adjustment_matches_layer({"imageAdjustVibranceAction", "layerNewVibranceAdjustmentAction",
+                                         "patchyVibranceDialog", [](QDialog& dialog) {
+                                           set_spin(dialog, "vibranceAmountSpin", 60);
+                                           set_spin(dialog, "vibranceSaturationSpin", -20);
+                                         }});
+}
+
+void ui_image_adjustments_exposure_matches_adjustment_layer() {
+  check_direct_adjustment_matches_layer({"imageAdjustExposureAction", "layerNewExposureAdjustmentAction",
+                                         "patchyExposureDialog", [](QDialog& dialog) {
+                                           set_double_spin(dialog, "exposureValueSpin", 0.7);
+                                           set_double_spin(dialog, "exposureGammaSpin", 1.2);
+                                         }});
+}
+
+void ui_image_adjustments_channel_mixer_matches_adjustment_layer() {
+  check_direct_adjustment_matches_layer({"imageAdjustChannelMixerAction", "layerNewChannelMixerAdjustmentAction",
+                                         "patchyChannelMixerDialog", [](QDialog& dialog) {
+                                           set_spin(dialog, "channelMixerRedSpin", 60);
+                                           set_spin(dialog, "channelMixerGreenSpin", 40);
+                                           set_spin(dialog, "channelMixerConstantSpin", 10);
+                                         }});
+}
+
+void ui_image_adjustments_photo_filter_matches_adjustment_layer() {
+  check_direct_adjustment_matches_layer({"imageAdjustPhotoFilterAction", "layerNewPhotoFilterAdjustmentAction",
+                                         "patchyPhotoFilterDialog", [](QDialog& dialog) {
+                                           set_spin(dialog, "photoFilterDensitySpin", 63);
+                                         }});
+}
+
+void ui_image_adjustments_gradient_map_matches_adjustment_layer() {
+  // The dialog's default black-to-white map already changes every colored pixel.
+  check_direct_adjustment_matches_layer({"imageAdjustGradientMapAction", "layerNewGradientMapAdjustmentAction",
+                                         "patchyGradientMapDialog", {}});
+}
+
+void ui_image_adjustments_selective_color_matches_adjustment_layer() {
+  check_direct_adjustment_matches_layer({"imageAdjustSelectiveColorAction",
+                                         "layerNewSelectiveColorAdjustmentAction", "patchySelectiveColorDialog",
+                                         [](QDialog& dialog) {
+                                           set_spin(dialog, "selectiveColorCyanSpin", 30);
+                                           auto* colors =
+                                               dialog.findChild<QComboBox*>(QStringLiteral("selectiveColorRangeCombo"));
+                                           CHECK(colors != nullptr);
+                                           if (colors != nullptr) {
+                                             colors->setCurrentIndex(7);  // Neutrals
+                                           }
+                                           set_spin(dialog, "selectiveColorBlackSpin", 20);
+                                         }});
+}
+
+void ui_image_adjustments_color_lookup_matches_adjustment_layer() {
+  const auto dir = patchy::test::unicode_artifact_dir(u8"direct-color-lookup");
+  const auto file = dir / std::filesystem::path(u8"direct-look.cube");
+  {
+    std::ofstream out(file, std::ios::binary);
+    out << "LUT_3D_SIZE 2\n0 0 0\n1 0 0\n0 1 0\n1 1 0\n0 0 1\n1 0 1\n0 1 1\n0.5 0.25 0.1\n";
+  }
+  const auto dir_name = patchy::ui::to_qstring(dir);
+  const auto file_name = patchy::ui::to_qstring(file.filename());
+  check_direct_adjustment_matches_layer(
+      {"imageAdjustColorLookupAction", "layerNewColorLookupAdjustmentAction", "patchyColorLookupDialog",
+       [dir_name, file_name](QDialog& dialog) {
+         auto* load = dialog.findChild<QPushButton*>(QStringLiteral("colorLookupLoadButton"));
+         CHECK(load != nullptr);
+         if (load == nullptr) {
+           return;
+         }
+         QTimer::singleShot(0, guarded([dir_name, file_name] {
+           auto* picker = qobject_cast<QFileDialog*>(find_top_level_dialog(QStringLiteral("colorLookupFileDialog")));
+           CHECK(picker != nullptr);
+           if (picker == nullptr) {
+             return;
+           }
+           picker->setDirectory(dir_name);
+           if (auto* edit = picker->findChild<QLineEdit*>(QStringLiteral("fileNameEdit")); edit != nullptr) {
+             edit->setText(file_name);
+           }
+           QApplication::processEvents();
+           static_cast<QDialog*>(picker)->accept();
+         }));
+         load->click();
+       }});
+  patchy::test::remove_test_scratch_tree(dir);
+}
+
+std::vector<patchy::test::TestCase> image_adjustments_curves_tests() {
+  return {
+      {"ui_image_adjustments_menu_applies_active_layer_filters",
+       ui_image_adjustments_menu_applies_active_layer_filters},
+      {"ui_image_adjustments_auto_trio_distinguishes_casts",
+       ui_image_adjustments_auto_trio_distinguishes_casts},
+      {"ui_auto_adjustments_apply_without_dialog", ui_auto_adjustments_apply_without_dialog},
+      {"ui_auto_all_applies_three_autos_as_one_undo_step",
+       ui_auto_all_applies_three_autos_as_one_undo_step},
+      {"ui_image_adjustments_respect_active_selection", ui_image_adjustments_respect_active_selection},
+      {"ui_direct_pixel_previews_preserve_floating_layer_bounds",
+       ui_direct_pixel_previews_preserve_floating_layer_bounds},
+      {"ui_levels_dialog_adjusts_selected_color_channel_on_transparent_layer",
+       ui_levels_dialog_adjusts_selected_color_channel_on_transparent_layer},
+      {"ui_levels_dialog_preserves_independent_channel_records",
+       ui_levels_dialog_preserves_independent_channel_records},
+      {"ui_levels_dialog_channel_tabs_tint_the_histogram", ui_levels_dialog_channel_tabs_tint_the_histogram},
+      {"ui_levels_histogram_clipped_linear_heights_and_auto_shared_sampler",
+       ui_levels_histogram_clipped_linear_heights_and_auto_shared_sampler},
+      {"ui_levels_alt_drag_input_handles_report_clipping", ui_levels_alt_drag_input_handles_report_clipping},
+      {"ui_levels_alt_drag_shows_canvas_clipping_view", ui_levels_alt_drag_shows_canvas_clipping_view},
+      {"ui_curves_clipping_preview_bands_match_reference", ui_curves_clipping_preview_bands_match_reference},
+      {"ui_levels_and_curves_preview_off_drags_send_no_preview",
+       ui_levels_and_curves_preview_off_drags_send_no_preview},
+      {"ui_levels_large_image_alt_drag_follows_handle_and_preview_off_stays_idle",
+       ui_levels_large_image_alt_drag_follows_handle_and_preview_off_stays_idle},
+      {"ui_histogram_display_ceiling_is_four_times_the_mean_non_empty_bin",
+       ui_histogram_display_ceiling_is_four_times_the_mean_non_empty_bin},
+      {"ui_hue_saturation_dialog_adjusts_selected_pixels", ui_hue_saturation_dialog_adjusts_selected_pixels},
+      {"ui_hue_saturation_range_edits_preview_and_apply_to_pixels",
+       ui_hue_saturation_range_edits_preview_and_apply_to_pixels},
+      {"ui_hue_saturation_creates_masked_adjustment_layer", ui_hue_saturation_creates_masked_adjustment_layer},
+      {"ui_adjustment_layer_inserts_above_selection_with_white_mask",
+       ui_adjustment_layer_inserts_above_selection_with_white_mask},
+      {"ui_adjustment_layer_preview_uses_topmost_selection_and_cancels_cleanly",
+       ui_adjustment_layer_preview_uses_topmost_selection_and_cancels_cleanly},
+      {"ui_hue_saturation_colorize_toggle_switches_ranges_and_creates_layer",
+       ui_hue_saturation_colorize_toggle_switches_ranges_and_creates_layer},
+      {"ui_layer_clipping_menu_toggles_renders_and_undoes", ui_layer_clipping_menu_toggles_renders_and_undoes},
+      {"ui_layer_clipping_action_enablement", ui_layer_clipping_action_enablement},
+      {"ui_generic_bg_clip_toggle_repaints_if_available", ui_generic_bg_clip_toggle_repaints_if_available},
+      {"ui_view_layer_mask_menu_action_shows_and_selects_mask",
+       ui_view_layer_mask_menu_action_shows_and_selects_mask},
+      {"ui_alt_click_layer_boundary_toggles_clipping", ui_alt_click_layer_boundary_toggles_clipping},
+      {"ui_adjustment_layer_thumbnails_show_type_symbols",
+       ui_adjustment_layer_thumbnails_show_type_symbols},
+      {"ui_invert_adjustment_layer_creates_without_dialog_and_reports_no_edit_settings",
+       ui_invert_adjustment_layer_creates_without_dialog_and_reports_no_edit_settings},
+      {"ui_posterize_and_threshold_adjustment_layers_create_and_edit",
+       ui_posterize_and_threshold_adjustment_layers_create_and_edit},
+      {"ui_exposure_adjustment_layer_creates_and_edits", ui_exposure_adjustment_layer_creates_and_edits},
+      {"ui_brightness_contrast_adjustment_layer_creates_and_edits",
+       ui_brightness_contrast_adjustment_layer_creates_and_edits},
+      {"ui_levels_dialog_remaps_selected_tonal_range", ui_levels_dialog_remaps_selected_tonal_range},
+      {"ui_curves_dialog_remaps_midtones_in_selection", ui_curves_dialog_remaps_midtones_in_selection},
+      {"ui_curves_editor_points_channels_keyboard_auto_and_reset",
+       ui_curves_editor_points_channels_keyboard_auto_and_reset},
+      {"ui_curves_transient_canvas_read_is_non_mutating",
+       ui_curves_transient_canvas_read_is_non_mutating},
+      {"ui_curves_histograms_box_average_fills_missing_codes",
+       ui_curves_histograms_box_average_fills_missing_codes},
+      {"ui_curves_histogram_display_is_linear_and_clips", ui_curves_histogram_display_is_linear_and_clips},
+      {"ui_curves_canvas_tool_buttons_show_checked_state",
+       ui_curves_canvas_tool_buttons_show_checked_state},
+      {"ui_curves_canvas_tools_before_and_clipping_hooks",
+       ui_curves_canvas_tools_before_and_clipping_hooks},
+      {"ui_curves_canvas_sampler_reads_below_preview_and_escape_closes",
+       ui_curves_canvas_sampler_reads_below_preview_and_escape_closes},
+      {"ui_levels_point_pickers_show_eyedropper_and_hide_brush_outline",
+       ui_levels_point_pickers_show_eyedropper_and_hide_brush_outline},
+      {"ui_curves_point_pickers_show_eyedropper_and_hide_brush_outline",
+       ui_curves_point_pickers_show_eyedropper_and_hide_brush_outline},
+      {"ui_curves_preset_thumbnails_apply_all_channels_and_track_custom",
+       ui_curves_preset_thumbnails_apply_all_channels_and_track_custom},
+      {"ui_curves_destructive_and_adjustment_luts_match",
+       ui_curves_destructive_and_adjustment_luts_match},
+      {"ui_levels_destructive_transfer_is_lround_on_double",
+       ui_levels_destructive_transfer_is_lround_on_double},
+      {"ui_levels_parallel_path_matches_sequential", ui_levels_parallel_path_matches_sequential},
+      {"ui_hue_saturation_parallel_path_matches_sequential",
+       ui_hue_saturation_parallel_path_matches_sequential},
+      {"ui_curves_acv_load_save_updates_editor_and_preview",
+       ui_curves_acv_load_save_updates_editor_and_preview},
+      {"ui_curves_dialog_preview_toggle_and_cancel_restore_pixels",
+       ui_curves_dialog_preview_toggle_and_cancel_restore_pixels},
+      {"ui_curves_destructive_apply_cancel_restores_exact_layer",
+       ui_curves_destructive_apply_cancel_restores_exact_layer},
+      {"ui_curves_adjustment_layer_preserves_rich_channels_and_undoes_one_edit",
+       ui_curves_adjustment_layer_preserves_rich_channels_and_undoes_one_edit},
+      {"ui_curves_legacy_metadata_cancel_and_undo_restore_exact_map",
+       ui_curves_legacy_metadata_cancel_and_undo_restore_exact_map},
+      {"ui_curves_clipped_adjustment_reedit_disables_auto",
+       ui_curves_clipped_adjustment_reedit_disables_auto},
+      {"ui_color_balance_dialog_adjusts_selected_pixels", ui_color_balance_dialog_adjusts_selected_pixels},
+      {"ui_image_adjustments_black_white_matches_adjustment_layer", ui_image_adjustments_black_white_matches_adjustment_layer},
+      {"ui_black_white_dialog_presets_and_measurement", ui_black_white_dialog_presets_and_measurement},
+      {"ui_black_white_preset_labels_fit_any_aspect_and_language", ui_black_white_preset_labels_fit_any_aspect_and_language},
+      {"ui_image_adjustments_vibrance_matches_adjustment_layer", ui_image_adjustments_vibrance_matches_adjustment_layer},
+      {"ui_image_adjustments_exposure_matches_adjustment_layer", ui_image_adjustments_exposure_matches_adjustment_layer},
+      {"ui_image_adjustments_channel_mixer_matches_adjustment_layer", ui_image_adjustments_channel_mixer_matches_adjustment_layer},
+      {"ui_image_adjustments_photo_filter_matches_adjustment_layer", ui_image_adjustments_photo_filter_matches_adjustment_layer},
+      {"ui_image_adjustments_gradient_map_matches_adjustment_layer", ui_image_adjustments_gradient_map_matches_adjustment_layer},
+      {"ui_image_adjustments_selective_color_matches_adjustment_layer", ui_image_adjustments_selective_color_matches_adjustment_layer},
+      {"ui_image_adjustments_color_lookup_matches_adjustment_layer", ui_image_adjustments_color_lookup_matches_adjustment_layer},
+      {"ui_color_balance_dialog_tone_selector_edits_each_range", ui_color_balance_dialog_tone_selector_edits_each_range},
+      {"ui_channel_mixer_dialog_edits_each_output_row", ui_channel_mixer_dialog_edits_each_output_row},
+      {"ui_photo_filter_dialog_picks_color_and_density", ui_photo_filter_dialog_picks_color_and_density},
+      {"ui_gradient_map_dialog_edits_gradient", ui_gradient_map_dialog_edits_gradient},
+      {"ui_black_white_dialog_edits_weights_and_tint", ui_black_white_dialog_edits_weights_and_tint},
+      {"ui_color_lookup_dialog_loads_a_lut_from_a_unicode_path", ui_color_lookup_dialog_loads_a_lut_from_a_unicode_path},
+      {"ui_selective_color_dialog_edits_each_range", ui_selective_color_dialog_edits_each_range},
+      {"ui_vibrance_dialog_sets_both_sliders", ui_vibrance_dialog_sets_both_sliders},
+      {"ui_adjustment_placeholders_name_their_kind_in_layers_panel",
+       ui_adjustment_placeholders_name_their_kind_in_layers_panel},
+      {"ui_af_colour_balance_matches_affinity_render_if_available",
+       ui_af_colour_balance_matches_affinity_render_if_available},
+      {"ui_levels_exception_restores_preview_pixels_and_unlocks_edits", ui_levels_exception_restores_preview_pixels_and_unlocks_edits},
+  };
+}

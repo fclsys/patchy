@@ -1,0 +1,2755 @@
+// Text along a path (docs/path-text.md): glyph placement against Photoshop 2026 captures, the
+// scripting API, the Type tool's targeting of paths and shape edges, and the on-canvas marks
+// that move the range and flip the text.
+#include "ui/canvas_widget.hpp"
+#include "ui/main_window.hpp"
+#include "ui/main_window_shared.hpp"
+#include "ui/edit_conversions.hpp"
+#include "ui/qt_paths.hpp"
+#include "ui/script_engine.hpp"
+#include "ui/text_document.hpp"
+#include "ui/text_path_layout.hpp"
+#include "ui/text_render.hpp"
+#include "ui/theme_script_host.hpp"
+#include "ui/tool_cursors.hpp"
+#include "core/document_path.hpp"
+#include "core/layer_metadata.hpp"
+#include "core/text_area.hpp"
+#include "core/text_path.hpp"
+#include "psd/psd_document_io.hpp"
+#include "local_psd_fixtures.hpp"
+#include "test_harness.hpp"
+#include "ui_test_access.hpp"
+#include "ui_test_support.hpp"
+
+#include <QAction>
+#include <QApplication>
+#include <QComboBox>
+#include <QDialog>
+#include <QDir>
+#include <QElapsedTimer>
+#include <QEventLoop>
+#include <QFontDatabase>
+#include <QImage>
+#include <QJsonArray>
+#include <QJsonDocument>
+#include <QJsonObject>
+#include <QListWidget>
+#include <QMenu>
+#include <QPainter>
+#include <QPointer>
+#include <QPushButton>
+#include <QStandardItemModel>
+#include <QTest>
+#include <QTextCursor>
+#include <QTextEdit>
+#include <QTimer>
+#include <QWidget>
+
+#include <algorithm>
+#include <cmath>
+#include <cstdio>
+#include <filesystem>
+#include <optional>
+#include <string>
+#include <string_view>
+#include <utility>
+#include <vector>
+
+namespace {
+using namespace patchy;
+using namespace patchy::ui;
+using namespace patchy::test::ui;
+
+PathAnchor knot(double x, double y, double in_x, double in_y, double out_x, double out_y) {
+  return PathAnchor{x, y, in_x, in_y, out_x, out_y, false};
+}
+
+VectorPath contour(std::vector<PathAnchor> anchors, bool closed) {
+  VectorPath path;
+  auto& sub = path.subpaths.emplace_back();
+  sub.anchors = std::move(anchors);
+  sub.closed = closed;
+  sub.op = PathCombineOp::Xor;
+  return path;
+}
+
+// The capture matrix's arc, in text-local coordinates (the captures put the origin at 80, 60).
+VectorPath arc_path() {
+  return contour({knot(0, 300, 0, 300, 120, 0), knot(500, 300, 380, 0, 500, 300)}, false);
+}
+
+QJsonValue run(MainWindow& window, const QString& code) {
+  auto& host = window.script_engine_host();
+  ScriptEngineHost::RunOptions options;
+  options.name = "path-text-test";
+  options.unattended = true;
+  const bool started = host.run_source(
+      QStringLiteral("function check(v,m){if(!v)throw Error(m||'check failed');}"
+                     "function reject(f){var bad=false;try{f();}catch(e){bad=true;}check(bad,'expected refusal');}\n") +
+          code,
+      options);
+  if (!started) {
+    for (const auto& message : host.message_backlog()) std::fprintf(stderr, "%s\n", message.toUtf8().constData());
+  }
+  CHECK(started);
+  QElapsedTimer timer;
+  timer.start();
+  while (host.run_active() && timer.elapsed() < 30000) QApplication::processEvents(QEventLoop::AllEvents, 10);
+  CHECK(!host.run_active());
+  if (host.last_run_had_error()) {
+    for (const auto& message : host.message_backlog()) std::fprintf(stderr, "%s\n", message.toUtf8().constData());
+  }
+  CHECK(!host.last_run_had_error());
+  return host.last_result();
+}
+
+// Ink (0 white to 255 black) of an image on white.
+int ink_at(const QImage& image, int x, int y) {
+  return 255 - qGray(image.pixel(x, y));
+}
+
+struct Blob {
+  double x{0.0};
+  double y{0.0};
+  double weight{0.0};
+};
+
+// Ink-weighted centroids of the connected marks of an image, sorted left to right then down.
+std::vector<Blob> ink_blobs(const QImage& image) {
+  constexpr int kThreshold = 40;
+  std::vector<int> labels(static_cast<std::size_t>(image.width()) * image.height(), 0);
+  std::vector<Blob> blobs;
+  std::vector<QPoint> stack;
+  for (int y = 0; y < image.height(); ++y) {
+    for (int x = 0; x < image.width(); ++x) {
+      const auto index = static_cast<std::size_t>(y) * image.width() + x;
+      if (labels[index] != 0 || ink_at(image, x, y) <= kThreshold) continue;
+      Blob blob;
+      double sum_x = 0.0;
+      double sum_y = 0.0;
+      stack.push_back(QPoint(x, y));
+      labels[index] = 1;
+      while (!stack.empty()) {
+        const auto point = stack.back();
+        stack.pop_back();
+        const double weight = ink_at(image, point.x(), point.y());
+        blob.weight += weight;
+        sum_x += weight * (point.x() + 0.5);
+        sum_y += weight * (point.y() + 0.5);
+        for (int dy = -1; dy <= 1; ++dy) {
+          for (int dx = -1; dx <= 1; ++dx) {
+            const int nx = point.x() + dx;
+            const int ny = point.y() + dy;
+            if (nx < 0 || ny < 0 || nx >= image.width() || ny >= image.height()) continue;
+            const auto next = static_cast<std::size_t>(ny) * image.width() + nx;
+            if (labels[next] != 0 || ink_at(image, nx, ny) <= kThreshold) continue;
+            labels[next] = 1;
+            stack.push_back(QPoint(nx, ny));
+          }
+        }
+      }
+      if (blob.weight < 255.0 * 20.0) continue;  // specks
+      blob.x = sum_x / blob.weight;
+      blob.y = sum_y / blob.weight;
+      blobs.push_back(blob);
+    }
+  }
+  std::sort(blobs.begin(), blobs.end(), [](const Blob& a, const Blob& b) { return a.x < b.x || (a.x == b.x && a.y < b.y); });
+  return blobs;
+}
+
+QRect ink_bounds(const QImage& image) {
+  QRect bounds;
+  for (int y = 0; y < image.height(); ++y) {
+    for (int x = 0; x < image.width(); ++x) {
+      if (ink_at(image, x, y) > 96) bounds = bounds.isNull() ? QRect(x, y, 1, 1) : bounds.united(QRect(x, y, 1, 1));
+    }
+  }
+  return bounds;
+}
+
+// How much of each image's ink lies within a pixel of the other's: 1 for the same marks.
+double ink_agreement(const QImage& a, const QImage& b) {
+  const auto near_ink = [](const QImage& image, int x, int y) {
+    for (int dy = -1; dy <= 1; ++dy) {
+      for (int dx = -1; dx <= 1; ++dx) {
+        const int nx = x + dx;
+        const int ny = y + dy;
+        if (nx >= 0 && ny >= 0 && nx < image.width() && ny < image.height() && ink_at(image, nx, ny) > 64) return true;
+      }
+    }
+    return false;
+  };
+  double total = 0.0;
+  double matched = 0.0;
+  for (int y = 0; y < a.height() && y < b.height(); ++y) {
+    for (int x = 0; x < a.width() && x < b.width(); ++x) {
+      if (ink_at(a, x, y) > 128) {
+        total += 1.0;
+        if (near_ink(b, x, y)) matched += 1.0;
+      }
+      if (ink_at(b, x, y) > 128) {
+        total += 1.0;
+        if (near_ink(a, x, y)) matched += 1.0;
+      }
+    }
+  }
+  return total > 0.0 ? matched / total : 0.0;
+}
+
+QImage photoshop_render(std::string_view name) {
+  const auto path = test::committed_psd_fixture_path(std::string(name) + ".png");
+  QImage image(to_qstring(path));
+  return image.convertToFormat(QImage::Format_RGB32);
+}
+
+// A text layer's pixels over white at the capture's canvas size.
+QImage layer_on_white(const Layer& layer, QSize size) {
+  QImage canvas(size, QImage::Format_RGB32);
+  canvas.fill(Qt::white);
+  QPainter painter(&canvas);
+  painter.drawImage(QPoint(layer.bounds().x, layer.bounds().y), qimage_from_pixel_buffer(layer.pixels()));
+  return canvas;
+}
+
+QImage render_on_white(const TextToolSettings& settings, const QString& paragraph_runs) {
+  const auto rendered = render_text_pixels_with_local_rect(settings, QColor(Qt::black), 660, paragraph_runs, QString(),
+                                                           std::nullopt, 1.0, QTransform::fromTranslate(80.0, 60.0));
+  QImage canvas(660, 520, QImage::Format_RGB32);
+  canvas.fill(Qt::white);
+  QPainter painter(&canvas);
+  painter.drawImage(rendered.local_rect.topLeft(), qimage_from_pixel_buffer(rendered.pixels));
+  return canvas;
+}
+
+bool arial_missing() {
+  if (QFontDatabase::hasFamily(QStringLiteral("Arial"))) return false;
+  std::printf("  [SKIP] Arial is not installed\n");
+  return true;
+}
+
+// The straight line bent onto the contour: points, glyph placements, strips and the way back.
+void ui_text_path_line_plan_maps_onto_the_contour() {
+  TextToolSettings settings;
+  settings.text = QStringLiteral("IIIII IIIII IIIII IIIII IIIII");
+  settings.family = QStringLiteral("Arial");
+  settings.size = 48;
+  settings.boxed = true;
+  settings.path = arc_path();
+  settings.path_range = {0.0, 0.5};
+  CHECK(text_settings_on_path(settings));
+  const auto built = build_text_render_document(settings, QColor(Qt::black), 660, QString(), QString(), 1.0, 1.0, 1.0);
+  const TextPathCurve curve(arc_path());
+  const auto span = text_path_span(curve, settings.path_range);
+  CHECK(std::abs(text_path_layout_width(arc_path(), settings.path_range) - span.length) < 1e-9);
+  CHECK(std::abs(built.document->textWidth() - span.length) < 1e-6);
+  const auto plan = text_path_line_plan(*built.document, arc_path(), settings.path_range);
+  CHECK(plan.valid);
+  // Photoshop hides whole words that do not fit: four of the five groups show.
+  CHECK(plan.hidden_lines);
+  CHECK(plan.line.line.textLength() >= 23 && plan.line.line.textLength() <= 24);
+  CHECK(std::abs(plan.start_distance) < 1e-9);
+  CHECK(std::abs(plan.span_length - span.length) < 1e-9);
+
+  // A straight point: x along the range, y from the baseline (down positive).
+  const auto on_line = plan.map(QPointF(100.0, 0.0));
+  const auto sample = curve.sample(100.0);
+  CHECK(std::abs(on_line.x() - sample.x) < 1e-6 && std::abs(on_line.y() - sample.y) < 1e-6);
+  const auto above = plan.map(QPointF(100.0, -20.0));
+  CHECK(std::abs(std::hypot(above.x() - sample.x, above.y() - sample.y) - 20.0) < 1e-6);
+  CHECK(curve.nearest(above.x(), above.y()).left);
+  // A glyph is placed rigidly about the middle of its advance.
+  const auto placement = plan.glyph_transform(100.0);
+  const auto centre = placement.map(QPointF(100.0, 0.0));
+  CHECK(std::abs(centre.x() - sample.x) < 1e-6 && std::abs(centre.y() - sample.y) < 1e-6);
+  const auto ahead = placement.map(QPointF(110.0, 0.0));
+  CHECK(std::abs(ahead.x() - (sample.x + 10.0 * sample.tangent_x)) < 1e-6);
+  CHECK(std::abs(ahead.y() - (sample.y + 10.0 * sample.tangent_y)) < 1e-6);
+  // And back: a point beside the line resolves to its place along it.
+  const auto back = plan.unmap(above);
+  CHECK(std::abs(back.x() - 100.0) < 0.5 && std::abs(back.y() + 20.0) < 0.1);
+  CHECK(plan.unmap(plan.map(QPointF(-50.0, 0.0))).x() == 0.0);  // clamped to the range
+  // A strip follows the line.
+  const auto strip = plan.strip(QRectF(50.0, -30.0, 100.0, 40.0));
+  CHECK(strip.size() >= 8);
+  CHECK(std::abs(strip.front().x() - plan.map(QPointF(50.0, -30.0)).x()) < 1e-6);
+
+  // Alignment works inside the range: a short centred line sits around the range's middle.
+  settings.text = QStringLiteral("III");
+  const auto centred = build_text_render_document(settings, QColor(Qt::black), 660, QStringLiteral("v1\n0\t3\tcenter"),
+                                                  QString(), 1.0, 1.0, 1.0);
+  const auto centred_plan = text_path_line_plan(*centred.document, arc_path(), settings.path_range);
+  CHECK(centred_plan.valid && !centred_plan.hidden_lines);
+  const auto natural = centred_plan.line.line.naturalTextRect();
+  CHECK(std::abs(natural.center().x() - span.length / 2.0) < 1.0);
+}
+
+// Photoshop 2026 captures of capital I rows (each a separate bar): every glyph's centroid
+// lands within a pixel of Photoshop's, for a left-aligned and a right-aligned range.
+void ui_text_path_glyphs_match_photoshop_placement_if_available() {
+  if (arial_missing()) return;
+  ensure_artifact_dir();
+  struct Case {
+    const char* fixture;
+    const char* text;
+    const char* align;
+    std::size_t bars;
+  };
+  const Case cases[] = {
+      {"photoshop-path-cal-arc-range", "IIIIIIIIIIIIIIIIIIII", "left", 20},
+      {"photoshop-path-cal-right-range", "IIIII", "right", 5},
+  };
+  for (const auto& item : cases) {
+    TextToolSettings settings;
+    settings.text = QString::fromLatin1(item.text);
+    settings.family = QStringLiteral("Arial");
+    settings.size = 48;
+    settings.boxed = true;
+    settings.photoshop_layout = true;
+    settings.path = arc_path();
+    settings.path_range = {0.3, 0.9};
+    const auto runs = QStringLiteral("v1\n0\t%1\t%2").arg(settings.text.size()).arg(QString::fromLatin1(item.align));
+    const auto ours = render_on_white(settings, runs);
+    const auto theirs = photoshop_render(item.fixture);
+    CHECK(!theirs.isNull());
+    if (theirs.isNull()) continue;
+    save_image_artifact(std::string("ui_text_path_") + item.fixture + "_patchy", ours);
+    const auto our_blobs = ink_blobs(ours);
+    const auto their_blobs = ink_blobs(theirs);
+    CHECK(their_blobs.size() == item.bars);
+    CHECK(our_blobs.size() == their_blobs.size());
+    if (our_blobs.size() != their_blobs.size()) continue;
+    double worst = 0.0;
+    for (std::size_t i = 0; i < our_blobs.size(); ++i) {
+      worst = std::max(worst, std::hypot(our_blobs[i].x - their_blobs[i].x, our_blobs[i].y - their_blobs[i].y));
+    }
+    std::printf("  %s: %zu bars, worst centroid distance %.2f px\n", item.fixture, our_blobs.size(), worst);
+    CHECK(worst <= 1.0);
+  }
+}
+
+// Photoshop's own path-text files, opened and drawn again by Patchy from the layer's text
+// (the saved raster replaced): the same ink in the same place.
+void ui_text_path_photoshop_files_redraw_where_photoshop_drew_them_if_available() {
+  if (arial_missing()) return;
+  ensure_artifact_dir();
+  struct Case {
+    const char* fixture;
+    double agreement;  // least share of ink within a pixel of the other render's
+    int bounds_slack;  // most each side of the ink bounds may differ, in pixels
+  };
+  const Case cases[] = {
+      {"photoshop-path-open-curve", 0.90, 2},   {"photoshop-path-wave-range", 0.90, 2},
+      {"photoshop-path-ellipse-range", 0.90, 2}, {"photoshop-path-center", 0.90, 2},
+      {"photoshop-path-mixed", 0.90, 2},        {"photoshop-path-baseline-shift", 0.90, 2},
+      {"photoshop-path-rotated", 0.90, 2},      {"photoshop-path-overflow", 0.90, 2},
+      // Made in Photoshop's window and saved after its flip gesture, which Photoshop 2026 neither
+      // draws nor stores (docs/path-text.md, "Flip"): plain path text, 50 px, behind a frame affine.
+      {"photoshop-path-flip-drag", 0.90, 2},
+      // Photoshop 2025 (26.9.0), which draws its flip and stores a flip key Patchy reads as the
+      // contour reversed: an open arc, the same centered, capital I bars, and an ellipse.
+      {"photoshop-path-2025-flip-arc", 0.90, 2},
+      {"photoshop-path-2025-flip-center", 0.90, 2},
+      {"photoshop-path-2025-flip-cal", 0.90, 2},
+      {"photoshop-path-2025-flip-ellipse", 0.90, 2},
+  };
+  for (const auto& item : cases) {
+    auto document = psd::DocumentIo::read_file(test::committed_psd_fixture_path(std::string(item.fixture) + ".psd"));
+    auto text = std::find_if(document.layers().begin(), document.layers().end(), [](const Layer& layer) {
+      return layer_is_text(layer);
+    });
+    CHECK(text != document.layers().end());
+    if (text == document.layers().end()) continue;
+    CHECK(text_path_for_layer(std::as_const(*text)).has_value());
+    CHECK(!text_geometry_is_protected(std::as_const(*text)));
+    const auto theirs = photoshop_render(item.fixture);
+    CHECK(!theirs.isNull());
+    if (theirs.isNull()) continue;
+    // Untouched, the layer shows Photoshop's saved raster.
+    const auto saved = layer_on_white(std::as_const(*text), theirs.size());
+    CHECK(ink_agreement(saved, theirs) > 0.99);
+    CHECK(rerender_text_layer_through_stored_transform(*text));
+    const auto ours = layer_on_white(std::as_const(*text), theirs.size());
+    CHECK(ours != saved);  // Patchy's own glyphs now, not Photoshop's raster
+    save_image_artifact(std::string("ui_text_path_") + item.fixture + "_patchy", ours);
+    const auto agreement = ink_agreement(ours, theirs);
+    const auto our_bounds = ink_bounds(ours);
+    const auto their_bounds = ink_bounds(theirs);
+    const int slack = std::max({std::abs(our_bounds.left() - their_bounds.left()),
+                                std::abs(our_bounds.top() - their_bounds.top()),
+                                std::abs(our_bounds.right() - their_bounds.right()),
+                                std::abs(our_bounds.bottom() - their_bounds.bottom())});
+    std::printf("  %s: ink agreement %.3f, ink bounds differ by at most %d px\n", item.fixture, agreement, slack);
+    CHECK(agreement >= item.agreement);
+    CHECK(slack <= item.bounds_slack);
+  }
+}
+
+// A reporter's file from an older Photoshop CC (GitHub issue 717: two texts on curves whose
+// frames carry that version's /11 and /12 keys, docs/path-text.md): local, so tests that use it
+// skip where it is missing.
+std::filesystem::path older_photoshop_cc_fixture() {
+  return test::local_psd_fixture_path("issue-717/photoshop-cc-text-on-a-path.psd");
+}
+
+bool older_photoshop_cc_fonts_missing() {
+  if (arial_missing()) return true;
+  register_test_fonts(patchy::test::TestFontRole::Verdana);
+  if (QFontDatabase::hasFamily(QStringLiteral("Verdana"))) return false;
+  std::printf("  [SKIP] Verdana is not installed\n");
+  return true;
+}
+
+// Both layers drawn again by Patchy from their text land where that Photoshop drew them (the
+// raster saved in the file).
+void ui_text_path_older_photoshop_cc_file_redraws_where_photoshop_drew_it_if_available() {
+  const auto fixture = older_photoshop_cc_fixture();
+  patchy::test::skip_unless_exists(fixture);
+  if (older_photoshop_cc_fonts_missing()) return;
+  ensure_artifact_dir();
+  auto document = psd::DocumentIo::read_file(fixture);
+  const QSize size(document.width(), document.height());
+  int checked = 0;
+  for (auto& layer : document.layers()) {
+    if (!layer_is_text(std::as_const(layer))) continue;
+    ++checked;
+    CHECK(text_path_for_layer(std::as_const(layer)).has_value());
+    CHECK(!text_geometry_is_protected(std::as_const(layer)));
+    const auto theirs = layer_on_white(std::as_const(layer), size);
+    CHECK(rerender_text_layer_through_stored_transform(layer));
+    const auto ours = layer_on_white(std::as_const(layer), size);
+    CHECK(ours != theirs);  // Patchy's own glyphs now, not Photoshop's raster
+    save_image_artifact("ui_text_path_older_cc_layer_" + std::to_string(checked) + "_photoshop", theirs);
+    save_image_artifact("ui_text_path_older_cc_layer_" + std::to_string(checked) + "_patchy", ours);
+    const auto agreement = ink_agreement(ours, theirs);
+    const auto our_bounds = ink_bounds(ours);
+    const auto their_bounds = ink_bounds(theirs);
+    const int slack = std::max({std::abs(our_bounds.left() - their_bounds.left()),
+                                std::abs(our_bounds.top() - their_bounds.top()),
+                                std::abs(our_bounds.right() - their_bounds.right()),
+                                std::abs(our_bounds.bottom() - their_bounds.bottom())});
+    std::printf("  %s: ink agreement %.3f, ink bounds differ by at most %d px\n", layer.name().c_str(), agreement,
+                slack);
+    CHECK(agreement >= 0.90);
+    CHECK(slack <= 2);
+  }
+  CHECK(checked == 2);
+}
+
+// Photoshop's own file through the app: the layer opens as path text, an edit keeps the contour
+// and the range, the text still follows the arc, and the save is a path frame again.
+void ui_text_path_photoshop_file_edits_in_place() {
+  MainWindow window;
+  show_window_empty(window);
+  window.set_cli_automation_mode(true);  // Match --run-script's missing-font substitution on Linux.
+  const auto fixture = to_qstring(test::committed_psd_fixture_path("photoshop-path-open-curve.psd"));
+  const auto quoted = QString::fromUtf8(QJsonDocument(QJsonArray{fixture}).toJson(QJsonDocument::Compact));
+  run(window, QStringLiteral(R"JS(
+    var d=app.open(%1[0]);
+    var t=d.layers.filter(function(l){return l.isText;})[0];
+    var story=t.text,path=JSON.stringify(t.textPath),range=JSON.stringify(t.textPathRange);
+    check(story==='One two three four five six seven eight nine ten.','story read');
+    check(t.textPath.subpaths[0].anchors.length===2 && t.textPath.subpaths[0].closed===false,'contour read');
+    check(Math.abs(t.textPath.subpaths[0].anchors[0].x-80)<1e-6 && Math.abs(t.textPath.subpaths[0].anchors[0].y-360)<1e-6,'in the document');
+    check(t.textPathRange.start===0 && t.textPathRange.end===1,'range read');
+    var before=t.bounds;
+    t.text=story+' More.';
+    check(t.text===story+' More.','edited');
+    check(JSON.stringify(t.textPath)===path && JSON.stringify(t.textPathRange)===range,'the edit kept the path');
+    // The longer line reaches further along the arc; it starts where it did.
+    check(Math.abs(t.bounds.x-before.x)<=6 && Math.abs(t.bounds.y-before.y)<=6,'the text did not move');
+    check(t.bounds.width>before.width+20,'the new words follow the arc');
+    t.textPathRange={start:0.5,end:1};
+    check(t.bounds.x>before.x+150,'the range moved the text');
+    patchy.setResult(t.id);
+  )JS").arg(quoted));
+  const auto id = window.script_engine_host().last_result().toString().toULongLong();
+  const auto& doc = std::as_const(MainWindowTestAccess::document(window));
+  const auto* layer = doc.find_layer(id);
+  CHECK(layer != nullptr);
+  if (layer == nullptr) return;
+  const auto reopened = psd::DocumentIo::read(psd::DocumentIo::write_layered_rgb8(doc));
+  bool kept = false;
+  for (const auto& candidate : reopened.layers()) {
+    if (!layer_is_text(candidate)) continue;
+    const auto frame = text_path_frame_for_layer(candidate);
+    kept = frame.has_value() && frame->path == *text_path_for_layer(*layer) &&
+           std::abs(frame->range.start - 0.5) < 1e-5 && frame->range.end == 1.0 &&
+           !text_geometry_is_protected(candidate);
+  }
+  CHECK(kept);
+}
+
+void ui_text_path_script_creation_range_flip_and_undo() {
+  MainWindow window;
+  show_window_empty(window);
+  window.set_cli_automation_mode(true);  // Match --run-script's missing-font substitution on Linux.
+  run(window, R"JS(
+    var d=app.newDocument(660,520);
+    var p={subpaths:[{closed:false,anchors:[{x:80,y:360,outX:200,outY:60},{x:580,y:360,inX:460,inY:60}]}]};
+    var t=d.addTextLayer('One two three four five six seven eight nine ten.',{font:'Arial',size:24,path:p});
+    t.name='Path';
+    check(t.textPath.subpaths.length===1 && t.textPath.subpaths[0].anchors.length===2,'path read back');
+    check(t.textPath.subpaths[0].closed===false,'open contour');
+    check(t.textPathRange.start===0 && t.textPathRange.end===1,'whole contour by default');
+    check(t.textArea===null,'not area text');
+    var original=JSON.stringify(t.textPath);
+    p.subpaths[0].anchors[0].x+=30;
+    check(JSON.stringify(t.textPath)===original,'the path is a snapshot');
+    reject(function(){d.addTextLayer('bad',{path:p,box:{width:100,height:100}});});
+    reject(function(){d.addTextLayer('bad',{path:p,area:{subpaths:[{anchors:[{x:0,y:0},{x:50,y:0},{x:50,y:50}]}]}});});
+    reject(function(){d.addTextLayer('bad',{path:{subpaths:[]}});});
+    reject(function(){d.addTextLayer('bad',{path:{subpaths:[p.subpaths[0],p.subpaths[0]]}});});
+    reject(function(){d.addTextLayer('bad',{path:p,pathRange:{start:0.8,end:0.2}});});
+    reject(function(){d.addTextLayer('bad',{path:p,pathRange:{start:0,end:3}});});
+    var ranged=d.addTextLayer('Ranged',{font:'Arial',size:24,path:p,pathRange:{start:0.25,end:0.75}});
+    check(Math.abs(ranged.textPathRange.start-0.25)<1e-9 && Math.abs(ranged.textPathRange.end-0.75)<1e-9,'range option');
+    ranged.remove();
+    d.activeLayer=t;
+    patchy.setResult({id:t.id,path:t.textPath,text:t.text,width:t.width,height:t.height});
+  )JS");
+  const auto original = window.script_engine_host().last_result().toObject();
+  const auto id = original["id"].toString().toULongLong();
+  const auto& doc = std::as_const(MainWindowTestAccess::document(window));
+  const auto* layer = doc.find_layer(id);
+  CHECK(layer != nullptr && text_path_for_layer(*layer).has_value());
+  if (layer == nullptr) return;
+  CHECK(!layer->pixels().empty());
+  CHECK(layer->metadata().at(kLayerMetadataTextFlow) == "box");
+  // The text follows the arc: its raster is far taller than a straight line of 24 px type.
+  CHECK(layer->bounds().height > 120);
+  const auto full_bounds = layer->bounds();
+
+  // The range moves the text along the contour, in one undoable step.
+  run(window, R"JS(
+    var t=app.activeDocument.findLayer('Path');
+    t.textPathRange={start:0.5,end:1};
+    check(Math.abs(t.textPathRange.start-0.5)<1e-9,'range set');
+    reject(function(){t.textPathRange={start:0.9,end:0.1};});
+    reject(function(){t.textPathRange={start:-1,end:0.5};});
+    patchy.setResult(t.x);
+  )JS");
+  CHECK(doc.find_layer(id)->bounds().x > full_bounds.x + 100);
+  run(window, "check(app.activeDocument.undo());patchy.setResult(app.activeDocument.findLayer('Path').textPathRange);");
+  CHECK(window.script_engine_host().last_result().toObject()["start"].toDouble() == 0.0);
+  CHECK(doc.find_layer(id)->bounds() == full_bounds);
+  run(window, "check(app.activeDocument.redo());check(app.activeDocument.undo());");
+
+  // A flip walks the contour the other way: the first anchor becomes the last, the text sits
+  // below the arc and reads from the other end.
+  run(window, R"JS(
+    var t=app.activeDocument.findLayer('Path'),before=t.textPath;
+    t.flipTextPath();
+    var after=t.textPath;
+    check(after.subpaths[0].anchors[0].x===before.subpaths[0].anchors[1].x,'contour reversed');
+    check(after.subpaths[0].anchors[0].outX===before.subpaths[0].anchors[1].inX,'handles swapped');
+    check(t.textPathRange.start===0 && t.textPathRange.end===1,'whole range stays whole');
+    patchy.setResult(t.y);
+  )JS");
+  CHECK(doc.find_layer(id)->bounds().y > full_bounds.y);
+  run(window, "check(app.activeDocument.undo());");
+  CHECK(doc.find_layer(id)->bounds() == full_bounds);
+
+  // Editing the text keeps the path; a duplicate, a copy into another document and a resize
+  // carry it; null turns the layer into a plain text box.
+  run(window, R"JS(
+    var source=app.activeDocument,t=source.findLayer('Path'),path=JSON.stringify(t.textPath);
+    t.text+=' More.';
+    check(JSON.stringify(t.textPath)===path,'an edit keeps the path');
+    var duplicate=t.duplicate();check(JSON.stringify(duplicate.textPath)===path,'duplicate');
+    duplicate.remove();
+    var target=app.newDocument(660,520),copy=t.duplicate(target);
+    check(copy.text===t.text && JSON.stringify(copy.textPath)===path,'cross-document copy');
+    var before=copy.textPath.subpaths[0].anchors;
+    target.resizeImage(330,260);
+    var after=copy.textPath.subpaths[0].anchors;
+    for(var i=0;i<before.length;i++) {
+      check(Math.abs(after[i].x-before[i].x/2)<1.01 && Math.abs(after[i].y-before[i].y/2)<1.01,'document resize');
+    }
+    copy.textPath=null;
+    check(copy.textPath===null && copy.textPathRange===null,'null clears the path');
+    check(copy.textBox!==null,'and leaves box text');
+    source.activate();source.activeLayer=t;
+  )JS");
+  CHECK(text_path_for_layer(*doc.find_layer(id)).has_value());
+
+  // PSD and PSB round trips keep the contour, the range and the story.
+  const auto saved = psd::DocumentIo::write_layered_rgb8(doc);
+  const auto reopened = psd::DocumentIo::read(saved);
+  const Layer* again = nullptr;
+  for (const auto& candidate : reopened.layers()) {
+    if (candidate.name() == "Path") again = &candidate;
+  }
+  CHECK(again != nullptr);
+  if (again != nullptr) {
+    CHECK(text_path_for_layer(*again) == text_path_for_layer(*doc.find_layer(id)));
+    CHECK(text_path_range_for_layer(*again, *text_path_for_layer(*again)) ==
+          text_path_range_for_layer(*doc.find_layer(id), *text_path_for_layer(*doc.find_layer(id))));
+    CHECK(again->metadata().at(kLayerMetadataText) == doc.find_layer(id)->metadata().at(kLayerMetadataText));
+    CHECK(!text_geometry_is_protected(*again));
+  }
+  const auto large = psd::DocumentIo::read(psd::DocumentIo::write_layered_rgb8(doc, {.large_document = true}));
+  bool found_large = false;
+  for (const auto& candidate : large.layers()) {
+    if (candidate.name() == "Path") {
+      found_large = text_path_for_layer(candidate) == text_path_for_layer(*doc.find_layer(id));
+    }
+  }
+  CHECK(found_large);
+  // The owned contour is the Direct Selection tool's path target, like an area boundary:
+  // reshaping it moves the text, and undo puts it back.
+  auto* canvas = require_canvas(window);
+  const auto* target = canvas->text_area_edit_target_path();
+  CHECK(target != nullptr);
+  if (target == nullptr) return;
+  const auto before_edit = *doc.find_layer(id);
+  auto reshaped = *target;
+  reshaped.subpaths.front().anchors.front().anchor_y += 40.0;
+  canvas->replace_path_edit_target(reshaped, {});
+  CHECK(text_path_for_layer(*doc.find_layer(id)) != text_path_for_layer(before_edit));
+  CHECK(text_path_range_for_layer(*doc.find_layer(id), *text_path_for_layer(*doc.find_layer(id))) ==
+        text_path_range_for_layer(before_edit, *text_path_for_layer(before_edit)));
+  CHECK(doc.find_layer(id)->bounds() != before_edit.bounds());
+  MainWindowTestAccess::undo(window);
+  CHECK(text_path_for_layer(*doc.find_layer(id)) == text_path_for_layer(before_edit));
+
+  // Free Transform turns the layer; the contour is text-local, so a later edit keeps it.
+  CHECK(canvas->begin_free_transform());
+  const auto state = canvas->transform_controls_state();
+  CHECK(state.has_value());
+  if (state) CHECK(canvas->set_transform_controls_state(state->reference_position, 100.0, 100.0, 20.0));
+  canvas->finish_free_transform();
+  run(window, "var t=app.activeDocument.findLayer('Path'),before=JSON.stringify(t.textPath);t.text+=' Turned.';"
+              "check(JSON.stringify(t.textPath)===before,'re-entry moved the path');");
+  const auto turned = text_area_transform(*doc.find_layer(id));
+  CHECK(std::abs(turned[1]) > 0.1);  // the rotation is in the text transform
+
+  // A file for the Photoshop acceptance check (docs/path-text.md): an open curve, a ranged
+  // two-segment wave, a closed ellipse whose range passes the seam, and a flipped arc.
+  ensure_artifact_dir();
+  run(window, R"JS(
+    var d=app.newDocument(660,520),story='One two three four five six seven eight nine ten.';
+    function knot(x,y,ix,iy,ox,oy){return {x:x+80,y:y+60,inX:ix+80,inY:iy+60,outX:ox+80,outY:oy+60};}
+    var arc={subpaths:[{closed:false,anchors:[knot(0,300,0,300,120,0),knot(500,300,380,0,500,300)]}]};
+    var wave={subpaths:[{closed:false,anchors:[knot(0,250,0,250,40,120),knot(150,150,110,150,260,150),knot(500,250,400,380,500,250)]}]};
+    var ellipse={subpaths:[{closed:true,anchors:[knot(250,0,111.9288,0,388.0712,0),knot(500,200,500,89.543,500,310.457),
+                                               knot(250,400,388.0712,400,111.9288,400),knot(0,200,0,310.457,0,89.543)]}]};
+    d.addTextLayer(story,{font:'Arial',size:24,color:'#000000',path:arc}).name='Arc';
+    d.addTextLayer(story,{font:'Arial',size:24,color:'#000000',path:wave,pathRange:{start:0.5,end:1.5}}).name='Wave';
+    d.addTextLayer(story,{font:'Arial',size:24,color:'#000000',path:ellipse,pathRange:{start:3.5,end:5.5}}).name='Ellipse';
+    var flipped=d.addTextLayer(story,{font:'Arial',size:24,color:'#000000',path:arc});
+    flipped.name='Flipped';flipped.flipTextPath();
+  )JS");
+  const auto artifact = to_filesystem_path(QDir::current().absoluteFilePath(QStringLiteral("test-artifacts/path-text-photoshop-check.psd")));
+  psd::DocumentIo::write_layered_rgb8_file(std::as_const(MainWindowTestAccess::document(window)), artifact);
+  const auto check = psd::DocumentIo::read_file(artifact);
+  int path_layers = 0;
+  for (const auto& candidate : check.layers()) {
+    if (text_path_for_layer(candidate).has_value()) ++path_layers;
+  }
+  CHECK(path_layers == 4);
+}
+
+QTextEdit* session_editor(CanvasWidget& canvas) {
+  return canvas.findChild<QTextEdit*>(QStringLiteral("inlineTextEditor"));
+}
+
+QWidget* session_overlay(CanvasWidget& canvas) {
+  return canvas.findChild<QWidget*>(QStringLiteral("transformedTextEditOverlay"));
+}
+
+// The session's overlay once its first preview has landed and its path marks are published. A
+// preview refresh can replace the overlay widget, so callers look it up again after each wait.
+QWidget* wait_for_path_overlay(CanvasWidget& canvas) {
+  QElapsedTimer timer;
+  timer.start();
+  while (timer.elapsed() < 10000) {
+    if (auto* overlay = session_overlay(canvas);
+        overlay != nullptr && overlay->isVisible() &&
+        overlay->property("patchy.transformedTextPathHandleCenters").toList().size() == 3) {
+      return overlay;
+    }
+    QApplication::processEvents(QEventLoop::AllEvents, 20);
+  }
+  return session_overlay(canvas);
+}
+
+void click_canvas(CanvasWidget& canvas, QPoint document_point) {
+  const auto click = canvas.widget_position_for_document_point(document_point);
+  send_mouse(canvas, QEvent::MouseButtonPress, click, Qt::LeftButton, Qt::LeftButton);
+  send_mouse(canvas, QEvent::MouseButtonRelease, click, Qt::LeftButton, Qt::NoButton);
+  QApplication::processEvents();
+}
+
+// A pixel of the layer's own ink, the one nearest the middle of its bounds, in the document.
+QPoint ink_point(const Layer& layer) {
+  const auto image = qimage_from_pixel_buffer(layer.pixels());
+  const QPoint middle(image.width() / 2, image.height() / 2);
+  QPoint best = middle;
+  int best_distance = -1;
+  for (int y = 0; y < image.height(); ++y) {
+    for (int x = 0; x < image.width(); ++x) {
+      if (qAlpha(image.pixel(x, y)) < 200) continue;
+      const int distance = (QPoint(x, y) - middle).manhattanLength();
+      if (best_distance < 0 || distance < best_distance) {
+        best_distance = distance;
+        best = QPoint(x, y);
+      }
+    }
+  }
+  return QPoint(layer.bounds().x, layer.bounds().y) + best;
+}
+
+// Which of the Type tool's cursors the canvas shows: the I-beam on a wavy stroke (text along a
+// line), the I-beam in a ring (text inside a shape) or the plain one (a theme's Type cursor,
+// else the system I-beam).
+enum class TypeCursor { Plain, Path, Area, Other };
+
+TypeCursor shown_type_cursor(const CanvasWidget& canvas) {
+  const auto cursor = canvas.cursor();
+  if (cursor.shape() == Qt::BitmapCursor) {
+    const auto image = cursor.pixmap().toImage();
+    if (image == text_path_cursor().pixmap().toImage()) return TypeCursor::Path;
+    if (image == text_area_cursor().pixmap().toImage()) return TypeCursor::Area;
+  }
+  const auto plain = theme_tool_cursor(CanvasTool::Text).value_or(QCursor(Qt::IBeamCursor));
+  if (cursor.shape() != plain.shape()) return TypeCursor::Other;
+  if (cursor.shape() == Qt::BitmapCursor && cursor.pixmap().toImage() != plain.pixmap().toImage()) {
+    return TypeCursor::Other;
+  }
+  return TypeCursor::Plain;
+}
+
+// The cursor that names a press's target (docs/path-text.md, "The Type tool").
+TypeCursor cursor_for(CanvasWidget::TypeToolTargetKind kind) {
+  using Kind = CanvasWidget::TypeToolTargetKind;
+  switch (kind) {
+    case Kind::NewPathText:
+    case Kind::EditPathText:
+      return TypeCursor::Path;
+    case Kind::NewAreaText:
+    case Kind::EditAreaText:
+      return TypeCursor::Area;
+    case Kind::NewText:
+    case Kind::EditText:
+      return TypeCursor::Plain;
+  }
+  return TypeCursor::Other;
+}
+
+// A hover move (no button) to a document point; the cursor the canvas then shows.
+TypeCursor hover(CanvasWidget& canvas, QPoint document_point) {
+  send_mouse(canvas, QEvent::MouseMove, canvas.widget_position_for_document_point(document_point), Qt::NoButton,
+             Qt::NoButton);
+  return shown_type_cursor(canvas);
+}
+
+// The same file through the app: a Type tool click on each text opens it on its path, typing
+// keeps the contour and the range, and the saved file opens as editable path text again.
+void ui_text_path_older_photoshop_cc_file_edits_with_the_type_tool_if_available() {
+  const auto fixture = older_photoshop_cc_fixture();
+  patchy::test::skip_unless_exists(fixture);
+  if (older_photoshop_cc_fonts_missing()) return;
+  MainWindow window;
+  show_window_empty(window);
+  window.set_cli_automation_mode(true);
+  const auto quoted =
+      QString::fromUtf8(QJsonDocument(QJsonArray{to_qstring(fixture)}).toJson(QJsonDocument::Compact));
+  run(window, QStringLiteral(R"JS(
+    var d=app.open(%1[0]);
+    var texts=d.layers.filter(function(l){return l.isText;});
+    check(texts.length===2,'two type layers');
+    patchy.setResult(texts.map(function(t){return t.id;}));
+  )JS").arg(quoted));
+  const auto ids = window.script_engine_host().last_result().toArray();
+  CHECK(ids.size() == 2);
+  if (ids.size() != 2) return;
+  auto* canvas = require_canvas(window);
+  canvas->set_zoom(1.0);
+  const auto& doc = std::as_const(MainWindowTestAccess::document(window));
+  require_action_by_text(window, QStringLiteral("Type"))->trigger();
+  int edited = 0;
+  for (const auto& value : ids) {
+    const auto id = value.toString().toULongLong();
+    const auto* layer = doc.find_layer(id);
+    CHECK(layer != nullptr);
+    if (layer == nullptr) continue;
+    const auto frame_before = text_path_frame_for_layer(*layer);
+    const auto story = QString::fromStdString(layer->metadata().at(kLayerMetadataText));
+    click_canvas(*canvas, ink_point(*layer));
+    if (edited == 0) save_widget_artifact("ui_text_path_older_cc_clicked", window);
+    CHECK(!text_geometry_is_protected(*layer));
+    auto* editor = session_editor(*canvas);
+    CHECK(editor != nullptr);
+    if (!editor) continue;
+    CHECK(editor->property("patchy.editingLayerId").toULongLong() == id);
+    CHECK(!editor->property("patchy.documentTextPath").toString().isEmpty());
+    CHECK(editor->toPlainText() == story);
+    auto* overlay = wait_for_path_overlay(*canvas);
+    CHECK(overlay != nullptr && overlay->isVisible());
+    if (!overlay) continue;
+    CHECK(overlay->property("patchy.transformedTextPathHandleCenters").toList().size() == 3);
+    // Short enough to fit the range, so no word is hidden.
+    const auto typed = edited == 0 ? QStringLiteral("Now editable") : QStringLiteral("Editable too");
+    editor->selectAll();
+    editor->insertPlainText(typed);
+    process_events_for(150);
+    CHECK(!editor->property("patchy.textHiddenLines").toBool());
+    if (edited == 0) save_widget_artifact("ui_text_path_older_cc_editing", window);
+    send_key(*editor, Qt::Key_Return, Qt::ControlModifier);
+    QApplication::processEvents();
+    CHECK(session_editor(*canvas) == nullptr);
+    layer = doc.find_layer(id);
+    CHECK(layer != nullptr);
+    if (layer == nullptr) continue;
+    CHECK(QString::fromStdString(layer->metadata().at(kLayerMetadataText)) == typed);
+    // The edit kept the contour and the range.
+    const auto frame_after = text_path_frame_for_layer(*layer);
+    CHECK(frame_before.has_value() && frame_after.has_value());
+    if (frame_before && frame_after) {
+      CHECK(frame_after->path == frame_before->path);
+      CHECK(std::abs(frame_after->range.start - frame_before->range.start) < 1e-9);
+      CHECK(std::abs(frame_after->range.end - frame_before->range.end) < 1e-9);
+    }
+    ++edited;
+  }
+  CHECK(edited == 2);
+  save_widget_artifact("ui_text_path_older_cc_edited", *canvas);
+
+  // The file holds five decimals of each coordinate.
+  const auto same_contour = [](const VectorPath& a, const VectorPath& b) {
+    if (a.subpaths.size() != 1 || b.subpaths.size() != 1) return false;
+    const auto& left = a.subpaths.front().anchors;
+    const auto& right = b.subpaths.front().anchors;
+    if (left.size() != right.size() || a.subpaths.front().closed != b.subpaths.front().closed) return false;
+    for (std::size_t i = 0; i < left.size(); ++i) {
+      const double gap = std::max({std::abs(left[i].anchor_x - right[i].anchor_x), std::abs(left[i].anchor_y - right[i].anchor_y),
+                                   std::abs(left[i].in_x - right[i].in_x), std::abs(left[i].in_y - right[i].in_y),
+                                   std::abs(left[i].out_x - right[i].out_x), std::abs(left[i].out_y - right[i].out_y)});
+      if (gap > 1e-4) return false;
+    }
+    return true;
+  };
+  const auto reopened = psd::DocumentIo::read(psd::DocumentIo::write_layered_rgb8(doc));
+  int kept = 0;
+  for (const auto& candidate : reopened.layers()) {
+    if (!layer_is_text(candidate)) continue;
+    const auto frame = text_path_frame_for_layer(candidate);
+    CHECK(frame.has_value() && !text_geometry_is_protected(candidate));
+    if (!frame) continue;
+    for (const auto& value : ids) {
+      const auto* source = doc.find_layer(value.toString().toULongLong());
+      if (source == nullptr || source->metadata().at(kLayerMetadataText) != candidate.metadata().at(kLayerMetadataText)) {
+        continue;
+      }
+      const auto source_frame = text_path_frame_for_layer(*source);
+      if (source_frame && same_contour(frame->path, source_frame->path) &&
+          std::abs(frame->range.start - source_frame->range.start) < 1e-5 &&
+          std::abs(frame->range.end - source_frame->range.end) < 1e-5) {
+        ++kept;
+      }
+    }
+  }
+  CHECK(kept == 2);
+}
+
+// The Type tool on a shape: its edge starts text along the outline, its inside fills the shape,
+// and a click on the text (or the bare contour) opens the layer again.
+void ui_text_path_type_tool_targets_shape_edges_and_reopens() {
+  MainWindow window;
+  show_window_empty(window);
+  window.set_cli_automation_mode(true);
+  run(window, R"JS(
+    var d=app.newDocument(660,520);
+    var s=d.addShape('Source',{type:'ellipse',x:130,y:90,width:400,height:320});
+    patchy.setResult(s.id);
+  )JS");
+  auto* canvas = require_canvas(window);
+  canvas->set_zoom(1.0);
+  const auto source_id = window.script_engine_host().last_result().toString().toULongLong();
+  const auto& doc = std::as_const(MainWindowTestAccess::document(window));
+  const auto source_path = doc.find_layer(source_id)->vector_shape()->path;
+  require_action_by_text(window, QStringLiteral("Type"))->trigger();
+
+  // The top of the ellipse is on its edge; the centre is inside; far outside is neither.
+  const QPoint edge(330, 90);
+  const QPoint centre(330, 250);
+  CHECK(canvas->text_path_at(QPointF(edge)).has_value());
+  CHECK(canvas->text_path_at(QPointF(edge + QPoint(0, 4))).has_value());
+  CHECK(!canvas->text_path_at(QPointF(centre)).has_value());
+  CHECK(canvas->text_area_at(centre).has_value());
+  CHECK(!canvas->text_path_at(QPointF(20, 20)).has_value());
+  const auto target = canvas->text_path_at(QPointF(edge));
+  if (!target) return;
+  CHECK(target->path.subpaths.size() == 1 && target->path.subpaths.front().closed);
+  // Once around from the click.
+  CHECK(std::abs((target->range.end - target->range.start) - text_path_segment_count(target->path)) < 1e-9);
+
+  click_canvas(*canvas, edge);
+  auto* editor = session_editor(*canvas);
+  CHECK(editor != nullptr);
+  if (!editor) return;
+  CHECK(!editor->property("patchy.documentTextPath").toString().isEmpty());
+  CHECK(editor->property("patchy.documentTextArea").toString().isEmpty());
+  auto* overlay = session_overlay(*canvas);
+  CHECK(overlay != nullptr && overlay->isVisible());
+  if (!overlay) return;
+  // No box handles; three marks on the contour.
+  for (const auto& corner : overlay->property("patchy.transformedTextResizeHandleCenters").toList()) {
+    CHECK(!corner.isValid());
+  }
+  CHECK(overlay->property("patchy.transformedTextPathHandleCenters").toList().size() == 3);
+  editor->selectAll();
+  editor->insertPlainText(QStringLiteral("Around the edge"));
+  process_events_for(150);
+  CHECK(!editor->property("patchy.textHiddenLines").toBool());
+  save_widget_artifact("ui_text_path_editing", *canvas);
+  send_key(*editor, Qt::Key_Return, Qt::ControlModifier);
+  QApplication::processEvents();
+  CHECK(session_editor(*canvas) == nullptr);
+
+  const auto id = doc.active_layer_id();
+  CHECK(id.has_value());
+  if (!id) return;
+  const auto* layer = doc.find_layer(*id);
+  CHECK(layer != nullptr && layer_is_text(*layer) && text_path_for_layer(*layer).has_value());
+  if (!layer) return;
+  CHECK(QString::fromStdString(layer->metadata().at(kLayerMetadataText)) == QStringLiteral("Around the edge"));
+  CHECK(!text_area_for_layer(*layer).has_value());
+  // The text stands on the outside of the ellipse's top, so its raster starts above the edge.
+  CHECK(layer->bounds().y < 90);
+  // The source shape is untouched: the text owns a copy.
+  CHECK(doc.find_layer(source_id)->vector_shape()->path == source_path);
+  const auto committed = *layer;
+
+  // Clicking the text opens it again; Escape leaves it as it was.
+  require_action_by_text(window, QStringLiteral("Move"))->trigger();
+  QApplication::processEvents();
+  require_action_by_text(window, QStringLiteral("Type"))->trigger();
+  const QPoint on_text(layer->bounds().x + layer->bounds().width / 2, layer->bounds().y + layer->bounds().height / 2);
+  click_canvas(*canvas, on_text);
+  editor = session_editor(*canvas);
+  CHECK(editor != nullptr);
+  if (!editor) return;
+  CHECK(editor->property("patchy.editingLayerId").toULongLong() == *id);
+  CHECK(editor->toPlainText() == QStringLiteral("Around the edge"));
+  editor->selectAll();
+  editor->insertPlainText(QStringLiteral("Cancelled edit"));
+  send_key(*editor, Qt::Key_Escape);
+  QApplication::processEvents();
+  CHECK(session_editor(*canvas) == nullptr);
+  CHECK(doc.find_layer(*id)->metadata() == committed.metadata());
+
+  // A long story overflows the range: the hidden text stays in the story and the end mark
+  // carries the overflow plus.
+  click_canvas(*canvas, on_text);
+  editor = session_editor(*canvas);
+  CHECK(editor != nullptr);
+  if (!editor) return;
+  editor->selectAll();
+  editor->insertPlainText(QStringLiteral("Round and round the outline goes. ").repeated(12));
+  process_events_for(150);
+  CHECK(editor->property("patchy.textHiddenLines").toBool());
+  send_key(*editor, Qt::Key_Return, Qt::ControlModifier);
+  QApplication::processEvents();
+  CHECK(QString::fromStdString(doc.find_layer(*id)->metadata().at(kLayerMetadataText)).size() > 300);
+  MainWindowTestAccess::undo(window);
+  CHECK(QString::fromStdString(doc.find_layer(*id)->metadata().at(kLayerMetadataText)) ==
+        QStringLiteral("Around the edge"));
+}
+
+// The Type tool on an open pen path: the click point starts the range, which runs to the end
+// of the path, and the path itself stays as it was.
+void ui_text_path_type_tool_types_along_an_open_work_path() {
+  MainWindow window;
+  show_window_empty(window);
+  window.set_cli_automation_mode(true);
+  run(window, R"JS(
+    var d=app.newDocument(660,520);
+    d.setWorkPath({subpaths:[{closed:false,anchors:[{x:80,y:360,outX:200,outY:60},{x:580,y:360,inX:460,inY:60}]}]});
+    patchy.setResult(JSON.stringify(d.workPath.getPath()));
+  )JS");
+  const auto work_before = window.script_engine_host().last_result().toString();
+  auto* canvas = require_canvas(window);
+  canvas->set_zoom(1.0);
+  const auto& doc = std::as_const(MainWindowTestAccess::document(window));
+  require_action_by_text(window, QStringLiteral("Type"))->trigger();
+  const auto source = contour({knot(80, 360, 80, 360, 200, 60), knot(580, 360, 460, 60, 580, 360)}, false);
+  const TextPathCurve curve(source);
+  const auto quarter = curve.sample(curve.distance_at_parameter(0.25));
+  const QPoint on_path(static_cast<int>(std::lround(quarter.x)), static_cast<int>(std::lround(quarter.y)));
+  const auto target = canvas->text_path_at(QPointF(on_path));
+  CHECK(target.has_value());
+  if (!target) return;
+  CHECK(!target->path.subpaths.front().closed);
+  CHECK(std::abs(target->range.start - 0.25) < 0.01);
+  CHECK(target->range.end == 1.0);
+  CHECK(!canvas->text_path_at(QPointF(on_path + QPoint(0, 30))).has_value());
+  // Over the line the cursor is the I-beam standing on a wavy stroke.
+  CHECK(hover(*canvas, on_path) == TypeCursor::Path);
+  CHECK(hover(*canvas, on_path + QPoint(0, 60)) == TypeCursor::Plain);
+  // The last pixels of the path leave no room for text: the whole path is taken.
+  const auto at_end = canvas->text_path_at(QPointF(579, 359));
+  CHECK(at_end.has_value() && at_end->range.start == 0.0 && at_end->range.end == 1.0);
+
+  click_canvas(*canvas, on_path);
+  auto* editor = session_editor(*canvas);
+  CHECK(editor != nullptr);
+  if (!editor) return;
+  CHECK(!editor->property("patchy.documentTextPath").toString().isEmpty());
+  editor->selectAll();
+  editor->insertPlainText(QStringLiteral("Along the path"));
+  process_events_for(150);
+  send_key(*editor, Qt::Key_Return, Qt::ControlModifier);
+  QApplication::processEvents();
+  const auto id = doc.active_layer_id();
+  CHECK(id.has_value());
+  if (!id) return;
+  const auto* layer = doc.find_layer(*id);
+  CHECK(layer != nullptr && layer_is_text(*layer));
+  if (!layer) return;
+  const auto frame = text_path_frame_for_layer(*layer);
+  CHECK(frame.has_value());
+  if (!frame) return;
+  CHECK(std::abs(frame->range.start - 0.25) < 0.01 && frame->range.end == 1.0);
+  // The layer's contour is the work path, in the document.
+  const auto in_document = text_path_in_document(*layer);
+  CHECK(in_document.has_value());
+  if (in_document) {
+    const auto& anchors = in_document->subpaths.front().anchors;
+    CHECK(anchors.size() == 2);
+    CHECK(std::abs(anchors[0].anchor_x - 80.0) < 1e-6 && std::abs(anchors[0].anchor_y - 360.0) < 1e-6);
+    CHECK(std::abs(anchors[1].in_x - 460.0) < 1e-6 && std::abs(anchors[1].in_y - 60.0) < 1e-6);
+  }
+  // The text starts at the click: its ink begins within the type's height of that point.
+  CHECK(std::abs(layer->bounds().x - on_path.x()) < 30);
+  CHECK(layer->bounds().x + layer->bounds().width > on_path.x() + 100);
+  run(window, "patchy.setResult(JSON.stringify(app.activeDocument.workPath.getPath()));");
+  CHECK(window.script_engine_host().last_result().toString() == work_before);
+}
+
+// The Type tool's cursor names what a press there works on (GitHub issue 717 follow-up): the
+// wavy cursor over text on a path and along its whole line, the ring inside a shape or over
+// text that fills one, the plain I-beam over other text and on empty canvas. The press asks
+// the same function, so a click does what the cursor said.
+void ui_text_path_type_tool_cursor_names_the_click_target() {
+  if (arial_missing()) return;
+  using Kind = CanvasWidget::TypeToolTargetKind;
+  MainWindow window;
+  show_window_empty(window);
+  window.set_cli_automation_mode(true);
+  run(window, R"JS(
+    var d=app.newDocument(660,520);
+    d.addShape('Shape',{type:'ellipse',x:420,y:330,width:200,height:150});
+    var line={subpaths:[{closed:false,anchors:[{x:60,y:470},{x:380,y:310}]}]};
+    var onPath=d.addTextLayer('Along',{font:'Arial',size:24,path:line});
+    var box={subpaths:[{closed:true,anchors:[{x:420,y:40},{x:620,y:40},{x:620,y:200},{x:420,y:200}]}]};
+    var inArea=d.addTextLayer('Area',{font:'Arial',size:24,area:box});
+    var point=d.addTextLayer('Point text',{font:'Arial',size:24,x:60,y:60});
+    d.setWorkPath({subpaths:[{closed:false,anchors:[{x:60,y:200},{x:360,y:200}]}]});
+    patchy.setResult([onPath.id,inArea.id,point.id]);
+  )JS");
+  const auto ids = window.script_engine_host().last_result().toArray();
+  CHECK(ids.size() == 3);
+  if (ids.size() != 3) return;
+  const auto path_id = ids[0].toString().toULongLong();
+  const auto area_id = ids[1].toString().toULongLong();
+  const auto point_id = ids[2].toString().toULongLong();
+  auto* canvas = require_canvas(window);
+  canvas->set_zoom(1.0);
+  const auto& doc = std::as_const(MainWindowTestAccess::document(window));
+  require_action_by_text(window, QStringLiteral("Type"))->trigger();
+  QApplication::processEvents();
+  const auto* path_layer = doc.find_layer(path_id);
+  const auto* point_layer = doc.find_layer(point_id);
+  CHECK(path_layer != nullptr && point_layer != nullptr && doc.find_layer(area_id) != nullptr);
+  if (path_layer == nullptr || point_layer == nullptr) return;
+
+  // What a press would work on, and the cursor a hover there shows.
+  const auto expect = [&](QPoint at, Kind kind, LayerId layer_id, const char* what) {
+    const auto target = canvas->type_tool_target_at(at);
+    const bool target_ok = target.kind == kind && (target.layer == nullptr ? 0 : target.layer->id()) == layer_id;
+    const bool cursor_ok = hover(*canvas, at) == cursor_for(kind);
+    if (!target_ok || !cursor_ok) {
+      std::printf("  %s at (%d, %d): target kind %d (want %d), cursor %d (want %d)\n", what, at.x(), at.y(),
+                  static_cast<int>(target.kind), static_cast<int>(kind), static_cast<int>(shown_type_cursor(*canvas)),
+                  static_cast<int>(cursor_for(kind)));
+    }
+    CHECK(target_ok);
+    CHECK(cursor_ok);
+  };
+
+  // The line of the path text: 85 percent along it is bare (the word stands near its start).
+  const auto contour_in_document = text_path_in_document(*path_layer);
+  CHECK(contour_in_document.has_value());
+  if (!contour_in_document) return;
+  const TextPathCurve curve(*contour_in_document);
+  const auto bare = curve.sample(curve.distance_at_parameter(0.85));
+  const auto beside = [&](double offset) {
+    return QPoint(static_cast<int>(std::lround(bare.x - bare.tangent_y * offset)),
+                  static_cast<int>(std::lround(bare.y + bare.tangent_x * offset)));
+  };
+  const QPoint on_bare_line = beside(0.0);
+  CHECK(!path_layer->bounds().contains(on_bare_line.x(), on_bare_line.y()));
+
+  const auto check_scene = [&] {
+    expect(ink_point(*path_layer), Kind::EditPathText, path_id, "path text ink");
+    expect(on_bare_line, Kind::EditPathText, path_id, "bare line of the path text");
+    // Five pixels either side is still the text's line: no strip there starts new text.
+    expect(beside(5.0), Kind::EditPathText, path_id, "beside the line");
+    expect(beside(-5.0), Kind::EditPathText, path_id, "beside the line, other side");
+    expect(beside(12.0), Kind::NewText, 0, "past the line's reach");
+    expect(beside(-12.0), Kind::NewText, 0, "past the line's reach, other side");
+    const auto point_bounds = point_layer->bounds();
+    expect(QPoint(point_bounds.x + point_bounds.width / 2, point_bounds.y + point_bounds.height / 2), Kind::EditText,
+           point_id, "point text");
+    // Anywhere inside the shape area text fills, glyphs or not.
+    expect(QPoint(600, 190), Kind::EditAreaText, area_id, "area text");
+    expect(QPoint(520, 405), Kind::NewAreaText, 0, "inside a closed shape");
+    expect(QPoint(520, 330), Kind::NewPathText, 0, "edge of a shape");
+    expect(QPoint(300, 120), Kind::NewText, 0, "empty canvas");
+  };
+  check_scene();
+  // The open work path, while it is the targeted path.
+  if (canvas->text_path_at(QPointF(200, 200)).has_value()) {
+    expect(QPoint(200, 200), Kind::NewPathText, 0, "open work path");
+    expect(QPoint(200, 205), Kind::NewPathText, 0, "beside the work path");
+    expect(QPoint(200, 212), Kind::NewText, 0, "past the work path's reach");
+    // Hiding the path display changes the answer with no pointer move.
+    CHECK(hover(*canvas, QPoint(200, 200)) == TypeCursor::Path);
+    canvas->set_target_path_visible(false);
+    CHECK(shown_type_cursor(*canvas) == TypeCursor::Plain);
+    canvas->set_target_path_visible(true);
+    CHECK(shown_type_cursor(*canvas) == TypeCursor::Path);
+  } else {
+    CHECK(false);  // the work path set above is the target until a layer with its own path is active
+  }
+
+  // A press beside the bare line opens that text (it used to start a second text on a copy of
+  // the line). The layer is then active and its line is the targeted path: the answers hold.
+  click_canvas(*canvas, beside(5.0));
+  auto* editor = session_editor(*canvas);
+  CHECK(editor != nullptr);
+  if (editor == nullptr) return;
+  CHECK(editor->property("patchy.editingLayerId").toULongLong() == path_id);
+  CHECK(editor->toPlainText() == QStringLiteral("Along"));
+  send_key(*editor, Qt::Key_Escape);
+  QApplication::processEvents();
+  CHECK(session_editor(*canvas) == nullptr);
+  CHECK(doc.active_layer_id() == std::optional<LayerId>(path_id));
+  path_layer = doc.find_layer(path_id);
+  point_layer = doc.find_layer(point_id);
+  if (path_layer == nullptr || point_layer == nullptr) return;
+  check_scene();
+}
+
+// Text that runs around a ring covers the ring's inside with its bounding box. Only the band
+// of glyphs and the line are the text's: the middle starts new text (free text, or text that
+// fills the ring while the ring's text is the active layer and its line the targeted path).
+void ui_text_path_type_tool_leaves_the_inside_of_a_ring_of_text_free() {
+  if (arial_missing()) return;
+  using Kind = CanvasWidget::TypeToolTargetKind;
+  MainWindow window;
+  show_window_empty(window);
+  window.set_cli_automation_mode(true);
+  run(window, R"JS(
+    var d=app.newDocument(660,520);
+    var ring={subpaths:[{closed:true,anchors:[
+      {x:330,y:80,inX:230.6,inY:80,outX:429.4,outY:80},
+      {x:510,y:260,inX:510,inY:160.6,outX:510,outY:359.4},
+      {x:330,y:440,inX:429.4,inY:440,outX:230.6,outY:440},
+      {x:150,y:260,inX:150,inY:359.4,outX:150,outY:160.6}]}]};
+    var t=d.addTextLayer('Round and round the ring the letters go. '.repeat(4),{font:'Arial',size:24,path:ring});
+    d.addTextLayer('Corner',{font:'Arial',size:12,x:10,y:10});
+    patchy.setResult(t.id);
+  )JS");
+  const auto id = window.script_engine_host().last_result().toString().toULongLong();
+  auto* canvas = require_canvas(window);
+  canvas->set_zoom(1.0);
+  const auto& doc = std::as_const(MainWindowTestAccess::document(window));
+  require_action_by_text(window, QStringLiteral("Type"))->trigger();
+  QApplication::processEvents();
+  const auto* layer = doc.find_layer(id);
+  CHECK(layer != nullptr);
+  if (layer == nullptr) return;
+  const QPoint middle(330, 260);
+  // The text goes most of the way round, so its box holds the middle of the ring.
+  CHECK(layer->bounds().contains(middle.x(), middle.y()));
+  CHECK(doc.active_layer_id() != std::optional<LayerId>(id));
+  CHECK(canvas->type_tool_target_at(middle).kind == Kind::NewText);
+  CHECK(hover(*canvas, middle) == TypeCursor::Plain);
+  const auto ink = ink_point(*layer);
+  CHECK(canvas->type_tool_target_at(ink).kind == Kind::EditPathText);
+  CHECK(hover(*canvas, ink) == TypeCursor::Path);
+  CHECK(canvas->type_tool_target_at(QPoint(330, 80)).layer == layer);
+  CHECK(hover(*canvas, QPoint(330, 80)) == TypeCursor::Path);
+
+  // The click agrees: new text in the middle, the ring untouched.
+  const auto committed = *layer;
+  const auto layers_before = doc.layers().size();
+  click_canvas(*canvas, middle);
+  auto* editor = session_editor(*canvas);
+  CHECK(editor != nullptr);
+  if (editor == nullptr) return;
+  CHECK(!editor->property("patchy.editingLayerId").isValid());
+  CHECK(editor->property("patchy.documentTextPath").toString().isEmpty());
+  send_key(*editor, Qt::Key_Escape);
+  QApplication::processEvents();
+  CHECK(session_editor(*canvas) == nullptr);
+  CHECK(doc.layers().size() == layers_before);
+  CHECK(doc.find_layer(id) != nullptr && doc.find_layer(id)->metadata() == committed.metadata());
+  // And a click on the letters opens the ring's text.
+  click_canvas(*canvas, ink_point(*doc.find_layer(id)));
+  editor = session_editor(*canvas);
+  CHECK(editor != nullptr);
+  if (editor == nullptr) return;
+  CHECK(editor->property("patchy.editingLayerId").toULongLong() == id);
+  send_key(*editor, Qt::Key_Escape);
+  QApplication::processEvents();
+  CHECK(session_editor(*canvas) == nullptr);
+  // The ring's text is the active layer now and its closed line the targeted path: the middle
+  // is the inside of that path, where a press fills it, and still not the ring's own text.
+  CHECK(doc.active_layer_id() == std::optional<LayerId>(id));
+  const auto in_middle = canvas->type_tool_target_at(middle);
+  CHECK(in_middle.layer == nullptr && in_middle.kind == Kind::NewAreaText);
+  CHECK(hover(*canvas, middle) == TypeCursor::Area);
+  CHECK(hover(*canvas, QPoint(330, 80)) == TypeCursor::Path);
+}
+
+// Every hover move sets the cursor from that move's own position: across the line of a path
+// text and along it the wavy cursor shows for exactly the points within the Type tool's reach
+// (six screen pixels), at any zoom, with no stale answers between moves.
+void ui_text_path_type_tool_cursor_follows_each_hover_move() {
+  if (arial_missing()) return;
+  MainWindow window;
+  show_window_empty(window);
+  window.set_cli_automation_mode(true);
+  run(window, R"JS(
+    var d=app.newDocument(660,520);
+    var p={subpaths:[{closed:false,anchors:[{x:80,y:260},{x:580,y:260}]}]};
+    var t=d.addTextLayer('Along',{font:'Arial',size:24,path:p});
+    patchy.setResult(t.id);
+  )JS");
+  const auto id = window.script_engine_host().last_result().toString().toULongLong();
+  auto* canvas = require_canvas(window);
+  canvas->set_zoom(1.0);
+  const auto& doc = std::as_const(MainWindowTestAccess::document(window));
+  require_action_by_text(window, QStringLiteral("Type"))->trigger();
+  QApplication::processEvents();
+  const auto* layer = doc.find_layer(id);
+  CHECK(layer != nullptr);
+  if (layer == nullptr) return;
+  // The word ends well before x = 400: that part of the line is bare.
+  CHECK(layer->bounds().x + layer->bounds().width < 300);
+
+  // Across the bare line, a pixel a move, there and back.
+  int wrong = 0;
+  for (const int direction : {1, -1}) {
+    for (int step = -14; step <= 14; ++step) {
+      const int dy = direction * step;
+      const auto want = std::abs(dy) <= 6 ? TypeCursor::Path : TypeCursor::Plain;
+      if (hover(*canvas, QPoint(400, 260 + dy)) != want) {
+        std::printf("  across the line at dy %d: cursor %d\n", dy, static_cast<int>(shown_type_cursor(*canvas)));
+        ++wrong;
+      }
+    }
+  }
+  CHECK(wrong == 0);
+  // Along the line, three pixels below it (the side the letters do not stand on), from before
+  // its start to past its end: the whole line answers, and only the line.
+  for (int x = 40; x <= 620; x += 7) {
+    const double gap = x < 80 ? std::hypot(80.0 - x, 3.0) : x > 580 ? std::hypot(x - 580.0, 3.0) : 3.0;
+    const auto want = gap <= 6.0 ? TypeCursor::Path : TypeCursor::Plain;
+    if (hover(*canvas, QPoint(x, 263)) != want) {
+      std::printf("  along the line at x %d: cursor %d\n", x, static_cast<int>(shown_type_cursor(*canvas)));
+      ++wrong;
+    }
+  }
+  CHECK(wrong == 0);
+  // The reach is six screen pixels: three document pixels at 200 percent, twelve at 50 percent.
+  canvas->set_zoom(2.0);
+  CHECK(hover(*canvas, QPoint(400, 263)) == TypeCursor::Path);
+  CHECK(hover(*canvas, QPoint(400, 264)) == TypeCursor::Plain);
+  CHECK(hover(*canvas, QPoint(400, 257)) == TypeCursor::Path);
+  canvas->set_zoom(0.5);
+  CHECK(hover(*canvas, QPoint(400, 272)) == TypeCursor::Path);
+  CHECK(hover(*canvas, QPoint(400, 274)) == TypeCursor::Plain);
+}
+
+// What lies under a resting pointer changes when the view scrolls or the document changes:
+// the cursor follows without waiting for a move.
+void ui_text_path_type_tool_cursor_refreshes_without_a_move() {
+  if (arial_missing()) return;
+  MainWindow window;
+  show_window_empty(window);
+  window.set_cli_automation_mode(true);
+  run(window, R"JS(
+    var d=app.newDocument(660,520);
+    var p={subpaths:[{closed:false,anchors:[{x:80,y:260},{x:580,y:260}]}]};
+    var t=d.addTextLayer('Along',{font:'Arial',size:24,path:p});
+    patchy.setResult(t.id);
+  )JS");
+  const auto id = window.script_engine_host().last_result().toString().toULongLong();
+  auto* canvas = require_canvas(window);
+  canvas->set_zoom(1.0);
+  const auto& doc = std::as_const(MainWindowTestAccess::document(window));
+  require_action_by_text(window, QStringLiteral("Type"))->trigger();
+  QApplication::processEvents();
+  CHECK(doc.find_layer(id) != nullptr);
+  const QPoint on_line(400, 260);
+  CHECK(hover(*canvas, on_line) == TypeCursor::Path);
+
+  // The text layer goes (undo of its creation) and comes back (redo).
+  MainWindowTestAccess::undo(window);
+  QApplication::processEvents();
+  CHECK(doc.find_layer(id) == nullptr);
+  CHECK(shown_type_cursor(*canvas) == TypeCursor::Plain);
+  MainWindowTestAccess::redo(window);
+  QApplication::processEvents();
+  CHECK(doc.find_layer(id) != nullptr);
+  CHECK(shown_type_cursor(*canvas) == TypeCursor::Path);
+
+  // The view scrolls under the pointer: at 400 percent a page down puts canvas far from the
+  // line there.
+  canvas->set_zoom(4.0);
+  CHECK(hover(*canvas, on_line) == TypeCursor::Path);
+  const auto resting = canvas->widget_position_for_document_point(on_line);
+  canvas->scroll_view(CanvasWidget::ViewScroll::PageDown);
+  QApplication::processEvents();
+  CHECK(canvas->widget_position_for_document_point(on_line) != resting);
+  CHECK(shown_type_cursor(*canvas) == TypeCursor::Plain);
+  canvas->scroll_view(CanvasWidget::ViewScroll::PageUp);
+  QApplication::processEvents();
+  if (canvas->widget_position_for_document_point(on_line) == resting) {
+    CHECK(shown_type_cursor(*canvas) == TypeCursor::Path);
+  }
+}
+
+// The reporter's file of the issue 717 follow-up: both texts stand on slanted and curved lines.
+// Over each text's letters and all along its line, a few pixels to either side included, the
+// cursor is the wavy one and the press would open that text, whichever layer is active.
+void ui_text_path_older_photoshop_cc_file_shows_the_path_cursor_along_each_line_if_available() {
+  const auto fixture = older_photoshop_cc_fixture();
+  patchy::test::skip_unless_exists(fixture);
+  if (older_photoshop_cc_fonts_missing()) return;
+  using Kind = CanvasWidget::TypeToolTargetKind;
+  MainWindow window;
+  show_window_empty(window);
+  window.set_cli_automation_mode(true);
+  const auto quoted =
+      QString::fromUtf8(QJsonDocument(QJsonArray{to_qstring(fixture)}).toJson(QJsonDocument::Compact));
+  run(window, QStringLiteral(R"JS(
+    var d=app.open(%1[0]);
+    var texts=d.layers.filter(function(l){return l.isText;});
+    check(texts.length===2,'two type layers');
+    patchy.setResult(texts.map(function(t){return t.id;}));
+  )JS").arg(quoted));
+  const auto ids = window.script_engine_host().last_result().toArray();
+  CHECK(ids.size() == 2);
+  if (ids.size() != 2) return;
+  auto* canvas = require_canvas(window);
+  canvas->set_zoom(1.0);
+  const auto& doc = std::as_const(MainWindowTestAccess::document(window));
+  require_action_by_text(window, QStringLiteral("Type"))->trigger();
+  QApplication::processEvents();
+  const auto sweep = [&](const char* when) {
+    int wrong = 0;
+    int checked = 0;
+    for (const auto& value : ids) {
+      const auto* layer = doc.find_layer(value.toString().toULongLong());
+      CHECK(layer != nullptr);
+      if (layer == nullptr) continue;
+      const auto ink = ink_point(*layer);
+      const auto on_ink = canvas->type_tool_target_at(ink);
+      CHECK(on_ink.kind == Kind::EditPathText && on_ink.layer == layer);
+      CHECK(hover(*canvas, ink) == TypeCursor::Path);
+      const auto in_document = text_path_in_document(*layer);
+      CHECK(in_document.has_value());
+      if (!in_document) continue;
+      const TextPathCurve curve(*in_document);
+      for (int step = 1; step < 40; ++step) {
+        const auto sample = curve.sample(curve.length() * step / 40.0);
+        for (const double offset : {-5.0, 0.0, 5.0}) {
+          const QPoint at(static_cast<int>(std::lround(sample.x - sample.tangent_y * offset)),
+                          static_cast<int>(std::lround(sample.y + sample.tangent_x * offset)));
+          if (at.x() < 0 || at.y() < 0 || at.x() >= doc.width() || at.y() >= doc.height()) continue;
+          ++checked;
+          // Where the two texts come close the upper layer may answer: still text on a path.
+          if (canvas->type_tool_target_at(at).kind != Kind::EditPathText || hover(*canvas, at) != TypeCursor::Path) {
+            std::printf("  %s: (%d, %d) is not path text\n", when, at.x(), at.y());
+            ++wrong;
+          }
+        }
+      }
+    }
+    CHECK(checked > 100);
+    CHECK(wrong == 0);
+  };
+  sweep("as opened");
+  // With each text active its line is the targeted path (drawn on the canvas): the same answers.
+  for (const auto& value : ids) {
+    const auto layer_id = value.toString().toULongLong();
+    click_canvas(*canvas, ink_point(*doc.find_layer(layer_id)));
+    auto* editor = session_editor(*canvas);
+    CHECK(editor != nullptr);
+    if (editor == nullptr) return;
+    CHECK(editor->property("patchy.editingLayerId").toULongLong() == layer_id);
+    send_key(*editor, Qt::Key_Escape);
+    QApplication::processEvents();
+    CHECK(session_editor(*canvas) == nullptr);
+    sweep("with a text active");
+  }
+}
+
+// The x centres of the separate marks of a layer's ink (runs of columns holding opaque
+// pixels), in the document. A row of capital I on a level line gives one per letter.
+std::vector<double> ink_column_centres(const Layer& layer) {
+  const auto image = qimage_from_pixel_buffer(layer.pixels());
+  std::vector<double> centres;
+  int run_start = -1;
+  for (int x = 0; x <= image.width(); ++x) {
+    bool ink = false;
+    for (int y = 0; x < image.width() && y < image.height() && !ink; ++y) {
+      ink = qAlpha(image.pixel(x, y)) > 128;
+    }
+    if (ink && run_start < 0) {
+      run_start = x;
+    } else if (!ink && run_start >= 0) {
+      centres.push_back(layer.bounds().x + (run_start + x) / 2.0);
+      run_start = -1;
+    }
+  }
+  return centres;
+}
+
+// The carets two Type tool clicks at one canvas point give: `first` from the click that opens
+// the text under it, `second` from the same click again in the open session (the caret is
+// parked elsewhere in between, so the second click has to move it). -1 where there was no
+// session to ask; `second` is also -1 where the point lies on one of a path session's marks,
+// since a press there drags the mark. The session is cancelled afterwards.
+struct ClickCarets {
+  int first{-1};
+  int second{-1};
+  bool second_asked{false};
+  qulonglong layer{0};
+};
+
+ClickCarets carets_from_two_clicks(CanvasWidget& canvas, QPoint widget_point, bool path_session = false) {
+  ClickCarets result;
+  send_mouse(canvas, QEvent::MouseButtonPress, widget_point, Qt::LeftButton, Qt::LeftButton);
+  send_mouse(canvas, QEvent::MouseButtonRelease, widget_point, Qt::LeftButton, Qt::NoButton);
+  QApplication::processEvents();
+  auto* editor = session_editor(canvas);
+  if (editor == nullptr) return result;
+  result.first = editor->textCursor().hasSelection() ? -2 : editor->textCursor().position();
+  result.layer = editor->property("patchy.editingLayerId").toULongLong();
+  bool on_a_mark = false;
+  if (path_session) {
+    if (const auto* overlay = wait_for_path_overlay(canvas); overlay != nullptr) {
+      for (const auto& centre : overlay->property("patchy.transformedTextPathHandleCenters").toList()) {
+        const auto offset = centre.toPointF() - QPointF(widget_point);
+        on_a_mark = on_a_mark || std::hypot(offset.x(), offset.y()) < 16.0;
+      }
+    }
+  } else {
+    process_events_for(30);
+  }
+  editor = session_editor(canvas);
+  if (editor != nullptr && !on_a_mark) {
+    auto cursor = editor->textCursor();
+    cursor.setPosition(result.first == 0 ? std::max(0, editor->document()->characterCount() - 1) : 0);
+    editor->setTextCursor(cursor);
+    // click_widget_like_a_user, except that the release goes to whatever is under the point by
+    // then: a press that moves the caret can make the session replace its overlay widget.
+    const auto under_point = [&]() -> QWidget* {
+      auto* child = canvas.childAt(widget_point);
+      return child != nullptr ? child : &canvas;
+    };
+    const auto local_point = [&](QWidget* receiver) {
+      return receiver == &canvas ? widget_point : receiver->mapFrom(&canvas, widget_point);
+    };
+    QPointer<QWidget> receiver = under_point();
+    QWidget* focus_target = receiver;
+    while (focus_target != nullptr && (focus_target->focusPolicy() & Qt::ClickFocus) != Qt::ClickFocus) {
+      focus_target = focus_target->parentWidget();
+    }
+    if (focus_target != nullptr) {
+      focus_target->setFocus(Qt::MouseFocusReason);
+      QApplication::processEvents();
+    }
+    if (receiver == nullptr) receiver = under_point();
+    send_mouse(*receiver, QEvent::MouseButtonPress, local_point(receiver), Qt::LeftButton, Qt::LeftButton);
+    if (receiver == nullptr) receiver = under_point();
+    send_mouse(*receiver, QEvent::MouseButtonRelease, local_point(receiver), Qt::LeftButton, Qt::NoButton);
+    QApplication::processEvents();
+    result.second_asked = true;
+    editor = session_editor(canvas);
+    if (editor != nullptr) {
+      result.second = editor->textCursor().hasSelection() ? -2 : editor->textCursor().position();
+    }
+  }
+  if (editor != nullptr) {
+    send_key(*editor, Qt::Key_Escape);
+    QApplication::processEvents();
+  }
+  return result;
+}
+
+// One click per letter of a row of capital I: three pixels right of a letter's centre the caret
+// goes after that letter, three pixels left of it before, on the opening click as on a second
+// one. `y` is a document row the letters cross. Returns how many answers were wrong.
+int wrong_carets_across_letters(CanvasWidget& canvas, const Layer& layer, int y, bool path_session, const char* what) {
+  const auto id = layer.id();
+  const auto centres = ink_column_centres(layer);
+  int wrong = 0;
+  for (std::size_t letter = 0; letter < centres.size(); ++letter) {
+    for (const int side : {-3, 3}) {
+      const QPoint at(static_cast<int>(std::floor(centres[letter])) + side, y);
+      const int want = static_cast<int>(letter) + (side > 0 ? 1 : 0);
+      const auto carets = carets_from_two_clicks(canvas, canvas.widget_position_for_document_point(at), path_session);
+      if (carets.layer != id || carets.first != want || (carets.second_asked && carets.second != want)) {
+        std::printf("  %s: click at (%d, %d): first caret %d, second %d, want %d\n", what, at.x(), at.y(), carets.first,
+                    carets.second, want);
+        ++wrong;
+      }
+    }
+  }
+  return wrong;
+}
+
+// Zoomed in on the first letters, a click every screen pixel across them (a fraction of a
+// document pixel apart): the opening click and a second click always agree, also where the
+// caret flips from one side of a letter to the other inside one document pixel.
+int wrong_carets_at_sub_pixel_clicks(CanvasWidget& canvas, const Layer& layer, int y, bool path_session,
+                                     const char* what) {
+  const auto centres = ink_column_centres(layer);
+  if (centres.size() < 3) return 1;
+  const int left = static_cast<int>(std::floor(centres[0])) - 2;
+  const int right = static_cast<int>(std::ceil(centres[2])) + 2;
+  const auto from = canvas.widget_position_for_document_point(QPoint(left, y));
+  const auto to = canvas.widget_position_for_document_point(QPoint(right, y));
+  int wrong = 0;
+  int flips = 0;
+  int last = -1;
+  for (int x = from.x(); x <= to.x(); ++x) {
+    const auto carets = carets_from_two_clicks(canvas, QPoint(x, from.y() + 1), path_session);
+    if (carets.first < 0 || (carets.second_asked && carets.second != carets.first) || carets.first < last) {
+      std::printf("  %s: click at widget x %d: first caret %d, second %d (after %d)\n", what, x, carets.first,
+                  carets.second, last);
+      ++wrong;
+    }
+    if (last >= 0 && carets.first != last) ++flips;
+    last = carets.first;
+  }
+  // The sweep crossed the first three letters: the caret moved on at each of their centres.
+  if (flips < 3) {
+    std::printf("  %s: the caret moved %d times across three letters\n", what, flips);
+    ++wrong;
+  }
+  return wrong;
+}
+
+// The Type tool click that opens text on a path puts the caret where the click landed, the way
+// a second click there does (GitHub issue 717 follow-up): between the letters under the
+// pointer, and at the nearest end of the text for a click on the bare line before or past it.
+void ui_text_path_first_click_puts_the_caret_at_the_click() {
+  if (arial_missing()) return;
+  MainWindow window;
+  show_window_empty(window);
+  window.set_cli_automation_mode(true);
+  run(window, R"JS(
+    var d=app.newDocument(660,520);
+    var p={subpaths:[{closed:false,anchors:[{x:80,y:260},{x:580,y:260}]}]};
+    var t=d.addTextLayer('IIIIIIII',{font:'Arial',size:48,path:p,pathRange:{start:0.2,end:1}});
+    patchy.setResult(t.id);
+  )JS");
+  const auto id = window.script_engine_host().last_result().toString().toULongLong();
+  auto* canvas = require_canvas(window);
+  canvas->set_zoom(1.0);
+  const auto& doc = std::as_const(MainWindowTestAccess::document(window));
+  require_action_by_text(window, QStringLiteral("Type"))->trigger();
+  QApplication::processEvents();
+  const auto* layer = doc.find_layer(id);
+  CHECK(layer != nullptr);
+  if (layer == nullptr) return;
+  const auto centres = ink_column_centres(*layer);
+  CHECK(centres.size() == 8);
+  if (centres.size() != 8) return;
+  // The range starts at 0.2 of the segment (x = 132, the range counts in Bezier units), so the
+  // line is bare on both sides of the row.
+  if (!(centres.front() > 130.0 && centres.back() < 320.0)) {
+    std::printf("  letters from x %.1f to %.1f\n", centres.front(), centres.back());
+  }
+  CHECK(centres.front() > 130.0 && centres.back() < 320.0);
+
+  CHECK(wrong_carets_across_letters(*canvas, *layer, 250, true, "path text") == 0);
+  // The tops of the letters, far from the line but in the band the type stands in. The band is
+  // sized from the runs: this layer's own size key holds a small default, as a script leaves it.
+  CHECK(layer->metadata().contains(kLayerMetadataTextSize) &&
+        std::atoi(layer->metadata().at(kLayerMetadataTextSize).c_str()) < 24);
+  CHECK(wrong_carets_across_letters(*canvas, *layer, 232, true, "path text, top of the letters") == 0);
+
+  // The bare line, and the reach beside it: the nearest end of the text.
+  const auto first_caret_at = [&](QPoint at) {
+    return carets_from_two_clicks(*canvas, canvas->widget_position_for_document_point(at), true);
+  };
+  for (const auto at : {QPoint(100, 260), QPoint(100, 256), QPoint(100, 264), QPoint(84, 260)}) {
+    const auto carets = first_caret_at(at);
+    CHECK(carets.layer == id && carets.first == 0);
+    CHECK(!carets.second_asked || carets.second == 0);
+  }
+  for (const auto at : {QPoint(450, 260), QPoint(450, 256), QPoint(450, 264), QPoint(576, 260)}) {
+    const auto carets = first_caret_at(at);
+    CHECK(carets.layer == id && carets.first == 8);
+    CHECK(!carets.second_asked || carets.second == 8);
+  }
+
+  // Zoomed in, between whole document pixels.
+  canvas->zoom_to_document_rect(QRect(static_cast<int>(centres.front()) - 14, 215, 110, 60));
+  QApplication::processEvents();
+  CHECK(canvas->zoom() > 2.0);
+  CHECK(wrong_carets_at_sub_pixel_clicks(*canvas, *layer, 250, true, "path text, zoomed") == 0);
+  CHECK(doc.find_layer(id) != nullptr &&
+        QString::fromStdString(doc.find_layer(id)->metadata().at(kLayerMetadataText)) == QStringLiteral("IIIIIIII"));
+}
+
+// A right-to-left paragraph holding Latin letters (the reporter's file of the issue 717
+// follow-up reads that way): the row stands at the far end of its range, each letter still
+// takes the caret on the side that was clicked, and the bare line on either side of the row
+// gives the nearer end of the text. Qt's own answer there goes by the paragraph's direction and
+// names the far end.
+void ui_text_path_first_click_in_a_right_to_left_paragraph_takes_the_nearer_end() {
+  if (arial_missing()) return;
+  MainWindow window;
+  show_window_empty(window);
+  window.set_cli_automation_mode(true);
+  run(window, R"JS(
+    var d=app.newDocument(660,520);
+    var p={subpaths:[{closed:false,anchors:[{x:80,y:260},{x:580,y:260}]}]};
+    var t=d.addTextLayer('IIIIIIII',{font:'Arial',size:48,path:p,direction:'rtl'});
+    check(t.textDirection==='rtl','right to left');
+    patchy.setResult(t.id);
+  )JS");
+  const auto id = window.script_engine_host().last_result().toString().toULongLong();
+  auto* canvas = require_canvas(window);
+  canvas->set_zoom(1.0);
+  const auto& doc = std::as_const(MainWindowTestAccess::document(window));
+  require_action_by_text(window, QStringLiteral("Type"))->trigger();
+  QApplication::processEvents();
+  const auto* layer = doc.find_layer(id);
+  CHECK(layer != nullptr);
+  if (layer == nullptr) return;
+  const auto centres = ink_column_centres(*layer);
+  CHECK(centres.size() == 8);
+  if (centres.size() != 8) return;
+  // The row ends where the line ends, so the line is bare before it.
+  CHECK(centres.front() > 400.0);
+  CHECK(wrong_carets_across_letters(*canvas, *layer, 250, true, "right-to-left paragraph") == 0);
+  for (const auto at : {QPoint(200, 260), QPoint(200, 256), QPoint(380, 264)}) {
+    const auto carets = carets_from_two_clicks(*canvas, canvas->widget_position_for_document_point(at), true);
+    if (carets.layer != id || carets.first != 0 || (carets.second_asked && carets.second != 0)) {
+      std::printf("  before the row at (%d, %d): first caret %d, second %d\n", at.x(), at.y(), carets.first,
+                  carets.second);
+    }
+    CHECK(carets.layer == id && carets.first == 0);
+    CHECK(!carets.second_asked || carets.second == 0);
+  }
+}
+
+// The same on a curve, where the line the letters stand on has to be unbent to find the caret:
+// along the whole contour and a few pixels to either side the opening click agrees with a
+// second click, the caret only moves forward as the click moves along the line, and the two
+// ends of the line give the two ends of the text.
+void ui_text_path_first_click_on_a_curve_matches_a_second_click() {
+  if (arial_missing()) return;
+  MainWindow window;
+  show_window_empty(window);
+  window.set_cli_automation_mode(true);
+  run(window, R"JS(
+    var d=app.newDocument(660,520);
+    var p={subpaths:[{closed:false,anchors:[{x:80,y:360,outX:200,outY:60},{x:580,y:360,inX:460,inY:60}]}]};
+    var t=d.addTextLayer('One two three four',{font:'Arial',size:24,path:p,pathRange:{start:0.25,end:1}});
+    patchy.setResult(t.id);
+  )JS");
+  const auto id = window.script_engine_host().last_result().toString().toULongLong();
+  auto* canvas = require_canvas(window);
+  canvas->set_zoom(1.0);
+  const auto& doc = std::as_const(MainWindowTestAccess::document(window));
+  require_action_by_text(window, QStringLiteral("Type"))->trigger();
+  QApplication::processEvents();
+  const auto* layer = doc.find_layer(id);
+  CHECK(layer != nullptr);
+  if (layer == nullptr) return;
+  const auto in_document = text_path_in_document(*layer);
+  CHECK(in_document.has_value());
+  if (!in_document) return;
+  const TextPathCurve curve(*in_document);
+  const int length = static_cast<int>(QString::fromStdString(layer->metadata().at(kLayerMetadataText)).size());
+  CHECK(length == 18);
+  int wrong = 0;
+  int asked_twice = 0;
+  int inside = 0;
+  for (const double offset : {0.0, -4.0, 4.0}) {
+    int last = 0;
+    for (int step = 1; step < 40; ++step) {
+      const auto sample = curve.sample(curve.length() * step / 40.0);
+      const QPoint at(static_cast<int>(std::lround(sample.x - sample.tangent_y * offset)),
+                      static_cast<int>(std::lround(sample.y + sample.tangent_x * offset)));
+      const auto carets = carets_from_two_clicks(*canvas, canvas->widget_position_for_document_point(at), true);
+      const bool agrees = !carets.second_asked || carets.second == carets.first;
+      if (carets.layer != id || carets.first < last || carets.first > length || !agrees) {
+        std::printf("  curve: click at (%d, %d): first caret %d, second %d (after %d)\n", at.x(), at.y(), carets.first,
+                    carets.second, last);
+        ++wrong;
+      }
+      if (carets.second_asked) ++asked_twice;
+      if (carets.first > 0 && carets.first < length) ++inside;
+      // Before the text starts (a quarter along) and well past its last letter.
+      if (step <= 8 && carets.first != 0) ++wrong;
+      if (step >= 36 && carets.first != length) ++wrong;
+      last = std::max(last, carets.first);
+    }
+  }
+  CHECK(wrong == 0);
+  CHECK(asked_twice > 90);
+  // The clicks on the letters landed among them, not at an end.
+  CHECK(inside >= 12);
+}
+
+// The reporter's file of the issue 717 follow-up: a click on either text opens it with the
+// caret where the click landed, as a second click puts it.
+void ui_text_path_older_photoshop_cc_file_first_click_puts_the_caret_at_the_click_if_available() {
+  const auto fixture = older_photoshop_cc_fixture();
+  patchy::test::skip_unless_exists(fixture);
+  if (older_photoshop_cc_fonts_missing()) return;
+  MainWindow window;
+  show_window_empty(window);
+  window.set_cli_automation_mode(true);
+  const auto quoted =
+      QString::fromUtf8(QJsonDocument(QJsonArray{to_qstring(fixture)}).toJson(QJsonDocument::Compact));
+  run(window, QStringLiteral(R"JS(
+    var d=app.open(%1[0]);
+    var texts=d.layers.filter(function(l){return l.isText;});
+    check(texts.length===2,'two type layers');
+    patchy.setResult(texts.map(function(t){return t.id;}));
+  )JS").arg(quoted));
+  const auto ids = window.script_engine_host().last_result().toArray();
+  CHECK(ids.size() == 2);
+  if (ids.size() != 2) return;
+  auto* canvas = require_canvas(window);
+  canvas->set_zoom(1.0);
+  const auto& doc = std::as_const(MainWindowTestAccess::document(window));
+  require_action_by_text(window, QStringLiteral("Type"))->trigger();
+  QApplication::processEvents();
+  for (const auto& value : ids) {
+    const auto id = value.toString().toULongLong();
+    const auto* layer = doc.find_layer(id);
+    CHECK(layer != nullptr);
+    if (layer == nullptr) continue;
+    const int length = static_cast<int>(QString::fromStdString(layer->metadata().at(kLayerMetadataText)).size());
+    const auto in_document = text_path_in_document(*layer);
+    CHECK(in_document.has_value() && length > 4);
+    if (!in_document) continue;
+    const TextPathCurve curve(*in_document);
+    // A click on the letters: among them, and where a second click goes.
+    const auto on_ink = carets_from_two_clicks(*canvas, canvas->widget_position_for_document_point(ink_point(*layer)), true);
+    CHECK(on_ink.layer == id && on_ink.first > 0 && on_ink.first < length);
+    CHECK(!on_ink.second_asked || on_ink.second == on_ink.first);
+    int wrong = 0;
+    int inside = 0;
+    int last = 0;
+    int smallest = length;
+    int largest = 0;
+    for (int step = 1; step < 50; ++step) {
+      const auto sample = curve.sample(curve.length() * step / 50.0);
+      const QPoint at(static_cast<int>(std::lround(sample.x)), static_cast<int>(std::lround(sample.y)));
+      if (at.x() < 0 || at.y() < 0 || at.x() >= doc.width() || at.y() >= doc.height()) continue;
+      // Where the two texts come close the other one may take the click.
+      if (canvas->type_tool_target_at(at).layer != layer) continue;
+      const auto carets = carets_from_two_clicks(*canvas, canvas->widget_position_for_document_point(at), true);
+      const bool agrees = !carets.second_asked || carets.second == carets.first;
+      if (carets.layer != id || carets.first < last || carets.first > length || !agrees) {
+        std::printf("  layer %llu: click at (%d, %d): first caret %d, second %d (after %d)\n", id, at.x(), at.y(),
+                    carets.first, carets.second, last);
+        ++wrong;
+      }
+      if (carets.first > 0 && carets.first < length) ++inside;
+      smallest = std::min(smallest, carets.first);
+      largest = std::max(largest, carets.first);
+      last = std::max(last, carets.first);
+    }
+    CHECK(wrong == 0);
+    CHECK(inside >= 3);
+    // Both lines run on past their letters: the bare parts give the two ends of the text.
+    CHECK(smallest == 0);
+    CHECK(largest == length);
+  }
+}
+
+// Ordinary text and text that fills a shape open the same way: the caret goes where the opening
+// click landed, between whole document pixels too.
+void ui_text_first_click_on_point_and_area_text_puts_the_caret_at_the_click() {
+  if (arial_missing()) return;
+  MainWindow window;
+  show_window_empty(window);
+  window.set_cli_automation_mode(true);
+  run(window, R"JS(
+    var d=app.newDocument(660,520);
+    var point=d.addTextLayer('IIIIIIII',{font:'Arial',size:48,x:100,y:120});
+    var box={subpaths:[{closed:true,anchors:[{x:100,y:260},{x:560,y:260},{x:560,y:420},{x:100,y:420}]}]};
+    var area=d.addTextLayer('IIIIIIII',{font:'Arial',size:48,area:box});
+    patchy.setResult([point.id,area.id]);
+  )JS");
+  const auto ids = window.script_engine_host().last_result().toArray();
+  CHECK(ids.size() == 2);
+  if (ids.size() != 2) return;
+  auto* canvas = require_canvas(window);
+  const auto& doc = std::as_const(MainWindowTestAccess::document(window));
+  require_action_by_text(window, QStringLiteral("Type"))->trigger();
+  QApplication::processEvents();
+  const char* names[] = {"point text", "area text"};
+  for (int index = 0; index < 2; ++index) {
+    const auto* layer = doc.find_layer(ids[index].toString().toULongLong());
+    CHECK(layer != nullptr);
+    if (layer == nullptr) continue;
+    CHECK(ink_column_centres(*layer).size() == 8);
+    const int y = layer->bounds().y + layer->bounds().height / 2;
+    canvas->set_zoom(1.0);
+    QApplication::processEvents();
+    CHECK(wrong_carets_across_letters(*canvas, *layer, y, false, names[index]) == 0);
+    const auto bounds = layer->bounds();
+    canvas->zoom_to_document_rect(QRect(bounds.x - 12, bounds.y - 12, 110, bounds.height + 24));
+    QApplication::processEvents();
+    CHECK(canvas->zoom() > 2.0);
+    CHECK(wrong_carets_at_sub_pixel_clicks(*canvas, *layer, y, false, names[index]) == 0);
+  }
+}
+
+QPoint overlay_point(const QWidget& overlay, const QVariant& canvas_point) {
+  return canvas_point.toPointF().toPoint() - overlay.pos();
+}
+
+// The marks on the contour: the end mark shortens the range, the middle mark slides it, and
+// dragging the middle mark across the line flips the text to the other side. Only the marks
+// move during a drag; the text is laid out on release.
+void ui_text_path_handles_move_the_range_and_flip() {
+  MainWindow window;
+  show_window_empty(window);
+  window.set_cli_automation_mode(true);
+  run(window, R"JS(
+    var d=app.newDocument(660,520);
+    var p={subpaths:[{closed:false,anchors:[{x:80,y:260},{x:580,y:260}]}]};
+    var t=d.addTextLayer('Along',{font:'Arial',size:24,path:p});
+    t.name='Path';
+    patchy.setResult(t.id);
+  )JS");
+  auto* canvas = require_canvas(window);
+  canvas->set_zoom(1.0);
+  const auto id = window.script_engine_host().last_result().toString().toULongLong();
+  const auto& doc = std::as_const(MainWindowTestAccess::document(window));
+  const auto committed = *doc.find_layer(id);
+  require_action_by_text(window, QStringLiteral("Type"))->trigger();
+  const auto bounds = doc.find_layer(id)->bounds();
+  click_canvas(*canvas, QPoint(bounds.x + bounds.width / 2, bounds.y + bounds.height / 2));
+  auto* editor = session_editor(*canvas);
+  CHECK(editor != nullptr);
+  if (!editor) return;
+  auto* overlay = wait_for_path_overlay(*canvas);
+  CHECK(overlay != nullptr && overlay->isVisible());
+  if (!overlay) return;
+  auto handles = overlay->property("patchy.transformedTextPathHandleCenters").toList();
+  CHECK(handles.size() == 3);
+  if (handles.size() != 3) return;
+  // Start at the line's left end, End at its right end, Middle halfway.
+  const auto left_end = canvas->widget_position_for_document_point(QPoint(80, 260));
+  const auto right_end = canvas->widget_position_for_document_point(QPoint(580, 260));
+  CHECK(std::abs(handles[0].toPointF().x() - left_end.x()) <= 1.5);
+  CHECK(std::abs(handles[1].toPointF().x() - right_end.x()) <= 1.5);
+  CHECK(std::abs(handles[2].toPointF().x() - (left_end.x() + right_end.x()) / 2.0) <= 1.5);
+
+  const auto range_of = [&]() {
+    return parse_text_path_range(editor->property("patchy.documentTextPathRange").toString().toStdString())
+        .value_or(TextPathRange{});
+  };
+  CHECK(range_of().start == 0.0 && range_of().end == 1.0);
+
+  // Drag the end mark 200 px back along the line.
+  const auto end_point = overlay_point(*overlay, handles[1]);
+  send_mouse(*overlay, QEvent::MouseButtonPress, end_point, Qt::LeftButton, Qt::LeftButton);
+  send_mouse(*overlay, QEvent::MouseMove, end_point - QPoint(100, 3), Qt::NoButton, Qt::LeftButton);
+  // Mid-drag only the overlay moved: the session's range is still the old one.
+  CHECK(range_of().end == 1.0);
+  const auto dragged = overlay->property("patchy.transformedTextPathHandleCenters").toList();
+  CHECK(dragged.size() == 3 && std::abs(dragged[1].toPointF().x() - (right_end.x() - 100)) <= 1.5);
+  send_mouse(*overlay, QEvent::MouseMove, end_point - QPoint(200, 0), Qt::NoButton, Qt::LeftButton);
+  send_mouse(*overlay, QEvent::MouseButtonRelease, end_point - QPoint(200, 0), Qt::LeftButton, Qt::NoButton);
+  process_events_for(150);
+  const TextPathCurve line(*text_path_for_layer(committed));
+  CHECK(std::abs(line.distance_at_parameter(range_of().end) - 300.0) <= 1.5);
+  CHECK(range_of().start == 0.0);
+  CHECK(editor->toPlainText() == QStringLiteral("Along"));  // the story is untouched
+
+  // Slide the whole range 80 px to the right with the middle mark.
+  overlay = wait_for_path_overlay(*canvas);
+  CHECK(overlay != nullptr);
+  if (!overlay) return;
+  handles = overlay->property("patchy.transformedTextPathHandleCenters").toList();
+  CHECK(handles.size() == 3);
+  if (handles.size() != 3) return;
+  const auto middle_point = overlay_point(*overlay, handles[2]);
+  send_mouse(*overlay, QEvent::MouseButtonPress, middle_point, Qt::LeftButton, Qt::LeftButton);
+  send_mouse(*overlay, QEvent::MouseMove, middle_point + QPoint(80, 0), Qt::NoButton, Qt::LeftButton);
+  send_mouse(*overlay, QEvent::MouseButtonRelease, middle_point + QPoint(80, 0), Qt::LeftButton, Qt::NoButton);
+  process_events_for(150);
+  CHECK(std::abs(line.distance_at_parameter(range_of().start) - 80.0) <= 1.5);
+  CHECK(std::abs(line.distance_at_parameter(range_of().end) - 380.0) <= 1.5);
+  const auto path_before_flip = parse_vector_path(editor->property("patchy.documentTextPath").toString().toStdString());
+
+  // Drag the middle mark across the line: the contour reverses and the text hangs below.
+  overlay = wait_for_path_overlay(*canvas);
+  CHECK(overlay != nullptr);
+  if (!overlay) return;
+  handles = overlay->property("patchy.transformedTextPathHandleCenters").toList();
+  CHECK(handles.size() == 3);
+  if (handles.size() != 3) return;
+  const auto flip_point = overlay_point(*overlay, handles[2]);
+  send_mouse(*overlay, QEvent::MouseButtonPress, flip_point, Qt::LeftButton, Qt::LeftButton);
+  send_mouse(*overlay, QEvent::MouseMove, flip_point + QPoint(0, 40), Qt::NoButton, Qt::LeftButton);
+  send_mouse(*overlay, QEvent::MouseButtonRelease, flip_point + QPoint(0, 40), Qt::LeftButton, Qt::NoButton);
+  process_events_for(150);
+  const auto flipped_path = parse_vector_path(editor->property("patchy.documentTextPath").toString().toStdString());
+  CHECK(path_before_flip.has_value() && flipped_path.has_value());
+  if (!path_before_flip || !flipped_path) return;
+  CHECK(*flipped_path == reversed_text_path(*path_before_flip));
+  // The same stretch of the line, measured from its other end.
+  const TextPathCurve reversed_line(*flipped_path);
+  CHECK(std::abs(reversed_line.distance_at_parameter(range_of().start) - 120.0) <= 1.5);
+  CHECK(std::abs(reversed_line.distance_at_parameter(range_of().end) - 420.0) <= 1.5);
+  save_widget_artifact("ui_text_path_flipped", *canvas);
+
+  send_key(*editor, Qt::Key_Return, Qt::ControlModifier);
+  QApplication::processEvents();
+  const auto* layer = doc.find_layer(id);
+  CHECK(layer != nullptr);
+  if (!layer) return;
+  // Below the line now (the text stood above it before), and one undo puts everything back.
+  CHECK(layer->bounds().y + layer->bounds().height / 2 > 262);
+  CHECK(committed.bounds().y + committed.bounds().height / 2 < 258);
+  MainWindowTestAccess::undo(window);
+  CHECK(doc.find_layer(id)->metadata() == committed.metadata());
+  CHECK(doc.find_layer(id)->bounds() == committed.bounds());
+}
+
+// The caret is a bar across the line where the text bends, and a click on it puts the cursor
+// back where it was (the hit test resolves from the nearest point of the contour).
+void ui_text_path_caret_and_clicks_follow_the_contour() {
+  MainWindow window;
+  show_window_empty(window);
+  window.set_cli_automation_mode(true);
+  run(window, R"JS(
+    var d=app.newDocument(660,520);
+    var p={subpaths:[{closed:false,anchors:[{x:80,y:360,outX:200,outY:60},{x:580,y:360,inX:460,inY:60}]}]};
+    var t=d.addTextLayer('One two three four five six seven',{font:'Arial',size:32,path:p});
+    patchy.setResult(t.id);
+  )JS");
+  auto* canvas = require_canvas(window);
+  canvas->set_zoom(1.0);
+  const auto id = window.script_engine_host().last_result().toString().toULongLong();
+  const auto& doc = std::as_const(MainWindowTestAccess::document(window));
+  require_action_by_text(window, QStringLiteral("Type"))->trigger();
+  const auto bounds = doc.find_layer(id)->bounds();
+  // A press on the ink of the first word.
+  click_canvas(*canvas, QPoint(bounds.x + 14, bounds.y + bounds.height - 30));
+  auto* editor = session_editor(*canvas);
+  CHECK(editor != nullptr);
+  if (!editor) return;
+  auto* overlay = wait_for_path_overlay(*canvas);
+  CHECK(overlay != nullptr && overlay->isVisible());
+  if (!overlay) return;
+  const TextPathCurve curve(*text_path_in_document(*doc.find_layer(id)));
+  const auto text_length = editor->toPlainText().size();
+  for (const int position : {0, 5, 14, static_cast<int>(text_length)}) {
+    auto cursor = editor->textCursor();
+    cursor.setPosition(position);
+    editor->setTextCursor(cursor);
+    overlay->repaint();
+    const auto polygon = overlay->property("patchy.transformedTextCaretPolygon").toList();
+    CHECK(polygon.size() == 4);
+    if (polygon.size() != 4) continue;
+    QPointF centre;
+    for (const auto& point : polygon) centre += point.toPointF() / 4.0;
+    const auto document_point = canvas->document_point_for_widget_position(centre);
+    const auto nearest = curve.nearest(document_point.x(), document_point.y());
+    // The bar stands on the text's side of the line, within the type's height of it.
+    CHECK(nearest.left);
+    CHECK(nearest.gap > 2.0 && nearest.gap < 32.0);
+    // Its long axis lies along the contour's normal there.
+    const auto top = polygon[0].toPointF();
+    const auto bottom = polygon[3].toPointF();
+    const auto sample = curve.sample(nearest.distance);
+    const auto along = bottom - top;
+    const auto length = std::hypot(along.x(), along.y());
+    CHECK(length > 20.0);
+    CHECK(std::abs((along.x() * sample.tangent_x + along.y() * sample.tangent_y) / length) < 0.05);
+    // A click there lands on the same position.
+    click_widget_like_a_user(*canvas, centre.toPoint());
+    QApplication::processEvents();
+    CHECK(session_editor(*canvas) == editor);
+    if (session_editor(*canvas) != editor) return;
+    CHECK(editor->textCursor().position() == position);
+    overlay = session_overlay(*canvas);
+    CHECK(overlay != nullptr);
+    if (!overlay) return;
+  }
+  // A selection highlights along the contour without ending the session.
+  auto cursor = editor->textCursor();
+  cursor.setPosition(4);
+  cursor.setPosition(13, QTextCursor::KeepAnchor);
+  editor->setTextCursor(cursor);
+  overlay->repaint();
+  save_widget_artifact("ui_text_path_selection", *canvas);
+  save_widget_artifact("ui_text_path_window", window);
+  // A click well off the line, though inside the contour's bounds, is not a caret click: it
+  // clicks off, which commits this session (the Type tool may open a new one at the click).
+  const QPointer<QTextEdit> session(editor);
+  cursor.insertText(QStringLiteral("XYZ"));
+  // Sent to the canvas, whose filter offers every press to the overlay first: the overlay
+  // declines this one, and the canvas handles it as a click off the text.
+  click_canvas(*canvas, QPoint(330, 330));
+  process_events_for(50);
+  CHECK(session.isNull() || session_editor(*canvas) != session.data());
+  if (auto* next = session_editor(*canvas); next != nullptr && next != session.data()) {
+    send_key(*next, Qt::Key_Escape);
+    QApplication::processEvents();
+  }
+  const auto* committed = doc.find_layer(id);
+  CHECK(committed != nullptr && text_path_for_layer(*committed).has_value());
+  if (committed != nullptr) {
+    CHECK(QString::fromStdString(committed->metadata().at(kLayerMetadataText)).contains(QStringLiteral("XYZ")));
+  }
+}
+
+bool has_work_path(const Document& document) {
+  for (const auto& path : document.paths()) {
+    if (path.kind() == DocumentPathKind::Work) return true;
+  }
+  return false;
+}
+
+// GitHub issue 717 follow-up: with a path-text layer active, the Paths panel lists the text's
+// own boundary and the work path. Delete (or Backspace) on the selected work path row deletes
+// that path, as the row's Delete Path does, and leaves the layer alone; on the layer's own
+// boundary row it deletes the text layer and leaves the work path alone. With the canvas
+// focused, Delete is still the layer command.
+void ui_paths_panel_delete_key_deletes_the_selected_path_not_the_layer() {
+  MainWindow window;
+  show_window_empty(window);
+  window.set_cli_automation_mode(true);
+  run(window, R"JS(
+    var d=app.newDocument(660,520);
+    var p={subpaths:[{closed:false,anchors:[{x:80,y:360,outX:200,outY:60},{x:580,y:360,inX:460,inY:60}]}]};
+    var t=d.addTextLayer('Along the path',{font:'Arial',size:24,path:p});
+    t.name='Path text';
+    d.setWorkPath({subpaths:[{closed:false,anchors:[{x:100,y:450},{x:560,y:450}]}]});
+    d.activeLayer=t;
+    patchy.setResult(t.id);
+  )JS");
+  const auto id = window.script_engine_host().last_result().toString().toULongLong();
+  auto* canvas = require_canvas(window);
+  const auto& doc = std::as_const(MainWindowTestAccess::document(window));
+  MainWindowTestAccess::refresh_paths_panel(window);
+  QApplication::processEvents();
+  auto* list = window.findChild<QListWidget*>(QStringLiteral("pathsList"));
+  CHECK(list != nullptr);
+  if (list == nullptr) return;
+  CHECK(list->count() == 2);
+  if (list->count() != 2) return;
+  CHECK(list->item(0)->text().contains(QStringLiteral("Text Boundary")));
+  CHECK(has_work_path(doc));
+  const auto layer_count = doc.layers().size();
+  auto* handle = window.windowHandle();
+  CHECK(handle != nullptr);
+  if (handle == nullptr) return;
+  const auto press = [&](Qt::Key key) {
+    QTest::keyClick(handle, key);
+    QApplication::processEvents();
+  };
+  const auto click_row = [&](int row) {
+    list = window.findChild<QListWidget*>(QStringLiteral("pathsList"));
+    click_widget_like_a_user(*list->viewport(), list->visualItemRect(list->item(row)).center());
+    QApplication::processEvents();
+  };
+
+  for (const auto key : {Qt::Key_Delete, Qt::Key_Backspace}) {
+    // The way Seth did it: click the Work Path row, press the key.
+    click_row(1);
+    CHECK(list->currentItem() == list->item(1) && list->item(1)->isSelected());
+    CHECK(QApplication::focusWidget() == list);
+    press(key);
+    CHECK(!has_work_path(doc));
+    CHECK(doc.layers().size() == layer_count);
+    CHECK(doc.find_layer(id) != nullptr);
+    CHECK(MainWindowTestAccess::current_history_label(window) == QStringLiteral("Delete path"));
+    // One undo step puts the path back.
+    MainWindowTestAccess::undo(window);
+    QApplication::processEvents();
+    CHECK(has_work_path(doc));
+    CHECK(doc.find_layer(id) != nullptr);
+    list = window.findChild<QListWidget*>(QStringLiteral("pathsList"));
+    CHECK(list != nullptr && list->count() == 2);
+    if (list == nullptr || list->count() != 2) return;
+  }
+
+  // The text's own boundary row is the layer's content: the key deletes the text layer, in one
+  // step, and the work path stays.
+  click_row(0);
+  CHECK(list->item(0)->isSelected());
+  press(Qt::Key_Delete);
+  CHECK(doc.find_layer(id) == nullptr);
+  CHECK(doc.layers().size() == layer_count - 1);
+  CHECK(has_work_path(doc));
+  CHECK(MainWindowTestAccess::current_history_label(window) == QStringLiteral("Delete layer"));
+  MainWindowTestAccess::undo(window);
+  QApplication::processEvents();
+  CHECK(doc.find_layer(id) != nullptr);
+  CHECK(doc.layers().size() == layer_count);
+  CHECK(has_work_path(doc));
+
+  // On the canvas nothing changed: Delete on a text layer still removes the layer.
+  canvas->setFocus(Qt::OtherFocusReason);
+  QApplication::processEvents();
+  press(Qt::Key_Delete);
+  CHECK(doc.find_layer(id) == nullptr);
+  CHECK(has_work_path(doc));
+  MainWindowTestAccess::undo(window);
+  CHECK(doc.find_layer(id) != nullptr);
+}
+
+// What the Paths panel tests below share: the list, a real click on one of its rows, and a
+// key sent the way the window gets it.
+struct PathsListDriver {
+  MainWindow& window;
+
+  QListWidget* list() const { return window.findChild<QListWidget*>(QStringLiteral("pathsList")); }
+
+  void click_row(int row) const {
+    auto* rows = list();
+    click_widget_like_a_user(*rows->viewport(), rows->visualItemRect(rows->item(row)).center());
+    QApplication::processEvents();
+  }
+
+  void press(Qt::Key key) const {
+    QTest::keyClick(window.windowHandle(), key);
+    QApplication::processEvents();
+  }
+};
+
+// Desk card paths-delete-text-boundary: Delete (or Backspace) on an area text layer's
+// "Text Boundary" row deletes the text layer, in one step that undo takes back with the text;
+// only that layer goes, whatever else is selected; and Delete Path with a text session open
+// commits the session first, so the undo brings back what was typed too.
+void ui_paths_panel_delete_key_on_text_boundary_row_deletes_the_text_layer() {
+  MainWindow window;
+  show_window_empty(window);
+  window.set_cli_automation_mode(true);
+  run(window, R"JS(
+    var d=app.newDocument(660,520);
+    var keep=d.addTextLayer('Keep',{font:'Arial',size:24,x:40,y:480});
+    keep.name='Keep';
+    var p={subpaths:[{closed:true,anchors:[{x:80,y:60},{x:580,y:60},{x:580,y:400},{x:80,y:400}]}]};
+    var t=d.addTextLayer('One two three four five six seven eight nine ten. '.repeat(4),{font:'Arial',size:24,area:p});
+    t.name='Area';
+    d.activeLayer=t;
+    patchy.setResult(t.id+','+keep.id);
+  )JS");
+  const auto ids = window.script_engine_host().last_result().toString().split(QLatin1Char(','));
+  CHECK(ids.size() == 2);
+  if (ids.size() != 2) return;
+  const auto id = ids[0].toULongLong();
+  const auto keep_id = ids[1].toULongLong();
+  auto* canvas = require_canvas(window);
+  canvas->set_zoom(1.0);
+  const auto& doc = std::as_const(MainWindowTestAccess::document(window));
+  MainWindowTestAccess::refresh_paths_panel(window);
+  QApplication::processEvents();
+  const PathsListDriver paths{window};
+  CHECK(paths.list() != nullptr && window.windowHandle() != nullptr);
+  if (paths.list() == nullptr || window.windowHandle() == nullptr) return;
+  const auto* layer = doc.find_layer(id);
+  CHECK(layer != nullptr);
+  if (layer == nullptr) return;
+  const auto before = *layer;
+  const auto layer_count = doc.layers().size();
+  const auto boundary_row_shows = [&] {
+    auto* list = paths.list();
+    return list != nullptr && list->count() == 1 && list->item(0)->text() == QStringLiteral("Area Text Boundary");
+  };
+
+  for (const auto key : {Qt::Key_Delete, Qt::Key_Backspace}) {
+    CHECK(boundary_row_shows());
+    if (!boundary_row_shows()) return;
+    paths.click_row(0);
+    CHECK(paths.list()->item(0)->isSelected());
+    CHECK(QApplication::focusWidget() == paths.list());
+    paths.press(key);
+    CHECK(doc.find_layer(id) == nullptr);
+    CHECK(doc.find_layer(keep_id) != nullptr);
+    CHECK(doc.layers().size() == layer_count - 1);
+    CHECK(MainWindowTestAccess::current_history_label(window) == QStringLiteral("Delete layer"));
+    CHECK(session_editor(*canvas) == nullptr);
+    // One undo step brings the layer back, text and frame as they were.
+    MainWindowTestAccess::undo(window);
+    QApplication::processEvents();
+    layer = doc.find_layer(id);
+    CHECK(layer != nullptr);
+    if (layer == nullptr) return;
+    CHECK(layer->metadata() == before.metadata());
+    CHECK(layer->bounds() == before.bounds());
+    CHECK(doc.layers().size() == layer_count);
+    CHECK(doc.active_layer_id() == std::optional<LayerId>(id));
+  }
+
+  // Both text layers selected, the area text active: the row is the active layer's, so only
+  // that one is deleted.
+  MainWindowTestAccess::select_layers(window, {keep_id, id}, id);
+  QApplication::processEvents();
+  CHECK(MainWindowTestAccess::selected_layer_ids(window).size() == 2);
+  CHECK(boundary_row_shows());
+  if (!boundary_row_shows()) return;
+  paths.click_row(0);
+  paths.press(Qt::Key_Delete);
+  CHECK(doc.find_layer(id) == nullptr);
+  CHECK(doc.find_layer(keep_id) != nullptr);
+  CHECK(doc.layers().size() == layer_count - 1);
+  MainWindowTestAccess::undo(window);
+  QApplication::processEvents();
+  CHECK(doc.find_layer(id) != nullptr);
+  MainWindowTestAccess::select_layers(window, {id}, id);
+  QApplication::processEvents();
+
+  // A text session open on the layer (the panel's trash button takes no focus, so a click on
+  // it leaves the session open): Delete Path commits the typing, then deletes the layer.
+  require_action_by_text(window, QStringLiteral("Type"))->trigger();
+  click_canvas(*canvas, QPoint(before.bounds().x + 20, before.bounds().y + 12));
+  auto* editor = session_editor(*canvas);
+  CHECK(editor != nullptr);
+  if (editor == nullptr) return;
+  CHECK(editor->property("patchy.editingLayerId").toULongLong() == id);
+  auto cursor = editor->textCursor();
+  cursor.movePosition(QTextCursor::Start);
+  editor->setTextCursor(cursor);
+  editor->insertPlainText(QStringLiteral("XYZ "));
+  QApplication::processEvents();
+  auto* delete_path = window.findChild<QAction*>(QStringLiteral("pathDeleteAction"));
+  CHECK(delete_path != nullptr);
+  if (delete_path == nullptr) return;
+  CHECK(boundary_row_shows());
+  CHECK(delete_path->isEnabled());
+  delete_path->trigger();
+  process_events_for(50);
+  CHECK(session_editor(*canvas) == nullptr);
+  CHECK(canvas->findChild<QWidget*>(QStringLiteral("transformedTextEditOverlay")) == nullptr);
+  CHECK(doc.find_layer(id) == nullptr);
+  CHECK(doc.find_layer(keep_id) != nullptr);
+  CHECK(MainWindowTestAccess::current_history_label(window) == QStringLiteral("Delete layer"));
+  MainWindowTestAccess::undo(window);
+  process_events_for(50);
+  layer = doc.find_layer(id);
+  CHECK(layer != nullptr);
+  if (layer == nullptr) return;
+  CHECK(QString::fromStdString(layer->metadata().at(kLayerMetadataText)).startsWith(QStringLiteral("XYZ One two")));
+  CHECK(layer->metadata().contains(kLayerMetadataTextArea));
+  CHECK(session_editor(*canvas) == nullptr);
+}
+
+// The same key on a "Vector Mask" row deletes the layer's vector mask, as Layer > Vector Mask >
+// Delete does, and keeps the layer.
+void ui_paths_panel_delete_key_on_vector_mask_row_deletes_the_mask() {
+  MainWindow window;
+  show_window_empty(window);
+  window.set_cli_automation_mode(true);
+  run(window, R"JS(
+    var d=app.newDocument(400,300);
+    var l=d.addLayer('Masked');
+    l.setVectorMask({path:{subpaths:[{closed:true,anchors:[{x:60,y:50},{x:340,y:50},{x:340,y:250},{x:60,y:250}]}]}});
+    d.activeLayer=l;
+    patchy.setResult(l.id);
+  )JS");
+  const auto id = window.script_engine_host().last_result().toString().toULongLong();
+  auto* canvas = require_canvas(window);
+  const auto& doc = std::as_const(MainWindowTestAccess::document(window));
+  MainWindowTestAccess::refresh_paths_panel(window);
+  QApplication::processEvents();
+  const PathsListDriver paths{window};
+  CHECK(paths.list() != nullptr && window.windowHandle() != nullptr);
+  if (paths.list() == nullptr || window.windowHandle() == nullptr) return;
+  const auto layer_count = doc.layers().size();
+  for (const auto key : {Qt::Key_Delete, Qt::Key_Backspace}) {
+    auto* list = paths.list();
+    CHECK(list->count() == 1);
+    if (list->count() != 1) return;
+    CHECK(list->item(0)->text() == QStringLiteral("Masked Vector Mask"));
+    CHECK(doc.find_layer(id) != nullptr && doc.find_layer(id)->vector_mask() != nullptr);
+    paths.click_row(0);
+    CHECK(paths.list()->item(0)->isSelected());
+    // The click targets the mask, as a click on its thumbnail does.
+    CHECK(canvas->layer_edit_target() == CanvasWidget::LayerEditTarget::VectorMask);
+    paths.press(key);
+    const auto* layer = doc.find_layer(id);
+    CHECK(layer != nullptr);
+    if (layer == nullptr) return;
+    CHECK(layer->vector_mask() == nullptr);
+    CHECK(doc.layers().size() == layer_count);
+    CHECK(MainWindowTestAccess::current_history_label(window) == QStringLiteral("Delete vector mask"));
+    CHECK(canvas->layer_edit_target() == CanvasWidget::LayerEditTarget::Content);
+    // The mask's row went with it, and a second press has nothing to act on.
+    CHECK(paths.list()->count() == 0);
+    paths.press(key);
+    CHECK(doc.find_layer(id) != nullptr);
+    CHECK(doc.layers().size() == layer_count);
+    MainWindowTestAccess::undo(window);
+    QApplication::processEvents();
+    layer = doc.find_layer(id);
+    CHECK(layer != nullptr && layer->vector_mask() != nullptr);
+  }
+}
+
+// On a "Shape Path" row the key deletes the shape layer: the path is the shape.
+void ui_paths_panel_delete_key_on_shape_path_row_deletes_the_shape_layer() {
+  MainWindow window;
+  show_window_empty(window);
+  window.set_cli_automation_mode(true);
+  run(window, R"JS(
+    var d=app.newDocument(400,300);
+    var other=d.addShape('Other',{type:'ellipse',x:20,y:20,width:80,height:60});
+    var s=d.addShape('Badge',{type:'rectangle',x:120,y:80,width:200,height:140});
+    d.activeLayer=s;
+    patchy.setResult(s.id+','+other.id);
+  )JS");
+  const auto ids = window.script_engine_host().last_result().toString().split(QLatin1Char(','));
+  CHECK(ids.size() == 2);
+  if (ids.size() != 2) return;
+  const auto id = ids[0].toULongLong();
+  const auto other_id = ids[1].toULongLong();
+  const auto& doc = std::as_const(MainWindowTestAccess::document(window));
+  MainWindowTestAccess::refresh_paths_panel(window);
+  QApplication::processEvents();
+  const PathsListDriver paths{window};
+  CHECK(paths.list() != nullptr && window.windowHandle() != nullptr);
+  if (paths.list() == nullptr || window.windowHandle() == nullptr) return;
+  const auto layer_count = doc.layers().size();
+  auto* delete_path = window.findChild<QAction*>(QStringLiteral("pathDeleteAction"));
+  auto* duplicate_path = window.findChild<QAction*>(QStringLiteral("pathDuplicateAction"));
+  CHECK(delete_path != nullptr && duplicate_path != nullptr);
+  if (delete_path == nullptr || duplicate_path == nullptr) return;
+  for (const auto key : {Qt::Key_Delete, Qt::Key_Backspace}) {
+    auto* list = paths.list();
+    CHECK(list->count() == 1);
+    if (list->count() != 1) return;
+    CHECK(list->item(0)->text() == QStringLiteral("Badge Shape Path"));
+    paths.click_row(0);
+    CHECK(paths.list()->item(0)->isSelected());
+    // The row can be deleted, not duplicated.
+    CHECK(delete_path->isEnabled());
+    CHECK(!duplicate_path->isEnabled());
+    paths.press(key);
+    CHECK(doc.find_layer(id) == nullptr);
+    CHECK(doc.find_layer(other_id) != nullptr);
+    CHECK(doc.layers().size() == layer_count - 1);
+    CHECK(MainWindowTestAccess::current_history_label(window) == QStringLiteral("Delete layer"));
+    MainWindowTestAccess::undo(window);
+    QApplication::processEvents();
+    const auto* layer = doc.find_layer(id);
+    CHECK(layer != nullptr && layer->vector_shape() != nullptr);
+    CHECK(doc.layers().size() == layer_count);
+    CHECK(doc.active_layer_id() == std::optional<LayerId>(id));
+  }
+}
+
+// Type > Flip Text on Path on a committed layer: the contour is reversed, the text hangs on
+// the other side, one undo step puts it back, and the command is offered for path text only.
+void ui_text_path_flip_command_flips_a_committed_layer() {
+  MainWindow window;
+  show_window_empty(window);
+  window.set_cli_automation_mode(true);
+  run(window, R"JS(
+    var d=app.newDocument(660,520);
+    var plain=d.addTextLayer('Plain',{font:'Arial',size:24,x:60,y:460});
+    plain.name='Plain';
+    var p={subpaths:[{closed:false,anchors:[{x:80,y:260},{x:580,y:260}]}]};
+    var t=d.addTextLayer('Along',{font:'Arial',size:24,path:p,pathRange:{start:0.2,end:0.9}});
+    t.name='Path';
+    d.activeLayer=t;
+    patchy.setResult(t.id);
+  )JS");
+  const auto id = window.script_engine_host().last_result().toString().toULongLong();
+  const auto& doc = std::as_const(MainWindowTestAccess::document(window));
+  QApplication::processEvents();
+  auto* action = window.findChild<QAction*>(QStringLiteral("typeFlipTextOnPathAction"));
+  CHECK(action != nullptr);
+  if (action == nullptr) return;
+  CHECK(action->text() == QStringLiteral("Flip Text on Path"));
+  CHECK(action->shortcut().isEmpty());
+  CHECK(action->isEnabled());
+  const auto* layer = doc.find_layer(id);
+  CHECK(layer != nullptr);
+  if (layer == nullptr) return;
+  const auto before = *layer;
+  const auto frame_before = text_path_frame_for_layer(before);
+  CHECK(frame_before.has_value());
+  if (!frame_before) return;
+  // The text stands above the line.
+  CHECK(before.bounds().y + before.bounds().height / 2 < 258);
+
+  action->trigger();
+  QApplication::processEvents();
+  CHECK(MainWindowTestAccess::current_history_label(window) == QStringLiteral("Flip Text on Path"));
+  layer = doc.find_layer(id);
+  CHECK(layer != nullptr);
+  if (layer == nullptr) return;
+  const auto frame_after = text_path_frame_for_layer(*layer);
+  CHECK(frame_after.has_value());
+  if (!frame_after) return;
+  CHECK(frame_after->path == reversed_text_path(frame_before->path));
+  CHECK(frame_after->range == reversed_text_path_range(frame_before->path, frame_before->range));
+  CHECK(std::abs(frame_after->range.start - 0.1) < 1e-9 && std::abs(frame_after->range.end - 0.8) < 1e-9);
+  CHECK(layer->metadata().at(kLayerMetadataText) == before.metadata().at(kLayerMetadataText));
+  // Below the line now, and still on the same stretch of it.
+  CHECK(layer->bounds().y + layer->bounds().height / 2 > 262);
+  const auto in_document = text_path_in_document(*layer);
+  CHECK(in_document.has_value());
+  if (in_document) {
+    CHECK(std::abs(in_document->subpaths.front().anchors.front().anchor_x - 580.0) < 1e-6);
+  }
+  // A second flip is the original again; so is one undo of the first.
+  action->trigger();
+  QApplication::processEvents();
+  const auto frame_twice = text_path_frame_for_layer(*doc.find_layer(id));
+  CHECK(frame_twice.has_value());
+  if (!frame_twice) return;
+  CHECK(frame_twice->path == frame_before->path);
+  CHECK(std::abs(frame_twice->range.start - frame_before->range.start) < 1e-9 &&
+        std::abs(frame_twice->range.end - frame_before->range.end) < 1e-9);
+  MainWindowTestAccess::undo(window);
+  MainWindowTestAccess::undo(window);
+  QApplication::processEvents();
+  layer = doc.find_layer(id);
+  CHECK(layer != nullptr && layer->metadata() == before.metadata());
+  CHECK(layer != nullptr && layer->bounds() == before.bounds());
+
+  // Only path text offers it.
+  run(window, "var d=app.activeDocument;d.activeLayer=d.findLayer('Plain');");
+  QApplication::processEvents();
+  CHECK(!action->isEnabled());
+  run(window, "var d=app.activeDocument;d.activeLayer=d.findLayer('Path');");
+  QApplication::processEvents();
+  CHECK(action->isEnabled());
+
+  // It sits in the Type menu, after the outline commands.
+  QMenu* type_menu = nullptr;
+  for (auto* object : action->associatedObjects()) {
+    if (auto* menu = qobject_cast<QMenu*>(object); menu != nullptr && menu->objectName() == QStringLiteral("typeMenu")) {
+      type_menu = menu;
+    }
+  }
+  CHECK(type_menu != nullptr);
+  if (type_menu == nullptr) return;
+  const auto entries = type_menu->actions();
+  const auto flip_index = entries.indexOf(action);
+  const auto shape_index = entries.indexOf(window.findChild<QAction*>(QStringLiteral("typeConvertToShapeAction")));
+  CHECK(shape_index >= 0 && flip_index == shape_index + 1);
+  ensure_artifact_dir();
+  type_menu->popup(window.mapToGlobal(QPoint(160, 60)));
+  QApplication::processEvents();
+  CHECK(action->isEnabled());  // the menu's own refresh agrees
+  save_widget_artifact("ui_text_path_type_menu", *type_menu);
+  type_menu->hide();
+  QApplication::processEvents();
+}
+
+// Column 2 (the stored alignment name) of a text layer's first paragraph run.
+QString stored_alignment(const Document& document, LayerId id) {
+  const auto* layer = document.find_layer(id);
+  if (layer == nullptr) return {};
+  const auto found = layer->metadata().find(kLayerMetadataTextParagraphRuns);
+  if (found == layer->metadata().end()) return {};
+  for (const auto& line : QString::fromStdString(found->second).split(QLatin1Char('\n'))) {
+    const auto fields = line.trimmed().split(QLatin1Char('\t'));
+    if (fields.size() >= 3) return fields[2];
+  }
+  return {};
+}
+
+// What the options bar's alignment buttons show: the checked one of L / C / R, "+justify" when
+// Justify is checked, "(justify off)" when the Justify button is disabled.
+QString bar_alignment(MainWindow& window) {
+  QString shown;
+  for (const auto& [object_name, label] : {std::pair{"textAlignLeftButton", "left"},
+                                           std::pair{"textAlignCenterButton", "center"},
+                                           std::pair{"textAlignRightButton", "right"}}) {
+    const auto* button = window.findChild<QPushButton*>(QLatin1String(object_name));
+    CHECK(button != nullptr);
+    if (button != nullptr && button->isChecked()) shown += QLatin1String(label);
+  }
+  const auto* justify = window.findChild<QPushButton*>(QStringLiteral("textJustifyButton"));
+  CHECK(justify != nullptr);
+  if (justify != nullptr && justify->isChecked()) shown += QStringLiteral("+justify");
+  if (justify != nullptr && !justify->isEnabled()) shown += QStringLiteral("(justify off)");
+  return shown;
+}
+
+// The checked entry of Type > Alignment after the menu refreshes its checks.
+QString menu_alignment(MainWindow& window) {
+  auto* menu = window.findChild<QMenu*>(QStringLiteral("typeMenu"));
+  auto* alignment = window.findChild<QMenu*>(QStringLiteral("typeAlignmentMenu"));
+  CHECK(menu != nullptr && alignment != nullptr);
+  if (menu == nullptr || alignment == nullptr) return {};
+  emit menu->aboutToShow();
+  QString checked;
+  for (const auto* action : alignment->actions()) {
+    if (action->isChecked()) checked += action->data().toString();
+  }
+  return checked;
+}
+
+// The Paragraph panel's alignment entry, and how many of its four justify entries can be picked.
+struct PanelAlignment {
+  QString shown;
+  int justify_entries_enabled{-1};
+};
+
+PanelAlignment panel_alignment(MainWindow& window) {
+  PanelAlignment result;
+  QTimer::singleShot(0, guarded([&] {
+    auto* dialog = window.findChild<QDialog*>(QStringLiteral("textParagraphDialog"));
+    CHECK(dialog != nullptr);
+    if (dialog == nullptr) return;
+    if (auto* combo = dialog->findChild<QComboBox*>(QStringLiteral("textParagraphAlignCombo")); combo != nullptr) {
+      result.shown = combo->currentData().toString();
+      result.justify_entries_enabled = 0;
+      if (const auto* model = qobject_cast<QStandardItemModel*>(combo->model()); model != nullptr) {
+        for (int row = 0; row < model->rowCount(); ++row) {
+          const auto* item = model->item(row);
+          if (item != nullptr && item->data(Qt::UserRole).toString().startsWith(QStringLiteral("justify")) &&
+              item->isEnabled()) {
+            ++result.justify_entries_enabled;
+          }
+        }
+      }
+    }
+    dialog->reject();
+  }));
+  auto* button = window.findChild<QPushButton*>(QStringLiteral("textParagraphButton"));
+  CHECK(button != nullptr);
+  if (button != nullptr) button->click();
+  QApplication::processEvents();
+  return result;
+}
+
+void select_layer_row(MainWindow& window, const QString& name) {
+  auto* list = window.findChild<QListWidget*>(QStringLiteral("layerList"));
+  CHECK(list != nullptr);
+  if (list == nullptr) return;
+  list->clearSelection();
+  list->setCurrentItem(require_layer_item(*list, name));
+  QApplication::processEvents();
+}
+
+// GitHub issue 717: a line on a path is justified like a one-line box, as Photoshop draws it,
+// and the controls show its plain alignment with Justify off. The expected ink columns are
+// Photoshop 2027's (COM, November 2026): a 660 x 320 px document, a straight path from (80, 160)
+// to (580, 160), black Arial 48 px. "fits" is IIIII IIIII; "over" is ten such groups, of which
+// the range holds six.
+void ui_text_path_justify_modes_draw_like_photoshop_and_show_plain_alignment() {
+  if (arial_missing()) return;
+  MainWindow window;
+  show_window_empty(window);
+  window.set_cli_automation_mode(true);
+  struct Case {
+    const char* name;
+    const char* align;
+    bool over;
+    int left;
+    int right;  // one past the last ink column, as Photoshop's bounds give it
+    const char* shown;
+  };
+  const std::vector<Case> cases{
+      {"left", "left", false, 84, 222, "left"},
+      {"center", "center", false, 261, 399, "center"},
+      {"right", "right", false, 437, 576, "right"},
+      {"justify", "justify", false, 84, 222, "left"},
+      {"justifyCenter", "justifyCenter", false, 261, 399, "center"},
+      {"justifyRight", "justifyRight", false, 437, 576, "right"},
+      {"justifyAll", "justifyAll", false, 84, 576, "left"},
+      {"over-left", "left", true, 84, 542, "left"},
+      {"over-justify", "justify", true, 84, 576, "left"},
+      {"over-right", "right", true, 117, 576, "right"},
+  };
+  QJsonArray specs;
+  for (const auto& entry : cases) {
+    specs.push_back(QJsonObject{{"name", entry.name}, {"align", entry.align}, {"over", entry.over}});
+  }
+  const auto ids = run(window, QStringLiteral(R"JS(
+    var d=app.newDocument(660,320);
+    var p={subpaths:[{closed:false,anchors:[{x:80,y:160},{x:580,y:160}]}]};
+    var fits='IIIII IIIII',over=[];
+    for(var i=0;i<10;i++)over.push('IIIII');
+    var ids=%1.map(function(spec){
+      var t=d.addTextLayer(spec.over?over.join(' '):fits,{font:'Arial',size:48,path:p,align:spec.align});
+      t.name=spec.name;
+      check(t.textAlign===spec.align,'the stored alignment is the one asked for');
+      return t.id;
+    });
+    var point=d.addTextLayer('Point',{font:'Arial',size:24,x:40,y:60,align:'justifyCenter'});point.name='point';
+    var box=d.addTextLayer('Box text',
+        {font:'Arial',size:24,x:40,y:220,box:{width:200,height:60},align:'justifyCenter'});
+    box.name='box';
+    patchy.setResult(ids);
+  )JS").arg(QString::fromUtf8(QJsonDocument(specs).toJson(QJsonDocument::Compact)))).toArray();
+  CHECK(ids.size() == static_cast<qsizetype>(cases.size()));
+  if (ids.size() != static_cast<qsizetype>(cases.size())) return;
+  const auto& doc = std::as_const(MainWindowTestAccess::document(window));
+  require_action_by_text(window, QStringLiteral("Type"))->trigger();
+  QApplication::processEvents();
+  for (std::size_t i = 0; i < cases.size(); ++i) {
+    const auto& entry = cases[i];
+    const auto id = ids[static_cast<qsizetype>(i)].toString().toULongLong();
+    const auto* layer = doc.find_layer(id);
+    CHECK(layer != nullptr);
+    if (layer == nullptr) continue;
+    const auto ink = ink_bounds(layer_on_white(*layer, QSize(660, 320)));
+    std::printf("  %s: ink x %d..%d (Photoshop %d..%d)\n", entry.name, ink.left(), ink.right() + 1, entry.left,
+                entry.right);
+    CHECK(std::abs(ink.left() - entry.left) <= 2);
+    CHECK(std::abs(ink.right() + 1 - entry.right) <= 2);
+    // The mode stays in the layer; the controls show the plain alignment and no Justify.
+    CHECK(stored_alignment(doc, id) == QLatin1String(entry.align));
+    select_layer_row(window, QLatin1String(entry.name));
+    CHECK(bar_alignment(window) == QLatin1String(entry.shown) + QStringLiteral("(justify off)"));
+    CHECK(menu_alignment(window) == QLatin1String(entry.shown));
+  }
+  std::fflush(stdout);
+
+  // The Paragraph panel shows the same and turns its justify entries off.
+  select_layer_row(window, QStringLiteral("justifyCenter"));
+  auto panel = panel_alignment(window);
+  CHECK(panel.shown == QStringLiteral("center"));
+  CHECK(panel.justify_entries_enabled == 0);
+  // Point text sets every justify mode at its start edge; a text box keeps the choice.
+  select_layer_row(window, QStringLiteral("point"));
+  CHECK(bar_alignment(window) == QStringLiteral("left(justify off)"));
+  CHECK(menu_alignment(window) == QStringLiteral("left"));
+  select_layer_row(window, QStringLiteral("box"));
+  CHECK(bar_alignment(window) == QStringLiteral("center+justify"));
+  CHECK(menu_alignment(window) == QStringLiteral("justifyCenter"));
+  panel = panel_alignment(window);
+  CHECK(panel.shown == QStringLiteral("justifyCenter"));
+  CHECK(panel.justify_entries_enabled == 4);
+
+  // An edit that leaves the alignment alone keeps the stored mode, so a save gives Photoshop
+  // back what it wrote; picking an alignment stores that one.
+  const auto center_id = ids[4].toString().toULongLong();
+  run(window, QStringLiteral("var t=app.activeDocument.findLayer('justifyCenter');t.text='IIIII III';"
+                             "check(t.textAlign==='justifyCenter','kept');"));
+  CHECK(stored_alignment(doc, center_id) == QStringLiteral("justifyCenter"));
+  select_layer_row(window, QStringLiteral("justifyCenter"));
+  CHECK(bar_alignment(window) == QStringLiteral("center(justify off)"));
+  auto* right = window.findChild<QPushButton*>(QStringLiteral("textAlignRightButton"));
+  CHECK(right != nullptr);
+  if (right == nullptr) return;
+  right->click();
+  QApplication::processEvents();
+  CHECK(stored_alignment(doc, center_id) == QStringLiteral("right"));
+  CHECK(bar_alignment(window) == QStringLiteral("right(justify off)"));
+  // A justify entry picked from the menu (or a key bound to it) comes to its plain alignment.
+  require_action(window, "typeAlignJustifyCenterAction")->trigger();
+  QApplication::processEvents();
+  CHECK(stored_alignment(doc, center_id) == QStringLiteral("center"));
+  CHECK(bar_alignment(window) == QStringLiteral("center(justify off)"));
+}
+
+// The reporter's file (GitHub issue 717): both texts are right-to-left paragraphs that store
+// Justify with the last line at the start edge and a first line indent, left over from the
+// Paragraph panel. Photoshop sets them from the right end of their range and shows no justify
+// mode; Patchy showed Left with Justify on.
+void ui_text_path_older_photoshop_cc_file_shows_plain_alignment_if_available() {
+  const auto fixture = older_photoshop_cc_fixture();
+  patchy::test::skip_unless_exists(fixture);
+  if (older_photoshop_cc_fonts_missing()) return;
+  MainWindow window;
+  show_window_empty(window);
+  window.set_cli_automation_mode(true);
+  const auto quoted =
+      QString::fromUtf8(QJsonDocument(QJsonArray{to_qstring(fixture)}).toJson(QJsonDocument::Compact));
+  const auto layers = run(window, QStringLiteral(R"JS(
+    var d=app.open(%1[0]);
+    var texts=d.layers.filter(function(l){return l.isText;});
+    check(texts.length===2,'two type layers');
+    patchy.setResult(texts.map(function(t){return {id:t.id,name:t.name};}));
+  )JS").arg(quoted)).toArray();
+  CHECK(layers.size() == 2);
+  const auto& doc = std::as_const(MainWindowTestAccess::document(window));
+  require_action_by_text(window, QStringLiteral("Type"))->trigger();
+  QApplication::processEvents();
+  for (const auto& value : layers) {
+    const auto entry = value.toObject();
+    const auto id = entry["id"].toString().toULongLong();
+    CHECK(stored_alignment(doc, id) == QStringLiteral("justify"));
+    select_layer_row(window, entry["name"].toString());
+    CHECK(bar_alignment(window) == QStringLiteral("right(justify off)"));
+    CHECK(menu_alignment(window) == QStringLiteral("right"));
+    CHECK(panel_alignment(window).shown == QStringLiteral("right"));
+  }
+}
+
+}  // namespace
+
+std::vector<patchy::test::TestCase> text_path_tests() {
+  return {
+      {"ui_text_path_line_plan_maps_onto_the_contour", ui_text_path_line_plan_maps_onto_the_contour},
+      {"ui_text_path_glyphs_match_photoshop_placement_if_available",
+       ui_text_path_glyphs_match_photoshop_placement_if_available},
+      {"ui_text_path_photoshop_files_redraw_where_photoshop_drew_them_if_available",
+       ui_text_path_photoshop_files_redraw_where_photoshop_drew_them_if_available},
+      {"ui_text_path_older_photoshop_cc_file_redraws_where_photoshop_drew_it_if_available",
+       ui_text_path_older_photoshop_cc_file_redraws_where_photoshop_drew_it_if_available},
+      {"ui_text_path_older_photoshop_cc_file_edits_with_the_type_tool_if_available",
+       ui_text_path_older_photoshop_cc_file_edits_with_the_type_tool_if_available},
+      {"ui_text_path_photoshop_file_edits_in_place", ui_text_path_photoshop_file_edits_in_place},
+      {"ui_text_path_script_creation_range_flip_and_undo", ui_text_path_script_creation_range_flip_and_undo},
+      {"ui_text_path_type_tool_targets_shape_edges_and_reopens", ui_text_path_type_tool_targets_shape_edges_and_reopens},
+      {"ui_text_path_type_tool_types_along_an_open_work_path", ui_text_path_type_tool_types_along_an_open_work_path},
+      {"ui_text_path_type_tool_cursor_names_the_click_target", ui_text_path_type_tool_cursor_names_the_click_target},
+      {"ui_text_path_type_tool_leaves_the_inside_of_a_ring_of_text_free",
+       ui_text_path_type_tool_leaves_the_inside_of_a_ring_of_text_free},
+      {"ui_text_path_type_tool_cursor_follows_each_hover_move", ui_text_path_type_tool_cursor_follows_each_hover_move},
+      {"ui_text_path_type_tool_cursor_refreshes_without_a_move", ui_text_path_type_tool_cursor_refreshes_without_a_move},
+      {"ui_text_path_older_photoshop_cc_file_shows_the_path_cursor_along_each_line_if_available",
+       ui_text_path_older_photoshop_cc_file_shows_the_path_cursor_along_each_line_if_available},
+      {"ui_text_path_first_click_puts_the_caret_at_the_click", ui_text_path_first_click_puts_the_caret_at_the_click},
+      {"ui_text_path_first_click_in_a_right_to_left_paragraph_takes_the_nearer_end",
+       ui_text_path_first_click_in_a_right_to_left_paragraph_takes_the_nearer_end},
+      {"ui_text_path_first_click_on_a_curve_matches_a_second_click",
+       ui_text_path_first_click_on_a_curve_matches_a_second_click},
+      {"ui_text_path_older_photoshop_cc_file_first_click_puts_the_caret_at_the_click_if_available",
+       ui_text_path_older_photoshop_cc_file_first_click_puts_the_caret_at_the_click_if_available},
+      {"ui_text_first_click_on_point_and_area_text_puts_the_caret_at_the_click",
+       ui_text_first_click_on_point_and_area_text_puts_the_caret_at_the_click},
+      {"ui_text_path_handles_move_the_range_and_flip", ui_text_path_handles_move_the_range_and_flip},
+      {"ui_text_path_flip_command_flips_a_committed_layer", ui_text_path_flip_command_flips_a_committed_layer},
+      {"ui_text_path_justify_modes_draw_like_photoshop_and_show_plain_alignment",
+       ui_text_path_justify_modes_draw_like_photoshop_and_show_plain_alignment},
+      {"ui_text_path_older_photoshop_cc_file_shows_plain_alignment_if_available",
+       ui_text_path_older_photoshop_cc_file_shows_plain_alignment_if_available},
+      {"ui_paths_panel_delete_key_deletes_the_selected_path_not_the_layer",
+       ui_paths_panel_delete_key_deletes_the_selected_path_not_the_layer},
+      {"ui_paths_panel_delete_key_on_text_boundary_row_deletes_the_text_layer",
+       ui_paths_panel_delete_key_on_text_boundary_row_deletes_the_text_layer},
+      {"ui_paths_panel_delete_key_on_vector_mask_row_deletes_the_mask",
+       ui_paths_panel_delete_key_on_vector_mask_row_deletes_the_mask},
+      {"ui_paths_panel_delete_key_on_shape_path_row_deletes_the_shape_layer",
+       ui_paths_panel_delete_key_on_shape_path_row_deletes_the_shape_layer},
+      {"ui_text_path_caret_and_clicks_follow_the_contour", ui_text_path_caret_and_clicks_follow_the_contour},
+  };
+}

@@ -1,0 +1,626 @@
+// Help > Add Patchy to Applications Menu (GitHub issue 226, docs/appimage.md): the desktop
+// file and icons it writes into a temporary XDG data folder, that Remove deletes only
+// those, the moved-AppImage refresh, other tools' entries, and the menu item and startup
+// offer under a faked AppImage environment.
+#include "ui/app_settings.hpp"
+#include "ui/appimage_menu_entry.hpp"
+#include "ui/main_window.hpp"
+#include "ui/qt_paths.hpp"
+#include "test_harness.hpp"
+#include "ui_test_access.hpp"
+#include "ui_test_groups.hpp"
+#include "ui_test_support.hpp"
+#include "unicode_path_names.hpp"
+
+#include <QAbstractButton>
+#include <QAction>
+#include <QApplication>
+#include <QByteArray>
+#include <QCoreApplication>
+#include <QDateTime>
+#include <QDir>
+#include <QFile>
+#include <QFileInfo>
+#include <QFrame>
+#include <QLabel>
+#include <QMenu>
+#include <QMenuBar>
+#include <QPoint>
+#include <QSpinBox>
+#include <QStatusBar>
+#include <QString>
+#include <QStringList>
+#include <QTemporaryDir>
+#include <QTimer>
+
+#ifdef PATCHY_HAVE_QT_DBUS
+#include <QDBusConnection>
+#include <QDBusServer>
+#endif
+
+#ifdef Q_OS_LINUX
+#include <sys/time.h>
+#endif
+
+#include <optional>
+#include <utility>
+#include <vector>
+
+namespace {
+
+using namespace patchy::test::ui;
+using patchy::ui::AppImageMenuEntryPaths;
+using patchy::ui::AppImageMenuEntryState;
+using patchy::ui::MainWindowTestAccess;
+
+// Scoped environment variables, restored (or unset) on destruction.
+class ScopedEnvironment {
+ public:
+  ScopedEnvironment(std::initializer_list<std::pair<const char*, QByteArray>> values) {
+    for (const auto& [name, value] : values) {
+      saved_.push_back({name, qEnvironmentVariableIsSet(name), qgetenv(name)});
+      qputenv(name, value);
+    }
+  }
+  ~ScopedEnvironment() {
+    for (const auto& entry : saved_) {
+      if (entry.had) {
+        qputenv(entry.name, entry.value);
+      } else {
+        qunsetenv(entry.name);
+      }
+    }
+  }
+  ScopedEnvironment(const ScopedEnvironment&) = delete;
+  ScopedEnvironment& operator=(const ScopedEnvironment&) = delete;
+
+ private:
+  struct Saved {
+    const char* name;
+    bool had;
+    QByteArray value;
+  };
+  std::vector<Saved> saved_;
+};
+
+QByteArray read_bytes(const QString& path) {
+  QFile file(path);
+  CHECK(file.open(QIODevice::ReadOnly));
+  return file.readAll();
+}
+
+void write_bytes(const QString& path, const QByteArray& bytes) {
+  CHECK(QDir().mkpath(QFileInfo(path).absolutePath()));
+  QFile file(path);
+  CHECK(file.open(QIODevice::WriteOnly | QIODevice::Truncate));
+  CHECK(file.write(bytes) == bytes.size());
+}
+
+// What the AppImage carries in usr/share, copied from the files CMake installs there
+// (packaging/linux, CMakeLists.txt's Linux install rules).
+void populate_bundled_share(const QString& share) {
+  write_bytes(QDir(share).filePath(QStringLiteral("applications/com.rtsoft.patchy.desktop")),
+              read_bytes(QStringLiteral(PATCHY_SOURCE_DIR "/packaging/linux/com.rtsoft.patchy.desktop")));
+  for (const int size : {16, 32, 48, 64, 128, 256, 512}) {
+    const auto name = QStringLiteral("icons/hicolor/%1x%1/apps/com.rtsoft.patchy.png").arg(size);
+    write_bytes(QDir(share).filePath(name),
+                read_bytes(QStringLiteral(PATCHY_SOURCE_DIR "/packaging/linux/") + name));
+  }
+  write_bytes(QDir(share).filePath(QStringLiteral("icons/hicolor/scalable/apps/com.rtsoft.patchy.svg")),
+              read_bytes(QStringLiteral(PATCHY_SOURCE_DIR "/packaging/branding/patchy-logo-folded.svg")));
+}
+
+// One [Desktop Entry] value, unescaped only for the backslash pair the tests use.
+QString desktop_value(const QByteArray& entry, const QString& key) {
+  for (const auto& line : entry.split('\n')) {
+    const auto text = QString::fromUtf8(line);
+    if (text.startsWith(key + QLatin1Char('='))) {
+      return text.mid(key.size() + 1);
+    }
+  }
+  return {};
+}
+
+QAction* help_menu_entry_action(patchy::ui::MainWindow& window) {
+  return require_action(window, "helpAppImageMenuEntryAction");
+}
+
+QMenu* help_menu(patchy::ui::MainWindow& window) {
+  for (auto* top : window.menuBar()->actions()) {
+    if (auto* menu = top->menu(); menu != nullptr && menu->actions().contains(help_menu_entry_action(window))) {
+      return menu;
+    }
+  }
+  CHECK(false);
+  return nullptr;
+}
+
+// Opens Help so its aboutToShow refresh runs, as a user opening the menu does.
+void open_help_menu(patchy::ui::MainWindow& window, const char* artifact = nullptr) {
+  auto* menu = help_menu(window);
+  menu->popup(window.mapToGlobal(QPoint(40, 30)));
+  QApplication::processEvents();
+  if (artifact != nullptr) {
+    save_widget_artifact(artifact, *menu);
+  }
+  menu->hide();
+  QApplication::processEvents();
+}
+
+// The AppImage file name every test uses: the shared Unicode stem plus the characters
+// the Exec quoting rules reserve.
+QString appimage_name() {
+  return QString::fromStdString(patchy::test::utf8_string(patchy::test::kUnicodeCombinedStem)) +
+         QStringLiteral(" $HOME `x` \"q\" back\\slash.AppImage");
+}
+
+struct EntryFixture {
+  QTemporaryDir root;
+  AppImageMenuEntryPaths paths;
+
+  EntryFixture() {
+    CHECK(root.isValid());
+    const auto artifacts = patchy::ui::to_qstring(
+        std::filesystem::absolute(patchy::test::unicode_artifact_dir(u8"appimage-menu-entry")));
+    paths.appimage_file = QDir(root.path()).filePath(QStringLiteral("Apps/") + appimage_name());
+    paths.bundled_share = QDir(root.path()).filePath(QStringLiteral("mount/usr/share"));
+    paths.data_home = QDir(artifacts).filePath(QStringLiteral("data-home"));
+    paths.data_dirs = {QDir(root.path()).filePath(QStringLiteral("system-share"))};
+    populate_bundled_share(paths.bundled_share);
+  }
+};
+
+// Add writes the shipped desktop file pointing at the .AppImage (Exec quoted per the Desktop
+// Entry spec, TryExec, the marker) plus every bundled icon; Remove deletes exactly those and
+// leaves the folders and everyone else's files; neither touches an entry Patchy did not write.
+void appimage_menu_entry_writes_and_removes_only_its_files() {
+  EntryFixture fixture;
+  const auto& paths = fixture.paths;
+  const QStringList unrelated{
+      QDir(paths.data_home).filePath(QStringLiteral("applications/org.example.Other.desktop")),
+      QDir(paths.data_home).filePath(QStringLiteral("applications/mimeinfo.cache")),
+      QDir(paths.data_home).filePath(QStringLiteral("icons/hicolor/48x48/apps/org.example.Other.png")),
+  };
+  write_bytes(unrelated[0], "[Desktop Entry]\nType=Application\nName=Other\nExec=other %F\nIcon=org.example.Other\n");
+  write_bytes(unrelated[1], "[MIME Cache]\n");
+  write_bytes(unrelated[2], "not really a png");
+
+  CHECK(patchy::ui::appimage_menu_entry_state(paths) == AppImageMenuEntryState::NotAdded);
+  const auto added = patchy::ui::add_appimage_menu_entry(paths);
+  CHECK(added.ok && added.changed && added.error.isEmpty());
+  CHECK(patchy::ui::appimage_menu_entry_state(paths) == AppImageMenuEntryState::Added);
+  CHECK(paths.desktop_file() ==
+        QDir(paths.data_home).filePath(QStringLiteral("applications/com.rtsoft.patchy.desktop")));
+
+  const auto entry = read_bytes(paths.desktop_file());
+  const auto shipped = read_bytes(QStringLiteral(PATCHY_SOURCE_DIR "/packaging/linux/com.rtsoft.patchy.desktop"));
+  // Inside the quotes `"`, `` ` ``, `$` and `\` take a backslash and `%` doubles; the string
+  // value then doubles every backslash.
+  auto quoted = paths.appimage_file;
+  quoted.replace(QLatin1Char('\\'), QStringLiteral("\\\\"))
+      .replace(QLatin1Char('"'), QStringLiteral("\\\""))
+      .replace(QLatin1Char('`'), QStringLiteral("\\`"))
+      .replace(QLatin1Char('$'), QStringLiteral("\\$"))
+      .replace(QLatin1Char('%'), QStringLiteral("%%"));
+  quoted.replace(QLatin1Char('\\'), QStringLiteral("\\\\"));
+  CHECK(desktop_value(entry, QStringLiteral("Exec")) == QLatin1Char('"') + quoted + QStringLiteral("\" %F"));
+  CHECK(patchy::ui::desktop_entry_exec_argument(paths.appimage_file) + QStringLiteral(" %F") ==
+        desktop_value(entry, QStringLiteral("Exec")));
+  auto try_exec = paths.appimage_file;
+  CHECK(desktop_value(entry, QStringLiteral("TryExec")) == try_exec.replace(QLatin1Char('\\'), QStringLiteral("\\\\")));
+  CHECK(desktop_value(entry, QStringLiteral("X-Patchy-AppImage")) == QStringLiteral("true"));
+  // Everything else is the shipped file: the formats Patchy opens, the localized names.
+  for (const auto* key : {"MimeType", "Name", "GenericName[ja]", "Categories", "StartupWMClass"}) {
+    CHECK(!desktop_value(shipped, QString::fromLatin1(key)).isEmpty());
+    CHECK(desktop_value(entry, QString::fromLatin1(key)) == desktop_value(shipped, QString::fromLatin1(key)));
+  }
+  // The icon is the copied 256 px PNG by its full path, not the shipped themed name: a
+  // running KDE Plasma did not see the new hicolor folders and showed a blank task bar
+  // icon (GitHub issue 226).
+  CHECK(desktop_value(shipped, QStringLiteral("Icon")) == QStringLiteral("com.rtsoft.patchy"));
+  const auto icon_file = QDir(paths.data_home).filePath(QStringLiteral("icons/hicolor/256x256/apps/com.rtsoft.patchy.png"));
+  CHECK(patchy::ui::appimage_menu_entry_icon_file(paths) == icon_file);
+  auto icon_value = icon_file;
+  CHECK(desktop_value(entry, QStringLiteral("Icon")) == icon_value.replace(QLatin1Char('\\'), QStringLiteral("\\\\")));
+  CHECK(patchy::ui::desktop_entry_starts_patchy_appimage(entry));
+
+  const auto names = patchy::ui::appimage_menu_entry_icon_names();
+  const auto targets = paths.icon_files();
+  CHECK(names.size() == 8 && targets.size() == 8);
+  for (qsizetype i = 0; i < names.size(); ++i) {
+    CHECK(read_bytes(targets[i]) == read_bytes(QDir(paths.bundled_share).filePath(names[i])));
+  }
+  CHECK(QFileInfo::exists(
+      QDir(paths.data_home).filePath(QStringLiteral("icons/hicolor/scalable/apps/com.rtsoft.patchy.svg"))));
+
+  // A second Add finds everything in place and writes nothing.
+  const auto again = patchy::ui::add_appimage_menu_entry(paths);
+  CHECK(again.ok && !again.changed);
+
+  const auto removed = patchy::ui::remove_appimage_menu_entry(paths);
+  CHECK(removed.ok && removed.changed);
+  CHECK(!QFileInfo::exists(paths.desktop_file()));
+  for (const auto& target : targets) {
+    CHECK(!QFileInfo::exists(target));
+  }
+  for (const auto& file : unrelated) {
+    CHECK(QFileInfo::exists(file));
+  }
+  CHECK(QFileInfo(QDir(paths.data_home).filePath(QStringLiteral("icons/hicolor/256x256/apps"))).isDir());
+  CHECK(patchy::ui::appimage_menu_entry_state(paths) == AppImageMenuEntryState::NotAdded);
+  CHECK(!patchy::ui::remove_appimage_menu_entry(paths).ok);
+
+  // A com.rtsoft.patchy.desktop Patchy did not write (a native install into ~/.local) is
+  // someone else's: never replaced, never removed.
+  const QByteArray foreign("[Desktop Entry]\nType=Application\nName=Patchy\nExec=/opt/patchy/bin/patchy %F\n");
+  write_bytes(paths.desktop_file(), foreign);
+  CHECK(patchy::ui::appimage_menu_entry_state(paths) == AppImageMenuEntryState::AddedElsewhere);
+  CHECK(patchy::ui::appimage_menu_entry_provided_by(paths) == paths.desktop_file());
+  CHECK(!patchy::ui::add_appimage_menu_entry(paths).ok);
+  CHECK(!patchy::ui::remove_appimage_menu_entry(paths).ok);
+  CHECK(read_bytes(paths.desktop_file()) == foreign);
+  CHECK(QFile::remove(paths.desktop_file()));
+
+  // No AppImage: nothing to add.
+  auto native = paths;
+  native.appimage_file.clear();
+  CHECK(patchy::ui::appimage_menu_entry_state(native) == AppImageMenuEntryState::Unavailable);
+  CHECK(!patchy::ui::add_appimage_menu_entry(native).ok);
+  CHECK(!QFileInfo::exists(paths.desktop_file()));
+}
+
+// Consent was given once: when the AppImage file moves (or a new release ships another
+// desktop file), the launch refresh rewrites the entry; it never creates one.
+void appimage_menu_entry_follows_a_moved_appimage() {
+  EntryFixture fixture;
+  auto paths = fixture.paths;
+  CHECK(patchy::ui::refresh_appimage_menu_entry(paths).ok);
+  CHECK(!QFileInfo::exists(paths.desktop_file()));
+
+  CHECK(patchy::ui::add_appimage_menu_entry(paths).ok);
+  paths.appimage_file = QDir(fixture.root.path()).filePath(QStringLiteral("Moved/PatchyLinux.AppImage"));
+  const auto moved = patchy::ui::refresh_appimage_menu_entry(paths);
+  CHECK(moved.ok && moved.changed);
+  const auto entry = read_bytes(paths.desktop_file());
+  CHECK(desktop_value(entry, QStringLiteral("Exec")) == QLatin1Char('"') + paths.appimage_file + QStringLiteral("\" %F"));
+  CHECK(desktop_value(entry, QStringLiteral("TryExec")) == paths.appimage_file);
+  const auto unchanged = patchy::ui::refresh_appimage_menu_entry(paths);
+  CHECK(unchanged.ok && !unchanged.changed);
+  CHECK(patchy::ui::remove_appimage_menu_entry(paths).ok);
+}
+
+// AppImageLauncher (appimagekit_<hash>-Patchy.desktop with a rewritten icon name), Gear
+// Lever (its own entry naming the moved .appimage) and a packaged Patchy (the Flatpak's
+// export, a distribution package) each already put Patchy in the menu, so Patchy offers no
+// second entry. Another program's AppImage entry does not count.
+void appimage_menu_entry_detects_other_integrations() {
+  EntryFixture fixture;
+  const auto& paths = fixture.paths;
+  const auto applications = QDir(paths.data_home).filePath(QStringLiteral("applications"));
+  const auto other_appimage = QDir(applications).filePath(QStringLiteral("appimagekit_89ab-Krita.desktop"));
+  write_bytes(other_appimage,
+              "[Desktop Entry]\nType=Application\nName=Krita\nExec=/home/u/Applications/krita-5.2.AppImage %F\n"
+              "Icon=appimagekit_89ab_krita\n");
+  CHECK(patchy::ui::appimage_menu_entry_state(paths) == AppImageMenuEntryState::NotAdded);
+
+  const struct {
+    const char* file;
+    QByteArray body;
+  } integrations[] = {
+      {"appimagekit_0123abcd-Patchy.desktop",
+       "[Desktop Entry]\nType=Application\nName=Patchy\nExec=/home/u/Applications/PatchyLinux_0123abcd.AppImage %F\n"
+       "TryExec=/home/u/Applications/PatchyLinux_0123abcd.AppImage\nIcon=appimagekit_0123abcd_com.rtsoft.patchy\n"
+       "X-AppImage-Comment=Generated by appimagelauncherd\n"},
+      {"patchy.desktop",
+       "[Desktop Entry]\nType=Application\nName=Image Tool\nExec=\"/home/u/AppImages/patchy.appimage\" %F\n"
+       "Icon=/home/u/.local/share/icons/patchy\n"},
+  };
+  for (const auto& integration : integrations) {
+    const auto path = QDir(applications).filePath(QString::fromLatin1(integration.file));
+    CHECK(patchy::ui::desktop_entry_starts_patchy_appimage(integration.body));
+    write_bytes(path, integration.body);
+    CHECK(patchy::ui::appimage_menu_entry_state(paths) == AppImageMenuEntryState::AddedElsewhere);
+    CHECK(patchy::ui::appimage_menu_entry_provided_by(paths) == path);
+    CHECK(!patchy::ui::add_appimage_menu_entry(paths).ok);
+    CHECK(!QFileInfo::exists(paths.desktop_file()));
+    CHECK(QFile::remove(path));
+  }
+  CHECK(!patchy::ui::desktop_entry_starts_patchy_appimage(read_bytes(other_appimage)));
+
+  const auto packaged = QDir(paths.data_dirs.front()).filePath(QStringLiteral("applications/com.rtsoft.patchy.desktop"));
+  write_bytes(packaged, read_bytes(QStringLiteral(PATCHY_SOURCE_DIR "/packaging/linux/com.rtsoft.patchy.desktop")));
+  CHECK(patchy::ui::appimage_menu_entry_state(paths) == AppImageMenuEntryState::AddedElsewhere);
+  CHECK(patchy::ui::appimage_menu_entry_provided_by(paths) == packaged);
+}
+
+// GitHub issue 226 follow-up: a running KDE Plasma lists the icon theme's folders once, so
+// the icons Add puts in folders that did not exist yet stayed invisible and the task bar
+// showed a blank icon. After a change Patchy gives the user's hicolor folder a new
+// modification time (GTK and Qt rescan a theme whose folder changed) and sends the signal
+// KDE's icon loaders reload their themes on.
+void appimage_menu_entry_tells_the_desktop_about_new_icons() {
+  EntryFixture fixture;
+  const auto& paths = fixture.paths;
+  const auto hicolor = QDir(paths.data_home).filePath(QStringLiteral("icons/hicolor"));
+  CHECK(!QFileInfo::exists(hicolor));
+  CHECK(!patchy::ui::mark_icon_theme_changed(paths));
+  CHECK(patchy::ui::add_appimage_menu_entry(paths).ok);
+#ifdef Q_OS_LINUX
+  const timeval old_times[2] = {{1000000000, 0}, {1000000000, 0}};
+  CHECK(::utimes(QFile::encodeName(hicolor).constData(), old_times) == 0);
+  CHECK(QFileInfo(hicolor).lastModified().toSecsSinceEpoch() == 1000000000);
+  const auto before = QDateTime::currentSecsSinceEpoch();
+  CHECK(patchy::ui::mark_icon_theme_changed(paths));
+  CHECK(QFileInfo(hicolor).lastModified().toSecsSinceEpoch() >= before - 1);
+#else
+  CHECK(!patchy::ui::mark_icon_theme_changed(paths));
+#endif
+  CHECK(patchy::ui::remove_appimage_menu_entry(paths).ok);
+
+#ifdef PATCHY_HAVE_QT_DBUS
+  // A peer-to-peer connection stands in for the session bus; the receiving side connects
+  // the way KIconLoader does (any sender, /KIconLoader, org.kde.KIconLoader.iconChanged(int)).
+  // A spin box's setValue(int) slot records the argument without a moc'd receiver.
+  QDBusServer server(QStringLiteral("unix:tmpdir=%1").arg(QDir::tempPath()));
+  CHECK(server.isConnected());
+  std::optional<QDBusConnection> desktop_side;
+  QObject::connect(&server, &QDBusServer::newConnection,
+                   [&desktop_side](const QDBusConnection& connection) { desktop_side = connection; });
+  const auto client_name = QStringLiteral("patchy_kde_icon_signal_test");
+  auto patchy_side = QDBusConnection::connectToPeer(server.address(), client_name);
+  CHECK(patchy_side.isConnected());
+  CHECK(process_events_until([&desktop_side] { return desktop_side.has_value(); }));
+  QSpinBox received;
+  received.setRange(-1, 9);
+  received.setValue(-1);
+  CHECK(desktop_side->connect(QString(), QStringLiteral("/KIconLoader"), QStringLiteral("org.kde.KIconLoader"),
+                              QStringLiteral("iconChanged"), &received, SLOT(setValue(int))));
+  CHECK(patchy::ui::send_kde_icon_theme_changed(patchy_side));
+  CHECK(process_events_until([&received] { return received.value() == 0; }));
+  QDBusConnection::disconnectFromPeer(client_name);
+  CHECK(!patchy::ui::send_kde_icon_theme_changed(QDBusConnection::connectToPeer(
+      QStringLiteral("unix:path=/nonexistent/patchy-no-bus"), QStringLiteral("patchy_kde_icon_no_bus"))));
+  QDBusConnection::disconnectFromPeer(QStringLiteral("patchy_kde_icon_no_bus"));
+#endif
+}
+
+// The Help item exists only for an AppImage run (never a native build, the Flatpak,
+// Windows or macOS), reads Add or Remove by the entry's state, and is unavailable, with a
+// tooltip saying why, when another tool already added Patchy.
+void ui_appimage_menu_entry_item_follows_the_environment() {
+  {
+    patchy::ui::MainWindow window;
+    show_window_empty(window);
+    open_help_menu(window);
+    CHECK(!help_menu_entry_action(window)->isVisible());
+  }
+  QTemporaryDir root;
+  CHECK(root.isValid());
+  const auto data_home = QDir(root.path()).filePath(QStringLiteral("data-home"));
+  const auto share = QDir(root.path()).filePath(QStringLiteral("mount/usr/share"));
+  populate_bundled_share(share);
+  auto parent = QDir(QCoreApplication::applicationDirPath());
+  parent.cdUp();
+  const ScopedEnvironment env{
+      {"APPIMAGE", QDir(root.path()).filePath(QStringLiteral("Apps/PatchyLinux.AppImage")).toUtf8()},
+      {"APPDIR", parent.absolutePath().toUtf8()},
+      {"XDG_DATA_HOME", data_home.toUtf8()},
+      {"XDG_DATA_DIRS", QDir(root.path()).filePath(QStringLiteral("system-share")).toUtf8()},
+  };
+  patchy::ui::set_stored_appimage_menu_entry_prompt_declined(false);
+  patchy::ui::MainWindow window;
+  MainWindowTestAccess::set_appimage_bundled_share(window, share);
+  show_window_empty(window);
+  open_help_menu(window);
+  auto* action = help_menu_entry_action(window);
+#ifdef Q_OS_LINUX
+  CHECK(action->isVisible() && action->isEnabled());
+  CHECK(action->text() == QStringLiteral("Add Patchy to Applications Menu..."));
+  CHECK(action->menuRole() == QAction::NoRole);
+  open_help_menu(window, "ui_appimage_menu_entry_help_item");
+  const auto desktop_file = QDir(data_home).filePath(QStringLiteral("applications/com.rtsoft.patchy.desktop"));
+
+  action->trigger();
+  CHECK(QFileInfo::exists(desktop_file));
+  CHECK(window.statusBar()->currentMessage() == QStringLiteral("Patchy was added to the applications menu"));
+  open_help_menu(window);
+  CHECK(action->isEnabled() && action->text() == QStringLiteral("Remove Patchy from Applications Menu"));
+  open_help_menu(window, "ui_appimage_menu_entry_help_item_added");
+
+  action->trigger();
+  CHECK(!QFileInfo::exists(desktop_file));
+  CHECK(window.statusBar()->currentMessage() == QStringLiteral("Patchy was removed from the applications menu"));
+  // Removing it answers the offer too.
+  CHECK(patchy::ui::stored_appimage_menu_entry_prompt_declined());
+  open_help_menu(window);
+  CHECK(action->text() == QStringLiteral("Add Patchy to Applications Menu..."));
+
+  const auto launcher = QDir(data_home).filePath(QStringLiteral("applications/appimagekit_0123abcd-Patchy.desktop"));
+  write_bytes(launcher, "[Desktop Entry]\nType=Application\nName=Patchy\n"
+                        "Exec=/home/u/Applications/PatchyLinux.AppImage %F\nIcon=appimagekit_0123abcd_com.rtsoft.patchy\n");
+  open_help_menu(window, "ui_appimage_menu_entry_help_item_elsewhere");
+  CHECK(action->isVisible() && !action->isEnabled());
+  CHECK(action->toolTip().contains(QStringLiteral("already in the applications menu")));
+  CHECK(QFile::remove(launcher));
+#else
+  // Windows and macOS have no AppImages: a stray APPIMAGE changes nothing.
+  CHECK(!action->isVisible());
+#endif
+  patchy::ui::set_stored_appimage_menu_entry_prompt_declined(false);
+}
+
+// The startup offer appears only in a desktop session that is not a CI run: the AppImage
+// catalog's test starts Patchy under a bare X server and captured the offer instead of the
+// main window (GitHub issue 208).
+void appimage_menu_entry_offer_needs_a_desktop_session() {
+  const auto allowed = [](const char* desktop, const char* session, const char* ci) {
+    const ScopedEnvironment env{{"XDG_CURRENT_DESKTOP", desktop}, {"DESKTOP_SESSION", session}, {"CI", ci}};
+    return patchy::ui::appimage_menu_entry_offer_session_allowed();
+  };
+  CHECK(allowed("GNOME", "", ""));
+  CHECK(allowed("", "plasma", ""));
+  CHECK(allowed("ubuntu:GNOME", "ubuntu", ""));
+  CHECK(!allowed("", "", ""));
+  CHECK(!allowed("GNOME", "gnome", "true"));
+  CHECK(!allowed("", "", "1"));
+}
+
+// The offer is a bar across the top of the workspace, never a window of its own: Not Now
+// leaves the next launch free to ask, Add writes the entry, Help adding it closes the bar,
+// Don't Ask Again stops it for good, and an unattended run never sees it.
+void ui_appimage_menu_entry_offer_dont_ask_again() {
+  QTemporaryDir root;
+  CHECK(root.isValid());
+  const auto data_home = QDir(root.path()).filePath(QStringLiteral("data-home"));
+  const auto share = QDir(root.path()).filePath(QStringLiteral("mount/usr/share"));
+  populate_bundled_share(share);
+  auto parent = QDir(QCoreApplication::applicationDirPath());
+  parent.cdUp();
+  const ScopedEnvironment env{
+      {"APPIMAGE", QDir(root.path()).filePath(QStringLiteral("Apps/PatchyLinux.AppImage")).toUtf8()},
+      {"APPDIR", parent.absolutePath().toUtf8()},
+      {"XDG_DATA_HOME", data_home.toUtf8()},
+      {"XDG_DATA_DIRS", QDir(root.path()).filePath(QStringLiteral("system-share")).toUtf8()},
+  };
+  patchy::ui::set_stored_appimage_menu_entry_prompt_declined(false);
+  patchy::ui::MainWindow window;
+  MainWindowTestAccess::set_appimage_bundled_share(window, share);
+  show_window_empty(window);
+  const auto desktop_file = QDir(data_home).filePath(QStringLiteral("applications/com.rtsoft.patchy.desktop"));
+  const auto offer_bar = [&window] { return window.findChild<QFrame*>(QStringLiteral("appImageMenuEntryOfferBar")); };
+#ifdef Q_OS_LINUX
+  auto* workspace = window.findChild<QWidget*>(QStringLiteral("workspaceSplitter"));
+  CHECK(workspace != nullptr && window.centralWidget() == workspace);
+  // Shows the offer, checks it is a bar inside the main window above the workspace, and
+  // clicks `button`.
+  const auto answer = [&](const char* button, const char* artifact = nullptr) {
+    const bool shown = MainWindowTestAccess::offer_appimage_menu_entry(window);
+    CHECK(shown);
+    auto* bar = offer_bar();
+    CHECK(bar != nullptr);
+    if (!shown || bar == nullptr) {
+      return false;
+    }
+    QApplication::processEvents();
+    CHECK(bar->window() == &window);
+    CHECK(bar->isVisible() && workspace->isVisible());
+    CHECK(bar->mapTo(&window, QPoint(0, bar->height())).y() <= workspace->mapTo(&window, QPoint(0, 0)).y());
+    CHECK(QApplication::activeModalWidget() == nullptr);
+    auto* text = bar->findChild<QLabel*>(QStringLiteral("appImageMenuEntryOfferText"));
+    CHECK(text != nullptr && text->text().contains(QStringLiteral("Help > Add Patchy to Applications Menu")));
+    // A second offer while one is up is not stacked.
+    CHECK(!MainWindowTestAccess::offer_appimage_menu_entry(window));
+    if (artifact != nullptr) {
+      save_widget_artifact(artifact, window);
+    }
+    auto* choice = bar->findChild<QAbstractButton*>(QString::fromLatin1(button));
+    CHECK(choice != nullptr);
+    if (choice != nullptr) {
+      choice->click();
+    }
+    QApplication::processEvents();
+    CHECK(offer_bar() == nullptr || !offer_bar()->isVisible());
+    // The workspace is the central widget again.
+    CHECK(window.centralWidget() == workspace && workspace->isVisible());
+    return true;
+  };
+
+  CHECK(answer("appImageMenuEntryNotNowButton", "ui_appimage_menu_entry_offer"));
+  CHECK(!QFileInfo::exists(desktop_file));
+  CHECK(!patchy::ui::stored_appimage_menu_entry_prompt_declined());
+
+  CHECK(answer("appImageMenuEntryAddButton"));
+  CHECK(QFileInfo::exists(desktop_file));
+  // Added: nothing left to offer.
+  CHECK(!MainWindowTestAccess::offer_appimage_menu_entry(window));
+  CHECK(patchy::ui::remove_appimage_menu_entry(patchy::ui::resolve_appimage_menu_entry_paths()).ok);
+  patchy::ui::set_stored_appimage_menu_entry_prompt_declined(false);
+
+  // The bar stays while the user works: Help adding the entry answers it and closes it.
+  CHECK(MainWindowTestAccess::offer_appimage_menu_entry(window));
+  help_menu_entry_action(window)->trigger();
+  QApplication::processEvents();
+  CHECK(QFileInfo::exists(desktop_file));
+  CHECK(offer_bar() == nullptr || !offer_bar()->isVisible());
+  CHECK(window.centralWidget() == workspace);
+  CHECK(patchy::ui::remove_appimage_menu_entry(patchy::ui::resolve_appimage_menu_entry_paths()).ok);
+  patchy::ui::set_stored_appimage_menu_entry_prompt_declined(false);
+
+  CHECK(answer("appImageMenuEntryDontAskButton"));
+  CHECK(patchy::ui::stored_appimage_menu_entry_prompt_declined());
+  CHECK(!QFileInfo::exists(desktop_file));
+  CHECK(!MainWindowTestAccess::offer_appimage_menu_entry(window));
+
+  patchy::ui::set_stored_appimage_menu_entry_prompt_declined(false);
+  window.set_cli_automation_mode(true);
+  CHECK(!MainWindowTestAccess::offer_appimage_menu_entry(window));
+  window.set_cli_automation_mode(false);
+#else
+  CHECK(!MainWindowTestAccess::offer_appimage_menu_entry(window));
+  CHECK(!QFileInfo::exists(desktop_file));
+#endif
+  QApplication::processEvents();
+  CHECK(offer_bar() == nullptr || !offer_bar()->isVisible());
+  patchy::ui::set_stored_appimage_menu_entry_prompt_declined(false);
+}
+
+// Startup schedules the offer only in a desktop session (issue 208): under CI, or with no
+// desktop named, the launch shows the main window alone; in a session the bar arrives.
+void ui_appimage_menu_entry_startup_offer_follows_the_session() {
+  QTemporaryDir root;
+  CHECK(root.isValid());
+  const auto data_home = QDir(root.path()).filePath(QStringLiteral("data-home"));
+  const auto share = QDir(root.path()).filePath(QStringLiteral("mount/usr/share"));
+  populate_bundled_share(share);
+  auto parent = QDir(QCoreApplication::applicationDirPath());
+  parent.cdUp();
+  const ScopedEnvironment env{
+      {"APPIMAGE", QDir(root.path()).filePath(QStringLiteral("Apps/PatchyLinux.AppImage")).toUtf8()},
+      {"APPDIR", parent.absolutePath().toUtf8()},
+      {"XDG_DATA_HOME", data_home.toUtf8()},
+      {"XDG_DATA_DIRS", QDir(root.path()).filePath(QStringLiteral("system-share")).toUtf8()},
+  };
+  patchy::ui::set_stored_appimage_menu_entry_prompt_declined(false);
+  const auto launch_shows_offer = [&share](const char* desktop, const char* ci) {
+    const ScopedEnvironment session{{"XDG_CURRENT_DESKTOP", desktop}, {"DESKTOP_SESSION", ""}, {"CI", ci}};
+    patchy::ui::MainWindow window;
+    MainWindowTestAccess::set_appimage_bundled_share(window, share);
+    show_window_empty(window);
+    window.begin_appimage_menu_entry_startup();
+    const auto bar = [&window] { return window.findChild<QFrame*>(QStringLiteral("appImageMenuEntryOfferBar")); };
+    // The offer comes 2 s after startup; wait past that.
+    const bool shown = process_events_until([&bar] { return bar() != nullptr; }, 4000);
+    if (shown) {
+      if (auto* not_now = bar()->findChild<QAbstractButton*>(QStringLiteral("appImageMenuEntryNotNowButton"));
+          not_now != nullptr) {
+        not_now->click();
+      }
+      QApplication::processEvents();
+    }
+    return shown;
+  };
+#ifdef Q_OS_LINUX
+  CHECK(!launch_shows_offer("", ""));
+  CHECK(!launch_shows_offer("GNOME", "true"));
+  CHECK(launch_shows_offer("GNOME", ""));
+#else
+  CHECK(!launch_shows_offer("GNOME", ""));
+#endif
+  CHECK(!patchy::ui::stored_appimage_menu_entry_prompt_declined());
+}
+
+}  // namespace
+
+std::vector<patchy::test::TestCase> appimage_menu_entry_tests() {
+  return {
+      {"appimage_menu_entry_writes_and_removes_only_its_files", appimage_menu_entry_writes_and_removes_only_its_files},
+      {"appimage_menu_entry_follows_a_moved_appimage", appimage_menu_entry_follows_a_moved_appimage},
+      {"appimage_menu_entry_detects_other_integrations", appimage_menu_entry_detects_other_integrations},
+      {"appimage_menu_entry_tells_the_desktop_about_new_icons", appimage_menu_entry_tells_the_desktop_about_new_icons},
+      {"ui_appimage_menu_entry_item_follows_the_environment", ui_appimage_menu_entry_item_follows_the_environment},
+      {"appimage_menu_entry_offer_needs_a_desktop_session", appimage_menu_entry_offer_needs_a_desktop_session},
+      {"ui_appimage_menu_entry_offer_dont_ask_again", ui_appimage_menu_entry_offer_dont_ask_again},
+      {"ui_appimage_menu_entry_startup_offer_follows_the_session",
+       ui_appimage_menu_entry_startup_offer_follows_the_session},
+  };
+}

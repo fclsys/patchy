@@ -1,0 +1,162 @@
+# Adjustment calibration vs Photoshop
+
+Calibration record for adjustment-layer and auto-adjustment math: Brightness/Contrast (legacy and modern), Curves, Levels, Posterize, Exposure, adjustment layers of CMYK and Grayscale documents, the auto adjustments, and Hue/Saturation. Read this before touching src/core/adjustment_layer.*, src/core/adjustment_deep.* or src/filters/auto_levels_math.*. The Photoshop kinds added for #250 (placeholders, Channel Mixer, Photo Filter and later ones) are in [adjustment-kinds.md](adjustment-kinds.md), with the Image > Adjustments commands that apply those kinds and Exposure destructively.
+Conventions: "PS" = Adobe Photoshop 2026 (version 27), the installed ground truth; every rule is pinned by PS COM captures unless noted. Fixtures named `photoshop-*` live in `test-fixtures/psd/`; `local-test-fixtures/` is machine-local. The COM workflow lives in [photoshop-com.md](photoshop-com.md).
+
+## Brightness/Contrast legacy calibration
+
+Nine 256-gray-ramp captures pin `brightness_contrast_channel_value` (core/adjustment_layer.cpp):
+
+- c = 0: `clamp(v + b)`.
+- 0 < c < 100: brightness folds into the INPUT: `clamp(lround((v + b - 127.5) * 100/(100-c) + 127.5))`. The slope is `100/(100-c)`, NOT the destructive filter's `(100+c)/100`.
+- c = 100: hard threshold `(v + b) >= 127 ? 255 : 0`.
+- c < 0: contrast compresses FIRST, brightness adds to the OUTPUT: `clamp(lround((v - 127.5) * (100+c)/100 + 127.5) + b)`.
+
+The hybrid order (brightness inside for positive contrast, outside for negative) is required by the interaction captures; residual +/-1 (PS's own LUT has sub-LSB noise). Do not "unify" this with the destructive `patchy.filters.brightness_contrast` in either direction: the destructive output is byte-pinned, and the adjustment layer must render PS's math because it round-trips as a native legacy `brit` record.
+
+## Modern Brightness/Contrast
+
+The default (useLegacy=false) algorithm is fully modeled, recovered from 300 16-bit ramp captures (PS computes in its 15-bit 0..32768 space), 150 contrast captures, and a 451-curve 8-bit sweep (captures/scripts in `local-test-fixtures/ps-bc-captures/`; implementation with exact constants in core/adjustment_layer.cpp):
+
+- `result = contrast(brightness(v))` on the unit interval, one final rounding per depth (compose the real-valued curves, not byte LUTs).
+- 0 < b <= 100: gain ray `sigma = 2^(b/110)` until output 0.5, then one cubic Hermite to (1, 1) with end slope `tau = max(0.1, 1/(1 + 12*(sigma-1)))`, clamped to 1 (legitimate overshoot for b > 88, where the tau floor engages).
+- b > 100: `f_b = f_{b-100} o f_100`. b < 0: the exact functional inverse of `f_{-b}`, evaluated by fixed 64-step bisection (deterministic; NOT a mirrored construction).
+- Contrast: `beta = 1 - 0.0076*c`; lower half `y = (2-2*beta)*u^2 + beta*u`, upper half mirrored through (0.5, 0.5). Exact for c in -50..100.
+- The stored `means` value is inert at render time (dialog Auto metadata); Patchy preserves imported values, writes 127 otherwise. `sigma` multiplies out the literal 110th root of 2 (1.006321233202252) per step instead of calling `exp2`, for determinism.
+- Validation: all 450 15-bit captures within 1 LSB15; 449 of 452 8-bit curves byte-exact, the rest within 1/255.
+
+## Curves 2.0 engine and editor
+
+- `CurvesAdjustment`: independent ordered control points for Composite RGB, R, G, B; 2-19 points, values 0-255, duplicate inputs resolve deterministically, first/last input may move inward; outside them the LUT clamps to that point's output.
+- `build_curve_lut` is the ONLY point-curve interpolation path: natural cubic through the points, zero second derivative at both endpoints, clamped outside movable endpoints, rounded to nearest byte. `build_curves_lut` applies component tables first, then Composite. All Curves consumers (destructive, adjustment render, thumbnails, editor graph) use these LUTs; ramp calibration matched all 3,072 measured bytes exactly.
+- Old Patchy 3-value data loads as Composite anchors at 0/128/255; `plAD` v4 may carry the `CRV2` v1 tail (bounded to 324 bytes; malformed tails fall back to the anchors). Editable saves migrate to native `curv` and OMIT `plAD` (PS warns on a second private adjustment block); malformed native `curv` stays on the opaque Pixel path retaining both raw blocks. Levels and Hue/Saturation saves omit `plAD` too (native `levl`/`hue2` carry every modeled value); the Levels dialog's channel tab persists only when importing legacy files (fresh saves reset to composite, matching PS).
+- Native `curv` shape: zero map-mode byte, version 1, big-endian u32 changed-channel bitmap (despite Adobe's table saying two bytes), implicit point records, indexed `Crv ` version 4 extension, padded to four bytes. Channel ids/bits: Composite=0, R=1, G=2, B=3; points are output then input; identity = bitmap/count zero, 20-byte payload. Patchy writes that shape, keeps untouched payloads byte-for-byte, regenerates only after a modeled edit; native blocks are authoritative over `plAD`. COM probes round-trip Patchy files as editable `LayerKind.CURVES`.
+- Editor: four-channel histogram, one box-averaged sample per 2x2 block over the full image (integer means over opaque pixels only, all-transparent blocks skipped). The light 2x2 kernel fills codes missing from quantized sources like PS's cache-level-2 histograms; a larger kernel over-concentrates noisy channels into a few towering bins that crush the rest of the linear display (observed on the blue channel of a warm-lit 24MP photo). The composite is the sum of the per-channel counts, and the display is linear with a ceiling: `height = min(1, count / ceiling)` with `ceiling = 4 * total_samples / non_empty_bins` (`histogram_display_ceiling` / `histogram_display_fraction` in ui/curves_editor.hpp, shared by Levels and Curves). PS's Histogram panel is linear to the tallest bin; its Levels dialog is not. Pinned (GitHub issue 32) by native captures of PS's Levels dialog over three synthetic 8-bit RGB images with known per-bin counts, measured column by column on the 256x100 plot: (a) 65,536 samples with spikes at 1/8..1/1024 of the total and every other bin at 188 filled the plot from 1/64 up and drew 1/80, 1/96, 1/128, 1/192, 1/256 at 80, 67, 50, 34, 25 px; (b) the same spikes with the remainder in one bin (12 non-empty bins) drew 1/8 at 38 px and 1/16 at 19 px (ceiling 21,845 = 4 * 65,536 / 12); (c) 40,000 samples over 122 non-empty bins, 20 of them holding one sample, drew 1/48, 1/64, 1/128, 1/256 at 64, 48, 24, 12 px (ceiling 1,311 = 4 * 40,000 / 122; a single-sample bin counts as non-empty). Refuted, do not re-derive: linear to the tallest bin, `sqrt(count / max)`, log, power 1/3, a fixed share of the total (1/64 matched (a) only), and any median or percentile base ((b) has median 0). PS also resamples the bar image with a smoothing filter, so a one-bin dip between taller neighbours renders dimmer rather than shorter; Patchy draws exact columns. Non-empty bins never draw under 1 px. Histogram columns draw unantialiased and inset 1px from the graph frame so a clipping spike in bin 0 or 255 stays visible instead of vanishing under the border. Probe generator and captures: `local-test-fixtures/histogram-scale-probe/` (machine-local). Dialog Auto consumes the same averaged histograms, and the Levels dialog shares the sampler over the active layer. Levels switches channels with a tab bar like the Curves editor and tints a color channel's bars with `channel_histogram_color` (ui/curves_editor.hpp, shared with Curves); the composite stays neutral. Re-editing an unclipped layer samples the layer-tree prefix below it (Auto sees the input); Auto is disabled for clipped adjustments. `.acv` Import accepts version 4 counted RGB, legacy version 1 bitmaps, and the indexed `Crv ` extension; Export writes PS's five-curve RGB shape with the trailing identity compatibility curve ([adjustment-presets.md](adjustment-presets.md)).
+
+## Levels stage order and Posterize
+
+Fitted against Photoshop's renders of psd-tools' `adjustments/levels_rgb.psd` and `posterize_rgb.psd` (GitHub issue 65; fetch with `testy/fetch_psd_tools_corpus.py`).
+
+- **Levels:** the component channel record runs FIRST, then Composite RGB (the Curves order), and the channel result reaches the composite stage unrounded. Within 2/255 everywhere on the render; composite-first is off by up to 52, and a byte-rounded intermediate has ten times the 2/255 misses. `apply_levels` (core) and `build_levels_luts` (ui/filter_workflows.cpp, the destructive command) both follow it. A master-only adjustment is unchanged.
+- **Posterize:** `floor(floor(value * levels / 256) * 255 / (levels - 1))`, byte-exact at 3, 7, 13 and 21 levels (3 levels give 0, 127, 255). Refuted: nearest-step rounding, and rounding the output step instead of truncating it. `posterize_channel_value` serves the adjustment layer and `patchy.filters.posterize` alike.
+- **Threshold:** white when `(30R + 59G + 11B + 50) / 100` (rounded half up) reaches the level. A Photoshop 2026 adjustment layer and Smart Filter over a 16-level cube at level 140 both match it exactly; the floored quotient missed 13 colors (October 2026, [smart-filters-adjustments.md](smart-filters-adjustments.md)). `threshold_luminance` serves the adjustment layer and `patchy.filters.threshold` alike; their 16/32-bit paths test `30R + 59G + 11B >= 100 * level - 50` on the deep scale (`threshold_reached`), identical on 8-bit-exact values.
+
+## Color Balance
+
+Fitted on a Photoshop 2026 COM probe (#250): a 256-step gray ramp plus a 16-level RGB cube through 60 settings (each slider at +-100 and +50 per tone, both Preserve Luminosity states, extra magnitudes, two mixed sets; adjustment layer and destructive command agree). The model matches 783,311 of 783,360 probe values (49 off by one) and both committed fixtures, `photoshop-color-balance{,-full}.psd`, exactly. S, M, H are the shadows, midtones and highlights triples (cyan/red, magenta/green, yellow/blue).
+
+- Each channel gets one Levels record: input black, input white, and an exponent e with gamma = 2^(e/100) rounded to two decimals, through `photoshop_levels_gamma` (its near-black toe matters at large gammas). No output points. A channel's output depends only on its own input in both modes, so a LUT always exists.
+- Preserve Luminosity off, channel c: input black max(0, -S[c]), input white 255 - max(0, H[c]), e = M[c] + S[c]/2 + H[c]/2, halves truncated toward zero (shadows +75 is gamma 1.29, not 1.30).
+- Preserve Luminosity on: input black max(S) - S[c], input white 255 - (H[c] - min(H)), e = M[c] - (max(M) + min(M))/2 (truncated); shadows and highlights add no gamma.
+- 8-bit rounding: the black/white-point stage rounds to a whole level before the gamma, and the output rounds half up. Unrounded points, or half-to-even rounding, give hundreds of misses. 16/32-bit documents run the same record without the point rounding.
+- Refuted: tones applied one after another in any order (199 and more misses per mixed set), per-tone gammas multiplied instead of exponents summed, and Preserve Luminosity as a luminance restore after the shift (HSL lightness, Rec.601/709, PDF SetLum: hundreds of thousands of misses).
+- `color_balance_channel_levels` / `color_balance_transfer` (core) serve the adjustment layer, the destructive command and the deep path. A new Color Balance starts with Preserve Luminosity checked, as in Photoshop.
+
+## Exposure
+
+`AdjustmentKind::Exposure`, Photoshop's `expA` block (16 bytes: u16 version 1, float32 exposure, offset, gamma, 2 pad bytes). Settings are integers at Photoshop's field precision: hundredths of a stop (-20.00..20.00), ten-thousandths of offset (-0.5000..0.5000), hundredths of gamma (0.01..9.99). An unedited imported block is written back byte for byte, which keeps Photoshop's exact floats.
+
+- Math (`exposure_channel_value`), per channel on 8-bit values: `linear = (v/255)^2.2`, `exposed = linear * 2^exposure + offset`, `corrected = max(0, exposed)^(1/gamma)`, `out = 255 * clamp(corrected)^(1/2.2)`. Within 1/255 on every pixel of Photoshop's render of psd-tools' `adjustments/exposure_rgb.psd` for all four of its setting triples.
+- Refuted: the piecewise sRGB curve in place of the plain 2.2 power (up to 7/255 off at +2 stops).
+- Grayscale documents run Exposure in the gray profile's linear light, not through the gray space below: on the profile-converted sRGB pixels that is the piecewise sRGB curve in place of gamma 2.2 (`exposure_gray_channel_value`, `exposure_gray_transfer`). Within 1/255 on every image pixel of Photoshop's composite of psd-tools' `adjustments/exposure_grayscale.psd` (Dot Gain 20%, the same four triples); gamma 2.2 on the stored gray value, the earlier path, was 21/255 off. `adjustment_depends_on_source_color_mode` still counts the layer for the RGB-save warnings. CMYK documents run the gamma 2.2 form on each ink; that output is unprobed against Photoshop. 16/32-bit documents use the continuous form (last section); 16-bit precision against Photoshop is not yet exact ([high-bit-depth-compositor.md](high-bit-depth-compositor.md#the-deep-fixture-corpus)).
+
+## Adjustment layers of CMYK documents
+
+Patchy converts a CMYK file's pixels to RGB when it reads it, but an adjustment layer is
+not pixels: Photoshop evaluates it on the ink channels. The same Levels numbers run on RGB
+matched Photoshop on 28 percent of the pixels of psd-tools' `levels_cmyk.psd`; run on the
+inks they match on 99.9 percent (worst channel miss 7/255 at the 16 pinned probes).
+
+- `InkSpace` (`core/ink_space.hpp`) is the document's CMYK profile sampled both ways:
+  sRGB to inks on a 33-node grid, inks to sRGB on a 17-node grid, 16-bit samples,
+  integer trilinear and quadrilinear interpolation (deterministic across toolchains).
+  `build_cmyk_ink_space` (color module, lcms2, relative colorimetric with black point
+  compensation, like the pixel conversion) builds it; the PSD reader registers it under
+  an id hashed from the profile bytes and stamps it on every adjustment layer it reads
+  (`kLayerMetadataAdjustmentInkSpace`).
+- `adjustment_runs_in_ink_space`: Levels, Curves, Invert, Posterize, Brightness/Contrast
+  and (CMYK only) Exposure. `apply_adjustment_to_color` then takes the color to the inks, maps each
+  ink through a 256-entry table built from the ordinary per-channel math, and returns to
+  sRGB. Cyan, magenta and yellow read the records an RGB document calls red, green and
+  blue; the black ink has its own (`LevelsAdjustment::black_ink`, the `levl` block's
+  fifth record, and `CurvesAdjustment::black_ink`, curve index 4). Ink values are the stored ones (0 = full ink), the domain Photoshop's CMYK
+  Levels reads. `build_adjustment_lut` returns nullopt for these, so every compositor
+  takes the per-pixel path.
+- Supported 8-bit CMYK stacks evaluate Threshold directly on retained ink planes
+  in `render/native_cmyk.cpp`: round `(30*C + 59*M + 11*Y)/100`, multiply by
+  inverted K and round to a byte, then compare with the level. Output has no CMY
+  ink and either full or zero K. The final profile conversion gives K-only black
+  its correct display tone. Five levels over 4096 synthetic native colors match
+  Photoshop exactly (`cmyk-render/threshold*`); masks, opacity and group coverage
+  blend the adjustment in ink space. Other adjustment kinds still use the
+  existing RGB/InkSpace path; Hue/Saturation and Color Balance use RGB math.
+- Grayscale documents get the one-channel form (`InkSpace::is_gray`, `build_gray_ink_space`):
+  the 256 stored gray values through the gray profile and the nearest-value inverse.
+  Their Levels record and curve sit in the slot RGB calls red (index 1; the composite
+  stays at the identity), so the reader copies it to green and blue; on red alone it
+  tinted the picture. Threshold is channel-wise here too. Photoshop's flatten of
+  psd-tools' `levels_grayscale.psd` and `curves_grayscale.psd` is matched within 3/255 and
+  1/255 (22/255 without the gray space, a visible tint before the copy). Pinned by
+  `psd_tools_grayscale_adjustments_apply_to_the_gray_channel_if_available`.
+- An untagged Grayscale file gets the gray space of the assumed Dot Gain 20% profile ([file-formats-psd.md](file-formats-psd.md)), as Photoshop evaluates it in its working gray; `exposure_grayscale.psd` stripped of its profile renders within 2/255 of the tagged file (`psd_tools_untagged_grayscale_reads_like_dot_gain_20_if_available`).
+- No profile on CMYK without an installed default, or one lcms2 cannot use: no ink space, RGB math as before.
+- On RGB saves the black ink's record is never written: Photoshop 2026 silently turns a Levels layer
+  of an RGB document into a plain empty layer, mask gone, when the `levl` block's fifth
+  record is not the identity.
+  A `curv` payload that carries a fifth curve is regenerated without it for the same
+  reason instead of being passed through.
+- Eligible unchanged 16-bit CMYK/grayscale documents retain their source channels,
+  profile and adjustment blocks on layered saves: [preservation rules](psd-native-color.md).
+- Gap on RGB saves: the layer is written as an ordinary RGB adjustment, so
+  Photoshop, and Patchy after a reopen in another run (the id is then unregistered),
+  evaluate it on RGB again. Pinned by `psd_tools_cmyk_levels_run_on_the_inks_if_available`.
+
+## Auto adjustments calibration
+
+Six self-authored ramp/outlier fixtures through PS COM (`autoLevels()`, `autoContrast()`, the `Lvls` event) vs Patchy's `auto_levels_math`:
+
+- **Auto Tone (per-channel) byte-exact on five of six fixtures**; PS leaves a constant channel untouched, matching Patchy's degenerate-scan identity rule.
+- **Auto Contrast is merged-histogram composite semantics** (color relationships preserved), within maxAbs 2 of Patchy's prediction.
+- **PS's effective clip thresholds exceed 0.1% on small images** (a 0.18%-per-end probe still clipped; bounded below 0.39%); not chased. Patchy keeps `max(1, samples/1000)` so menu commands and the Levels dialog Auto agree internally.
+- **Auto Color is not flag-invocable**: `Lvls` with `AuCo` reproduces monochromatic-contrast output; ScriptListener records menu Auto Color as explicit computed values. Patchy's midtone snap follows PS's documented Auto Options defaults (midtones 128 neutral, shadows 0, highlights 255); the snap formulation is Patchy's own design. Photoshop-like, not pixel identity.
+
+Capture scripts are session-scratch; conclusions are pinned by the core auto-adjustment tests.
+
+## Hue/Saturation calibration
+
+Calibrated with byte-patched `hue2` probes (patch the header triple, PS flatten to BMP, fit each stage by exact interval arithmetic). Shared helpers and the measured tables (`photoshop_lightness_value`, the 1530-step wheel, `photoshop_hsl_reconstruct`, `kColorizeSaturationScale`, `kColorizeHueInterp`, `kMasterSaturationScale`) live in src/core/adjustment_layer.cpp.
+
+### Colorize
+
+- hue2 header = version(=2) u16, colorize u8, pad u8, colorize h/s/l i16 x3, master h/s/l i16 x3; hue stored -180..180 (raw 203 also accepted); colorize-off files still carry (0, 25, 0). Fresh layers append six default hextant band records plus an undocumented 36-byte trailer of (k*60, 100, 50) triples (together `kPhotoshopHueSaturationDefaultTail`). Patchy writes the header and the band records from the model and keeps only the trailer as bytes: an imported layer's own, else the template's (Per-hue-range bands, below).
+- Pipeline (`apply_colorize`): `li = (max+min)>>1`; lightness blends toward white/black and ROUNDS; `delta = min(li, 255-li) * kColorizeSaturationScale[s]` (PS's percent conversion sits ~0.05-0.2% BELOW s/100, hence a per-percent table); `q = li + floor(delta + 0.5)` but `p = li - floor(delta)` (the round/truncate asymmetry reproduces PS's alternating 2l/2l+1 channel sums); `mid = p + floor((q-p) * kColorizeHueInterp[hue]/255 + 0.5)`. `kColorizeHueInterp` is a measured per-degree table (adjacent degrees quantize together, values pin near sector boundaries, sinusoidal deviation up to ~5/255, sectors NOT symmetric; no closed form, all 360 degrees probed).
+- Accuracy: 99.62% of 1.04M probed pixels byte-exact, residuals +/-1 (worst +/-2 on 0.16%). Master sliders are ignored by PS while colorize is on. The 'HStr' action path renders identically to the file path. Fixture `photoshop-hue-saturation-colorize.psd`.
+
+### Hue/Saturation master (colorize off)
+
+Calibrated from a 256x284 probe canvas (gray ramp, the full 32,640-entry lightness/chroma grid, three hue strips) under 763 byte-patched slider triples; harness `local-test-fixtures/hue-sat-master-probe/`.
+
+- Stage order (`apply_hue_saturation`): LIGHTNESS runs FIRST and PER CHANNEL, then integer HSL read (`light = (max+min)>>1`), saturation scales the half-chroma, hue rotates the wheel position, shared reconstruction rebuilds the triple.
+- Lightness is BYTE-EXACT: PS quantizes the percent to a byte first (`step = |lightness| * 255 / 100` truncated), then rounds the scale toward 0 or 255. The plain `|lightness|/100` form drifts by 1 on 188 of 201 percents (they agree on multiples of 20, which is why colorize probes at 0/+-40 never saw it). Colorize shares this helper.
+- Saturation multiplies the half-chroma via `kMasterSaturationScale` (201 entries, indexed delta + 100), fitted by maximum-agreement interval overlap. NEUTRALS ARE NEVER TINTED (`max == min` returns early). No closed form reproduces the table: -100 is exactly 0, 0 exactly 1, -50 exactly 0.5 and +50 exactly 2.0, but +40/+60 sit measurably BELOW `1/(1 - s/100)`, and +100 is 128, not unbounded (PS leaves a chroma-1 midtone at half saturation). Refuted candidates, do not re-derive: `1 + s/100`, `1/(1 - s/100)`, `1/(1 - kColorizeSaturationScale[s])`, `(100+s)/(100-s)`, any HSV-saturation variant.
+- The saturation limit clamps the RECONSTRUCTED BYTES, never the incoming chroma: `half_chroma = min(half * ratio, max(min(light, 255-light), half))`. Because `light` floors, normalized saturation legitimately exceeds 1 for `{min == 0, max odd}` and `{max == 255, min even}`; clamping at 1 there breaks the identity, and dropping the `max(base, ...)` limit overshoots saturated dark pixels by up to 17/255.
+- Hue rotates by a WHOLE number of wheel steps, `floor(degrees * 4.25 + 0.5)`, not continuous `4.25 * degrees`. Do NOT reuse `kColorizeHueInterp` here: degree-indexed, deliberately non-monotone; inverting it breaks the shift-zero identity.
+- Identity: all sliders zero is a BYTE-EXACT identity over the whole RGB cube (bought by the asymmetric q/p rounding); PS's own zero-slider render wobbles by 1 on about half the wheel. Patchy is deliberately the cleaner.
+- Accuracy: no probed pixel off by more than 2/255 (61% byte-exact, 97% within 1). Fixture `photoshop-hue-saturation-master.psd` + `.bmp`.
+- Destructive Image > Adjustments > Hue/Saturation routes through the same core math (`apply_hue_saturation_to_pixels`, filter_workflows.cpp), bit-identical; Affinity `HsRA` import maps onto this model.
+
+### Per-hue-range bands
+
+Each of the six band records = four i16 range stops in wheel order + an i16 h/s/l triple.
+
+- Weight: a trapezoid over the four stops (0 outside, ramps between outer and inner stops, 1 between the inner pair), linear in degrees, wrapping past 360 (reds default 315/345/15/45); `outer == inner` = hard step.
+- Selection is by the pixel's ORIGINAL hue; a master hue rotation does not move it; neutral pixels are never touched.
+- Hue: rotations ADD, converted to wheel steps PER BAND (`floor(weight * degrees * 4.25 + 0.5)`), then added to the master rotation.
+- Saturation: each band contributes `weight * (kMasterSaturationScale[percent] - 1)`; contributions SUM; `1 + sum` multiplies the master ratio. A full-weight band equals the master slider exactly. Do not multiply per-band ratios or sum percents into one lookup (weight 0.5 at +50 measures ratio 1.5, not `table[+25]`).
+- Lightness is NOT the master blend: positive collapses chroma toward the max channel (`min' = min + (max-min) * L/100`), negative toward the min channel (`max' = max + (min-max) * |L|/100`). Overlapping bands SUM weighted percents and apply once. Band lightness runs BEFORE master lightness.
+- Accuracy: plateaus within 2/255; feather RAMPS carry up to 7/255 (the reds ramp-in runs a constant 6 wheel steps behind PS, unexplained; ramp-out within 1). Fixture `photoshop-hue-saturation-bands.psd`/`.bmp`: max 7, mean 0.13, 98% within 2, pinned at those bounds.
+- Round trip: the six band records are written from the model (header plus 84 bytes); only the undocumented 36-byte trailer stays patch-in-place, so an unedited layer resaves byte-identically.
+
+## 16/32-bit documents
+
+Deep documents run adjustments through `DeepAdjuster` (src/core/adjustment_deep.hpp) on the deep scale (255 = full); the 8-bit path above, with its 256-entry LUTs, stays the only one for 8-bit documents. Channel-wise kinds (Levels, Curves as the natural cubic of `build_curve_lut` without the final rounding, Brightness/Contrast, Exposure, Color Balance, Invert, Posterize, Threshold) run their continuous transfer. Hue/Saturation and ink-space adjustments, whose calibrated 8-bit math mixes channels through integer stages, are lifted: the 8-bit function evaluated on the eight byte colors around the value and blended trilinearly, exact on byte values and continuous between them. In 32-bit documents (the Linear domain) Exposure acts on the linear values and every other kind on their display encoding. Measured precision and the remaining gaps: [high-bit-depth-compositor.md](high-bit-depth-compositor.md#the-deep-fixture-corpus).

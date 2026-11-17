@@ -1,0 +1,5200 @@
+#include "core/layer.hpp"
+#include "core/image_trace.hpp"
+// Vector shape tool flows: a released Shape/Path-mode drag from the canvas
+// becomes a new shape layer, an addition to the active shape layer, or work
+// path subpaths. The options-bar swatches and per-mode widget visibility for
+// the Line/Rectangle/Ellipse tools live here too (built in
+// main_window_actions.cpp, refined by refresh_vector_tool_options_visibility).
+#include "ui/canvas_types.hpp"
+#include "ui/appearance_edits.hpp"
+#include "ui/main_window.hpp"
+#include "support/startup_trace.hpp"
+#include <QComboBox>
+#include <QPushButton>
+#include <QStatusBar>
+#include "ui/canvas_widget.hpp"
+#include "ui/preset_library.hpp"
+#include "ui/unit_spin_box.hpp"
+#include "ui/theme_qss.hpp"
+#include "ui/vector_operations.hpp"
+
+#include "core/path_simplify.hpp"
+#include "core/shape_combine.hpp"
+#include "core/blend_math.hpp"
+#include "core/artboard.hpp"
+#include "core/document_path.hpp"
+#include "core/gradient_fill_drag.hpp"
+#include "core/layer_render_utils.hpp"
+#include "core/pattern_resource.hpp"
+#include "core/pixel_tools.hpp"
+#include "core/vector_live_shapes.hpp"
+#include "core/vector_raster.hpp"
+#include "core/vector_shape.hpp"
+#include "formats/svg_document_io.hpp"
+#include "ui/app_settings.hpp"
+#include "ui/image_trace_dialog.hpp"
+#include "ui/background_workers.hpp"
+#include "ui/color_panel.hpp"
+#include "ui/custom_shape_library.hpp"
+#include "ui/custom_shape_manager_dialog.hpp"
+#include "ui/custom_shape_picker.hpp"
+#include "ui/default_custom_shapes.hpp"
+#include "ui/dialog_utils.hpp"
+#include "ui/edit_conversions.hpp"
+#include "ui/gradient_library.hpp"
+#include "ui/gradient_manager_dialog.hpp"
+#include "ui/main_window_shared.hpp"
+#include "ui/pattern_library.hpp"
+#include "ui/pattern_manager_dialog.hpp"
+#include "ui/photo_pattern_presets.hpp"
+#include "ui/qt_geometry.hpp"
+#include "ui/shape_appearance_dialog.hpp"
+#include "ui/shape_appearance_panel.hpp"
+#include "ui/appearance_properties.hpp"
+#include "ui/shape_create_dialog.hpp"
+#include "ui/shape_pixel_options.hpp"
+#include "ui/stroke_preset_manager_dialog.hpp"
+#include "ui/mask_properties_dialog.hpp"
+#include "ui/theme_palette.hpp"
+#include "ui/localization.hpp"
+
+#include <QAction>
+#include <QBrush>
+#include <QCheckBox>
+#include <QColor>
+#include <QConicalGradient>
+#include <QCoreApplication>
+#include <QDialog>
+#include <QDialogButtonBox>
+#include <QDoubleSpinBox>
+#include <QElapsedTimer>
+#include <cstdio>
+#include <QEventLoop>
+#include <QFile>
+#include <QFileInfo>
+#include <QFontMetrics>
+#include <QFormLayout>
+#include <QGradient>
+#include <QGradientStop>
+#include <QGradientStops>
+#include <QIODevice>
+#include <QIcon>
+#include <QLabel>
+#include <QLatin1String>
+#include <QLineEdit>
+#include <QLinearGradient>
+#include <QListView>
+#include <QMenu>
+#include <QMetaObject>
+#include <QPainter>
+#include <QPen>
+#include <QPixmap>
+#include <QPoint>
+#include <QPointF>
+#include <QPointer>
+#include <QRadialGradient>
+#include <QRect>
+#include <QRectF>
+#include <QScopeGuard>
+#include <QSignalBlocker>
+#include <QSize>
+#include <QSizeF>
+#include <QSpinBox>
+#include <QStandardItemModel>
+#include <QString>
+#include <QStringLiteral>
+#include <QTimer>
+#include <QToolButton>
+#include <QTransform>
+#include <QVBoxLayout>
+#include <QWidget>
+#include <Qt>
+#include <QtGlobal>
+#include <array>
+#include <atomic>
+
+#include <algorithm>
+#include <cmath>
+#include <iterator>
+#include <functional>
+#include <thread>
+#include <future>
+#include <chrono>
+#include <cstdint>
+#include <cstddef>
+#include <exception>
+#include <memory>
+#include <optional>
+#include <qlatin1stringview.h>
+#include <set>
+#include <span>
+#include <string>
+#include <utility>
+#include <vector>
+
+namespace patchy::ui {
+
+namespace {
+
+// Ordered to match the options-bar combine combo: index 0 is "New Layer"
+// (Shape mode) / plain Add (Path mode); 1..4 are the PSD operation values.
+PathCombineOp combine_op_for_index(int index) noexcept {
+  switch (index) {
+    case 2:
+      return PathCombineOp::Subtract;
+    case 3:
+      return PathCombineOp::Intersect;
+    case 4:
+      return PathCombineOp::Xor;
+    default:
+      return PathCombineOp::Add;
+  }
+}
+
+QString shape_layer_base_name(LiveShapeKind kind) {
+  switch (kind) {
+    case LiveShapeKind::Ellipse:
+      return MainWindow::tr("Ellipse %1");
+    case LiveShapeKind::Line:
+      return MainWindow::tr("Line %1");
+    case LiveShapeKind::Polygon:
+      return MainWindow::tr("Polygon %1");
+    default:
+      return MainWindow::tr("Rectangle %1");
+  }
+}
+
+void collect_shape_layer_names(const std::vector<Layer>& layers, std::set<std::string>& names) {
+  for (const auto& layer : layers) {
+    names.insert(layer.name());
+    collect_shape_layer_names(layer.children(), names);
+  }
+}
+
+// Copies pattern tiles referenced by the fill (and stroke paint) into the
+// document store so the rasterizer and the PSD writer can resolve them
+// (the ensure_patterns_for_style convention: library first, bundle repair).
+void ensure_vector_fill_patterns(Document& doc, const VectorShapeContent& content,
+                                 const PatternLibrary& library, const PatternStore* available = nullptr) {
+  std::vector<const VectorFill*> paints{&content.fill, &content.stroke.content};
+  for (const auto& part : content.parts) {
+    paints.push_back(&part.fill);
+    paints.push_back(&part.stroke.content);
+  }
+  for (const auto* fill : paints) {
+    if (fill->kind != VectorFillKind::Pattern || fill->pattern_id.empty()) {
+      continue;
+    }
+    // A stored entry only satisfies the reference when it can actually
+    // render; an empty tile (a poisoned adopt) must be replaced, which the
+    // healing adopt below performs.
+    if (const auto* existing = doc.metadata().patterns.find(fill->pattern_id);
+        existing != nullptr && !existing->tile.empty()) {
+      continue;
+    }
+    if (const auto* resource = available ? available->find(fill->pattern_id) : nullptr;
+        resource && !resource->tile.empty()) {
+      doc.metadata().patterns.adopt(*resource);
+    } else if (auto library_resource = library.resource(QString::fromStdString(fill->pattern_id));
+        library_resource.has_value()) {
+      library_resource->provenance = PatternProvenance::Authored;
+      doc.metadata().patterns.adopt(*library_resource);
+    } else if (auto bundled = bundled_pattern_resource(fill->pattern_id); bundled.has_value()) {
+      doc.metadata().patterns.adopt(*bundled);
+    }
+  }
+}
+
+// A Color, Gradient or Pattern fill layer (no path, or a disabled one) fills the canvas and
+// draws no stroke, so the options bar's stroke controls set up the next shape instead of
+// editing it (GitHub #583). Same rule as the renderer's full-canvas test.
+bool shape_has_stroke_path(const VectorShapeContent& content) {
+  return !content.path.empty() && !content.path_disabled;
+}
+
+// The edit with its stroke operations taken out, for a layer that has no path to stroke.
+ShapeAppearanceSettings without_stroke_edits(const ShapeAppearanceSettings& settings) {
+  auto result = settings;
+  if (!settings.edits) return result;
+  auto edits = std::make_shared<AppearanceEdits<ShapeAppearanceSettings>>(*settings.edits);
+  std::erase_if(edits->operations, [](const auto& operation) { return operation.key.starts_with("stroke."); });
+  result.edits = std::move(edits);
+  return result;
+}
+
+}  // namespace
+
+void MainWindow::handle_vector_shape_drawn(LiveShapeKind kind, QRectF bounds, QPointF line_start,
+                                           QPointF line_end) {
+  if (!has_active_document() || canvas_ == nullptr) {
+    return;
+  }
+  if (kind == LiveShapeKind::Line) {
+    const auto length = std::hypot(line_end.x() - line_start.x(), line_end.y() - line_start.y());
+    if (length < 1.0) {
+      return;
+    }
+  } else if (bounds.width() < 1.0 || bounds.height() < 1.0) {
+    return;
+  }
+
+  LiveShapeParams params;
+  params.kind = kind;
+  params.resolution = document().print_settings().horizontal_ppi;
+  if (kind == LiveShapeKind::Line) {
+    params.line_start_x = line_start.x();
+    params.line_start_y = line_start.y();
+    params.line_end_x = line_end.x();
+    params.line_end_y = line_end.y();
+    params.line_weight = std::max(1.0, current_vector_line_weight_);
+    // Photoshop's default arrowhead proportions: width 500%, length 1000% of the weight,
+    // the values Shape Appearance's Arrowheads section shows for a new head.
+    params.arrow_start = current_line_arrow_start_;
+    params.arrow_end = current_line_arrow_end_;
+    give_line_arrowheads_default_size(params);
+  } else {
+    params.left = bounds.left();
+    params.top = bounds.top();
+    params.right = bounds.right();
+    params.bottom = bounds.bottom();
+    if (kind == LiveShapeKind::Rectangle && current_shape_corner_radius_ > 0) {
+      params.kind = LiveShapeKind::RoundedRectangle;
+      const auto radius = static_cast<double>(current_shape_corner_radius_);
+      params.corner_radii = {radius, radius, radius, radius};
+    }
+  }
+  commit_live_shape(std::move(params));
+}
+
+void MainWindow::commit_live_shape(LiveShapeParams params) {
+  const auto kind = params.kind;
+  populate_live_shape_box_corners(params);
+  if (kind == LiveShapeKind::Line) {
+    // The line's bbox is the generated quad's hull (the drag endpoints sit on
+    // the centerline, half a weight inside it).
+    VectorPath preview;
+    preview.subpaths = generate_live_shape_subpaths(params);
+    if (const auto hull = preview.bounds(); hull.has_value()) {
+      params.left = hull->left;
+      params.top = hull->top;
+      params.right = hull->right;
+      params.bottom = hull->bottom;
+    }
+  }
+
+  // While the vector-mask target is active, drags extend the mask path
+  // regardless of the Shape/Path mode (the Photoshop behavior).
+  if (canvas_->layer_edit_target() == CanvasWidget::LayerEditTarget::VectorMask) {
+    canvas_->add_subpaths_to_vector_mask(generate_live_shape_subpaths(params),
+                                         tr("Add to vector mask"));
+    return;
+  }
+  // Polygon has no Pixels behavior: a persisted Pixels mode draws a path, as before.
+  if (current_vector_tool_mode_ == VectorToolMode::Path ||
+      (kind == LiveShapeKind::Polygon && current_vector_tool_mode_ != VectorToolMode::Shape)) {
+    add_drag_to_work_path(params);
+  } else {
+    create_shape_layer_from_drag(params);
+  }
+}
+
+void MainWindow::handle_shape_create_requested(CanvasTool tool, QPointF document_point) {
+  if (!has_active_document() || canvas_ == nullptr) {
+    return;
+  }
+  // A click off the canvas (outside the document, or outside every artboard when it has
+  // artboards) deselects like Select > Deselect instead of asking for a size (Seth,
+  // October 28, 2026). Undo gets an entry only when a pixel selection went away.
+  {
+    const auto& doc = std::as_const(document());
+    const auto x = static_cast<std::int32_t>(std::floor(document_point.x()));
+    const auto y = static_cast<std::int32_t>(std::floor(document_point.y()));
+    const bool on_canvas = document_has_artboards(doc)
+                               ? artboard_at(doc, x, y) != nullptr
+                               : x >= 0 && y >= 0 && x < doc.width() && y < doc.height();
+    if (!on_canvas) {
+      canvas_->clear_path_anchor_selection();
+      canvas_->run_selection_command(tr("Deselect"), [this] { canvas_->clear_selection(); });
+      return;
+    }
+  }
+  auto& memory = shape_create_memory_[static_cast<int>(tool)];
+  ShapeCreateRequest request;
+  request.tool = tool;
+  request.width = memory.width;
+  request.height = memory.height;
+  request.from_center = memory.from_center;
+  const int bar_radius = std::max(0, current_shape_corner_radius_);
+  const auto radius = static_cast<double>(bar_radius);
+  request.corner_radii = memory.corner_radii.has_value() && memory.radii_from == bar_radius
+                             ? *memory.corner_radii
+                             : std::array<double, 4>{radius, radius, radius, radius};
+  request.polygon_sides = canvas_->polygon_sides();
+  if (tool == CanvasTool::CustomShape) {
+    request.custom_shapes = &custom_shape_library();
+    if (custom_shape_combo_ != nullptr) {
+      request.custom_shape_id = custom_shape_combo_->currentData().toString();
+    }
+  }
+  request.units = dialog_field_units();
+  const auto result = request_shape_create_settings(this, request);
+  if (!result.has_value() || !has_active_document() || canvas_ == nullptr) {
+    return;
+  }
+  memory.width = result->width;
+  memory.height = result->height;
+  memory.from_center = result->from_center;
+  if (tool == CanvasTool::Rectangle) {
+    memory.corner_radii = result->corner_radii;
+    memory.radii_from = bar_radius;
+  }
+  // The dialog's Sides and Shape become the tool's, as if picked on the
+  // options bar (its handlers update the canvas and save the setting). The
+  // Sides spin's handler also reshapes the selected live polygon, which must
+  // keep its own count, so its signal is blocked and the tool updated here.
+  if (tool == CanvasTool::Polygon && result->polygon_sides != canvas_->polygon_sides()) {
+    if (auto* sides = findChild<QSpinBox*>(QStringLiteral("polygonSidesSpin")); sides != nullptr) {
+      QSignalBlocker blocker(sides);
+      sides->setValue(result->polygon_sides);
+    }
+    canvas_->set_polygon_sides(result->polygon_sides);
+    schedule_save_tool_settings();
+  }
+  if (tool == CanvasTool::CustomShape && custom_shape_combo_ != nullptr &&
+      !result->custom_shape_id.isEmpty()) {
+    if (const auto index = custom_shape_combo_->findData(result->custom_shape_id); index >= 0) {
+      custom_shape_combo_->setCurrentIndex(index);
+    }
+  }
+  // Photoshop's placement: the click is the top-left corner, or the center.
+  const QPointF top_left =
+      result->from_center
+          ? document_point - QPointF(result->width / 2.0, result->height / 2.0)
+          : document_point;
+  const QRectF bounds(top_left, QSizeF(result->width, result->height));
+  if (tool == CanvasTool::Rectangle || tool == CanvasTool::Ellipse) {
+    LiveShapeParams params;
+    params.kind = tool == CanvasTool::Rectangle ? LiveShapeKind::Rectangle : LiveShapeKind::Ellipse;
+    params.resolution = document().print_settings().horizontal_ppi;
+    params.left = bounds.left();
+    params.top = bounds.top();
+    params.right = bounds.right();
+    params.bottom = bounds.bottom();
+    if (tool == CanvasTool::Rectangle &&
+        std::any_of(result->corner_radii.begin(), result->corner_radii.end(),
+                    [](double value) { return value > 0.0; })) {
+      params.kind = LiveShapeKind::RoundedRectangle;
+      params.corner_radii = result->corner_radii;
+    }
+    commit_live_shape(std::move(params));
+    return;
+  }
+  VectorPath path;
+  if (tool == CanvasTool::Polygon) {
+    // Unit polygon (first vertex pointing up) scaled into the box, so W and H
+    // may differ, like Photoshop's Create Polygon dialog. It stays live (GitHub #521).
+    commit_live_shape(polygon_live_shape_params(bounds, -std::acos(-1.0) / 2.0));
+    return;
+  }
+  const auto* custom = canvas_->custom_shape_path();
+  if (custom == nullptr || custom->empty()) {
+    show_status_error(tr("Pick a custom shape first"));
+    return;
+  }
+  path = *custom;
+  transform_vector_path(path, {bounds.width(), 0.0, 0.0, bounds.height(), bounds.x(), bounds.y()});
+  handle_vector_path_committed(std::move(path), true, VectorPathSource::CustomShape);
+}
+
+int MainWindow::effective_vector_combine_index() const {
+  if (canvas_ != nullptr && canvas_->shape_drag_adds_to_shape()) {
+    return 1;  // Add
+  }
+  return current_vector_combine_index_;
+}
+
+void MainWindow::create_shape_layer_from_drag(const LiveShapeParams& params) {
+  auto subpaths = generate_live_shape_subpaths(params);
+  create_or_extend_shape_layer(std::move(subpaths), params, shape_layer_base_name(params.kind));
+}
+
+void MainWindow::create_or_extend_shape_layer(std::vector<PathSubpath> subpaths,
+                                              std::optional<LiveShapeParams> origination,
+                                              const QString& name_pattern, std::string library_shape_id) {
+  auto& doc = document();
+  if (subpaths.empty()) {
+    return;
+  }
+  const auto canvas_rect = Rect::from_size(doc.width(), doc.height());
+  const auto* patterns = &doc.metadata().patterns;
+
+  // A non-default combine op extends the active shape layer (Photoshop's
+  // add/subtract/intersect/exclude shape-area modes); so does Shift at the press.
+  const auto combine_index = effective_vector_combine_index();
+  if (combine_index != 0) {
+    if (const auto active = doc.active_layer_id(); active.has_value()) {
+      if (auto* layer = doc.find_layer(*active);
+          layer != nullptr && layer_is_vector_shape(*layer) && vector_lock_reason(*layer).empty()) {
+        push_undo_snapshot(tr("Edit shape"));
+        const auto old_effect_rect =
+            to_qrect(layer_bounds_with_effects(std::as_const(*layer), std::as_const(*layer).bounds()));
+        auto content = *layer->vector_shape();
+        content.library_shape_id.clear();  // the outline is no longer one library shape
+        const auto group = content.path.next_shape_group();
+        const auto op = combine_op_for_index(combine_index);
+        if (!content.parts.empty()) {
+          if (op == PathCombineOp::Add) {
+            VectorShapePart part;
+            part.groups = {group};
+            part.fill = content.fill;
+            part.stroke = content.stroke;
+            part.pattern_anchor = layer_effects_reference_point(*layer);
+            content.parts.push_back(std::move(part));
+          } else {
+            for (auto& part : content.parts) { part.groups.push_back(group); }
+          }
+        }
+        for (auto& subpath : subpaths) {
+          subpath.shape_group = group;
+          subpath.op = op;
+          content.path.subpaths.push_back(std::move(subpath));
+        }
+        if (origination.has_value()) {
+          origination->index = group;
+          content.origination.push_back(std::move(*origination));
+        }
+        layer->set_vector_shape(std::move(content));
+        layer->metadata()[kLayerMetadataVectorRasterStatus] = kVectorRasterStatusPatchy;
+        mark_layer_vector_block_dirty(*layer);
+        update_vector_shape_raster(*layer, canvas_rect, patterns);
+        // Extending a shape layer changes no row structure, and the commit
+        // only dirties the layer's own effect rect: a full layer-list rebuild
+        // plus full-canvas recomposite per combine drag dominated the shape
+        // workflow (synchronously so below the async-defer threshold and
+        // always on wasm).
+        refresh_layer_thumbnails();
+        refresh_layer_controls();
+        path_row_hidden_for_layer_.reset();  // a fresh drag re-shows the outline
+        refresh_paths_panel();
+        canvas_->document_changed_effect_bounds(old_effect_rect.united(
+            to_qrect(layer_bounds_with_effects(std::as_const(*layer), std::as_const(*layer).bounds()))));
+        return;
+      }
+    }
+  }
+
+  std::set<std::string> existing_names;
+  collect_shape_layer_names(doc.layers(), existing_names);
+  int suffix = 1;
+  std::string name;
+  do {
+    name = name_pattern.arg(suffix++).toStdString();
+  } while (existing_names.contains(name));
+
+  auto anchor_id = doc.active_layer_id();
+  if (const auto selected_ids = selected_layer_ids(); !selected_ids.empty()) {
+    anchor_id = selected_ids.front();
+  }
+
+  push_undo_snapshot(tr("New shape layer"));
+  Layer layer(doc.allocate_layer_id(), name, PixelBuffer());
+  const auto layer_id = layer.id();
+  auto content = current_shape_appearance_content(origination.has_value() && origination->kind == LiveShapeKind::Line);
+  content.path.subpaths = std::move(subpaths);
+  if (origination.has_value()) {
+    content.origination = {std::move(*origination)};
+  }
+  content.library_shape_id = std::move(library_shape_id);
+  // A pattern default picked from the library must land in the document store
+  // before the rasterize (and before the writer's Patt collection).
+  ensure_vector_fill_patterns(doc, content, pattern_library());
+  layer.set_vector_shape(std::move(content));
+  layer.metadata()[kLayerMetadataVectorShape] = "1";
+  layer.metadata()[kLayerMetadataVectorRasterStatus] = kVectorRasterStatusPatchy;
+  update_vector_shape_raster(layer, canvas_rect, patterns);
+  insert_layer_after_anchor(doc, std::move(layer), anchor_id);
+  doc.set_active_layer(layer_id);
+  refresh_layer_list();
+  refresh_layer_controls();
+  path_row_hidden_for_layer_.reset();
+  refresh_paths_panel();  // the transient layer-path row auto-targets the new shape
+  // Bounded: a new shape only dirties its own effect rect; the full-canvas
+  // recomposite per drag-out dominated shape workflows at small canvas sizes
+  // (synchronous below the async-defer threshold, always synchronous on wasm).
+  if (const auto* created = std::as_const(doc).find_layer(layer_id); created != nullptr) {
+    canvas_->document_changed_effect_bounds(to_qrect(layer_bounds_with_effects(*created, created->bounds())));
+  } else {
+    canvas_->document_changed();
+  }
+  statusBar()->showMessage(tr("Created shape layer %1.").arg(QString::fromStdString(name)));
+}
+
+Layer MainWindow::shape_layer_from_subpaths(std::vector<PathSubpath> subpaths) {
+  auto& doc = document();
+  std::set<std::string> existing_names;
+  collect_shape_layer_names(doc.layers(), existing_names);
+  int suffix = 1;
+  std::string name;
+  do {
+    name = tr("Shape %1").arg(suffix++).toStdString();
+  } while (existing_names.contains(name));
+  Layer layer(doc.allocate_layer_id(), name, PixelBuffer());
+  auto content = current_shape_appearance_content();
+  content.path.subpaths = std::move(subpaths);
+  ensure_vector_fill_patterns(doc, content, pattern_library());
+  layer.set_vector_shape(std::move(content));
+  layer.metadata()[kLayerMetadataVectorShape] = "1";
+  layer.metadata()[kLayerMetadataVectorRasterStatus] = kVectorRasterStatusPatchy;
+  update_vector_shape_raster(layer, Rect::from_size(doc.width(), doc.height()), &doc.metadata().patterns);
+  return layer;
+}
+
+std::string MainWindow::unused_duplicate_layer_name(const std::string& source_name) {
+  std::set<std::string> existing_names;
+  collect_shape_layer_names(std::as_const(document()).layers(), existing_names);
+  return next_duplicate_name(source_name, existing_names);
+}
+
+void MainWindow::write_shape_layer_content(Layer& layer, VectorShapeContent content) {
+  auto& doc = document();
+  const auto old_effect_rect = to_qrect(layer_bounds_with_effects(std::as_const(layer), std::as_const(layer).bounds()));
+  // Paint parts name groups; a group that left the path must not paint a later one that reuses
+  // its number (next_shape_group).
+  if (!content.parts.empty()) {
+    std::set<std::int32_t> groups;
+    for (const auto& subpath : content.path.subpaths) {
+      groups.insert(subpath.shape_group);
+    }
+    for (auto& part : content.parts) {
+      std::erase_if(part.groups, [&groups](std::int32_t group) { return !groups.contains(group); });
+    }
+    std::erase_if(content.parts,
+                  [](const VectorShapePart& part) { return part.groups.empty() && !part.whole_canvas; });
+  }
+  layer.set_vector_shape(std::move(content));
+  layer.metadata()[kLayerMetadataVectorRasterStatus] = kVectorRasterStatusPatchy;
+  mark_layer_vector_block_dirty(layer);
+  update_vector_shape_raster(layer, Rect::from_size(doc.width(), doc.height()), &doc.metadata().patterns);
+  if (canvas_ != nullptr) {
+    canvas_->document_changed_effect_bounds(old_effect_rect.united(
+        to_qrect(layer_bounds_with_effects(std::as_const(layer), std::as_const(layer).bounds()))));
+  }
+}
+
+void MainWindow::handle_vector_path_committed(VectorPath path, bool closed,
+                                              VectorPathSource source) {
+  (void)closed;  // open pen paths fill their implied chord like Photoshop
+  if (!has_active_document() || canvas_ == nullptr || path.subpaths.empty()) {
+    return;
+  }
+  // While the vector-mask target is active, polygon/custom commits extend the
+  // mask path (pen commits handle this canvas-side before reaching here).
+  if (canvas_->layer_edit_target() == CanvasWidget::LayerEditTarget::VectorMask) {
+    canvas_->add_subpaths_to_vector_mask(std::move(path.subpaths), tr("Add to vector mask"));
+    return;
+  }
+  // Shape creates/extends a shape layer, anything else lands on the work path. (Pixels mode
+  // never gets here: the canvas paints a Polygon or a Custom Shape itself, GitHub issue 716.)
+  if (current_vector_tool_mode_ == VectorToolMode::Shape) {
+    const auto name_pattern = source == VectorPathSource::Polygon ? tr("Polygon %1")
+                              : source == VectorPathSource::CustomShape
+                                  ? tr("Custom Shape %1")
+                                  : tr("Shape %1");
+    // A stamp records its library shape, so Shape Appearance's picker can show it (GitHub #644).
+    std::string library_shape_id;
+    if (source == VectorPathSource::CustomShape && custom_shape_combo_ != nullptr)
+      library_shape_id = custom_shape_combo_->currentData().toString().toStdString();
+    create_or_extend_shape_layer(std::move(path.subpaths), std::nullopt, name_pattern,
+                                 std::move(library_shape_id));
+    return;
+  }
+  add_subpaths_to_work_path(std::move(path.subpaths));
+}
+
+void MainWindow::add_subpaths_to_work_path(std::vector<PathSubpath> subpaths, std::optional<LiveShapeParams> live) {
+  auto& doc = document();
+  if (subpaths.empty()) {
+    return;
+  }
+  const auto record_live = [&live](DocumentPath& target, std::int32_t group) {
+    if (!live.has_value()) {
+      return;
+    }
+    auto entries = target.live_shapes();
+    std::erase_if(entries, [group](const LiveShapeParams& entry) { return entry.index == group; });
+    live->index = group;
+    populate_live_shape_box_corners(*live);
+    entries.push_back(*live);
+    target.set_live_shapes(std::move(entries));
+  };
+  const auto op = combine_op_for_index(effective_vector_combine_index());
+  // A shape tool's drag leaves the component it drew picked, as Path Select would: the
+  // tool's box and the Width / Height fields then act on it (GitHub issue 716). The Pen's
+  // paths stay unpicked.
+  const auto select_drawn_group = [this](std::int32_t group) {
+    if (canvas_ == nullptr) {
+      return;
+    }
+    switch (current_tool_) {
+      case CanvasTool::Rectangle:
+      case CanvasTool::Ellipse:
+      case CanvasTool::Polygon:
+      case CanvasTool::Line:
+      case CanvasTool::CustomShape:
+        canvas_->select_path_groups({group});
+        break;
+      default:
+        break;
+    }
+  };
+  // A path explicitly selected in the Paths panel receives the subpaths
+  // instead of the work path.
+  if (active_document_path_id_.has_value()) {
+    if (auto* target = doc.find_path(*active_document_path_id_); target != nullptr) {
+      push_undo_snapshot(tr("Add to path"));
+      auto path = target->path();
+      const auto group = path.next_shape_group();
+      for (auto& subpath : subpaths) {
+        subpath.shape_group = group;
+        subpath.op = op;
+        path.subpaths.push_back(std::move(subpath));
+      }
+      target->set_path(std::move(path));
+      record_live(*target, group);
+      select_drawn_group(group);
+      refresh_paths_panel();
+      statusBar()->showMessage(tr("Added the shape to %1.").arg(QString::fromStdString(target->name())));
+      return;
+    }
+  }
+  push_undo_snapshot(tr("Add to work path"));
+  DocumentPathId work_id = 0;
+  std::int32_t drawn_group = 0;
+  if (auto* work = doc.work_path(); work != nullptr) {
+    auto path = work->path();
+    const auto group = path.next_shape_group();
+    drawn_group = group;
+    for (auto& subpath : subpaths) {
+      subpath.shape_group = group;
+      subpath.op = op;
+      path.subpaths.push_back(std::move(subpath));
+    }
+    work->set_path(std::move(path));
+    record_live(*work, group);
+    work_id = work->id();
+  } else {
+    VectorPath path;
+    const auto group = subpaths.front().shape_group;
+    drawn_group = group;
+    for (auto& subpath : subpaths) {
+      subpath.op = op;
+      path.subpaths.push_back(std::move(subpath));
+    }
+    DocumentPath created(doc.allocate_path_id(), tr("Work Path").toStdString(),
+                         DocumentPathKind::Work, std::move(path));
+    created.mark_dirty();  // authored: no original resource bytes to re-emit
+    record_live(created, group);
+    work_id = doc.add_path(std::move(created)).id();
+  }
+  // Photoshop highlights the Work Path row as soon as you draw, keeping the
+  // outline visible across tool switches.
+  active_document_path_id_ = work_id;
+  path_row_hidden_for_layer_.reset();
+  if (canvas_ != nullptr) {
+    canvas_->set_active_document_path(work_id);
+  }
+  select_drawn_group(drawn_group);
+  refresh_paths_panel();
+  statusBar()->showMessage(tr("Added the path to the work path."));
+}
+
+void MainWindow::add_drag_to_work_path(const LiveShapeParams& params) {
+  add_subpaths_to_work_path(generate_live_shape_subpaths(params), params);
+}
+
+LiveShapeParams MainWindow::polygon_live_shape_params(QRectF box, double angle_radians) const {
+  LiveShapeParams params;
+  params.kind = LiveShapeKind::Polygon;
+  params.resolution = document().print_settings().horizontal_ppi;
+  params.left = box.left();
+  params.top = box.top();
+  params.right = box.right();
+  params.bottom = box.bottom();
+  params.polygon_sides = canvas_ != nullptr ? canvas_->polygon_sides() : 5;
+  params.polygon_star_inset = canvas_ != nullptr ? canvas_->polygon_star_inset() : 0;
+  params.polygon_angle = angle_radians;
+  return params;
+}
+
+VectorShapeContent MainWindow::current_shape_appearance_content(bool line) const {
+  VectorShapeContent content;
+  content.fill = current_vector_fill_;
+  content.stroke.enabled = current_vector_stroke_enabled_;
+  content.stroke.width = current_vector_stroke_width_;
+  // New shapes: the stroke hugs the inside of the path, unless the bar's alignment list set
+  // another one (GitHub issue 716). A line is a filled outline as wide as its Weight, where an
+  // Inside stroke could only recolour it, so a line's stroke is centered on that outline and
+  // its width makes the line thicker (local-051). A saved stroke preset, below, still sets
+  // the alignment it was saved with.
+  content.stroke.alignment =
+      line ? VectorStrokeAlignment::Center
+           : shape_pixel_options_ != nullptr ? shape_pixel_options_->alignment.value_or(VectorStrokeAlignment::Inside)
+                                             : VectorStrokeAlignment::Inside;
+  content.stroke.content = current_vector_stroke_paint_;
+  apply_stroke_dash_preset(content.stroke, current_vector_stroke_dash_preset_);
+  if (current_vector_stroke_style_.has_value()) {
+    apply_stroke_style_preset(content.stroke, stroke_style_preset_from(*current_vector_stroke_style_, {}));
+  }
+  return content;
+}
+
+void MainWindow::refresh_path_point_count_chip() {
+  refresh_path_edit_action_states();  // the point commands follow the tool and the selection
+  if (path_point_count_chip_ == nullptr) {
+    return;
+  }
+  // Every per-point path tool shows the multi-point selection count (Direct
+  // Select, and the Pen family whose Ctrl latch selects the same way); Path
+  // Select selects whole shapes, where an anchor count would be noise.
+  const bool per_point_tool = current_tool_ == CanvasTool::Pen ||
+                              current_tool_ == CanvasTool::DirectSelect ||
+                              current_tool_ == CanvasTool::AddAnchor ||
+                              current_tool_ == CanvasTool::DeleteAnchor ||
+                              current_tool_ == CanvasTool::ConvertPoint;
+  const auto count = per_point_tool && canvas_ != nullptr
+                         ? canvas_->path_edit_selected_anchor_count()
+                         : 0;
+  if (count >= 2) {
+    path_point_count_chip_->setText(tr("%n points selected", nullptr, count));
+    path_point_count_chip_->show();
+  } else {
+    path_point_count_chip_->hide();
+  }
+}
+
+void MainWindow::refresh_vector_tool_options_visibility() {
+  refresh_path_point_count_chip();
+  const bool shape_tool = current_tool_ == CanvasTool::Line ||
+                          current_tool_ == CanvasTool::Rectangle ||
+                          current_tool_ == CanvasTool::Ellipse ||
+                          current_tool_ == CanvasTool::Pen ||
+                          current_tool_ == CanvasTool::Polygon ||
+                          current_tool_ == CanvasTool::CustomShape;
+  const bool select_tool = current_tool_ == CanvasTool::PathSelect ||
+                           current_tool_ == CanvasTool::DirectSelect;
+  // Visibility itself is decided per widget in refresh_options_bar through
+  // vector_option_widget_visible (one final setVisible per widget); this pass
+  // only syncs control state.
+  if (select_tool) {
+    // The appearance controls live-edit the selected shape layer; they only
+    // show while one is editable (the Combine combo keeps its per-tool
+    // visibility for plain path selections).
+    if (editable_active_vector_shape_layer() != nullptr) {
+      sync_shape_appearance_options_from_active_layer();
+    }
+    sync_vector_shape_size_spins();
+    update_vector_swatch_icons();
+    return;
+  }
+  if (current_tool_ == CanvasTool::Move) {
+    sync_vector_shape_size_spins();
+    return;
+  }
+  if (!shape_tool) {
+    return;  // per-tool visibility already hid every mode-specific widget
+  }
+  // The Pen never rasterizes: a persisted Pixels mode behaves as Path for it, so the
+  // combo greys the Pixels entry out and displays the effective mode instead - without
+  // rewriting the setting the other shape tools use. (Polygon and Custom Shape paint
+  // pixels since GitHub issue 716.)
+  const bool vector_only_tool = current_tool_ == CanvasTool::Pen;
+  const auto effective_mode =
+      vector_only_tool && current_vector_tool_mode_ == VectorToolMode::Pixels
+          ? VectorToolMode::Path
+          : current_vector_tool_mode_;
+  if (vector_mode_combo_ != nullptr) {
+    if (auto* model = qobject_cast<QStandardItemModel*>(vector_mode_combo_->model());
+        model != nullptr && model->item(2) != nullptr) {
+      model->item(2)->setEnabled(!vector_only_tool);
+    }
+    const int display_index = effective_mode == VectorToolMode::Path     ? 1
+                              : effective_mode == VectorToolMode::Pixels ? 2
+                                                                         : 0;
+    if (vector_mode_combo_->currentIndex() != display_index) {
+      QSignalBlocker blocker(vector_mode_combo_);
+      vector_mode_combo_->setCurrentIndex(display_index);
+    }
+  }
+  const bool shape_mode = effective_mode == VectorToolMode::Shape;
+  if (shape_mode) {
+    // Photoshop-style: with a shape layer selected the bar reflects (and
+    // edits) that layer, and its appearance sticks as the next-shape default.
+    sync_shape_appearance_options_from_active_layer();
+  }
+  sync_vector_shape_size_spins();
+  update_vector_swatch_icons();
+}
+
+std::vector<LayerId> MainWindow::editable_selected_shape_layer_ids() const {
+  if (!has_active_document()) return {};
+  auto ids = selected_or_active_layer_ids();
+  const auto active = document().active_layer_id();
+  if (active) {
+    const auto found = std::find(ids.begin(), ids.end(), *active);
+    if (found != ids.end()) std::rotate(ids.begin(), found, std::next(found));
+  }
+  std::erase_if(ids, [this](LayerId id) {
+    const auto* layer = std::as_const(document()).find_layer(id);
+    return !layer || !layer_is_vector_shape(*layer) || !vector_lock_reason(*layer).empty() ||
+           layer_id_locks_image_pixels(id);
+  });
+  return ids;
+}
+
+std::vector<LayerId> MainWindow::stroke_target_shape_layer_ids() const {
+  auto ids = editable_selected_shape_layer_ids();
+  std::erase_if(ids, [this](LayerId id) {
+    const auto* layer = std::as_const(document()).find_layer(id);
+    return !shape_has_stroke_path(*std::as_const(*layer).vector_shape());
+  });
+  return ids;
+}
+
+namespace {
+
+std::vector<std::pair<std::uint64_t, std::uint64_t>> layer_revisions(const Document& document,
+                                                                     const std::vector<LayerId>& ids) {
+  std::vector<std::pair<std::uint64_t, std::uint64_t>> revisions;
+  for (const auto id : ids) {
+    const auto* layer = document.find_layer(id);
+    revisions.emplace_back(layer != nullptr ? layer->render_revision() : 0,
+                           layer != nullptr ? layer->content_revision() : 0);
+  }
+  return revisions;
+}
+
+}  // namespace
+
+// --- The stay-open Shape Appearance window (docs/vector-tools-appearance-window.md) ---
+
+bool MainWindow::edit_active_shape_appearance() {
+  if (unattended_automation()) return false;  // as the modal dialog under automation
+  const bool open = shape_appearance_panel_ != nullptr && shape_appearance_panel_->is_open();
+  if (!open) {
+    // The same refusals the dialog had; an open window just comes forward and says why.
+    if (preview_dialog_edit_locked()) { show_preview_dialog_edit_lock_message(); return false; }
+    if (refuse_layer_dialog_during_transform()) return false;
+    if (!has_active_document() || canvas_ == nullptr || editable_selected_shape_layer_ids().empty()) {
+      show_status_error(tr("Select an unlocked, editable shape layer"));
+      return false;
+    }
+  }
+  finish_pending_shape_appearance_edit();
+  if (shape_appearance_panel_ == nullptr) {
+    ShapeAppearancePanelHost host;
+    host.unavailable_reason = [this] { return shape_appearance_panel_unavailable_reason(); };
+    host.target = [this] { return shape_appearance_panel_target(); };
+    host.apply = [this](const ShapeAppearanceSettings& settings) { apply_live_shape_appearance_edit(settings); };
+    host.finish_run = [this] { finish_pending_shape_appearance_edit(); };
+    host.run_child_dialog = [this](const std::function<bool()>& body) {
+      run_shape_appearance_panel_child_dialog(body);
+    };
+    host.key_target = [this]() -> QWidget* { return canvas_; };
+    host.gradient_handles_changed = [this] { sync_shape_appearance_gradient_handles(); };
+    shape_appearance_panel_ = new ShapeAppearancePanel(this, std::move(host));
+  }
+  shape_appearance_panel_->open();
+  sync_shape_appearance_gradient_handles();
+  return true;
+}
+
+void MainWindow::sync_shape_appearance_panel() {
+  if (shape_appearance_panel_ == nullptr) return;
+  shape_appearance_panel_->sync();
+  sync_shape_appearance_gradient_handles();  // a tab opened since: its canvas follows too
+}
+
+void MainWindow::sync_shape_appearance_gradient_handles() {
+  // The canvas decides where the handles can work (its tool, a transform session, the
+  // active layer); this only says the window asks for them.
+  const bool forced = shape_appearance_panel_ != nullptr && shape_appearance_panel_->gradient_handles_wanted();
+  const auto preferred = forced && shape_appearance_panel_->gradient_handles_on_stroke()
+                             ? GradientHandleTarget::Stroke
+                             : GradientHandleTarget::Fill;
+  for (const auto& target_session : sessions_) {
+    if (target_session != nullptr && target_session->canvas != nullptr) {
+      target_session->canvas->set_gradient_handles_forced(forced, preferred);
+    }
+  }
+}
+
+void MainWindow::hide_shape_appearance_panel_for_shutdown() {
+  if (shape_appearance_panel_ == nullptr) return;
+  end_live_shape_appearance_run();
+  shape_appearance_panel_->hide_for_shutdown();
+  sync_shape_appearance_gradient_handles();
+}
+
+QString MainWindow::shape_appearance_panel_unavailable_reason() const {
+  if (!has_active_document() || canvas_ == nullptr) {
+    return tr("Open a document and select a shape layer to edit its appearance.");
+  }
+  if (preview_dialog_edit_locked()) {
+    return tr("Finish the open dialog to edit the shape here.");
+  }
+  if (canvas_->free_transform_active() || canvas_->warp_transform_active() || canvas_->path_transform_active()) {
+    return tr("Finish the transform to edit the shape here.");
+  }
+  if (editable_selected_shape_layer_ids().empty()) {
+    return tr("Select an unlocked, editable shape layer");
+  }
+  return {};
+}
+
+std::optional<ShapeAppearanceTarget> MainWindow::shape_appearance_panel_target() {
+  if (!shape_appearance_panel_unavailable_reason().isEmpty()) return std::nullopt;
+  const auto& doc = std::as_const(document());
+  ShapeAppearanceTarget target;
+  target.session_id = session().session_id;
+  target.selected_count = selected_or_active_layer_ids().size();
+  target.context.selected_count = target.selected_count;
+  target.context.skipped_reason = tr("Locked layers and layers without editable shapes are skipped.");
+  for (const auto id : editable_selected_shape_layer_ids()) {
+    const auto* layer = doc.find_layer(id);
+    if (layer == nullptr || layer->vector_shape() == nullptr) continue;
+    target.ids.push_back(id);
+    target.context.originals.push_back(shape_appearance_settings(*layer));
+    target.context.names.push_back(QString::fromStdString(layer->name()));
+  }
+  if (target.ids.empty()) return std::nullopt;
+  target.revisions = layer_revisions(doc, target.ids);
+
+  const auto foreground = canvas_->primary_color();
+  const auto background = canvas_->secondary_color();
+  auto& options = target.options;
+  options.initial = target.context.originals.front();
+  options.reset_defaults.fill.kind = VectorFillKind::Solid;
+  options.reset_defaults.fill.color = {static_cast<std::uint8_t>(foreground.red()),
+                                       static_cast<std::uint8_t>(foreground.green()),
+                                       static_cast<std::uint8_t>(foreground.blue())};
+  options.reset_defaults.stroke.enabled = false;
+  options.reset_defaults.stroke.width = 3.0;
+  options.reset_defaults.stroke.alignment = VectorStrokeAlignment::Inside;
+  options.gradient_library = &gradient_library();
+  options.pattern_library = &pattern_library();
+  options.document_patterns = &doc.metadata().patterns;
+  options.foreground = options.reset_defaults.fill.color;
+  options.background = {static_cast<std::uint8_t>(background.red()), static_cast<std::uint8_t>(background.green()),
+                        static_cast<std::uint8_t>(background.blue())};
+  options.units = dialog_field_units();
+  options.custom_shapes =
+      ShapeAppearanceShapeSource{[this]() -> const CustomShapeLibrary* { return &custom_shape_library_with_bundled(); },
+                                 [this](QWidget* parent) { open_custom_shape_manager(parent); }};
+  return target;
+}
+
+void MainWindow::apply_live_shape_appearance_edit(const ShapeAppearanceSettings& settings) {
+  auto* panel = shape_appearance_panel_;
+  if (panel == nullptr || !settings.edits || settings.edits->operations.empty()) return;
+  // Nothing is applied while the window is unavailable, or from a page built for other
+  // layers (its rebuild is on the way).
+  if (!shape_appearance_panel_unavailable_reason().isEmpty()) return;
+  const auto session_id = session().session_id;
+  const auto ids = editable_selected_shape_layer_ids();
+  if (!panel->page_targets(session_id, ids)) {
+    panel->sync();
+    return;
+  }
+  const auto& key = settings.edits->operations.back().key;
+  auto& run = panel->run();
+  // Another property, or layers something else changed since the run's last write: the
+  // run is over, and this change starts the next one from the layers as they are now.
+  if (run.has_value() &&
+      (run->session_id != session_id || run->ids != ids || run->key != key ||
+       run->written != layer_revisions(std::as_const(document()), run->ids))) {
+    finish_pending_shape_appearance_edit();
+  }
+  if (!run.has_value()) {
+    finish_pending_shape_appearance_edit();
+    finish_pending_layer_opacity_edit();
+    finish_pending_layer_fill_opacity_edit();
+    finish_pending_layer_blend_edit();
+    ShapeAppearanceLiveRun next;
+    next.session_id = session_id;
+    next.ids = ids;
+    next.key = key;
+    next.base_patterns = document().metadata().patterns;
+    for (const auto id : ids) {
+      if (const auto* layer = std::as_const(document()).find_layer(id)) next.bases.push_back(*layer);
+    }
+    // The undo step, and the first value. A value that changes nothing starts no run.
+    if (!commit_shape_appearance_edit(ids, settings)) return;
+    next.written = layer_revisions(std::as_const(document()), next.ids);
+    next.steps = 1;
+    run = std::move(next);
+    panel->restart_idle_timer();
+    return;
+  }
+  write_live_shape_appearance_step(*run, settings, true);
+  panel->restart_idle_timer();
+}
+
+void MainWindow::write_live_shape_appearance_step(ShapeAppearanceLiveRun& run,
+                                                  const ShapeAppearanceSettings& settings, bool draft) {
+  auto& doc = document();
+  // From the layers as the run found them: its edits are every value since then.
+  doc.metadata().patterns = run.base_patterns;
+  std::vector<const Layer*> originals;
+  for (const auto& base : run.bases) originals.push_back(&base);
+  bool drafted = false;
+  auto layers = shape_appearance_edit_layers(originals, settings, true, draft ? &drafted : nullptr);
+  for (auto& layer : layers) {
+    const auto id = layer.id();
+    if (auto* target = doc.find_layer(id)) *target = std::move(layer);
+  }
+  run.written = layer_revisions(std::as_const(doc), run.ids);
+  run.drafted = drafted;
+  run.last = settings;
+  ++run.steps;
+  if (canvas_ != nullptr) canvas_->document_changed_async_preview();
+}
+
+void MainWindow::end_live_shape_appearance_run() {
+  auto* panel = shape_appearance_panel_;
+  if (panel == nullptr || !panel->run().has_value()) return;
+  auto finished = std::move(*panel->run());
+  panel->run().reset();
+  if (has_active_document() && canvas_ != nullptr && session().session_id == finished.session_id &&
+      finished.steps > 1) {
+    // The last value was a draft bake: bake it exactly, unless something else has changed
+    // the layers since (that edit rebaked them).
+    if (finished.drafted && finished.last.has_value() &&
+        finished.written == layer_revisions(std::as_const(document()), finished.ids)) {
+      write_live_shape_appearance_step(finished, *finished.last, false);
+    }
+    canvas_->document_changed();
+    refresh_layer_thumbnails();
+    refresh_paths_panel();
+  }
+  panel->run_finished();
+  // The other controls that show these values (options bar, Properties, the Layers panel's
+  // Opacity) follow once the caller that ended the run is done.
+  if (!shape_appearance_panel_refresh_queued_) {
+    shape_appearance_panel_refresh_queued_ = true;
+    QTimer::singleShot(0, this, [this] {
+      shape_appearance_panel_refresh_queued_ = false;
+      refresh_layer_controls();
+      refresh_options_bar();
+    });
+  }
+}
+
+void MainWindow::run_shape_appearance_panel_child_dialog(const std::function<bool()>& body) {
+  auto* panel = shape_appearance_panel_;
+  if (panel == nullptr || !body) return;
+  finish_pending_shape_appearance_edit();
+  if (!has_active_document() || !shape_appearance_panel_unavailable_reason().isEmpty() ||
+      !panel->page_targets(session().session_id, editable_selected_shape_layer_ids())) {
+    panel->sync();
+    return;
+  }
+  // The dialog has its own OK and Cancel, so it runs as the modal edit does: the document
+  // locked, its changes previews, one undo step on OK and the layers put back on Cancel.
+  // The lock is also what keeps the selection, and with it this page, in place under the
+  // row's handler while the dialog's event loop runs.
+  const QPointer<ShapeAppearancePanel> guard(panel);
+  panel->begin_child_dialog();
+  // Ended after the commit, so the page takes the committed layers as its new baseline.
+  const auto end = qScopeGuard([guard] {
+    if (guard != nullptr) guard->end_child_dialog();
+  });
+  edit_active_shape_appearance_modal(
+      true,
+      [&](const ShapeAppearanceSettings&, std::function<void(const ShapeAppearanceSettings&)> preview)
+          -> std::optional<ShapeAppearanceSettings> {
+        panel->set_child_preview(std::move(preview));
+        const auto clear = qScopeGuard([guard] {
+          if (guard != nullptr) guard->set_child_preview({});
+        });
+        if (!body()) return std::nullopt;
+        return panel->page_settings();
+      });
+}
+
+bool MainWindow::edit_active_shape_appearance_modal(bool record_undo,
+    std::function<std::optional<ShapeAppearanceSettings>(const ShapeAppearanceSettings&,
+        std::function<void(const ShapeAppearanceSettings&)>)> editor, bool stroke_edit) {
+  if (preview_dialog_edit_locked()) { show_preview_dialog_edit_lock_message(); return false; }
+  if (refuse_layer_dialog_during_transform()) return false;
+  // Every entry (Properties, options bar, menus, row badge) may arrive with no document or no
+  // shape selected; report it instead of reaching document() (GitHub issue 273 follow-up).
+  if (!has_active_document() || canvas_ == nullptr) {
+    show_status_error(tr("Select an unlocked, editable shape layer"));
+    return false;
+  }
+  finish_pending_shape_appearance_edit();
+  finish_pending_layer_opacity_edit();
+  finish_pending_layer_fill_opacity_edit();
+  finish_pending_layer_blend_edit();
+  auto& doc = document();
+  auto ids = stroke_edit ? stroke_target_shape_layer_ids() : editable_selected_shape_layer_ids();
+  // Creation already owns its outer transaction and edits only its staged layer.
+  if (!record_undo && doc.active_layer_id()) ids = {*doc.active_layer_id()};
+  if (ids.empty()) {
+    show_status_error(tr("Select an unlocked, editable shape layer"));
+    return false;
+  }
+  const auto selected_ids = selected_layer_ids();
+  const auto active_id = doc.active_layer_id();
+  const auto original_patterns = doc.metadata().patterns;
+  auto originals = std::make_shared<std::vector<Layer>>();
+  AppearanceDialogContext<ShapeAppearanceSettings> context;
+  context.selected_count = record_undo ? selected_or_active_layer_ids().size() : 1;
+  context.skipped_reason = tr("Locked layers and layers without editable shapes are skipped.");
+  for (const auto id : ids) {
+    const auto* layer = std::as_const(doc).find_layer(id);
+    if (!layer || !layer->vector_shape()) continue;
+    originals->push_back(*layer);
+    context.originals.push_back(shape_appearance_settings(*layer));
+    context.names.push_back(QString::fromStdString(layer->name()));
+  }
+  if (originals->empty()) return false;
+  const QPointer<CanvasWidget> target_canvas(canvas_);
+  auto latest = std::make_shared<std::vector<Layer>>();
+  auto render_failed = std::make_shared<bool>(false);
+  auto preview_state = std::make_shared<AsyncPixelPreviewState<ShapeAppearanceSettings>>();
+  auto request_serial = std::make_shared<std::atomic<std::uint64_t>>(0);
+
+  const auto restore = [this, originals, original_patterns, target_canvas] {
+    if (!target_canvas || canvas_ != target_canvas) return;
+    document().metadata().patterns = original_patterns;
+    for (const auto& original : *originals)
+      if (auto* target = document().find_layer(original.id())) *target = original;
+    canvas_->document_changed();
+    refresh_layer_thumbnails();
+  };
+  const auto prepare = [this, originals, original_patterns](const ShapeAppearanceSettings& settings) {
+    auto result = std::make_shared<std::vector<Layer>>(*originals);
+    // Preserve collision aliases made by a previous picker preview.
+    const auto available = document().metadata().patterns;
+    document().metadata().patterns = original_patterns;
+    for (auto& layer : *result) {
+      const auto baseline = shape_appearance_settings(std::as_const(layer));
+      auto next = apply_shape_appearance_edits(baseline, settings);
+      const auto* original_content = std::as_const(layer).vector_shape();
+      auto content = assemble_shape_appearance(*original_content, next);
+      ensure_vector_fill_patterns(document(), content, pattern_library(), &available);
+      if (!shape_vector_appearance_equal(*original_content, content)) layer.set_vector_shape(std::move(content));
+      if (next.layer_opacity != baseline.layer_opacity) layer.set_opacity(next.layer_opacity);
+      if (next.fill_opacity != baseline.fill_opacity) layer.set_fill_opacity(next.fill_opacity);
+    }
+    return result;
+  };
+  const auto render = [originals, request_serial](std::vector<Layer>& layers, Rect bounds, const PatternStore& patterns,
+                                                 std::uint64_t serial) {
+    for (std::size_t index = 0; index < layers.size(); ++index) {
+      if (request_serial->load() != serial) return false;
+      if (!shape_vector_appearance_equal(*(*originals)[index].vector_shape(), *std::as_const(layers[index]).vector_shape()))
+        update_vector_shape_raster(layers[index], bounds, &patterns);
+    }
+    return true;
+  };
+  // The live preview shows only finished renders (local-051 follow-up). A request's layers,
+  // the new outline with the pixels baked from it, reach the document together when their
+  // render lands. Until then the document keeps the last finished render, so nothing a
+  // repaint reads (the composite, the path outline, Dynamic Vector Preview) can pair a new
+  // outline with older pixels: assigning the request's layers at once put the pixels from
+  // when the dialog opened back for the length of every render, and a scrubbed arrowhead
+  // flipped between that size and the new one. A finished render also lands while a newer
+  // value waits, as in the adjustment previews (GitHub #601): one render runs at a time, so
+  // results arrive in request order and a scrub shows every size it passes.
+  preview_state->start = [this, preview_state, latest, render_failed, prepare, render, target_canvas, request_serial](
+                             const ShapeAppearanceSettings& settings) {
+    // prepare() adopts the request's patterns into the document's store. The store goes
+    // back to what the shown layers use, and the request's store lands with its layers.
+    auto shown_patterns = document().metadata().patterns;
+    auto result = prepare(settings);
+    const auto patterns = std::make_shared<PatternStore>(document().metadata().patterns);
+    document().metadata().patterns = std::move(shown_patterns);
+    const auto bounds = Rect::from_size(document().width(), document().height());
+    const auto generation = ++preview_state->generation;
+    const auto serial = request_serial->load();
+    preview_state->in_flight = true;
+    *render_failed = false;
+    canvas_->begin_processing_operation(tr("Updating shapes..."));
+    const QPointer<MainWindow> window(this);
+    auto* app = QCoreApplication::instance();
+    run_tracked_background_worker([app, window, preview_state, latest, render_failed, result,
+                                   patterns, bounds, generation, render, target_canvas, serial] {
+      bool failed = false;
+      try { failed = !render(*result, bounds, *patterns, serial); } catch (...) { failed = true; }
+      if (!app) return;
+      QMetaObject::invokeMethod(app, [window, preview_state, latest, render_failed, result, patterns,
+                                     generation, failed, target_canvas] {
+        preview_state->in_flight = false;
+        if (target_canvas) target_canvas->end_processing_operation();
+        // Preview off bumps the generation, so a render it overtook never lands.
+        if (window && target_canvas && window->canvas_ == target_canvas &&
+            !preview_state->closed && generation == preview_state->generation) {
+          *render_failed = failed;
+          if (!failed) {
+            *latest = *result;
+            window->document().metadata().patterns = *patterns;
+            for (const auto& layer : *result)
+              if (auto* target = window->document().find_layer(layer.id())) *target = layer;
+            window->canvas_->document_changed();
+            window->refresh_layer_thumbnails();
+          }
+        }
+        if (!preview_state->closed && preview_state->pending && preview_state->start) {
+          auto next = std::move(*preview_state->pending);
+          preview_state->pending.reset();
+          preview_state->start(next);
+        }
+      }, Qt::QueuedConnection);
+    });
+  };
+  auto edit_lock = lock_preview_dialog_edits();
+  auto cleanup = qScopeGuard([preview_state, restore, request_serial] {
+    ++*request_serial;
+    close_async_pixel_preview(preview_state);
+    restore();
+  });
+  const auto foreground = canvas_->primary_color();
+  const auto background = canvas_->secondary_color();
+  ShapeAppearanceSettings defaults;
+  defaults.fill.kind = VectorFillKind::Solid;
+  defaults.fill.color = {static_cast<std::uint8_t>(foreground.red()),
+                         static_cast<std::uint8_t>(foreground.green()),
+                         static_cast<std::uint8_t>(foreground.blue())};
+  defaults.stroke.enabled = false;
+  defaults.stroke.width = 3.0;
+  defaults.stroke.alignment = VectorStrokeAlignment::Inside;
+  const auto preview_changed = [preview_state, restore, request_serial](const ShapeAppearanceSettings& value) {
+    if (!value.preview_enabled) {
+      // Preview off shows the layers as they were, at once: a render still running is
+      // abandoned (the serial) and never lands (the generation). An ordinary change lets the
+      // running render finish and land, then renders the newest value.
+      ++*request_serial;
+      ++preview_state->generation;
+      restore();
+    }
+    enqueue_async_pixel_preview(preview_state, value);
+  };
+  const auto accepted = editor ? editor(context.originals.front(), preview_changed) : request_shape_appearance_settings(
+      this, preview_changed, context.originals.front(), defaults, &gradient_library(), &pattern_library(),
+      &doc.metadata().patterns, defaults.fill.color,
+      {static_cast<std::uint8_t>(background.red()), static_cast<std::uint8_t>(background.green()),
+       static_cast<std::uint8_t>(background.blue())}, dialog_field_units(), &context,
+      ShapeAppearanceShapeSource{[this]() -> const CustomShapeLibrary* { return &custom_shape_library_with_bundled(); },
+                                 [this](QWidget* parent) { open_custom_shape_manager(parent); }});
+  // Save... and Delete in the dialog's Dashes row change the options bar's list too.
+  rebuild_vector_stroke_dash_combo();
+
+  if (accepted) {
+    QElapsedTimer drain;
+    drain.start();
+    while ((preview_state->in_flight || preview_state->pending) && drain.elapsed() < 60000)
+      QCoreApplication::processEvents(QEventLoop::AllEvents, 50);
+  }
+  const bool complete = !preview_state->in_flight && !preview_state->pending &&
+                        !latest->empty() && !*render_failed;
+  ++*request_serial;
+  close_async_pixel_preview(preview_state);
+  if (accepted && !complete && accepted->edits && !accepted->edits->operations.empty()) {
+    latest = prepare(*accepted);
+    render(*latest, Rect::from_size(doc.width(), doc.height()), doc.metadata().patterns, request_serial->load());
+  }
+  auto final_patterns = doc.metadata().patterns;
+  restore();
+  if (!accepted) {
+    cleanup.dismiss();
+    edit_lock.release();
+    statusBar()->showMessage(tr("Cancelled shape appearance"));
+    refresh_layer_controls();
+    return false;
+  }
+  bool changed = false;
+  for (std::size_t i = 0; i < latest->size(); ++i) {
+    const auto& before = (*originals)[i];
+    const auto& after = (*latest)[i];
+    changed = changed || !shape_appearance_equal(shape_appearance_settings(before), shape_appearance_settings(after));
+    const auto* a = before.vector_shape();
+    const auto* b = after.vector_shape();
+    // A custom shape picked into the same box changes only the outline (GitHub #644).
+    changed = changed || a->path != b->path;
+    for (std::size_t part = 0; part < a->parts.size(); ++part)
+      changed = changed || a->parts[part].fill != b->parts[part].fill ||
+                a->parts[part].stroke != b->parts[part].stroke;
+  }
+  if (changed) {
+    // Prepare native-source invalidation before recording the completed edit.
+    for (std::size_t i = 0; i < latest->size(); ++i) {
+      auto& layer = (*latest)[i];
+      const auto& before = (*originals)[i];
+      const auto* a = before.vector_shape();
+      const auto* b = std::as_const(layer).vector_shape();
+      const bool vector_changed = !shape_vector_appearance_equal(*a, *b);
+      if (!vector_changed && before.opacity() == layer.opacity() && before.fill_opacity() == layer.fill_opacity()) continue;
+      if (vector_changed) {
+        mark_layer_vector_block_dirty(layer);
+        layer.metadata()[kLayerMetadataVectorRasterStatus] = kVectorRasterStatusPatchy;
+      }
+    }
+    if (record_undo) push_undo_snapshot(tr("Shape appearance"));
+    doc.metadata().patterns = std::move(final_patterns);
+    for (auto& layer : *latest)
+      if (auto* target = doc.find_layer(layer.id())) *target = std::move(layer);
+    canvas_->document_changed();
+  }
+  cleanup.dismiss();
+  edit_lock.release();
+  refresh_layer_list();
+  select_layers_in_layer_list(selected_ids, active_id.value_or(ids.front()));
+  refresh_layer_controls();
+  refresh_options_bar();
+  refresh_paths_panel();
+  return true;
+}
+
+Layer MainWindow::build_fill_layer(const VectorFill& fill, const QString& name, bool bake) {
+  auto& doc = document();
+  Layer layer(doc.allocate_layer_id(), name.toStdString(), PixelBuffer());
+  VectorShapeContent content;  // empty path = the whole canvas
+  // A work path or saved path targeted in the Paths panel clips the new fill layer
+  // (it becomes the layer's shape path). The active layer's own path row (a shape
+  // layer's path, a vector mask, a text box) is targeted automatically and never
+  // counts: a fill layer made while a shape layer is selected spans the canvas
+  // (GitHub #710).
+  if (canvas_ != nullptr && canvas_->panel_path_targeted() && active_document_path_id_.has_value()) {
+    if (const auto* target = std::as_const(doc).find_path(*active_document_path_id_);
+        target != nullptr && !target->path().empty()) {
+      content.path = target->path();
+    }
+  }
+  content.fill = fill;
+  content.stroke.enabled = false;
+  ensure_vector_fill_patterns(doc, content, pattern_library());
+  layer.set_vector_shape(std::move(content));
+  layer.metadata()[kLayerMetadataVectorShape] = "1";
+  layer.metadata()[kLayerMetadataVectorRasterStatus] = kVectorRasterStatusPatchy;
+  if (bake) {
+    update_vector_shape_raster(layer, Rect::from_size(doc.width(), doc.height()),
+                               &doc.metadata().patterns);
+  }
+  const auto selection = canvas_->selected_document_region();
+  const auto selection_rect =
+      selection.boundingRect().intersected(QRect(0, 0, doc.width(), doc.height()));
+  if (!selection.isEmpty() && !selection_rect.isEmpty()) {
+    layer.set_mask(LayerMask{to_core_rect(selection_rect),
+                             coverage_at_document_depth(doc, selection_mask_pixels(*canvas_, selection_rect)), 0,
+                             false});
+  }
+  return layer;
+}
+
+QString MainWindow::unique_fill_layer_name(const QString& base) {
+  std::set<std::string> existing_names;
+  collect_shape_layer_names(document().layers(), existing_names);
+  int suffix = 1;
+  std::string name;
+  do {
+    name = base.arg(suffix++).toStdString();
+  } while (existing_names.contains(name));
+  return QString::fromStdString(name);
+}
+
+// What a background Gradient Fill bake needs to land: where the layer goes, what the layer
+// was when the bake began, and the worker's result.
+struct MainWindow::PendingGradientFillBake {
+  std::int64_t session_id{0};
+  std::uint64_t token{0};
+  LayerId layer_id{0};
+  // A layer the document does not hold yet, inserted above `anchor_id`; otherwise the
+  // existing fill `layer_id` takes `gradient`.
+  bool new_layer{false};
+  std::optional<LayerId> anchor_id;
+  LayerStyleGradient gradient;
+  std::uint64_t base_render_revision{0};
+  std::uint64_t base_content_revision{0};
+  QString undo_label;
+  QString status;
+  // The layer with the committed shape and no raster, and the worker's copy with it.
+  Layer unbaked;
+  std::shared_future<Layer> baked;
+  // Set by the worker before it posts its completion. The future only turns ready once the
+  // worker has returned, a moment after that post, so "is it done" reads this flag.
+  std::shared_ptr<std::atomic<bool>> done{std::make_shared<std::atomic<bool>>(false)};
+  // The commit made after this one, while it was pending.
+  std::shared_ptr<PendingGradientFillBake> next;
+};
+
+namespace {
+
+int gradient_fill_bake_test_delay_ms() noexcept {
+  bool ok = false;
+  const auto value = qEnvironmentVariableIntValue("PATCHY_GRADIENT_FILL_BAKE_TEST_DELAY_MS", &ok);
+  return ok ? std::max(0, value) : 0;
+}
+
+}  // namespace
+
+bool MainWindow::gradient_fill_bake_runs_in_background(const Layer& fill) {
+#if defined(Q_OS_WASM)
+  // A blocked wait on a worker is not safe there (docs/wasm.md); the bake stays inline.
+  (void)fill;
+  return false;
+#else
+  // Read per commit (PATCHY_GRADIENT_FILL_BACKGROUND_BAKE=0 bakes on the spot, as before
+  // GitHub #714's third follow-up; tests of that path set it).
+  const bool disabled = qEnvironmentVariable("PATCHY_GRADIENT_FILL_BACKGROUND_BAKE") == QLatin1String("0");
+  if (kBackgroundWorkRunsInline || disabled || canvas_ == nullptr || !has_active_document()) {
+    return false;
+  }
+  // The fills the canvas previews at view resolution: pathless, 8-bit, 1 Mpx and up.
+  const auto& doc = std::as_const(document());
+  return doc.color_state().bit_depth == BitDepth::UInt8 &&
+         gradient_fill_draft_supported(fill, Rect::from_size(doc.width(), doc.height()));
+#endif
+}
+
+void MainWindow::start_gradient_fill_bake(std::shared_ptr<PendingGradientFillBake> pending) {
+  const auto& doc = std::as_const(document());
+  pending->session_id = session().session_id;
+  pending->token = ++gradient_fill_bake_token_;
+  // The worker's layer shares nothing the GUI thread writes: the old raster is dropped here.
+  pending->unbaked.set_pixels(PixelBuffer());
+  const auto canvas_rect = Rect::from_size(doc.width(), doc.height());
+  auto patterns = std::make_shared<const PatternStore>(doc.metadata().patterns);
+  auto* app = QCoreApplication::instance();
+  const QPointer<MainWindow> self(this);
+  pending->baked = launch_async([layer = pending->unbaked, canvas_rect, patterns = std::move(patterns), app, self,
+                                 done = pending->done]() mutable {
+                     // Posted however the bake ends; the GUI thread then takes the result
+                     // (or the exception) from the future.
+                     const auto notify = qScopeGuard([app, self, done] {
+                       done->store(true);
+                       if (app == nullptr) {
+                         return;
+                       }
+                       QMetaObject::invokeMethod(
+                           app,
+                           [self] {
+                             if (self != nullptr) {
+                               self->land_gradient_fill_bakes(false);
+                             }
+                           },
+                           Qt::QueuedConnection);
+                     });
+                     // A test holds the bake by setting the delay and lets it go by clearing it.
+                     const auto started = std::chrono::steady_clock::now();
+                     while (std::chrono::steady_clock::now() - started <
+                            std::chrono::milliseconds(gradient_fill_bake_test_delay_ms())) {
+                       std::this_thread::sleep_for(std::chrono::milliseconds(2));
+                     }
+                     update_vector_shape_raster(layer, canvas_rect, patterns.get());
+                     return layer;
+                   }).share();
+  if (pending_gradient_fill_bake_ == nullptr) {
+    pending_gradient_fill_bake_ = std::move(pending);
+    return;
+  }
+  auto* tail = pending_gradient_fill_bake_.get();
+  while (tail->next != nullptr) {
+    tail = tail->next.get();
+  }
+  tail->next = std::move(pending);
+}
+
+std::shared_ptr<MainWindow::PendingGradientFillBake> MainWindow::gradient_fill_bake_queue_tail(LayerId layer_id) {
+  if (pending_gradient_fill_bake_ == nullptr || !has_active_document() ||
+      session().session_id != pending_gradient_fill_bake_->session_id) {
+    return nullptr;
+  }
+  const auto* layer = std::as_const(document()).find_layer(layer_id);
+  if (layer == nullptr || layer->render_revision() != pending_gradient_fill_bake_->base_render_revision ||
+      layer->content_revision() != pending_gradient_fill_bake_->base_content_revision) {
+    return nullptr;
+  }
+  auto tail = pending_gradient_fill_bake_;
+  while (true) {
+    if (tail->new_layer || tail->layer_id != layer_id) {
+      return nullptr;
+    }
+    if (tail->next == nullptr) {
+      return tail;
+    }
+    tail = tail->next;
+  }
+}
+
+void MainWindow::finish_pending_gradient_fill_bake() {
+  land_gradient_fill_bakes(true);
+}
+
+void MainWindow::land_gradient_fill_bakes(bool wait) {
+  while (pending_gradient_fill_bake_ != nullptr && (wait || pending_gradient_fill_bake_->done->load())) {
+    // Detached while it lands: the history snapshot it takes ends pending edits, and must
+    // not pull the commits behind this one in ahead of it.
+    const auto front = std::move(pending_gradient_fill_bake_);
+    pending_gradient_fill_bake_.reset();
+    auto rest = std::move(front->next);
+    land_gradient_fill_bake(*front, rest.get());
+    if (rest != nullptr) {
+      // A commit that started during the landing (none can: it takes no input) goes last.
+      if (pending_gradient_fill_bake_ != nullptr) {
+        auto* tail = rest.get();
+        while (tail->next != nullptr) {
+          tail = tail->next.get();
+        }
+        tail->next = std::move(pending_gradient_fill_bake_);
+      }
+      pending_gradient_fill_bake_ = std::move(rest);
+    }
+    if (!wait && pending_gradient_fill_bake_ != nullptr && pending_gradient_fill_bake_->done->load()) {
+      // One landing per pass of the event loop: a pointer held on a handle keeps moving
+      // between them (three in a row took 300 ms at 48 Mpx).
+      const QPointer<MainWindow> self(this);
+      QMetaObject::invokeMethod(
+          this,
+          [self] {
+            if (self != nullptr) {
+              self->land_gradient_fill_bakes(false);
+            }
+          },
+          Qt::QueuedConnection);
+      return;
+    }
+  }
+}
+
+void MainWindow::land_gradient_fill_bake(const PendingGradientFillBake& landing, PendingGradientFillBake* next) {
+  const auto* pending = &landing;
+  if (canvas_ == nullptr || !has_active_document() || session().session_id != pending->session_id) {
+    return;  // its document is gone (every switch and close finishes the bake first)
+  }
+  // The canvas keeps the newest commit's picture and handles until the last one lands.
+  const auto finish_on_canvas = [this, next](bool landed) {
+    if (next == nullptr) {
+      canvas_->finish_gradient_fill_pending_commit(landed);
+    }
+  };
+  auto& doc = document();
+  const auto canvas_rect = Rect::from_size(doc.width(), doc.height());
+  Layer baked;
+  try {
+    baked = pending->baked.get();  // waits when the worker has not finished
+  } catch (...) {
+    baked = pending->unbaked;
+    update_vector_shape_raster(baked, canvas_rect, &doc.metadata().patterns);
+  }
+  if (pending->new_layer) {
+    push_undo_snapshot(pending->undo_label);
+    insert_layer_after_anchor(doc, std::move(baked), pending->anchor_id);
+    doc.set_active_layer(pending->layer_id);
+    refresh_layer_list();
+    refresh_layer_controls();
+    canvas_->document_changed();
+    finish_on_canvas(true);
+    statusBar()->showMessage(pending->status);
+    return;
+  }
+  const auto* current = std::as_const(doc).find_layer(pending->layer_id);
+  const auto* shape = current != nullptr && layer_is_vector_shape(*current) ? current->vector_shape() : nullptr;
+  if (shape == nullptr || !shape->parts.empty() || shape->fill.kind != VectorFillKind::Gradient) {
+    finish_on_canvas(false);
+    return;
+  }
+  // The bake stands for the layer it was made from. Anything that changed the layer since
+  // (a mask, the path, another gradient) gets the gradient written into the layer as it is
+  // now and baked here instead.
+  const bool unchanged = current->render_revision() == pending->base_render_revision &&
+                         current->content_revision() == pending->base_content_revision &&
+                         std::as_const(baked).vector_shape() != nullptr;
+  push_undo_snapshot(pending->undo_label);
+  auto* layer = doc.find_layer(pending->layer_id);
+  if (layer == nullptr) {
+    finish_on_canvas(false);
+    return;
+  }
+  if (unchanged) {
+    layer->set_vector_shape(*std::as_const(baked).vector_shape());
+    layer->set_pixels(std::as_const(baked).pixels());
+    layer->set_bounds(std::as_const(baked).bounds());
+    layer->metadata()[kLayerMetadataVectorRasterStatus] = kVectorRasterStatusPatchy;
+  } else {
+    apply_gradient_fill_handle_gradient(pending->layer_id, pending->gradient);
+  }
+  mark_layer_vector_block_dirty(*layer);
+  if (unchanged && next != nullptr && !next->new_layer && next->layer_id == pending->layer_id) {
+    // The commit queued behind this one was baked from this one's shape: the layer it
+    // expects is the layer as this landing leaves it (read after the last write above).
+    next->base_render_revision = std::as_const(*layer).render_revision();
+    next->base_content_revision = std::as_const(*layer).content_revision();
+  }
+  canvas_->document_changed();
+  finish_on_canvas(true);
+  refresh_layer_list();
+  refresh_layer_controls();
+  if (!pending->status.isEmpty()) {
+    statusBar()->showMessage(pending->status);
+  }
+}
+
+void MainWindow::create_fill_layer(const VectorFill& fill, const QString& name, QString label, float opacity,
+                                   bool bake_in_background) {
+  auto& doc = document();
+  auto anchor_id = doc.active_layer_id();
+  if (const auto selected_ids = selected_layer_ids(); !selected_ids.empty()) {
+    anchor_id = selected_ids.front();
+  }
+  if (bake_in_background) {
+    // The layer is built without its raster; when a worker can make it, the layer joins
+    // the document (and the history) once that is done.
+    auto unbaked = build_fill_layer(fill, name, false);
+    unbaked.set_opacity(std::clamp(opacity, 0.0F, 1.0F));
+    if (gradient_fill_bake_runs_in_background(std::as_const(unbaked))) {
+      auto pending = std::make_shared<PendingGradientFillBake>();
+      pending->layer_id = std::as_const(unbaked).id();
+      pending->new_layer = true;
+      pending->anchor_id = anchor_id;
+      pending->undo_label = std::move(label);
+      pending->status = tr("Created fill layer %1.").arg(name);
+      pending->unbaked = std::move(unbaked);
+      canvas_->begin_gradient_fill_pending_new_layer();
+      start_gradient_fill_bake(std::move(pending));
+      return;
+    }
+    push_undo_snapshot(std::move(label));
+    update_vector_shape_raster(unbaked, Rect::from_size(doc.width(), doc.height()), &doc.metadata().patterns);
+    const auto layer_id = std::as_const(unbaked).id();
+    insert_layer_after_anchor(doc, std::move(unbaked), anchor_id);
+    doc.set_active_layer(layer_id);
+    refresh_layer_list();
+    refresh_layer_controls();
+    canvas_->document_changed();
+    statusBar()->showMessage(tr("Created fill layer %1.").arg(name));
+    return;
+  }
+  push_undo_snapshot(std::move(label));
+  auto layer = build_fill_layer(fill, name);
+  layer.set_opacity(std::clamp(opacity, 0.0F, 1.0F));
+  const auto layer_id = layer.id();
+  insert_layer_after_anchor(doc, std::move(layer), anchor_id);
+  doc.set_active_layer(layer_id);
+  refresh_layer_list();
+  refresh_layer_controls();
+  canvas_->document_changed();
+  statusBar()->showMessage(tr("Created fill layer %1.").arg(name));
+}
+
+void MainWindow::new_solid_color_fill_layer() {
+  if (canvas_ == nullptr || !has_active_document()) {
+    return;
+  }
+  if (preview_dialog_edit_locked()) {
+    show_preview_dialog_edit_lock_message();
+    return;
+  }
+  std::optional<LayerId> preview_id;
+  const auto restore_active_layer = document().active_layer_id();
+  const auto fill_for_color = [](QColor color) {
+    VectorFill fill;
+    fill.kind = VectorFillKind::Solid;
+    fill.color = RgbColor{static_cast<std::uint8_t>(color.red()),
+                          static_cast<std::uint8_t>(color.green()),
+                          static_cast<std::uint8_t>(color.blue())};
+    return fill;
+  };
+  const auto preview_name = unique_fill_layer_name(tr("Color Fill %1"));
+  const auto update_preview = [this, &preview_id, restore_active_layer, fill_for_color,
+                               preview_name](QColor color) {
+    auto& doc = document();
+    if (preview_id.has_value()) {
+      if (auto* layer = doc.find_layer(*preview_id);
+          layer != nullptr && layer->vector_shape() != nullptr) {
+        auto content = *layer->vector_shape();
+        content.fill = fill_for_color(color);
+        layer->set_vector_shape(std::move(content));
+        update_vector_shape_raster(*layer, Rect::from_size(doc.width(), doc.height()),
+                                   &doc.metadata().patterns);
+        canvas_->document_changed();
+        return;
+      }
+      preview_id.reset();
+    }
+    auto preview = build_fill_layer(fill_for_color(color), preview_name);
+    preview_id = preview.id();
+    doc.add_layer(std::move(preview));
+    if (restore_active_layer.has_value() && doc.find_layer(*restore_active_layer) != nullptr) {
+      doc.set_active_layer(*restore_active_layer);
+    }
+    canvas_->document_changed();
+  };
+
+  auto preview_edit_lock = lock_preview_dialog_edits();
+  const auto initial = canvas_->primary_color();
+  update_preview(initial);
+  const auto chosen =
+      request_patchy_color(this, initial, tr("New Fill Layer"),
+                           [&update_preview](QColor color) { update_preview(color); });
+  if (preview_id.has_value()) {
+    auto& doc = document();
+    doc.remove_layer(*preview_id);
+    preview_id.reset();
+    if (restore_active_layer.has_value() && doc.find_layer(*restore_active_layer) != nullptr) {
+      doc.set_active_layer(*restore_active_layer);
+    }
+    canvas_->document_changed();
+  }
+  preview_edit_lock.release();
+  if (!chosen.has_value()) {
+    statusBar()->showMessage(tr("Cancelled fill layer"));
+    return;
+  }
+  create_fill_layer(fill_for_color(*chosen), preview_name, tr("New fill layer"));
+}
+
+void MainWindow::new_gradient_fill_layer() {
+  if (canvas_ == nullptr || !has_active_document()) {
+    return;
+  }
+  const auto foreground = canvas_->primary_color();
+  const auto background = canvas_->secondary_color();
+  VectorFill fill;
+  fill.kind = VectorFillKind::Gradient;
+  fill.gradient.type = LayerStyleGradientType::Linear;
+  fill.gradient.angle_degrees = 90.0F;
+  fill.gradient.color_stops = {
+      GradientColorStop{0.0F,
+                        RgbColor{static_cast<std::uint8_t>(foreground.red()),
+                                 static_cast<std::uint8_t>(foreground.green()),
+                                 static_cast<std::uint8_t>(foreground.blue())},
+                        0.5F},
+      GradientColorStop{1.0F,
+                        RgbColor{static_cast<std::uint8_t>(background.red()),
+                                 static_cast<std::uint8_t>(background.green()),
+                                 static_cast<std::uint8_t>(background.blue())},
+                        0.5F}};
+  fill.gradient.alpha_stops = {GradientAlphaStop{0.0F, 1.0F, 0.5F},
+                               GradientAlphaStop{1.0F, 1.0F, 0.5F}};
+  create_fill_layer_with_appearance(fill, unique_fill_layer_name(tr("Gradient Fill %1")));
+}
+
+void MainWindow::handle_gradient_fill_drawn(QPoint from, QPoint to) {
+  if (canvas_ == nullptr || !has_active_document() || from == to) {
+    return;
+  }
+  if (preview_dialog_edit_locked()) {
+    show_preview_dialog_edit_lock_message();
+    return;
+  }
+  // Commits still being baked land first, each as its own step, unless they are on the
+  // active fill, where this one can queue behind them (below).
+  auto queue_tail = std::shared_ptr<PendingGradientFillBake>();
+  if (pending_gradient_fill_bake_ != nullptr) {
+    const auto pending_active = std::as_const(document()).active_layer_id();
+    queue_tail = pending_active.has_value() ? gradient_fill_bake_queue_tail(*pending_active) : nullptr;
+    if (queue_tail == nullptr) {
+      finish_pending_gradient_fill_bake();
+    }
+  }
+  auto& doc = document();
+  const auto canvas_rect = Rect::from_size(doc.width(), doc.height());
+  auto gradient = gradient_fill_from_drag(canvas_->resolved_gradient(), canvas_->gradient_method(),
+                                          canvas_->gradient_reverse(), canvas_rect, from.x(), from.y(), to.x(),
+                                          to.y());
+  // An active Gradient Fill layer (or gradient-filled shape) takes the drag's gradient and
+  // keeps everything else: name, masks, opacity, blend mode, styles, path.
+  const auto active_id = doc.active_layer_id();
+  const auto* active = active_id.has_value() ? std::as_const(doc).find_layer(*active_id) : nullptr;
+  const auto* active_shape = active != nullptr && layer_is_vector_shape(*active) ? active->vector_shape() : nullptr;
+  if (active_shape != nullptr && active_shape->parts.empty() &&
+      active_shape->fill.kind == VectorFillKind::Gradient) {
+    if (!vector_lock_reason(*active).empty() || layer_id_locks_image_pixels(*active_id)) {
+      show_status_error(tr("Unlock the Gradient Fill layer to change its gradient"));
+      return;
+    }
+    // Behind a pending commit the shape to change is that commit's.
+    auto content = queue_tail != nullptr && std::as_const(queue_tail->unbaked).vector_shape() != nullptr
+                       ? *std::as_const(queue_tail->unbaked).vector_shape()
+                       : *active_shape;
+    content.fill.gradient = std::move(gradient);
+    const auto changed_status = tr("Changed the gradient of %1.").arg(QString::fromStdString(active->name()));
+    // A large fill bakes in the background (GitHub #714 follow-up): the canvas shows the
+    // new gradient and its handles at once, and the layer takes it when the bake is done.
+    if (gradient_fill_bake_runs_in_background(*active) &&
+        canvas_->begin_gradient_fill_pending_commit(*active_id, content.fill.gradient,
+                                                    gradient_fill_alignment_bounds(*active, canvas_rect))) {
+      auto pending = std::make_shared<PendingGradientFillBake>();
+      pending->layer_id = *active_id;
+      pending->gradient = content.fill.gradient;
+      pending->base_render_revision = active->render_revision();
+      pending->base_content_revision = active->content_revision();
+      pending->undo_label = tr("Edit Gradient Fill");
+      pending->status = changed_status;
+      pending->unbaked = queue_tail != nullptr ? queue_tail->unbaked : *active;
+      pending->unbaked.set_vector_shape(std::move(content));
+      start_gradient_fill_bake(std::move(pending));
+      return;
+    }
+    finish_pending_gradient_fill_bake();  // not queued after all: the pending ones land first
+    push_undo_snapshot(tr("Edit Gradient Fill"));
+    auto* layer = doc.find_layer(*active_id);
+    layer->set_vector_shape(std::move(content));
+    update_vector_shape_raster(*layer, canvas_rect, &doc.metadata().patterns);
+    mark_layer_vector_block_dirty(*layer);
+    if (canvas_->gradient_drag_view_preview_shown()) {
+      // The drag was shown through the composite: that picture, for the committed
+      // gradient, stays until the layer is composited, in place of the painted overlay.
+      const auto& committed = std::as_const(*layer);
+      canvas_->hold_gradient_fill_view_preview(*active_id, committed.vector_shape()->fill.gradient,
+                                               gradient_fill_alignment_bounds(committed, canvas_rect));
+    }
+    canvas_->document_changed();
+    refresh_layer_list();
+    refresh_layer_controls();
+    statusBar()->showMessage(changed_status);
+    return;
+  }
+  VectorFill fill;
+  fill.kind = VectorFillKind::Gradient;
+  fill.gradient = std::move(gradient);
+  // The options bar's Opacity becomes the layer's opacity; the stops keep their own alpha.
+  create_fill_layer(fill, unique_fill_layer_name(tr("Gradient Fill %1")), tr("New Gradient Fill"),
+                    static_cast<float>(canvas_->gradient_opacity()) / 100.0F, true);
+}
+
+void MainWindow::apply_gradient_fill_handle_gradient(LayerId layer_id, const LayerStyleGradient& gradient,
+                                                     std::optional<Rect> draft_bounds, GradientHandleTarget target) {
+  auto& doc = document();
+  auto* layer = doc.find_layer(layer_id);
+  const auto* shape = layer != nullptr ? std::as_const(*layer).vector_shape() : nullptr;
+  if (shape == nullptr) {
+    return;
+  }
+  auto content = *shape;
+  if (target == GradientHandleTarget::Stroke) {
+    content.stroke.content.gradient = gradient;
+    draft_bounds.reset();  // the draft bakes full-canvas fills only
+  } else {
+    content.fill.gradient = gradient;
+  }
+  layer->set_vector_shape(std::move(content));
+  const auto canvas_rect = Rect::from_size(doc.width(), doc.height());
+  // 16 and 32-bit documents render fills from the shape itself (deep_gradient_fill_raster),
+  // so only 8-bit ones take the draft.
+  const bool drafted = draft_bounds.has_value() && doc.color_state().bit_depth == BitDepth::UInt8 &&
+                       update_gradient_fill_draft_raster(*layer, canvas_rect, *draft_bounds);
+  if (!drafted) {
+    update_vector_shape_raster(*layer, canvas_rect, &doc.metadata().patterns);
+  }
+  mark_layer_vector_block_dirty(*layer);
+}
+
+void MainWindow::handle_gradient_fill_handle_edit(LayerId layer_id, const LayerStyleGradient& gradient,
+                                                  GradientFillEditPhase phase, std::uint64_t serial,
+                                                  const QString& undo_label, GradientHandleTarget target) {
+  if (canvas_ == nullptr || !has_active_document()) {
+    gradient_fill_handle_preview_.reset();
+    return;
+  }
+  const bool on_stroke = target == GradientHandleTarget::Stroke;
+  auto& doc = document();
+  const auto session_id = session().session_id;
+  const bool previewing = gradient_fill_handle_preview_.has_value() &&
+                          gradient_fill_handle_preview_->session_id == session_id &&
+                          gradient_fill_handle_preview_->layer_id == layer_id &&
+                          gradient_fill_handle_preview_->serial == serial;
+  // Previews that only went to the canvas's view preview left the layer alone.
+  const bool view_previewing = previewing && !gradient_fill_handle_preview_->document_touched;
+  // Puts the layer back as it was before this drag's first preview; true when it had changed.
+  const auto restore = [&] {
+    if (!previewing) {
+      return false;
+    }
+    auto* layer = doc.find_layer(layer_id);
+    const bool touched = gradient_fill_handle_preview_->document_touched;
+    if (layer != nullptr && touched) {
+      *layer = gradient_fill_handle_preview_->original;
+    }
+    gradient_fill_handle_preview_.reset();
+    return layer != nullptr && touched;
+  };
+  if (phase == GradientFillEditPhase::Cancel) {
+    if (restore()) {
+      canvas_->document_changed();
+      refresh_layer_controls();
+    } else if (view_previewing) {
+      canvas_->clear_gradient_fill_view_preview();
+    }
+    return;
+  }
+  // Earlier commits still being baked land first, each as its own step, unless this commit
+  // can queue behind them (they edit this fill). A preview does not wait for them: a drag
+  // that starts on top of a pending commit previews at view resolution and leaves the
+  // document alone (below).
+  auto queue_tail = std::shared_ptr<PendingGradientFillBake>();
+  if (phase == GradientFillEditPhase::Commit && pending_gradient_fill_bake_ != nullptr) {
+    queue_tail = on_stroke ? nullptr : gradient_fill_bake_queue_tail(layer_id);
+    if (queue_tail == nullptr) {
+      finish_pending_gradient_fill_bake();
+    }
+  }
+  // A gesture still open in the Shape Appearance window ends before this one writes: its
+  // next value would otherwise be written over the handle's preview.
+  if (!previewing) {
+    finish_pending_shape_appearance_edit_alone();
+  }
+  const auto* layer = std::as_const(doc).find_layer(layer_id);
+  const auto* shape = layer != nullptr && layer_is_vector_shape(*layer) ? layer->vector_shape() : nullptr;
+  if (shape == nullptr || !shape->parts.empty() ||
+      (on_stroke ? shape->stroke.content.kind : shape->fill.kind) != VectorFillKind::Gradient) {
+    if (!previewing) {
+      gradient_fill_handle_preview_.reset();
+    }
+    return;
+  }
+  if (preview_dialog_edit_locked() || !vector_lock_reason(*layer).empty() || layer_id_locks_image_pixels(layer_id)) {
+    if (restore()) {
+      canvas_->document_changed();
+    } else if (view_previewing) {
+      canvas_->clear_gradient_fill_view_preview();
+    }
+    if (phase == GradientFillEditPhase::Commit) {
+      if (preview_dialog_edit_locked()) {
+        show_preview_dialog_edit_lock_message();
+      } else {
+        show_status_error(tr("Unlock the Gradient Fill layer to change its gradient"));
+      }
+    }
+    return;
+  }
+  if (phase == GradientFillEditPhase::Preview) {
+    if (!previewing) {
+      // The bounds are for a fill's draft bake; a stroke bakes exactly.
+      gradient_fill_handle_preview_ = GradientFillHandlePreview{
+          session_id, layer_id, serial, *layer,
+          on_stroke ? Rect{} : gradient_fill_alignment_bounds(*layer, Rect::from_size(doc.width(), doc.height()))};
+    }
+    QElapsedTimer trace_timer;
+    trace_timer.start();
+    const bool trace = qEnvironmentVariableIntValue("PATCHY_GRADIENT_HANDLE_TRACE") != 0;
+    // A fill the draft covers previews on the canvas at the view's resolution and leaves
+    // the document alone (GitHub #714: a full-size draft and a full composite per preview
+    // still took the event loop on a 19 Mpx photo). Once a preview has gone through the
+    // document, the rest of the edit does too.
+    if (!on_stroke && !gradient_fill_handle_preview_->document_touched &&
+        canvas_->show_gradient_fill_view_preview(layer_id, gradient, gradient_fill_handle_preview_->gradient_bounds)) {
+      if (trace) {
+        std::fprintf(stderr, "[gradient handles] view preview %.1f ms, %llu px\n",
+                     static_cast<double>(trace_timer.nsecsElapsed()) / 1e6,
+                     static_cast<unsigned long long>(
+                         canvas_->render_cache_diagnostics().gradient_view_preview_last_pixels));
+      }
+      return;
+    }
+    if (pending_gradient_fill_bake_ != nullptr) {
+      // This preview goes through the document, so the commit still being baked lands
+      // first and the edit starts from the layer it makes.
+      finish_pending_gradient_fill_bake();
+      const auto* landed = std::as_const(doc).find_layer(layer_id);
+      if (landed == nullptr || !gradient_fill_handle_preview_.has_value()) {
+        gradient_fill_handle_preview_.reset();
+        return;
+      }
+      if (!gradient_fill_handle_preview_->document_touched) {
+        gradient_fill_handle_preview_->original = *landed;
+      }
+    }
+    gradient_fill_handle_preview_->document_touched = true;
+    // Otherwise a live preview takes the draft bake and an asynchronous recomposite that never
+    // cancels the one in flight (GitHub issue 663 follow-up: an exact bake and a cancelled
+    // composite per move made the handles lag on large documents); the release bakes exactly.
+    apply_gradient_fill_handle_gradient(
+        layer_id, gradient,
+        on_stroke ? std::nullopt : std::optional(gradient_fill_handle_preview_->gradient_bounds), target);
+    const auto bake_ms = static_cast<double>(trace_timer.nsecsElapsed()) / 1e6;
+    canvas_->document_changed_async_preview();
+    if (trace) {
+      std::fprintf(stderr, "[gradient handles] bake %.1f ms, invalidate %.1f ms\n", bake_ms,
+                   static_cast<double>(trace_timer.nsecsElapsed()) / 1e6 - bake_ms);
+    }
+    return;
+  }
+  // Commit: the history snapshot must hold the layer as it was before the drag.
+  const auto view_bounds = view_previewing ? gradient_fill_handle_preview_->gradient_bounds : Rect{};
+  // The layer is as it was before the edit when no preview went through the document.
+  const bool layer_untouched = !previewing || view_previewing;
+  restore();
+  if (!on_stroke && layer_untouched) {
+    // A large fill bakes in the background (GitHub #714 follow-up): the canvas keeps the
+    // committed gradient and its handles on screen, the next press works at once, and the
+    // layer takes the gradient, as this one undo step, when the bake is done.
+    const auto* fill_layer = std::as_const(doc).find_layer(layer_id);
+    if (fill_layer != nullptr && fill_layer->vector_shape() != nullptr &&
+        gradient_fill_bake_runs_in_background(*fill_layer) &&
+        canvas_->begin_gradient_fill_pending_commit(
+            layer_id, gradient,
+            view_previewing ? view_bounds
+                            : gradient_fill_alignment_bounds(*fill_layer,
+                                                             Rect::from_size(doc.width(), doc.height())))) {
+      auto pending = std::make_shared<PendingGradientFillBake>();
+      pending->layer_id = layer_id;
+      pending->gradient = gradient;
+      pending->base_render_revision = fill_layer->render_revision();
+      pending->base_content_revision = fill_layer->content_revision();
+      pending->undo_label = undo_label.isEmpty() ? tr("Edit Gradient Fill") : undo_label;
+      // Behind a pending commit the layer to change is that commit's.
+      const Layer& base = queue_tail != nullptr && std::as_const(queue_tail->unbaked).vector_shape() != nullptr
+                              ? std::as_const(queue_tail->unbaked)
+                              : *fill_layer;
+      auto content = *base.vector_shape();
+      content.fill.gradient = gradient;
+      pending->unbaked = base;
+      pending->unbaked.set_vector_shape(std::move(content));
+      start_gradient_fill_bake(std::move(pending));
+      return;
+    }
+  }
+  finish_pending_gradient_fill_bake();  // not queued after all: the pending ones land first
+  push_undo_snapshot(undo_label.isEmpty() ? tr("Edit Gradient Fill") : undo_label);
+  apply_gradient_fill_handle_gradient(layer_id, gradient, std::nullopt, target);
+  if (view_previewing) {
+    // The view preview stays up, showing the committed gradient, until the exact
+    // composite lands; the frame under it is still the one from before the drag.
+    canvas_->hold_gradient_fill_view_preview(layer_id, gradient, view_bounds);
+  }
+  canvas_->document_changed();
+  refresh_layer_list();
+  refresh_layer_controls();
+}
+
+void MainWindow::handle_gradient_fill_stop_color_requested(LayerId layer_id, int stop_index,
+                                                           GradientHandleTarget target) {
+  if (canvas_ == nullptr || !has_active_document() || stop_index < 0) {
+    return;
+  }
+  finish_pending_gradient_fill_bake();  // the picker starts from the layer's own gradient
+  const auto* layer = std::as_const(document()).find_layer(layer_id);
+  const auto* shape = layer != nullptr ? layer->vector_shape() : nullptr;
+  const auto* paint =
+      shape == nullptr ? nullptr : target == GradientHandleTarget::Stroke ? &shape->stroke.content : &shape->fill;
+  if (paint == nullptr || paint->kind != VectorFillKind::Gradient ||
+      static_cast<std::size_t>(stop_index) >= paint->gradient.color_stops.size()) {
+    return;
+  }
+  const auto original = paint->gradient;
+  const auto initial = original.color_stops[static_cast<std::size_t>(stop_index)].color;
+  const auto serial = ++gradient_fill_stop_color_serial_ | (std::uint64_t{1} << 63U);
+  const auto session_id = session().session_id;
+  const auto with_color = [original, stop_index](QColor color) {
+    auto edited = original;
+    edited.color_stops[static_cast<std::size_t>(stop_index)].color =
+        RgbColor{static_cast<std::uint8_t>(color.red()), static_cast<std::uint8_t>(color.green()),
+                 static_cast<std::uint8_t>(color.blue())};
+    return edited;
+  };
+  const auto still_here = [this, session_id] { return has_active_document() && session().session_id == session_id; };
+  const auto chosen = request_patchy_color(
+      this, QColor(initial.red, initial.green, initial.blue), tr("Gradient Stop Color"),
+      [&](QColor color) {
+        if (color.isValid() && still_here()) {
+          handle_gradient_fill_handle_edit(layer_id, with_color(color), GradientFillEditPhase::Preview, serial,
+                                           QString(), target);
+        }
+      });
+  if (!still_here()) {
+    return;
+  }
+  if (!chosen.has_value() || !chosen->isValid() || with_color(*chosen) == original) {
+    handle_gradient_fill_handle_edit(layer_id, original, GradientFillEditPhase::Cancel, serial, QString(), target);
+    return;
+  }
+  handle_gradient_fill_handle_edit(layer_id, with_color(*chosen), GradientFillEditPhase::Commit, serial,
+                                   tr("Change Color Stop"), target);
+}
+
+void MainWindow::new_pattern_fill_layer() {
+  if (canvas_ == nullptr || !has_active_document()) {
+    return;
+  }
+  VectorFill fill;
+  fill.kind = VectorFillKind::Pattern;
+  if (const auto& patterns = document().metadata().patterns; !patterns.empty()) {
+    fill.pattern_id = patterns.patterns.front().id;
+    fill.pattern_name = patterns.patterns.front().name;
+  } else if (!pattern_library().entries().empty()) {
+    const auto& entry = pattern_library().entries().front();
+    fill.pattern_id = entry.id.toStdString();
+    fill.pattern_name = entry.name.toStdString();
+  } else {
+    show_status_error(tr("No patterns are available."));
+    return;
+  }
+  create_fill_layer_with_appearance(fill, unique_fill_layer_name(tr("Pattern Fill %1")));
+}
+
+void MainWindow::create_fill_layer_with_appearance(const VectorFill& fill, const QString& name) {
+  if (preview_dialog_edit_locked()) {
+    show_preview_dialog_edit_lock_message();
+    return;
+  }
+  if (refuse_layer_dialog_during_transform()) {
+    return;
+  }
+  // The layer is made at once, as one undo step, and its settings open in the stay-open
+  // Fill Layer Settings window, the one that edits an existing fill layer (GitHub #714
+  // follow-up). The creation used to run the modal dialog, whose edit lock refused the
+  // gradient's handles on the canvas. Changes made in the window are undo steps of their
+  // own, as when editing; Undo takes the new layer away again.
+  create_fill_layer(fill, name, tr("New fill layer"));
+  if (fill.kind == VectorFillKind::Gradient && canvas_->tool() != CanvasTool::Gradient) {
+    // The Gradient tool shows the new fill's handles whatever the window's Show handles
+    // box says, and under the tools that otherwise own every press.
+    activate_tool(CanvasTool::Gradient);
+  }
+  edit_active_shape_appearance();
+}
+
+void MainWindow::populate_new_fill_layer_menu(QMenu* menu, const QString& object_name_prefix) {
+  if (menu == nullptr) {
+    return;
+  }
+  const auto add_fill = [this, menu, &object_name_prefix](const char* source,
+                                                          const QString& object_key, auto callback) {
+    auto* action = menu->addAction(tr(source));
+    bind_action_text(action, source);
+    if (!object_name_prefix.isEmpty()) {
+      action->setObjectName(object_name_prefix + object_key + QStringLiteral("Action"));
+      register_document_action(action);
+    }
+    connect(action, &QAction::triggered, this, callback);
+    return action;
+  };
+  add_fill(QT_TR_NOOP("&Solid Color..."), QStringLiteral("SolidColorFill"),
+           [this] { new_solid_color_fill_layer(); });
+  add_fill(QT_TR_NOOP("&Gradient..."), QStringLiteral("GradientFill"),
+           [this] { new_gradient_fill_layer(); });
+  add_fill(QT_TR_NOOP("&Pattern..."), QStringLiteral("PatternFill"),
+           [this] { new_pattern_fill_layer(); });
+}
+
+Layer* MainWindow::vector_mask_command_layer(bool require_mask) {
+  if (!has_active_document()) {
+    return nullptr;
+  }
+  auto& doc = document();
+  select_only_layer_if_none_active();
+  const auto active = doc.active_layer_id();
+  auto* layer = active.has_value() ? doc.find_layer(*active) : nullptr;
+  if (layer == nullptr) {
+    show_status_error(tr("Select a layer to work with vector masks"));
+    return nullptr;
+  }
+  if (!require_mask && layer->vector_shape()) {
+    show_status_error(tr("Put shape layers in a group and apply the vector mask to that group."));
+    return nullptr;
+  }
+  if (!vector_lock_reason(*layer).empty()) {
+    show_status_error(tr("This layer's vector data is preserved but can't be edited."));
+    return nullptr;
+  }
+  if (require_mask && layer->vector_mask() == nullptr) {
+    show_status_error(tr("The active layer has no vector mask"));
+    return nullptr;
+  }
+  if (!require_mask && layer->vector_mask() != nullptr) {
+    show_status_error(tr("The active layer already has a vector mask"));
+    return nullptr;
+  }
+  return layer;
+}
+
+std::vector<LayerId> MainWindow::vector_mask_command_ids(bool require_mask, MaskCommandScope scope) {
+  if (!has_active_document()) {
+    return {};
+  }
+  select_only_layer_if_none_active();
+  auto ids = mask_command_targets(scope, [require_mask](const Layer& candidate) {
+    if (!require_mask && candidate.vector_shape() != nullptr) {
+      return false;
+    }
+    return vector_lock_reason(candidate).empty() && (candidate.vector_mask() != nullptr) == require_mask;
+  });
+  if (ids.empty()) {
+    // Nothing qualifies: the active layer's own check says why.
+    if (const auto* layer = vector_mask_command_layer(require_mask); layer != nullptr) {
+      ids.push_back(layer->id());
+    }
+  }
+  return ids;
+}
+
+void MainWindow::add_vector_mask(bool hide_all, bool from_work_path) {
+  const auto ids = vector_mask_command_ids(false, MaskCommandScope::SelectedLayers);
+  if (ids.empty()) {
+    return;
+  }
+  auto& doc = document();
+  LayerVectorMask mask;
+  if (from_work_path) {
+    const auto* work = doc.work_path();
+    if (work == nullptr || work->path().empty()) {
+      show_status_error(tr("Draw a work path first"));
+      return;
+    }
+    mask.path = work->path();
+  }
+  mask.inverted = hide_all;
+  push_undo_snapshot(tr("Add vector mask"));
+  for (const auto id : ids) {
+    auto* layer = doc.find_layer(id);
+    if (layer == nullptr) {
+      continue;
+    }
+    layer->set_vector_mask(mask);
+    mark_layer_vector_block_dirty(*layer);
+    update_vector_mask_raster(*layer, Rect::from_size(doc.width(), doc.height()));
+  }
+  refresh_layer_list_keeping_selection();
+  if (canvas_ != nullptr && ids.front() == doc.active_layer_id()) {
+    canvas_->set_layer_edit_target(CanvasWidget::LayerEditTarget::VectorMask);
+  }
+  refresh_layer_controls();
+  canvas_->document_changed();
+  // An empty Reveal All or Hide All mask has nothing to select yet: say how to fill it.
+  statusBar()->showMessage(from_work_path ? tr("Added a vector mask")
+                                          : tr("Added a vector mask. Draw a path or shape with the Pen or a "
+                                               "shape tool to mask the layer"));
+}
+
+void MainWindow::delete_active_vector_mask(MaskCommandScope scope) {
+  const auto ids = vector_mask_command_ids(true, scope);
+  if (ids.empty()) {
+    return;
+  }
+  push_undo_snapshot(tr("Delete vector mask"));
+  for (const auto id : ids) {
+    auto* layer = document().find_layer(id);
+    if (layer == nullptr) {
+      continue;
+    }
+    layer->clear_vector_mask();
+    auto& blocks = layer->unknown_psd_blocks();
+    std::erase_if(blocks, [](const UnknownPsdBlock& block) {
+      return block.key == "vmsk" || block.key == "vsms";
+    });
+    mark_layer_vector_block_dirty(*layer);
+  }
+  if (canvas_ != nullptr && ids.front() == document().active_layer_id() &&
+      canvas_->layer_edit_target() == CanvasWidget::LayerEditTarget::VectorMask) {
+    canvas_->set_layer_edit_target(CanvasWidget::LayerEditTarget::Content);
+  }
+  refresh_layer_list_keeping_selection();
+  refresh_layer_controls();
+  canvas_->document_changed();
+  statusBar()->showMessage(tr("Deleted the vector mask"));
+}
+
+void MainWindow::set_active_layer_vector_mask_disabled(bool disabled, MaskCommandScope scope) {
+  const auto ids = vector_mask_command_ids(true, scope);
+  // Every layer takes the new state, not a flip each.
+  std::vector<LayerId> changed;
+  for (const auto id : ids) {
+    const auto* layer = std::as_const(document()).find_layer(id);
+    if (layer != nullptr && layer->vector_mask()->disabled != disabled) {
+      changed.push_back(id);
+    }
+  }
+  if (changed.empty()) {
+    return;
+  }
+  push_undo_snapshot(disabled ? tr("Disable vector mask") : tr("Enable vector mask"));
+  for (const auto id : changed) {
+    auto* layer = document().find_layer(id);
+    if (layer == nullptr) {
+      continue;
+    }
+    auto mask = *layer->vector_mask();
+    mask.disabled = disabled;
+    layer->set_vector_mask(std::move(mask));
+    mark_layer_vector_block_dirty(*layer);
+  }
+  refresh_layer_list_keeping_selection();
+  refresh_layer_controls();
+  canvas_->document_changed();
+  statusBar()->showMessage(disabled ? tr("Disabled the vector mask")
+                                    : tr("Enabled the vector mask"));
+}
+
+void MainWindow::rasterize_active_vector_mask(MaskCommandScope scope) {
+  const auto ids = vector_mask_command_ids(true, scope);
+  if (ids.empty()) {
+    return;
+  }
+  auto& doc = document();
+  push_undo_snapshot(tr("Rasterize vector mask"));
+  for (const auto id : ids) {
+    if (auto* layer = doc.find_layer(id); layer != nullptr) {
+      bake_vector_mask(*layer, doc.width(), doc.height());
+    }
+  }
+  const bool was_vector_target = canvas_ != nullptr && ids.front() == doc.active_layer_id() &&
+                                 canvas_->layer_edit_target() == CanvasWidget::LayerEditTarget::VectorMask;
+  refresh_layer_list_keeping_selection();
+  if (was_vector_target) {
+    canvas_->set_layer_edit_target(CanvasWidget::LayerEditTarget::Mask);
+  }
+  refresh_layer_controls();
+  canvas_->document_changed();
+  statusBar()->showMessage(tr("Rasterized the vector mask into the layer mask"));
+}
+
+void MainWindow::set_active_layer_vector_mask_linked(bool linked, MaskCommandScope scope) {
+  const auto ids = vector_mask_command_ids(true, scope);
+  if (ids.empty()) {
+    refresh_layer_list_keeping_selection();
+    return;
+  }
+  // Every layer takes the new state, not a flip each.
+  std::vector<LayerId> changed;
+  for (const auto id : ids) {
+    const auto* layer = std::as_const(document()).find_layer(id);
+    if (layer != nullptr && layer->vector_mask()->unlinked == linked) {
+      changed.push_back(id);
+    }
+  }
+  if (changed.empty()) {
+    return;
+  }
+  push_undo_snapshot(linked ? tr("Link vector mask") : tr("Unlink vector mask"));
+  for (const auto id : changed) {
+    auto* layer = document().find_layer(id);
+    if (layer == nullptr) {
+      continue;
+    }
+    auto mask = *layer->vector_mask();
+    mask.unlinked = !linked;
+    layer->set_vector_mask(std::move(mask));
+    mark_layer_vector_block_dirty(*layer);
+  }
+  refresh_layer_list_keeping_selection();
+  refresh_layer_controls();
+  statusBar()->showMessage(linked ? tr("Layer and vector mask linked") : tr("Layer and vector mask unlinked"));
+}
+
+void MainWindow::edit_layer_mask_properties(LayerId id, bool vector_mask) {
+  if (preview_dialog_edit_locked()) {
+    show_preview_dialog_edit_lock_message();
+    return;
+  }
+  if (refuse_layer_dialog_during_transform() || !has_active_document() || canvas_ == nullptr) {
+    return;
+  }
+  const auto* layer = std::as_const(document()).find_layer(id);
+  if (layer == nullptr || (vector_mask ? layer->vector_mask() == nullptr : !layer->mask().has_value())) {
+    return;
+  }
+  if (vector_mask && !vector_lock_reason(*layer).empty()) {
+    show_status_error(tr("This layer's vector data is preserved but can't be edited."));
+    return;
+  }
+  if (layer_id_locks_image_pixels(id)) {
+    show_status_error(tr("Layer pixels are locked."));
+    return;
+  }
+  const Layer original = *layer;
+  const auto density = vector_mask ? original.vector_mask()->density : original.mask()->density;
+  const auto feather = vector_mask ? original.vector_mask()->feather : original.mask()->feather;
+  const MaskPropertiesValues initial{static_cast<int>(std::lround(density * 100.0 / 255.0)),
+                                     static_cast<int>(std::lround(feather))};
+  const QPointer<CanvasWidget> target_canvas(canvas_);
+  // Writes `values` over the original mask; a field the dialog did not move keeps
+  // its exact stored value (a fractional PSD feather, a density between percents).
+  const auto apply = [this, id, vector_mask, &original, initial, target_canvas](const MaskPropertiesValues& values) {
+    if (!target_canvas || canvas_ != target_canvas) {
+      return;
+    }
+    auto* target = document().find_layer(id);
+    if (target == nullptr) {
+      return;
+    }
+    *target = original;
+    const auto canvas = Rect::from_size(document().width(), document().height());
+    const auto density_raw = static_cast<std::uint8_t>(std::lround(values.density_percent * 255.0 / 100.0));
+    if (vector_mask) {
+      auto mask = *original.vector_mask();
+      if (values.density_percent != initial.density_percent) mask.density = density_raw;
+      if (values.feather != initial.feather) mask.feather = values.feather;
+      target->set_vector_mask(std::move(mask));
+      mark_layer_vector_block_dirty(*target);
+      update_vector_mask_raster(*target, canvas);
+    } else {
+      auto& mask = target->mask();
+      if (values.density_percent != initial.density_percent) mask->density = density_raw;
+      if (values.feather != initial.feather) mask->feather = values.feather;
+      sync_layer_mask_feather_canvas(*target, canvas);
+    }
+    canvas_->document_changed();
+    refresh_layer_thumbnails();
+  };
+  const auto restore = [this, id, &original, target_canvas] {
+    if (!target_canvas || canvas_ != target_canvas) {
+      return;
+    }
+    if (auto* target = document().find_layer(id); target != nullptr) {
+      *target = original;
+    }
+    canvas_->document_changed();
+    refresh_layer_thumbnails();
+  };
+  std::optional<MaskPropertiesValues> accepted;
+  {
+    auto edit_lock = lock_preview_dialog_edits();
+    accepted = request_mask_properties(this, vector_mask, QString::fromStdString(original.name()), initial, apply);
+  }
+  restore();
+  if (!target_canvas || canvas_ != target_canvas) {
+    return;
+  }
+  if (!accepted.has_value() || (accepted->density_percent == initial.density_percent &&
+                                accepted->feather == initial.feather)) {
+    refresh_layer_controls();
+    return;
+  }
+  push_undo_snapshot(vector_mask ? tr("Vector mask properties") : tr("Layer mask properties"));
+  apply(*accepted);
+  refresh_layer_controls();
+  statusBar()->showMessage(vector_mask ? tr("Changed the vector mask's density and feather")
+                                       : tr("Changed the layer mask's density and feather"));
+}
+
+void MainWindow::populate_vector_mask_menu(QMenu* menu, const QString& object_name_prefix) {
+  if (menu == nullptr) {
+    return;
+  }
+  const auto add_command = [this, menu, &object_name_prefix](const char* source,
+                                                             const QString& object_key,
+                                                             auto callback) {
+    auto* action = menu->addAction(tr(source));
+    bind_action_text(action, source);
+    if (!object_name_prefix.isEmpty()) {
+      action->setObjectName(object_name_prefix + object_key + QStringLiteral("Action"));
+      register_document_action(action);
+    }
+    connect(action, &QAction::triggered, this, callback);
+    return action;
+  };
+  add_command(QT_TR_NOOP("&Reveal All"), QStringLiteral("VectorMaskRevealAll"),
+              [this] { add_vector_mask(false, false); });
+  add_command(QT_TR_NOOP("&Hide All"), QStringLiteral("VectorMaskHideAll"),
+              [this] { add_vector_mask(true, false); });
+  add_command(QT_TR_NOOP("&Current Path"), QStringLiteral("VectorMaskCurrentPath"),
+              [this] { add_vector_mask(false, true); });
+  menu->addSeparator();
+  add_command(QT_TR_NOOP("&Delete Vector Mask"), QStringLiteral("VectorMaskDelete"),
+              [this] { delete_active_vector_mask(); });
+  // Every selected vector mask takes the toggled state of the active layer's (the first one's
+  // when the active layer has none).
+  add_command(QT_TR_NOOP("D&isable Vector Mask"), QStringLiteral("VectorMaskDisable"), [this] {
+    const auto ids = vector_mask_command_ids(true, MaskCommandScope::SelectedLayers);
+    if (const auto* layer = ids.empty() ? nullptr : std::as_const(document()).find_layer(ids.front());
+        layer != nullptr) {
+      set_active_layer_vector_mask_disabled(!layer->vector_mask()->disabled);
+    }
+  });
+  add_command(QT_TR_NOOP("Ras&terize Vector Mask"), QStringLiteral("VectorMaskRasterize"),
+              [this] { rasterize_active_vector_mask(); });
+}
+
+CustomShapeLibrary& MainWindow::custom_shape_library() {
+  if (custom_shape_library_ == nullptr) {
+    // Built on first use, which is startup (docs/startup-performance.md).
+    const startup_trace::Scope library_phase("mw.lib.custom_shapes");
+    custom_shape_library_ = new CustomShapeLibrary({}, this);
+    // Seed the builtins once, like the other preset libraries: a shape the
+    // user deletes in the Custom Shapes manager stays deleted; its Restore
+    // button brings it back. Geometry refreshes run on every start. On wasm
+    // the sidecars live in MEMFS, so every session seeds afresh.
+    auto settings = app_settings();
+    const auto version_key = QStringLiteral("shapes/defaultShapesVersion");
+#ifdef Q_OS_WASM
+    const int stored_version = 0;
+#else
+    const int stored_version = settings.value(version_key, 0).toInt();
+#endif
+    custom_shape_library_->restore_default_shapes(stored_version);
+    if (stored_version < kDefaultCustomShapesVersion &&
+        custom_shape_library_->has_all_default_shapes_introduced_after(stored_version)) {
+      settings.setValue(version_key, kDefaultCustomShapesVersion);
+    }
+    connect(custom_shape_library_, &CustomShapeLibrary::changed, this, [this] {
+      refresh_custom_shape_combo();
+      apply_custom_shape_selection();
+    });
+  }
+  return *custom_shape_library_;
+}
+
+CustomShapeLibrary& MainWindow::custom_shape_library_with_bundled() {
+  auto& library = custom_shape_library();
+  if (!library.bundled_shapes_loaded()) {
+    library.ensure_bundled_shapes_loaded();
+    // Its folders start closed in the picker, once: after that the user's choice sticks.
+    auto settings = app_settings();
+    const auto seeded_key = QStringLiteral("shapes/bundledFoldersClosedSeeded");
+    if (!settings.value(seeded_key, false).toBool()) {
+      auto closed = settings.value(QLatin1String(kCustomShapePickerCollapsedFoldersKey)).toStringList();
+      for (const auto* folder : bundled_custom_shape_folders()) {
+        if (!closed.contains(QLatin1String(folder))) {
+          closed.append(QString::fromLatin1(folder));
+        }
+      }
+      settings.setValue(QLatin1String(kCustomShapePickerCollapsedFoldersKey), closed);
+      settings.setValue(seeded_key, true);
+    }
+  }
+  return library;
+}
+
+void MainWindow::open_custom_shape_manager(QWidget* parent) {
+  custom_shape_library_with_bundled();
+  const auto initial =
+      custom_shape_combo_ != nullptr ? custom_shape_combo_->currentData().toString() : QString();
+  const auto storage_id =
+      request_custom_shape_manager(parent != nullptr ? parent : this, custom_shape_library(), initial);
+  const auto* entry = custom_shape_library().find_entry(storage_id);
+  if (entry == nullptr || custom_shape_combo_ == nullptr) {
+    return;
+  }
+  if (const auto index = custom_shape_combo_->findData(entry->id); index >= 0) {
+    custom_shape_combo_->setCurrentIndex(index);  // the combo's handler applies and saves it
+  }
+}
+
+void MainWindow::refresh_custom_shape_combo() {
+  if (custom_shape_combo_ == nullptr) {
+    return;
+  }
+  populate_custom_shape_combo(*custom_shape_combo_, custom_shape_library());
+}
+
+void MainWindow::apply_custom_shape_selection() {
+  if (custom_shape_combo_ == nullptr || canvas_ == nullptr) {
+    return;
+  }
+  const auto shape_id = custom_shape_combo_->currentData().toString();
+  const auto* entry = custom_shape_library().find_entry_by_shape_id(shape_id);
+  canvas_->set_custom_shape_path(entry != nullptr
+                                     ? std::make_shared<const VectorPath>(entry->path)
+                                     : std::shared_ptr<const VectorPath>{});
+}
+
+void MainWindow::define_custom_shape_from_path() {
+  QString path_name;
+  const auto* path = resolved_panel_path(&path_name);
+  if (path == nullptr || path->empty()) {
+    // Fall back to the active layer's path / work path without a panel selection.
+    if (canvas_ != nullptr) {
+      select_only_layer_if_none_active();
+      path = canvas_->path_edit_target_path();
+    }
+  }
+  if (path == nullptr || path->empty()) {
+    show_status_error(tr("Select a path or shape layer to define a custom shape"));
+    return;
+  }
+  const auto bounds = path->bounds();
+  if (!bounds.has_value() || bounds->right - bounds->left < 1e-6 ||
+      bounds->bottom - bounds->top < 1e-6) {
+    show_status_error(tr("The path is too small to define a shape"));
+    return;
+  }
+  // Normalize into the unit box.
+  auto normalized = *path;
+  const auto width = bounds->right - bounds->left;
+  const auto height = bounds->bottom - bounds->top;
+  const auto scale = 1.0 / std::max(width, height);
+  transform_vector_path(normalized, {scale, 0.0, 0.0, scale, -bounds->left * scale,
+                                     -bounds->top * scale});
+  // Name prompt, prefilled with the generated fallback (Photoshop's flow).
+  const auto default_name =
+      tr("Custom Shape %1").arg(custom_shape_library().entries().size() + 1);
+  QDialog dialog(this);
+  dialog.setObjectName(QStringLiteral("defineCustomShapeDialog"));
+  dialog.setWindowTitle(tr("Define Custom Shape"));
+  auto* layout = new QVBoxLayout(&dialog);
+  auto* form = new QFormLayout();
+  auto* name_edit = new QLineEdit(default_name, &dialog);
+  name_edit->setObjectName(QStringLiteral("defineCustomShapeNameEdit"));
+  name_edit->selectAll();
+  form->addRow(tr("Name:"), name_edit);
+  layout->addLayout(form);
+  auto* buttons = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel, &dialog);
+  connect(buttons, &QDialogButtonBox::accepted, &dialog, &QDialog::accept);
+  connect(buttons, &QDialogButtonBox::rejected, &dialog, &QDialog::reject);
+  layout->addWidget(buttons);
+  if (run_non_modal_dialog(dialog) != QDialog::Accepted) {
+    statusBar()->showMessage(tr("Cancelled defining a custom shape"));
+    return;
+  }
+  const auto trimmed_name = name_edit->text().trimmed();
+  const auto name = trimmed_name.isEmpty() ? default_name : trimmed_name;
+  const auto storage_id = custom_shape_library().add_shape(name, normalized);
+  if (storage_id.isEmpty()) {
+    show_status_error(tr("Could not save the custom shape"));
+    return;
+  }
+  if (custom_shape_combo_ != nullptr) {
+    if (const auto* entry = custom_shape_library().find_entry(storage_id); entry != nullptr) {
+      if (const auto index = custom_shape_combo_->findData(entry->id); index >= 0) {
+        QSignalBlocker blocker(custom_shape_combo_);
+        custom_shape_combo_->setCurrentIndex(index);
+      }
+      apply_custom_shape_selection();
+    }
+  }
+  statusBar()->showMessage(tr("Defined %1 from the path.").arg(name));
+}
+
+void MainWindow::define_custom_shape_from_svg_file() {
+  const auto path = get_open_file_name(this, tr("Define Custom Shape from SVG File"),
+                                       file_dialog_initial_path(QString(), QString()),
+                                       tr("SVG Files (*.svg *.svgz);;All Files (*.*)"), nullptr,
+                                       QStringLiteral("defineCustomShapeSvgFileDialog"));
+  if (path.isEmpty()) {
+    return;
+  }
+  define_custom_shape_from_svg_path(path);
+}
+
+bool MainWindow::define_custom_shape_from_svg_path(const QString& path) {
+  QString error;
+  const auto parsed = custom_shape_path_from_svg_file(path, error);
+  if (!parsed.has_value()) {
+    show_status_error(error);
+    return false;
+  }
+  const auto& merged = *parsed;
+  const auto name = QFileInfo(path).completeBaseName();
+  const auto storage_id = custom_shape_library().add_shape(name.isEmpty() ? tr("SVG Shape") : name, merged);
+  if (storage_id.isEmpty()) {
+    show_status_error(tr("Could not save the custom shape"));
+    return false;
+  }
+  if (custom_shape_combo_ != nullptr) {
+    if (const auto* entry = custom_shape_library().find_entry(storage_id); entry != nullptr) {
+      if (const auto index = custom_shape_combo_->findData(entry->id); index >= 0) {
+        QSignalBlocker blocker(custom_shape_combo_);
+        custom_shape_combo_->setCurrentIndex(index);
+      }
+      apply_custom_shape_selection();
+    }
+  }
+  statusBar()->showMessage(tr("Defined custom shape %1 from the SVG").arg(name));
+  return true;
+}
+
+std::optional<PatternResource> MainWindow::resolve_vector_pattern_resource(
+    const std::string& pattern_id) {
+  if (pattern_id.empty()) {
+    return std::nullopt;
+  }
+  if (has_active_document()) {
+    if (const auto* existing = std::as_const(document()).metadata().patterns.find(pattern_id);
+        existing != nullptr && !existing->tile.empty()) {
+      return *existing;
+    }
+  }
+  if (auto resource = pattern_library().resource(QString::fromStdString(pattern_id));
+      resource.has_value() && !resource->tile.empty()) {
+    return resource;
+  }
+  if (auto bundled = bundled_pattern_resource(pattern_id);
+      bundled.has_value() && !bundled->tile.empty()) {
+    return bundled;
+  }
+  return std::nullopt;
+}
+
+QIcon MainWindow::options_bar_swatch_icon(const VectorFill& paint, const QToolButton& button) {
+  // Drawn at the size the button shows it (the options bar's swatches are a
+  // 28x16 chip, GitHub issue 311): a scaled pixmap would blur the one-pixel
+  // outline into the bar.
+  const QSize size = button.iconSize().isEmpty() ? QSize(28, 16) : button.iconSize();
+  QPixmap pixmap(size);
+  pixmap.fill(Qt::transparent);
+  QPainter painter(&pixmap);
+  painter.setRenderHint(QPainter::Antialiasing);
+  const QRectF box(0.5, 0.5, size.width() - 1.0, size.height() - 1.0);
+  // The outline is a theme role so a chip the color of the options bar keeps
+  // an edge (black on Dark, white on Light). apply_color_scheme() rebuilds
+  // these pixmaps, since the color is baked in here.
+  const QColor outline = theme().swatch_border;
+  switch (paint.kind) {
+    case VectorFillKind::None: {
+      // Photoshop's "no paint" swatch: white chip with a red slash.
+      painter.setPen(outline);
+      painter.setBrush(Qt::white);
+      painter.drawRoundedRect(box, 2.0, 2.0);
+      painter.setPen(QPen(QColor(214, 44, 44), 2.0));
+      painter.drawLine(QPointF(3.0, size.height() - 3.0), QPointF(size.width() - 3.0, 3.0));
+      break;
+    }
+    case VectorFillKind::Gradient: {
+      const auto ramp = gradient_thumbnail(paint.gradient, size.width(), size.height());
+      painter.setBrush(QBrush(ramp));
+      painter.setPen(outline);
+      painter.drawRoundedRect(box, 2.0, 2.0);
+      break;
+    }
+    case VectorFillKind::Pattern: {
+      if (const auto resource = resolve_vector_pattern_resource(paint.pattern_id);
+          resource.has_value()) {
+        const auto tile = pattern_thumbnail(resource->tile, size.width());
+        painter.setBrush(QBrush(tile));
+        painter.setPen(outline);
+        painter.drawRoundedRect(box, 2.0, 2.0);
+      } else {
+        // Unresolvable pattern renders as no paint (the rasterizer's rule).
+        painter.setPen(outline);
+        painter.setBrush(QColor(190, 190, 190));
+        painter.drawRoundedRect(box, 2.0, 2.0);
+      }
+      break;
+    }
+    case VectorFillKind::Solid: {
+      painter.setPen(outline);
+      painter.setBrush(QColor(paint.color.red, paint.color.green, paint.color.blue));
+      painter.drawRoundedRect(box, 2.0, 2.0);
+      break;
+    }
+  }
+  return QIcon(pixmap);
+}
+
+void MainWindow::update_vector_swatch_icons() {
+  if (vector_fill_swatch_button_ != nullptr) {
+    vector_fill_swatch_button_->setIcon(options_bar_swatch_icon(current_vector_fill_, *vector_fill_swatch_button_));
+  }
+  if (vector_stroke_swatch_button_ != nullptr) {
+    vector_stroke_swatch_button_->setIcon(
+        options_bar_swatch_icon(current_vector_stroke_paint_, *vector_stroke_swatch_button_));
+  }
+  // The paints also decide the draw-mode buttons and what Pixels mode paints (GitHub issue 716).
+  refresh_shape_draw_controls();
+}
+
+ShapePixelStyle MainWindow::shape_pixel_style_for_canvas() {
+  // The values Shape mode makes its layers from (GitHub issue 716): one fill, one stroke.
+  ShapePixelStyle style;
+  const auto content = current_shape_appearance_content(false);
+  style.fill = content.fill.kind != VectorFillKind::None;
+  style.stroke = content.stroke.enabled && content.stroke.content.kind != VectorFillKind::None;
+  // The bar's paints, the same ones a shape layer gets (an unset paint, which only a canvas
+  // no bar drives has, is the canvas's foreground color).
+  if (style.fill) {
+    style.fill_paint = content.fill;
+  }
+  style.stroke_paint = content.stroke.content;
+  style.line = content.stroke;
+  // Pattern paints bring their tiles; the store is rebuilt only when a pattern changes.
+  std::string key;
+  for (const auto* paint : {style.fill ? &content.fill : nullptr, style.stroke ? &content.stroke.content : nullptr}) {
+    if (paint != nullptr && paint->kind == VectorFillKind::Pattern) {
+      key += paint->pattern_id + "|";
+    }
+  }
+  if (shape_pixel_options_ != nullptr) {
+    if (key.empty()) {
+      shape_pixel_options_->pattern_store.reset();
+      shape_pixel_options_->pattern_store_key.clear();
+    } else if (key != shape_pixel_options_->pattern_store_key || shape_pixel_options_->pattern_store == nullptr) {
+      auto store = std::make_shared<PatternStore>();
+      for (const auto* paint : {&content.fill, &content.stroke.content}) {
+        if (paint->kind != VectorFillKind::Pattern) {
+          continue;
+        }
+        if (auto resource = resolve_vector_pattern_resource(paint->pattern_id); resource.has_value()) {
+          store->adopt(*resource);
+        }
+      }
+      shape_pixel_options_->pattern_store = std::move(store);
+      shape_pixel_options_->pattern_store_key = key;
+    }
+    style.patterns = shape_pixel_options_->pattern_store;
+  }
+  return style;
+}
+
+void MainWindow::refresh_shape_draw_controls() {
+  if (shape_pixel_options_ == nullptr) {
+    return;
+  }
+  auto& options = *shape_pixel_options_;
+  const bool draws_fill = current_vector_fill_.kind != VectorFillKind::None;
+  const bool draws_stroke = current_vector_stroke_enabled_;
+  options.sync_draw_controls(draws_fill, draws_stroke, current_shape_appearance_content(false).stroke.alignment);
+  // Stroke only hides the Fill group and Fill only the Stroke group, on the tools with the
+  // buttons (sync_shape_bar_state); the bar is laid out again when that changes.
+  if (sync_shape_bar_state()) {
+    queue_shape_bar_refresh();
+  }
+  if (canvas_ != nullptr) {
+    auto style = shape_pixel_style_for_canvas();
+    if (options.pushed_canvas != canvas_ || !(options.pushed_style == style)) {
+      canvas_->set_shape_pixel_style(style);
+      options.pushed_canvas = canvas_;
+      options.pushed_style = std::move(style);
+    }
+  }
+}
+
+void MainWindow::queue_shape_bar_refresh() {
+  // Never at once: this is reached in the middle of an edit (a draw-mode click sets the bar's
+  // values, then applies them to the selected shapes), and refresh_options_bar reads the
+  // selected shape back into the bar, which would undo the click before it is applied. The
+  // refresh runs when the event that changed the state is done.
+  if (refreshing_shape_bar_ || shape_bar_refresh_queued_) {
+    return;
+  }
+  shape_bar_refresh_queued_ = true;
+  QTimer::singleShot(0, this, [this] {
+    shape_bar_refresh_queued_ = false;
+    refresh_options_bar();
+  });
+}
+
+bool MainWindow::sync_shape_bar_state() {
+  if (shape_pixel_options_ == nullptr) {
+    return false;
+  }
+  auto& options = *shape_pixel_options_;
+  const bool draw_modes = shape_tool_has_draw_modes(current_tool_);
+  const bool draws_fill = current_vector_fill_.kind != VectorFillKind::None;
+  bool draws_stroke = current_vector_stroke_enabled_;
+  // A width being typed keeps its field: 0 on the way to 0.5 must not take the box away.
+  // Leaving the field settles it.
+  if (!draws_stroke && options.shown_stroke) {
+    if (const auto* width = findChild<QDoubleSpinBox*>(QStringLiteral("vectorStrokeWidthSpin"));
+        width != nullptr && width->hasFocus()) {
+      draws_stroke = true;
+    }
+  }
+  // The size pair edits a selected shape layer or path in the vector modes and the pending
+  // shape in Pixels mode. The Polygon's Pixels row has no room for it at 1366 px: a pending
+  // polygon is sized by its handles.
+  const bool pending_pixels = canvas_ != nullptr && canvas_->pending_pixel_shape_box().has_value();
+  const bool size_live =
+      draw_modes && has_active_document() &&
+      (current_vector_tool_mode_ == VectorToolMode::Pixels ? pending_pixels && current_tool_ != CanvasTool::Polygon
+                                                           : vector_shape_size_controls_live());
+  const bool changed =
+      options.shown_fill != draws_fill || options.shown_stroke != draws_stroke || options.size_live != size_live;
+  options.shown_fill = draws_fill;
+  options.shown_stroke = draws_stroke;
+  options.size_live = size_live;
+  // The pair shows the live shape's size in whole pixels, else the Style's Fixed Size.
+  if (options.size_width_spin != nullptr && options.size_height_spin != nullptr) {
+    int width = options.width;
+    int height = options.height;
+    if (size_live) {
+      if (pending_pixels) {
+        const auto box = *canvas_->pending_pixel_shape_box();
+        width = static_cast<int>(std::lround(box.width()));
+        height = static_cast<int>(std::lround(box.height()));
+      } else if (vector_shape_width_spin_ != nullptr && vector_shape_height_spin_ != nullptr) {
+        width = static_cast<int>(std::lround(vector_shape_width_spin_->value()));
+        height = static_cast<int>(std::lround(vector_shape_height_spin_->value()));
+      }
+    }
+    const bool editing = options.size_width_spin->hasFocus() || options.size_height_spin->hasFocus();
+    if (!editing) {
+      for (const auto& [spin, value] : {std::pair{options.size_width_spin, width},
+                                        std::pair{options.size_height_spin, height}}) {
+        const QSignalBlocker blocker(spin);
+        spin->setValue(std::clamp(value, spin->minimum(), spin->maximum()));
+      }
+    }
+  }
+  return changed && draw_modes;
+}
+
+// --- Options-bar paint pickers and live editing of the selected shape ---
+
+patchy::Layer* MainWindow::editable_active_vector_shape_layer() {
+  if (!has_active_document()) {
+    return nullptr;
+  }
+  auto& doc = document();
+  const auto active = doc.active_layer_id();
+  auto* layer = active.has_value() ? doc.find_layer(*active) : nullptr;
+  if (layer == nullptr || !layer_is_vector_shape(*layer) || !vector_lock_reason(*layer).empty()) {
+    return nullptr;
+  }
+  return layer;
+}
+
+bool MainWindow::vector_shape_size_controls_live() {
+  return path_component_target().has_value();
+}
+
+std::optional<MainWindow::PathComponentTarget> MainWindow::path_component_target() {
+  if (!has_active_document() || canvas_ == nullptr) {
+    return std::nullopt;
+  }
+  const auto* path = canvas_->path_edit_target_path();
+  if (path == nullptr) {
+    return std::nullopt;
+  }
+  auto& doc = document();
+  const auto& const_doc = std::as_const(doc);
+  PathComponentTarget target;
+  target.groups = canvas_->path_edit_selected_groups();
+  const auto active = const_doc.active_layer_id();
+  const auto* active_layer = active.has_value() ? const_doc.find_layer(*active) : nullptr;
+  if (canvas_->layer_edit_target() == CanvasWidget::LayerEditTarget::VectorMask) {
+    if (active_layer == nullptr || active_layer->vector_mask() == nullptr || path != &active_layer->vector_mask()->path) {
+      return std::nullopt;
+    }
+    target.mask_layer = *active;
+  } else if (const auto* work = const_doc.work_path(); canvas_->active_document_path().has_value() ||
+                                                         (work != nullptr && path == &work->path())) {
+    const auto id = canvas_->active_document_path().value_or(work != nullptr ? work->id() : 0);
+    const auto* document_path = const_doc.find_path(id);
+    if (document_path == nullptr || path != &document_path->path()) {
+      return std::nullopt;
+    }
+    target.document_path = id;
+  } else if (const auto* layer = editable_active_vector_shape_layer();
+             layer != nullptr && path == &std::as_const(*layer).vector_shape()->path) {
+    if (selected_or_active_layer_ids().size() != 1) {
+      return std::nullopt;
+    }
+    target.shape_layer = layer->id();
+    // Every component selected is the whole layer: the layer route keeps its effects in step.
+    std::vector<int> all_groups;
+    for (const auto& subpath : path->subpaths) {
+      all_groups.push_back(subpath.shape_group);
+    }
+    std::sort(all_groups.begin(), all_groups.end());
+    all_groups.erase(std::unique(all_groups.begin(), all_groups.end()), all_groups.end());
+    if (target.groups == all_groups) {
+      target.groups.clear();
+    }
+    return target;
+  } else {
+    return std::nullopt;
+  }
+  // A work path, saved path or vector mask sizes only the components Path/Direct Select picked.
+  if (target.groups.empty()) {
+    return std::nullopt;
+  }
+  return target;
+}
+
+const VectorPath* MainWindow::path_component_target_path(const PathComponentTarget& target) {
+  if (!has_active_document()) {
+    return nullptr;
+  }
+  const auto& doc = std::as_const(document());
+  if (target.shape_layer.has_value()) {
+    const auto* layer = doc.find_layer(*target.shape_layer);
+    return layer != nullptr && layer->vector_shape() != nullptr ? &layer->vector_shape()->path : nullptr;
+  }
+  if (target.mask_layer.has_value()) {
+    const auto* layer = doc.find_layer(*target.mask_layer);
+    return layer != nullptr && layer->vector_mask() != nullptr ? &layer->vector_mask()->path : nullptr;
+  }
+  if (target.document_path.has_value()) {
+    const auto* path = doc.find_path(*target.document_path);
+    return path != nullptr ? &path->path() : nullptr;
+  }
+  return nullptr;
+}
+
+namespace {
+
+VectorPath path_component_subset(const VectorPath& path, const std::vector<int>& groups) {
+  if (groups.empty()) {
+    return path;
+  }
+  VectorPath subset;
+  for (const auto& subpath : path.subpaths) {
+    if (std::find(groups.begin(), groups.end(), subpath.shape_group) != groups.end()) {
+      subset.subpaths.push_back(subpath);
+    }
+  }
+  return subset;
+}
+
+std::vector<int> path_groups_of(const VectorPath& path) {
+  std::vector<int> groups;
+  for (const auto& subpath : path.subpaths) {
+    if (std::find(groups.begin(), groups.end(), subpath.shape_group) == groups.end()) {
+      groups.push_back(subpath.shape_group);
+    }
+  }
+  return groups;
+}
+
+}  // namespace
+
+std::optional<VectorPathBounds> MainWindow::path_component_target_bounds(const PathComponentTarget& target) {
+  const auto* path = path_component_target_path(target);
+  if (path == nullptr) {
+    return std::nullopt;
+  }
+  return path_component_subset(*path, target.groups).bounds();
+}
+
+std::optional<LiveShapeParams> MainWindow::path_component_live_shape(const PathComponentTarget& target) {
+  const auto* path = path_component_target_path(target);
+  if (path == nullptr || target.mask_layer.has_value()) {
+    return std::nullopt;
+  }
+  const auto groups = target.groups.empty() ? path_groups_of(*path) : target.groups;
+  if (groups.size() != 1) {
+    return std::nullopt;
+  }
+  const auto& doc = std::as_const(document());
+  if (target.shape_layer.has_value()) {
+    const auto* layer = doc.find_layer(*target.shape_layer);
+    if (layer == nullptr || layer->vector_shape() == nullptr) {
+      return std::nullopt;
+    }
+    return resolve_live_shape_group(*path, layer->vector_shape()->origination, groups.front());
+  }
+  const auto* document_path = doc.find_path(*target.document_path);
+  if (document_path == nullptr) {
+    return std::nullopt;
+  }
+  return resolve_live_shape_group(*path, document_path->live_shapes(), groups.front());
+}
+
+bool MainWindow::apply_path_component_geometry(const PathComponentTarget& target, double scale_x, double scale_y,
+                                               double translate_x, double translate_y) {
+  if (canvas_ == nullptr || scale_x <= 0.0 || scale_y <= 0.0 ||
+      (!target.shape_layer.has_value() && !target.mask_layer.has_value() && !target.document_path.has_value())) {
+    return false;
+  }
+  push_undo_snapshot(tr("Shape size"));
+  if (!transform_path_component_target(target, scale_x, scale_y, translate_x, translate_y)) {
+    return false;
+  }
+  if (!target.document_path.has_value()) {
+    refresh_layer_thumbnails();
+  }
+  refresh_paths_panel();
+  sync_vector_shape_size_spins();
+  return true;
+}
+
+bool MainWindow::transform_path_component_target(const PathComponentTarget& target, double scale_x, double scale_y,
+                                                 double translate_x, double translate_y, QRect also_changed) {
+  if (canvas_ == nullptr || scale_x <= 0.0 || scale_y <= 0.0) {
+    return false;
+  }
+  auto& doc = document();
+  const std::array<double, 6> matrix{scale_x, 0.0, 0.0, scale_y, translate_x, translate_y};
+  const auto in_groups = [&target](int group) {
+    return target.groups.empty() ||
+           std::find(target.groups.begin(), target.groups.end(), group) != target.groups.end();
+  };
+  const auto transform_components = [&](VectorPath& path) {
+    for (auto& subpath : path.subpaths) {
+      if (!in_groups(subpath.shape_group)) {
+        continue;
+      }
+      VectorPath one;
+      one.subpaths.push_back(std::move(subpath));
+      transform_vector_path(one, matrix);
+      subpath = std::move(one.subpaths.front());
+    }
+  };
+  const auto transform_live = [&](std::vector<LiveShapeParams> entries, const VectorPath& before) {
+    // Entries the old geometry still matched follow the scale; the rest stay as they were
+    // (resolve_live_shape_group drops them on the next read anyway).
+    for (auto& entry : entries) {
+      if (!in_groups(entry.index)) {
+        continue;
+      }
+      if (auto resolved = resolve_live_shape_group(before, {entry}, entry.index); resolved.has_value()) {
+        entry = *resolved;
+        scale_live_shape_params(entry, scale_x, scale_y, translate_x, translate_y);
+        populate_live_shape_box_corners(entry);
+      }
+    }
+    return entries;
+  };
+  // An uneven scale stretches a rounded rectangle's corners into a curve its parameters
+  // (the radii follow the mean factor) no longer generate, which would end the live shape.
+  // Such a rectangle is rebuilt from its scaled parameters instead: the corners stay round
+  // and it stays live (GitHub issue 690). `entries` is the list after the scale.
+  const auto keep_rectangles_round = [&](VectorPath& path, std::vector<LiveShapeParams>& entries,
+                                         const VectorPath& before,
+                                         const std::vector<LiveShapeParams>& entries_before) {
+    bool rebuilt = false;
+    for (auto& entry : entries) {
+      if ((entry.kind != LiveShapeKind::Rectangle && entry.kind != LiveShapeKind::RoundedRectangle) ||
+          !in_groups(entry.index) || resolve_live_shape_group(path, {entry}, entry.index).has_value()) {
+        continue;
+      }
+      auto scaled = resolve_live_shape_group(before, entries_before, entry.index);
+      if (!scaled.has_value()) {
+        continue;  // it was no live rectangle before the scale either
+      }
+      scale_live_shape_params(*scaled, scale_x, scale_y, translate_x, translate_y);
+      populate_live_shape_box_corners(*scaled);
+      if (replace_live_shape_group(path, *scaled)) {
+        entry = std::move(*scaled);
+        rebuilt = true;
+      }
+    }
+    return rebuilt;
+  };
+  if (target.shape_layer.has_value()) {
+    auto* layer = doc.find_layer(*target.shape_layer);
+    if (layer == nullptr || layer->vector_shape() == nullptr) {
+      return false;
+    }
+    const auto old_effect_rect =
+        to_qrect(layer_bounds_with_effects(std::as_const(*layer), std::as_const(*layer).bounds())).united(also_changed);
+    const auto canvas_rect = Rect::from_size(doc.width(), doc.height());
+    if (target.groups.empty()) {
+      const auto before = std::as_const(*layer).vector_shape()->path;
+      const auto origination_before = std::as_const(*layer).vector_shape()->origination;
+      // Top-left anchored axis-aligned scale: transform_layer_vector_data keeps
+      // live-shape annotations for exactly this matrix family.
+      transform_layer_vector_data(doc, *layer, matrix, canvas_rect);
+      auto content = *std::as_const(*layer).vector_shape();
+      if (keep_rectangles_round(content.path, content.origination, before, origination_before)) {
+        layer->set_vector_shape(std::move(content));
+        update_vector_shape_raster(*layer, canvas_rect, &doc.metadata().patterns);
+      }
+    } else {
+      auto content = *std::as_const(*layer).vector_shape();
+      const auto before = content.path;
+      const auto origination_before = content.origination;
+      transform_components(content.path);
+      content.origination = transform_live(content.origination, before);
+      keep_rectangles_round(content.path, content.origination, before, origination_before);
+      layer->set_vector_shape(std::move(content));
+      layer->metadata()[kLayerMetadataVectorRasterStatus] = kVectorRasterStatusPatchy;
+      mark_layer_vector_block_dirty(*layer);
+      update_vector_shape_raster(*layer, canvas_rect, &doc.metadata().patterns);
+    }
+    canvas_->document_changed_effect_bounds(old_effect_rect.united(
+        to_qrect(layer_bounds_with_effects(std::as_const(*layer), std::as_const(*layer).bounds()))));
+  } else if (target.mask_layer.has_value()) {
+    auto* layer = doc.find_layer(*target.mask_layer);
+    if (layer == nullptr || layer->vector_mask() == nullptr) {
+      return false;
+    }
+    auto mask = *std::as_const(*layer).vector_mask();
+    transform_components(mask.path);
+    layer->set_vector_mask(std::move(mask));
+    mark_layer_vector_block_dirty(*layer);
+    update_vector_mask_raster(*layer, Rect::from_size(doc.width(), doc.height()));
+    canvas_->document_changed();
+  } else if (target.document_path.has_value()) {
+    auto* document_path = doc.find_path(*target.document_path);
+    if (document_path == nullptr) {
+      return false;
+    }
+    auto path = document_path->path();
+    const auto before = path;
+    transform_components(path);
+    auto live_shapes = transform_live(document_path->live_shapes(), before);
+    keep_rectangles_round(path, live_shapes, before, document_path->live_shapes());
+    document_path->set_path(std::move(path));
+    document_path->set_live_shapes(std::move(live_shapes));
+    canvas_->update();
+  } else {
+    return false;
+  }
+  return true;
+}
+
+bool MainWindow::apply_path_component_rotation(const PathComponentTarget& target, double pivot_x, double pivot_y,
+                                               double degrees) {
+  if (canvas_ == nullptr ||
+      (!target.shape_layer.has_value() && !target.mask_layer.has_value() && !target.document_path.has_value())) {
+    return false;
+  }
+  push_undo_snapshot(tr("Rotate"));
+  if (!rotate_path_component_target(target, pivot_x, pivot_y, degrees)) {
+    return false;
+  }
+  if (!target.document_path.has_value()) {
+    refresh_layer_thumbnails();
+  }
+  refresh_paths_panel();
+  sync_vector_shape_size_spins();
+  return true;
+}
+
+bool MainWindow::rotate_path_component_target(const PathComponentTarget& target, double pivot_x, double pivot_y,
+                                              double degrees, QRect also_changed) {
+  if (canvas_ == nullptr) {
+    return false;
+  }
+  auto& doc = document();
+  const auto matrix = rotation_matrix_about(pivot_x, pivot_y, degrees);
+  const auto in_groups = [&target](int group) {
+    return target.groups.empty() ||
+           std::find(target.groups.begin(), target.groups.end(), group) != target.groups.end();
+  };
+  // Turns the target's components of `path` and returns its live entries after the turn.
+  // An entry the old geometry still matched, of a kind that can say the turn (a line, a
+  // regular polygon, anything at a quarter turn), is turned and its component regenerated
+  // from it, so the shape stays live. Every other entry of a turned component is dropped:
+  // the path is then the only truth (Photoshop's keyShapeInvalidated).
+  const auto turn = [&](VectorPath& path, const std::vector<LiveShapeParams>& entries) {
+    const auto before = path;
+    for (auto& subpath : path.subpaths) {
+      if (!in_groups(subpath.shape_group)) {
+        continue;
+      }
+      VectorPath one;
+      one.subpaths.push_back(std::move(subpath));
+      transform_vector_path(one, matrix);
+      subpath = std::move(one.subpaths.front());
+    }
+    std::vector<LiveShapeParams> kept;
+    for (const auto& entry : entries) {
+      if (!in_groups(entry.index)) {
+        kept.push_back(entry);
+        continue;
+      }
+      const auto resolved = resolve_live_shape_group(before, {entry}, entry.index);
+      if (!resolved.has_value()) {
+        continue;
+      }
+      auto turned = rotate_live_shape_params(*resolved, pivot_x, pivot_y, degrees);
+      if (turned.has_value() && replace_live_shape_group(path, *turned)) {
+        kept.push_back(std::move(*turned));
+      }
+    }
+    return kept;
+  };
+  if (target.shape_layer.has_value()) {
+    auto* layer = doc.find_layer(*target.shape_layer);
+    if (layer == nullptr || layer->vector_shape() == nullptr) {
+      return false;
+    }
+    const auto old_effect_rect =
+        to_qrect(layer_bounds_with_effects(std::as_const(*layer), std::as_const(*layer).bounds())).united(also_changed);
+    const auto canvas_rect = Rect::from_size(doc.width(), doc.height());
+    if (target.groups.empty()) {
+      // The whole layer: Free Transform's rotate of a shape layer (its gradient, pattern and
+      // vector mask turn with it), which drops every live annotation. Those that can say the
+      // turn come back.
+      const auto before = *std::as_const(*layer).vector_shape();
+      transform_layer_vector_data(doc, *layer, matrix, canvas_rect);
+      auto path = before.path;
+      auto kept = turn(path, before.origination);
+      if (!kept.empty()) {
+        auto content = *std::as_const(*layer).vector_shape();
+        content.path = std::move(path);
+        content.origination = std::move(kept);
+        layer->set_vector_shape(std::move(content));
+        update_vector_shape_raster(*layer, canvas_rect, &doc.metadata().patterns);
+      }
+    } else {
+      auto content = *std::as_const(*layer).vector_shape();
+      content.origination = turn(content.path, content.origination);
+      layer->set_vector_shape(std::move(content));
+      layer->metadata()[kLayerMetadataVectorRasterStatus] = kVectorRasterStatusPatchy;
+      mark_layer_vector_block_dirty(*layer);
+      update_vector_shape_raster(*layer, canvas_rect, &doc.metadata().patterns);
+    }
+    canvas_->document_changed_effect_bounds(old_effect_rect.united(
+        to_qrect(layer_bounds_with_effects(std::as_const(*layer), std::as_const(*layer).bounds()))));
+  } else if (target.mask_layer.has_value()) {
+    auto* layer = doc.find_layer(*target.mask_layer);
+    if (layer == nullptr || layer->vector_mask() == nullptr) {
+      return false;
+    }
+    auto mask = *std::as_const(*layer).vector_mask();
+    turn(mask.path, {});
+    layer->set_vector_mask(std::move(mask));
+    mark_layer_vector_block_dirty(*layer);
+    update_vector_mask_raster(*layer, Rect::from_size(doc.width(), doc.height()));
+    canvas_->document_changed();
+  } else if (target.document_path.has_value()) {
+    auto* document_path = doc.find_path(*target.document_path);
+    if (document_path == nullptr) {
+      return false;
+    }
+    auto path = document_path->path();
+    auto live_shapes = turn(path, document_path->live_shapes());
+    document_path->set_path(std::move(path));
+    document_path->set_live_shapes(std::move(live_shapes));
+    canvas_->update();
+  } else {
+    return false;
+  }
+  return true;
+}
+
+void MainWindow::run_path_handle_edit(DocumentPathId path_id, ShapeResizePhase phase, std::uint64_t serial,
+                                      bool editable, const std::function<void()>& preview,
+                                      const std::function<void()>& commit) {
+  if (canvas_ == nullptr || !has_active_document()) {
+    shape_path_preview_.reset();
+    return;
+  }
+  auto& doc = document();
+  const auto session_id = session().session_id;
+  const bool previewing = shape_path_preview_.has_value() && shape_path_preview_->session_id == session_id &&
+                          shape_path_preview_->path_id == path_id && shape_path_preview_->serial == serial;
+  // Puts the path back as it was before this drag's first preview.
+  const auto restore = [&] {
+    if (!previewing) {
+      return false;
+    }
+    if (auto* path = doc.find_path(path_id); path != nullptr) {
+      *path = shape_path_preview_->original;
+    }
+    shape_path_preview_.reset();
+    return true;
+  };
+  if (phase == ShapeResizePhase::Cancel || !editable) {
+    if (restore()) {
+      canvas_->update();
+      sync_vector_shape_size_spins();
+    }
+    return;
+  }
+  if (phase == ShapeResizePhase::Preview) {
+    if (previewing) {
+      // Every preview edits the path as it was at the press, so nothing accumulates.
+      if (auto* path = doc.find_path(path_id); path != nullptr) {
+        *path = shape_path_preview_->original;
+      }
+    } else {
+      const auto* path = std::as_const(doc).find_path(path_id);
+      if (path == nullptr) {
+        return;
+      }
+      if (vector_shape_size_apply_timer_ != nullptr) {
+        vector_shape_size_apply_timer_->stop();  // the drag replaces a W / H edit still waiting
+      }
+      shape_path_preview_ = ShapePathPreview{session_id, path_id, serial, *path};
+    }
+    preview();
+    sync_vector_shape_size_spins();
+    return;
+  }
+  // Commit: the history snapshot must hold the path as it was before the drag.
+  restore();
+  commit();
+  canvas_->update();
+}
+
+void MainWindow::run_shape_handle_edit(LayerId layer_id, ShapeResizePhase phase, std::uint64_t serial,
+                                       bool editable, const std::function<void(QRect covered)>& preview,
+                                       const std::function<void()>& commit) {
+  if (canvas_ == nullptr || !has_active_document()) {
+    shape_resize_preview_.reset();
+    return;
+  }
+  auto& doc = document();
+  const auto session_id = session().session_id;
+  const bool previewing = shape_resize_preview_.has_value() && shape_resize_preview_->session_id == session_id &&
+                          shape_resize_preview_->layer_id == layer_id && shape_resize_preview_->serial == serial;
+  const auto effect_rect = [](const Layer& layer) {
+    return to_qrect(layer_bounds_with_effects(layer, layer.bounds()));
+  };
+  // Puts the layer back as it was before this drag's first preview; returns what the
+  // preview had covered, for the repaint.
+  const auto restore = [&]() -> std::optional<QRect> {
+    if (!previewing) {
+      return std::nullopt;
+    }
+    std::optional<QRect> covered;
+    if (auto* layer = doc.find_layer(layer_id); layer != nullptr) {
+      covered = effect_rect(std::as_const(*layer));
+      *layer = shape_resize_preview_->original;
+      covered = covered->united(effect_rect(std::as_const(*layer)));
+    }
+    shape_resize_preview_.reset();
+    return covered;
+  };
+  const auto restore_and_repaint = [&] {
+    if (const auto covered = restore(); covered.has_value()) {
+      canvas_->document_changed_effect_bounds(*covered);
+      sync_vector_shape_size_spins();
+    }
+  };
+  if (phase == ShapeResizePhase::Cancel || !editable) {
+    restore_and_repaint();
+    return;
+  }
+  if (phase == ShapeResizePhase::Preview) {
+    QRect covered;
+    if (previewing) {
+      // Every preview edits the layer as it was at the press, so nothing accumulates.
+      if (auto* layer = doc.find_layer(layer_id); layer != nullptr) {
+        covered = effect_rect(std::as_const(*layer));
+        *layer = shape_resize_preview_->original;
+      }
+    } else {
+      const auto* layer = std::as_const(doc).find_layer(layer_id);
+      if (layer == nullptr) {
+        return;
+      }
+      // A W / H edit still waiting on its debounce would land on the preview: the drag
+      // replaces it.
+      if (vector_shape_size_apply_timer_ != nullptr) {
+        vector_shape_size_apply_timer_->stop();
+      }
+      shape_resize_preview_ = ShapeResizePreview{session_id, layer_id, serial, *layer};
+    }
+    preview(covered);
+    sync_vector_shape_size_spins();
+    return;
+  }
+  // Commit: the history snapshot must hold the layer as it was before the drag.
+  const auto covered = restore();
+  commit();
+  if (covered.has_value()) {
+    canvas_->document_changed_effect_bounds(*covered);
+  }
+}
+
+void MainWindow::handle_shape_box_edit(const ShapeBoxEdit& edit, ShapeResizePhase phase,
+                                       std::uint64_t serial) {
+  // The box sizes and turns what the W / H fields size: this layer, whole or the components
+  // Path Select picked, or in Path mode the picked components of the work or saved path,
+  // through the fields' own scale (apply_path_component_geometry) or a turn about the box's
+  // center (apply_path_component_rotation).
+  std::optional<PathComponentTarget> target;
+  if (canvas_ != nullptr && has_active_document() && phase != ShapeResizePhase::Cancel) {
+    target = path_component_target();
+  }
+  const auto& from = edit.from;
+  const auto& to = edit.to;
+  const bool same_target =
+      target.has_value() &&
+      (edit.layer_id.has_value() ? target->shape_layer == edit.layer_id
+                                 : edit.document_path.has_value() && target->document_path == edit.document_path);
+  const bool editable = same_target && !preview_dialog_edit_locked() && from.width() > 0.0 && from.height() > 0.0 &&
+                        (edit.rotate || (to.width() > 0.0 && to.height() > 0.0));
+  const double scale_x = editable && !edit.rotate ? to.width() / from.width() : 1.0;
+  const double scale_y = editable && !edit.rotate ? to.height() / from.height() : 1.0;
+  const double translate_x = to.left() - from.left() * scale_x;
+  const double translate_y = to.top() - from.top() * scale_y;
+  const auto pivot = from.center();
+  const auto preview = [&](QRect covered) {
+    if (edit.rotate) {
+      rotate_path_component_target(*target, pivot.x(), pivot.y(), edit.angle_degrees, covered);
+    } else {
+      transform_path_component_target(*target, scale_x, scale_y, translate_x, translate_y, covered);
+    }
+  };
+  const auto commit = [&] {
+    if (edit.rotate) {
+      apply_path_component_rotation(*target, pivot.x(), pivot.y(), edit.angle_degrees);
+    } else {
+      apply_path_component_geometry(*target, scale_x, scale_y, translate_x, translate_y);
+    }
+  };
+  if (edit.layer_id.has_value()) {
+    run_shape_handle_edit(*edit.layer_id, phase, serial, editable, preview, commit);
+  } else if (edit.document_path.has_value()) {
+    run_path_handle_edit(*edit.document_path, phase, serial, editable, [&] { preview({}); }, commit);
+  }
+}
+
+bool MainWindow::replace_shape_layer_live_component(LayerId layer_id, const LiveShapeParams& params,
+                                                    QRect also_changed) {
+  if (canvas_ == nullptr || !has_active_document()) {
+    return false;
+  }
+  auto& doc = document();
+  auto* layer = doc.find_layer(layer_id);
+  if (layer == nullptr || std::as_const(*layer).vector_shape() == nullptr) {
+    return false;
+  }
+  auto content = *std::as_const(*layer).vector_shape();
+  // Only a component that is live now, of the same kind, is regenerated: the points never
+  // turn a plain path into a live shape or one kind into another.
+  const auto live = resolve_live_shape_group(content.path, content.origination, params.index);
+  if (!live.has_value() || live->kind != params.kind || !replace_live_shape_group(content.path, params)) {
+    return false;
+  }
+  const auto old_effect_rect =
+      to_qrect(layer_bounds_with_effects(std::as_const(*layer), std::as_const(*layer).bounds())).united(also_changed);
+  std::erase_if(content.origination, [&params](const LiveShapeParams& entry) { return entry.index == params.index; });
+  content.origination.push_back(params);
+  layer->set_vector_shape(std::move(content));
+  layer->metadata()[kLayerMetadataVectorRasterStatus] = kVectorRasterStatusPatchy;
+  mark_layer_vector_block_dirty(*layer);
+  update_vector_shape_raster(*layer, Rect::from_size(doc.width(), doc.height()), &doc.metadata().patterns);
+  canvas_->document_changed_effect_bounds(old_effect_rect.united(
+      to_qrect(layer_bounds_with_effects(std::as_const(*layer), std::as_const(*layer).bounds()))));
+  return true;
+}
+
+void MainWindow::handle_shape_point_edit(LayerId layer_id, const LiveShapeParams& to, ShapeResizePhase phase,
+                                         std::uint64_t serial) {
+  // The points edit the one live component the canvas showed them for, on the layer the
+  // W / H fields act on.
+  std::optional<PathComponentTarget> target;
+  if (canvas_ != nullptr && has_active_document() && phase != ShapeResizePhase::Cancel) {
+    target = path_component_target();
+  }
+  const bool editable = target.has_value() && target->shape_layer == layer_id && !preview_dialog_edit_locked() &&
+                        (to.kind == LiveShapeKind::Polygon || to.kind == LiveShapeKind::Line);
+  run_shape_handle_edit(
+      layer_id, phase, serial, editable,
+      [&](QRect covered) { replace_shape_layer_live_component(layer_id, to, covered); },
+      [&] {
+        const auto* layer = std::as_const(document()).find_layer(layer_id);
+        const auto* content = layer != nullptr ? layer->vector_shape() : nullptr;
+        const auto live = content != nullptr
+                              ? resolve_live_shape_group(content->path, content->origination, to.index)
+                              : std::nullopt;
+        if (!live.has_value() || live->kind != to.kind || *live == to || generate_live_shape_subpaths(to).empty()) {
+          return;  // nothing to edit, or nothing changed: no history step
+        }
+        push_undo_snapshot(tr("Edit shape"));
+        if (!replace_shape_layer_live_component(layer_id, to)) {
+          return;
+        }
+        refresh_layer_thumbnails();
+        refresh_paths_panel();
+        sync_vector_shape_size_spins();
+      });
+}
+
+bool MainWindow::apply_live_shape_component_edit(const std::function<void(LiveShapeParams&)>& edit) {
+  if (canvas_ == nullptr || !has_active_document()) {
+    return false;
+  }
+  const auto target = path_component_target();
+  if (!target.has_value()) {
+    return false;
+  }
+  auto params = path_component_live_shape(*target);
+  if (!params.has_value()) {
+    return false;
+  }
+  const auto before = *params;
+  edit(*params);
+  populate_live_shape_box_corners(*params);
+  if (*params == before) {
+    return false;
+  }
+  const auto* current = path_component_target_path(*target);
+  if (current == nullptr) {
+    return false;
+  }
+  auto path = *current;
+  if (!replace_live_shape_group(path, *params)) {
+    return false;
+  }
+  const bool had_selection = canvas_->path_edit_has_selection();
+  const auto replace_entry = [&params](std::vector<LiveShapeParams> entries) {
+    std::erase_if(entries, [&params](const LiveShapeParams& entry) { return entry.index == params->index; });
+    entries.push_back(*params);
+    return entries;
+  };
+  auto& doc = document();
+  push_undo_snapshot(tr("Edit shape"));
+  if (target->shape_layer.has_value()) {
+    auto* layer = doc.find_layer(*target->shape_layer);
+    if (layer == nullptr || layer->vector_shape() == nullptr) {
+      return false;
+    }
+    const auto old_effect_rect =
+        to_qrect(layer_bounds_with_effects(std::as_const(*layer), std::as_const(*layer).bounds()));
+    auto content = *std::as_const(*layer).vector_shape();
+    content.path = std::move(path);
+    content.origination = replace_entry(std::move(content.origination));
+    layer->set_vector_shape(std::move(content));
+    layer->metadata()[kLayerMetadataVectorRasterStatus] = kVectorRasterStatusPatchy;
+    mark_layer_vector_block_dirty(*layer);
+    update_vector_shape_raster(*layer, Rect::from_size(doc.width(), doc.height()), &doc.metadata().patterns);
+    canvas_->document_changed_effect_bounds(old_effect_rect.united(
+        to_qrect(layer_bounds_with_effects(std::as_const(*layer), std::as_const(*layer).bounds()))));
+    refresh_layer_thumbnails();
+  } else {
+    auto* document_path = doc.find_path(*target->document_path);
+    if (document_path == nullptr) {
+      return false;
+    }
+    document_path->set_path(std::move(path));
+    document_path->set_live_shapes(replace_entry(document_path->live_shapes()));
+    canvas_->update();
+  }
+  // Sides and insets change the anchor count: the selection is the whole component again.
+  if (had_selection) {
+    canvas_->select_path_groups({params->index});
+  }
+  refresh_paths_panel();
+  sync_vector_shape_size_spins();
+  return true;
+}
+
+void MainWindow::refresh_path_component_controls() {
+  // The Properties rows only: the options-bar W / H keep their shape-layer visibility.
+  sync_vector_shape_size_spins();
+}
+
+void MainWindow::refresh_properties_live_shape_panel() {
+  if (properties_live_shape_panel_ == nullptr) {
+    return;
+  }
+  std::optional<LiveShapeParams> params;
+  if (const auto target = path_component_target(); target.has_value()) {
+    params = path_component_live_shape(*target);
+  }
+  const bool rect = params.has_value() &&
+                    (params->kind == LiveShapeKind::Rectangle || params->kind == LiveShapeKind::RoundedRectangle);
+  const bool polygon = params.has_value() && params->kind == LiveShapeKind::Polygon;
+  if (properties_shape_radius_spin_ != nullptr) {
+    const QSignalBlocker blocker(properties_shape_radius_spin_);
+    properties_shape_radius_spin_->setValue(rect ? params->corner_radii[0] : 0.0);
+  }
+  if (properties_polygon_sides_spin_ != nullptr) {
+    const QSignalBlocker blocker(properties_polygon_sides_spin_);
+    properties_polygon_sides_spin_->setValue(polygon ? params->polygon_sides : 5);
+  }
+  if (properties_polygon_star_inset_spin_ != nullptr) {
+    const QSignalBlocker blocker(properties_polygon_star_inset_spin_);
+    properties_polygon_star_inset_spin_->setValue(polygon ? params->polygon_star_inset : 0);
+  }
+  if (properties_shape_radius_row_ != nullptr) {
+    properties_shape_radius_row_->setVisible(rect);
+  }
+  if (properties_polygon_row_ != nullptr) {
+    properties_polygon_row_->setVisible(polygon);
+  }
+  properties_live_shape_panel_->setVisible(rect || polygon);
+}
+
+bool MainWindow::vector_appearance_controls_live() const {
+  if (current_tool_ == CanvasTool::PathSelect || current_tool_ == CanvasTool::DirectSelect) {
+    return true;
+  }
+  const bool shape_tool = current_tool_ == CanvasTool::Line ||
+                          current_tool_ == CanvasTool::Rectangle ||
+                          current_tool_ == CanvasTool::Ellipse ||
+                          current_tool_ == CanvasTool::Pen ||
+                          current_tool_ == CanvasTool::Polygon ||
+                          current_tool_ == CanvasTool::CustomShape;
+  if (!shape_tool) {
+    return false;
+  }
+  // The appearance controls only edit shape layers in (effective) Shape mode; the
+  // Pen coerces a persisted Pixels mode to Path.
+  const bool vector_only_tool = current_tool_ == CanvasTool::Pen;
+  const auto effective_mode =
+      vector_only_tool && current_vector_tool_mode_ == VectorToolMode::Pixels
+          ? VectorToolMode::Path
+          : current_vector_tool_mode_;
+  return effective_mode == VectorToolMode::Shape;
+}
+
+void MainWindow::refresh_vector_stroke_controls() {
+  // The width is the stroke switch (0 = none, GitHub issue 311), so the stroke controls
+  // stay usable whether or not a stroke is on.
+  const bool enabled = has_active_document() && !preview_dialog_edit_locked();
+  for (const char* name : {"vectorStrokeSwatchButton", "vectorStrokeWidthLabel", "vectorStrokeWidthSpin",
+                           "vectorStrokeDashCombo", "vectorStrokePresetButton"}) {
+    if (auto* widget = findChild<QWidget*>(QLatin1String(name)); widget != nullptr) {
+      widget->setEnabled(enabled);
+    }
+  }
+  refresh_shape_draw_controls();  // Fill only greys the stroke's swatch, dashes and alignment
+}
+
+double MainWindow::vector_stroke_field_value() const {
+  return current_vector_stroke_enabled_ ? current_vector_stroke_width_ : 0.0;
+}
+
+void MainWindow::set_vector_stroke_width_from_field(double value) {
+  // 0 turns the stroke off and keeps the last real width, so the model (and the
+  // PSD's vstk) never carries a zero width; any other value turns it on.
+  current_vector_stroke_enabled_ = value > 0.0;
+  if (current_vector_stroke_enabled_) {
+    current_vector_stroke_width_ = std::clamp(value, 0.1, 1000.0);
+  }
+  schedule_save_tool_settings();
+  schedule_vector_appearance_apply();
+  refresh_shape_draw_controls();  // 0 is Fill only, a width is Both or Stroke only
+}
+
+void MainWindow::set_new_shape_stroke_dash_preset(StrokeDashPreset preset) {
+  current_vector_stroke_dash_preset_ = preset;
+  if (current_vector_stroke_style_.has_value() &&
+      stroke_dash_preset_for(current_vector_stroke_style_->dashes, current_vector_stroke_style_->cap) != preset) {
+    // The saved preset's alignment stays; the dashes, and the caps and corners a dash
+    // preset sets, follow the new pattern.
+    apply_stroke_dash_preset(*current_vector_stroke_style_, preset);
+    current_vector_stroke_style_->dash_offset = 0.0;
+  }
+}
+
+void MainWindow::set_vector_stroke_dash_preset_from_combo(StrokeDashPreset preset) {
+  set_new_shape_stroke_dash_preset(preset);
+  schedule_save_tool_settings();
+  finish_pending_shape_appearance_edit();
+  if (!has_active_document() || !vector_appearance_controls_live()) {
+    refresh_vector_stroke_dash_combo();
+    return;
+  }
+  // Every selected shape gets the same caps and pattern; corners only from a dot preset.
+  ShapeAppearanceSettings settings;
+  apply_stroke_dash_preset(settings.stroke, preset);
+  const bool sets_cap = stroke_dash_preset_cap(preset).has_value();
+  const bool sets_join = stroke_dash_preset_join(preset).has_value();
+  auto edits = std::make_shared<AppearanceEdits<ShapeAppearanceSettings>>();
+  for (const auto& property : shape_appearance_properties())
+    if (property.key == "stroke.dashes" || (sets_cap && property.key == "stroke.cap") ||
+        (sets_join && property.key == "stroke.join"))
+      edits->append(property.capture(settings));
+  settings.edits = std::move(edits);
+  commit_shape_appearance_edit(editable_selected_shape_layer_ids(), settings);
+  refresh_vector_stroke_dash_combo();
+}
+
+void MainWindow::apply_vector_stroke_style_preset(const StrokeStylePreset& preset) {
+  VectorStroke line;
+  apply_stroke_style_preset(line, preset);
+  current_vector_stroke_style_ = line;
+  if (shape_pixel_options_ != nullptr) {
+    shape_pixel_options_->alignment = line.alignment;
+  }
+  const auto dash_preset = stroke_dash_preset_for(preset.dashes, preset.cap);
+  if (dash_preset.has_value()) current_vector_stroke_dash_preset_ = *dash_preset;
+  schedule_save_tool_settings();
+  finish_pending_shape_appearance_edit();
+  if (has_active_document() && vector_appearance_controls_live()) {
+    // One undo step over every selected shape: the line settings only, never width or paint.
+    ShapeAppearanceSettings settings;
+    apply_stroke_style_preset(settings.stroke, preset);
+    auto edits = std::make_shared<AppearanceEdits<ShapeAppearanceSettings>>();
+    for (const auto& property : shape_appearance_properties())
+      if (property.key == "stroke.alignment" || property.key == "stroke.cap" || property.key == "stroke.join" ||
+          property.key == "stroke.dashes" || property.key == "stroke.dash_offset")
+        edits->append(property.capture(settings));
+    settings.edits = std::move(edits);
+    commit_shape_appearance_edit(editable_selected_shape_layer_ids(), settings);
+  }
+  refresh_vector_stroke_dash_combo();
+  statusBar()->showMessage(tr("Stroke preset: %1").arg(preset.name));
+}
+
+void MainWindow::refresh_vector_stroke_dash_combo() {
+  // A selected shape shows its own stroke (the first one; the combo marks a mixed selection
+  // itself); otherwise the line settings new shapes get.
+  if (has_active_document() && vector_appearance_controls_live()) {
+    for (const auto id : editable_selected_shape_layer_ids()) {
+      const auto* layer = std::as_const(document()).find_layer(id);
+      const auto* content = layer != nullptr ? std::as_const(*layer).vector_shape() : nullptr;
+      if (content != nullptr && shape_has_stroke_path(*content)) {
+        refresh_vector_stroke_dash_combo(content->stroke);
+        return;
+      }
+    }
+  }
+  refresh_vector_stroke_dash_combo(current_shape_appearance_content(current_tool_ == CanvasTool::Line).stroke);
+}
+
+void MainWindow::refresh_vector_stroke_dash_combo(const VectorStroke& shown) {
+  auto* combo = vector_stroke_dash_combo_;
+  if (combo == nullptr) return;
+  const int custom_row = combo->findData(kStrokeComboCustomRow);
+  int row = -1;
+  const auto presets = load_stroke_style_presets();
+  for (int i = 0; i < combo->count() && row < 0; ++i) {
+    const auto item_data = combo->itemData(i);
+    if (!item_data.isValid() || item_data.toInt() < kSavedStrokePresetRow) continue;
+    const auto saved = static_cast<std::size_t>(item_data.toInt() - kSavedStrokePresetRow);
+    if (saved < presets.size() && presets[saved].name == combo->itemText(i) &&
+        stroke_matches_style_preset(shown, presets[saved])) {
+      row = i;
+    }
+  }
+  if (row < 0) {
+    const auto builtin = stroke_dash_preset_for(shown.dashes, shown.cap);
+    row = builtin.has_value() ? combo->findData(static_cast<int>(*builtin)) : custom_row;
+  }
+  if (auto* model = qobject_cast<QStandardItemModel*>(combo->model())) {
+    if (auto* item = model->item(custom_row)) item->setEnabled(false);
+  }
+  if (auto* view = qobject_cast<QListView*>(combo->view())) view->setRowHidden(custom_row, row != custom_row);
+  {
+    const QSignalBlocker blocker(combo);
+    combo->setCurrentIndex(std::max(0, row));
+  }
+  refresh_shape_draw_controls();  // the line settings changed with the pick
+}
+
+void MainWindow::sync_shape_appearance_options_from_active_layer() {
+  // A pending debounced user edit outranks a passive sync; without this guard
+  // a refresh between the spin edit and the apply would revert the mirror and
+  // silently drop the edit.
+  if (vector_appearance_apply_timer_ != nullptr && vector_appearance_apply_timer_->isActive()) {
+    return;
+  }
+  const auto ids = editable_selected_shape_layer_ids();
+  const auto* layer = ids.empty() ? nullptr : std::as_const(document()).find_layer(ids.front());
+  if (layer == nullptr) {
+    for (const char* name : {"vectorFillSwatchButton", "vectorStrokeSwatchButton", "vectorStrokeWidthSpin",
+                             "vectorStrokeDashCombo", "shapeCornerRadiusSpin"})
+      set_appearance_mixed(findChild<QWidget*>(QLatin1String(name)), false);
+    refresh_vector_stroke_dash_combo();
+    if (auto* spin = findChild<QSpinBox*>(QStringLiteral("shapeCornerRadiusSpin"))) {
+      const QSignalBlocker blocker(spin);
+      spin->setValue(current_shape_corner_radius_);
+    }
+    sync_line_options_from_selection({});
+    return;
+  }
+  const auto* content = std::as_const(*layer).vector_shape();
+  if (content == nullptr) {
+    return;
+  }
+  current_vector_fill_ = content->fill;
+  // Fill only and Both bring this layer's kind of fill back.
+  if (shape_pixel_options_ != nullptr && content->fill.kind != VectorFillKind::None) {
+    shape_pixel_options_->fill_restore_kind = content->fill.kind;
+  }
+  // A fill layer has no stroke of its own: the stroke controls keep the next shape's stroke.
+  const bool strokable = shape_has_stroke_path(*content);
+  if (strokable) {
+    current_vector_stroke_enabled_ = content->stroke.enabled;
+    current_vector_stroke_width_ = std::clamp(content->stroke.width, 0.1, 1000.0);
+    current_vector_stroke_paint_ = content->stroke.content;
+    if (shape_pixel_options_ != nullptr) {
+      auto& options = *shape_pixel_options_;
+      // A line's stroke is centered by rule; its alignment is not the next shape's.
+      if (!appearance_has_editable_line(shape_appearance_settings(*layer))) {
+        options.alignment = content->stroke.alignment;
+      }
+    }
+    // A preset pattern also becomes the default for new shapes; a custom one shows as Custom.
+    const auto dash_preset = stroke_dash_preset_for(content->stroke.dashes, content->stroke.cap);
+    if (dash_preset.has_value()) set_new_shape_stroke_dash_preset(*dash_preset);
+    refresh_vector_stroke_dash_combo(content->stroke);
+  } else {
+    refresh_vector_stroke_dash_combo();
+  }
+  refresh_vector_stroke_controls();
+  if (auto* stroke_width = findChild<QDoubleSpinBox*>(QStringLiteral("vectorStrokeWidthSpin"));
+      stroke_width != nullptr) {
+    QSignalBlocker blocker(stroke_width);
+    stroke_width->setValue(vector_stroke_field_value());  // a disabled stroke reads 0
+  }
+  const auto reference = shape_appearance_settings(*layer);
+  const auto mixed = [&](const auto& read) {
+    return std::any_of(ids.begin(), ids.end(), [&](LayerId id) {
+      const auto* target = std::as_const(document()).find_layer(id);
+      return target && read(shape_appearance_settings(*target)) != read(reference);
+    });
+  };
+  // Stroke values compare only the layers a stroke edit reaches (fill layers are skipped).
+  const auto stroke_mixed = [&](const auto& read) {
+    return strokable && std::any_of(ids.begin(), ids.end(), [&](LayerId id) {
+             const auto* target = std::as_const(document()).find_layer(id);
+             return target && shape_has_stroke_path(*std::as_const(*target).vector_shape()) &&
+                    read(shape_appearance_settings(*target)) != read(reference);
+           });
+  };
+  set_appearance_mixed(vector_fill_swatch_button_, mixed([](const auto& value) { return value.fill; }));
+  set_appearance_mixed(vector_stroke_swatch_button_,
+                       stroke_mixed([](const auto& value) { return value.stroke.content; }));
+  set_appearance_mixed(findChild<QWidget*>(QStringLiteral("vectorStrokeWidthSpin")), stroke_mixed([](const auto& value) {
+                         return value.stroke.enabled ? value.stroke.width : 0.0;
+                       }));
+  set_appearance_mixed(vector_stroke_dash_combo_, stroke_mixed([](const auto& value) {
+                         return stroke_dash_preset_for(value.stroke.dashes, value.stroke.cap);
+                       }));
+  if (auto* spin = findChild<QSpinBox*>(QStringLiteral("shapeCornerRadiusSpin"))) {
+    std::optional<double> radius;
+    bool different = false;
+    for (const auto id : ids) {
+      const auto value = shape_appearance_settings(*std::as_const(document()).find_layer(id));
+      if (!appearance_has_editable_radii(value)) continue;
+      if (!radius) radius = value.geometry->corner_radii.front();
+      for (const auto corner : value.geometry->corner_radii) different |= corner != *radius;
+    }
+    QSignalBlocker blocker(spin);
+    spin->setValue(radius ? static_cast<int>(std::lround(*radius)) : current_shape_corner_radius_);
+    set_appearance_mixed(spin, different);
+  }
+  sync_line_options_from_selection(ids);
+  update_vector_swatch_icons();
+}
+
+std::vector<Layer> MainWindow::shape_appearance_edit_layers(const std::vector<const Layer*>& originals,
+                                                            const ShapeAppearanceSettings& settings,
+                                                            bool keep_unchanged, bool* drafted) {
+  auto& doc = document();
+  const auto canvas_rect = Rect::from_size(doc.width(), doc.height());
+  // 16 and 32-bit documents render fills from the shape itself, so only 8-bit ones draft.
+  const bool may_draft = drafted != nullptr && doc.color_state().bit_depth == BitDepth::UInt8;
+  std::vector<Layer> result;
+  for (const auto* original : originals) {
+    if (!original || !original->vector_shape() || !vector_lock_reason(*original).empty() ||
+        layer_id_locks_image_pixels(original->id())) continue;
+    const auto before = shape_appearance_settings(*original);
+    const auto& layer_settings =
+        shape_has_stroke_path(*original->vector_shape()) ? settings : without_stroke_edits(settings);
+    const auto after = apply_shape_appearance_edits(before, layer_settings);
+    auto content = assemble_shape_appearance(*original->vector_shape(), after);
+    if (shape_appearance_equal(before, after) &&
+        shape_vector_appearance_equal(*original->vector_shape(), content)) {
+      if (keep_unchanged) result.push_back(*original);
+      continue;
+    }
+    Layer layer = *original;
+    if (!shape_vector_appearance_equal(*original->vector_shape(), content)) {
+      ensure_vector_fill_patterns(doc, content, pattern_library());
+      const bool gradient_fill = content.fill.kind == VectorFillKind::Gradient;
+      layer.set_vector_shape(std::move(content));
+      const bool draft =
+          may_draft && gradient_fill &&
+          update_gradient_fill_draft_raster(layer, canvas_rect, gradient_fill_alignment_bounds(layer, canvas_rect));
+      if (draft) {
+        *drafted = true;
+      } else {
+        update_vector_shape_raster(layer, canvas_rect, &doc.metadata().patterns);
+      }
+      mark_layer_vector_block_dirty(layer);
+      layer.metadata()[kLayerMetadataVectorRasterStatus] = kVectorRasterStatusPatchy;
+    }
+    if (after.layer_opacity != before.layer_opacity) layer.set_opacity(after.layer_opacity);
+    if (after.fill_opacity != before.fill_opacity) layer.set_fill_opacity(after.fill_opacity);
+    result.push_back(std::move(layer));
+  }
+  return result;
+}
+
+bool MainWindow::commit_shape_appearance_edit(const std::vector<LayerId>& ids,
+                                              const ShapeAppearanceSettings& settings) {
+  if (!has_active_document() || canvas_ == nullptr) return false;
+  auto& doc = document();
+  const auto patterns = doc.metadata().patterns;
+  auto restore_patterns = qScopeGuard([&] { doc.metadata().patterns = patterns; });
+  std::vector<const Layer*> originals;
+  for (const auto id : ids) originals.push_back(std::as_const(doc).find_layer(id));
+  auto changed = shape_appearance_edit_layers(originals, settings, false);
+  const auto final_patterns = doc.metadata().patterns;
+  doc.metadata().patterns = patterns;
+  if (changed.empty()) return false;
+  push_undo_snapshot(tr("Shape appearance"));
+  doc.metadata().patterns = final_patterns;
+  for (auto& layer : changed) {
+    const auto id = layer.id();
+    if (auto* target = doc.find_layer(id)) *target = std::move(layer);
+  }
+  restore_patterns.dismiss();
+  canvas_->document_changed();
+  refresh_layer_thumbnails();
+  refresh_paths_panel();
+  return true;
+}
+
+bool MainWindow::apply_options_bar_appearance_to_active_shape(const std::vector<std::string>& fields) {
+  finish_pending_shape_appearance_edit();
+  if (!vector_appearance_controls_live()) return false;
+  return commit_options_bar_appearance_fields(fields);
+}
+
+ShapeAppearanceSettings MainWindow::options_bar_appearance_settings(const std::vector<std::string>& fields) const {
+  ShapeAppearanceSettings settings;
+  settings.fill = current_vector_fill_;
+  settings.stroke.enabled = current_vector_stroke_enabled_;
+  settings.stroke.width = current_vector_stroke_width_;
+  settings.stroke.content = current_vector_stroke_paint_;
+  auto edits = std::make_shared<AppearanceEdits<ShapeAppearanceSettings>>();
+  for (const auto& property : shape_appearance_properties())
+    if (std::find(fields.begin(), fields.end(), property.key) != fields.end() ||
+        (fields.empty() && (property.key == "fill.kind" || property.key == "stroke.content.kind" ||
+                            property.key == "stroke.enabled" || property.key == "stroke.width")))
+      edits->append(property.capture(settings));
+  settings.edits = std::move(edits);
+  return settings;
+}
+
+bool MainWindow::commit_options_bar_appearance_fields(const std::vector<std::string>& fields) {
+  return commit_shape_appearance_edit(editable_selected_shape_layer_ids(), options_bar_appearance_settings(fields));
+}
+
+void MainWindow::finish_pending_shape_appearance_edit() {
+  // Every history, selection, document and tab transition comes through here, so a
+  // Gradient Fill commit still being baked (GitHub #714 follow-up) lands before any of them.
+  finish_pending_gradient_fill_bake();
+  finish_pending_shape_appearance_edit_alone();
+}
+
+void MainWindow::finish_pending_shape_appearance_edit_alone() {
+  if (vector_appearance_apply_timer_) vector_appearance_apply_timer_->stop();
+  auto pending = std::move(pending_shape_appearance_edit_);
+  pending_shape_appearance_edit_ = {};
+  pending_shape_appearance_property_.clear();
+  if (pending) pending();
+  // The stay-open Shape Appearance window's gesture ends wherever a toolbar edit is flushed:
+  // before every history, selection, document and tab transition.
+  end_live_shape_appearance_run();
+}
+
+void MainWindow::note_inside_stroke_on_selected_lines() {
+  if (!has_active_document()) return;
+  for (const auto id : stroke_target_shape_layer_ids()) {
+    const auto* layer = std::as_const(document()).find_layer(id);
+    if (layer == nullptr) continue;
+    const auto settings = shape_appearance_settings(*layer);
+    if (appearance_has_editable_line(settings) && settings.stroke.enabled &&
+        settings.stroke.alignment == VectorStrokeAlignment::Inside) {
+      statusBar()->showMessage(tr("Inside keeps this stroke within the line's Weight. Choose Center or Outside "
+                                  "under Align in Shape Appearance to make the line thicker."));
+      return;
+    }
+  }
+}
+
+void MainWindow::queue_shape_appearance_edit(const ShapeAppearanceSettings& settings,
+                                             std::function<void()> after_commit) {
+  if (!has_active_document() || !vector_appearance_controls_live()) return;
+  const auto property = settings.edits && !settings.edits->operations.empty()
+      ? settings.edits->operations.front().key : std::string();
+  if (pending_shape_appearance_edit_ && property != pending_shape_appearance_property_)
+    finish_pending_shape_appearance_edit();
+  const auto ids = editable_selected_shape_layer_ids();
+  if (ids.empty()) return;
+  if (!vector_appearance_apply_timer_) {
+    vector_appearance_apply_timer_ = new QTimer(this);
+    vector_appearance_apply_timer_->setSingleShot(true);
+    vector_appearance_apply_timer_->setInterval(250);
+    connect(vector_appearance_apply_timer_, &QTimer::timeout, this,
+            [this] { finish_pending_shape_appearance_edit(); });
+  }
+  const auto session_id = session().session_id;
+  pending_shape_appearance_property_ = property;
+  pending_shape_appearance_edit_ = [this, session_id, ids, settings, after_commit = std::move(after_commit)] {
+    if (has_active_document() && session().session_id == session_id) {
+      commit_shape_appearance_edit(ids, settings);
+      if (after_commit) after_commit();
+    }
+  };
+  vector_appearance_apply_timer_->start();
+}
+
+void MainWindow::schedule_vector_appearance_apply() {
+  // The width field is also the stroke switch (GitHub issue 311). At 0 only the switch
+  // changes, so each selected shape keeps its own width for when the stroke comes back.
+  ShapeAppearanceSettings settings;
+  settings.stroke.enabled = current_vector_stroke_enabled_;
+  settings.stroke.width = current_vector_stroke_width_;
+  auto edits = std::make_shared<AppearanceEdits<ShapeAppearanceSettings>>();
+  for (const auto& property : shape_appearance_properties())
+    if (property.key == "stroke.enabled" || (property.key == "stroke.width" && current_vector_stroke_enabled_))
+      edits->append(property.capture(settings));
+  settings.edits = std::move(edits);
+  // A width that cannot thicken an Inside-stroked line says why (local-051).
+  queue_shape_appearance_edit(settings, current_vector_stroke_enabled_
+                                            ? std::function<void()>([this] { note_inside_stroke_on_selected_lines(); })
+                                            : std::function<void()>{});
+}
+
+void MainWindow::apply_selected_shape_corner_radius(double radius) {
+  LiveShapeParams shape;
+  shape.kind = LiveShapeKind::RoundedRectangle;
+  shape.corner_radii.fill(radius);
+  // Built engaged: assigning into an empty optional trips GCC 12's -Wmaybe-uninitialized.
+  ShapeAppearanceSettings settings{.geometry = std::move(shape)};
+  auto edits = std::make_shared<AppearanceEdits<ShapeAppearanceSettings>>();
+  for (const auto& property : shape_appearance_properties())
+    if (property.key.starts_with("radius.")) edits->append(property.capture(settings));
+  settings.edits = std::move(edits);
+  queue_shape_appearance_edit(settings);
+}
+
+void MainWindow::apply_selected_line_weight(double weight) {
+  // Queued like Radius: a spin drag or held arrow is one undo step.
+  LiveShapeParams shape;
+  shape.kind = LiveShapeKind::Line;
+  shape.line_weight = weight;
+  ShapeAppearanceSettings settings{.geometry = std::move(shape)};
+  auto edits = std::make_shared<AppearanceEdits<ShapeAppearanceSettings>>();
+  for (const auto& property : shape_appearance_properties())
+    if (property.key == "line.weight") edits->append(property.capture(settings));
+  settings.edits = std::move(edits);
+  queue_shape_appearance_edit(settings);
+}
+
+void MainWindow::apply_selected_line_arrowhead(bool at_end, bool on) {
+  // A click is one edit: it commits at once, after any pending Weight edit.
+  finish_pending_shape_appearance_edit();
+  if (!has_active_document() || !vector_appearance_controls_live()) return;
+  LiveShapeParams shape;
+  shape.kind = LiveShapeKind::Line;
+  (at_end ? shape.arrow_end : shape.arrow_start) = on;
+  ShapeAppearanceSettings settings{.geometry = std::move(shape)};
+  const std::string key = at_end ? "line.arrow_end" : "line.arrow_start";
+  auto edits = std::make_shared<AppearanceEdits<ShapeAppearanceSettings>>();
+  for (const auto& property : shape_appearance_properties())
+    if (property.key == key) edits->append(property.capture(settings));
+  settings.edits = std::move(edits);
+  commit_shape_appearance_edit(editable_selected_shape_layer_ids(), settings);
+}
+
+void MainWindow::sync_line_options_from_selection(const std::vector<LayerId>& ids) {
+  // Like Radius: the fields show the first selected line's values (mixed when the lines
+  // differ) and the tool defaults when no line is selected; the defaults stay as they are.
+  std::optional<LiveShapeParams> line;
+  bool weight_mixed = false;
+  for (const auto id : ids) {
+    const auto* layer = std::as_const(document()).find_layer(id);
+    if (layer == nullptr) continue;
+    const auto value = shape_appearance_settings(*layer);
+    if (!appearance_has_editable_line(value)) continue;
+    if (!line) line = value.geometry;
+    else weight_mixed |= value.geometry->line_weight != line->line_weight;
+  }
+  if (auto* spin = findChild<QDoubleSpinBox*>(QStringLiteral("vectorLineWeightSpin"))) {
+    const QSignalBlocker blocker(spin);
+    spin->setValue(line ? line->line_weight : current_vector_line_weight_);
+    set_appearance_mixed(spin, weight_mixed);
+  }
+  for (const bool at_end : {false, true}) {
+    auto* button = findChild<QAbstractButton*>(at_end ? QStringLiteral("lineArrowEndButton")
+                                                      : QStringLiteral("lineArrowStartButton"));
+    if (button == nullptr) continue;
+    const QSignalBlocker blocker(button);
+    button->setChecked(line ? (at_end ? line->arrow_end : line->arrow_start)
+                            : (at_end ? current_line_arrow_end_ : current_line_arrow_start_));
+  }
+}
+
+MainWindow::VectorOptionModeRules MainWindow::vector_option_mode_rules() {
+  return vector_option_mode_rules(current_tool_, !editable_selected_shape_layer_ids().empty());
+}
+
+MainWindow::VectorOptionModeRules MainWindow::vector_option_mode_rules(CanvasTool tool, bool live_shape) const {
+  VectorOptionModeRules rules;
+  const bool shape_tool = tool == CanvasTool::Line ||
+                          tool == CanvasTool::Rectangle ||
+                          tool == CanvasTool::Ellipse ||
+                          tool == CanvasTool::Pen ||
+                          tool == CanvasTool::Polygon ||
+                          tool == CanvasTool::CustomShape;
+  rules.select_tool = tool == CanvasTool::PathSelect ||
+                      tool == CanvasTool::DirectSelect;
+  rules.live_shape = live_shape;
+  // Move shows none of these (GitHub issue 350: the shape's W/H are in the
+  // Properties panel there).
+  rules.refine = shape_tool || rules.select_tool;
+  if (rules.select_tool) {
+    return rules;
+  }
+  // The Pen never rasterizes: a persisted Pixels mode behaves as Path for it
+  // (refresh_vector_tool_options_visibility shows the effective mode without
+  // rewriting the setting).
+  const bool vector_only_tool = tool == CanvasTool::Pen;
+  const auto effective_mode =
+      vector_only_tool && current_vector_tool_mode_ == VectorToolMode::Pixels
+          ? VectorToolMode::Path
+          : current_vector_tool_mode_;
+  rules.vector_mode = effective_mode != VectorToolMode::Pixels;
+  rules.shape_mode = effective_mode == VectorToolMode::Shape;
+  rules.pixel_style = effective_mode == VectorToolMode::Pixels && shape_tool_has_draw_modes(tool);
+  return rules;
+}
+
+bool MainWindow::vector_option_widget_visible(const VectorOptionModeRules& rules,
+                                              QWidget* widget) const {
+  if (!rules.refine || widget == nullptr) {
+    return true;
+  }
+  const auto in = [widget](const std::vector<QWidget*>& widgets) {
+    return std::find(widgets.begin(), widgets.end(), widget) != widgets.end();
+  };
+  if (in(vector_shape_size_option_widgets_)) {
+    // The W / H readouts: Shape mode keeps them as a disabled readout before
+    // the first shape exists (Path and Pixels modes have no shape layer to
+    // size, and Pixels already shows the fixed-size Width / Height row); the
+    // path selection tools show them only with an editable shape layer.
+    if (rules.select_tool) {
+      return rules.live_shape;
+    }
+    return rules.shape_mode;
+  }
+  if (rules.select_tool) {
+    // Appearance controls only while an editable shape layer is active; the
+    // Combine combo keeps its per-tool visibility for plain path selections.
+    return !in(vector_shape_mode_option_widgets_) || rules.live_shape;
+  }
+  if (in(vector_pixel_only_option_widgets_) && rules.vector_mode) {
+    return false;
+  }
+  // Path mode draws no fill or stroke: the draw-mode buttons and both groups hide, and the
+  // Style row stays (it sizes the path a drag makes).
+  if (in(vector_shape_mode_option_widgets_) && !rules.shape_mode) {
+    // The draw-mode buttons and the Fill and Stroke groups also serve Pixels mode on the
+    // tools that paint pixels with them (GitHub issue 716).
+    return rules.pixel_style && shape_pixel_options_ != nullptr && in(shape_pixel_options_->appearance_widgets);
+  }
+  if (in(vector_vector_mode_option_widgets_) && !rules.vector_mode) {
+    return false;
+  }
+  return true;
+}
+
+void MainWindow::sync_vector_shape_size_spins() {
+  if (vector_shape_width_spin_ == nullptr || vector_shape_height_spin_ == nullptr) {
+    return;
+  }
+  // A pending debounced edit outranks a passive sync (see the appearance sync).
+  if (vector_shape_size_apply_timer_ != nullptr && vector_shape_size_apply_timer_->isActive()) {
+    return;
+  }
+  std::optional<VectorPathBounds> bounds;
+  if (const auto target = path_component_target(); target.has_value()) {
+    bounds = path_component_target_bounds(*target);
+  }
+  const bool live = bounds.has_value();
+  const double width = live ? bounds->right - bounds->left : 0.0;
+  const double height = live ? bounds->bottom - bounds->top : 0.0;
+  for (auto* spin : {vector_shape_width_spin_, vector_shape_height_spin_,
+                     properties_shape_width_spin_, properties_shape_height_spin_}) {
+    if (spin == nullptr) {
+      continue;
+    }
+    QSignalBlocker blocker(spin);
+    spin->setValue(spin == vector_shape_width_spin_ || spin == properties_shape_width_spin_ ? width : height);
+    spin->setEnabled(live);
+  }
+  for (auto* spin : {properties_shape_x_spin_, properties_shape_y_spin_}) {
+    if (spin == nullptr) {
+      continue;
+    }
+    QSignalBlocker blocker(spin);
+    spin->setValue(!live ? 0.0 : spin == properties_shape_x_spin_ ? bounds->left : bounds->top);
+    spin->setEnabled(live);
+  }
+  const bool linked = vector_shape_link_size_button_ != nullptr && vector_shape_link_size_button_->isChecked();
+  for (auto* link_button : {vector_shape_link_size_button_, properties_shape_link_size_button_}) {
+    if (link_button == nullptr) {
+      continue;
+    }
+    QSignalBlocker blocker(link_button);
+    link_button->setChecked(linked);
+    // The options-bar link also keeps a new custom shape in its own proportions while
+    // it is drawn, so it stays usable for the Custom Shape tool without a shape layer.
+    link_button->setEnabled(live || (link_button == vector_shape_link_size_button_ &&
+                                     current_tool_ == CanvasTool::CustomShape));
+  }
+  if (canvas_ != nullptr) {
+    canvas_->set_custom_shape_keep_proportions(linked);
+  }
+  // The shape tools' Style row shows the same size in its pixel pair (GitHub issue 716).
+  if (sync_shape_bar_state()) {
+    queue_shape_bar_refresh();
+  }
+  if (vector_appearance_button_ != nullptr) {
+    vector_appearance_button_->setEnabled(!editable_selected_shape_layer_ids().empty() && vector_appearance_controls_live());
+  }
+  if (properties_shape_size_panel_ != nullptr) {
+    properties_shape_size_panel_->setVisible(live);
+    properties_shape_size_panel_->setEnabled(live);
+  }
+  vector_shape_size_ratio_ = live && height > 1e-9 ? width / height : 1.0;
+  refresh_properties_live_shape_panel();
+}
+
+void MainWindow::handle_vector_shape_size_value_changed(bool width_changed, double value) {
+  if (vector_shape_width_spin_ == nullptr || vector_shape_height_spin_ == nullptr) {
+    return;
+  }
+  const bool linked = (vector_shape_link_size_button_ != nullptr && vector_shape_link_size_button_->isChecked()) ||
+                      (properties_shape_link_size_button_ != nullptr &&
+                       properties_shape_link_size_button_->isChecked());
+  double width = width_changed ? value : vector_shape_width_spin_->value();
+  double height = width_changed ? vector_shape_height_spin_->value() : value;
+  if (linked && vector_shape_size_ratio_ > 0.0) {
+    if (width_changed) {
+      height = value / vector_shape_size_ratio_;
+    } else {
+      width = value * vector_shape_size_ratio_;
+    }
+  }
+  const QSignalBlocker width_blocker(vector_shape_width_spin_);
+  const QSignalBlocker height_blocker(vector_shape_height_spin_);
+  // QSignalBlocker accepts a null object (the Properties panel may not exist).
+  const QSignalBlocker properties_width_blocker(properties_shape_width_spin_);
+  const QSignalBlocker properties_height_blocker(properties_shape_height_spin_);
+  vector_shape_width_spin_->setValue(width);
+  vector_shape_height_spin_->setValue(height);
+  if (properties_shape_width_spin_ != nullptr) {
+    properties_shape_width_spin_->setValue(width);
+  }
+  if (properties_shape_height_spin_ != nullptr) {
+    properties_shape_height_spin_->setValue(height);
+  }
+  schedule_vector_shape_size_apply();
+}
+
+bool MainWindow::apply_options_bar_size_to_active_shape() {
+  if (canvas_ == nullptr || vector_shape_width_spin_ == nullptr || vector_shape_height_spin_ == nullptr) {
+    return false;
+  }
+  const auto target = path_component_target();
+  if (!target.has_value()) {
+    return false;
+  }
+  const auto bounds = path_component_target_bounds(*target);
+  if (!bounds.has_value()) {
+    return false;
+  }
+  const double old_width = bounds->right - bounds->left;
+  const double old_height = bounds->bottom - bounds->top;
+  const double new_width = vector_shape_width_spin_->value();
+  const double new_height = vector_shape_height_spin_->value();
+  const double new_left = properties_shape_x_spin_ != nullptr ? properties_shape_x_spin_->value() : bounds->left;
+  const double new_top = properties_shape_y_spin_ != nullptr ? properties_shape_y_spin_->value() : bounds->top;
+  if (old_width < 1e-6 || old_height < 1e-6 || new_width < 0.5 || new_height < 0.5) {
+    sync_vector_shape_size_spins();  // nothing sensible to scale to; show the truth
+    return false;
+  }
+  if (std::abs(new_width - old_width) < 0.05 && std::abs(new_height - old_height) < 0.05 &&
+      std::abs(new_left - bounds->left) < 0.05 && std::abs(new_top - bounds->top) < 0.05) {
+    return false;  // no-op; also keeps stale debounced applies harmless
+  }
+  const double scale_x = new_width / old_width;
+  const double scale_y = new_height / old_height;
+  // Scale about the old top-left corner, then move it to the X / Y fields.
+  return apply_path_component_geometry(*target, scale_x, scale_y, new_left - bounds->left * scale_x,
+                                       new_top - bounds->top * scale_y);
+}
+
+void MainWindow::schedule_vector_shape_size_apply() {
+  if (!vector_shape_size_controls_live()) {
+    return;
+  }
+  if (vector_shape_size_apply_timer_ == nullptr) {
+    vector_shape_size_apply_timer_ = new QTimer(this);
+    vector_shape_size_apply_timer_->setSingleShot(true);
+    vector_shape_size_apply_timer_->setInterval(250);
+    connect(vector_shape_size_apply_timer_, &QTimer::timeout, this,
+            [this] { apply_options_bar_size_to_active_shape(); });
+  }
+  vector_shape_size_apply_timer_->start();
+}
+
+void MainWindow::show_vector_paint_menu(bool for_stroke) {
+  auto* button = for_stroke ? vector_stroke_swatch_button_ : vector_fill_swatch_button_;
+  if (button == nullptr) {
+    return;
+  }
+  const auto& paint = for_stroke ? current_vector_stroke_paint_ : current_vector_fill_;
+  QMenu menu(button);
+  menu.setObjectName(for_stroke ? QStringLiteral("vectorStrokePaintMenu")
+                                : QStringLiteral("vectorFillPaintMenu"));
+  const auto add_kind = [&](const QString& label, const char* object_name, VectorFillKind kind,
+                            auto callback) {
+    auto* action = menu.addAction(label);
+    action->setObjectName(QLatin1String(object_name));
+    action->setCheckable(true);
+    action->setChecked(paint.kind == kind);
+    connect(action, &QAction::triggered, this, callback);
+    return action;
+  };
+  // No Fill is not on the bars with the Fill only / Stroke only / Both buttons (Seth, November
+  // 13, 2026): picked there with the stroke off it left a shape that draws nothing and no
+  // button checked. On those bars Stroke only turns the fill off, and Shape Appearance keeps
+  // its No Fill. The Pen, Line and the path selection tools have no such buttons, so their
+  // Fill menu still leads with it. The stroke has no "none" paint: a width of 0 turns it off.
+  if (!for_stroke && !shape_tool_has_draw_modes(current_tool_)) {
+    add_kind(tr("No Fill"), "vectorFillNoneAction", VectorFillKind::None, [this] {
+      if (shape_pixel_options_ != nullptr && current_vector_fill_.kind != VectorFillKind::None) {
+        shape_pixel_options_->fill_restore_kind = current_vector_fill_.kind;  // what Both brings back
+      }
+      current_vector_fill_.kind = VectorFillKind::None;
+      update_vector_swatch_icons();
+      schedule_save_tool_settings();
+      apply_options_bar_appearance_to_active_shape({"fill.kind"});
+    });
+  }
+  // Foreground Color (GitHub issue 716): a one-time pick. The paint becomes a solid color,
+  // the foreground color as it is now, in the selected shapes too; it does not follow later
+  // changes of the foreground color, so Shape and Pixels modes keep one paint.
+  {
+    auto* action = menu.addAction(tr("Foreground Color"));
+    action->setObjectName(for_stroke ? QStringLiteral("vectorStrokeForegroundAction")
+                                     : QStringLiteral("vectorFillForegroundAction"));
+    connect(action, &QAction::triggered, this, [this, for_stroke] {
+      finish_pending_shape_appearance_edit();
+      const QColor foreground = canvas_ != nullptr ? canvas_->primary_color() : foreground_color_;
+      auto& target = for_stroke ? current_vector_stroke_paint_ : current_vector_fill_;
+      target.kind = VectorFillKind::Solid;
+      target.color = {static_cast<std::uint8_t>(foreground.red()), static_cast<std::uint8_t>(foreground.green()),
+                      static_cast<std::uint8_t>(foreground.blue())};
+      if (!for_stroke && shape_pixel_options_ != nullptr) {
+        shape_pixel_options_->fill_restore_kind = VectorFillKind::Solid;
+      }
+      schedule_save_tool_settings();
+      apply_options_bar_appearance_to_active_shape(
+          for_stroke ? std::vector<std::string>{"stroke.content.kind", "stroke.content.color"}
+                     : std::vector<std::string>{"fill.kind", "fill.color"});
+      update_vector_swatch_icons();
+    });
+  }
+  add_kind(tr("Solid Color..."), for_stroke ? "vectorStrokeSolidAction" : "vectorFillSolidAction",
+           VectorFillKind::Solid, [this, for_stroke] { pick_vector_solid_color(for_stroke); });
+  add_kind(tr("Gradient..."), for_stroke ? "vectorStrokeGradientAction" : "vectorFillGradientAction",
+           VectorFillKind::Gradient, [this, for_stroke] { pick_vector_gradient(for_stroke); });
+  add_kind(tr("Pattern..."), for_stroke ? "vectorStrokePatternAction" : "vectorFillPatternAction",
+           VectorFillKind::Pattern, [this, for_stroke] { pick_vector_pattern(for_stroke); });
+  menu.exec(button->mapToGlobal(QPoint(0, button->height())));
+}
+
+void MainWindow::pick_vector_solid_color(bool for_stroke) {
+  finish_pending_shape_appearance_edit();
+  if (preview_dialog_edit_locked()) { show_preview_dialog_edit_lock_message(); return; }
+  const auto paint = for_stroke ? current_vector_stroke_paint_ : current_vector_fill_;
+  const QColor initial(paint.color.red, paint.color.green, paint.color.blue);
+  const auto title = for_stroke ? tr("Shape Stroke Color") : tr("Shape Fill Color");
+  const auto commit_mirror = [&](QColor color) {
+    auto& target = for_stroke ? current_vector_stroke_paint_ : current_vector_fill_;
+    target.kind = VectorFillKind::Solid;
+    target.color = {static_cast<std::uint8_t>(color.red()), static_cast<std::uint8_t>(color.green()),
+                    static_cast<std::uint8_t>(color.blue())};
+    if (shape_pixel_options_ != nullptr && !for_stroke) {
+      shape_pixel_options_->fill_restore_kind = VectorFillKind::Solid;
+    }
+    update_vector_swatch_icons();
+    schedule_save_tool_settings();
+  };
+  const auto targets = for_stroke ? stroke_target_shape_layer_ids() : editable_selected_shape_layer_ids();
+  if (!vector_appearance_controls_live() || targets.empty()) {
+    if (const auto chosen = request_patchy_color(this, initial, title)) commit_mirror(*chosen);
+    return;
+  }
+  edit_active_shape_appearance_modal(true, [&](const ShapeAppearanceSettings& baseline,
+                                              std::function<void(const ShapeAppearanceSettings&)> preview) {
+    auto settings = baseline;
+    const auto apply = [&](QColor color) {
+      auto& target = for_stroke ? settings.stroke.content : settings.fill;
+      target.kind = VectorFillKind::Solid;
+      target.color = {static_cast<std::uint8_t>(color.red()), static_cast<std::uint8_t>(color.green()),
+                      static_cast<std::uint8_t>(color.blue())};
+      auto edits = std::make_shared<AppearanceEdits<ShapeAppearanceSettings>>();
+      for (const auto& property : shape_appearance_properties())
+        if (property.key == (for_stroke ? "stroke.content.color" : "fill.color")) edits->append(property.capture(settings));
+      settings.edits = std::move(edits);
+      preview(settings);
+    };
+    const auto chosen = request_patchy_color(this, initial, title, apply);
+    if (!chosen) return std::optional<ShapeAppearanceSettings>{};
+    // Choosing Solid Color and accepting is an explicit paint-kind selection.
+    apply(*chosen);
+    commit_mirror(*chosen);
+    return std::optional<ShapeAppearanceSettings>{settings};
+  }, for_stroke);
+}
+
+void MainWindow::apply_swatch_color_to_shape_paint(QColor color) {
+  if (!vector_appearance_controls_live() || preview_dialog_edit_locked()) return;
+  apply_solid_color_to_shape_paint(color, /*debounce=*/false);
+}
+
+void MainWindow::apply_picked_color_to_selected_shapes(QColor color) {
+  // GitHub issue 67: a pick is a deliberate color choice for whatever is
+  // selected, so it reaches the selected shapes from the Eyedropper tool even
+  // though no shape controls are live. Alt-picks keep the swatch gate: a brush
+  // painter sampling a color with a shape layer selected must not recolor it.
+  if (preview_dialog_edit_locked() || editable_selected_shape_layer_ids().empty()) return;
+  if (current_tool_ != CanvasTool::Eyedropper && !vector_appearance_controls_live()) return;
+  apply_solid_color_to_shape_paint(color, /*debounce=*/false);
+}
+
+void MainWindow::apply_foreground_color_to_shape_paint(QColor color) {
+  // The Foreground color panel while the shape controls are live (GitHub issue
+  // 67): the same rule as a swatch click, debounced because the panel reports
+  // every step of a drag through the picker and each commit is an undo step.
+  if (!vector_appearance_controls_live() || preview_dialog_edit_locked()) return;
+  apply_solid_color_to_shape_paint(color, /*debounce=*/true);
+}
+
+void MainWindow::apply_solid_color_to_shape_paint(QColor color, bool debounce) {
+  // A Solid fill takes the color, else a Solid stroke behind a None fill. Gradient
+  // and pattern fills, and outline-only shapes, are deliberately left alone: the
+  // paint KIND is an explicit options-bar choice (Seth, October 2026).
+  const bool to_fill = current_vector_fill_.kind == VectorFillKind::Solid;
+  const bool to_stroke = !to_fill && current_vector_fill_.kind == VectorFillKind::None &&
+                         current_vector_stroke_enabled_ &&
+                         current_vector_stroke_paint_.kind == VectorFillKind::Solid;
+  if (!to_fill && !to_stroke) return;
+  if (!debounce) finish_pending_shape_appearance_edit();
+  auto& target = to_fill ? current_vector_fill_ : current_vector_stroke_paint_;
+  target.color = {static_cast<std::uint8_t>(color.red()), static_cast<std::uint8_t>(color.green()),
+                  static_cast<std::uint8_t>(color.blue())};
+  update_vector_swatch_icons();
+  schedule_save_tool_settings();
+  const std::vector<std::string> fields{to_fill ? "fill.color" : "stroke.content.color"};
+  if (debounce) {
+    queue_shape_appearance_edit(options_bar_appearance_settings(fields));
+  } else {
+    commit_options_bar_appearance_fields(fields);
+  }
+}
+
+void MainWindow::pick_vector_gradient(bool for_stroke) {
+  finish_pending_shape_appearance_edit();
+  if (preview_dialog_edit_locked()) { show_preview_dialog_edit_lock_message(); return; }
+  auto edit_lock = lock_preview_dialog_edits();
+  auto& paint = for_stroke ? current_vector_stroke_paint_ : current_vector_fill_;
+  auto& stored_id = for_stroke ? current_vector_stroke_gradient_id_ : current_vector_fill_gradient_id_;
+  std::optional<GradientDefinition> current;
+  if (paint.kind == VectorFillKind::Gradient) {
+    current = static_cast<const GradientDefinition&>(paint.gradient);
+  }
+  const auto selected = request_gradient_manager(this, gradient_library(), stored_id, current);
+  if (selected.isEmpty()) {
+    return;
+  }
+  const auto* entry = gradient_library().find_entry(selected);
+  if (entry == nullptr) {
+    return;
+  }
+  const auto foreground = canvas_ != nullptr ? canvas_->primary_color() : QColor(Qt::black);
+  const auto background = canvas_ != nullptr ? canvas_->secondary_color() : QColor(Qt::white);
+  const bool was_gradient = paint.kind == VectorFillKind::Gradient;
+  paint.kind = VectorFillKind::Gradient;
+  // Presets replace the definition; existing placement (type/angle/scale/
+  // reverse) is the user's and stays - fresh gradients start linear at 90.
+  static_cast<GradientDefinition&>(paint.gradient) = resolve_gradient_definition(
+      entry->definition,
+      RgbColor{static_cast<std::uint8_t>(foreground.red()),
+               static_cast<std::uint8_t>(foreground.green()),
+               static_cast<std::uint8_t>(foreground.blue())},
+      RgbColor{static_cast<std::uint8_t>(background.red()),
+               static_cast<std::uint8_t>(background.green()),
+               static_cast<std::uint8_t>(background.blue())});
+  if (!was_gradient) {
+    paint.gradient.type = LayerStyleGradientType::Linear;
+    paint.gradient.angle_degrees = 90.0F;
+    paint.gradient.scale = 1.0F;
+    paint.gradient.reverse = false;
+  }
+  const auto chosen_paint = paint;
+  edit_lock.release();
+  paint = chosen_paint;
+  stored_id = selected;
+  if (shape_pixel_options_ != nullptr && !for_stroke) {
+    shape_pixel_options_->fill_restore_kind = VectorFillKind::Gradient;
+  }
+  update_vector_swatch_icons();
+  schedule_save_tool_settings();
+  apply_options_bar_appearance_to_active_shape({for_stroke ? "stroke.content.kind" : "fill.kind"});
+}
+
+void MainWindow::pick_vector_pattern(bool for_stroke) {
+  finish_pending_shape_appearance_edit();
+  if (preview_dialog_edit_locked()) { show_preview_dialog_edit_lock_message(); return; }
+  if (vector_appearance_controls_live() &&
+      !(for_stroke ? stroke_target_shape_layer_ids() : editable_selected_shape_layer_ids()).empty()) {
+    edit_active_shape_appearance_modal(true, [&](const ShapeAppearanceSettings& baseline,
+                                                std::function<void(const ShapeAppearanceSettings&)> preview) {
+      auto settings = baseline;
+      auto& paint = for_stroke ? settings.stroke.content : settings.fill;
+      const auto storage_id = request_pattern_manager(this, pattern_library(), QString::fromStdString(paint.pattern_id));
+      auto resource = pattern_library().resource_for_entry(storage_id);
+      if (!resource || resource->tile.empty()) return std::optional<ShapeAppearanceSettings>{};
+      auto& patterns = document().metadata().patterns;
+      if (const auto* embedded = patterns.find(resource->id);
+          embedded && !presets::pattern_tiles_equal(embedded->tile, resource->tile)) {
+        const auto prior = std::find_if(patterns.patterns.begin(), patterns.patterns.end(), [&](const auto& candidate) {
+          return candidate.name == resource->name && presets::pattern_tiles_equal(candidate.tile, resource->tile);
+        });
+        if (prior != patterns.patterns.end()) resource->id = prior->id;
+        else do { resource->id = generate_pattern_uuid(); }
+          while (patterns.find(resource->id) || pattern_library().find_entry_by_pattern_id(QString::fromStdString(resource->id)));
+      }
+      resource->provenance = PatternProvenance::Authored;
+      patterns.adopt(*resource);
+      if (paint.kind != VectorFillKind::Pattern) {
+        paint.pattern_scale = 1.0;
+        paint.pattern_angle_degrees = 0.0;
+        paint.pattern_linked = true;
+        paint.pattern_phase_x = 0.0;
+        paint.pattern_phase_y = 0.0;
+      }
+      paint.kind = VectorFillKind::Pattern;
+      paint.pattern_id = resource->id;
+      paint.pattern_name = resource->name;
+      auto edits = std::make_shared<AppearanceEdits<ShapeAppearanceSettings>>();
+      for (const auto& property : shape_appearance_properties())
+        if (property.key == (for_stroke ? "stroke.content.kind" : "fill.kind")) edits->append(property.capture(settings));
+      settings.edits = std::move(edits);
+      preview(settings);
+      (for_stroke ? current_vector_stroke_paint_ : current_vector_fill_) = paint;
+      if (shape_pixel_options_ != nullptr && !for_stroke) {
+        shape_pixel_options_->fill_restore_kind = VectorFillKind::Pattern;
+      }
+      schedule_save_tool_settings();
+      return std::optional<ShapeAppearanceSettings>{settings};
+    }, for_stroke);
+    return;
+  }
+  auto edit_lock = lock_preview_dialog_edits();
+  auto& paint = for_stroke ? current_vector_stroke_paint_ : current_vector_fill_;
+  const auto storage_id = request_pattern_manager(this, pattern_library(),
+                                                  QString::fromStdString(paint.pattern_id));
+  if (storage_id.isEmpty()) {
+    return;
+  }
+  const auto resource = pattern_library().resource_for_entry(storage_id);
+  if (!resource.has_value() || resource->tile.empty()) {
+    return;
+  }
+  const bool was_pattern = paint.kind == VectorFillKind::Pattern;
+  paint.kind = VectorFillKind::Pattern;
+  paint.pattern_id = resource->id;
+  paint.pattern_name = resource->name;
+  if (!was_pattern) {
+    // Placement params reset only on a fresh switch to Pattern; re-picking a
+    // tile keeps the layer's tuned scale/angle/offset (the appearance dialog
+    // owns detailed placement).
+    paint.pattern_scale = 1.0;
+    paint.pattern_angle_degrees = 0.0;
+    paint.pattern_linked = true;
+    paint.pattern_phase_x = 0.0;
+    paint.pattern_phase_y = 0.0;
+  }
+  const auto chosen_paint = paint;
+  edit_lock.release();
+  paint = chosen_paint;
+  if (shape_pixel_options_ != nullptr && !for_stroke) {
+    shape_pixel_options_->fill_restore_kind = VectorFillKind::Pattern;
+  }
+  update_vector_swatch_icons();
+  schedule_save_tool_settings();
+  apply_options_bar_appearance_to_active_shape({for_stroke ? "stroke.content.kind" : "fill.kind"});
+}
+
+QBrush MainWindow::vector_fill_preview_brush(const patchy::VectorFill& paint) const {
+  switch (paint.kind) {
+    case VectorFillKind::None:
+      return QBrush(Qt::NoBrush);
+    case VectorFillKind::Solid:
+      return QBrush(QColor(paint.color.red, paint.color.green, paint.color.blue));
+    case VectorFillKind::Gradient: {
+      // Drag-preview approximation (the commit rasterizes exactly): ObjectMode
+      // gradients span the painted path's bounds; Reflected/Diamond fall back
+      // to linear, easing/dither are skipped, and alpha stops apply at the
+      // color-stop locations.
+      const auto& gradient = paint.gradient;
+      QGradientStops stops;
+      for (const auto& stop : gradient.color_stops) {
+        // Color and alpha sample the raw ramp position; reverse only flips
+        // where the stop lands visually (matching gradient_position's rule).
+        const auto source = std::clamp(stop.location, 0.0F, 1.0F);
+        const auto location = gradient.reverse ? 1.0F - source : source;
+        QColor color(stop.color.red, stop.color.green, stop.color.blue);
+        color.setAlphaF(std::clamp(gradient_stop_opacity(gradient, source, false), 0.0F, 1.0F));
+        stops.append({location, color});
+      }
+      std::sort(stops.begin(), stops.end(),
+                [](const QGradientStop& a, const QGradientStop& b) { return a.first < b.first; });
+      const auto angle_radians = gradient.angle_degrees * 3.14159265358979323846 / 180.0;
+      const auto scale = std::max(0.05F, gradient.scale);
+      const QPointF center(0.5, 0.5);
+      const QPointF half(std::cos(angle_radians) * 0.5 * scale,
+                         -std::sin(angle_radians) * 0.5 * scale);
+      if (gradient.type == LayerStyleGradientType::Radial) {
+        QRadialGradient radial(center, 0.5 * scale);
+        radial.setCoordinateMode(QGradient::ObjectMode);
+        radial.setStops(stops);
+        return QBrush(radial);
+      }
+      if (gradient.type == LayerStyleGradientType::Angle) {
+        QConicalGradient conical(center, gradient.angle_degrees);
+        conical.setCoordinateMode(QGradient::ObjectMode);
+        conical.setStops(stops);
+        return QBrush(conical);
+      }
+      QLinearGradient linear(center - half, center + half);
+      linear.setCoordinateMode(QGradient::ObjectMode);
+      if (gradient.type == LayerStyleGradientType::Reflected) {
+        linear.setStart(center);
+        linear.setFinalStop(center + half);
+        linear.setSpread(QGradient::ReflectSpread);
+      }
+      linear.setStops(stops);
+      return QBrush(linear);
+    }
+    case VectorFillKind::Pattern: {
+      auto* self = const_cast<MainWindow*>(this);
+      const auto resource = self->resolve_vector_pattern_resource(paint.pattern_id);
+      if (!resource.has_value()) {
+        return QBrush(Qt::NoBrush);  // missing tiles render as no paint
+      }
+      QBrush brush(QPixmap::fromImage(qimage_from_pixel_buffer(resource->tile)));
+      // Document-space placement mirroring PatternTileSampler: anchor at the
+      // phase (a NEW layer's effects reference point is the origin), rotate,
+      // then scale. The sampler's doc-to-tile mapping is R(angle); tile-to-doc
+      // is its inverse, which in Qt's y-down rotate() convention is -angle
+      // (the pattern appears rotated counterclockwise, the PS dial).
+      QTransform placement;
+      placement.translate(paint.pattern_phase_x, paint.pattern_phase_y);
+      placement.rotate(-paint.pattern_angle_degrees);
+      placement.scale(std::max(0.01, paint.pattern_scale), std::max(0.01, paint.pattern_scale));
+      brush.setTransform(placement);
+      return brush;
+    }
+  }
+  return QBrush(Qt::NoBrush);
+}
+
+namespace {
+
+// QSettings keys for the last-used trace options (persisted identifiers).
+constexpr const char* kTraceSettingsPrefix = "imageTrace/";
+
+ImageTraceOptions image_trace_options_from_settings() {
+  auto settings = app_settings();
+  const auto key = [](const char* name) { return QLatin1String(kTraceSettingsPrefix) + QLatin1String(name); };
+  ImageTraceOptions options;
+  options.mode = static_cast<ImageTraceOptions::Mode>(
+      std::clamp(settings.value(key("mode"), static_cast<int>(options.mode)).toInt(), 0, 2));
+  options.colors = settings.value(key("colors"), options.colors).toInt();
+  options.threshold = settings.value(key("threshold"), options.threshold).toInt();
+  options.paths = settings.value(key("paths"), options.paths).toInt();
+  options.corners = settings.value(key("corners"), options.corners).toInt();
+  options.noise = settings.value(key("noise"), options.noise).toInt();
+  options.smoothing = settings.value(key("smoothing"), options.smoothing).toInt();
+  options.merge_colors = settings.value(key("mergeColors"), options.merge_colors).toInt();
+  options.max_anchors = settings.value(key("maxAnchors"), options.max_anchors).toInt();
+  options.method = static_cast<ImageTraceOptions::Method>(
+      std::clamp(settings.value(key("method"), static_cast<int>(options.method)).toInt(), 0, 1));
+  options.snap_curves_to_lines = settings.value(key("snapCurvesToLines"), options.snap_curves_to_lines).toBool();
+  options.ignore_white = settings.value(key("ignoreWhite"), options.ignore_white).toBool();
+  return options;
+}
+
+void save_image_trace_options(const ImageTraceOptions& options) {
+  auto settings = app_settings();
+  const auto key = [](const char* name) { return QLatin1String(kTraceSettingsPrefix) + QLatin1String(name); };
+  settings.setValue(key("mode"), static_cast<int>(options.mode));
+  settings.setValue(key("colors"), options.colors);
+  settings.setValue(key("threshold"), options.threshold);
+  settings.setValue(key("paths"), options.paths);
+  settings.setValue(key("corners"), options.corners);
+  settings.setValue(key("noise"), options.noise);
+  settings.setValue(key("smoothing"), options.smoothing);
+  settings.setValue(key("mergeColors"), options.merge_colors);
+  settings.setValue(key("maxAnchors"), options.max_anchors);
+  settings.setValue(key("method"), static_cast<int>(options.method));
+  settings.setValue(key("snapCurvesToLines"), options.snap_curves_to_lines);
+  settings.setValue(key("ignoreWhite"), options.ignore_white);
+}
+
+// "Pick colors from the whole layer" for selection traces. Deliberately
+// outside ImageTraceOptions (it is a scope switch, not a preset option);
+// persisted identifier, never rename.
+constexpr const char* kTracePaletteFromLayerKey = "imageTrace/paletteFromLayer";
+
+bool image_trace_palette_from_layer_from_settings() {
+  auto settings = app_settings();
+  return settings.value(QLatin1String(kTracePaletteFromLayerKey), true).toBool();
+}
+
+void save_image_trace_palette_from_layer(bool palette_from_layer) {
+  auto settings = app_settings();
+  settings.setValue(QLatin1String(kTracePaletteFromLayerKey), palette_from_layer);
+}
+
+}  // namespace
+
+void MainWindow::trace_image_to_shapes() {
+  if (canvas_ == nullptr || !has_active_document()) {
+    return;
+  }
+  if (canvas_->quick_mask_active()) {
+    show_status_error(tr("Tracing is unavailable in Quick Mask mode"));
+    return;
+  }
+  auto& doc = document();
+  select_only_layer_if_none_active();
+  const auto active = doc.active_layer_id();
+  if (!active.has_value()) {
+    show_status_error(tr("Select a pixel layer to trace"));
+    return;
+  }
+  auto* layer = doc.find_layer(*active);
+  if (layer == nullptr || layer->kind() != LayerKind::Pixel) {
+    show_status_error(tr("Select a pixel layer to trace"));
+    return;
+  }
+  if (layer_pixels_are_procedural(*layer)) {
+    // Text, shape, and Smart Object layers trace their rendered pixels; the
+    // shared prompt rasterizes first (the destructive-edit contract).
+    if (!prompt_rasterize_procedural_layer(*active, tr("Trace Image to Shapes"), false)) {
+      return;
+    }
+    layer = doc.find_layer(*active);
+    if (layer == nullptr) {
+      return;
+    }
+  }
+  const auto& source_pixels = std::as_const(*layer).pixels();
+  if (source_pixels.empty()) {
+    show_status_error(tr("The layer has no pixels to trace"));
+    return;
+  }
+  // An active selection limits the traced area: pixels outside it become
+  // untraced on the input copy, a per-pixel predicate like alpha < 128. The
+  // parameters stay global (docs/legal-constraints.md, "Vector tracing").
+  // The unmasked layer rides along as the dialog's optional palette source,
+  // so the traced colors can match a whole-layer trace.
+  const bool inside_selection = canvas_->has_selection();
+  auto pixels = std::make_shared<const PixelBuffer>(
+      inside_selection ? pixels_limited_to_selection(*canvas_, source_pixels, std::as_const(*layer).bounds())
+                       : source_pixels);
+  std::shared_ptr<const PixelBuffer> whole_layer_pixels;
+  if (inside_selection) {
+    whole_layer_pixels = std::make_shared<const PixelBuffer>(source_pixels);
+  }
+  const auto chosen = request_image_trace(this, pixels, image_trace_options_from_settings(), inside_selection,
+                                          whole_layer_pixels, image_trace_palette_from_layer_from_settings());
+  if (!chosen.has_value()) {
+    return;
+  }
+  save_image_trace_options(chosen->options);
+  if (inside_selection) {
+    save_image_trace_palette_from_layer(chosen->palette_from_layer);
+  }
+  if (chosen->result == nullptr || chosen->result->layers.empty()) {
+    show_status_error(tr("Nothing to trace with these settings"));
+    return;
+  }
+  if (const auto group = insert_image_trace_layers(*active, *chosen->result); group.has_value()) {
+    statusBar()->showMessage(tr("Traced the layer into %n shape layer(s).", nullptr,
+                                static_cast<int>(chosen->result->layers.size())));
+  }
+}
+
+std::optional<LayerId> MainWindow::insert_image_trace_layers(LayerId source_id, const ImageTraceResult& result) {
+  if (canvas_ == nullptr || !has_active_document() || result.layers.empty()) {
+    return std::nullopt;
+  }
+  auto& doc = document();
+  auto* source = doc.find_layer(source_id);
+  if (source == nullptr) {
+    return std::nullopt;
+  }
+  const auto source_bounds = std::as_const(*source).bounds();
+
+  push_undo_snapshot(tr("Trace image to shapes"));
+  source = doc.find_layer(source_id);
+  if (source == nullptr) {
+    return std::nullopt;
+  }
+  auto group = build_image_trace_group(doc, result, source_bounds.x, source_bounds.y,
+                                       tr("Traced %1").arg(QString::fromStdString(source->name())).toStdString());
+  const auto group_id = group.id();
+  // The frontmost traced shape becomes active (not the group): the pen and
+  // path tools edit the active layer's path, so the trace is editable at once.
+  const auto active_id = group.children().empty() ? group_id : group.children().back().id();
+  source->set_visible(false);  // before the insert: it may reallocate the siblings
+  insert_layer_after_anchor(doc, std::move(group), source_id);
+  doc.set_active_layer(active_id);
+  refresh_layer_list();
+  reveal_layer_in_layer_list(active_id);
+  refresh_layer_controls();
+  refresh_document_info();
+  path_row_hidden_for_layer_.reset();
+  refresh_paths_panel();
+  canvas_->document_changed();
+  return group_id;
+}
+
+
+namespace {
+
+constexpr const char* kSimplifyToleranceKey = "paths/simplifyTolerance";
+constexpr const char* kSimplifyCornerKey = "paths/simplifyCornerAngle";
+constexpr const char* kSimplifySnapKey = "paths/simplifySnapCurvesToLines";
+
+}  // namespace
+
+void MainWindow::simplify_target_path() {
+  if (canvas_ == nullptr || !has_active_document()) {
+    return;
+  }
+  if (preview_dialog_edit_locked()) {
+    show_preview_dialog_edit_lock_message();
+    return;
+  }
+  select_only_layer_if_none_active();
+  const auto* target = canvas_->path_edit_target_path();
+  if (target == nullptr || target->subpaths.empty()) {
+    show_status_error(tr("Select a path or shape layer to simplify"));
+    return;
+  }
+  auto& doc = document();
+  Document* const doc_identity = &doc;
+  const VectorPath original = *target;
+  // Snapshot the owner for cancel, in path_edit_target_path's precedence: the
+  // vector-mask target, a targeted Paths-panel row, the active shape layer,
+  // else the work path. Whole objects, so a saved path keeps its verbatim PSD
+  // record bytes and dirty flag on cancel.
+  std::optional<LayerId> snapshot_layer_id;
+  std::optional<Layer> snapshot_layer;
+  std::optional<DocumentPathId> snapshot_path_id;
+  std::optional<DocumentPath> snapshot_path;
+  const auto active_layer_id = doc.active_layer_id();
+  const auto* active =
+      active_layer_id.has_value() ? std::as_const(doc).find_layer(*active_layer_id) : nullptr;
+  const auto panel_path = canvas_->active_document_path();
+  if (canvas_->layer_edit_target() == CanvasWidget::LayerEditTarget::VectorMask && active != nullptr &&
+      active->vector_mask() != nullptr) {
+    snapshot_layer_id = active_layer_id;
+    snapshot_layer = *active;
+  } else if (panel_path.has_value() && std::as_const(doc).find_path(*panel_path) != nullptr) {
+    snapshot_path_id = panel_path;
+    snapshot_path = *std::as_const(doc).find_path(*panel_path);
+  } else if (active != nullptr && layer_is_vector_shape(*active) && vector_lock_reason(*active).empty()) {
+    snapshot_layer_id = active_layer_id;
+    snapshot_layer = *active;
+  } else if (const auto* work = doc.work_path(); work != nullptr) {
+    snapshot_path_id = work->id();
+    snapshot_path = *work;
+  } else {
+    show_status_error(tr("Select a path or shape layer to simplify"));
+    return;
+  }
+  const auto restore = [this, doc_identity, snapshot_layer_id, snapshot_layer, snapshot_path_id,
+                        snapshot_path] {
+    // Non-modal: the document may have closed or switched meanwhile.
+    if (!has_active_document() || &document() != doc_identity) {
+      return false;
+    }
+    auto& current = document();
+    if (snapshot_layer.has_value()) {
+      auto* layer = current.find_layer(*snapshot_layer_id);
+      if (layer == nullptr) {
+        return false;
+      }
+      *layer = *snapshot_layer;
+    }
+    if (snapshot_path.has_value()) {
+      auto* path = current.find_path(*snapshot_path_id);
+      if (path == nullptr) {
+        return false;
+      }
+      *path = *snapshot_path;
+    }
+    if (canvas_ != nullptr) {
+      canvas_->document_changed();
+    }
+    refresh_layer_thumbnails();
+    refresh_paths_panel();
+    return true;
+  };
+
+  auto settings = app_settings();
+  QDialog dialog(this);
+  dialog.setObjectName(QStringLiteral("simplifyPathDialog"));
+  dialog.setWindowTitle(tr("Simplify Path"));
+  auto* layout = new QVBoxLayout(&dialog);
+  auto* form = new QFormLayout();
+  auto* tolerance = new UnitSpinBox(SpinUnit::Pixels, &dialog);
+  tolerance->setObjectName(QStringLiteral("simplifyPathToleranceSpin"));
+  tolerance->set_context_provider(document_unit_context_provider(true));
+  tolerance->setRange(0.1, 20.0);
+  tolerance->setDecimals(1);
+  tolerance->setSingleStep(0.5);
+  tolerance->setValue(std::clamp(settings.value(QLatin1String(kSimplifyToleranceKey), 1.0).toDouble(), 0.1, 20.0));
+  tolerance->setToolTip(tr("Larger values remove more points"));
+  form->addRow(tr("Tolerance:"), tolerance);
+  auto* corners = new UnitIntSpinBox(SpinUnit::Degrees, &dialog);
+  corners->setObjectName(QStringLiteral("simplifyPathCornerSpin"));
+  corners->setRange(10, 170);
+  corners->setValue(std::clamp(settings.value(QLatin1String(kSimplifyCornerKey), 60).toInt(), 10, 170));
+  corners->setToolTip(tr("Bends sharper than this angle stay corners"));
+  form->addRow(tr("Corners:"), corners);
+  auto* snap = new QCheckBox(tr("Snap curves to lines"), &dialog);
+  snap->setObjectName(QStringLiteral("simplifyPathSnapLinesCheck"));
+  snap->setChecked(settings.value(QLatin1String(kSimplifySnapKey), false).toBool());
+  form->addRow(QString(), snap);
+  layout->addLayout(form);
+  auto* readout = new QLabel(&dialog);
+  readout->setObjectName(QStringLiteral("simplifyPathAnchorsLabel"));
+  layout->addWidget(readout);
+  auto* buttons = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel, &dialog);
+  connect(buttons, &QDialogButtonBox::accepted, &dialog, &QDialog::accept);
+  connect(buttons, &QDialogButtonBox::rejected, &dialog, &QDialog::reject);
+  layout->addWidget(buttons);
+  append_themed_style(dialog, dialog_spinbox_button_style());
+
+  // Live preview: the vector model applies to the real target, undo stays
+  // un-armed (the snapshot above restores), one entry lands on accept.
+  auto preview_lock = lock_preview_dialog_edits();
+  canvas_->clear_path_edit_selection();
+  const auto current_options = [&] {
+    PathSimplifyOptions options;
+    options.tolerance = tolerance->value();
+    options.corner_angle_degrees = corners->value();
+    options.snap_curves_to_lines = snap->isChecked();
+    return options;
+  };
+  // A path with nothing to remove at this tolerance stays as it is ("never
+  // worse"), so the readout says whether a larger tolerance would help or the
+  // path is already as simple as Simplify makes it (GitHub issue 396: a
+  // 4-anchor shape looked like a dialog that did nothing).
+  const auto no_change_hint = [&](const PathSimplifyOptions& options, std::size_t anchors_before) {
+    auto loosest = options;
+    loosest.tolerance = tolerance->maximum();
+    const bool larger_helps = loosest.tolerance > options.tolerance &&
+                              simplify_vector_path(original, loosest).anchors_after < anchors_before;
+    return larger_helps ? tr("Raise Tolerance to remove points.") : tr("This path has no points to remove.");
+  };
+  const auto apply_preview = [&] {
+    const auto options = current_options();
+    const auto result = simplify_vector_path(original, options);
+    canvas_->replace_path_edit_target(result.path, result.changed_groups);
+    auto text = tr("Anchors: %1 -> %2")
+                    .arg(static_cast<qulonglong>(result.anchors_before))
+                    .arg(static_cast<qulonglong>(result.anchors_after));
+    if (result.anchors_after >= result.anchors_before) {
+      text += QLatin1Char('\n') + no_change_hint(options, result.anchors_before);
+    }
+    readout->setText(text);
+    refresh_paths_panel();
+    refresh_layer_thumbnails();
+  };
+  connect(tolerance, &QDoubleSpinBox::valueChanged, &dialog, [&](double) { apply_preview(); });
+  connect(corners, &QSpinBox::valueChanged, &dialog, [&](int) { apply_preview(); });
+  connect(snap, &QCheckBox::toggled, &dialog, [&](bool) { apply_preview(); });
+  apply_preview();
+  const auto code = run_non_modal_dialog(dialog);
+  const auto final_options = current_options();
+  if (!restore()) {
+    return;
+  }
+  if (code != QDialog::Accepted) {
+    statusBar()->showMessage(tr("Cancelled simplifying the path"));
+    return;
+  }
+  settings.setValue(QLatin1String(kSimplifyToleranceKey), final_options.tolerance);
+  settings.setValue(QLatin1String(kSimplifyCornerKey), static_cast<int>(final_options.corner_angle_degrees));
+  settings.setValue(QLatin1String(kSimplifySnapKey), final_options.snap_curves_to_lines);
+  const auto result = simplify_vector_path(original, final_options);
+  if (result.anchors_after >= result.anchors_before) {
+    statusBar()->showMessage(no_change_hint(final_options, result.anchors_before));  // no empty undo entry
+    return;
+  }
+  push_undo_snapshot(tr("Simplify path"));
+  canvas_->replace_path_edit_target(result.path, result.changed_groups);
+  refresh_paths_panel();
+  refresh_layer_thumbnails();
+  refresh_layer_controls();
+  statusBar()->showMessage(tr("Simplified the path: %1 -> %2 anchors")
+                               .arg(static_cast<qulonglong>(result.anchors_before))
+                               .arg(static_cast<qulonglong>(result.anchors_after)));
+}
+
+void MainWindow::refresh_combine_shapes_action_states() {
+  if (layer_shape_appearance_action_ != nullptr) {
+    layer_shape_appearance_action_->setEnabled(has_active_document() && !preview_dialog_edit_locked() &&
+                                               !editable_selected_shape_layer_ids().empty());
+  }
+  // Two or more shape layers, or two or more components of the targeted path (GitHub #521).
+  const bool enabled =
+      has_active_document() && !preview_dialog_edit_locked() &&
+      (combine_shape_candidates(std::as_const(document()).layers(), selected_or_active_layer_ids()).refusal ==
+           ShapeCombineRefusal::None ||
+       (canvas_ != nullptr && canvas_->path_edit_selected_groups().size() >= 2));
+  for (auto* action : layer_combine_actions_) {
+    if (action != nullptr) {
+      action->setEnabled(enabled);
+    }
+  }
+  refresh_path_edit_action_states();
+}
+
+void MainWindow::combine_selected_shape_layers(PathCombineOp op) {
+  if (canvas_ == nullptr || !has_active_document()) {
+    return;
+  }
+  if (preview_dialog_edit_locked()) {
+    show_preview_dialog_edit_lock_message();
+    return;
+  }
+  canvas_->finish_free_transform();
+  auto& doc = document();
+  const auto candidates = combine_shape_candidates(std::as_const(doc).layers(), selected_or_active_layer_ids());
+  QString label;
+  switch (op) {
+    case PathCombineOp::Add:
+      label = tr("Unite shapes");
+      break;
+    case PathCombineOp::Subtract:
+      label = tr("Subtract front shape");
+      break;
+    case PathCombineOp::Intersect:
+      label = tr("Intersect shapes");
+      break;
+    case PathCombineOp::Xor:
+      label = tr("Exclude overlapping shapes");
+      break;
+  }
+  // One layer (or none) with two or more of its components selected under Path Select or
+  // Direct Select: combine those, in the shape layer, work path, saved path or vector mask.
+  if (candidates.refusal != ShapeCombineRefusal::None && canvas_->path_edit_selected_groups().size() >= 2) {
+    if (canvas_->combine_selected_path_components(op, label)) {
+      refresh_paths_panel();
+      refresh_layer_thumbnails();
+      statusBar()->showMessage(label);
+    }
+    return;
+  }
+  switch (candidates.refusal) {
+    case ShapeCombineRefusal::NeedTwoLayers:
+      show_status_error(tr("Select two or more shape layers to combine"));
+      return;
+    case ShapeCombineRefusal::NotShapeLayer:
+      show_status_error(tr("Only editable shape layers can be combined"));
+      return;
+    case ShapeCombineRefusal::Locked:
+      show_status_error(tr("Shape layers are locked"));
+      return;
+    case ShapeCombineRefusal::EmptyPath:
+      show_status_error(tr("Fill layers without a path cannot be combined"));
+      return;
+    case ShapeCombineRefusal::DifferentParents:
+      show_status_error(tr("Shape layers must be in the same folder to combine"));
+      return;
+    case ShapeCombineRefusal::None:
+      break;
+  }
+  push_undo_snapshot(label);
+  const auto result = combine_shape_layers(document(), candidates.bottom_to_top, op);
+  if (!result.has_value()) {
+    show_status_error(tr("Only editable shape layers can be combined"));
+    return;
+  }
+  document().set_active_layer(result->layer_id);
+  canvas_->clear_path_edit_selection();
+  refresh_layer_list();
+  refresh_layer_controls();
+  refresh_document_info();
+  path_row_hidden_for_layer_.reset();
+  refresh_paths_panel();
+  canvas_->document_changed();
+  statusBar()->showMessage(
+      tr("Combined %n shape layer(s)", nullptr, static_cast<int>(candidates.bottom_to_top.size())));
+}
+
+}  // namespace patchy::ui

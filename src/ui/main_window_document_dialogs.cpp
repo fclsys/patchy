@@ -1,0 +1,1930 @@
+// MainWindow's document create/resize dialog implementation, split out of
+// main_window.cpp: the Image Size and Canvas Size dialogs (the
+// request_*_settings helpers and the settings structs they return) plus the
+// members that drive them (reset_document, create_clipboard_document,
+// create_new_document, resize_image_dialog, resize_canvas_dialog). The New
+// Document dialog itself lives in ui/new_document_dialog.cpp (it grew a preset
+// card grid); create_new_document here just consumes its settings.
+
+#include "core/artboard.hpp"
+#include "core/layer.hpp"
+#include "core/pixel_buffer.hpp"
+#include "ui/main_window.hpp"
+#include "ui/theme_script_host.hpp"
+#include <QStatusBar>
+#include "ui/canvas_widget.hpp"
+#include "ui/canvas_widget_shared.hpp"
+#include "ui/main_window_shared.hpp"
+#include "ui/file_info_dialog.hpp"
+#include "formats/document_trim.hpp"
+#include "formats/metadata/metadata_edit.hpp"
+#include "ui/background_workers.hpp"
+
+#include "core/document_depth.hpp"
+#include "core/layer_metadata.hpp"
+#include "core/smart_object.hpp"
+#include "core/pixel_tools.hpp"
+#include "core/resample.hpp"
+#include "ui/action_icons.hpp"
+#include "ui/app_settings.hpp"
+#include "ui/brush_dynamics_popup.hpp"
+#include "ui/brush_tip_manager_dialog.hpp"
+#include "ui/image_document_io.hpp"
+#include "ui/filter_workflows.hpp"
+#include "ui/dialog_utils.hpp"
+#include "ui/document_float_window.hpp"
+#include "ui/edit_conversions.hpp"
+#include "ui/color_panel.hpp"
+#include "ui/layer_style_dialog.hpp"
+#include "ui/layer_list_widget.hpp"
+#include "ui/measurement_units.hpp"
+#include "ui/new_document_dialog.hpp"
+#include "ui/scanner_import.hpp"
+#include "ui/tile_preview_window.hpp"
+#include "ui/unit_spin_box.hpp"
+#include "ui/warp_text_dialog.hpp"
+#include "ui/qt_geometry.hpp"
+#include "ui/update_checker.hpp"
+#include "ui/theme_qss.hpp"
+
+#include <QButtonGroup>
+#include <QCheckBox>
+#include <QColor>
+#include <QComboBox>
+#include <QDialog>
+#include <QDialogButtonBox>
+#include <QDoubleSpinBox>
+#include <QFormLayout>
+#include <QFrame>
+#include <QGridLayout>
+#include <QHBoxLayout>
+#include <QImage>
+#include <QLabel>
+#include <QObject>
+#include <QPainter>
+#include <QPen>
+#include <QPixmap>
+#include <QPoint>
+#include <QPushButton>
+#include <QRadioButton>
+#include <QRect>
+#include <QSignalBlocker>
+#include <QSize>
+#include <QSpinBox>
+#include <QStandardItemModel>
+#include <QString>
+#include <QStringLiteral>
+#include <QToolButton>
+#include <QVBoxLayout>
+#include <QWidget>
+#include <Qt>
+#include <QtGlobal>
+
+#include <algorithm>
+#include <array>
+#include <chrono>
+#include <cstddef>
+#include <cstdint>
+#include <cmath>
+#include <cstdlib>
+#include <functional>
+#include <future>
+#include <initializer_list>
+#include <optional>
+#include <string>
+#include <string_view>
+#include <utility>
+
+
+// Icon resources live in the static patchy_ui library; force registration before first use.
+int qInitResources_icons();
+
+namespace patchy::ui {
+
+namespace {
+
+// New documents open like opened files: an oversized canvas fits the view, a smaller one
+// shows at 100% (GitHub issue 247). No-op while the window has no size (startup).
+void fit_new_document_view(CanvasWidget* canvas) {
+  if (canvas != nullptr) {
+    canvas->fit_to_view_without_enlarging();
+  }
+}
+
+struct CanvasSizeSettings {
+  std::int32_t width{0};
+  std::int32_t height{0};
+  CanvasAnchor anchor{CanvasAnchor::Center};
+  // The new canvas in current document coordinates: the anchor applied to the dialog's
+  // reference frame (the canvas, or the selection for Crop to Selection (Advanced)).
+  Rect frame;
+  QColor extension_color{Qt::white};
+  bool crop_layers{false};
+  bool delete_off_canvas_layers{false};
+};
+
+struct RotateCanvasSettings {
+  // Positive turns the canvas clockwise on screen, negative counterclockwise.
+  double clockwise_degrees{0.0};
+};
+
+// Image > Rotate Arbitrary...: Photoshop's small angle + direction prompt.
+std::optional<RotateCanvasSettings> request_rotate_canvas_settings(QWidget* parent) {
+  QDialog dialog(parent);
+  dialog.setObjectName(QStringLiteral("patchyRotateCanvasDialog"));
+  dialog.setWindowTitle(QObject::tr("Rotate Canvas"));
+  append_themed_style(dialog, QStringLiteral(R"(
+    QDialog#patchyRotateCanvasDialog {
+      background: @dlg_raised_bg;
+      color: @text_on_raised;
+    }
+    QDialog#patchyRotateCanvasDialog QWidget {
+      background: @dlg_raised_bg;
+      color: @text_on_raised;
+    }
+    QDialog#patchyRotateCanvasDialog QLabel {
+      background: transparent;
+      color: @text_on_raised;
+      font-size: 11px;
+    }
+    QDialog#patchyRotateCanvasDialog QDoubleSpinBox {
+      background: @dlg_tab_bg;
+      border: 1px solid @dlg_tab_border;
+      border-radius: 3px;
+      color: @text_on_raised;
+      min-height: 22px;
+      padding: 0 8px;
+    }
+    QDialog#patchyRotateCanvasDialog QDoubleSpinBox:focus {
+      border-color: @dlg_focus_border;
+      background: @dlg_button_bg;
+    }
+    QDialog#patchyRotateCanvasDialog QRadioButton {
+      background: transparent;
+      color: @text_on_raised;
+      font-size: 11px;
+      spacing: 7px;
+    }
+    QDialog#patchyRotateCanvasDialog QRadioButton::indicator {
+      width: 11px;
+      height: 11px;
+      border-radius: 6px;
+      background: @dlg_grid_bg;
+      border: 1px solid @dlg_grid_border;
+    }
+    QDialog#patchyRotateCanvasDialog QRadioButton::indicator:checked {
+      background: @accent_pressed_bg;
+      border-color: @dlg_focus_border;
+    }
+    QDialog#patchyRotateCanvasDialog QPushButton {
+      background: @dlg_raised_bg;
+      border: 1px solid @dlg_action_border;
+      border-radius: 13px;
+      color: @text_on_raised;
+      min-width: 70px;
+      min-height: 24px;
+      padding: 0 14px;
+      font-size: 11px;
+      font-weight: 700;
+    }
+    QDialog#patchyRotateCanvasDialog QPushButton:hover {
+      background: @dlg_raised_hover_bg;
+      border-color: @dlg_action_hover_border;
+    }
+  )"));
+
+  auto* layout = new QVBoxLayout(&dialog);
+  layout->setContentsMargins(15, 17, 14, 14);
+  layout->setSpacing(10);
+  auto* form = new QFormLayout();
+  form->setHorizontalSpacing(8);
+  auto* angle = new UnitSpinBox(SpinUnit::Degrees, &dialog);
+  angle->setObjectName(QStringLiteral("rotateCanvasAngleSpin"));
+  angle->setRange(0.0, 360.0);
+  angle->setDecimals(2);
+  angle->setSingleStep(1.0);
+  angle->setValue(0.0);
+  configure_dialog_spinbox(angle);
+  form->addRow(QObject::tr("Angle:"), angle);
+  layout->addLayout(form);
+
+  auto* direction = new QHBoxLayout();
+  direction->setSpacing(14);
+  auto* clockwise = new QRadioButton(QObject::tr("Clockwise"), &dialog);
+  clockwise->setObjectName(QStringLiteral("rotateCanvasClockwiseRadio"));
+  clockwise->setChecked(true);
+  auto* counterclockwise = new QRadioButton(QObject::tr("Counterclockwise"), &dialog);
+  counterclockwise->setObjectName(QStringLiteral("rotateCanvasCounterclockwiseRadio"));
+  direction->addWidget(clockwise);
+  direction->addWidget(counterclockwise);
+  direction->addStretch(1);
+  layout->addLayout(direction);
+
+  auto* buttons = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel, &dialog);
+  layout->addWidget(buttons);
+  QObject::connect(buttons, &QDialogButtonBox::accepted, &dialog, &QDialog::accept);
+  QObject::connect(buttons, &QDialogButtonBox::rejected, &dialog, &QDialog::reject);
+  angle->selectAll();
+  if (exec_dialog(dialog) != QDialog::Accepted) {
+    return std::nullopt;
+  }
+  return RotateCanvasSettings{clockwise->isChecked() ? angle->value() : -angle->value()};
+}
+
+struct TrimSettings {
+  TrimBasis basis{TrimBasis::TransparentPixels};
+  TrimSides sides;
+  int tolerance{0};
+};
+
+// Image > Trim... (GitHub issue 297): what to compare against, how close counts as a match
+// (Tolerance, 0..255 like the Magic Wand's) and which sides to cut. Transparent Pixels is
+// offered only when the composite has transparency; the choices persist under `trim/`
+// (permanent keys).
+std::optional<TrimSettings> request_trim_settings(QWidget* parent, bool has_transparency) {
+  QDialog dialog(parent);
+  dialog.setObjectName(QStringLiteral("patchyTrimDialog"));
+  dialog.setWindowTitle(QObject::tr("Trim"));
+  append_themed_style(dialog, QStringLiteral(R"(
+    QDialog#patchyTrimDialog {
+      background: @dlg_raised_bg;
+      color: @text_on_raised;
+    }
+    QDialog#patchyTrimDialog QWidget {
+      background: @dlg_raised_bg;
+      color: @text_on_raised;
+    }
+    QDialog#patchyTrimDialog QLabel {
+      background: transparent;
+      color: @text_on_raised;
+      font-size: 11px;
+    }
+    QDialog#patchyTrimDialog QLabel[sectionLabel="true"] {
+      font-weight: 700;
+    }
+    QDialog#patchyTrimDialog QSpinBox {
+      background: @dlg_tab_bg;
+      border: 1px solid @dlg_tab_border;
+      border-radius: 3px;
+      color: @text_on_raised;
+      min-height: 22px;
+      padding: 0 8px;
+    }
+    QDialog#patchyTrimDialog QSpinBox:focus {
+      border-color: @dlg_focus_border;
+      background: @dlg_button_bg;
+    }
+    QDialog#patchyTrimDialog QRadioButton,
+    QDialog#patchyTrimDialog QCheckBox {
+      background: transparent;
+      color: @text_on_raised;
+      font-size: 11px;
+      spacing: 7px;
+    }
+    QDialog#patchyTrimDialog QRadioButton:disabled,
+    QDialog#patchyTrimDialog QCheckBox:disabled {
+      color: @text_disabled;
+    }
+    QDialog#patchyTrimDialog QRadioButton::indicator {
+      width: 11px;
+      height: 11px;
+      border-radius: 6px;
+      background: @dlg_grid_bg;
+      border: 1px solid @dlg_grid_border;
+    }
+    QDialog#patchyTrimDialog QRadioButton::indicator:checked {
+      background: @accent_pressed_bg;
+      border-color: @dlg_focus_border;
+    }
+    QDialog#patchyTrimDialog QCheckBox::indicator {
+      width: 11px;
+      height: 11px;
+      background: @dlg_grid_bg;
+      border: 1px solid @dlg_grid_border;
+    }
+    QDialog#patchyTrimDialog QCheckBox::indicator:checked {
+      background: @accent_pressed_bg;
+      border-color: @dlg_focus_border;
+      image: url(@icon(checkmark));
+    }
+    QDialog#patchyTrimDialog QPushButton {
+      background: @dlg_raised_bg;
+      border: 1px solid @dlg_action_border;
+      border-radius: 13px;
+      color: @text_on_raised;
+      min-width: 70px;
+      min-height: 24px;
+      padding: 0 14px;
+      font-size: 11px;
+      font-weight: 700;
+    }
+    QDialog#patchyTrimDialog QPushButton:hover {
+      background: @dlg_raised_hover_bg;
+      border-color: @dlg_action_hover_border;
+    }
+    QDialog#patchyTrimDialog QPushButton:disabled {
+      color: @text_disabled;
+    }
+  )"));
+
+  auto settings = app_settings();
+  auto* layout = new QVBoxLayout(&dialog);
+  layout->setContentsMargins(15, 17, 14, 14);
+  layout->setSpacing(7);
+
+  auto* based_on_label = new QLabel(QObject::tr("Based On"), &dialog);
+  based_on_label->setProperty("sectionLabel", true);
+  layout->addWidget(based_on_label);
+  auto* transparent = new QRadioButton(QObject::tr("Transparent Pixels"), &dialog);
+  transparent->setObjectName(QStringLiteral("trimTransparentRadio"));
+  auto* top_left = new QRadioButton(QObject::tr("Top Left Pixel Color"), &dialog);
+  top_left->setObjectName(QStringLiteral("trimTopLeftRadio"));
+  auto* bottom_right = new QRadioButton(QObject::tr("Bottom Right Pixel Color"), &dialog);
+  bottom_right->setObjectName(QStringLiteral("trimBottomRightRadio"));
+  auto* basis_group = new QButtonGroup(&dialog);
+  basis_group->addButton(transparent, static_cast<int>(TrimBasis::TransparentPixels));
+  basis_group->addButton(top_left, static_cast<int>(TrimBasis::TopLeftColor));
+  basis_group->addButton(bottom_right, static_cast<int>(TrimBasis::BottomRightColor));
+  for (auto* radio : {transparent, top_left, bottom_right}) {
+    auto* row = new QHBoxLayout();
+    row->setContentsMargins(14, 0, 0, 0);
+    row->addWidget(radio);
+    row->addStretch(1);
+    layout->addLayout(row);
+  }
+  transparent->setEnabled(has_transparency);
+  if (!has_transparency) {
+    transparent->setToolTip(QObject::tr("The image has no transparent pixels"));
+  }
+  const auto remembered = parse_trim_basis(
+      settings.value(QStringLiteral("trim/basedOn")).toString().toStdString());
+  // A new user starts on Transparent Pixels when the image has transparency, as does a
+  // remembered Transparent Pixels; an opaque image falls back to the top-left color.
+  auto basis = remembered.value_or(TrimBasis::TransparentPixels);
+  if (basis == TrimBasis::TransparentPixels && !has_transparency) {
+    basis = TrimBasis::TopLeftColor;
+  }
+  basis_group->button(static_cast<int>(basis))->setChecked(true);
+
+  // Tolerance 0 is an exact match; higher values also cut near matches (JPEG noise,
+  // anti-aliased edges): alpha up to the value, or every channel within it of the corner.
+  auto* tolerance_row = new QHBoxLayout();
+  tolerance_row->setContentsMargins(14, 2, 0, 0);
+  tolerance_row->setSpacing(8);
+  auto* tolerance_label = new QLabel(QObject::tr("Tolerance:"), &dialog);
+  auto* tolerance = new QSpinBox(&dialog);
+  tolerance->setObjectName(QStringLiteral("trimToleranceSpin"));
+  tolerance->setRange(0, 255);
+  tolerance->setValue(std::clamp(settings.value(QStringLiteral("trim/tolerance"), 0).toInt(), 0, 255));
+  configure_dialog_spinbox(tolerance, 64);
+  tolerance->setToolTip(QObject::tr("How far a pixel may differ from the trim color and still be cut (0 is an exact match)"));
+  tolerance_label->setBuddy(tolerance);
+  tolerance_row->addWidget(tolerance_label);
+  tolerance_row->addWidget(tolerance);
+  tolerance_row->addStretch(1);
+  layout->addLayout(tolerance_row);
+
+  layout->addSpacing(6);
+  auto* trim_away_label = new QLabel(QObject::tr("Trim Away"), &dialog);
+  trim_away_label->setProperty("sectionLabel", true);
+  layout->addWidget(trim_away_label);
+  auto* sides_grid = new QGridLayout();
+  sides_grid->setContentsMargins(14, 0, 0, 0);
+  sides_grid->setHorizontalSpacing(24);
+  sides_grid->setVerticalSpacing(7);
+  auto* top = new QCheckBox(QObject::tr("Top"), &dialog);
+  top->setObjectName(QStringLiteral("trimTopCheck"));
+  auto* bottom = new QCheckBox(QObject::tr("Bottom"), &dialog);
+  bottom->setObjectName(QStringLiteral("trimBottomCheck"));
+  auto* left = new QCheckBox(QObject::tr("Left"), &dialog);
+  left->setObjectName(QStringLiteral("trimLeftCheck"));
+  auto* right = new QCheckBox(QObject::tr("Right"), &dialog);
+  right->setObjectName(QStringLiteral("trimRightCheck"));
+  top->setChecked(settings.value(QStringLiteral("trim/top"), true).toBool());
+  bottom->setChecked(settings.value(QStringLiteral("trim/bottom"), true).toBool());
+  left->setChecked(settings.value(QStringLiteral("trim/left"), true).toBool());
+  right->setChecked(settings.value(QStringLiteral("trim/right"), true).toBool());
+  sides_grid->addWidget(top, 0, 0);
+  sides_grid->addWidget(left, 0, 1);
+  sides_grid->addWidget(bottom, 1, 0);
+  sides_grid->addWidget(right, 1, 1);
+  sides_grid->setColumnStretch(2, 1);
+  layout->addLayout(sides_grid);
+  layout->addSpacing(6);
+
+  auto* buttons = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel, &dialog);
+  layout->addWidget(buttons);
+  QObject::connect(buttons, &QDialogButtonBox::accepted, &dialog, &QDialog::accept);
+  QObject::connect(buttons, &QDialogButtonBox::rejected, &dialog, &QDialog::reject);
+  // With every side off there is nothing to trim.
+  auto* ok = buttons->button(QDialogButtonBox::Ok);
+  ok->setObjectName(QStringLiteral("trimOkButton"));
+  const auto refresh_ok = [ok, top, bottom, left, right] {
+    ok->setEnabled(top->isChecked() || bottom->isChecked() || left->isChecked() || right->isChecked());
+  };
+  for (auto* check : {top, bottom, left, right}) {
+    QObject::connect(check, &QCheckBox::toggled, &dialog, refresh_ok);
+  }
+  refresh_ok();
+
+  if (exec_dialog(dialog) != QDialog::Accepted) {
+    return std::nullopt;
+  }
+  TrimSettings result;
+  result.basis = static_cast<TrimBasis>(basis_group->checkedId());
+  result.sides = TrimSides{top->isChecked(), bottom->isChecked(), left->isChecked(), right->isChecked()};
+  result.tolerance = tolerance->value();
+  const auto id = trim_basis_id(result.basis);
+  settings.setValue(QStringLiteral("trim/basedOn"), QString::fromUtf8(id.data(), static_cast<qsizetype>(id.size())));
+  settings.setValue(QStringLiteral("trim/top"), result.sides.top);
+  settings.setValue(QStringLiteral("trim/bottom"), result.sides.bottom);
+  settings.setValue(QStringLiteral("trim/left"), result.sides.left);
+  settings.setValue(QStringLiteral("trim/right"), result.sides.right);
+  settings.setValue(QStringLiteral("trim/tolerance"), result.tolerance);
+  return result;
+}
+
+struct ImageSizeSettings {
+  std::int32_t width{0};
+  std::int32_t height{0};
+  double resolution{300.0};
+  bool resample{true};
+  ResampleMethod method{ResampleMethod::Automatic};
+};
+
+// The combo's visible names; the item data is the permanent id (core/resample.hpp).
+QString resample_method_label(ResampleMethod method) {
+  switch (method) {
+    case ResampleMethod::Automatic:
+      return QObject::tr("Automatic");
+    case ResampleMethod::NearestNeighbor:
+      return QObject::tr("Nearest Neighbor (hard edges)");
+    case ResampleMethod::Bilinear:
+      return QObject::tr("Bilinear");
+    case ResampleMethod::Bicubic:
+      return QObject::tr("Bicubic (smooth gradients)");
+    case ResampleMethod::BicubicSmoother:
+      return QObject::tr("Bicubic Smoother (enlargement)");
+    case ResampleMethod::BicubicSharper:
+      return QObject::tr("Bicubic Sharper (reduction)");
+  }
+  return QObject::tr("Automatic");
+}
+
+QString resample_method_id_string(ResampleMethod method) {
+  const auto id = resample_method_id(method);
+  return QString::fromUtf8(id.data(), static_cast<qsizetype>(id.size()));
+}
+
+QString format_image_size_bytes(std::int32_t width, std::int32_t height, PixelFormat format) {
+  const auto bytes = static_cast<double>(std::max<std::int32_t>(0, width)) *
+                     static_cast<double>(std::max<std::int32_t>(0, height)) *
+                     static_cast<double>(bytes_per_pixel(format));
+  if (bytes >= 1024.0 * 1024.0) {
+    return QObject::tr("%1M").arg(bytes / (1024.0 * 1024.0), 0, 'f', 1);
+  }
+  return QObject::tr("%1K").arg(bytes / 1024.0, 0, 'f', 1);
+}
+
+// The preview's source: the flattened document as RGBA8, reduced once (smoothly) to at
+// most four times the preview box when larger, since the box cannot show more detail;
+// a small document keeps its exact pixels so an enlargement previews true.
+PixelBuffer image_size_preview_source(const Document& document, QSize preview_size, const QImage& composite) {
+  // The canvas's current composite when it has one: compositing a 365 Mpx page grid again
+  // kept the dialog from opening for seconds.
+  auto image = (!composite.isNull() && composite.size() == QSize(document.width(), document.height())
+                    ? composite
+                    : qimage_from_document(document, true))
+                   .convertToFormat(QImage::Format_RGBA8888);
+  const QSize bound = preview_size * 4;
+  if (image.width() > bound.width() || image.height() > bound.height()) {
+    image = image.scaled(bound, Qt::KeepAspectRatio, Qt::SmoothTransformation).convertToFormat(QImage::Format_RGBA8888);
+  }
+  PixelBuffer pixels(image.width(), image.height(), PixelFormat::rgba8());
+  for (int y = 0; y < image.height(); ++y) {
+    std::copy_n(image.constScanLine(y), static_cast<std::size_t>(image.width()) * 4, pixels.row(y).data());
+  }
+  return pixels;
+}
+
+// Resamples the source to the target size with the chosen method, fitted into the
+// box, so the preview shows the method: Nearest Neighbor its blocks, the cubics their
+// blur. (A Qt smooth scale of the current pixels showed every method as a blur; Seth,
+// October 2026.) Automatic resolves from the real document and target sizes.
+QPixmap image_size_preview_pixmap(const PixelBuffer& source, QSize preview_size, QSize document_size,
+                                  QSize target_size, ResampleMethod method) {
+  QPixmap pixmap(preview_size);
+  pixmap.fill(QColor(22, 22, 22));
+
+  QPainter painter(&pixmap);
+  constexpr int kTileSize = 12;
+  for (int y = 0; y < preview_size.height(); y += kTileSize) {
+    for (int x = 0; x < preview_size.width(); x += kTileSize) {
+      const bool light_tile = ((x / kTileSize) + (y / kTileSize)) % 2 == 0;
+      painter.fillRect(QRect(x, y, kTileSize, kTileSize), light_tile ? QColor(228, 228, 228) : QColor(176, 176, 176));
+    }
+  }
+
+  if (!source.empty() && !target_size.isEmpty()) {
+    const auto resolved = resolve_automatic_resample_method(method, document_size.width(), document_size.height(),
+                                                            target_size.width(), target_size.height());
+    const auto fitted = target_size.scaled(preview_size, Qt::KeepAspectRatio).expandedTo(QSize(1, 1));
+    const auto image = display_qimage_from_pixel_buffer(resample_pixels(source, fitted.width(), fitted.height(), resolved));
+    const QPoint position((preview_size.width() - image.width()) / 2, (preview_size.height() - image.height()) / 2);
+    painter.drawImage(position, image);
+  }
+  painter.setPen(QPen(QColor(30, 30, 30), 1));
+  painter.drawRect(pixmap.rect().adjusted(0, 0, -1, -1));
+  painter.end();
+  return pixmap;
+}
+
+ThemedQss canvas_color_swatch_style(QColor color) {
+  return ThemedQss(QStringLiteral("QPushButton#canvasSizeExtensionColorSwatch { background: rgb(%1, %2, %3); "
+                        "border: 1px solid @dlg_neutral_border; border-radius: 3px; padding: 0; min-width: 49px; "
+                        "max-width: 49px; min-height: 24px; max-height: 24px; } "
+                        "QPushButton#canvasSizeExtensionColorSwatch:hover { border-color: @dlg_neutral_border_bright; }")
+                          .arg(color.red())
+                          .arg(color.green())
+                          .arg(color.blue()));
+}
+
+std::optional<ImageSizeSettings> request_image_size_settings(QWidget* parent, const Document& document,
+                                                            const QImage& composite = {}) {
+  QDialog dialog(parent);
+  dialog.setObjectName(QStringLiteral("patchyImageSizeDialog"));
+  dialog.setWindowTitle(QObject::tr("Image Size"));
+  append_themed_style(dialog, QStringLiteral(R"(
+    QDialog#patchyImageSizeDialog {
+      background: @dlg_raised_bg;
+      color: @dlg_raised_text;
+    }
+    QLabel {
+      background: transparent;
+      color: @dlg_raised_text;
+    }
+    QLabel#imageSizePreview {
+      background: @dlg_field_bg;
+      border: 1px solid @dlg_field_border;
+    }
+    QLabel#imageSizeResampleHintLabel {
+      color: @dlg_field_text;
+    }
+    QSpinBox, QDoubleSpinBox, QComboBox {
+      background: @dlg_button_bg;
+      border: 1px solid @dlg_button_border;
+      color: @text_on_raised;
+      min-height: 24px;
+      padding: 1px 6px;
+    }
+    QSpinBox:focus, QDoubleSpinBox:focus {
+      border: 1px solid @accent;
+      background: @dlg_button_focus_bg;
+    }
+    QToolButton#imageSizeLinkButton {
+      background: @dlg_button_bg;
+      border: 1px solid @dlg_button_border;
+      min-width: 24px;
+      max-width: 24px;
+      min-height: 46px;
+      max-height: 46px;
+      padding: 0;
+    }
+    QToolButton#imageSizeLinkButton:checked {
+      border-color: @dlg_focus_border;
+      background: @dlg_anchor_active_bg;
+    }
+    QDialogButtonBox QPushButton {
+      background: @dlg_raised_bg;
+      border: 1px solid @dlg_raised_border;
+      border-radius: 13px;
+      color: @text_on_raised;
+      min-width: 130px;
+      min-height: 24px;
+      padding: 0 18px;
+    }
+    QDialogButtonBox QPushButton:hover {
+      border-color: @dlg_raised_hover_border;
+      background: @dlg_raised_hover_bg;
+    }
+  )"));
+  dialog.resize(632, 386);
+
+  auto* root = new QVBoxLayout(&dialog);
+  root->setContentsMargins(7, 10, 7, 10);
+  root->setSpacing(10);
+
+  auto* body = new QHBoxLayout();
+  body->setSpacing(36);
+  root->addLayout(body, 1);
+
+  auto* preview = new QLabel(&dialog);
+  preview->setObjectName(QStringLiteral("imageSizePreview"));
+  preview->setFixedSize(276, 304);
+  preview->setAlignment(Qt::AlignCenter);
+  // Flattened once; every size or method change re-resamples it (update_summary).
+  const auto preview_source = image_size_preview_source(document, preview->size(), composite);
+  body->addWidget(preview, 0, Qt::AlignTop);
+
+  auto* controls = new QWidget(&dialog);
+  auto* controls_layout = new QVBoxLayout(controls);
+  controls_layout->setContentsMargins(0, 0, 0, 0);
+  controls_layout->setSpacing(8);
+  body->addWidget(controls, 1, Qt::AlignTop);
+
+  auto* grid = new QGridLayout();
+  grid->setContentsMargins(0, 0, 0, 0);
+  grid->setHorizontalSpacing(8);
+  grid->setVerticalSpacing(7);
+  grid->setColumnMinimumWidth(0, 72);
+  grid->setColumnMinimumWidth(1, 28);
+  grid->setColumnMinimumWidth(2, 72);
+  grid->setColumnMinimumWidth(3, 128);
+  controls_layout->addLayout(grid);
+
+  auto* image_size_value = new QLabel(&dialog);
+  image_size_value->setObjectName(QStringLiteral("imageSizeSizeLabel"));
+  auto* dimensions_value = new QLabel(&dialog);
+  dimensions_value->setObjectName(QStringLiteral("imageSizeDimensionsLabel"));
+
+  grid->addWidget(new QLabel(QObject::tr("Image Size:"), &dialog), 0, 0, Qt::AlignRight | Qt::AlignVCenter);
+  grid->addWidget(image_size_value, 0, 1, 1, 3);
+  grid->addWidget(new QLabel(QObject::tr("Dimensions:"), &dialog), 1, 0, Qt::AlignRight | Qt::AlignVCenter);
+  grid->addWidget(dimensions_value, 1, 1, 1, 3);
+
+  auto* fit = new QComboBox(&dialog);
+  fit->setObjectName(QStringLiteral("imageSizeFitCombo"));
+  fit->addItem(QObject::tr("Original Size"), QSize(document.width(), document.height()));
+  fit->addItem(QObject::tr("Fit 640 x 480"), QSize(640, 480));
+  fit->addItem(QObject::tr("Fit 1024 x 768"), QSize(1024, 768));
+  fit->addItem(QObject::tr("Fit 1920 x 1080"), QSize(1920, 1080));
+  grid->addWidget(new QLabel(QObject::tr("Fit To:"), &dialog), 2, 0, Qt::AlignRight | Qt::AlignVCenter);
+  grid->addWidget(fit, 2, 1, 1, 3);
+
+  // Canonical state, Photoshop's model: integer pixel dimensions plus resolution.
+  // The spins display conversions in their selected unit and every edit routes back
+  // through this state; pixels stay the stored truth.
+  const auto sanitized_initial_resolution =
+      std::isfinite(document.print_settings().horizontal_ppi) && document.print_settings().horizontal_ppi > 0.0
+          ? std::clamp(document.print_settings().horizontal_ppi, 1.0, 9999.0)
+          : 300.0;
+  struct ImageSizeState {
+    int pixel_width;
+    int pixel_height;
+    double ppi;
+  };
+  ImageSizeState state{document.width(), document.height(), sanitized_initial_resolution};
+
+  auto* width = new QDoubleSpinBox(&dialog);
+  width->setObjectName(QStringLiteral("imageSizeWidthSpin"));
+  configure_dialog_spinbox(width, 72);
+  auto* height = new QDoubleSpinBox(&dialog);
+  height->setObjectName(QStringLiteral("imageSizeHeightSpin"));
+  configure_dialog_spinbox(height, 72);
+
+  // The W/H unit persists across sessions (`imageSize/lastUnit`, Photoshop's dialog
+  // memory) and seeds from the ruler unit on a first run; the combos are connected
+  // only after the first refresh_all below, so seeding needs no signal blocking.
+  const std::initializer_list<MeasurementUnit> dimension_units = {
+      MeasurementUnit::Percent,     MeasurementUnit::Pixels,      MeasurementUnit::Inches,
+      MeasurementUnit::Centimeters, MeasurementUnit::Millimeters, MeasurementUnit::Points};
+  const auto initial_unit = remembered_dialog_unit(QStringLiteral("imageSize/lastUnit"), dimension_units);
+  const auto populate_dimension_units = [&dimension_units, initial_unit](QComboBox* combo) {
+    for (const auto unit : dimension_units) {
+      combo->addItem(measurement_unit_name(unit), static_cast<int>(unit));
+    }
+    combo->setCurrentIndex(combo->findData(static_cast<int>(initial_unit)));
+  };
+  auto* width_unit = new QComboBox(&dialog);
+  width_unit->setObjectName(QStringLiteral("imageSizeWidthUnitCombo"));
+  populate_dimension_units(width_unit);
+  auto* height_unit = new QComboBox(&dialog);
+  height_unit->setObjectName(QStringLiteral("imageSizeHeightUnitCombo"));
+  populate_dimension_units(height_unit);
+
+  auto* link = new QToolButton(&dialog);
+  link->setObjectName(QStringLiteral("imageSizeLinkButton"));
+  link->setIcon(simple_icon(QStringLiteral("link"), QColor(220, 226, 235)));
+  link->setIconSize(QSize(18, 18));
+  link->setCheckable(true);
+  link->setChecked(true);
+  link->setToolTip(QObject::tr("Constrain proportions"));
+
+  grid->addWidget(new QLabel(QObject::tr("Width:"), &dialog), 3, 0, Qt::AlignRight | Qt::AlignVCenter);
+  // The spin goes in right after its label (insertion order is what pairs the
+  // scrub handle, GitHub issue 46); the link button's grid cell is unaffected.
+  grid->addWidget(width, 3, 2);
+  grid->addWidget(link, 3, 1, 2, 1, Qt::AlignCenter);
+  grid->addWidget(width_unit, 3, 3);
+  grid->addWidget(new QLabel(QObject::tr("Height:"), &dialog), 4, 0, Qt::AlignRight | Qt::AlignVCenter);
+  grid->addWidget(height, 4, 2);
+  grid->addWidget(height_unit, 4, 3);
+
+  auto* resolution = new QDoubleSpinBox(&dialog);
+  resolution->setObjectName(QStringLiteral("imageSizeResolutionSpin"));
+  resolution->setDecimals(2);
+  resolution->setRange(0.01, 9999.0);
+  resolution->setValue(state.ppi);
+  configure_dialog_spinbox(resolution, 72);
+  // Item data is the display divisor: shown value = PPI / divisor (px/cm shows
+  // PPI / 2.54). The stored resolution is always PPI, matching PSD resource 1005.
+  auto* resolution_unit = new QComboBox(&dialog);
+  resolution_unit->setObjectName(QStringLiteral("imageSizeResolutionUnitCombo"));
+  resolution_unit->addItem(QObject::tr("Pixels/Inch"), 1.0);
+  resolution_unit->addItem(QObject::tr("Pixels/Centimeter"), 2.54);
+  resolution_unit->setCurrentIndex(remembered_resolution_unit_index(QStringLiteral("imageSize/lastResolutionUnit")));
+  grid->addWidget(new QLabel(QObject::tr("Resolution:"), &dialog), 5, 0, Qt::AlignRight | Qt::AlignVCenter);
+  grid->addWidget(resolution, 5, 2);
+  grid->addWidget(resolution_unit, 5, 3);
+
+  auto* resample = new QCheckBox(QObject::tr("Resample:"), &dialog);
+  resample->setObjectName(QStringLiteral("imageSizeResampleCheck"));
+  resample->setChecked(true);
+  resample->setToolTip(QObject::tr("Off: the pixel dimensions stay the same and only the print resolution "
+                                   "changes, so the image is not scaled."));
+  // The method persists across sessions by its permanent id (`imageSize/lastResampleMethod`,
+  // Photoshop's dialog memory); an unknown or missing value is Automatic.
+  auto* resample_method = new QComboBox(&dialog);
+  resample_method->setObjectName(QStringLiteral("imageSizeResampleCombo"));
+  for (const auto method : all_resample_methods()) {
+    resample_method->addItem(resample_method_label(method), resample_method_id_string(method));
+  }
+  const auto remembered_method =
+      parse_resample_method(
+          app_settings().value(QStringLiteral("imageSize/lastResampleMethod")).toString().toStdString())
+          .value_or(ResampleMethod::Automatic);
+  resample_method->setCurrentIndex(resample_method->findData(resample_method_id_string(remembered_method)));
+  grid->addWidget(resample, 6, 0, Qt::AlignRight | Qt::AlignVCenter);
+  grid->addWidget(resample_method, 6, 1, 1, 3);
+
+  // Shown only while Resample is off: that mode never scales pixels, which is not
+  // obvious from a disabled combo alone.
+  auto* resample_hint = new QLabel(
+      QObject::tr("Pixel dimensions are locked. Only the print resolution and the print size change."), &dialog);
+  resample_hint->setObjectName(QStringLiteral("imageSizeResampleHintLabel"));
+  resample_hint->setWordWrap(true);
+  resample_hint->setMinimumHeight(54);
+  auto hint_policy = resample_hint->sizePolicy();
+  hint_policy.setRetainSizeWhenHidden(true);
+  resample_hint->setSizePolicy(hint_policy);
+  resample_hint->setVisible(false);
+  controls_layout->addSpacing(26);
+  controls_layout->addWidget(resample_hint);
+  controls_layout->addStretch(1);
+
+  const auto update_summary = [image_size_value, dimensions_value, preview, &preview_source, resample_method, &state,
+                               &document] {
+    image_size_value->setText(format_image_size_bytes(state.pixel_width, state.pixel_height, document.format()));
+    dimensions_value->setText(QObject::tr("%1 px x %2 px").arg(state.pixel_width).arg(state.pixel_height));
+    const auto method = parse_resample_method(resample_method->currentData().toString().toStdString())
+                            .value_or(ResampleMethod::Automatic);
+    preview->setPixmap(image_size_preview_pixmap(preview_source, preview->size(),
+                                                 QSize(document.width(), document.height()),
+                                                 QSize(state.pixel_width, state.pixel_height), method));
+  };
+  QObject::connect(resample_method, &QComboBox::currentIndexChanged, &dialog, [&](int) { update_summary(); });
+
+  const auto current_unit = [](QComboBox* combo) {
+    return static_cast<MeasurementUnit>(combo->currentData().toInt());
+  };
+  const double original_width_px = std::max<std::int32_t>(1, document.width());
+  const double original_height_px = std::max<std::int32_t>(1, document.height());
+  const double aspect_ratio = original_width_px / original_height_px;
+
+  const auto refresh_dimension_spin = [&state, current_unit](QDoubleSpinBox* spin, QComboBox* unit_combo,
+                                                             double pixels, double reference_pixels) {
+    const QSignalBlocker blocker(spin);
+    const auto unit = current_unit(unit_combo);
+    spin->setDecimals(measurement_unit_decimals(unit));
+    spin->setSingleStep(measurement_unit_single_step(unit));
+    spin->setRange(unit == MeasurementUnit::Pixels ? 1.0 : 0.001, 999999.0);
+    spin->setValue(pixels_to_measurement_unit(pixels, unit, state.ppi, reference_pixels));
+  };
+  const auto refresh_resolution_spin = [&state, resolution, resolution_unit] {
+    const QSignalBlocker blocker(resolution);
+    resolution->setValue(state.ppi / resolution_unit->currentData().toDouble());
+  };
+  const auto refresh_all = [&](QDoubleSpinBox* except) {
+    if (except != width) {
+      refresh_dimension_spin(width, width_unit, state.pixel_width, original_width_px);
+    }
+    if (except != height) {
+      refresh_dimension_spin(height, height_unit, state.pixel_height, original_height_px);
+    }
+    if (except != resolution) {
+      refresh_resolution_spin();
+    }
+    update_summary();
+  };
+  refresh_all(nullptr);
+
+  bool updating_dimensions = false;
+  const auto handle_dimension_edit = [&](bool editing_width) {
+    if (updating_dimensions) {
+      return;
+    }
+    updating_dimensions = true;
+    auto* spin = editing_width ? width : height;
+    auto* unit_combo = editing_width ? width_unit : height_unit;
+    const auto unit = current_unit(unit_combo);
+    if (!resample->isChecked()) {
+      // Resample off: the pixel dimensions are locked, so a physical-size edit
+      // re-derives the resolution instead (Photoshop's W/H/Resolution tri-link).
+      const auto pixels = editing_width ? state.pixel_width : state.pixel_height;
+      const auto inches = std::max(spin->value(), 0.000001) / measurement_units_per_inch(unit);
+      state.ppi = std::clamp(pixels / inches, 0.01, 9999.0);
+      refresh_all(spin);
+      updating_dimensions = false;
+      return;
+    }
+    const auto reference = editing_width ? original_width_px : original_height_px;
+    const auto pixels = std::clamp(
+        static_cast<int>(std::lround(measurement_unit_to_pixels(spin->value(), unit, state.ppi, reference))), 1,
+        30000);
+    if (editing_width) {
+      state.pixel_width = pixels;
+      if (link->isChecked()) {
+        state.pixel_height = std::clamp(static_cast<int>(std::lround(pixels / aspect_ratio)), 1, 30000);
+      }
+    } else {
+      state.pixel_height = pixels;
+      if (link->isChecked()) {
+        state.pixel_width = std::clamp(static_cast<int>(std::lround(pixels * aspect_ratio)), 1, 30000);
+      }
+    }
+    refresh_all(spin);
+    updating_dimensions = false;
+  };
+  QObject::connect(width, &QDoubleSpinBox::valueChanged, &dialog, [&] { handle_dimension_edit(true); });
+  QObject::connect(height, &QDoubleSpinBox::valueChanged, &dialog, [&] { handle_dimension_edit(false); });
+
+  // Photoshop keeps the two dimension units in step; changing one changes both.
+  const auto sync_unit_combos = [&](QComboBox* changed, QComboBox* other) {
+    {
+      const QSignalBlocker blocker(other);
+      other->setCurrentIndex(changed->currentIndex());
+    }
+    refresh_all(nullptr);
+  };
+  QObject::connect(width_unit, &QComboBox::currentIndexChanged, &dialog,
+                   [&](int) { sync_unit_combos(width_unit, height_unit); });
+  QObject::connect(height_unit, &QComboBox::currentIndexChanged, &dialog,
+                   [&](int) { sync_unit_combos(height_unit, width_unit); });
+
+  QObject::connect(resolution, &QDoubleSpinBox::valueChanged, &dialog, [&](double value) {
+    if (updating_dimensions) {
+      return;
+    }
+    updating_dimensions = true;
+    const auto new_ppi = std::clamp(value * resolution_unit->currentData().toDouble(), 0.01, 9999.0);
+    if (resample->isChecked() && measurement_unit_is_physical(current_unit(width_unit))) {
+      // Physical W/H hold their print size, so the pixel dimensions re-derive
+      // (Photoshop: raising resolution at a fixed print size adds pixels).
+      const double width_inches = state.pixel_width / state.ppi;
+      const double height_inches = state.pixel_height / state.ppi;
+      state.ppi = new_ppi;
+      state.pixel_width = std::clamp(static_cast<int>(std::lround(width_inches * new_ppi)), 1, 30000);
+      state.pixel_height = std::clamp(static_cast<int>(std::lround(height_inches * new_ppi)), 1, 30000);
+    } else {
+      // Pixel/percent display (or Resample off): the pixels hold and only the
+      // resolution metadata moves.
+      state.ppi = new_ppi;
+    }
+    refresh_all(resolution);
+    updating_dimensions = false;
+  });
+  QObject::connect(resolution_unit, &QComboBox::currentIndexChanged, &dialog, [&](int) { refresh_resolution_spin(); });
+
+  QObject::connect(fit, &QComboBox::currentIndexChanged, &dialog, [&](int index) {
+    const auto size = fit->itemData(index).toSize();
+    if (!size.isValid()) {
+      return;
+    }
+    state.pixel_width = std::clamp(size.width(), 1, 30000);
+    state.pixel_height = std::clamp(size.height(), 1, 30000);
+    refresh_all(nullptr);
+  });
+  QObject::connect(resample, &QCheckBox::toggled, &dialog, [&](bool checked) {
+    fit->setEnabled(checked);
+    link->setEnabled(checked);
+    resample_method->setEnabled(checked);
+    resample_hint->setVisible(!checked);
+    if (!checked) {
+      // Pixels lock to the document's real dimensions: any pending resample reverts
+      // (Photoshop behavior), matching the metadata-only apply that follows.
+      state.pixel_width = document.width();
+      state.pixel_height = document.height();
+    }
+    // Pixel and Percent entry require resampling; Photoshop flips the unit to Inches
+    // when Resample goes off and disables the non-physical choices.
+    const auto set_units_enabled = [checked](QComboBox* combo) {
+      auto* model = qobject_cast<QStandardItemModel*>(combo->model());
+      if (model == nullptr) {
+        return;
+      }
+      for (int index = 0; index < combo->count(); ++index) {
+        const auto unit = static_cast<MeasurementUnit>(combo->itemData(index).toInt());
+        if (auto* item = model->item(index); item != nullptr && !measurement_unit_is_physical(unit)) {
+          item->setEnabled(checked);
+        }
+      }
+    };
+    set_units_enabled(width_unit);
+    set_units_enabled(height_unit);
+    if (!checked && !measurement_unit_is_physical(current_unit(width_unit))) {
+      // The sync handler mirrors the change into the height combo and refreshes.
+      width_unit->setCurrentIndex(width_unit->findData(static_cast<int>(MeasurementUnit::Inches)));
+    } else {
+      refresh_all(nullptr);
+    }
+  });
+
+  auto* buttons = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel, &dialog);
+  root->addWidget(buttons);
+  QObject::connect(buttons, &QDialogButtonBox::accepted, &dialog, &QDialog::accept);
+  QObject::connect(buttons, &QDialogButtonBox::rejected, &dialog, &QDialog::reject);
+
+  width->setFocus(Qt::OtherFocusReason);
+  width->selectAll();
+  if (exec_dialog(dialog) != QDialog::Accepted) {
+    return std::nullopt;
+  }
+  remember_dialog_unit(QStringLiteral("imageSize/lastUnit"), current_unit(width_unit));
+  remember_resolution_unit(QStringLiteral("imageSize/lastResolutionUnit"), resolution_unit->currentIndex());
+  const auto method = parse_resample_method(resample_method->currentData().toString().toStdString())
+                          .value_or(ResampleMethod::Automatic);
+  app_settings().setValue(QStringLiteral("imageSize/lastResampleMethod"), resample_method_id_string(method));
+  return ImageSizeSettings{state.pixel_width, state.pixel_height, state.ppi, resample->isChecked(), method};
+}
+
+// `crop_frame` is Crop to Selection (Advanced): the selection rect prefills the fields
+// and replaces the canvas as the frame the anchor grid works on, so the unchanged dialog
+// crops exactly to it and an edit grows or shrinks the crop about its anchor point.
+std::optional<CanvasSizeSettings> request_canvas_size_settings(QWidget* parent, const Document& document,
+                                                               std::optional<Rect> crop_frame) {
+  const auto current_width = document.width();
+  const auto current_height = document.height();
+  const Rect reference = crop_frame.value_or(Rect{0, 0, current_width, current_height});
+  QDialog dialog(parent);
+  dialog.setObjectName(QStringLiteral("patchyCanvasSizeDialog"));
+  dialog.setWindowTitle(crop_frame.has_value() ? QObject::tr("Crop to Selection (Advanced)")
+                                               : QObject::tr("Canvas Size"));
+  append_themed_style(dialog, QStringLiteral(R"(
+    QDialog#patchyCanvasSizeDialog {
+      background: @dlg_raised_bg;
+      color: @text_on_raised;
+    }
+    QDialog#patchyCanvasSizeDialog QWidget {
+      background: @dlg_raised_bg;
+      color: @text_on_raised;
+    }
+    QDialog#patchyCanvasSizeDialog QLabel {
+      background: transparent;
+      color: @text_on_raised;
+      font-size: 11px;
+    }
+    QDialog#patchyCanvasSizeDialog QLabel[sectionLabel="true"] {
+      font-weight: 700;
+    }
+    QDialog#patchyCanvasSizeDialog QFrame#canvasSizeSeparator {
+      background: @dlg_divider;
+      color: @dlg_divider;
+      min-height: 1px;
+      max-height: 1px;
+      border: 0;
+    }
+    QDialog#patchyCanvasSizeDialog QDoubleSpinBox,
+    QDialog#patchyCanvasSizeDialog QComboBox {
+      background: @dlg_tab_bg;
+      border: 1px solid @dlg_tab_border;
+      border-radius: 3px;
+      color: @text_on_raised;
+      min-height: 22px;
+      padding: 0 8px;
+    }
+    QDialog#patchyCanvasSizeDialog QDoubleSpinBox:focus,
+    QDialog#patchyCanvasSizeDialog QComboBox:focus {
+      border-color: @dlg_focus_border;
+      background: @dlg_button_bg;
+    }
+    /* No QComboBox::drop-down rule: styling the drop-down without a ::down-arrow
+       image makes Qt draw no arrow, and the combos read as text fields (issue 358). */
+    QDialog#patchyCanvasSizeDialog QCheckBox {
+      background: transparent;
+      color: @text_on_raised;
+      font-size: 11px;
+      spacing: 7px;
+    }
+    QDialog#patchyCanvasSizeDialog QCheckBox::indicator {
+      width: 11px;
+      height: 11px;
+      background: @dlg_grid_bg;
+      border: 1px solid @dlg_grid_border;
+    }
+    QDialog#patchyCanvasSizeDialog QCheckBox::indicator:checked {
+      background: @accent_pressed_bg;
+      border-color: @dlg_focus_border;
+      image: url(@icon(checkmark));
+    }
+    QDialog#patchyCanvasSizeDialog QToolButton#canvasSizeAnchorButton {
+      background: @dlg_cell_bg;
+      border: 1px solid @dlg_cell_border;
+      border-radius: 0;
+      min-width: 22px;
+      max-width: 22px;
+      min-height: 22px;
+      max-height: 22px;
+      padding: 0;
+    }
+    QDialog#patchyCanvasSizeDialog QToolButton#canvasSizeAnchorButton:hover {
+      background: @dlg_cell_hover_bg;
+      border-color: @dlg_neutral_border;
+    }
+    QDialog#patchyCanvasSizeDialog QToolButton#canvasSizeLinkButton {
+      background: @dlg_button_bg;
+      border: 1px solid @dlg_button_border;
+      min-width: 24px;
+      max-width: 24px;
+      min-height: 46px;
+      max-height: 46px;
+      padding: 0;
+    }
+    QDialog#patchyCanvasSizeDialog QToolButton#canvasSizeLinkButton:checked {
+      border-color: @dlg_focus_border;
+      background: @dlg_anchor_active_bg;
+    }
+    QDialog#patchyCanvasSizeDialog QToolButton#canvasSizeAnchorButton:checked {
+      background: @dlg_button_bg;
+      border-color: @dlg_neutral_border_bright;
+    }
+    QDialog#patchyCanvasSizeDialog QPushButton {
+      background: @dlg_raised_bg;
+      border: 1px solid @dlg_action_border;
+      border-radius: 13px;
+      color: @text_on_raised;
+      min-width: 70px;
+      min-height: 24px;
+      padding: 0 14px;
+      font-size: 11px;
+      font-weight: 700;
+    }
+    QDialog#patchyCanvasSizeDialog QPushButton:hover {
+      background: @dlg_raised_hover_bg;
+      border-color: @dlg_action_hover_border;
+    }
+    QDialog#patchyCanvasSizeDialog QPushButton#canvasSizeOkButton {
+      border-color: @dlg_focus_ring;
+      border-width: 2px;
+    }
+  )"));
+  dialog.resize(453, 377);
+
+  auto* root = new QHBoxLayout(&dialog);
+  root->setContentsMargins(15, 17, 14, 14);
+  root->setSpacing(12);
+
+  auto* content = new QWidget(&dialog);
+  content->setObjectName(QStringLiteral("canvasSizeContent"));
+  auto* content_layout = new QVBoxLayout(content);
+  content_layout->setContentsMargins(0, 0, 0, 0);
+  content_layout->setSpacing(7);
+  root->addWidget(content, 1, Qt::AlignTop);
+
+  auto* current_size_label =
+      new QLabel(QObject::tr("Current Size: %1").arg(format_image_size_bytes(current_width, current_height, document.format())),
+                 &dialog);
+  current_size_label->setObjectName(QStringLiteral("canvasSizeCurrentSizeLabel"));
+  current_size_label->setProperty("sectionLabel", true);
+  content_layout->addWidget(current_size_label);
+
+  auto* current_grid = new QGridLayout();
+  current_grid->setContentsMargins(0, 0, 0, 0);
+  current_grid->setHorizontalSpacing(8);
+  current_grid->setVerticalSpacing(5);
+  current_grid->setColumnMinimumWidth(0, 52);
+  content_layout->addLayout(current_grid);
+  auto* current_width_label = new QLabel(&dialog);
+  current_width_label->setObjectName(QStringLiteral("canvasSizeCurrentWidthLabel"));
+  auto* current_height_label = new QLabel(&dialog);
+  current_height_label->setObjectName(QStringLiteral("canvasSizeCurrentHeightLabel"));
+  current_grid->addWidget(new QLabel(QObject::tr("Width"), &dialog), 0, 0);
+  current_grid->addWidget(current_width_label, 0, 1);
+  current_grid->addWidget(new QLabel(QObject::tr("Height"), &dialog), 1, 0);
+  current_grid->addWidget(current_height_label, 1, 1);
+
+  auto* separator = new QFrame(&dialog);
+  separator->setObjectName(QStringLiteral("canvasSizeSeparator"));
+  separator->setFrameShape(QFrame::HLine);
+  content_layout->addWidget(separator);
+
+  auto* new_size_label = new QLabel(&dialog);
+  new_size_label->setObjectName(QStringLiteral("canvasSizeNewSizeLabel"));
+  new_size_label->setProperty("sectionLabel", true);
+  content_layout->addWidget(new_size_label);
+
+  auto* size_grid = new QGridLayout();
+  size_grid->setContentsMargins(0, 0, 42, 0);
+  size_grid->setHorizontalSpacing(8);
+  size_grid->setVerticalSpacing(7);
+  size_grid->setColumnMinimumWidth(0, 38);
+  content_layout->addLayout(size_grid);
+
+  // Pixels stay the stored truth (Image Size's model): the canonical state is the
+  // absolute target size in pixels, and the spins display it, or the delta from the
+  // current size in Relative mode, converted through the document PPI into the unit
+  // the combos select. Percent is relative to the current size on each axis.
+  const auto ppi = std::isfinite(document.print_settings().horizontal_ppi) &&
+                           document.print_settings().horizontal_ppi > 0.0
+                       ? std::clamp(document.print_settings().horizontal_ppi, 1.0, 9999.0)
+                       : 300.0;
+  struct CanvasSizeState {
+    int target_width;
+    int target_height;
+  };
+  CanvasSizeState state{reference.width, reference.height};
+
+  auto* width = new QDoubleSpinBox(&dialog);
+  width->setObjectName(QStringLiteral("canvasSizeWidthSpin"));
+  configure_dialog_spinbox(width, 84);
+  auto* height = new QDoubleSpinBox(&dialog);
+  height->setObjectName(QStringLiteral("canvasSizeHeightSpin"));
+  configure_dialog_spinbox(height, 84);
+
+  // The unit persists across sessions (`canvasSize/lastUnit`) and seeds from the
+  // ruler unit on a first run, like Image Size; the combos connect after the first
+  // refresh_all, so seeding needs no signal blocking.
+  const std::initializer_list<MeasurementUnit> dimension_units = {
+      MeasurementUnit::Percent,     MeasurementUnit::Pixels,      MeasurementUnit::Inches,
+      MeasurementUnit::Centimeters, MeasurementUnit::Millimeters, MeasurementUnit::Points};
+  const auto initial_unit = remembered_dialog_unit(QStringLiteral("canvasSize/lastUnit"), dimension_units);
+  const auto populate_dimension_units = [&dimension_units, initial_unit](QComboBox* combo) {
+    for (const auto unit : dimension_units) {
+      combo->addItem(measurement_unit_name(unit), static_cast<int>(unit));
+    }
+    combo->setCurrentIndex(combo->findData(static_cast<int>(initial_unit)));
+  };
+  auto* width_unit = new QComboBox(&dialog);
+  width_unit->setObjectName(QStringLiteral("canvasSizeWidthUnitCombo"));
+  populate_dimension_units(width_unit);
+  width_unit->setMinimumWidth(160);
+  auto* height_unit = new QComboBox(&dialog);
+  height_unit->setObjectName(QStringLiteral("canvasSizeHeightUnitCombo"));
+  populate_dimension_units(height_unit);
+  height_unit->setMinimumWidth(160);
+
+  // Photoshop's Canvas Size has no proportion lock; Patchy adds Image Size's link
+  // button (off by default, never persisted). Linked, an edit on one axis derives the
+  // other from the document's current aspect ratio.
+  auto* link = new QToolButton(&dialog);
+  link->setObjectName(QStringLiteral("canvasSizeLinkButton"));
+  link->setIcon(simple_icon(QStringLiteral("link")));
+  link->setIconSize(QSize(18, 18));
+  link->setCheckable(true);
+  link->setChecked(false);
+  link->setToolTip(QObject::tr("Constrain proportions"));
+
+  size_grid->addWidget(new QLabel(QObject::tr("Width"), &dialog), 0, 0, Qt::AlignVCenter);
+  // The spin goes in right after its label (insertion order is what pairs the
+  // scrub handle, GitHub issue 46); the link button's grid cell is unaffected.
+  size_grid->addWidget(width, 0, 2);
+  size_grid->addWidget(link, 0, 1, 2, 1, Qt::AlignCenter);
+  size_grid->addWidget(width_unit, 0, 3);
+  size_grid->addWidget(new QLabel(QObject::tr("Height"), &dialog), 1, 0, Qt::AlignVCenter);
+  size_grid->addWidget(height, 1, 2);
+  size_grid->addWidget(height_unit, 1, 3);
+
+  auto* relative = new QCheckBox(QObject::tr("Relative to current dimension"), &dialog);
+  relative->setObjectName(QStringLiteral("canvasSizeRelativeCheck"));
+  auto* relative_row = new QHBoxLayout();
+  relative_row->setContentsMargins(77, 7, 0, 0);
+  relative_row->setSpacing(0);
+  relative_row->addWidget(relative);
+  relative_row->addStretch(1);
+  content_layout->addLayout(relative_row);
+
+  auto* anchor_row = new QHBoxLayout();
+  anchor_row->setContentsMargins(0, 4, 0, 0);
+  anchor_row->setSpacing(10);
+  content_layout->addLayout(anchor_row);
+  anchor_row->addWidget(new QLabel(QObject::tr("Anchor"), &dialog), 0, Qt::AlignTop);
+
+  auto* anchor_grid_widget = new QWidget(&dialog);
+  anchor_grid_widget->setObjectName(QStringLiteral("canvasSizeAnchorGrid"));
+  auto* anchor_grid = new QGridLayout(anchor_grid_widget);
+  anchor_grid->setContentsMargins(0, 0, 0, 0);
+  anchor_grid->setSpacing(0);
+  anchor_row->addWidget(anchor_grid_widget, 0, Qt::AlignLeft | Qt::AlignTop);
+  anchor_row->addStretch(1);
+
+  auto* anchor_group = new QButtonGroup(&dialog);
+  anchor_group->setExclusive(true);
+  const std::array<std::pair<CanvasAnchor, QString>, 9> anchors{{
+      {CanvasAnchor::TopLeft, QObject::tr("Anchor top left")},
+      {CanvasAnchor::Top, QObject::tr("Anchor top")},
+      {CanvasAnchor::TopRight, QObject::tr("Anchor top right")},
+      {CanvasAnchor::Left, QObject::tr("Anchor left")},
+      {CanvasAnchor::Center, QObject::tr("Anchor center")},
+      {CanvasAnchor::Right, QObject::tr("Anchor right")},
+      {CanvasAnchor::BottomLeft, QObject::tr("Anchor bottom left")},
+      {CanvasAnchor::Bottom, QObject::tr("Anchor bottom")},
+      {CanvasAnchor::BottomRight, QObject::tr("Anchor bottom right")},
+  }};
+  for (int index = 0; index < static_cast<int>(anchors.size()); ++index) {
+    auto* button = new QToolButton(anchor_grid_widget);
+    button->setObjectName(QStringLiteral("canvasSizeAnchorButton"));
+    button->setIcon(canvas_anchor_icon(anchors[static_cast<std::size_t>(index)].first));
+    button->setIconSize(QSize(18, 18));
+    button->setToolTip(anchors[static_cast<std::size_t>(index)].second);
+    button->setCheckable(true);
+    anchor_group->addButton(button, static_cast<int>(anchors[static_cast<std::size_t>(index)].first));
+    anchor_grid->addWidget(button, index / 3, index % 3);
+    if (anchors[static_cast<std::size_t>(index)].first == CanvasAnchor::Center) {
+      button->setChecked(true);
+    }
+  }
+
+  auto* extension_row = new QHBoxLayout();
+  extension_row->setContentsMargins(0, 6, 0, 0);
+  extension_row->setSpacing(8);
+  content_layout->addLayout(extension_row);
+  auto* extension_label = new QLabel(QObject::tr("Canvas extension color"), &dialog);
+  extension_label->setObjectName(QStringLiteral("canvasSizeExtensionColorLabel"));
+  // At least the text's width: a wider font or a translation cut it off (issue 358).
+  extension_label->ensurePolished();
+  extension_label->setFixedWidth(std::max(116, extension_label->sizeHint().width()));
+  extension_row->addWidget(extension_label, 0, Qt::AlignVCenter);
+
+  auto* extension_color = new QComboBox(&dialog);
+  extension_color->setObjectName(QStringLiteral("canvasSizeExtensionColorCombo"));
+  extension_color->addItem(QObject::tr("Other..."), QColor(Qt::white));
+  extension_color->addItem(QObject::tr("White"), QColor(Qt::white));
+  extension_color->addItem(QObject::tr("Black"), QColor(Qt::black));
+  extension_color->addItem(QObject::tr("Gray"), QColor(128, 128, 128));
+  extension_color->setFixedWidth(154);
+  extension_row->addWidget(extension_color, 0);
+
+  auto* color_swatch = new QPushButton(&dialog);
+  color_swatch->setObjectName(QStringLiteral("canvasSizeExtensionColorSwatch"));
+  color_swatch->setAccessibleName(QObject::tr("Canvas extension color"));
+  color_swatch->setToolTip(QObject::tr("Choose canvas extension color"));
+  color_swatch->setCursor(Qt::PointingHandCursor);
+  color_swatch->setFocusPolicy(Qt::StrongFocus);
+  color_swatch->setFixedSize(49, 24);
+  extension_row->addWidget(color_swatch);
+  auto* crop_layers = new QCheckBox(QObject::tr("Also crop each actual layer to the canvas area"), &dialog);
+  crop_layers->setObjectName(QStringLiteral("canvasSizeCropLayersCheck"));
+  // Never loaded from or saved to settings. Canvas Size keeps off-canvas pixels (a
+  // destructive opt-in, like Photoshop); a crop trims the layers, like Photoshop's
+  // Image > Crop with Delete Cropped Pixels, so the advanced crop starts checked.
+  crop_layers->setChecked(crop_frame.has_value());
+  content_layout->addWidget(crop_layers);
+  auto* delete_off_canvas =
+      new QCheckBox(QObject::tr("Also delete layers that end up fully off the canvas"), &dialog);
+  delete_off_canvas->setObjectName(QStringLiteral("canvasSizeDeleteOffCanvasCheck"));
+  // The same destructive opt-in rule: unchecked on every opening, never persisted.
+  delete_off_canvas->setChecked(false);
+  content_layout->addWidget(delete_off_canvas);
+  content_layout->addStretch(1);
+
+  QColor extension_color_value(Qt::white);
+  const auto update_swatch = [&extension_color_value, color_swatch] {
+    set_themed_style(*color_swatch, canvas_color_swatch_style(extension_color_value));
+  };
+  update_swatch();
+
+  const auto choose_extension_color = [extension_color, &dialog, &extension_color_value, update_swatch] {
+    // Patchy's own picker (palettes, names, hex), previewed live on the swatch; a cancel
+    // puts the previous color back.
+    const auto original = extension_color_value;
+    const auto selected = request_patchy_color(&dialog, original, QObject::tr("Canvas Extension Color"),
+                                               [&extension_color_value, update_swatch](QColor color) {
+                                                 extension_color_value = color;
+                                                 update_swatch();
+                                               });
+    if (!selected.has_value()) {
+      extension_color_value = original;
+      update_swatch();
+      return;
+    }
+    extension_color_value = *selected;
+    extension_color->setItemData(0, *selected);
+    extension_color->setCurrentIndex(0);
+    update_swatch();
+  };
+
+  QObject::connect(extension_color, &QComboBox::activated, &dialog, [extension_color, &extension_color_value,
+                                                                      update_swatch, choose_extension_color](int index) {
+    if (index == 0) {
+      choose_extension_color();
+      return;
+    }
+    extension_color_value = extension_color->itemData(index).value<QColor>();
+    update_swatch();
+  });
+  QObject::connect(color_swatch, &QPushButton::clicked, &dialog, choose_extension_color);
+
+  const auto current_unit = [width_unit] { return static_cast<MeasurementUnit>(width_unit->currentData().toInt()); };
+  const auto update_summary = [new_size_label, &state, &document] {
+    new_size_label->setText(QObject::tr("New Size: %1")
+                                .arg(format_image_size_bytes(state.target_width, state.target_height, document.format())));
+  };
+  // A spin shows its axis in the selected unit: the absolute target, or in Relative
+  // mode the change from the current size, with the range mapped the same way so the
+  // field itself keeps the pixel result within 1..30000.
+  const auto refresh_dimension_spin = [relative, current_unit, ppi](QDoubleSpinBox* spin, int current,
+                                                                            int target) {
+    const QSignalBlocker blocker(spin);
+    const auto unit = current_unit();
+    const auto reference = static_cast<double>(current);
+    const auto to_unit = [unit, ppi, reference](int pixels) {
+      return pixels_to_measurement_unit(static_cast<double>(pixels), unit, ppi, reference);
+    };
+    spin->setDecimals(measurement_unit_decimals(unit));
+    spin->setSingleStep(measurement_unit_single_step(unit));
+    if (relative->isChecked()) {
+      spin->setRange(to_unit(1 - current), to_unit(30000 - current));
+      spin->setValue(to_unit(target - current));
+    } else {
+      spin->setRange(to_unit(1), to_unit(30000));
+      spin->setValue(to_unit(target));
+    }
+  };
+  const auto refresh_current_size_labels = [current_width_label, current_height_label, current_unit, ppi,
+                                            current_width, current_height] {
+    const auto unit = current_unit();
+    const auto decimals = measurement_unit_decimals(unit);
+    current_width_label->setText(format_measurement(
+        pixels_to_measurement_unit(current_width, unit, ppi, current_width), unit, decimals));
+    current_height_label->setText(format_measurement(
+        pixels_to_measurement_unit(current_height, unit, ppi, current_height), unit, decimals));
+  };
+  const auto refresh_all = [&](QDoubleSpinBox* except) {
+    if (except != width) {
+      refresh_dimension_spin(width, current_width, state.target_width);
+    }
+    if (except != height) {
+      refresh_dimension_spin(height, current_height, state.target_height);
+    }
+    refresh_current_size_labels();
+    update_summary();
+  };
+  refresh_all(nullptr);
+
+  // Linked, the other axis follows the document's aspect ratio in absolute pixels, so
+  // Relative mode keeps the resulting canvas proportional rather than the two deltas.
+  const auto aspect_ratio = static_cast<double>(reference.width) / static_cast<double>(reference.height);
+  const auto follow_linked_axis = [&](bool from_width) {
+    if (!link->isChecked()) {
+      return;
+    }
+    if (from_width) {
+      state.target_height = std::clamp(static_cast<int>(std::lround(state.target_width / aspect_ratio)), 1, 30000);
+      refresh_dimension_spin(height, current_height, state.target_height);
+    } else {
+      state.target_width = std::clamp(static_cast<int>(std::lround(state.target_height * aspect_ratio)), 1, 30000);
+      refresh_dimension_spin(width, current_width, state.target_width);
+    }
+  };
+  // An edit converts back to pixels; the edited field is left alone so typing never
+  // fights a re-rounded value.
+  const auto handle_dimension_edit = [&](bool editing_width) {
+    auto* spin = editing_width ? width : height;
+    const auto current = editing_width ? current_width : current_height;
+    const auto unit = current_unit();
+    const auto pixels = static_cast<int>(
+        std::lround(measurement_unit_to_pixels(spin->value(), unit, ppi, static_cast<double>(current))));
+    const auto target = std::clamp(relative->isChecked() ? current + pixels : pixels, 1, 30000);
+    (editing_width ? state.target_width : state.target_height) = target;
+    follow_linked_axis(editing_width);
+    update_summary();
+  };
+  QObject::connect(width, &QDoubleSpinBox::valueChanged, &dialog, [&] { handle_dimension_edit(true); });
+  QObject::connect(height, &QDoubleSpinBox::valueChanged, &dialog, [&] { handle_dimension_edit(false); });
+  QObject::connect(relative, &QCheckBox::toggled, &dialog, [&](bool) { refresh_all(nullptr); });
+  // Turning the link on makes the pair proportional right away, from the width.
+  QObject::connect(link, &QToolButton::toggled, &dialog, [&](bool checked) {
+    if (checked) {
+      follow_linked_axis(true);
+      update_summary();
+    }
+  });
+
+  // Photoshop keeps the two dimension units in step; changing one changes both.
+  const auto sync_unit_combos = [&](QComboBox* changed, QComboBox* other) {
+    {
+      const QSignalBlocker blocker(other);
+      other->setCurrentIndex(changed->currentIndex());
+    }
+    refresh_all(nullptr);
+  };
+  QObject::connect(width_unit, &QComboBox::currentIndexChanged, &dialog,
+                   [&](int) { sync_unit_combos(width_unit, height_unit); });
+  QObject::connect(height_unit, &QComboBox::currentIndexChanged, &dialog,
+                   [&](int) { sync_unit_combos(height_unit, width_unit); });
+
+  auto* button_column = new QWidget(&dialog);
+  button_column->setObjectName(QStringLiteral("canvasSizeButtonColumn"));
+  auto* button_layout = new QVBoxLayout(button_column);
+  button_layout->setContentsMargins(0, 1, 0, 0);
+  button_layout->setSpacing(9);
+  root->addWidget(button_column, 0, Qt::AlignTop);
+
+  auto* ok = new QPushButton(QObject::tr("OK"), &dialog);
+  ok->setObjectName(QStringLiteral("canvasSizeOkButton"));
+  ok->setDefault(true);
+  auto* cancel = new QPushButton(QObject::tr("Cancel"), &dialog);
+  cancel->setObjectName(QStringLiteral("canvasSizeCancelButton"));
+  ok->setFixedSize(73, 28);
+  cancel->setFixedSize(73, 28);
+  button_layout->addWidget(ok);
+  button_layout->addWidget(cancel);
+  button_layout->addStretch(1);
+  QObject::connect(ok, &QPushButton::clicked, &dialog, &QDialog::accept);
+  QObject::connect(cancel, &QPushButton::clicked, &dialog, &QDialog::reject);
+
+  width->setFocus(Qt::OtherFocusReason);
+  width->selectAll();
+
+  if (exec_dialog(dialog) != QDialog::Accepted) {
+    return std::nullopt;
+  }
+  remember_dialog_unit(QStringLiteral("canvasSize/lastUnit"), current_unit());
+  const auto checked_anchor =
+      anchor_group->checkedId() < 0 ? CanvasAnchor::Center : static_cast<CanvasAnchor>(anchor_group->checkedId());
+  return CanvasSizeSettings{state.target_width,
+                            state.target_height,
+                            checked_anchor,
+                            canvas_resize_frame(reference, checked_anchor, state.target_width, state.target_height),
+                            extension_color_value,
+                            crop_layers->isChecked(),
+                            delete_off_canvas->isChecked()};
+}
+
+}  // namespace
+
+void MainWindow::reset_document(std::int32_t width, std::int32_t height, QColor background, QString history_label,
+                                double resolution_ppi, QString title, std::optional<bool> add_empty_layer) {
+  Document new_document(width, height, PixelFormat::rgb8());
+  if (std::isfinite(resolution_ppi) && resolution_ppi > 0.0) {
+    new_document.print_settings().horizontal_ppi = std::clamp(resolution_ppi, 1.0, 9999.0);
+    new_document.print_settings().vertical_ppi = std::clamp(resolution_ppi, 1.0, 9999.0);
+  }
+  const auto background_format = background.alpha() == 0 ? PixelFormat::rgba8() : PixelFormat::rgb8();
+  auto& background_layer = new_document.add_pixel_layer("Background",
+                                                        make_solid_pixels(new_document.width(), new_document.height(),
+                                                                          background, background_format));
+  set_layer_locks_position(background_layer, true);
+  // An opaque Background also locks transparency, as in Photoshop: the Eraser and Clear paint
+  // the background color there. A transparent one stays paintable.
+  if (background_format == PixelFormat::rgb8()) {
+    set_layer_locks_transparent_pixels(background_layer, true);
+  }
+  // Preferences, or the New Document checkbox for one document, can leave a new document as
+  // the Background alone, selected (GitHub issue 363).
+  if (add_empty_layer.value_or(app_settings().value(QStringLiteral("newDocument/addEmptyLayer"), true).toBool())) {
+    new_document.add_pixel_layer(tr("Paint Layer").toStdString(),
+                                 make_solid_pixels(new_document.width(), new_document.height(), QColor(0, 0, 0, 0),
+                                                   PixelFormat::rgba8()));
+  } else {
+    new_document.set_active_layer(background_layer.id());
+  }
+  if (title.isEmpty()) {
+    title = tr("Untitled-%1").arg(sessions_.size() + 1);
+  }
+  add_document_session(std::move(new_document), std::move(title), QString(), std::move(history_label));
+  refresh_layer_list();
+  refresh_layer_controls();
+  update_undo_redo_actions();
+  statusBar()->showMessage(tr("Created %1 x %2 document").arg(width).arg(height));
+}
+
+void MainWindow::create_clipboard_document(const QImage& image, QString history_label, QString title) {
+  if (image.isNull()) {
+    show_status_error(tr("Clipboard does not contain an image"));
+    return;
+  }
+
+  auto pixels = pixels_from_image_at_depth(image, BitDepth::UInt8);
+  Document new_document(pixels.width(), pixels.height(), PixelFormat::rgba8());
+  // Photoshop's Clipboard preset convention: pasted pixels carry no reliable density.
+  new_document.print_settings().horizontal_ppi = kUntaggedImportPpi;
+  new_document.print_settings().vertical_ppi = kUntaggedImportPpi;
+  new_document.add_pixel_layer(tr("Clipboard Image").toStdString(), std::move(pixels));
+  if (title.isEmpty()) {
+    title = tr("Untitled-%1").arg(sessions_.size() + 1);
+  }
+  add_document_session(std::move(new_document), std::move(title), QString(), std::move(history_label));
+  // The pasted pixels have no backing file: closing must warn about unsaved changes.
+  mark_session_modified(session());
+  fit_new_document_view(canvas_);
+  refresh_layer_list();
+  refresh_layer_controls();
+  update_undo_redo_actions();
+  statusBar()->showMessage(tr("Created %1 x %2 document").arg(image.width()).arg(image.height()));
+}
+
+void MainWindow::create_new_document() {
+  if (preview_dialog_edit_locked()) {
+    show_preview_dialog_edit_lock_message();
+    return;
+  }
+  const auto settings = request_new_document_settings(this, tr("Untitled-%1").arg(sessions_.size() + 1));
+  if (!settings.has_value()) {
+    return;
+  }
+  if (settings->from_clipboard) {
+    create_clipboard_document(settings->clipboard_image, tr("New document"), settings->name);
+    return;
+  }
+  reset_document(settings->width, settings->height, settings->background, tr("New document"),
+                 settings->resolution_ppi, settings->name, settings->add_empty_layer);
+  fire_theme_event(ThemeSoundEvent::DocumentNew);
+  if (settings->artboards && has_active_document()) {
+    // The canvas becomes "Artboard 1" with the chosen background and an empty layer to
+    // paint on, in place of the Background layer (Photoshop's Artboards document).
+    auto& doc = document();
+    const auto color = settings->background;
+    const auto background = color.alpha() == 0                ? ArtboardBackground::Transparent
+                            : color == QColor(Qt::white)       ? ArtboardBackground::White
+                            : color == QColor(Qt::black)       ? ArtboardBackground::Black
+                                                               : ArtboardBackground::Custom;
+    doc.layers().clear();
+    auto artboard = make_artboard_group(doc.allocate_layer_id(), next_artboard_name(std::as_const(doc)),
+                                        Rect::from_size(doc.width(), doc.height()), background,
+                                        RgbColor{static_cast<std::uint8_t>(color.red()),
+                                                 static_cast<std::uint8_t>(color.green()),
+                                                 static_cast<std::uint8_t>(color.blue())});
+    Layer layer(doc.allocate_layer_id(), tr("Layer 1").toStdString(),
+                PixelBuffer(doc.width(), doc.height(), PixelFormat::rgba8()));
+    const auto layer_id = layer.id();
+    artboard.add_child(std::move(layer));
+    doc.layers().push_back(std::move(artboard));
+    doc.metadata().artboard_settings.emplace();
+    doc.set_active_layer(layer_id);
+    if (canvas_ != nullptr) {
+      canvas_->set_document(&doc);
+    }
+    refresh_layer_list();
+    refresh_layer_controls();
+    refresh_document_info();
+  }
+  if (settings->bit_depth != BitDepth::UInt8 && has_active_document()) {
+    // A fresh document: the conversion is part of creating it, not an undo step.
+    convert_document_depth(document(), settings->bit_depth);
+    if (canvas_ != nullptr) {
+      canvas_->document_changed();
+    }
+    refresh_layer_list();
+    refresh_document_info();
+    refresh_bit_depth_actions();
+  }
+  if (settings->cmyk_proof && has_active_document()) {
+    // Image > Mode > CMYK Proof's own switch (GitHub issue 360; docs/cmyk.md).
+    if (const auto refusal = set_session_cmyk_proof(session(), true); !refusal.isEmpty()) {
+      show_status_error(refusal);
+    }
+  }
+  // Only the dialog path fits: reset_document is also the startup path, where the
+  // canvas only has its pre-layout default size and a fit would stick a bogus zoom.
+  fit_new_document_view(canvas_);
+}
+
+bool MainWindow::resize_document_image(DocumentSession& target, int width, int height, ResampleMethod method,
+                                       std::function<bool()> keep_running) {
+  if (target.document.width() == width && target.document.height() == height) { return true; }
+  auto edit_lock = lock_preview_dialog_edits();
+  // The displayed document remains immutable during the wait. Resampling a
+  // private copy lets the normal Processing overlay paint without racing the
+  // canvas, thumbnails, or an in-flight renderer against partially resized data.
+  const auto* source = &std::as_const(target.document);
+  auto future = launch_async([source, width, height, method] {
+    auto resized = *source;
+    resize_image_and_layers(resized, width, height, method);
+    return resized;
+  });
+  bool cancelled = false;
+  if (target.canvas) {
+    target.canvas->wait_for_processing_operation([&] {
+      if (keep_running && !keep_running()) { cancelled = true; }
+      return future.wait_for(std::chrono::milliseconds(16)) == std::future_status::ready;
+    });
+  }
+  auto resized = future.get();
+  if (cancelled || (keep_running && !keep_running())) { return false; }
+  target.document = std::move(resized);
+  // Text layers only had their transform composed and their raster resampled by the core
+  // resize; re-render them here (GUI thread, after the swap) so the dialog, doc.resizeImage
+  // and MCP all land the same crisp, size-folded result.
+  rerender_text_layers_through_transforms(target);
+  // Image Size is the one geometry operation that resamples: the scaled placements
+  // re-render from their full-resolution sources (embedded bytes or the linked file)
+  // so smart objects stay crisp, the way Photoshop's non-destructive Image Size
+  // leaves them. Here rather than in the dialog so the script and MCP resize match.
+  rerender_smart_object_previews(target);
+  return true;
+}
+
+void MainWindow::show_file_info_dialog(bool watermarks_scan) {
+  finish_active_text_editor();
+  if (!has_active_document()) {
+    return;
+  }
+  FileInfoWatermarkSupport watermarks;
+#if !defined(Q_OS_WASM)
+  watermarks.download_models = [this](QWidget* parent) {
+    QString error;
+    const bool ok = download_watermark_models(true, {}, &error, parent);
+    if (!ok && !error.isEmpty()) {
+      show_status_error(tr("The watermark models could not be downloaded: %1").arg(error));
+    }
+    return ok;
+  };
+#endif
+  watermarks.open_watermarks_and_scan = watermarks_scan;
+  auto edit = request_file_info_edit(this, std::as_const(document()), session().path, watermarks);
+  if (!edit.has_value()) {
+    return;
+  }
+  push_undo_snapshot(tr("File Info"));
+  auto& doc = document();
+  doc.file_info() = std::move(edit->info);
+  if (edit->drop_color_profile) {
+    doc.color_state().embedded_icc_profile.clear();
+  }
+  refresh_status_document_info();  // the color readout names the kept profile
+  statusBar()->showMessage(tr("File info updated; it is written the next time you save."));
+}
+
+void MainWindow::strip_all_metadata() {
+  finish_active_text_editor();
+  if (!has_active_document()) {
+    return;
+  }
+  const auto keep_profile = confirm_strip_metadata(this);
+  if (!keep_profile.has_value()) {
+    return;
+  }
+  push_undo_snapshot(tr("Strip metadata"));
+  metadata::strip_metadata(document(), *keep_profile);
+  refresh_status_document_info();
+  statusBar()->showMessage(tr("Metadata removed; the file changes the next time you save."));
+}
+
+void MainWindow::resize_image_dialog() {
+  // A live text session's provisional layer must be committed before the document is
+  // resampled and its text layers re-rendered (docs/text-tool.md, mutating actions).
+  finish_active_text_editor();
+  auto& doc = document();
+  const auto settings =
+      request_image_size_settings(this, doc, canvas_ != nullptr ? canvas_->current_composite() : QImage());
+  if (!settings.has_value()) {
+    return;
+  }
+  if (!settings->resample) {
+    const auto resolution = static_cast<double>(settings->resolution);
+    if (std::abs(doc.print_settings().horizontal_ppi - resolution) > 0.01 ||
+        std::abs(doc.print_settings().vertical_ppi - resolution) > 0.01) {
+      push_undo_snapshot(tr("Print resolution"));
+      doc.print_settings().horizontal_ppi = resolution;
+      doc.print_settings().vertical_ppi = resolution;
+      refresh_document_info();
+    }
+    statusBar()->showMessage(tr("Image size unchanged; print resolution set to %1 ppi").arg(settings->resolution));
+    return;
+  }
+  const auto resolution = static_cast<double>(settings->resolution);
+  const bool dimensions_changed = settings->width != doc.width() || settings->height != doc.height();
+  const bool resolution_changed = std::abs(doc.print_settings().horizontal_ppi - resolution) > 0.01 ||
+                                  std::abs(doc.print_settings().vertical_ppi - resolution) > 0.01;
+  if (!dimensions_changed && !resolution_changed) {
+    return;
+  }
+  if (dimensions_changed && refuse_document_geometry_change()) {
+    return;
+  }
+
+  push_undo_snapshot(tr("Image size"));
+  if (dimensions_changed) {
+    resize_document_image(session(), settings->width, settings->height, settings->method);
+    canvas_->clear_selection();
+    const auto previous_channel_target = canvas_->layer_edit_target();
+    const auto previous_channel_id = canvas_->active_document_channel_id();
+    const auto previous_channel_display = canvas_->mask_display_mode();
+    canvas_->set_document(&doc);
+    restore_channel_target_after_document_reset(previous_channel_target, previous_channel_id,
+                                                previous_channel_display);
+    // The old pan is meaningless for the resized document and can leave it
+    // mostly off screen, so recenter at the current zoom (same as crop).
+    canvas_->center_document_in_view();
+    refresh_layer_list();
+    refresh_layer_controls();
+  }
+  doc.print_settings().horizontal_ppi = resolution;
+  doc.print_settings().vertical_ppi = resolution;
+  refresh_document_info();
+  statusBar()->showMessage(tr("Image %1 x %2 px (%3 x %4 in) at %5 ppi")
+                               .arg(settings->width)
+                               .arg(settings->height)
+                               .arg(settings->width / resolution, 0, 'f', 2)
+                               .arg(settings->height / resolution, 0, 'f', 2)
+                               .arg(settings->resolution));
+}
+
+void MainWindow::resize_canvas_dialog() {
+  finish_active_text_editor();
+  const auto settings = request_canvas_size_settings(this, document(), std::nullopt);
+  if (!settings.has_value()) {
+    return;
+  }
+  apply_canvas_size(settings->frame, settings->extension_color, settings->crop_layers,
+                    settings->delete_off_canvas_layers, tr("Canvas size"));
+}
+
+void MainWindow::crop_to_selection_advanced() {
+  if (canvas_ == nullptr || !has_active_document()) {
+    return;  // the menu item is disabled then; scripts and stale shortcuts land here (issue 162)
+  }
+  finish_active_text_editor();
+  // With the Crop tool active, a box the user laid out is the frame; the
+  // untouched canvas frame defers to a marquee selection (it stays after Esc or
+  // Select commands). The dialog resizes through `resize_canvas_to_frame`, which
+  // has no rotation, so a rotated box is refused rather than silently ignored.
+  if (refuse_crop_with_artboards()) {
+    return;
+  }
+  auto selection = canvas_->selected_document_rect();
+  if (canvas_->crop_session_active() && canvas_->crop_session_has_changes()) {
+    if (canvas_->crop_session_angle() != 0.0) {
+      show_status_error(tr("Crop to Selection (Advanced) cannot straighten a rotated crop box; use Crop to Selection"));
+      return;
+    }
+    selection = canvas_->crop_session_rect();
+  }
+  if (!selection.has_value() || selection->isEmpty()) {
+    show_status_error(canvas_->crop_session_active() ? tr("Nothing to crop: the crop box matches the canvas")
+                                                     : tr("Make a rectangular selection before cropping"));
+    return;
+  }
+  const auto settings = request_canvas_size_settings(this, document(), to_core_rect(*selection));
+  if (!settings.has_value()) {
+    return;
+  }
+  apply_canvas_size(settings->frame, settings->extension_color, settings->crop_layers,
+                    settings->delete_off_canvas_layers, tr("Crop"));
+}
+
+void MainWindow::apply_canvas_size(Rect frame, QColor extension_color, bool crop_layers,
+                                   bool delete_off_canvas_layers, const QString& history_label) {
+  auto& doc = document();
+  const auto frame_is_canvas =
+      frame.x == 0 && frame.y == 0 && frame.width == doc.width() && frame.height == doc.height();
+  if (frame_is_canvas && !crop_layers && !delete_off_canvas_layers) {
+    return;
+  }
+  if (refuse_document_geometry_change()) {
+    return;
+  }
+
+  push_undo_snapshot(history_label);
+  const auto deleted_layers = resize_canvas_without_history(frame, extension_color, crop_layers, delete_off_canvas_layers);
+  if (deleted_layers > 0) {
+    statusBar()->showMessage(tr("Canvas %1 x %2, off-canvas layers deleted: %3")
+                                 .arg(frame.width)
+                                 .arg(frame.height)
+                                 .arg(static_cast<int>(deleted_layers)));
+    return;
+  }
+  statusBar()->showMessage(tr("Canvas %1 x %2").arg(doc.width()).arg(doc.height()));
+}
+
+std::size_t MainWindow::resize_canvas_without_history(Rect frame, QColor extension_color, bool crop_layers,
+                                                      bool delete_off_canvas_layers) {
+  auto& doc = document();
+  // Delete against the frame before resizing: the layer crop gives every pixel layer
+  // canvas-sized bounds, so afterwards nothing would test as off the canvas.
+  const auto deleted_layers =
+      delete_off_canvas_layers ? remove_layers_outside_canvas(doc, frame) : std::size_t{0};
+  // Without the layer crop, a Background left with pixels beyond the canvas becomes "Layer 0"
+  // (GitHub issue 701).
+  resize_canvas_to_frame(doc, frame, edit_color(extension_color), crop_layers, layer_from_background_name());
+  // A smaller canvas never clips an artboard: Photoshop grows it back around them
+  // (docs/artboards.md, "Feature interactions").
+  static_cast<void>(grow_canvas_to_artboards(doc));
+  canvas_->clear_selection();
+  const auto previous_channel_target = canvas_->layer_edit_target();
+  const auto previous_channel_id = canvas_->active_document_channel_id();
+  const auto previous_channel_display = canvas_->mask_display_mode();
+  canvas_->set_document(&doc);
+  restore_channel_target_after_document_reset(previous_channel_target, previous_channel_id,
+                                              previous_channel_display);
+  // The old pan is meaningless for the resized document and can leave it
+  // mostly off screen, so recenter at the current zoom (same as crop).
+  canvas_->center_document_in_view();
+  refresh_layer_list();
+  refresh_layer_controls();
+  refresh_document_info();
+  return deleted_layers;
+}
+
+void MainWindow::trim_canvas_dialog() {
+  if (canvas_ == nullptr || !has_active_document()) {
+    return;
+  }
+  finish_active_text_editor();
+  if (refuse_crop_with_artboards()) {
+    return;
+  }
+  // The analysis reads the composite of every visible layer at the document's depth; it
+  // is made once, before the dialog, which needs it to offer Transparent Pixels.
+  const auto composite = flatten_document_for_trim(std::as_const(document()));
+  const auto settings = request_trim_settings(this, trim_composite_has_transparency(composite));
+  if (!settings.has_value()) {
+    return;
+  }
+  const auto bounds = trim_bounds(composite, settings->basis, settings->sides, settings->tolerance);
+  if (!bounds.has_value()) {
+    // With a tolerance, "every pixel matches" usually means the tolerance is too high, not
+    // that the image is blank or one color.
+    const auto transparent = settings->basis == TrimBasis::TransparentPixels;
+    if (settings->tolerance > 0) {
+      statusBar()->showMessage(
+          transparent ? tr("Nothing to trim: every pixel is transparent within the tolerance. Lower the Tolerance.")
+                      : tr("Nothing to trim: every pixel is within the tolerance of the trim color. Lower the "
+                           "Tolerance."));
+    } else {
+      statusBar()->showMessage(transparent ? tr("Nothing to trim: the image has no visible pixels")
+                                           : tr("Nothing to trim: the whole image is one color"));
+    }
+    return;
+  }
+  auto& doc = document();
+  if (*bounds == Rect::from_size(doc.width(), doc.height())) {
+    statusBar()->showMessage(tr("Nothing to trim on the chosen sides"));
+    return;
+  }
+  if (refuse_document_geometry_change()) {
+    return;
+  }
+  auto trimmed_document = doc;
+  if (!patchy::crop_document(trimmed_document, *bounds)) {
+    return;
+  }
+  push_undo_snapshot(tr("Trim"));
+  doc = std::move(trimmed_document);
+  canvas_->clear_selection();
+  const auto previous_channel_target = canvas_->layer_edit_target();
+  const auto previous_channel_id = canvas_->active_document_channel_id();
+  const auto previous_channel_display = canvas_->mask_display_mode();
+  canvas_->set_document(&doc);
+  restore_channel_target_after_document_reset(previous_channel_target, previous_channel_id,
+                                              previous_channel_display);
+  // The old pan is meaningless for the smaller document, so recenter at the current zoom.
+  canvas_->center_document_in_view();
+  refresh_layer_list();
+  refresh_layer_controls();
+  refresh_document_info();
+  statusBar()->showMessage(tr("Trimmed to %1 x %2").arg(doc.width()).arg(doc.height()));
+}
+
+void MainWindow::rotate_canvas_arbitrary() {
+  finish_active_text_editor();
+  auto& doc = document();
+  const auto settings = request_rotate_canvas_settings(this);
+  if (!settings.has_value()) {
+    return;
+  }
+  const auto turn = std::fmod(std::abs(settings->clockwise_degrees), 360.0);
+  if (turn < 0.01 || turn > 359.99 || doc.width() <= 0 || doc.height() <= 0) {
+    return;
+  }
+  if (refuse_document_geometry_change()) {
+    return;
+  }
+
+  push_undo_snapshot(tr("Rotate canvas"));
+  // Exposed corners take the background color under a Background layer, transparent elsewhere.
+  if (!patchy::rotate_document_arbitrary(doc, settings->clockwise_degrees, edit_color(canvas_->secondary_color()))) {
+    return;
+  }
+  // The rotation resampled every raster; text layers re-render crisp through the composed
+  // matrix, exactly as after Image Size.
+  rerender_text_layers_through_transforms(session());
+  canvas_->clear_selection();
+  const auto previous_channel_target = canvas_->layer_edit_target();
+  const auto previous_channel_id = canvas_->active_document_channel_id();
+  const auto previous_channel_display = canvas_->mask_display_mode();
+  canvas_->set_document(&doc);
+  restore_channel_target_after_document_reset(previous_channel_target, previous_channel_id,
+                                              previous_channel_display);
+  // The enlarged canvas makes the old pan stale, so recenter at the current zoom.
+  canvas_->center_document_in_view();
+  refresh_layer_list();
+  refresh_layer_controls();
+  refresh_document_info();
+  const auto degrees_text = QString::number(std::abs(settings->clockwise_degrees), 'f', 2);
+  statusBar()->showMessage(settings->clockwise_degrees > 0.0
+                               ? tr("Rotated canvas %1 degrees clockwise").arg(degrees_text)
+                               : tr("Rotated canvas %1 degrees counterclockwise").arg(degrees_text));
+}
+
+}  // namespace patchy::ui

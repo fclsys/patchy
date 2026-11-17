@@ -1,0 +1,1547 @@
+#include "psd/psd_filter_effects.hpp"
+#include "ui/main_window_shared.hpp"
+
+#include "core/artboard.hpp"
+#include "core/adjustment_layer.hpp"
+#include "core/document.hpp"
+#include "core/layer.hpp"
+#include "core/layer_metadata.hpp"
+#include "core/layer_tree.hpp"
+#include "core/pixel_buffer.hpp"
+#include "core/pixel_depth.hpp"
+#include "core/smart_filter.hpp"
+#include "core/smart_filter_effects.hpp"
+#include "core/smart_object.hpp"
+#include "core/vector_shape.hpp"
+#include "filters/filter_registry.hpp"
+#include "support/string_utils.hpp"
+#include "ui/app_settings.hpp"
+#include "ui/background_workers.hpp"
+#include "ui/canvas_types.hpp"
+#include "ui/canvas_widget.hpp"
+#include "ui/brush_presets.hpp"
+#include "ui/curves_clipping_preview.hpp"
+#include "ui/dialog_utils.hpp"
+#include "ui/filter_workflows.hpp"
+#include "ui/layer_list_widget.hpp"
+#include "ui/tool_cursors.hpp"
+#include "ui/ui_profile.hpp"
+
+#include <QAbstractButton>
+#include <QAction>
+#include <QApplication>
+#include <QByteArray>
+#include <QChar>
+#include <QColor>
+#include <QComboBox>
+#include <QCoreApplication>
+#include <QDialog>
+#include <QDialogButtonBox>
+#include <QDir>
+#include <QDockWidget>
+#include <QEventLoop>
+#include <QFileInfo>
+#include <QFormLayout>
+#include <QGroupBox>
+#include <QImage>
+#include <QInputDialog>
+#include <QLabel>
+#include <QLatin1Char>
+#include <QLineEdit>
+#include <QListWidget>
+#include <QMenu>
+#include <QMetaObject>
+#include <QObject>
+#include <QPoint>
+#include <QProgressDialog>
+#include <QRect>
+#include <QRegion>
+#include <QSignalBlocker>
+#include <QSpinBox>
+#include <QStandardPaths>
+#include <QString>
+#include <QStringList>
+#include <QStringLiteral>
+#include <QStringView>
+#include <QTimer>
+#include <QToolBar>
+#include <QUrl>
+#include <QVBoxLayout>
+#include <QWidget>
+#include <Qt>
+#include <QtGlobal>
+
+#include <algorithm>
+#include <cctype>
+#include <cmath>
+#include <cstddef>
+#include <cstdint>
+#include <cstring>
+#include <exception>
+#include <functional>
+#include <iostream>
+#include <limits>
+#include <memory>
+#include <optional>
+#include <set>
+#include <sstream>
+#include <string>
+#include <string_view>
+#include <utility>
+#include <vector>
+
+namespace patchy::ui {
+
+bool layer_tree_contains_smart_filters(const Layer& layer) {
+  if (layer.smart_filter_stack() != nullptr) {
+    return true;
+  }
+  return std::any_of(layer.children().begin(), layer.children().end(),
+                     layer_tree_contains_smart_filters);
+}
+
+bool layer_tree_contains_smart_object(const Layer& layer) {
+  if (layer_is_smart_object(layer)) {
+    return true;
+  }
+  return std::any_of(layer.children().begin(), layer.children().end(),
+                     layer_tree_contains_smart_object);
+}
+
+bool document_contains_smart_objects(const Document& document) {
+  return std::any_of(document.layers().begin(), document.layers().end(),
+                     layer_tree_contains_smart_object);
+}
+
+namespace {
+
+bool layer_tree_contains_unparsed_smart_object(const Layer& layer) {
+  if (layer_is_smart_object(layer) && !smart_object_placement_from_layer(layer).has_value()) {
+    return true;
+  }
+  return std::any_of(layer.children().begin(), layer.children().end(),
+                     layer_tree_contains_unparsed_smart_object);
+}
+
+}  // namespace
+
+bool document_contains_smart_filters(const Document& document) {
+  if (!document.metadata().smart_filter_effects.empty()) {
+    return true;
+  }
+  return std::any_of(document.layers().begin(), document.layers().end(),
+                     layer_tree_contains_smart_filters);
+}
+
+bool document_contains_unparsed_smart_objects(const Document& document) {
+  return std::any_of(document.layers().begin(), document.layers().end(),
+                     layer_tree_contains_unparsed_smart_object);
+}
+
+namespace {
+
+bool layer_tree_contains_vector_content(const Layer& layer) {
+  if (layer.vector_shape() != nullptr || layer.vector_mask() != nullptr) {
+    return true;
+  }
+  return std::any_of(layer.children().begin(), layer.children().end(),
+                     layer_tree_contains_vector_content);
+}
+
+}  // namespace
+
+bool document_contains_vector_content(const Document& document) {
+  return std::any_of(document.layers().begin(), document.layers().end(),
+                     layer_tree_contains_vector_content);
+}
+
+QString localized_adjustment_display_name(AdjustmentKind kind) {
+  switch (kind) {
+    case AdjustmentKind::Levels:
+      return QObject::tr("Levels");
+    case AdjustmentKind::Curves:
+      return QObject::tr("Curves");
+    case AdjustmentKind::HueSaturation:
+      return QObject::tr("Hue/Saturation");
+    case AdjustmentKind::ColorBalance:
+      return QObject::tr("Color Balance");
+    case AdjustmentKind::Invert:
+      return QObject::tr("Invert");
+    case AdjustmentKind::Posterize:
+      return QObject::tr("Posterize");
+    case AdjustmentKind::Threshold:
+      return QObject::tr("Threshold");
+    case AdjustmentKind::BrightnessContrast:
+      return QObject::tr("Brightness/Contrast");
+    case AdjustmentKind::Exposure:
+      return QObject::tr("Exposure");
+    case AdjustmentKind::ChannelMixer:
+      return QObject::tr("Channel Mixer");
+    case AdjustmentKind::PhotoFilter:
+      return QObject::tr("Photo Filter");
+    case AdjustmentKind::GradientMap:
+      return QObject::tr("Gradient Map");
+    case AdjustmentKind::BlackWhite:
+      return QObject::tr("Black & White");
+    case AdjustmentKind::ColorLookup:
+      return QObject::tr("Color Lookup");
+    case AdjustmentKind::SelectiveColor:
+      return QObject::tr("Selective Color");
+    case AdjustmentKind::Vibrance:
+      return QObject::tr("Vibrance");
+  }
+  return QObject::tr("Adjustment");
+}
+
+LevelsAdjustment sanitized_levels_adjustment(LevelsSettings settings) {
+  const auto master = levels_master_record(settings);
+  return LevelsAdjustment{master.black_input, master.white_input, master.gamma_percent, master.black_output,
+                          master.white_output, settings.channel, clamp_levels_record(settings.red),
+                          clamp_levels_record(settings.green), clamp_levels_record(settings.blue)};
+}
+
+CurvesDialogHooks curves_canvas_hooks(CanvasWidget* canvas,
+                                      std::function<QColor(QPoint)> sample_input_color) {
+  CurvesDialogHooks hooks;
+  if (canvas == nullptr || !sample_input_color) {
+    return hooks;
+  }
+  hooks.set_canvas_mode = [canvas, sample_input_color = std::move(sample_input_color)](
+                              CurvesCanvasMode mode,
+                              std::function<void(const CurvesCanvasSample&)> sample_changed) {
+    canvas->clear_transient_read_interaction();
+    if (mode == CurvesCanvasMode::None || !sample_changed) {
+      return;
+    }
+    // The black, gray and white point pickers sample a color: the plain eyedropper, with no
+    // foreground/background badge since a click sets neither (GitHub issue 638). The Curves
+    // on-image drag adjusts a point rather than picking a color, so it keeps the cross.
+    canvas->set_transient_read_interaction(
+        [sample_input_color, sample_changed = std::move(sample_changed)](const CanvasReadGesture& gesture) {
+          auto color = gesture.phase == CanvasReadPhase::Press
+                           ? sample_input_color(gesture.document_position)
+                           : QColor{};
+          sample_changed(CurvesCanvasSample{color, gesture});
+        },
+        mode == CurvesCanvasMode::Targeted ? QCursor(Qt::CrossCursor) : eyedropper_cursor());
+  };
+  hooks.clear_canvas_mode = [canvas] { canvas->clear_transient_read_interaction(); };
+  hooks.clipping_changed = [canvas](std::optional<CurvesClippingMode> mode, CurvesChannel channel) {
+    canvas->set_curves_clipping_preview(mode, channel);
+  };
+  return hooks;
+}
+
+FilterProgress progress_dialog_filter_progress(QProgressDialog& progress,
+                                               std::function<QString(const QString&)> label_text,
+                                               QEventLoop::ProcessEventsFlags event_flags,
+                                               std::function<void()> tick_processing) {
+  auto last_progress_value = std::make_shared<int>(-1);
+  return FilterProgress{[&progress, label_text = std::move(label_text), event_flags,
+                         tick_processing = std::move(tick_processing),
+                         last_progress_value](int completed, int total, FilterProgressStage stage) {
+    const auto value = total <= 0 ? 100 : std::clamp((completed * 100) / total, 0, 100);
+    if (value != *last_progress_value) {
+      progress.setValue(value);
+      progress.setLabelText(label_text(filter_progress_stage_text(stage)));
+      *last_progress_value = value;
+      QApplication::processEvents(event_flags);
+    }
+    if (tick_processing) {
+      tick_processing();
+    }
+    return !progress.wasCanceled();
+  }};
+}
+
+void run_filter_compute_with_progress(QProgressDialog& progress,
+                                      std::function<QString(const QString&)> label_text,
+                                      std::function<void()> tick_processing,
+                                      const std::function<void(FilterProgress&)>& compute) {
+#if defined(Q_OS_WASM) && defined(__EMSCRIPTEN_PTHREADS__)
+  struct SharedProgress {
+    std::atomic<int> completed{0};
+    std::atomic<int> total{0};
+    std::atomic<int> stage{static_cast<int>(FilterProgressStage::Filtering)};
+    std::atomic<bool> cancelled{false};
+  };
+  const auto shared = std::make_shared<SharedProgress>();
+  const auto error = std::make_shared<std::exception_ptr>();
+  QEventLoop wait_loop;
+  QObject::connect(&progress, &QProgressDialog::canceled, &progress,
+                   [shared] { shared->cancelled.store(true, std::memory_order_relaxed); });
+  QTimer update_timer;
+  update_timer.setInterval(50);
+  int last_value = -1;
+  QObject::connect(&update_timer, &QTimer::timeout, &progress, [&] {
+    const auto total = shared->total.load(std::memory_order_relaxed);
+    const auto completed = shared->completed.load(std::memory_order_relaxed);
+    const auto value = total <= 0 ? 0 : std::clamp((completed * 100) / total, 0, 100);
+    if (value != last_value) {
+      progress.setValue(value);
+      progress.setLabelText(label_text(filter_progress_stage_text(
+          static_cast<FilterProgressStage>(shared->stage.load(std::memory_order_relaxed)))));
+      last_value = value;
+    }
+    if (tick_processing) {
+      tick_processing();
+    }
+  });
+  update_timer.start();
+  auto* app = QCoreApplication::instance();
+  // The references captured here stay valid: this function only returns
+  // after wait_loop quits, and the loop only quits from the queued
+  // completion the worker posts after it is done touching them.
+  run_tracked_background_worker([shared, error, app, &wait_loop, &compute] {
+    FilterProgress worker_progress{[shared](int completed, int total, FilterProgressStage stage) {
+      shared->completed.store(completed, std::memory_order_relaxed);
+      shared->total.store(total, std::memory_order_relaxed);
+      shared->stage.store(static_cast<int>(stage), std::memory_order_relaxed);
+      return !shared->cancelled.load(std::memory_order_relaxed);
+    }};
+    try {
+      compute(worker_progress);
+    } catch (...) {
+      *error = std::current_exception();
+    }
+    if (app == nullptr) {
+      return;
+    }
+    QMetaObject::invokeMethod(app, [&wait_loop] { wait_loop.quit(); }, Qt::QueuedConnection);
+  });
+  wait_loop.exec();
+  update_timer.stop();
+  if (*error) {
+    std::rethrow_exception(*error);
+  }
+#else
+  auto filter_progress = progress_dialog_filter_progress(progress, std::move(label_text),
+                                                         QEventLoop::AllEvents, std::move(tick_processing));
+  compute(filter_progress);
+#endif
+}
+
+std::shared_ptr<AsyncPixelPreviewState<DestructiveAdjustmentPreviewRequest>>
+make_destructive_adjustment_preview_state(DestructiveAdjustmentPreviewHooks hooks) {
+  auto preview_state =
+      std::make_shared<AsyncPixelPreviewState<DestructiveAdjustmentPreviewRequest>>();
+  // The layer holds its original pixels until a render lands: an identity request then
+  // has nothing to restore, so it repaints nothing (a drag with Preview unticked, or over
+  // settings with no effect, showed the canvas busy notice for each move; #687).
+  auto showing_original = std::make_shared<bool>(true);
+  // The start closure holds the state (and the state holds the closure); the
+  // cycle is broken when the dialog calls close_async_pixel_preview, exactly
+  // like the per-dialog workers this replaces.
+  preview_state->start = [preview_state, showing_original, hooks = std::move(hooks)](
+                             const DestructiveAdjustmentPreviewRequest& request) {
+    if (request.identity) {
+      preview_state->pending.reset();
+      ++preview_state->generation;
+      if (!*showing_original) {
+        *showing_original = true;
+        hooks.restore_identity();
+      }
+      return;
+    }
+
+    preview_state->in_flight = true;
+    const auto generation = ++preview_state->generation;
+    auto* app = QCoreApplication::instance();
+    if (hooks.preview_render_active) {
+      hooks.preview_render_active(true);
+    }
+    run_tracked_background_worker([app, preview_state, showing_original, generation, hooks, request] {
+      auto result = std::make_shared<PixelBuffer>(*hooks.original_pixels);
+      try {
+        request.render(*result);
+      } catch (const std::exception&) {
+        result.reset();
+      }
+      if (app == nullptr) {
+        return;
+      }
+      QMetaObject::invokeMethod(
+          app,
+          [preview_state, showing_original, hooks, generation, result]() mutable {
+            preview_state->in_flight = false;
+            if (hooks.preview_render_active) {
+              hooks.preview_render_active(false);
+            }
+            // A newer request may already wait (a slider still dragging): the
+            // finished render is still newer than what the canvas shows, so it
+            // lands; holding every result back while one is pending froze the
+            // preview for the whole drag (GitHub #601). An identity request
+            // bumps the generation, so a render it overtook never lands.
+            if (!preview_state->closed && generation == preview_state->generation && result != nullptr) {
+              *showing_original = false;
+              hooks.apply_result(std::move(*result));
+            }
+            if (!preview_state->closed && preview_state->pending.has_value() &&
+                preview_state->start) {
+              auto next = *preview_state->pending;
+              preview_state->pending.reset();
+              preview_state->start(next);
+            }
+          },
+          Qt::QueuedConnection);
+    });
+  };
+  return preview_state;
+}
+
+namespace {
+
+template <typename Vector>
+void append_effect_rows(std::vector<LayerEffectRow>& rows, LayerStyleEffect effect, const Vector& instances) {
+  for (std::size_t index = 0; index < instances.size(); ++index) {
+    rows.push_back(LayerEffectRow{effect, index, instances[index].enabled});
+  }
+}
+
+template <typename Vector>
+bool* effect_enabled_flag(Vector& instances, std::size_t index) {
+  return index < instances.size() ? &instances[index].enabled : nullptr;
+}
+
+}  // namespace
+
+std::vector<LayerEffectRow> layer_effect_rows(const LayerStyle& style) {
+  std::vector<LayerEffectRow> rows;
+  rows.reserve(style.effect_count());
+  append_effect_rows(rows, LayerStyleEffect::BevelEmboss, style.bevels);
+  append_effect_rows(rows, LayerStyleEffect::Stroke, style.strokes);
+  append_effect_rows(rows, LayerStyleEffect::InnerShadow, style.inner_shadows);
+  append_effect_rows(rows, LayerStyleEffect::InnerGlow, style.inner_glows);
+  append_effect_rows(rows, LayerStyleEffect::Satin, style.satins);
+  append_effect_rows(rows, LayerStyleEffect::ColorOverlay, style.color_overlays);
+  append_effect_rows(rows, LayerStyleEffect::GradientOverlay, style.gradient_fills);
+  append_effect_rows(rows, LayerStyleEffect::PatternOverlay, style.pattern_overlays);
+  append_effect_rows(rows, LayerStyleEffect::OuterGlow, style.outer_glows);
+  append_effect_rows(rows, LayerStyleEffect::DropShadow, style.drop_shadows);
+  return rows;
+}
+
+bool* layer_effect_enabled_flag(LayerStyle& style, LayerStyleEffect effect, std::size_t index) {
+  switch (effect) {
+    case LayerStyleEffect::BevelEmboss: return effect_enabled_flag(style.bevels, index);
+    case LayerStyleEffect::Stroke: return effect_enabled_flag(style.strokes, index);
+    case LayerStyleEffect::InnerShadow: return effect_enabled_flag(style.inner_shadows, index);
+    case LayerStyleEffect::InnerGlow: return effect_enabled_flag(style.inner_glows, index);
+    case LayerStyleEffect::Satin: return effect_enabled_flag(style.satins, index);
+    case LayerStyleEffect::ColorOverlay: return effect_enabled_flag(style.color_overlays, index);
+    case LayerStyleEffect::GradientOverlay: return effect_enabled_flag(style.gradient_fills, index);
+    case LayerStyleEffect::PatternOverlay: return effect_enabled_flag(style.pattern_overlays, index);
+    case LayerStyleEffect::OuterGlow: return effect_enabled_flag(style.outer_glows, index);
+    case LayerStyleEffect::DropShadow: return effect_enabled_flag(style.drop_shadows, index);
+  }
+  return nullptr;
+}
+
+namespace {
+
+template <typename Vector>
+bool erase_effect_instance(Vector& instances, std::size_t index) {
+  if (index >= instances.size()) {
+    return false;
+  }
+  instances.erase(instances.begin() + static_cast<std::ptrdiff_t>(index));
+  return true;
+}
+
+}  // namespace
+
+bool remove_layer_effect_instance(LayerStyle& style, LayerStyleEffect effect, std::size_t index) {
+  switch (effect) {
+    case LayerStyleEffect::BevelEmboss: return erase_effect_instance(style.bevels, index);
+    case LayerStyleEffect::Stroke: return erase_effect_instance(style.strokes, index);
+    case LayerStyleEffect::InnerShadow: return erase_effect_instance(style.inner_shadows, index);
+    case LayerStyleEffect::InnerGlow: return erase_effect_instance(style.inner_glows, index);
+    case LayerStyleEffect::Satin: return erase_effect_instance(style.satins, index);
+    case LayerStyleEffect::ColorOverlay: return erase_effect_instance(style.color_overlays, index);
+    case LayerStyleEffect::GradientOverlay: return erase_effect_instance(style.gradient_fills, index);
+    case LayerStyleEffect::PatternOverlay: return erase_effect_instance(style.pattern_overlays, index);
+    case LayerStyleEffect::OuterGlow: return erase_effect_instance(style.outer_glows, index);
+    case LayerStyleEffect::DropShadow: return erase_effect_instance(style.drop_shadows, index);
+  }
+  return false;
+}
+
+QString layer_effect_display_name(LayerStyleEffect effect) {
+  // The same texts as the Layer Style dialog's category rows.
+  switch (effect) {
+    case LayerStyleEffect::BevelEmboss: return QObject::tr("Bevel & Emboss");
+    case LayerStyleEffect::Stroke: return QObject::tr("Stroke");
+    case LayerStyleEffect::InnerShadow: return QObject::tr("Inner Shadow");
+    case LayerStyleEffect::InnerGlow: return QObject::tr("Inner Glow");
+    case LayerStyleEffect::Satin: return QObject::tr("Satin");
+    case LayerStyleEffect::ColorOverlay: return QObject::tr("Color Overlay");
+    case LayerStyleEffect::GradientOverlay: return QObject::tr("Gradient Overlay");
+    case LayerStyleEffect::PatternOverlay: return QObject::tr("Pattern Overlay");
+    case LayerStyleEffect::OuterGlow: return QObject::tr("Outer Glow");
+    case LayerStyleEffect::DropShadow: return QObject::tr("Drop Shadow");
+  }
+  return {};
+}
+
+void clear_layer_psd_style_source(Layer& layer) {
+  auto& blocks = layer.unknown_psd_blocks();
+  std::erase_if(blocks, [](const UnknownPsdBlock& block) {
+    // 'lmfx' must go too: a stale multi-instance block left beside a
+    // regenerated lfx2 would win in Photoshop and hide the edit.
+    return block.key == "lfx2" || block.key == "lrFX" || block.key == "plFX" ||
+           block.key == "lmfx";
+  });
+}
+
+double text_size_ppi(const Document& document) noexcept {
+  const auto ppi = document.print_settings().horizontal_ppi;
+  return std::isfinite(ppi) && ppi > 0.0 ? std::clamp(ppi, 1.0, 9999.0) : 300.0;
+}
+
+double text_pixels_to_points(int pixels, const Document& document) noexcept {
+  pixels = std::max(1, pixels);
+  const double exact = std::max(0.01, static_cast<double>(pixels) * 72.0 / text_size_ppi(document));
+  // Whole points, then tenths, then hundredths (the size field's precision): the nearest step
+  // values on each side of the exact size are the only candidates, since the points naming
+  // `pixels` form one interval around it.
+  for (const double step : {1.0, 0.1, 0.01}) {
+    std::optional<double> best;
+    for (const double candidate : {std::floor(exact / step) * step, std::ceil(exact / step) * step}) {
+      const double rounded = std::round(candidate / step) * step;
+      if (rounded >= 0.01 && text_points_to_pixels(rounded, document) == pixels &&
+          (!best.has_value() || std::abs(rounded - exact) < std::abs(*best - exact))) {
+        best = rounded;
+      }
+    }
+    if (best.has_value()) {
+      return *best;
+    }
+  }
+  return exact;
+}
+
+double text_points_for_display(double shown_points, int pixels, const Document& document) noexcept {
+  if (std::isfinite(shown_points) && shown_points > 0.0 && text_points_to_pixels(shown_points, document) == pixels) {
+    return shown_points;
+  }
+  return text_pixels_to_points(pixels, document);
+}
+
+int text_points_to_pixels(double points, const Document& document) noexcept {
+  if (!std::isfinite(points)) {
+    return 1;
+  }
+  return std::max(1, static_cast<int>(std::lround(std::max(0.01, points) * text_size_ppi(document) / 72.0)));
+}
+
+QString smart_filter_unmodeled_show_message() {
+  return QObject::tr(
+      "Patchy can't render every Smart Filter that would then run. Photoshop renders them when the file is "
+      "opened there.");
+}
+
+QString smart_filter_unmodeled_left_running_message() {
+  return QObject::tr(
+      "Hiding this filter would leave Smart Filters running that Patchy can't render. Hide or delete those "
+      "first, or hide all Smart Filters.");
+}
+
+QString smart_filter_unmodeled_left_after_delete_message() {
+  return QObject::tr(
+      "Deleting this filter would leave Smart Filters running that Patchy can't render. Hide or delete those "
+      "first, or delete all Smart Filters.");
+}
+
+QString smart_filter_unmodeled_settings_message() {
+  return QObject::tr("Patchy can't edit this filter's settings. It is preserved unchanged.");
+}
+
+QString smart_filter_unmodeled_stack_settings_message() {
+  return QObject::tr(
+      "This stack runs Smart Filters that Patchy can't render, so their settings can't change here. Hide or "
+      "delete those filters first.");
+}
+
+QString escape_qaction_ampersands(QString text) {
+  return text.replace(QLatin1Char('&'), QStringLiteral("&&"));
+}
+
+void set_layer_pixels_preserving_origin(Layer& layer, PixelBuffer pixels, Rect original_bounds) {
+  const auto x = original_bounds.x;
+  const auto y = original_bounds.y;
+  layer.set_pixels(std::move(pixels));
+  layer.set_bounds(Rect{x, y, layer.pixels().width(), layer.pixels().height()});
+}
+
+void set_layer_pixels_with_bounds(Layer& layer, PixelBuffer pixels, Rect new_bounds) {
+  const auto x = new_bounds.x;
+  const auto y = new_bounds.y;
+  layer.set_pixels(std::move(pixels));
+  layer.set_bounds(Rect{x, y, layer.pixels().width(), layer.pixels().height()});
+}
+
+void decode_pending_svg_images(std::vector<Layer>& layers, QStringList& import_notices) {
+  for (auto& layer : layers) {
+    if (!layer.children().empty()) {
+      decode_pending_svg_images(layer.children(), import_notices);
+    }
+    auto& metadata = layer.metadata();
+    const auto pending = metadata.find(kLayerMetadataSvgPendingImage);
+    if (pending == metadata.end()) {
+      continue;
+    }
+    const QString uri = QString::fromStdString(pending->second);
+    metadata.erase(pending);
+    QImage image;
+    if (const auto comma = uri.indexOf(QLatin1Char(',')); comma > 0) {
+      const auto header = uri.left(comma);
+      const auto payload = QStringView(uri).mid(comma + 1).toLatin1();
+      const auto bytes = header.contains(QStringLiteral("base64"))
+                             ? QByteArray::fromBase64(payload)
+                             : QUrl::fromPercentEncoding(payload).toUtf8();
+      image = QImage::fromData(bytes);
+    }
+    const auto bounds = layer.bounds();
+    if (image.isNull() || bounds.width <= 0 || bounds.height <= 0) {
+      import_notices.push_back(QObject::tr("An embedded SVG image could not be decoded (layer %1)")
+                                   .arg(QString::fromStdString(layer.name())));
+      continue;
+    }
+    image = image.convertToFormat(QImage::Format_RGBA8888)
+                .scaled(bounds.width, bounds.height, Qt::IgnoreAspectRatio, Qt::SmoothTransformation);
+    PixelBuffer pixels(bounds.width, bounds.height, PixelFormat::rgba8());
+    for (std::int32_t y = 0; y < bounds.height; ++y) {
+      std::memcpy(pixels.row(y).data(), image.constScanLine(y), static_cast<std::size_t>(bounds.width) * 4U);
+    }
+    set_layer_pixels_with_bounds(layer, std::move(pixels), bounds);
+  }
+}
+
+PixelBuffer selection_mask_pixels(const CanvasWidget& canvas, QRect selection_rect) {
+  PixelBuffer mask_pixels(selection_rect.width(), selection_rect.height(), PixelFormat::gray8());
+  mask_pixels.clear(0);
+  if (selection_rect.isEmpty()) {
+    return mask_pixels;
+  }
+
+  if (!canvas.selection_has_partial_alpha()) {
+    const auto selected = canvas.selected_document_region().intersected(QRegion(selection_rect));
+    const QRect local_bounds(0, 0, selection_rect.width(), selection_rect.height());
+    for (const auto& rect : selected) {
+      const auto local =
+          QRect(rect.x() - selection_rect.x(), rect.y() - selection_rect.y(), rect.width(), rect.height())
+              .intersected(local_bounds);
+      if (local.isEmpty()) {
+        continue;
+      }
+      for (int y = local.top(); y <= local.bottom(); ++y) {
+        auto row = mask_pixels.row(y);
+        std::fill(row.begin() + local.left(), row.begin() + local.left() + local.width(),
+                  static_cast<std::uint8_t>(255));
+      }
+    }
+    return mask_pixels;
+  }
+
+  for (int y = 0; y < selection_rect.height(); ++y) {
+    for (int x = 0; x < selection_rect.width(); ++x) {
+      const QPoint document_point(selection_rect.x() + x, selection_rect.y() + y);
+      *mask_pixels.pixel(x, y) = canvas.selection_alpha_at(document_point);
+    }
+  }
+  return mask_pixels;
+}
+
+PixelBuffer pixels_limited_to_selection(const CanvasWidget& canvas, const PixelBuffer& pixels, Rect bounds) {
+  if (pixels.empty() || pixels.format().bit_depth != BitDepth::UInt8) {
+    return pixels;
+  }
+  const auto coverage = selection_mask_pixels(canvas, QRect(bounds.x, bounds.y, pixels.width(), pixels.height()));
+  PixelBuffer out(pixels.width(), pixels.height(), PixelFormat::rgba8());
+  const auto channels = pixels.format().channels;
+  for (std::int32_t y = 0; y < pixels.height(); ++y) {
+    for (std::int32_t x = 0; x < pixels.width(); ++x) {
+      const auto* src = pixels.pixel(x, y);
+      auto* dst = out.pixel(x, y);
+      if (channels <= 2) {
+        dst[0] = src[0];
+        dst[1] = src[0];
+        dst[2] = src[0];
+        dst[3] = channels == 2 ? src[1] : std::uint8_t{255};
+      } else {
+        dst[0] = src[0];
+        dst[1] = src[1];
+        dst[2] = src[2];
+        dst[3] = channels >= 4 ? src[3] : std::uint8_t{255};
+      }
+      if (*coverage.pixel(x, y) < 128) {
+        dst[3] = 0;  // the tracer's alpha cut: outside the selection is untraced
+      }
+    }
+  }
+  return out;
+}
+
+int proportional_brush_step(int size, int direction, bool coarse) {
+  const double f = coarse ? 0.30 : 0.10;
+  const int min_step = coarse ? 2 : 1;
+  const double basis = direction > 0 ? size * f : size * f / (1.0 + f);
+  return std::max(min_step, static_cast<int>(std::lround(basis)));
+}
+
+int stepped_brush_hardness(int hardness, int direction) {
+  constexpr int kStop = 25;
+  const int clamped = std::clamp(hardness, 0, 100);
+  const int stepped = direction < 0 ? ((clamped + kStop - 1) / kStop - 1) * kStop : (clamped / kStop + 1) * kStop;
+  return std::clamp(stepped, 0, 100);
+}
+
+bool tool_shows_brush_softness(CanvasTool tool) noexcept {
+  switch (tool) {
+    case CanvasTool::Brush:
+    case CanvasTool::MixerBrush:
+    case CanvasTool::PatternStamp:
+    case CanvasTool::Clone:
+    case CanvasTool::Healing:
+    case CanvasTool::SpotHealing:
+    case CanvasTool::Smudge:
+    case CanvasTool::Dodge:
+    case CanvasTool::Burn:
+    case CanvasTool::Sponge:
+    case CanvasTool::BlurBrush:
+    case CanvasTool::SharpenBrush:
+    case CanvasTool::ColorReplace:
+    case CanvasTool::BackgroundEraser:
+    case CanvasTool::Eraser:
+    case CanvasTool::Line:
+    case CanvasTool::Rectangle:
+    case CanvasTool::Ellipse:
+      return true;
+    default:
+      return false;
+  }
+}
+
+QString default_startup_brush_preset_id() {
+  // 25 px hard round, the startup brush since before issue 482 renamed its preset.
+  return QStringLiteral("hard_round");
+}
+
+void apply_brush_preset(CanvasWidget& canvas, const BrushPreset& preset) {
+  canvas.set_brush_build_up(preset.build_up);
+  canvas.set_brush_size(preset.size);
+  canvas.set_brush_opacity(preset.opacity);
+  canvas.set_brush_flow(preset.flow);
+  canvas.set_brush_softness(preset.softness);
+}
+
+QString translate_source(const QObject* object, const char* property_name) {
+  const auto source = object->property(property_name).toString();
+  if (source.isEmpty()) {
+    return {};
+  }
+  auto context = object->property(kTranslationContextProperty).toString();
+  if (context.isEmpty()) {
+    context = QStringLiteral("patchy::ui::MainWindow");
+  }
+  const auto context_bytes = context.toUtf8();
+  const auto source_bytes = source.toUtf8();
+  return QCoreApplication::translate(context_bytes.constData(), source_bytes.constData());
+}
+
+void bind_translated_text(QObject* object, const char* source, const char* context) {
+  if (object == nullptr) {
+    return;
+  }
+  object->setProperty(kTranslationContextProperty, QString::fromLatin1(context));
+  object->setProperty(kTranslationTextProperty, QString::fromUtf8(source));
+}
+
+void bind_translated_tooltip(QObject* object, const char* source, const char* context) {
+  if (object == nullptr) {
+    return;
+  }
+  object->setProperty(kTranslationContextProperty, QString::fromLatin1(context));
+  object->setProperty(kTranslationToolTipProperty, QString::fromUtf8(source));
+}
+
+QString strip_trailing_colon(QString text) {
+  auto trimmed = text.trimmed();
+  if (trimmed.endsWith(QLatin1Char(':')) || trimmed.endsWith(QChar(0xFF1A))) {
+    trimmed.chop(1);
+    return trimmed.trimmed();
+  }
+  return text;
+}
+
+void apply_bound_translation(QObject* object) {
+  if (object == nullptr) {
+    return;
+  }
+
+  if (object->property(kTranslationTextProperty).isValid()) {
+    const auto text = translate_source(object, kTranslationTextProperty);
+    if (auto* action = qobject_cast<QAction*>(object); action != nullptr) {
+      action->setText(text);
+    } else if (auto* menu = qobject_cast<QMenu*>(object); menu != nullptr) {
+      menu->setTitle(text);
+    } else if (auto* dock = qobject_cast<QDockWidget*>(object); dock != nullptr) {
+      dock->setWindowTitle(text);
+    } else if (auto* toolbar = qobject_cast<QToolBar*>(object); toolbar != nullptr) {
+      toolbar->setWindowTitle(text);
+    } else if (auto* label = qobject_cast<QLabel*>(object); label != nullptr) {
+      label->setText(label->property(kTranslationStripsTrailingColonProperty).toBool()
+                         ? strip_trailing_colon(text)
+                         : text);
+    } else if (auto* line_edit = qobject_cast<QLineEdit*>(object); line_edit != nullptr) {
+      // Line edits carry user data in text(); the bound translation targets
+      // the placeholder.
+      line_edit->setPlaceholderText(text);
+    } else if (auto* button = qobject_cast<QAbstractButton*>(object); button != nullptr) {
+      button->setText(text);
+    } else if (auto* group = qobject_cast<QGroupBox*>(object); group != nullptr) {
+      group->setTitle(text);
+    }
+  }
+
+  if (object->property(kTranslationToolTipProperty).isValid()) {
+    const auto tooltip = translate_source(object, kTranslationToolTipProperty);
+    if (auto* action = qobject_cast<QAction*>(object); action != nullptr) {
+      action->setToolTip(tooltip);
+    } else if (auto* widget = qobject_cast<QWidget*>(object); widget != nullptr) {
+      widget->setToolTip(tooltip);
+    }
+  }
+
+  if (object->property(kTranslationStatusTipProperty).isValid()) {
+    if (auto* action = qobject_cast<QAction*>(object); action != nullptr) {
+      action->setStatusTip(translate_source(object, kTranslationStatusTipProperty));
+    }
+  }
+}
+
+void bind_action_text(QAction* action, const char* source) {
+  bind_translated_text(action, source);
+  apply_bound_translation(action);
+}
+
+void bind_widget_text(QObject* object, const char* source) {
+  bind_translated_text(object, source);
+  apply_bound_translation(object);
+}
+
+void bind_tooltip(QObject* object, const char* source) {
+  bind_translated_tooltip(object, source);
+  apply_bound_translation(object);
+}
+
+// The palette labels double as object names (tool_action_object_name, plain_tool_button_object_name):
+// never change one. Translated in the MainWindow context through bind_action_text.
+const char* tool_action_source(CanvasTool tool) {
+  switch (tool) {
+    case CanvasTool::Move:
+      return QT_TRANSLATE_NOOP("patchy::ui::MainWindow", "Move");
+    case CanvasTool::Marquee:
+      return QT_TRANSLATE_NOOP("patchy::ui::MainWindow", "Marquee");
+    case CanvasTool::EllipticalMarquee:
+      return QT_TRANSLATE_NOOP("patchy::ui::MainWindow", "Elliptical Marquee");
+    case CanvasTool::Lasso:
+      return QT_TRANSLATE_NOOP("patchy::ui::MainWindow", "Lasso");
+    case CanvasTool::PolygonLasso:
+      return QT_TRANSLATE_NOOP("patchy::ui::MainWindow", "Polygonal Lasso");
+    case CanvasTool::MagneticLasso:
+      return QT_TRANSLATE_NOOP("patchy::ui::MainWindow", "Magnetic Lasso");
+    case CanvasTool::MagicWand:
+      return QT_TRANSLATE_NOOP("patchy::ui::MainWindow", "Magic Wand");
+    case CanvasTool::QuickSelect:
+      return QT_TRANSLATE_NOOP("patchy::ui::MainWindow", "Quick Select");
+    case CanvasTool::ObjectSelect:
+      return QT_TRANSLATE_NOOP("patchy::ui::MainWindow", "Object Selection");
+    case CanvasTool::Brush:
+      return QT_TRANSLATE_NOOP("patchy::ui::MainWindow", "Brush");
+    case CanvasTool::MixerBrush:
+      return QT_TRANSLATE_NOOP("patchy::ui::MainWindow", "Mixer Brush");
+    case CanvasTool::Clone:
+      return QT_TRANSLATE_NOOP("patchy::ui::MainWindow", "Clone");
+    case CanvasTool::PatternStamp:
+      return QT_TRANSLATE_NOOP("patchy::ui::MainWindow", "Pattern Stamp");
+    case CanvasTool::Healing:
+      return QT_TRANSLATE_NOOP("patchy::ui::MainWindow", "Healing Brush");
+    case CanvasTool::Smudge:
+      return QT_TRANSLATE_NOOP("patchy::ui::MainWindow", "Smudge");
+    case CanvasTool::Dodge:
+      return QT_TRANSLATE_NOOP("patchy::ui::MainWindow", "Dodge");
+    case CanvasTool::Burn:
+      return QT_TRANSLATE_NOOP("patchy::ui::MainWindow", "Burn");
+    case CanvasTool::Sponge:
+      return QT_TRANSLATE_NOOP("patchy::ui::MainWindow", "Sponge");
+    case CanvasTool::BlurBrush:
+      return QT_TRANSLATE_NOOP("patchy::ui::MainWindow", "Blur");
+    case CanvasTool::SharpenBrush:
+      return QT_TRANSLATE_NOOP("patchy::ui::MainWindow", "Sharpen");
+    case CanvasTool::Eraser:
+      return QT_TRANSLATE_NOOP("patchy::ui::MainWindow", "Eraser");
+    case CanvasTool::Gradient:
+      return QT_TRANSLATE_NOOP("patchy::ui::MainWindow", "Gradient");
+    case CanvasTool::Line:
+      return QT_TRANSLATE_NOOP("patchy::ui::MainWindow", "Line");
+    case CanvasTool::Rectangle:
+      return QT_TRANSLATE_NOOP("patchy::ui::MainWindow", "Rect");
+    case CanvasTool::Ellipse:
+      return QT_TRANSLATE_NOOP("patchy::ui::MainWindow", "Ellipse");
+    case CanvasTool::Fill:
+      return QT_TRANSLATE_NOOP("patchy::ui::MainWindow", "Fill");
+    case CanvasTool::Eyedropper:
+      return QT_TRANSLATE_NOOP("patchy::ui::MainWindow", "Pick");
+    case CanvasTool::Ruler:
+      return QT_TRANSLATE_NOOP("patchy::ui::MainWindow", "Ruler");
+    case CanvasTool::Text:
+      return QT_TRANSLATE_NOOP("patchy::ui::MainWindow", "Type");
+    case CanvasTool::Pan:
+      return QT_TRANSLATE_NOOP("patchy::ui::MainWindow", "Hand");
+    case CanvasTool::Zoom:
+      return QT_TRANSLATE_NOOP("patchy::ui::MainWindow", "Zoom");
+    case CanvasTool::Pen:
+      return QT_TRANSLATE_NOOP("patchy::ui::MainWindow", "Pen");
+    case CanvasTool::PathSelect:
+      return QT_TRANSLATE_NOOP("patchy::ui::MainWindow", "Path Select");
+    case CanvasTool::DirectSelect:
+      return QT_TRANSLATE_NOOP("patchy::ui::MainWindow", "Direct Select");
+    case CanvasTool::Polygon:
+      return QT_TRANSLATE_NOOP("patchy::ui::MainWindow", "Polygon");
+    case CanvasTool::CustomShape:
+      return QT_TRANSLATE_NOOP("patchy::ui::MainWindow", "Custom Shape");
+    case CanvasTool::SpotHealing:
+      return QT_TRANSLATE_NOOP("patchy::ui::MainWindow", "Spot Healing");
+    case CanvasTool::PatchTool:
+      return QT_TRANSLATE_NOOP("patchy::ui::MainWindow", "Patch");
+    case CanvasTool::ContentAwareMove:
+      return QT_TRANSLATE_NOOP("patchy::ui::MainWindow", "Content-Aware Move");
+    case CanvasTool::RedEye:
+      return QT_TRANSLATE_NOOP("patchy::ui::MainWindow", "Red Eye");
+    case CanvasTool::ColorReplace:
+      return QT_TRANSLATE_NOOP("patchy::ui::MainWindow", "Color Replacement");
+    case CanvasTool::BackgroundEraser:
+      return QT_TRANSLATE_NOOP("patchy::ui::MainWindow", "Background Eraser");
+    case CanvasTool::MagicEraser:
+      return QT_TRANSLATE_NOOP("patchy::ui::MainWindow", "Magic Eraser");
+    case CanvasTool::Crop:
+      return QT_TRANSLATE_NOOP("patchy::ui::MainWindow", "Crop");
+    case CanvasTool::PerspectiveCrop:
+      return QT_TRANSLATE_NOOP("patchy::ui::MainWindow", "Perspective Crop");
+    case CanvasTool::AddAnchor:
+      return QT_TRANSLATE_NOOP("patchy::ui::MainWindow", "Add Anchor");
+    case CanvasTool::DeleteAnchor:
+      return QT_TRANSLATE_NOOP("patchy::ui::MainWindow", "Delete Anchor");
+    case CanvasTool::ConvertPoint:
+      return QT_TRANSLATE_NOOP("patchy::ui::MainWindow", "Convert Point");
+    case CanvasTool::Artboard:
+      return QT_TRANSLATE_NOOP("patchy::ui::MainWindow", "Artboard");
+    case CanvasTool::RotateView:
+      return QT_TRANSLATE_NOOP("patchy::ui::MainWindow", "Rotate View");
+    case CanvasTool::TypeMask:
+      return QT_TRANSLATE_NOOP("patchy::ui::MainWindow", "Type Mask");
+  }
+  return QT_TRANSLATE_NOOP("patchy::ui::MainWindow", "Tool");
+}
+
+// The status bar and Info panel name a tool as the palette does: one table, so "Pick" and "Hand"
+// never read as Eyedropper and Pan in one place and Pick and Hand in the other.
+QString tool_name(CanvasTool tool) {
+  return QCoreApplication::translate("patchy::ui::MainWindow", tool_action_source(tool));
+}
+
+QString select_layer_first_message(const QString& command) {
+  //: %1 is the command or tool that needs a target layer, for example "Stroke Selection".
+  return QCoreApplication::translate("patchy::ui::MainWindow", "%1: select a layer first").arg(command);
+}
+
+int text_smoothing_combo_value(const QComboBox* combo) {
+  if (combo == nullptr) {
+    return kDefaultTextAntiAlias;
+  }
+  bool ok = false;
+  const auto value = combo->currentData().toInt(&ok);
+  return std::clamp(ok ? value : kDefaultTextAntiAlias, 0, 16);
+}
+
+void set_text_smoothing_combo_value(QComboBox* combo, int value) {
+  if (combo == nullptr) {
+    return;
+  }
+  value = std::clamp(value, 0, 16);
+  const auto index = combo->findData(value);
+  const auto fallback_index = combo->findData(kDefaultTextAntiAlias);
+  const QSignalBlocker blocker(combo);
+  combo->setCurrentIndex(index >= 0 ? index : std::max(0, fallback_index));
+}
+
+namespace {
+
+bool ui_profile_enabled() noexcept {
+  static const bool enabled = qEnvironmentVariableIsSet("PATCHY_UI_PROFILE");
+  return enabled;
+}
+
+}  // namespace
+
+void log_ui_profile(std::string_view stage, double elapsed_ms, std::string_view detail) {
+  if (!ui_profile_enabled()) {
+    return;
+  }
+  // One write per line: workers log too (page decodes, fingerprints, encoders), and
+  // piecewise output from two threads interleaves.
+  std::ostringstream line;
+  line << "PATCHY_UI_PROFILE stage=" << stage << " elapsed_ms=" << elapsed_ms;
+  if (!detail.empty()) {
+    line << " detail=\"" << detail << "\"";
+  }
+  line << '\n';
+  std::cerr << line.str();
+}
+
+void restyle_layer_rows(QListWidget* list) {
+  if (list == nullptr) {
+    return;
+  }
+  const UiProfileScope profile_scope("restyle_layer_rows");
+  for (int row = 0; row < list->count(); ++row) {
+    auto* item = list->item(row);
+    auto* row_widget = list->itemWidget(item);
+    if (row_widget == nullptr) {
+      continue;
+    }
+    const auto is_group = item->data(kLayerIsGroupRole).toBool();
+    // The row visuals live in app-stylesheet rules keyed on these dynamic
+    // properties (see photoshop_style). A per-widget setStyleSheet background
+    // here never showed: the row's inner containers painted the global QWidget
+    // window_bg over it (the theme now forces them transparent).
+    if (row_widget->property("layerRowSelected").toBool() != item->isSelected() ||
+        row_widget->property("layerRowGroup").toBool() != is_group) {
+      row_widget->setProperty("layerRowSelected", item->isSelected());
+      row_widget->setProperty("layerRowGroup", is_group);
+      row_widget->style()->unpolish(row_widget);
+      row_widget->style()->polish(row_widget);
+      row_widget->update();
+    }
+    if (auto* name = row_widget->findChild<QLabel*>(QStringLiteral("layerRowName")); name != nullptr) {
+      auto font = name->font();
+      font.setBold(item == list->currentItem() || is_group);
+      name->setFont(font);
+    }
+  }
+}
+
+bool smart_filter_mask_document_editing_supported(
+    std::int32_t document_width, std::int32_t document_height) noexcept {
+  const auto document_pixels =
+      document_width > 0 && document_height > 0
+          ? static_cast<std::uint64_t>(document_width) *
+                static_cast<std::uint64_t>(document_height)
+          : 0;
+  return document_pixels > 0 &&
+         document_pixels <= psd::kMaximumEditableSmartFilterMaskPixels;
+}
+
+std::optional<PixelBuffer> materialize_smart_filter_mask(
+    const SmartFilterMask& mask, std::int32_t document_width,
+    std::int32_t document_height) {
+  if (!smart_filter_mask_document_editing_supported(document_width,
+                                                     document_height) ||
+      mask.pixels.empty() ||
+      mask.pixels.format() != PixelFormat::gray8() ||
+      mask.bounds.width != mask.pixels.width() ||
+      mask.bounds.height != mask.pixels.height()) {
+    return std::nullopt;
+  }
+  PixelBuffer pixels(document_width, document_height, PixelFormat::gray8());
+  pixels.clear(mask.extend_with_white ? 255U : mask.default_color);
+  const auto left = std::max<std::int64_t>(0, mask.bounds.x);
+  const auto top = std::max<std::int64_t>(0, mask.bounds.y);
+  const auto right = std::min<std::int64_t>(
+      document_width, static_cast<std::int64_t>(mask.bounds.x) +
+                          mask.bounds.width);
+  const auto bottom = std::min<std::int64_t>(
+      document_height, static_cast<std::int64_t>(mask.bounds.y) +
+                           mask.bounds.height);
+  for (auto y = top; y < bottom; ++y) {
+    for (auto x = left; x < right; ++x) {
+      *pixels.pixel(static_cast<std::int32_t>(x),
+                    static_cast<std::int32_t>(y)) =
+          *mask.pixels.pixel(
+              static_cast<std::int32_t>(x - mask.bounds.x),
+              static_cast<std::int32_t>(y - mask.bounds.y));
+    }
+  }
+  return pixels;
+}
+
+void update_layer_target_styles(QListWidget* list, std::optional<LayerId> active_layer,
+                                CanvasWidget::LayerEditTarget edit_target) {
+  if (list == nullptr) {
+    return;
+  }
+  const UiProfileScope profile_scope("update_layer_target_styles");
+
+  auto set_target_active = [](QWidget* widget, bool active) {
+    if (widget == nullptr || (widget->property("layerTargetActive").isValid() &&
+                             widget->property("layerTargetActive").toBool() == active)) {
+      return;
+    }
+    widget->setProperty("layerTargetActive", active);
+    widget->style()->unpolish(widget);
+    widget->style()->polish(widget);
+    widget->update();
+  };
+
+  for (int row = 0; row < list->count(); ++row) {
+    auto* item = list->item(row);
+    auto* row_widget = list->itemWidget(item);
+    if (item == nullptr || row_widget == nullptr) {
+      continue;
+    }
+    const auto layer_id = static_cast<LayerId>(item->data(kLayerIdRole).toULongLong());
+    const auto row_active = active_layer.has_value() && *active_layer == layer_id;
+    set_target_active(row_widget->findChild<QWidget*>(QStringLiteral("layerContentThumbnail")),
+                      row_active && edit_target == CanvasWidget::LayerEditTarget::Content);
+    set_target_active(row_widget->findChild<QWidget*>(QStringLiteral("layerMaskThumbnail")),
+                      row_active && edit_target == CanvasWidget::LayerEditTarget::Mask);
+    set_target_active(row_widget->findChild<QWidget*>(QStringLiteral("layerVectorMaskThumbnail")),
+                      row_active && edit_target == CanvasWidget::LayerEditTarget::VectorMask);
+    set_target_active(
+        row_widget->findChild<QWidget*>(
+            QStringLiteral("layerSmartFilterMaskThumbnail")),
+        row_active &&
+            edit_target == CanvasWidget::LayerEditTarget::SmartFilterMask);
+  }
+}
+
+bool layer_has_rasterizable_content(const Layer& layer) {
+  return layer.kind() == LayerKind::Pixel || layer.kind() == LayerKind::Text || layer_is_text(layer);
+}
+
+bool layer_can_rasterize(const Layer& layer) {
+  return layer.kind() == LayerKind::Text || layer_is_text(layer) || layer_is_smart_object(layer) ||
+         layer_is_vector_shape(layer);
+}
+
+bool layer_can_rasterize_layer_style(const Layer& layer) {
+  return layer_has_rasterizable_content(layer) && !layer.layer_style().empty();
+}
+
+QString default_file_dialog_directory() {
+  auto path = QStandardPaths::writableLocation(QStandardPaths::DocumentsLocation);
+  if (path.isEmpty()) {
+    path = QDir::homePath();
+  }
+  return path;
+}
+
+QString last_save_directory() {
+  auto settings = app_settings();
+  const auto path = settings.value(QStringLiteral("lastSaveDirectory")).toString();
+  if (!path.isEmpty()) {
+    const QFileInfo info(path);
+    if (info.isDir()) {
+      return info.absoluteFilePath();
+    }
+  }
+  return default_file_dialog_directory();
+}
+
+void remember_save_directory_for_path(const QString& path) {
+  const QFileInfo info(path);
+  const auto directory = info.absoluteDir();
+  if (!directory.exists()) {
+    return;
+  }
+  auto settings = app_settings();
+  settings.setValue(QStringLiteral("lastSaveDirectory"), directory.absolutePath());
+}
+
+QString file_dialog_initial_path(const QString& existing_path, const QString& filename) {
+  if (!existing_path.isEmpty()) {
+    return existing_path;
+  }
+  return QDir(last_save_directory()).filePath(filename);
+}
+
+QString last_open_directory() {
+  auto settings = app_settings();
+  const auto path = settings.value(QStringLiteral("lastOpenDirectory")).toString();
+  if (!path.isEmpty()) {
+    const QFileInfo info(path);
+    if (info.isDir()) {
+      return info.absoluteFilePath();
+    }
+  }
+  return default_file_dialog_directory();
+}
+
+QString last_place_directory() {
+  const auto path = app_settings().value(QStringLiteral("lastPlaceDirectory")).toString();
+  if (!path.isEmpty()) {
+    const QFileInfo info(path);
+    if (info.isDir()) {
+      return info.absoluteFilePath();
+    }
+  }
+  return last_open_directory();
+}
+
+void remember_place_directory_for_path(const QString& path) {
+  const QFileInfo info(QFileInfo(path).absolutePath());
+  if (path.isEmpty() || !info.isDir()) {
+    return;
+  }
+  auto settings = app_settings();
+  settings.setValue(QStringLiteral("lastPlaceDirectory"), info.absoluteFilePath());
+}
+
+namespace {
+
+bool smart_filter_record_is_cloneable(const SmartFilterEffectsRecord& record) {
+  return !record.original_placed_uuid.empty() && record.raw_storage != nullptr &&
+         record.raw_body_offset <= record.raw_storage->size() &&
+         record.raw_body_length <= record.raw_storage->size() - record.raw_body_offset;
+}
+
+const SmartFilterEffectsRecord* transferred_smart_filter_record(
+    const std::vector<SmartFilterEffectsRecord>& records, std::string_view placed_uuid) {
+  const SmartFilterEffectsRecord* found = nullptr;
+  for (const auto& record : records) {
+    if (record.placed_uuid != placed_uuid) {
+      continue;
+    }
+    if (found != nullptr) {
+      return nullptr;
+    }
+    found = &record;
+  }
+  return found;
+}
+
+}  // namespace
+
+class PhotoshopLayerIdAllocator {
+public:
+  explicit PhotoshopLayerIdAllocator(const std::vector<Layer>& layers) {
+    const auto collect = [this](const auto& self,
+                                const std::vector<Layer>& siblings) -> void {
+      for (const auto& layer : siblings) {
+        if (const auto id = patchy::photoshop_layer_id(layer); id.has_value()) {
+          used_.insert(*id);
+        }
+        self(self, layer.children());
+      }
+    };
+    collect(collect, layers);
+    if (!used_.empty() &&
+        *used_.rbegin() != std::numeric_limits<std::uint32_t>::max()) {
+      next_ = *used_.rbegin() + 1U;
+    }
+  }
+
+  [[nodiscard]] std::optional<std::uint32_t> allocate() {
+    // A run of occupied candidates cannot be longer than used_.size(). Trying
+    // one more value therefore either finds a hole or proves the id space full.
+    const auto attempts = used_.size() + 1U;
+    for (std::size_t attempt = 0; attempt < attempts; ++attempt) {
+      const auto candidate = next_;
+      next_ = candidate == std::numeric_limits<std::uint32_t>::max()
+                  ? 1U
+                  : candidate + 1U;
+      if (used_.insert(candidate).second) {
+        return candidate;
+      }
+    }
+    return std::nullopt;
+  }
+
+private:
+  std::set<std::uint32_t> used_;
+  std::uint32_t next_{1U};
+};
+
+bool smart_filter_records_available_for_clone(
+    const Layer& source, const SmartFilterEffectsStore& store,
+    const std::vector<SmartFilterEffectsRecord>* transferred_records) {
+  if (source.smart_filter_stack() != nullptr) {
+    const auto placed_uuid = smart_object_placed_uuid(source);
+    const auto* record = transferred_records != nullptr
+                             ? transferred_smart_filter_record(*transferred_records, placed_uuid)
+                             : store.find_unique(placed_uuid);
+    if (record == nullptr || !smart_filter_record_is_cloneable(*record)) {
+      return false;
+    }
+  }
+  return std::all_of(source.children().begin(), source.children().end(),
+                     [&](const Layer& child) {
+                       return smart_filter_records_available_for_clone(
+                           child, store, transferred_records);
+                     });
+}
+
+std::optional<Layer> clone_layer_tree_with_document_ids(
+    Document& document, const Layer& source,
+    const std::vector<SmartFilterEffectsRecord>* transferred_records,
+    PhotoshopLayerIdAllocator* native_layer_ids) {
+  std::optional<PhotoshopLayerIdAllocator> owned_native_layer_ids;
+  if (native_layer_ids == nullptr) {
+    owned_native_layer_ids.emplace(document.layers());
+    native_layer_ids = &*owned_native_layer_ids;
+  }
+  auto cloned = source.clone_with_id(document.allocate_layer_id());
+  cloned.children().clear();
+  if (patchy::photoshop_layer_id(source).has_value()) {
+    const auto new_native_layer_id = native_layer_ids->allocate();
+    if (!new_native_layer_id.has_value()) {
+      return std::nullopt;
+    }
+    patchy::set_photoshop_layer_id(cloned, *new_native_layer_id);
+  }
+
+  if (layer_is_smart_object(source)) {
+    const auto old_placed_uuid = smart_object_placed_uuid(source);
+    if (!old_placed_uuid.empty()) {
+      const auto new_placed_uuid = generate_smart_object_uuid();
+      if (source.smart_filter_stack() != nullptr) {
+        bool cache_cloned = false;
+        if (transferred_records != nullptr) {
+          if (const auto* record = transferred_smart_filter_record(
+                  *transferred_records, old_placed_uuid);
+              record != nullptr) {
+            cache_cloned = document.metadata().smart_filter_effects.adopt(
+                *record, new_placed_uuid);
+          }
+        } else {
+          cache_cloned = document.metadata().smart_filter_effects.clone_rekey(
+              old_placed_uuid, new_placed_uuid);
+        }
+        if (!cache_cloned) {
+          return std::nullopt;
+        }
+      }
+      cloned.metadata()[kLayerMetadataSmartObjectPlaced] = new_placed_uuid;
+      mark_layer_smart_object_block_dirty(cloned);
+    }
+  }
+
+  for (const auto& child : source.children()) {
+    auto child_clone = clone_layer_tree_with_document_ids(document, child,
+                                                          transferred_records,
+                                                          native_layer_ids);
+    if (!child_clone.has_value()) {
+      return std::nullopt;
+    }
+    cloned.add_child(std::move(*child_clone));
+  }
+  return cloned;
+}
+// Promoted from main_window.cpp's anonymous namespace: used by the
+// document-dialog TU and by the layer/selection commands that stayed in
+// main_window.cpp.
+PixelBuffer coverage_at_document_depth(const Document& document, PixelBuffer coverage) {
+  const auto depth = document.color_state().bit_depth;
+  if (coverage.empty() || coverage.format().bit_depth == depth) {
+    return coverage;
+  }
+  return convert_pixel_buffer_depth(coverage, depth, SampleKind::Coverage);
+}
+
+PixelBuffer make_solid_pixels(std::int32_t width, std::int32_t height, QColor color, PixelFormat format) {
+  PixelBuffer pixels(width, height, format);
+  if (format.bit_depth != BitDepth::UInt8 && format.channels >= 3) {
+    // 16/32-bit: the 8-bit color at the buffer's depth (docs/high-bit-depth.md).
+    std::vector<float> row(static_cast<std::size_t>(std::max(0, width)) * 4U);
+    for (std::size_t i = 0; i < row.size(); i += 4U) {
+      row[i] = static_cast<float>(color.red());
+      row[i + 1U] = static_cast<float>(color.green());
+      row[i + 2U] = static_cast<float>(color.blue());
+      row[i + 3U] = static_cast<float>(color.alpha());
+    }
+    for (std::int32_t y = 0; y < height && width > 0; ++y) {
+      store_rgba_row(pixels, y, 0, width, DeepDomain::Encoded, row);
+    }
+    return pixels;
+  }
+  for (std::int32_t y = 0; y < height; ++y) {
+    for (std::int32_t x = 0; x < width; ++x) {
+      auto* px = pixels.pixel(x, y);
+      px[0] = static_cast<std::uint8_t>(color.red());
+      px[1] = static_cast<std::uint8_t>(color.green());
+      px[2] = static_cast<std::uint8_t>(color.blue());
+      if (format.channels >= 4) {
+        px[3] = static_cast<std::uint8_t>(color.alpha());
+      }
+    }
+  }
+  return pixels;
+}
+
+std::optional<QString> request_text_input(QWidget* parent, const QString& object_name, const QString& title,
+                                          const QString& label, const QString& initial) {
+  QInputDialog dialog(parent);
+  dialog.setObjectName(object_name);
+  dialog.setWindowTitle(title);
+  dialog.setLabelText(label);
+  dialog.setInputMode(QInputDialog::TextInput);
+  dialog.setTextEchoMode(QLineEdit::Normal);
+  dialog.setTextValue(initial);
+  if (exec_dialog(dialog) != QDialog::Accepted) {
+    return std::nullopt;
+  }
+  return dialog.textValue();
+}
+
+std::optional<int> request_integer_input(QWidget* parent, const QString& object_name, const QString& title,
+                                         const QString& label, int value, int minimum, int maximum, int step) {
+  QDialog dialog(parent);
+  dialog.setObjectName(object_name);
+  dialog.setWindowTitle(title);
+  auto* layout = new QVBoxLayout(&dialog);
+  auto* form = new QFormLayout();
+  auto* spin = new QSpinBox(&dialog);
+  spin->setObjectName(QStringLiteral("integerInputSpin"));
+  spin->setRange(minimum, maximum);
+  spin->setSingleStep(std::max(1, step));
+  spin->setValue(std::clamp(value, minimum, maximum));
+  configure_dialog_spinbox(spin);
+  form->addRow(label, spin);
+  layout->addLayout(form);
+  auto* buttons = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel, &dialog);
+  match_ok_cancel_widths(*buttons);
+  layout->addWidget(buttons);
+  QObject::connect(buttons, &QDialogButtonBox::accepted, &dialog, &QDialog::accept);
+  QObject::connect(buttons, &QDialogButtonBox::rejected, &dialog, &QDialog::reject);
+  spin->selectAll();
+  if (exec_dialog(dialog) != QDialog::Accepted) {
+    return std::nullopt;
+  }
+  return spin->value();
+}
+
+namespace {
+
+std::vector<Layer>* layer_siblings_containing(std::vector<Layer>& layers, LayerId id, std::size_t& index) {
+  // Walks const and casts the hit (find_layer_location): descending through the mutable
+  // children() bumped every visited layer's revisions, so each duplicate or new layer
+  // re-rendered the thumbnails of every layer below it (GitHub issue 402).
+  const auto location = find_layer_location(layers, id);
+  if (!location.has_value()) {
+    return nullptr;
+  }
+  index = location->index;
+  return location->siblings;
+}
+
+}  // namespace
+
+void insert_layer_after_anchor(Document& document, Layer layer, std::optional<LayerId> anchor_id) {
+  if (anchor_id.has_value() && layer_is_artboard(std::as_const(layer))) {
+    // Artboards never nest (docs/artboards.md): above the anchor's top-level layer.
+    anchor_id = top_level_ancestor_id(std::as_const(document), *anchor_id);
+  } else if (anchor_id.has_value()) {
+    // A selected artboard takes the new layer inside, on top of its children (Photoshop's
+    // New Layer and Paste, docs/artboards.md "Feature interactions").
+    if (auto* anchor = document.find_layer(*anchor_id); anchor != nullptr && layer_is_artboard(std::as_const(*anchor))) {
+      anchor->add_child(std::move(layer));
+      return;
+    }
+  }
+  if (anchor_id.has_value()) {
+    std::size_t index = 0;
+    if (auto* siblings = layer_siblings_containing(document.layers(), *anchor_id, index); siblings != nullptr) {
+      siblings->insert(siblings->begin() + static_cast<std::ptrdiff_t>(index + 1U), std::move(layer));
+      return;
+    }
+  }
+  document.add_layer(std::move(layer));
+}
+
+void insert_layer_below_anchor(Document& document, Layer layer, std::optional<LayerId> anchor_id) {
+  if (anchor_id.has_value() && layer_is_artboard(std::as_const(layer))) {
+    anchor_id = top_level_ancestor_id(std::as_const(document), *anchor_id);
+  }
+  std::size_t index = 0;
+  auto* siblings =
+      anchor_id.has_value() ? layer_siblings_containing(document.layers(), *anchor_id, index) : nullptr;
+  if (siblings == nullptr) {
+    siblings = &document.layers();
+    index = 0;
+  }
+  siblings->insert(siblings->begin() + static_cast<std::ptrdiff_t>(index), std::move(layer));
+}
+
+void offset_copied_layer_tree(Layer& layer, std::int32_t dx, std::int32_t dy, std::int32_t document_width,
+                              std::int32_t document_height) {
+  if (!layer.bounds().empty()) {
+    const auto bounds = layer.bounds();
+    layer.set_bounds(Rect{bounds.x + dx, bounds.y + dy, bounds.width, bounds.height});
+  }
+  const bool mask_linked = layer_mask_linked(std::as_const(layer));
+  translate_moved_layer_metadata(layer, dx, dy, document_width, document_height);
+  layer.translate_artboard(dx, dy);
+  if (!mask_linked) {
+    if (auto& mask = layer.mask(); mask.has_value()) {
+      mask->bounds.x += dx;
+      mask->bounds.y += dy;
+    }
+  }
+  if (const auto* vector_mask = std::as_const(layer).vector_mask();
+      vector_mask != nullptr && vector_mask->unlinked) {
+    auto moved = *vector_mask;
+    translate_vector_path(moved.path, dx, dy);
+    moved.cache_bounds.x += dx;
+    moved.cache_bounds.y += dy;
+    layer.set_vector_mask_translated(std::move(moved));
+    mark_layer_vector_block_dirty(layer);
+  }
+  for (auto& child : layer.children()) {
+    offset_copied_layer_tree(child, dx, dy, document_width, document_height);
+  }
+}
+
+std::string duplicate_name_stem(std::string_view name) {
+  constexpr std::string_view kCopySuffix = " copy";
+  constexpr std::string_view kNumberedCopySuffix = " copy ";
+  const auto lower = ascii_lower_copy(name);
+  if (lower.size() > kCopySuffix.size() && lower.ends_with(kCopySuffix)) {
+    return std::string(name.substr(0, name.size() - kCopySuffix.size()));
+  }
+
+  const auto suffix_position = lower.rfind(kNumberedCopySuffix);
+  if (suffix_position == std::string::npos || suffix_position == 0) {
+    return std::string(name);
+  }
+  const auto number_position = suffix_position + kNumberedCopySuffix.size();
+  if (number_position >= lower.size()) {
+    return std::string(name);
+  }
+
+  bool suffix_is_number = true;
+  for (auto index = number_position; index < lower.size(); ++index) {
+    if (std::isdigit(static_cast<unsigned char>(lower[index])) == 0) {
+      suffix_is_number = false;
+      break;
+    }
+  }
+  return suffix_is_number ? std::string(name.substr(0, suffix_position)) : std::string(name);
+}
+
+std::string next_duplicate_name(std::string_view source_name,
+                                const std::set<std::string>& existing_names) {
+  const auto stem = duplicate_name_stem(source_name);
+  for (int copy_index = 1;; ++copy_index) {
+    auto candidate = stem + " copy";
+    if (copy_index > 1) {
+      candidate += ' ';
+      candidate += std::to_string(copy_index);
+    }
+    if (!existing_names.contains(candidate)) {
+      return candidate;
+    }
+  }
+}
+
+}  // namespace patchy::ui

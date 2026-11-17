@@ -1,0 +1,89 @@
+#pragma once
+
+// Color-scheme-aware icons.
+//
+// The 98 hand-authored SVGs in src/ui/icons are drawn in a fixed ten-color
+// vocabulary (icon_ink plus nine accents, see theme_palette.hpp). Rather than
+// maintaining a second light-mode icon set, a QIconEngine substitutes those
+// colors in the SVG *text* before rasterizing, at paint time. Substituting the
+// text rather than the rendered pixels keeps gradients and antialiasing exact:
+// tool-gradient.svg's <linearGradient> stops recolor like any other attribute.
+//
+// This is what makes a live scheme change cheap. In Qt 6 a QIcon holds no pixmap
+// cache of its own and nothing outside the stock engines keys on
+// QIcon::cacheKey(), so a QIcon handed to a QAction at startup renders in the new
+// scheme on its next repaint. A scheme change must NOT call QAction::setIcon;
+// nothing needs rebuilding.
+//
+// Two deliberate exclusions:
+//   * default-colors.svg and swap-colors.svg draw the black and white paint
+//     swatches, and quick-mask(-on).svg the mask overlay's red. Those fills
+//     depict colors and must never be recolored, which is why #ffffff, #111111
+//     and #eb5f6e are absent from the substitution map. Their outlines are
+//     ordinary icon ink and do recolor.
+//   * The SVGs referenced from QSS by url() (checkmark, scroll-dither,
+//     tool-flyout-corner, the four spin arrows) cannot go through a QIconEngine
+//     at all: QStyleSheetStyle loads them as plain files. They get hand-authored
+//     light variants under icons/light/, selected by themed_icon_url().
+//
+// ui_icon_color_map_covers_every_authored_color enforces both.
+
+#include "ui/theme_palette.hpp"
+
+#include <QByteArray>
+#include <QColor>
+#include <QIcon>
+#include <QString>
+#include <QStringList>
+
+#include <span>
+#include <utility>
+
+namespace patchy::ui {
+
+// ":/patchy/icons/<name>.svg" recolored for the active scheme.
+[[nodiscard]] QByteArray themed_icon_svg(const QString& name);
+// Substitutes the authored icon colors in `svg` with the active palette's roles,
+// the recoloring themed_icon_svg applies (also used for a theme package's SVG
+// overrides when its "recolorIcons" is on).
+[[nodiscard]] QByteArray recolor_icon_svg(QByteArray svg);
+// Gives a theme package's SVG the color its "currentColor" stands for: icon sets such
+// as Tabler and Lucide write stroke="currentColor" for the page to fill in, and QtSvg
+// alone draws that black. The root <svg> gets color="<color>", so every currentColor
+// (attribute or style, stroke or fill) resolves to it; an SVG whose root sets its own
+// color keeps it, and one that never says currentColor comes back unchanged. Applied
+// whatever "recolorIcons" says. Built-in icons never use currentColor
+// (ui_icon_color_map_covers_every_authored_color).
+[[nodiscard]] QByteArray resolve_svg_current_color(QByteArray svg, const QColor& color);
+
+// Every SVG stem in the icon resources (light/ variants left out), sorted, and one
+// stem's bytes as authored.
+[[nodiscard]] QStringList builtin_icon_stems();
+[[nodiscard]] QByteArray builtin_icon_svg(const QString& name);
+
+// A QIcon backed by the recoloring engine. `name` is the resource stem, without
+// the directory or the .svg suffix. The active theme package's icons/<name> file,
+// when it has one, is drawn instead (theme_package.hpp); the engine re-reads that
+// choice whenever theme_generation() moves, so a theme switch repaints in place.
+[[nodiscard]] QIcon themed_svg_icon(const QString& name);
+// The same with a second stem drawn for QIcon::On, for checkable actions whose
+// checked look is its own drawing (Quick Mask).
+[[nodiscard]] QIcon themed_svg_icon(const QString& name, const QString& on_name);
+
+// Resource path for a QSS url(): the icons/light/ variant when the active scheme
+// is Light and that variant exists, otherwise the base path. A custom theme's
+// scroll-dither comes from themed_scroll_gutter_url() (theme_backdrop.hpp) when it
+// differs from the built-in one.
+[[nodiscard]] QString themed_icon_url(const QString& name);
+
+using IconColorRole = std::pair<QLatin1StringView, QColor ThemePalette::*>;
+
+// Source hex (lowercase, with '#') to palette role. Exposed for the audit test.
+[[nodiscard]] std::span<const IconColorRole> icon_color_roles();
+
+// Icon stems whose colors are intentionally not substituted, and why. Exposed for
+// the audit test so a new icon cannot quietly join the list.
+[[nodiscard]] QStringList literal_color_icon_names();
+[[nodiscard]] QStringList stylesheet_referenced_icon_names();
+
+}  // namespace patchy::ui

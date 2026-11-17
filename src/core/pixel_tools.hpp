@@ -1,0 +1,544 @@
+#pragma once
+
+#include "core/brush_tip.hpp"
+#include "core/document.hpp"
+#include "core/paint_mode.hpp"
+#include "core/palette.hpp"
+#include "core/rect_utils.hpp"
+#include "core/resample.hpp"
+
+#include <array>
+#include <cstddef>
+#include <cstdint>
+#include <functional>
+#include <optional>
+#include <string_view>
+#include <utility>
+#include <vector>
+
+namespace patchy {
+
+struct EditColor {
+  std::uint8_t r{0};
+  std::uint8_t g{0};
+  std::uint8_t b{0};
+  std::uint8_t a{255};
+};
+
+// Procedural brush footprint used while no bitmap tip is set. Append-only: the script tip
+// ids "builtin.round" and "builtin.square" map onto these values.
+enum class BrushShape : std::uint8_t { Round, Square };
+
+struct EditOptions {
+  // A 16/32-bit layer's paint color when it is finer than `primary` (the gradient
+  // tool's interpolated color), straight RGBA on the deep scale in the layer's domain;
+  // unset means `primary` (docs/high-bit-depth.md).
+  std::optional<std::array<float, 4>> deep_primary;
+  EditColor primary{};
+  EditColor secondary{255, 255, 255, 255};
+  // Linear-light multipliers of `primary` and `secondary` (2^stops of the color's Intensity,
+  // core/hdr_color.hpp): 32-bit layers scale the decoded colors by them, so a foreground
+  // above display white paints values above 1.0. 8 and 16-bit layers ignore them.
+  float primary_gain{1.0F};
+  float secondary_gain{1.0F};
+  int brush_size{12};
+  int brush_softness{0};
+  int brush_roundness{100};
+  double brush_angle_degrees{0.0};
+  BrushShape brush_shape{BrushShape::Round};  // procedural footprint; ignored while brush_tip is set
+  const ScaledBrushTip* brush_tip{nullptr};  // non-owning; null = procedural round/soft brush
+  double brush_tip_spacing{0.25};            // dab spacing as a fraction of brush_size
+  BrushDynamics brush_dynamics{};            // per-dab tip dynamics; default = disabled
+  bool fill_shapes{false};
+  int shape_corner_radius{0};
+  double fill_softness_feather{0.0};  // fill_rect/flood_fill: inward edge feather band (px); 0 = hard edge
+  // fill_rect only: the Edit > Fill dialog's Mode (GitHub issue 530). Normal keeps the
+  // ordinary write_pixel path bit for bit; any other mode composites through paint_mode.
+  PaintMode fill_paint_mode{};
+  // flood_fill only. Tolerance is the Magic Wand's metric (color_within_tolerance), so Fill
+  // tolerance N accepts exactly the pixels Wand tolerance N selects; 0 is an exact match.
+  // Contiguous limits the fill to pixels connected to the click; off fills every matching
+  // pixel of the layer (within the selection), like Photoshop's Contiguous checkbox.
+  int flood_tolerance{0};
+  bool flood_contiguous{true};
+  bool lock_transparent_pixels{false};
+  // Smudge only: its Strength, 0..1 (GitHub issue 675; the options bar's own field, default 50%).
+  // smudge_brush_segment maps it through smudge_carry_amount; `primary` plays no part.
+  float smudge_strength{0.5F};
+  // Palette-mode write constraint (non-owning, caller keeps the LUT alive for the
+  // operation). When set, pixel writes binarize coverage at its threshold, blend
+  // at full strength, then snap RGB to the palette and alpha to 0/255. Null =
+  // the historical write path, bit for bit.
+  const PaletteSnapContext* palette_snap{nullptr};
+  std::optional<Rect> selection;
+  std::vector<Rect> selection_scan_rects;
+  std::function<bool(std::int32_t, std::int32_t)> selection_mask;
+  std::function<float(std::int32_t, std::int32_t)> selection_coverage;
+  std::function<bool(std::int32_t, std::int32_t)> stroke_pixel_gate;
+  // A disk (document pixel centre and radius) this stroke already painted at full coverage, so
+  // `stroke_pixel_gate` rejects every pixel inside it. The procedural hard round segment skips
+  // those pixels instead of testing each one, which keeps a short move of a big brush from
+  // costing the brush's whole area (GitHub issue 135). The caller guarantees the skipped pixels
+  // would be no-ops: same color and opacity, no partial selection coverage.
+  struct CoveredDisk {
+    double x{0.0};
+    double y{0.0};
+    double radius{0.0};
+  };
+  std::optional<CoveredDisk> stroke_covered_disk;
+  // Optional per-dab color source. Called exactly once for each spatial dab, before any of that
+  // dab's pixels are written. The returned alpha participates in the ordinary opacity/Flow cap.
+  std::function<EditColor(double, double, const EditColor&)> dab_primary_provider;
+  // Observes the final per-pixel coverage before the stroke writer's alpha gate. The canvas uses
+  // this to build one union mask for Wet Edges, so interior stamp boundaries never become edges.
+  std::function<void(std::int32_t, std::int32_t, float, const EditColor&)>
+      stroke_coverage_observer;
+  // The last argument is the dab's effective primary color. It normally equals `primary`, but
+  // Color Dynamics supplies a per-dab value while retaining the stroke compositor.
+  std::function<bool(std::int32_t, std::int32_t, std::uint8_t*, std::uint16_t, float,
+                     const EditColor&)>
+      stroke_pixel_writer;
+  std::function<void()> progress_callback;
+  // Optional cooperative boundary between completed stamp batches. Returning
+  // true stops this segment and preserves its completed pixels and dirty bounds.
+  std::function<bool(Rect)> stroke_progress;
+};
+
+enum class ShapeKind {
+  Rectangle,
+  Ellipse
+};
+
+// Pure geometric coverage of a shape pixel, in [0,1]. Shared by the pixel-layer renderer and the
+// layer-mask renderer so both produce identical antialiased / soft / rounded shapes. Carries no
+// Document/PixelBuffer dependency.
+struct ShapeCoverageParams {
+  ShapeKind kind{ShapeKind::Rectangle};
+  bool fill{false};
+  double cx{0.0};               // shape center (document pixels)
+  double cy{0.0};
+  double rx{1.0};               // ellipse radii / rectangle half-extents
+  double ry{1.0};
+  double corner_radius{0.0};    // rounded-rect radius (px); ignored for ellipse
+  double half_thickness{1.0};   // outline ring half-width (= brush_size/2)
+  double band{1.0};             // antialias + softness band width (px)
+};
+
+[[nodiscard]] ShapeCoverageParams make_shape_coverage_params(Rect rect, const EditOptions& options,
+                                                            ShapeKind kind);
+[[nodiscard]] float shape_pixel_coverage(const ShapeCoverageParams& params, std::int32_t x,
+                                         std::int32_t y) noexcept;
+
+// Procedural round-brush coverage falloff: 1 inside the hard core, a smoothstep
+// over the softness band (softness percent of the radius, at least one pixel),
+// 0 outside the radius. The brush engine's stamp shapes, the canvas brush
+// preview and the spot-healing footprint all sample this one function; its
+// output is pinned by tool_write_paths_digest_baseline.
+[[nodiscard]] float brush_coverage(double distance_squared, int radius, int softness);
+
+// One dab's coverage at an offset (pixel index minus dab position) from where it lands, before
+// selection, flow, opacity and per-dab dynamics: the scaled tip under its angle and roundness
+// when options.brush_tip is set, else the procedural Round or Square footprint. paint_brush_dab
+// stamps exactly this at whole-pixel offsets (a 1 px dab fully covers the one pixel nearest it,
+// offsets in (-0.5, 0.5]); the Brush tool's live overlay previews it (GitHub issue 517).
+[[nodiscard]] float brush_dab_coverage(double offset_x, double offset_y, const EditOptions& options);
+
+// The Gradient tool's Style (options bar), saved as tools/gradientMethod: append only. The
+// order matches LayerStyleGradientType's first five (the Gradient Fill dialog's Style list).
+enum class GradientMethod {
+  Linear,
+  Radial,
+  Angle,      // GitHub issue 610
+  Reflected,  // GitHub issue 610
+  Diamond     // GitHub issue 610
+};
+
+// The Gradient tool's ramp position (before Reverse) at offset (px, py) from the drag start,
+// for a drag of (dx, dy). Linear and Reflected project onto the drag, Radial and Diamond
+// measure the circle and the L1 diamond whose radius is the drag, Angle sweeps one ramp per
+// turn from the drag direction, clockwise on screen (the start pixel is 0.25). The same math as gradient_position's
+// Gradient Fill types, so a Fill Layer drag renders what Pixels paints (docs/gradients.md).
+// A zero-length drag is position 0.
+[[nodiscard]] double gradient_tool_position(GradientMethod method, double px, double py, double dx,
+                                            double dy) noexcept;
+
+struct GradientStop {
+  float location{0.0F};
+  EditColor color{};
+  // The stop's Intensity in stops (core/hdr_color.hpp): 32-bit layers scale its decoded color
+  // by 2^stops before interpolating, so a gradient can run above 1.0. 8 and 16-bit layers
+  // ignore it (docs/high-bit-depth-color.md, "Color choice at 32 bits").
+  float intensity_stops{0.0F};
+  // Where the blend from the previous stop reaches 50%, as a fraction of the way there
+  // (Photoshop's Mdpn convention: the destination stop owns it; 0.5 is a straight ramp and
+  // the first stop's value is unused). Gradient presets keep theirs (GitHub issue 663).
+  float midpoint{0.5F};
+};
+
+// The segment position `t` (0..1 between two stops) remapped through the destination
+// stop's midpoint: piecewise linear, 0.5 at the midpoint. Identity at 0.5.
+[[nodiscard]] double gradient_stop_midpoint_remap(double t, float midpoint) noexcept;
+// The same ramp with every non-default midpoint written out as a stop of its own (half
+// way between its neighbors, intensity included), for consumers that interpolate stops
+// straight (QGradient previews, CSS swatches). Exact: the remap is piecewise linear.
+[[nodiscard]] std::vector<GradientStop> gradient_stops_with_explicit_midpoints(const std::vector<GradientStop>& stops);
+
+struct GradientOptions {
+  GradientMethod method{GradientMethod::Linear};
+  bool reverse{false};
+  float opacity{1.0F};
+  std::vector<GradientStop> stops;
+  // The Gradient tool's two-track gradient (GitHub issue 663, one gradient editor): when set,
+  // draw_gradient evaluates it like a Gradient Fill does (gradient_color and
+  // gradient_stop_opacity with endpoint smoothing; Noise included) and ignores `stops`.
+  // Foreground and Background stop kinds must already be resolved; a color stop's
+  // intensity_stops lifts 32-bit output.
+  std::optional<LayerStyleGradient> definition;
+  // Paint on the calling thread only (PATCHY_RENDER_SINGLE_THREADED); otherwise a large paint
+  // fans its rows out over strips with the same bytes.
+  bool single_threaded{false};
+};
+
+struct SmudgeState {
+  std::int32_t diameter{0};
+  bool initialized{false};
+  std::vector<std::uint8_t> sample_rgba;
+  // The same carried sample for a 16/32-bit layer: straight RGBA floats on the deep scale
+  // in the layer's domain (docs/high-bit-depth.md).
+  std::vector<float> sample_deep;
+  // Paint every dab on the calling thread (PATCHY_RENDER_SINGLE_THREADED); otherwise a big
+  // dab fans its rows out over bands with the same bytes (GitHub issue 660).
+  bool single_threaded{false};
+};
+
+// Mixer Brush design boundary (claim review 2026-08-14, docs/patent-research.md): the pickup
+// store is ONE running premultiplied-RGBA average fed only by per-dab canvas samples. It is
+// never seeded from or blended with the foreground/deposit color (US 7768525 claim-14 rule,
+// binding until 2028-03-07); the foreground enters only the transient per-dab deposit
+// interpolation in mixer_brush_dab_color. No per-pixel/per-bristle brush state or spatial
+// pickup texture, no paint-amount/fill channel (US 8749572), no erodible tip state
+// (US 10217253), linear color mixing only (US 10924633 B1), and no region-sweep loading mode
+// or multi-cell brush model (US 8654143). See docs/mixer.md and docs/legal-constraints.md
+// ("Mixer Brush").
+struct MixerBrushState {
+  bool initialized{false};
+  bool has_pickup{false};
+  // Running pickup average, premultiplied RGBA in 0..255 doubles. Canvas-derived only.
+  double pickup_r{0.0};
+  double pickup_g{0.0};
+  double pickup_b{0.0};
+  double pickup_a{0.0};
+  bool has_last_dab{false};
+  double last_dab_x{0.0};
+  double last_dab_y{0.0};
+  double distance{0.0};
+};
+
+void begin_mixer_brush_stroke(MixerBrushState& state) noexcept;
+// canvas_sample is the straight-alpha average of the CURRENT canvas under the brush footprint
+// at (x, y); the caller supplies it so this stays pure and testable.
+[[nodiscard]] EditColor mixer_brush_dab_color(MixerBrushState& state, double x, double y,
+                                              int brush_size, EditColor loaded_color,
+                                              EditColor canvas_sample, int wet, int load,
+                                              int mix) noexcept;
+
+enum class CanvasAnchor {
+  TopLeft,
+  Top,
+  TopRight,
+  Left,
+  Center,
+  Right,
+  BottomLeft,
+  Bottom,
+  BottomRight
+};
+
+[[nodiscard]] Rect paint_brush(Document& document, LayerId layer_id, std::int32_t x, std::int32_t y,
+                               const EditOptions& options, bool erase);
+[[nodiscard]] Rect paint_brush_dab(Document& document, LayerId layer_id, double x, double y,
+                                   const EditOptions& options, bool erase);
+
+// A procedural (Round or Square, no tip) dab as paint_brush_dab walks it, for a caller that
+// writes the pixels itself: the Brush's banded dab path paints big dabs on several threads
+// (GitHub issue 677). Visit rows rect.y.. of the layer, columns row_span(row), and skip pixels
+// whose selection_coverage or coverage is 0, in that order, to match paint_brush_dab.
+struct BrushDabWalk {
+  Rect rect;  // canvas-clipped footprint
+  double x{0.0};
+  double y{0.0};
+  int radius{0};
+  bool round_rows{false};
+
+  // Columns [first, end) of `row` the footprint can reach (empty when first >= end).
+  [[nodiscard]] std::pair<std::int32_t, std::int32_t> row_span(std::int32_t row) const noexcept;
+  // The footprint's coverage of pixel (px, py), before selection.
+  [[nodiscard]] float coverage(std::int32_t px, std::int32_t py, const EditOptions& options) const;
+};
+// Does what paint_brush_dab does before its pixel walk: checks the layer, gives an erase target
+// alpha, grows the layer to the dab. Nullopt when paint_brush_dab would paint nothing.
+[[nodiscard]] std::optional<BrushDabWalk> begin_brush_dab_walk(Document& document, LayerId layer_id, double x,
+                                                               double y, const EditOptions& options, bool erase);
+// The selection's coverage of a pixel as every core writer reads it (selection_coverage,
+// selection_mask, then the selection rect).
+[[nodiscard]] float edit_selection_coverage(const EditOptions& options, std::int32_t x, std::int32_t y) noexcept;
+// One stationary Airbrush timer tick. Active shape/Transfer dynamics advance through the
+// stroke state, while scatter/count are deliberately suppressed so a held pointer remains one
+// flat 2D stamp rather than a particle burst. Falls back to paint_brush_dab without dynamics.
+[[nodiscard]] Rect paint_stationary_airbrush_dab(Document& document, LayerId layer_id, double x,
+                                                 double y, const EditOptions& options,
+                                                 BrushTipStrokeState& state);
+[[nodiscard]] Rect paint_brush_segment(Document& document, LayerId layer_id, double x0, double y0, double x1,
+                                       double y1, const EditOptions& options, bool erase);
+[[nodiscard]] Rect paint_brush_segment(Document& document, LayerId layer_id, std::int32_t x0, std::int32_t y0,
+                                       std::int32_t x1, std::int32_t y1, const EditOptions& options, bool erase);
+// Stateful overload for bitmap brush tips: carries dab spacing across chained segments so the
+// canvas stroke smoother's short steps do not cluster dabs at joins. Falls back to the
+// procedural path when options.brush_tip is null. When the angle follows the stroke direction,
+// the first dab waits at the press point until the pointer has moved a few pixels, so a
+// stateful stroke must end with finish_brush_tip_stroke.
+[[nodiscard]] Rect paint_brush_segment(Document& document, LayerId layer_id, double x0, double y0, double x1,
+                                       double y1, const EditOptions& options, bool erase,
+                                       BrushTipStrokeState& state);
+// Stamps a first dab the stroke still holds (a click, or a stroke shorter than the direction
+// distance): at the press point, along the stroke's travel, or at the base angle for a click.
+[[nodiscard]] Rect finish_brush_tip_stroke(Document& document, LayerId layer_id, const EditOptions& options,
+                                           bool erase, BrushTipStrokeState& state);
+// Smudge's per-dab amount for a Strength of 0..1 (GitHub issue 675): each dab mixes that much
+// of the carried sample into the pixels and picks up the rest. Calibrated against Photoshop's
+// Smudge so the carried color travels as far at each Strength (docs/brushes.md, "Smudge
+// Strength"); 1 carries the start color the whole stroke, as in Photoshop.
+[[nodiscard]] float smudge_carry_amount(float strength) noexcept;
+[[nodiscard]] Rect smudge_brush_segment(Document& document, LayerId layer_id, std::int32_t x0, std::int32_t y0,
+                                        std::int32_t x1, std::int32_t y1, const EditOptions& options);
+[[nodiscard]] Rect smudge_brush_segment(Document& document, LayerId layer_id, std::int32_t x0, std::int32_t y0,
+                                        std::int32_t x1, std::int32_t y1, const EditOptions& options,
+                                        SmudgeState& state);
+[[nodiscard]] Rect draw_line(Document& document, LayerId layer_id, std::int32_t x0, std::int32_t y0, std::int32_t x1,
+                             std::int32_t y1, const EditOptions& options, bool erase);
+[[nodiscard]] Rect draw_rectangle(Document& document, LayerId layer_id, Rect rect, const EditOptions& options,
+                                  bool erase);
+[[nodiscard]] Rect draw_ellipse(Document& document, LayerId layer_id, Rect rect, const EditOptions& options,
+                                bool erase);
+// The Magic Wand's color metric, shared with flood_fill: the sum of squared per-channel
+// differences over the channels present (at most four) is within 4 * tolerance^2.
+// Tolerance 0 is an exact match. With four channels, a fully transparent pixel's color is
+// invisible, so when either side has alpha 0 only the alpha difference counts and every
+// alpha-0 pixel matches every other (GitHub issue 498: moved content leaves its RGB behind).
+// CanvasWidget's wand engines call it too (`tool_fill_bucket_tolerance_metric_matches_magic_wand`
+// pins it).
+[[nodiscard]] bool color_within_tolerance(const std::uint8_t* a, const std::uint8_t* b, std::uint16_t channels,
+                                          int tolerance) noexcept;
+// The Magic Wand's seed color for a click at (x, y) in an RGBA8 image (GitHub issue 435):
+// the pixel itself for Point Sample (sample_size 1), otherwise the mean of the
+// sample_size square centered on it, clipped to the image like the Pick tool's average.
+// Alpha is the plain mean and RGB is alpha-weighted (the plain mean when the square is
+// fully transparent). Integer math, rounded to nearest.
+[[nodiscard]] std::array<std::uint8_t, 4> wand_seed_color(const std::uint8_t* rgba, std::int32_t width,
+                                                          std::int32_t height, std::size_t stride, std::int32_t x,
+                                                          std::int32_t y, std::int32_t sample_size) noexcept;
+// Paint Bucket fill from (x, y): honors options.flood_tolerance, options.flood_contiguous,
+// options.primary.a (opacity, blended through the ordinary pixel writer), and
+// options.fill_softness_feather (feathered inward from the filled region's edge).
+[[nodiscard]] Rect flood_fill(Document& document, LayerId layer_id, std::int32_t x, std::int32_t y,
+                              const EditOptions& options);
+// A document-sized RGBA8 image a flood reads its colors from instead of the layer (the Magic
+// Eraser's Sample All Layers): the composite as it is displayed. Not owned.
+struct FloodSampleImage {
+  const std::uint8_t* rgba{nullptr};
+  std::int32_t width{0};
+  std::int32_t height{0};
+  std::size_t stride{0};
+};
+// The Magic Eraser (GitHub issue 727, docs/eraser-tools.md): erases the region the Fill tool
+// would flood from (x, y) with options.flood_tolerance and options.flood_contiguous (the same
+// region code), by options.primary.a as Opacity. With `anti_alias`, pixels just past the
+// tolerance are erased in part: those touching the region when Contiguous, otherwise all of
+// them. `composite` (Sample All Layers) supplies the colors the region is found in; the erase
+// is still written to the layer. The write is the Eraser's: alpha falls, or under
+// options.lock_transparent_pixels the pixel moves toward options.secondary and keeps its
+// alpha; an unlocked layer without alpha gains one. The layer never grows. Returns the
+// changed box (document coordinates).
+[[nodiscard]] Rect magic_erase(Document& document, LayerId layer_id, std::int32_t x, std::int32_t y,
+                               const EditOptions& options, bool anti_alias,
+                               const FloodSampleImage* composite = nullptr);
+// Gives a color layer without alpha an opaque alpha channel at its depth, as the Eraser does
+// before it erases to transparency. A layer that has alpha is left alone.
+void ensure_layer_alpha_for_erase(Layer& layer);
+// Fills `rect` (clipped to the canvas and options.selection, weighted by selection coverage)
+// with options.primary at its alpha, composited by options.fill_paint_mode.
+[[nodiscard]] Rect fill_rect(Document& document, LayerId layer_id, Rect rect, const EditOptions& options);
+[[nodiscard]] Rect clear_rect_change_bounds(const Document& document, LayerId layer_id, Rect rect,
+                                            const EditOptions& options);
+[[nodiscard]] Rect clear_rect(Document& document, LayerId layer_id, Rect rect, const EditOptions& options);
+[[nodiscard]] std::vector<GradientStop> normalized_gradient_stops(const std::vector<GradientStop>& stops);
+[[nodiscard]] EditColor gradient_color_at(const std::vector<GradientStop>& sorted_stops, float opacity, bool reverse,
+                                          double position);
+[[nodiscard]] Rect draw_gradient(Document& document, LayerId layer_id, std::int32_t x0, std::int32_t y0,
+                                 std::int32_t x1, std::int32_t y1, const EditOptions& options,
+                                 const GradientOptions& gradient);
+[[nodiscard]] Rect draw_linear_gradient(Document& document, LayerId layer_id, std::int32_t x0, std::int32_t y0,
+                                        std::int32_t x1, std::int32_t y1, const EditOptions& options);
+void expand_layer_to_include_rect(Layer& layer, Rect document_rect);
+// Growth headroom for one stroke on one layer (docs/performance-strokes.md). While a reserve is
+// open on this thread, expand_layer_to_include_rect grows that layer well past each
+// requested rect (clamped to `limit`, usually the canvas), so a stroke that leaves a small
+// layer (a pasted one) reallocates a few times instead of on every dab. close() trims the
+// layer back to exactly what per-dab growth gives: its starting bounds united with every
+// requested rect, the same pixels byte for byte. Destroying an unclosed reserve skips the
+// trim. Reserves nest; only the innermost one applies.
+class LayerGrowthReserve {
+ public:
+  LayerGrowthReserve(LayerId layer_id, Rect limit) noexcept;
+  ~LayerGrowthReserve();
+  LayerGrowthReserve(const LayerGrowthReserve&) = delete;
+  LayerGrowthReserve& operator=(const LayerGrowthReserve&) = delete;
+  LayerGrowthReserve(LayerGrowthReserve&&) = delete;
+  LayerGrowthReserve& operator=(LayerGrowthReserve&&) = delete;
+
+  [[nodiscard]] LayerId layer_id() const noexcept { return layer_id_; }
+  // Trims `layer` (the reserved one; any other is left alone) and returns whether its
+  // bounds changed. Further expansion after close() is exact again.
+  bool close(Layer& layer);
+
+ private:
+  friend void expand_layer_to_include_rect(Layer& layer, Rect document_rect);
+  LayerId layer_id_{0};
+  Rect limit_{};
+  Rect exact_{};
+  bool exact_known_{false};
+  bool grown_{false};
+  bool closed_{false};
+  LayerGrowthReserve* previous_{nullptr};
+};
+// Source-over an RGBA8 document-space block through the native pixel writer.
+// The caller has already applied selection coverage to the source alpha.
+// Preserves layer metadata and supports the same palette/alpha-lock rules as painting.
+[[nodiscard]] Rect paint_pixel_block(Layer& layer, const PixelBuffer& source, Rect bounds,
+                                      const EditOptions& options);
+[[nodiscard]] Rect flip_layer_horizontal(Document& document, LayerId layer_id);
+[[nodiscard]] Rect flip_layer_vertical(Document& document, LayerId layer_id);
+// Image Size: resamples every layer, mask and channel with `method` (core/resample.hpp;
+// Automatic resolves once from the document dimensions) and scales the text, smart-object
+// and vector transforms to match.
+void resize_image_and_layers(Document& document, std::int32_t width, std::int32_t height,
+                             ResampleMethod method = ResampleMethod::Automatic);
+// Preserve off-canvas layer pixels and masks unless crop_layers is explicitly enabled.
+// The Background still fills newly exposed canvas with extension_color (see
+// resize_canvas_to_frame for which layers that is).
+void resize_canvas_and_layers(Document& document, std::int32_t width, std::int32_t height,
+                              CanvasAnchor anchor = CanvasAnchor::TopLeft,
+                              EditColor extension_color = EditColor{255, 255, 255, 255},
+                              bool crop_layers = false);
+// The frame the anchor overload resizes to: `reference` (the canvas, or the selection for
+// Crop to Selection (Advanced)) becomes new_width x new_height about its anchor point,
+// in current document coordinates.
+[[nodiscard]] Rect canvas_resize_frame(Rect reference, CanvasAnchor anchor, std::int32_t new_width,
+                                       std::int32_t new_height) noexcept;
+// Canvas resize to an explicit frame in current document coordinates: the canvas becomes
+// frame.width x frame.height with the frame's top-left as the new origin, under the anchor
+// overload's layer, mask, and channel rules. A degenerate frame is a no-op.
+// The Background (background_layer, core/layer_metadata.hpp, whatever its name; also any
+// pixel layer named "Background") is rebuilt to cover the new canvas with extension_color
+// under new area, so it stays the Background. The one exception (GitHub issue 701): with
+// crop_layers off, a frame that leaves the Background's pixels beyond the new canvas keeps
+// those pixels, and the layer becomes an ordinary one through release_background, named
+// `layer_from_background_name` when that is not empty. Named so, it is only translated, like
+// every other layer, and new canvas area beside it is transparent. A Background that a
+// transparent extension_color gave an alpha channel (artboard canvas growth) is released too.
+void resize_canvas_to_frame(Document& document, Rect frame,
+                            EditColor extension_color = EditColor{255, 255, 255, 255},
+                            bool crop_layers = false, std::string_view layer_from_background_name = {});
+// Removes every non-group layer whose bounds lie entirely outside the canvas and every
+// group emptied by that (Canvas Size's "delete layers fully off the canvas" option).
+// Layers without bounds (adjustments, never-painted layers) stay. Returns the number of
+// layers removed, a removed group counting once.
+std::size_t remove_layers_outside_canvas(Document& document);
+// The same against `canvas`, a rect in current document coordinates. A canvas resize
+// that also crops layers must call this with its frame BEFORE resizing: the crop
+// rewrites every pixel layer to canvas-sized bounds, which hides the off-canvas ones.
+std::size_t remove_layers_outside_canvas(Document& document, Rect canvas);
+[[nodiscard]] bool crop_document(Document& document, Rect crop);
+// Crop that may extend beyond the canvas: content outside `crop` is discarded,
+// the canvas becomes crop.width x crop.height, area outside the old canvas is
+// transparent, and the Background (by the background_layer rule, or a pixel layer
+// literally named "Background") is rebuilt canvas-sized with extension_color under
+// its content (the canvas-resize fill rules). Returns false when the rect is degenerate.
+[[nodiscard]] bool crop_document(Document& document, Rect crop, EditColor extension_color);
+// Rotated crop: the box is `crop` rotated by angle_degrees about its center in
+// document space, and committing straightens it (result pixel q samples the
+// document at center + R(angle) * (q - result_center), bilinear at every depth).
+// Text transforms, smart-object placements, and vector data ride the same
+// affine. Angles under 0.01 degrees take the exact unrotated path.
+[[nodiscard]] bool crop_document(Document& document, Rect crop, double angle_degrees,
+                                 EditColor extension_color);
+// Perspective Crop (GitHub issue 328, docs/crop-tool.md): `quad` holds four document
+// corners (x, y pairs) in output order, top left, top right, bottom right, bottom left,
+// and the document becomes width x height with that quad rectified onto it. Every pixel
+// layer, mask and channel resamples through the rect-to-quad homography with the rotated
+// crop's sampler (bilinear; 16/32-bit layers in their own float domain); a "Background"
+// layer is rebuilt canvas-sized with extension_color under area the quad takes from
+// beyond the canvas, other layers get transparency there. Shape layers, vector masks and
+// paths map their points through the homography. A parallelogram quad is affine: text
+// and smart-object placements then ride it like the other crops. A true perspective quad
+// rasterizes text layers (type cannot take a perspective, as in Free Transform) and gives
+// smart objects a perspective placement. Returns false for a quad that is not strictly
+// convex, a size under 1, or a document with artboards.
+[[nodiscard]] bool perspective_crop_document(Document& document, const std::array<double, 8>& quad,
+                                             std::int32_t width, std::int32_t height,
+                                             EditColor extension_color);
+// True for four corners forming a strictly convex quad (either winding).
+[[nodiscard]] bool perspective_crop_quad_is_convex(const std::array<double, 8>& quad);
+// The output size Perspective Crop uses when W or H is left blank: the mean of the
+// quad's top and bottom edge lengths by the mean of its left and right ones, rounded.
+[[nodiscard]] std::array<std::int32_t, 2> perspective_crop_auto_size(const std::array<double, 8>& quad);
+void rotate_document_clockwise(Document& document);
+void rotate_document_counterclockwise(Document& document);
+// Two quarter turns: exact, no resampling (Image > Rotate 180, GitHub issue 139).
+void rotate_document_180(Document& document);
+// Mirrors the whole document about the canvas center: every layer's pixels, bounds
+// and mask, the document channels, text transforms, smart-object placements and
+// vector data (Image > Flip Horizontal / Vertical, GitHub issue 139).
+void flip_document_horizontal(Document& document);
+void flip_document_vertical(Document& document);
+// Quarter turns of one pixel layer about its own center (Layer > Arrange > Rotate,
+// GitHub issue 139): pixels, mask, text transform and vector data turn together
+// and the layer's center stays put (rounded to whole pixels). Returns the union of
+// the old and new bounds, or an empty rect when the layer is not a pixel layer.
+[[nodiscard]] Rect rotate_layer_clockwise(Document& document, LayerId layer_id);
+[[nodiscard]] Rect rotate_layer_counterclockwise(Document& document, LayerId layer_id);
+[[nodiscard]] Rect rotate_layer_180(Document& document, LayerId layer_id);
+// Rotates the whole document by any angle (positive = clockwise on screen) about its
+// center and enlarges the canvas to the rotated image's bounding box, like Photoshop's
+// Image > Rotate > Arbitrary. Exposed corners follow the rotated-crop fill rules
+// (extension_color under a "Background" layer, transparent elsewhere); text transforms,
+// smart-object placements and vector data ride the same affine. Angles under 0.01
+// degrees are a no-op that returns true.
+[[nodiscard]] bool rotate_document_arbitrary(Document& document, double clockwise_degrees,
+                                             EditColor extension_color);
+// Shifts the whole document by (dx, dy) with wraparound at the canvas edges (the seamless
+// tile "offset" operation). Raster layer content, layer masks, and document channels roll;
+// object-like layers (text, placed records, shape layers) translate whole without wrapping,
+// so applying (-dx, -dy) afterwards restores every layer exactly.
+void wrap_offset_document(Document& document, std::int32_t dx, std::int32_t dy);
+
+// Applies an affine (a, b, c, d, tx, ty like transform_vector_path) to a
+// layer's vector shape/mask (dropping live-shape annotations unless the
+// matrix is a positive axis-aligned scale + translate) and re-rasterizes at
+// canvas_after. stroke_scale != 1 additionally scales the shape stroke width
+// (Image Size). The document-wide variant also transforms every saved/work
+// path. Every geometry op above already calls these; they are exposed for
+// the free-transform commit.
+void transform_layer_vector_data(Document& document, Layer& layer,
+                                 const std::array<double, 6>& matrix, Rect canvas_after,
+                                 double stroke_scale = 1.0);
+void transform_document_vector_data(Document& document, const std::array<double, 6>& matrix,
+                                    Rect canvas_after, double stroke_scale = 1.0);
+// Free Transform's Distort/Perspective for one layer (GitHub issue 225): the shape
+// path and the vector mask path go through the homography (transform_vector_path_
+// projective), pattern anchors follow, live-shape annotations drop (a perspective
+// rectangle is no longer a rectangle), and both re-rasterize at canvas_after.
+void transform_layer_vector_data_projective(Document& document, Layer& layer,
+                                            const std::array<double, 9>& homography, Rect canvas_after);
+
+}  // namespace patchy

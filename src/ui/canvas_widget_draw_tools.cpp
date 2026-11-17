@@ -1,0 +1,2525 @@
+// CanvasWidget's pixel drawing tools, split out of canvas_widget.cpp: the
+// Line/Gradient/Rectangle/Ellipse pixel commit paths and flood fill, their
+// grayscale-target twins with the shared mask-shape renderer, the shape
+// options and shape_drag_rect constraint math with the in-flight shape /
+// text-rect previews and the drag size readout, and the eyedropper color
+// picking. Pure function moves from canvas_widget.cpp; behavior must stay
+// identical.
+
+#include "ui/canvas_widget.hpp"
+
+#include "core/document_channel.hpp"
+#include "core/hdr_color.hpp"
+#include "core/layer.hpp"
+#include "core/layer_render_utils.hpp"
+#include "core/pixel_buffer.hpp"
+#include "core/pixel_depth.hpp"
+#include "core/pixel_shape_style.hpp"
+#include "core/pixel_tools.hpp"
+#include "core/smart_object.hpp"
+#include "core/vector_live_shapes.hpp"
+#include "core/vector_shape.hpp"
+#include "ui/canvas_types.hpp"
+#include "ui/canvas_widget_shared.hpp"
+#include "ui/dialog_utils.hpp"
+#include "ui/edit_conversions.hpp"
+#include "ui/eyedropper_sample_overlay.hpp"
+#include "ui/qt_geometry.hpp"
+#include "ui/theme_palette.hpp"
+
+#include <QBrush>
+#include <QColor>
+#include <QFontMetrics>
+#include <QGradient>
+#include <QImage>
+#include <QLinearGradient>
+#include <QList>
+#include <QPainter>
+#include <QPainterPath>
+#include <QPainterPathStroker>
+#include <QPen>
+#include <QPoint>
+#include <QPointF>
+#include <QPolygonF>
+#include <QRadialGradient>
+#include <QRect>
+#include <QRectF>
+#include <QRegion>
+#include <QScopeGuard>
+#include <QScrollBar>
+#include <QRgb>
+#include <QSize>
+#include <QString>
+#include <QTransform>
+#include <QWidget>
+#include <Qt>
+
+#include <algorithm>
+#include <cmath>
+#include <cstdint>
+#include <cstdio>
+#include <cstring>
+#include <functional>
+#include <optional>
+#include <utility>
+#include <vector>
+
+namespace patchy::ui {
+
+namespace {
+
+std::uint8_t channel_from_color(QColor color, int channel) {
+  switch (channel) {
+    case 0:
+      return static_cast<std::uint8_t>(color.red());
+    case 1:
+      return static_cast<std::uint8_t>(color.green());
+    case 2:
+      return static_cast<std::uint8_t>(color.blue());
+    default:
+      return static_cast<std::uint8_t>(color.alpha());
+  }
+}
+
+// The Gradient tool's drag preview for the styles Qt has no gradient for (Angle, Reflected,
+// Diamond; GitHub issue 610): gradient_tool_position, the core's own math, sampled at cell
+// centers over `area` (widget coordinates, the drag from `a` to `b`) and drawn scaled up as a
+// texture. The cell grows with the area so a repaint samples at most kMaxSamples points.
+// `grayscale` previews a mask or channel edit as its gray value.
+QBrush sampled_gradient_preview_brush(GradientMethod method, QPointF a, QPointF b,
+                                      const std::vector<GradientStop>& stops, float opacity, bool reverse,
+                                      QRectF area, bool grayscale) {
+  constexpr double kMaxSamples = 160000.0;
+  if (area.width() <= 0.0 || area.height() <= 0.0) {
+    return QBrush(Qt::NoBrush);
+  }
+  const auto cell = std::max(1.0, std::ceil(std::sqrt(area.width() * area.height() / kMaxSamples)));
+  const auto columns = std::max(1, static_cast<int>(std::ceil(area.width() / cell)));
+  const auto rows = std::max(1, static_cast<int>(std::ceil(area.height() / cell)));
+  QImage image(columns, rows, QImage::Format_ARGB32);
+  const auto normalized = normalized_gradient_stops(stops);
+  const auto dx = b.x() - a.x();
+  const auto dy = b.y() - a.y();
+  for (int row = 0; row < rows; ++row) {
+    auto* line = reinterpret_cast<QRgb*>(image.scanLine(row));
+    const auto py = area.top() + (static_cast<double>(row) + 0.5) * cell - a.y();
+    for (int column = 0; column < columns; ++column) {
+      const auto px = area.left() + (static_cast<double>(column) + 0.5) * cell - a.x();
+      const auto color =
+          gradient_color_at(normalized, opacity, reverse, gradient_tool_position(method, px, py, dx, dy));
+      if (grayscale) {
+        const auto value = mask_value_from_color(QColor(color.r, color.g, color.b));
+        line[column] = qRgba(value, value, value, color.a);
+      } else {
+        line[column] = qRgba(color.r, color.g, color.b, color.a);
+      }
+    }
+  }
+  QBrush brush(image);
+  QTransform transform;
+  transform.translate(area.left(), area.top());
+  transform.scale(cell, cell);
+  brush.setTransform(transform);
+  return brush;
+}
+
+patchy::VectorFill solid_shape_paint(QColor color) {
+  patchy::VectorFill paint;
+  paint.kind = patchy::VectorFillKind::Solid;
+  paint.color = {static_cast<std::uint8_t>(color.red()), static_cast<std::uint8_t>(color.green()),
+                 static_cast<std::uint8_t>(color.blue())};
+  return paint;
+}
+
+// The style for the core renderers: an unset paint is `foreground`, an unset line the classic
+// outline (`brush_size` wide, solid, centered, round corners). The gain is left at 1.
+patchy::PixelShapeStyle core_shape_style(const ShapePixelStyle& style, QColor foreground, int brush_size) {
+  patchy::PixelShapeStyle core;
+  if (style.fill) {
+    core.fill = style.fill_paint.value_or(solid_shape_paint(foreground));
+  }
+  if (style.line.has_value()) {
+    core.stroke = *style.line;
+  } else {
+    core.stroke.width = static_cast<double>(std::max(1, brush_size));
+    core.stroke.alignment = patchy::VectorStrokeAlignment::Center;
+    core.stroke.join = patchy::VectorStrokeJoin::Round;
+  }
+  core.stroke.enabled = style.stroke;
+  core.stroke.content = style.stroke_paint.value_or(solid_shape_paint(foreground));
+  return core;
+}
+
+// The stroke's width as the classic renderer and Soft take it: whole pixels, at least 1.
+int shape_stroke_size(const patchy::PixelShapeStyle& core) {
+  return static_cast<int>(std::clamp(std::lround(core.stroke.width), 1L, static_cast<long>(kMaxBrushSize)));
+}
+
+// True when every paint the style draws is the foreground color (unset), so the foreground's
+// Intensity applies on a 32-bit layer.
+bool shape_paints_are_foreground(const ShapePixelStyle& style, const patchy::PixelShapeStyle& core) {
+  return (!patchy::pixel_shape_style_draws_fill(core) || !style.fill_paint.has_value()) &&
+         (!patchy::pixel_shape_style_draws_stroke(core) || !style.stroke_paint.has_value());
+}
+
+// One color that stands for a paint in a preview: a solid paint's own color; a gradient's or
+// a pattern's is `fallback`.
+QColor shape_paint_preview_color(const patchy::VectorFill& paint, QColor fallback) {
+  return paint.kind == patchy::VectorFillKind::Solid ? QColor(paint.color.red, paint.color.green, paint.color.blue)
+                                                     : fallback;
+}
+
+// The drag preview of a Pixels-mode Rectangle or Ellipse where the options bar's own preview
+// does not apply (a mask, a channel, Quick Mask, a canvas no bar drives): the fill, then the
+// stroke as a pen. The two classic styles draw exactly what they always did; the others add
+// the stroke's dashes (a pen's dash lengths are in pen widths, like the stroke's) and its
+// alignment, by drawing the pen's center line half a width inside or outside the outline.
+void paint_pixel_shape_preview(QPainter& painter, bool ellipse, QRect shape_rect, double corner_radius,
+                               const patchy::PixelShapeStyle& core, QColor fill, QColor stroke, double zoom) {
+  const bool draws_fill = patchy::pixel_shape_style_draws_fill(core);
+  const bool draws_stroke = patchy::pixel_shape_style_draws_stroke(core);
+  if (!draws_fill && !draws_stroke) {
+    return;
+  }
+  if (patchy::pixel_shape_style_is_classic(core)) {
+    if (draws_fill) {
+      painter.setPen(Qt::NoPen);
+      painter.setBrush(fill);
+    } else {
+      QPen pen(stroke);
+      pen.setWidth(std::max(1, static_cast<int>(std::round(static_cast<double>(shape_stroke_size(core)) * zoom))));
+      pen.setCosmetic(false);
+      painter.setPen(pen);
+      painter.setBrush(Qt::NoBrush);
+    }
+    if (ellipse) {
+      painter.drawEllipse(shape_rect);
+    } else if (corner_radius > 0.0) {
+      const auto clamped = std::min(corner_radius, std::min(shape_rect.width(), shape_rect.height()) / 2.0);
+      painter.drawRoundedRect(shape_rect, clamped, clamped);
+    } else {
+      painter.drawRect(shape_rect);
+    }
+    return;
+  }
+
+  const QRectF outline(shape_rect);
+  const auto radius =
+      ellipse ? 0.0 : std::min(std::max(0.0, corner_radius), std::min(outline.width(), outline.height()) / 2.0);
+  const auto draw = [&painter, ellipse](const QRectF& rect, double rect_radius) {
+    if (ellipse) {
+      painter.drawEllipse(rect);
+    } else if (rect_radius > 0.0) {
+      painter.drawRoundedRect(rect, rect_radius, rect_radius);
+    } else {
+      painter.drawRect(rect);
+    }
+  };
+  if (draws_fill) {
+    painter.setPen(Qt::NoPen);
+    painter.setBrush(fill);
+    draw(outline, radius);
+  }
+  if (!draws_stroke) {
+    return;
+  }
+  const auto width = std::max(1.0, core.stroke.width * zoom);
+  const auto inset = core.stroke.alignment == patchy::VectorStrokeAlignment::Inside    ? width / 2.0
+                     : core.stroke.alignment == patchy::VectorStrokeAlignment::Outside ? -width / 2.0
+                                                                                       : 0.0;
+  const auto line = outline.adjusted(inset, inset, -inset, -inset);
+  if (line.width() <= 0.0 || line.height() <= 0.0) {
+    // An inside stroke wider than the shape covers all of it.
+    painter.setPen(Qt::NoPen);
+    painter.setBrush(stroke);
+    draw(outline, radius);
+    return;
+  }
+  QPen pen(stroke);
+  pen.setWidthF(width);
+  pen.setCosmetic(false);
+  pen.setJoinStyle(core.stroke.join == patchy::VectorStrokeJoin::Round   ? Qt::RoundJoin
+                   : core.stroke.join == patchy::VectorStrokeJoin::Bevel ? Qt::BevelJoin
+                                                                         : Qt::MiterJoin);
+  pen.setCapStyle(core.stroke.cap == patchy::VectorStrokeCap::Round    ? Qt::RoundCap
+                  : core.stroke.cap == patchy::VectorStrokeCap::Square ? Qt::SquareCap
+                                                                       : Qt::FlatCap);
+  if (!core.stroke.dashes.empty() && core.stroke.dashes.size() % 2U == 0U) {
+    QList<qreal> pattern;
+    for (const auto length : core.stroke.dashes) {
+      pattern.push_back(length);
+    }
+    pen.setDashPattern(pattern);
+    pen.setDashOffset(core.stroke.dash_offset);
+  }
+  painter.setPen(pen);
+  painter.setBrush(Qt::NoBrush);
+  draw(line, radius > 0.0 ? std::max(0.0, radius - inset) : 0.0);
+}
+
+}  // namespace
+
+void CanvasWidget::set_fill_shapes(bool fill_shapes) noexcept {
+  shape_pixel_style_.fill = fill_shapes;
+  shape_pixel_style_.stroke = !fill_shapes;
+}
+
+bool CanvasWidget::fill_shapes() const noexcept {
+  return shape_pixel_style_.fill && !shape_pixel_style_.stroke;
+}
+
+// A shape drawn in Pixels mode that is not in the document yet. Only its geometry is kept:
+// the style, opacity, softness, corner radius, sides, star inset and picked shape are the
+// canvas's own values, so the options bar edits a pending shape by editing those.
+struct CanvasWidget::PendingPixelShape {
+  CanvasTool tool{CanvasTool::Rectangle};
+  // The layer that was active when it was drawn: the commit paints that one, also when the
+  // host changed the active layer first.
+  std::optional<LayerId> layer_id;
+  QRectF box;                // document space, edge coordinates, before `angle` turns it
+  double polygon_angle{0.0};  // the first vertex's direction from the center
+  // Degrees, clockwise, about the box's center: the rotate drag just outside a corner. A
+  // turned shape is painted from its turned path by the shape layer's renderer.
+  double angle{0.0};
+  // The preview: the pixels a commit would paint, rendered again only when one of the inputs
+  // below changes, never per repaint.
+  struct Inputs {
+    QRectF box;
+    double polygon_angle{0.0};
+    double angle{0.0};
+    ShapePixelStyle style;
+    QRgb foreground{0};
+    int brush_size{0};
+    int opacity{0};
+    int softness{0};
+    int corner_radius{0};
+    int sides{0};
+    int star_inset{0};
+    const patchy::VectorPath* custom_shape{nullptr};
+    bool grayscale{false};
+    QSize document_size;
+    friend bool operator==(const Inputs&, const Inputs&) = default;
+  };
+  std::optional<Inputs> preview_inputs;
+  QImage preview;         // premultiplied, one image pixel per document pixel
+  QPoint preview_origin;  // its top left corner in document space
+};
+
+void CanvasWidget::set_shape_pixel_style(const ShapePixelStyle& style) {
+  if (shape_pixel_style_ == style) {
+    return;
+  }
+  shape_pixel_style_ = style;
+  if (drawing_shape_) {
+    update();
+  }
+  pending_pixel_shape_inputs_changed();
+}
+
+const ShapePixelStyle& CanvasWidget::shape_pixel_style() const noexcept {
+  return shape_pixel_style_;
+}
+
+void CanvasWidget::set_shape_corner_radius(int radius) noexcept {
+  shape_corner_radius_ = std::max(0, radius);
+  if (drawing_shape_ && tool_ == CanvasTool::Rectangle) {
+    update();
+  }
+  pending_pixel_shape_inputs_changed();
+}
+
+int CanvasWidget::shape_corner_radius() const noexcept {
+  return shape_corner_radius_;
+}
+
+void CanvasWidget::set_vector_tool_mode(VectorToolMode mode) noexcept {
+  if (vector_tool_mode_ == mode) {
+    return;
+  }
+  commit_pending_pixel_shape();  // it belongs to the mode it was drawn in
+  vector_tool_mode_ = mode;
+  update();  // the shape tools' resize box shows in Shape mode only (GitHub issue 690)
+}
+
+VectorToolMode CanvasWidget::vector_tool_mode() const noexcept {
+  return vector_tool_mode_;
+}
+
+void CanvasWidget::set_vector_shape_drawn_callback(
+    std::function<void(patchy::LiveShapeKind, QRectF, QPointF, QPointF)> callback) {
+  vector_shape_drawn_callback_ = std::move(callback);
+}
+
+void CanvasWidget::set_shape_create_requested_callback(
+    std::function<void(CanvasTool, QPointF)> callback) {
+  shape_create_requested_callback_ = std::move(callback);
+}
+
+void CanvasWidget::set_shape_appearance_requested_callback(std::function<void()> callback) {
+  shape_appearance_requested_callback_ = std::move(callback);
+}
+
+void CanvasWidget::set_fill_opacity(int opacity) noexcept {
+  fill_opacity_ = std::clamp(opacity, 0, 100);  // 0 fills nothing (issue 253)
+}
+
+int CanvasWidget::fill_opacity() const noexcept {
+  return fill_opacity_;
+}
+
+void CanvasWidget::set_fill_softness(int softness) noexcept {
+  fill_softness_ = std::clamp(softness, 0, 100);
+}
+
+int CanvasWidget::fill_softness() const noexcept {
+  return fill_softness_;
+}
+
+void CanvasWidget::set_fill_tolerance(int tolerance) noexcept {
+  fill_tolerance_ = std::clamp(tolerance, 0, 255);
+}
+
+int CanvasWidget::fill_tolerance() const noexcept {
+  return fill_tolerance_;
+}
+
+void CanvasWidget::set_fill_contiguous(bool enabled) noexcept {
+  fill_contiguous_ = enabled;
+}
+
+bool CanvasWidget::fill_contiguous() const noexcept {
+  return fill_contiguous_;
+}
+
+void CanvasWidget::set_shape_style(MarqueeStyle style) noexcept {
+  shape_style_ = style;
+}
+
+CanvasWidget::MarqueeStyle CanvasWidget::shape_style() const noexcept {
+  return shape_style_;
+}
+
+void CanvasWidget::set_shape_fixed_size(int width, int height) noexcept {
+  shape_fixed_size_ = QSize(std::clamp(width, 1, 30000), std::clamp(height, 1, 30000));
+}
+
+QSize CanvasWidget::shape_fixed_size() const noexcept {
+  return shape_fixed_size_;
+}
+
+QRect CanvasWidget::shape_drag_rect(QPoint anchor, QPoint current) const {
+  // Geometry rect for an in-flight Rectangle/Ellipse/Custom Shape drag, folding in the
+  // options-bar Style (Normal / Fixed Ratio / Fixed Size; Rectangle and Ellipse only),
+  // the Shift square constraint, and Alt draw-from-center. A custom shape is stored in
+  // the unit box at its own proportions, so a square rect keeps them; the options-bar
+  // link does the same for it as Shift. The rect is an inclusive pixel rect: commit it via
+  // (topLeft(), bottomRight()) so draw_rectangle/draw_ellipse re-derive exactly this
+  // rect through normalized_rect(). Mirrors marquee_selection_rect(), kept separate on
+  // purpose: the marquee variant embeds selection-only concerns (edge-clamped square
+  // anchoring, Alt-at-press from-center gating) and is pinned by its own tests.
+  if (tool_ != CanvasTool::Rectangle && tool_ != CanvasTool::Ellipse && tool_ != CanvasTool::CustomShape) {
+    return normalized_rect(anchor, current);
+  }
+  const auto style = shape_style_;
+  const bool square = shape_square_constrained_ ||
+                      (tool_ == CanvasTool::CustomShape && custom_shape_keep_proportions_);
+  QRect rect;
+  if (shape_from_center_) {
+    // Alt held mid-drag: the press point is the center, so the shape grows
+    // symmetrically and is twice the drag extent.
+    if (style == MarqueeStyle::FixedSize) {
+      rect = QRect(anchor - QPoint(shape_fixed_size_.width() / 2, shape_fixed_size_.height() / 2),
+                   shape_fixed_size_);
+    } else {
+      const auto delta = current - anchor;
+      auto half_w = std::abs(delta.x());
+      auto half_h = std::abs(delta.y());
+      if (style == MarqueeStyle::FixedRatio) {
+        const auto ratio = std::max(1.0, static_cast<double>(shape_fixed_size_.width())) /
+                           std::max(1.0, static_cast<double>(shape_fixed_size_.height()));
+        if (static_cast<double>(half_w) / std::max(1, half_h) > ratio) {
+          half_h = std::max(0, static_cast<int>(std::round(half_w / ratio)));
+        } else {
+          half_w = std::max(0, static_cast<int>(std::round(half_h * ratio)));
+        }
+      } else if (square) {
+        half_w = half_h = std::min(half_w, half_h);
+      }
+      rect = QRect(anchor.x() - half_w, anchor.y() - half_h, half_w * 2, half_h * 2);
+    }
+  } else if (style == MarqueeStyle::FixedSize) {
+    // A click places the exact W x H shape extending down-right; the drag is ignored.
+    rect = QRect(anchor, shape_fixed_size_);
+  } else if (style == MarqueeStyle::FixedRatio) {
+    const auto ratio = std::max(1.0, static_cast<double>(shape_fixed_size_.width())) /
+                       std::max(1.0, static_cast<double>(shape_fixed_size_.height()));
+    const auto delta = current - anchor;
+    auto width = std::max(1, std::abs(delta.x()));
+    auto height = std::max(1, std::abs(delta.y()));
+    if (static_cast<double>(width) / static_cast<double>(height) > ratio) {
+      width = std::max(1, static_cast<int>(std::round(height * ratio)));
+    } else {
+      height = std::max(1, static_cast<int>(std::round(width / ratio)));
+    }
+    rect = QRect(anchor, anchor + QPoint(delta.x() < 0 ? -width : width,
+                                         delta.y() < 0 ? -height : height))
+               .normalized();
+  } else if (square) {
+    // Shift forces a 1:1 square (circle for the ellipse), sized to the smaller drag axis.
+    const auto dx = current.x() - anchor.x();
+    const auto dy = current.y() - anchor.y();
+    const auto side = std::max(1, std::min(std::abs(dx), std::abs(dy)));
+    rect = normalized_rect(anchor, anchor + QPoint(dx < 0 ? -side : side, dy < 0 ? -side : side));
+  } else {
+    rect = normalized_rect(anchor, current);
+  }
+  if (rect.width() < 1) {
+    rect.setWidth(1);
+  }
+  if (rect.height() < 1) {
+    rect.setHeight(1);
+  }
+  return rect;
+}
+
+void CanvasWidget::draw_shape_preview(QPainter& painter, QRect exposed_rect) {
+  // A pending pixel shape on a channel, Quick Mask or a Smart Filter mask is presented by the
+  // channel preview below, like the drag that drew it; on a layer or a layer mask
+  // draw_pending_pixel_shape paints it.
+  const bool pending_shape = !drawing_shape_ && pending_pixel_shape_ != nullptr;
+  if (!drawing_shape_ && gradient_fill_drag_hold_drawn()) {
+    // A Fill Layer mode release whose layer is not composited yet (GitHub #714 follow-up):
+    // the drag's own preview, without the end dots (the layer's handles are there now),
+    // over the frame from before the drag.
+    draw_gradient_drag_preview(painter, widget_position(gradient_drag_hold_->start),
+                               widget_position(gradient_drag_hold_->end), true, false);
+    return;
+  }
+  if (!drawing_shape_ && (!pending_shape || !pending_pixel_shape_uses_channel_preview())) {
+    return;
+  }
+
+  auto doc_a = shape_start_;
+  auto doc_b = shape_current_;
+  if (tool_ == CanvasTool::Rectangle || tool_ == CanvasTool::Ellipse ||
+      tool_ == CanvasTool::CustomShape) {
+    const auto rect = shape_drag_rect(shape_start_, shape_current_);
+    doc_a = rect.topLeft();
+    doc_b = rect.bottomRight();
+  }
+  const auto a = widget_position(doc_a);
+  const auto b = widget_position(doc_b);
+
+  // Shape mode previews with the ACTUAL appearance (options-bar fill and
+  // stroke), like Photoshop; Path mode keeps its outline, and so do the
+  // raster-committing edit targets (masks, channels, quick mask)
+  // and the vector-mask target (its drags append mask subpaths, not a fill).
+  // Pixels mode paints the same fill and stroke (GitHub issue 716), so it previews
+  // the same way wherever the bar drives the style; the two classic styles of a
+  // rectangle or an ellipse keep the raster preview below.
+  const bool vector_shape_tool = tool_ == CanvasTool::Line || tool_ == CanvasTool::Rectangle ||
+                                 tool_ == CanvasTool::Ellipse || tool_ == CanvasTool::Polygon ||
+                                 tool_ == CanvasTool::CustomShape;
+  const bool path_tool = tool_ == CanvasTool::Polygon || tool_ == CanvasTool::CustomShape;
+  const bool styled_pixels =
+      vector_tool_mode_ == VectorToolMode::Pixels && tool_ != CanvasTool::Line &&
+      shape_pixel_style_.line.has_value() &&
+      (path_tool || !patchy::pixel_shape_style_is_classic(core_shape_style(shape_pixel_style_, primary_color_, brush_size_)));
+  if (vector_shape_tool && (vector_tool_mode_ == VectorToolMode::Shape || styled_pixels) &&
+      layer_edit_target_ == LayerEditTarget::Content && !quick_mask_active_ &&
+      !editing_smart_filter_mask() && shape_preview_appearance_callback_) {
+    if (const auto appearance = shape_preview_appearance_callback_();
+        appearance.has_value() && draw_shape_appearance_preview(painter, *appearance)) {
+      return;
+    }
+  }
+
+  // A drag that commits a work path or vector-mask subpaths previews that
+  // geometry as a path outline (options-bar radius, line weight, polygon or
+  // custom shape included). The raster preview below is Pixels mode's: its
+  // brush-size stroke and Fill option never apply to a path. Polygon and
+  // Custom Shape always commit vectors.
+  const bool vector_target =
+      !quick_mask_active_ &&
+      (layer_edit_target_ == LayerEditTarget::Content ||
+       (layer_edit_target_ == LayerEditTarget::VectorMask && vector_mask_target_layer() != nullptr));
+  const bool commits_path =
+      tool_ == CanvasTool::Polygon || tool_ == CanvasTool::CustomShape ||
+      (vector_shape_tool && vector_target && vector_tool_mode_ != VectorToolMode::Pixels &&
+       vector_shape_drawn_callback_);
+  if (commits_path) {
+    double line_weight = 1.0;
+    if (tool_ == CanvasTool::Line && shape_preview_appearance_callback_) {
+      if (const auto appearance = shape_preview_appearance_callback_(); appearance.has_value()) {
+        line_weight = static_cast<double>(appearance->line_weight);
+      }
+    }
+    draw_path_preview_outline(painter, shape_drag_preview_path(line_weight));
+    return;
+  }
+
+  // A document-channel preview is not an RGB paint preview. The committed edit
+  // first converts the paint color to gray, then presents that gray either by
+  // itself or through the channel's colored overlay. Build the prospective
+  // value/coverage image at viewport resolution so the preview follows those
+  // same rules without doing work proportional to the document pixel count.
+  const auto* preview_channel =
+      quick_mask_active_ ? nullptr : active_document_channel_const();
+  if (quick_mask_active_ || editing_smart_filter_mask() ||
+      (layer_edit_target_ == LayerEditTarget::DocumentChannel &&
+       preview_channel != nullptr &&
+       preview_channel->kind() == DocumentChannelKind::Alpha)) {
+    const QRectF exact_target_rect(widget_position_f(QPointF(0.0, 0.0)),
+                                   widget_position_f(QPointF(document_->width(), document_->height())));
+    const bool pixel_aligned_view = uses_pixel_aligned_view(zoom_);
+    QRect pixel_aligned_target_rect;
+    if (pixel_aligned_view) {
+      const auto top_left = widget_position(QPoint(0, 0));
+      const auto bottom_right = widget_position(QPoint(document_->width(), document_->height()));
+      pixel_aligned_target_rect =
+          QRect(top_left, QSize(bottom_right.x() - top_left.x(), bottom_right.y() - top_left.y()));
+    }
+    const QRectF target_rect = pixel_aligned_view ? QRectF(pixel_aligned_target_rect) : exact_target_rect;
+    const auto preview_rect =
+        target_rect.toAlignedRect().intersected(overlay_exposed_rect(exposed_rect)).intersected(overlay_view_rect());
+    if (!preview_rect.isEmpty()) {
+      QImage source(preview_rect.size(), QImage::Format_ARGB32_Premultiplied);
+      source.fill(Qt::transparent);
+      {
+        QPainter source_painter(&source);
+        source_painter.translate(-preview_rect.topLeft());
+        source_painter.setClipRect(target_rect);
+        if (selection_clips_grayscale_edits()) {
+          QRegion widget_selection;
+          for (const auto& selection_rect : selection_) {
+            widget_selection += widget_rect_for_document_rect(selection_rect);
+          }
+          source_painter.setClipRegion(widget_selection, Qt::IntersectClip);
+        }
+        source_painter.setRenderHint(QPainter::Antialiasing, true);
+
+        if (pending_shape) {
+          // The grays and coverage a commit would write, from the pending shape's cache.
+          auto& shape = *pending_pixel_shape_;
+          refresh_pending_pixel_shape_preview(shape);
+          if (!shape.preview.isNull()) {
+            source_painter.save();
+            source_painter.setTransform(view_transform().to_widget(), true);
+            source_painter.setRenderHint(QPainter::SmoothPixmapTransform, zoom_ < 1.0);
+            source_painter.drawImage(QPointF(shape.preview_origin), shape.preview);
+            source_painter.restore();
+          }
+        } else if (tool_ == CanvasTool::Gradient && gradient_method_ != GradientMethod::Linear &&
+                   gradient_method_ != GradientMethod::Radial) {
+          source_painter.setRenderHint(QPainter::SmoothPixmapTransform, true);
+          source_painter.fillRect(target_rect,
+                                  sampled_gradient_preview_brush(
+                                      gradient_method_, QPointF(a), QPointF(b), effective_gradient_stops(),
+                                      static_cast<float>(gradient_opacity_) / 100.0F, gradient_reverse_,
+                                      target_rect, true));
+        } else if (tool_ == CanvasTool::Gradient) {
+          QLinearGradient linear_gradient(a, b);
+          const auto radius =
+              std::max(1.0, std::hypot(static_cast<double>(b.x() - a.x()), static_cast<double>(b.y() - a.y())));
+          QRadialGradient radial_gradient(a, radius);
+          auto* gradient = gradient_method_ == GradientMethod::Radial ? static_cast<QGradient*>(&radial_gradient)
+                                                                      : static_cast<QGradient*>(&linear_gradient);
+          // QGradient interpolates straight: midpoints become stops of their own.
+          for (const auto& stop : gradient_stops_with_explicit_midpoints(effective_gradient_stops())) {
+            const auto value = mask_value_from_color(QColor(stop.color.r, stop.color.g, stop.color.b));
+            const auto alpha = static_cast<int>(std::clamp(
+                std::lround(static_cast<double>(stop.color.a) * static_cast<double>(gradient_opacity_) / 100.0),
+                0L, 255L));
+            gradient->setColorAt(gradient_reverse_ ? 1.0 - static_cast<double>(stop.location)
+                                                   : static_cast<double>(stop.location),
+                                 QColor(value, value, value, alpha));
+          }
+          source_painter.fillRect(target_rect, QBrush(*gradient));
+        } else {
+          const auto value = mask_value_from_color(primary_color_);
+          const auto alpha = static_cast<int>(
+              std::clamp(std::lround(255.0 * static_cast<double>(brush_opacity_) / 100.0), 0L, 255L));
+          const QColor gray(value, value, value, alpha);
+          if (tool_ == CanvasTool::Line) {
+            QPen pen(gray);
+            pen.setWidth(std::max(1, static_cast<int>(std::round(static_cast<double>(brush_size_) * zoom_))));
+            pen.setCapStyle(Qt::RoundCap);
+            pen.setJoinStyle(Qt::RoundJoin);
+            pen.setCosmetic(false);
+            source_painter.setPen(pen);
+            source_painter.setBrush(Qt::NoBrush);
+            source_painter.drawLine(a, b);
+          } else if (tool_ == CanvasTool::Rectangle || tool_ == CanvasTool::Ellipse) {
+            // Each paint as the gray the edit writes (GitHub issue 716); a gradient or a
+            // pattern previews as a middle gray.
+            const auto core = core_shape_style(shape_pixel_style_, primary_color_, brush_size_);
+            const auto gray_of = [alpha](const patchy::VectorFill& paint) {
+              const QColor middle_gray(128, 128, 128);  // color-literal-ok: a mask value, not chrome
+              const auto own_value = mask_value_from_color(shape_paint_preview_color(paint, middle_gray));
+              return QColor(own_value, own_value, own_value, alpha);
+            };
+            paint_pixel_shape_preview(
+                source_painter, tool_ == CanvasTool::Ellipse, normalized_rect(a, b),
+                tool_ == CanvasTool::Rectangle ? static_cast<double>(shape_corner_radius_) * zoom_ : 0.0, core,
+                gray_of(core.fill), gray_of(core.stroke.content), zoom_);
+          }
+        }
+      }
+
+      if (quick_mask_active_ || mask_display_mode_ == MaskDisplayMode::Overlay) {
+        QImage base(preview_rect.size(), QImage::Format_ARGB32_Premultiplied);
+        base.fill(backdrop_color());
+        {
+          QPainter base_painter(&base);
+          base_painter.translate(-preview_rect.topLeft());
+          draw_checkerboard(base_painter, target_rect, preview_rect);
+          if (!render_cache_.isNull()) {
+            const auto& display_image = zoom_ < 1.0 ? display_image_for_zoom() : render_cache_;
+            base_painter.setRenderHint(
+                QPainter::SmoothPixmapTransform,
+                uses_smooth_display_scaling(view_zoom(), deep_zoom_pixels_active()));
+            if (pixel_aligned_view) {
+              base_painter.drawImage(pixel_aligned_target_rect, display_image, display_image.rect());
+            } else {
+              base_painter.drawImage(target_rect, display_image, QRectF(display_image.rect()));
+            }
+          }
+        }
+
+        const auto display = preview_channel != nullptr
+                                 ? preview_channel->display_info()
+                                 : DocumentChannelDisplayInfo{};
+        const QColor overlay =
+            quick_mask_active_
+                ? QColor(255, 0, 0)
+                : QColor(display.color.red, display.color.green,
+                         display.color.blue);
+        const bool selected_areas =
+            !quick_mask_active_ &&
+            display.color_indicates ==
+                DocumentChannelColorIndicates::SelectedAreas;
+        const auto overlay_opacity =
+            quick_mask_active_ ? 0.5F
+                               : std::clamp(display.opacity, 0.0F, 1.0F);
+        for (int y = 0; y < source.height(); ++y) {
+          auto* source_row = reinterpret_cast<QRgb*>(source.scanLine(y));
+          const auto* base_row = reinterpret_cast<const QRgb*>(base.constScanLine(y));
+          for (int x = 0; x < source.width(); ++x) {
+            const auto paint = qUnpremultiply(source_row[x]);
+            const auto paint_alpha = qAlpha(paint);
+            if (paint_alpha == 0) {
+              continue;
+            }
+            const auto value = qRed(paint);
+            const auto coverage = selected_areas ? value : 255 - value;
+            const auto channel_alpha = static_cast<int>(std::clamp(
+                std::lround(static_cast<double>(coverage) * static_cast<double>(overlay_opacity)), 0L, 255L));
+            const auto background = qUnpremultiply(base_row[x]);
+            const auto blend = [channel_alpha](int foreground, int background_component) {
+              return (foreground * channel_alpha + background_component * (255 - channel_alpha) + 127) / 255;
+            };
+            source_row[x] = qPremultiply(qRgba(blend(overlay.red(), qRed(background)),
+                                                  blend(overlay.green(), qGreen(background)),
+                                                  blend(overlay.blue(), qBlue(background)), paint_alpha));
+          }
+        }
+      }
+      if (quick_mask_active_ || mask_display_mode_ == MaskDisplayMode::Overlay ||
+          mask_display_mode_ == MaskDisplayMode::Grayscale) {
+        // For a mask-only view the current grayscale image is already on the
+        // canvas; this translucent prospective paint is layered over it.
+        painter.drawImage(preview_rect.topLeft(), source);
+      }
+    }
+
+    if (tool_ == CanvasTool::Gradient) {
+      const auto stops = effective_gradient_stops();
+      painter.setPen(QPen(QColor(230, 235, 242), 1));
+      const auto first =
+          gradient_color_at(stops, static_cast<float>(gradient_opacity_) / 100.0F, gradient_reverse_, 0.0);
+      const auto last =
+          gradient_color_at(stops, static_cast<float>(gradient_opacity_) / 100.0F, gradient_reverse_, 1.0);
+      painter.setBrush(QColor(first.r, first.g, first.b, first.a));
+      painter.drawEllipse(a, 4, 4);
+      painter.setBrush(QColor(last.r, last.g, last.b, last.a));
+      painter.drawEllipse(b, 4, 4);
+    }
+    return;
+  }
+
+  if (tool_ == CanvasTool::Gradient) {
+    draw_gradient_drag_preview(painter, a, b, gradient_drag_makes_fill_layer(), true);
+  } else if (tool_ == CanvasTool::Line) {
+    QPen pen(primary_color_);
+    pen.setWidth(std::max(1, static_cast<int>(std::round(static_cast<double>(brush_size_) * zoom_))));
+    pen.setCosmetic(false);
+    painter.setPen(pen);
+    painter.setBrush(Qt::NoBrush);
+    painter.drawLine(a, b);
+  } else if (tool_ == CanvasTool::Rectangle || tool_ == CanvasTool::Ellipse) {
+    // The fill previews translucent so the artwork under it shows; the stroke in its color.
+    const auto core = core_shape_style(shape_pixel_style_, primary_color_, brush_size_);
+    const auto fill = shape_paint_preview_color(core.fill, primary_color_);
+    paint_pixel_shape_preview(
+        painter, tool_ == CanvasTool::Ellipse, normalized_rect(a, b),
+        tool_ == CanvasTool::Rectangle ? static_cast<double>(shape_corner_radius_) * zoom_ : 0.0, core,
+        QColor(fill.red(), fill.green(), fill.blue(), std::clamp(brush_opacity_ * 2, 60, 180)),
+        shape_paint_preview_color(core.stroke.content, primary_color_), zoom_);
+  }
+}
+
+void CanvasWidget::draw_gradient_drag_preview(QPainter& painter, QPoint a, QPoint b, bool fills_canvas,
+                                              bool end_points) {
+  QGradient* raw_gradient = nullptr;
+  QLinearGradient linear_gradient(a, b);
+  const auto radius = std::max(1.0, std::hypot(static_cast<double>(b.x() - a.x()), static_cast<double>(b.y() - a.y())));
+  QRadialGradient radial_gradient(a, radius);
+  raw_gradient = gradient_method_ == GradientMethod::Radial ? static_cast<QGradient*>(&radial_gradient)
+                                                            : static_cast<QGradient*>(&linear_gradient);
+  const auto stops = effective_gradient_stops();
+  for (const auto& stop : gradient_stops_with_explicit_midpoints(stops)) {
+    auto color = stop.color;
+    color.a = static_cast<std::uint8_t>(
+        std::clamp(std::lround(static_cast<float>(color.a) * static_cast<float>(gradient_opacity_) / 100.0F), 0L,
+                   255L));
+    raw_gradient->setColorAt(gradient_reverse_ ? 1.0 - static_cast<double>(stop.location)
+                                               : static_cast<double>(stop.location),
+                              QColor(color.r, color.g, color.b, color.a));
+  }
+
+  QRect document_rect;
+  // The gradient covers the canvas unless transparency is locked (core draw_gradient grows
+  // the layer; GitHub issue 498), so the preview does too.
+  // A Fill Layer mode drag (GitHub issue 580) makes a canvas-wide fill layer whatever
+  // the active layer's locks.
+  if (fills_canvas || editing_grayscale_target() || !active_layer_locks_transparent_pixels()) {
+    document_rect =
+        QRect(0, 0, document_ != nullptr ? document_->width() : 0, document_ != nullptr ? document_->height() : 0);
+  } else if (const auto layer_rect = active_layer_document_rect()) {
+    document_rect = *layer_rect;
+  }
+  if (document_ != nullptr) {
+    document_rect = document_rect.intersected(QRect(0, 0, document_->width(), document_->height()));
+  }
+  if (has_selection() && selected_document_rect().has_value()) {
+    document_rect = document_rect.intersected(*selected_document_rect());
+  }
+  // A drag shown through the composite (its layer's effects, opacity and blend mode, the
+  // layers above: GitHub #714 follow-up) needs no painted gradient over it; only the dots.
+  const bool composite_shown = end_points && drawing_shape_ && gradient_drag_view_preview_shown();
+  if (!document_rect.isEmpty() && !composite_shown) {
+    const auto fill_rect = widget_rect_for_document_rect(QRectF(document_rect));
+    painter.save();
+    painter.setClipRect(fill_rect);
+    if (has_selection()) {
+      QRegion widget_selection;
+      for (const auto& rect : selection_.intersected(document_rect)) {
+        widget_selection += widget_rect_for_document_rect(rect);
+      }
+      painter.setClipRegion(widget_selection, Qt::IntersectClip);
+    }
+    if (gradient_method_ == GradientMethod::Linear || gradient_method_ == GradientMethod::Radial) {
+      painter.fillRect(fill_rect, QBrush(*raw_gradient));
+    } else {
+      painter.setRenderHint(QPainter::SmoothPixmapTransform, true);
+      painter.fillRect(fill_rect, sampled_gradient_preview_brush(
+                                      gradient_method_, QPointF(a), QPointF(b), stops,
+                                      static_cast<float>(gradient_opacity_) / 100.0F, gradient_reverse_,
+                                      fill_rect, false));
+    }
+    painter.restore();
+  }
+
+  if (!end_points) {
+    return;
+  }
+  painter.setPen(QPen(QColor(230, 235, 242), 1));
+  const auto first = gradient_color_at(stops, static_cast<float>(gradient_opacity_) / 100.0F, gradient_reverse_, 0.0);
+  const auto last = gradient_color_at(stops, static_cast<float>(gradient_opacity_) / 100.0F, gradient_reverse_, 1.0);
+  painter.setBrush(QColor(first.r, first.g, first.b, first.a));
+  painter.drawEllipse(a, 4, 4);
+  painter.setBrush(QColor(last.r, last.g, last.b, last.a));
+  painter.drawEllipse(b, 4, 4);
+}
+
+QPainterPath CanvasWidget::shape_drag_preview_path(double line_weight) const {
+  QPainterPath path;
+  const auto to_widget = [this](QPointF document_point) {
+    return widget_position_f(document_point);
+  };
+  const auto drag_rect = shape_drag_rect(shape_start_, shape_current_);
+  const QRectF widget_rect(to_widget(QPointF(drag_rect.topLeft())),
+                           to_widget(QPointF(drag_rect.bottomRight())));
+  switch (tool_) {
+    case CanvasTool::Rectangle: {
+      if (shape_corner_radius_ > 0) {
+        const auto radius = static_cast<double>(shape_corner_radius_) * zoom_;
+        const auto clamped =
+            std::min(radius, std::min(widget_rect.width(), widget_rect.height()) / 2.0);
+        path.addRoundedRect(widget_rect, clamped, clamped);
+      } else {
+        path.addRect(widget_rect);
+      }
+      break;
+    }
+    case CanvasTool::Ellipse:
+      path.addEllipse(widget_rect);
+      break;
+    case CanvasTool::Line: {
+      // The committed line is a filled band of the weight; preview the same
+      // band with a flat-capped pen path.
+      QPainterPath spine;
+      spine.moveTo(to_widget(QPointF(shape_start_)));
+      spine.lineTo(to_widget(QPointF(shape_current_)));
+      QPainterPathStroker stroker;
+      stroker.setWidth(std::max(1.0, line_weight * zoom_));
+      stroker.setCapStyle(Qt::FlatCap);
+      path = stroker.createStroke(spine);
+      break;
+    }
+    case CanvasTool::Polygon: {
+      const auto subpath = polygon_drag_subpath(QPointF(shape_start_), QPointF(shape_current_));
+      if (subpath.anchors.size() < 3) {
+        return {};
+      }
+      QPolygonF outline;
+      for (const auto& anchor : subpath.anchors) {
+        outline << to_widget(QPointF(anchor.anchor_x, anchor.anchor_y));
+      }
+      path.addPolygon(outline);
+      path.closeSubpath();
+      break;
+    }
+    case CanvasTool::CustomShape: {
+      if (custom_shape_path_ == nullptr || custom_shape_path_->subpaths.empty() ||
+          drag_rect.width() <= 0 || drag_rect.height() <= 0) {
+        return {};
+      }
+      // The stamp scales the unit-box shape into the drag rect.
+      for (const auto& subpath : custom_shape_path_->subpaths) {
+        if (subpath.anchors.empty()) {
+          continue;
+        }
+        const auto map = [&](double x, double y) {
+          return to_widget(QPointF(drag_rect.x() + x * drag_rect.width(),
+                                   drag_rect.y() + y * drag_rect.height()));
+        };
+        const auto& anchors = subpath.anchors;
+        path.moveTo(map(anchors[0].anchor_x, anchors[0].anchor_y));
+        const auto anchor_count = anchors.size();
+        const auto segment_count = subpath.closed ? anchor_count : anchor_count - 1;
+        for (std::size_t i = 0; i < segment_count; ++i) {
+          const auto& from = anchors[i];
+          const auto& to = anchors[(i + 1) % anchor_count];
+          path.cubicTo(map(from.out_x, from.out_y), map(to.in_x, to.in_y),
+                       map(to.anchor_x, to.anchor_y));
+        }
+        path.closeSubpath();
+      }
+      break;
+    }
+    default:
+      break;
+  }
+  return path;
+}
+
+bool CanvasWidget::draw_shape_appearance_preview(QPainter& painter,
+                                                 const ShapePreviewAppearance& appearance) {
+  // Approximation note: line arrowheads appear at commit. The stroke itself
+  // follows the committed alignment, join and cap (issue 125): an inside or
+  // outside stroke is the double-width centered band clipped to the fill
+  // region or its complement, the same construction rasterize_vector_stroke
+  // uses, so the shape neither shrinks nor changes its corners on release.
+  const auto path = shape_drag_preview_path(static_cast<double>(appearance.line_weight));
+  if (path.isEmpty()) {
+    return false;
+  }
+  // Texture (pattern) brushes arrive in document space; compose the
+  // widget-from-document view onto their placement so tiles track zoom/pan.
+  // ObjectMode gradients span the painted path's bounds and solid colors are
+  // position-free - both stay untouched.
+  const auto view = view_transform().to_widget();
+  const auto widget_space_brush = [&view](QBrush brush) {
+    if (brush.style() == Qt::TexturePattern) {
+      brush.setTransform(brush.transform() * view);
+    }
+    return brush;
+  };
+  painter.save();
+  painter.setRenderHint(QPainter::Antialiasing, true);
+  painter.setPen(Qt::NoPen);
+  painter.setBrush(widget_space_brush(appearance.fill));
+  painter.drawPath(path);
+  if (appearance.stroke_enabled && appearance.stroke.style() != Qt::NoBrush &&
+      appearance.stroke_width > 0.0) {
+    const bool centered = appearance.stroke_alignment == VectorStrokeAlignment::Center;
+    const double band_width =
+        std::max(0.5, appearance.stroke_width * zoom_) * (centered ? 1.0 : 2.0);
+    QPen pen(widget_space_brush(appearance.stroke), band_width);
+    pen.setJoinStyle(appearance.stroke_join == VectorStrokeJoin::Round   ? Qt::RoundJoin
+                     : appearance.stroke_join == VectorStrokeJoin::Bevel ? Qt::BevelJoin
+                                                                         : Qt::MiterJoin);
+    pen.setCapStyle(appearance.stroke_cap == VectorStrokeCap::Round    ? Qt::RoundCap
+                    : appearance.stroke_cap == VectorStrokeCap::Square ? Qt::SquareCap
+                                                                       : Qt::FlatCap);
+    pen.setMiterLimit(std::max(1.0, appearance.stroke_miter_limit));
+    if (!appearance.stroke_dashes.empty()) {
+      // A pen measures dashes in pen widths; an inside or outside band is twice the stroke.
+      const double unit = centered ? 1.0 : 0.5;
+      QList<qreal> pattern;
+      for (const auto length : appearance.stroke_dashes) {
+        pattern.push_back(length * unit);
+      }
+      if (pattern.size() % 2 != 0) {
+        pattern.append(pattern);
+      }
+      pen.setDashPattern(pattern);
+      pen.setDashOffset(appearance.stroke_dash_offset * unit);
+    }
+    painter.save();
+    if (appearance.stroke_alignment == VectorStrokeAlignment::Inside) {
+      painter.setClipPath(path, Qt::IntersectClip);
+    } else if (appearance.stroke_alignment == VectorStrokeAlignment::Outside) {
+      QPainterPath outside;
+      outside.addRect(QRectF(overlay_view_rect()).adjusted(-band_width, -band_width, band_width, band_width));
+      painter.setClipPath(outside.subtracted(path), Qt::IntersectClip);
+    }
+    painter.setBrush(Qt::NoBrush);
+    painter.setPen(pen);
+    painter.drawPath(path);
+    painter.restore();
+  }
+  painter.restore();
+  return true;
+}
+
+void CanvasWidget::draw_drag_size_readout(QPainter& painter) const {
+  // Photoshop-style live W x H readout while dragging out a shape or a
+  // rectangular/elliptical marquee, drawn just below-right of the drag corner.
+  QRect rect;
+  QPoint corner;
+  if (drawing_shape_ && (tool_ == CanvasTool::Rectangle || tool_ == CanvasTool::Ellipse)) {
+    rect = shape_drag_rect(shape_start_, shape_current_);
+    corner = shape_current_;
+  } else if (selecting_ && (tool_ == CanvasTool::Marquee || tool_ == CanvasTool::EllipticalMarquee)) {
+    rect = marquee_selection_rect(selection_start_, selection_current_);
+    corner = selection_current_;
+  } else if (marquee_resize_handle_ != TransformHandle::None && marquee_shape_.has_value()) {
+    // Resizing a committed marquee by a handle: the readout follows the pointer.
+    rect = marquee_shape_->rect;
+    corner = document_position(last_mouse_position_);
+  } else if (artboard_drag_moved_ && (artboard_drag_mode_ == ArtboardDragMode::Create ||
+                                      artboard_drag_mode_ == ArtboardDragMode::Resize)) {
+    rect = artboard_drag_rect_;
+    corner = QPoint(rect.x() + rect.width(), rect.y() + rect.height());
+  } else if (crop_dragging_out_) {
+    rect = crop_drag_rect(crop_anchor_document_, crop_current_document_);
+    corner = crop_current_document_;
+  } else if (tool_ == CanvasTool::Crop && crop_session_active_ && crop_drag_handle_ != TransformHandle::None &&
+             crop_drag_handle_ != TransformHandle::Move) {
+    rect = crop_rect_;
+    corner = QPoint(crop_rect_.x() + crop_rect_.width(), crop_rect_.y() + crop_rect_.height());
+  } else {
+    return;
+  }
+  const auto readout = tr("%1 x %2 px").arg(rect.width()).arg(rect.height());
+  const auto anchor = widget_position(corner);
+  const auto metrics = painter.fontMetrics();
+  // A HUD pill just below-right of the pointer, the Free Transform readout's
+  // look: the bare outlined text 16/24 px away vanished on busy artwork
+  // (GitHub issue 142).
+  QRect pill(anchor + QPoint(12, 14), canvas_hud_pill_size(metrics, readout));
+  const int left = rulers_visible_ ? kLeftRulerWidth : 0;
+  const int top = rulers_visible_ ? kTopRulerHeight : 0;
+  const QRect bounds(left, top, std::max(1, width() - left), std::max(1, height() - top));
+  if (pill.right() > bounds.right() - 4) {
+    pill.moveRight(bounds.right() - 4);
+  }
+  if (pill.bottom() > bounds.bottom() - 4) {
+    pill.moveBottom(bounds.bottom() - 4);
+  }
+  if (pill.left() < bounds.left() + 4) {
+    pill.moveLeft(bounds.left() + 4);
+  }
+  if (pill.top() < bounds.top() + 4) {
+    pill.moveTop(bounds.top() + 4);
+  }
+  paint_canvas_hud_pill(painter, pill, readout);
+}
+
+QRect CanvasWidget::drag_readout_widget_rect() const {
+  const auto readout = transform_drag_readout();
+  if (!readout.has_value() || readout->canvas_lines.isEmpty()) {
+    return {};
+  }
+  const QFontMetrics metrics(font());
+  constexpr int kPadX = 8;
+  constexpr int kPadY = 5;
+  constexpr int kLineGap = 2;
+  int text_width = 0;
+  for (const auto& line : readout->canvas_lines) {
+    text_width = std::max(text_width, metrics.horizontalAdvance(line));
+  }
+  const int line_count = static_cast<int>(readout->canvas_lines.size());
+  const QSize size(text_width + 2 * kPadX, line_count * metrics.height() + (line_count - 1) * kLineGap + 2 * kPadY);
+  // Photoshop's placement: just below-right of the pointer (the same offset the
+  // W x H drag readout uses), kept inside the viewport and clear of the rulers.
+  QRect rect(last_mouse_position_ + QPoint(16, 24), size);
+  const int left = rulers_visible_ ? kLeftRulerWidth : 0;
+  const int top = rulers_visible_ ? kTopRulerHeight : 0;
+  const QRect bounds(left, top, std::max(1, width() - left), std::max(1, height() - top));
+  if (rect.right() > bounds.right() - 4) {
+    rect.moveRight(bounds.right() - 4);
+  }
+  if (rect.bottom() > bounds.bottom() - 4) {
+    rect.moveBottom(bounds.bottom() - 4);
+  }
+  if (rect.left() < bounds.left() + 4) {
+    rect.moveLeft(bounds.left() + 4);
+  }
+  if (rect.top() < bounds.top() + 4) {
+    rect.moveTop(bounds.top() + 4);
+  }
+  return rect;
+}
+
+void CanvasWidget::draw_transform_drag_readout(QPainter& painter) const {
+  const auto readout = transform_drag_readout();
+  const auto rect = drag_readout_widget_rect();
+  if (!readout.has_value() || rect.isEmpty()) {
+    return;
+  }
+  // Whatever repaint drew the panel, the next readout update must clear it.
+  drag_readout_dirty_rect_ = drag_readout_dirty_rect_.united(rect);
+  const QFontMetrics metrics(painter.fontMetrics());
+  constexpr int kPadX = 8;
+  constexpr int kPadY = 5;
+  constexpr int kLineGap = 2;
+  painter.save();
+  painter.setRenderHint(QPainter::Antialiasing, true);
+  QPainterPath panel_path;
+  panel_path.addRoundedRect(QRectF(rect), 4.0, 4.0);
+  auto hud_fill = theme().canvas_hud_bg;
+  hud_fill.setAlpha(236);
+  painter.fillPath(panel_path, hud_fill);
+  painter.setPen(QPen(theme().canvas_hud_border, 1.0));
+  painter.drawPath(panel_path);
+  painter.setPen(theme().canvas_hud_text);
+  int y = rect.top() + kPadY;
+  for (const auto& line : readout->canvas_lines) {
+    painter.drawText(QRect(rect.left() + kPadX, y, rect.width() - 2 * kPadX, metrics.height()),
+                     Qt::AlignLeft | Qt::AlignVCenter, line);
+    y += metrics.height() + kLineGap;
+  }
+  painter.restore();
+}
+
+void CanvasWidget::update_drag_readout_region() {
+  const auto next = drag_readout_widget_rect();
+  const auto dirty = drag_readout_dirty_rect_.united(next);
+  drag_readout_dirty_rect_ = next;
+  if (!dirty.isEmpty()) {
+    update(dirty.adjusted(-2, -2, 2, 2));
+  }
+  // Status-bar mirror, only when the text actually changes.
+  if (status_callback_) {
+    const auto readout = transform_drag_readout();
+    const auto text = readout.has_value() ? readout->lines.join(QStringLiteral("    ")) : QString();
+    if (!text.isEmpty() && text != drag_readout_status_text_) {
+      drag_readout_status_text_ = text;
+      status_callback_(text);
+    }
+  }
+}
+
+void CanvasWidget::clear_drag_readout() {
+  const auto dirty = drag_readout_dirty_rect_;
+  drag_readout_dirty_rect_ = QRect();
+  drag_readout_status_text_.clear();
+  if (!dirty.isEmpty()) {
+    update(dirty.adjusted(-2, -2, 2, 2));
+  }
+}
+
+namespace {
+
+// Alignment guides extend a little past the two boxes they bridge, like
+// Photoshop's, so a line landing exactly on an edge still reads as a line.
+constexpr int kSnapGuideOverhangPixels = 4;
+
+bool snap_match_draws_line(const std::optional<CanvasWidget::SnapMatch>& match) {
+  // Guides already draw themselves and the grid has no single line to show.
+  return match.has_value() && match->kind != CanvasWidget::SnapMatch::Kind::Guide &&
+         match->kind != CanvasWidget::SnapMatch::Kind::Grid;
+}
+
+}  // namespace
+
+QRect CanvasWidget::move_snap_guides_widget_rect() const {
+  // A Move drag, a whole-shape path drag (GitHub issue 695) or a polygon's center drag
+  // owns the guides.
+  if (!move_snap_guides_owned() || document_ == nullptr) {
+    return {};
+  }
+  QRect rect;
+  const auto extent = [](const SnapMatch& match, bool vertical) {
+    const auto lo = vertical ? std::min(match.source_span.top(), match.target_span.top())
+                             : std::min(match.source_span.left(), match.target_span.left());
+    const auto hi = vertical ? std::max(match.source_span.bottom(), match.target_span.bottom())
+                             : std::max(match.source_span.right(), match.target_span.right());
+    return std::pair<double, double>{lo, hi};
+  };
+  if (snap_match_draws_line(move_snap_x_)) {
+    const auto [top, bottom] = extent(*move_snap_x_, true);
+    const auto x = widget_position_f(QPointF(move_snap_x_->position, 0.0)).x();
+    const auto y0 = widget_position_f(QPointF(0.0, top)).y() - kSnapGuideOverhangPixels;
+    const auto y1 = widget_position_f(QPointF(0.0, bottom)).y() + kSnapGuideOverhangPixels;
+    rect = rect.united(QRectF(x - 1.5, y0, 3.0, y1 - y0).toAlignedRect());
+  }
+  if (snap_match_draws_line(move_snap_y_)) {
+    const auto [left, right] = extent(*move_snap_y_, false);
+    const auto y = widget_position_f(QPointF(0.0, move_snap_y_->position)).y();
+    const auto x0 = widget_position_f(QPointF(left, 0.0)).x() - kSnapGuideOverhangPixels;
+    const auto x1 = widget_position_f(QPointF(right, 0.0)).x() + kSnapGuideOverhangPixels;
+    rect = rect.united(QRectF(x0, y - 1.5, x1 - x0, 3.0).toAlignedRect());
+  }
+  if (!view_axis_aligned()) {
+    // Drawn in the upright frame and turned: repaint the view rather than map the lines.
+    return this->rect();
+  }
+  // A document-edge line at deep zoom is enormous; only the visible part matters.
+  return rect.intersected(this->rect());
+}
+
+void CanvasWidget::draw_move_snap_guides(QPainter& painter) const {
+  if (!move_snap_guides_owned() || document_ == nullptr || !extra_shown(ViewExtra::SmartGuides) ||
+      (!snap_match_draws_line(move_snap_x_) && !snap_match_draws_line(move_snap_y_))) {
+    return;
+  }
+  painter.save();
+  QPen pen(theme().canvas_snap_guide, 1.0, Qt::SolidLine);
+  pen.setCosmetic(true);
+  painter.setPen(pen);
+  // Crisp 1 px lines on the pixel-aligned view, like the guides overlay.
+  const auto pixel_aligned_coordinate = [](double coordinate, double zoom) {
+    return uses_pixel_aligned_view(zoom) ? std::round(coordinate) : coordinate;
+  };
+  if (snap_match_draws_line(move_snap_x_)) {
+    const auto& match = *move_snap_x_;
+    const auto top = std::min(match.source_span.top(), match.target_span.top());
+    const auto bottom = std::max(match.source_span.bottom(), match.target_span.bottom());
+    const auto x = pixel_aligned_coordinate(widget_position_f(QPointF(match.position, 0.0)).x(), zoom_);
+    const auto y0 = widget_position_f(QPointF(0.0, top)).y() - kSnapGuideOverhangPixels;
+    const auto y1 = widget_position_f(QPointF(0.0, bottom)).y() + kSnapGuideOverhangPixels;
+    painter.drawLine(QPointF(x, y0), QPointF(x, y1));
+  }
+  if (snap_match_draws_line(move_snap_y_)) {
+    const auto& match = *move_snap_y_;
+    const auto left = std::min(match.source_span.left(), match.target_span.left());
+    const auto right = std::max(match.source_span.right(), match.target_span.right());
+    const auto y = pixel_aligned_coordinate(widget_position_f(QPointF(0.0, match.position)).y(), zoom_);
+    const auto x0 = widget_position_f(QPointF(left, 0.0)).x() - kSnapGuideOverhangPixels;
+    const auto x1 = widget_position_f(QPointF(right, 0.0)).x() + kSnapGuideOverhangPixels;
+    painter.drawLine(QPointF(x0, y), QPointF(x1, y));
+  }
+  painter.restore();
+}
+
+void CanvasWidget::update_move_snap_guides_region() {
+  const auto next = move_snap_guides_widget_rect();
+  const auto dirty = move_snap_guides_dirty_rect_.united(next);
+  move_snap_guides_dirty_rect_ = next;
+  if (!dirty.isEmpty()) {
+    update(dirty.adjusted(-2, -2, 2, 2));
+  }
+}
+
+void CanvasWidget::clear_move_snap_guides() {
+  move_snap_x_.reset();
+  move_snap_y_.reset();
+  const auto dirty = move_snap_guides_dirty_rect_;
+  move_snap_guides_dirty_rect_ = QRect();
+  if (!dirty.isEmpty()) {
+    update(dirty.adjusted(-2, -2, 2, 2));
+  }
+}
+
+void CanvasWidget::draw_text_rect_preview(QPainter& painter) const {
+  if (!dragging_text_rect_) {
+    return;
+  }
+
+  const auto preview_rect = QRect(widget_position(text_rect_start_), widget_position(text_rect_current_)).normalized();
+  if (preview_rect.width() < 2 && preview_rect.height() < 2) {
+    return;
+  }
+
+  painter.save();
+  painter.setBrush(QColor(65, 135, 220, 28));
+  painter.setPen(Qt::NoPen);
+  painter.drawRect(preview_rect);
+  QPen border(theme().canvas_layer_selection_border, 1.0);
+  border.setCosmetic(true);
+  border.setDashPattern({5.0, 4.0});
+  painter.setBrush(Qt::NoBrush);
+  painter.setPen(border);
+  painter.drawRect(preview_rect.adjusted(0, 0, -1, -1));
+  painter.restore();
+}
+
+void CanvasWidget::draw_pixel(Layer& layer, QPoint document_point, QColor color, bool erase) {
+  if (!document_contains(document_point) || !selection_allows(document_point)) {
+    return;
+  }
+
+  auto& pixels = layer.pixels();
+  if (pixels.format().bit_depth != BitDepth::UInt8 || pixels.format().channels < 3) {
+    return;
+  }
+
+  const auto local = layer_position(layer, document_point);
+  if (local.x() < 0 || local.y() < 0 || local.x() >= pixels.width() || local.y() >= pixels.height()) {
+    return;
+  }
+
+  auto* px = pixels.pixel(local.x(), local.y());
+  if (erase) {
+    if (pixels.format().channels >= 4) {
+      px[3] = 0;
+    } else {
+      px[0] = channel_from_color(secondary_color_, 0);
+      px[1] = channel_from_color(secondary_color_, 1);
+      px[2] = channel_from_color(secondary_color_, 2);
+    }
+    return;
+  }
+
+  px[0] = channel_from_color(color, 0);
+  px[1] = channel_from_color(color, 1);
+  px[2] = channel_from_color(color, 2);
+  if (pixels.format().channels >= 4) {
+    px[3] = channel_from_color(color, 3);
+  }
+}
+
+QRect CanvasWidget::draw_line(QPoint from, QPoint to, bool erase) {
+  if (editing_grayscale_target()) {
+    return draw_mask_line(from, to, erase);
+  }
+  if (document_ == nullptr || !document_->active_layer_id().has_value()) {
+    return {};
+  }
+  if (brush_opacity_ <= 0) {
+    return {};  // Opacity 0 draws nothing (issue 253); edit_options floors the core alpha at 1/255
+  }
+
+  auto options = edit_options(primary_color_, secondary_color_, brush_size_, brush_opacity_, brush_softness_,
+                              fill_shapes(),
+                              active_layer_locks_transparent_pixels(), *this);
+  if (brush_opacity_ < 100) {
+    options.stroke_pixel_gate = [this](std::int32_t x, std::int32_t y) {
+      return brush_stroke_pixels_.insert(x, y);
+    };
+  }
+  return to_qrect(patchy::draw_line(*document_, *document_->active_layer_id(), from.x(), from.y(), to.x(), to.y(),
+                                       options, erase));
+}
+
+QRect CanvasWidget::draw_gradient(QPoint from, QPoint to) {
+  if (editing_grayscale_target()) {
+    return draw_mask_gradient(from, to);
+  }
+  if (document_ == nullptr || !document_->active_layer_id().has_value()) {
+    return {};
+  }
+
+  return to_qrect(patchy::draw_gradient(
+      *document_, *document_->active_layer_id(), from.x(), from.y(), to.x(), to.y(),
+      edit_options(primary_color_, secondary_color_, brush_size_, brush_opacity_, brush_softness_, fill_shapes(),
+                   active_layer_locks_transparent_pixels(), *this),
+      current_gradient_options()));
+}
+
+GradientOptions CanvasWidget::current_gradient_options() const {
+  GradientOptions gradient;
+  gradient.method = gradient_method_;
+  gradient.reverse = gradient_reverse_;
+  gradient.opacity = static_cast<float>(gradient_opacity_) / 100.0F;
+  gradient.stops = effective_gradient_stops();
+  // The tool's own two-track gradient draws (the flat stops serve previews only).
+  gradient.definition = resolved_gradient();
+  gradient.single_threaded = qEnvironmentVariableIsSet("PATCHY_RENDER_SINGLE_THREADED");
+  return gradient;
+}
+
+QRect CanvasWidget::draw_rectangle(QPoint from, QPoint to, bool erase) {
+  if (editing_grayscale_target()) {
+    return draw_mask_rectangle(from, to, erase);
+  }
+  return draw_pixel_shape(normalized_rect(from, to), patchy::ShapeKind::Rectangle, erase);
+}
+
+QRect CanvasWidget::draw_ellipse(QPoint from, QPoint to, bool erase) {
+  if (editing_grayscale_target()) {
+    return draw_mask_ellipse(from, to, erase);
+  }
+  return draw_pixel_shape(normalized_rect(from, to), patchy::ShapeKind::Ellipse, erase);
+}
+
+QRect CanvasWidget::draw_pixel_shape(QRect rect, patchy::ShapeKind kind, bool erase) {
+  if (document_ == nullptr || !document_->active_layer_id().has_value()) {
+    return {};
+  }
+  if (brush_opacity_ <= 0) {
+    return {};  // Opacity 0 draws nothing (issue 253)
+  }
+  const auto& style = shape_pixel_style_;
+  const auto core = core_shape_style(style, primary_color_, brush_size_);
+  const bool fill = patchy::pixel_shape_style_draws_fill(core);
+  if (!patchy::pixel_shape_style_is_classic(core)) {
+    // Everything but a solid fill alone or a plain centered stroke alone: the shape layer's
+    // own renderer (GitHub issue 716).
+    return draw_shape_path_pixels(
+        patchy::pixel_shape_path(to_core_rect(rect), kind,
+                                 kind == patchy::ShapeKind::Rectangle ? shape_corner_radius_ : 0),
+        erase);
+  }
+  // The classic renderer paints one color: the fill's or the stroke's own, else the foreground.
+  const bool own_paint = fill ? style.fill_paint.has_value() : style.stroke_paint.has_value();
+  const auto color = own_paint ? shape_paint_preview_color(fill ? core.fill : core.stroke.content, primary_color_)
+                               : primary_color_;
+  auto options = edit_options(color, secondary_color_, shape_stroke_size(core), brush_opacity_, brush_softness_, fill,
+                              active_layer_locks_transparent_pixels(), *this);
+  if (own_paint) {
+    options.primary_gain = 1.0F;  // the foreground's Intensity belongs to the foreground color
+  }
+  if (kind == patchy::ShapeKind::Rectangle) {
+    options.shape_corner_radius = shape_corner_radius_;
+  }
+  // Single-pass shape rendering composites each pixel once, so no buildup gate is needed; the gate
+  // only matters for the crisp 1px-outline legacy path, which paints overlapping line segments.
+  if (brush_opacity_ < 100) {
+    options.stroke_pixel_gate = [this](std::int32_t x, std::int32_t y) {
+      return brush_stroke_pixels_.insert(x, y);
+    };
+  }
+  const auto layer_id = *document_->active_layer_id();
+  return to_qrect(kind == patchy::ShapeKind::Rectangle
+                      ? patchy::draw_rectangle(*document_, layer_id, to_core_rect(rect), options, erase)
+                      : patchy::draw_ellipse(*document_, layer_id, to_core_rect(rect), options, erase));
+}
+
+QRect CanvasWidget::draw_shape_path_pixels(const patchy::VectorPath& path, bool erase) {
+  if (document_ == nullptr || path.empty() || brush_opacity_ <= 0) {
+    return {};
+  }
+  const auto& style = shape_pixel_style_;
+  auto core = core_shape_style(style, primary_color_, brush_size_);
+  const int size = shape_stroke_size(core);
+  if (editing_grayscale_target()) {
+    // A mask, a channel or Quick Mask takes the same shape as the paints' grays.
+    patchy::EditOptions soft;
+    soft.brush_size = size;
+    soft.brush_softness = brush_softness_;
+    const QRect canvas(0, 0, document_->width(), document_->height());
+    const auto raster = patchy::pixel_shape_raster(path, core, patchy::pixel_shape_soft_feather(soft),
+                                                   to_core_rect(canvas), style.patterns.get());
+    const auto covered = to_qrect(raster.bounds).intersected(canvas);
+    if (covered.isEmpty() || raster.pixels.empty()) {
+      return {};
+    }
+    auto target = active_grayscale_edit_target(covered);
+    if (!target.has_value() || target->pixels == nullptr) {
+      return {};
+    }
+    const auto bounds = target->bounds;
+    const auto opacity = static_cast<float>(brush_opacity_) / 100.0F;
+    QRect dirty;
+    for (int y = covered.top(); y <= covered.bottom(); ++y) {
+      for (int x = covered.left(); x <= covered.right(); ++x) {
+        const auto* source = raster.pixels.pixel(x - raster.bounds.x, y - raster.bounds.y);
+        const QPoint document_point(x, y);
+        if (source[3] == 0 || !selection_allows(document_point)) {
+          continue;
+        }
+        auto amount = opacity * static_cast<float>(source[3]) / 255.0F;
+        if (selection_clips_grayscale_edits()) {
+          amount *= static_cast<float>(selection_alpha_at(document_point)) / 255.0F;
+        }
+        if (amount <= 0.0F) {
+          continue;
+        }
+        const auto value =
+            erase ? std::uint8_t{0} : mask_value_from_color(QColor(source[0], source[1], source[2]));
+        auto* px = target->pixels->pixel(x - bounds.x(), y - bounds.y());
+        blend_mask_at(target->pixels->format(), px, value, amount);
+        dirty = dirty.united(QRect(document_point, QSize(1, 1)));
+      }
+      tick_processing_operation();
+    }
+    return dirty;
+  }
+  if (!document_->active_layer_id().has_value()) {
+    return {};
+  }
+  const auto options = edit_options(primary_color_, secondary_color_, size, brush_opacity_, brush_softness_, false,
+                                    active_layer_locks_transparent_pixels(), *this);
+  core.gain = shape_paints_are_foreground(style, core) ? options.primary_gain : 1.0F;
+  return to_qrect(patchy::draw_styled_shape(*document_, *document_->active_layer_id(), path, options, core,
+                                            style.patterns.get(), erase));
+}
+
+QRect CanvasWidget::flood_fill(QPoint start) {
+  if (editing_grayscale_target()) {
+    return flood_fill_mask(start);
+  }
+  if (document_ == nullptr || !document_->active_layer_id().has_value()) {
+    return {};
+  }
+  if (fill_opacity_ <= 0) {
+    return {};  // Opacity 0 fills nothing (issue 253); the core floors a written alpha at 1/255
+  }
+
+  // The Fill tool has its own Opacity/Soft/Tol/Contiguous (options bar), independent of the
+  // brush: build the options at full brush opacity and let apply_fill_settings scale them.
+  auto options = edit_options(primary_color_, secondary_color_, brush_size_, 100, brush_softness_, fill_shapes(),
+                              active_layer_locks_transparent_pixels(), *this);
+  apply_fill_settings(options, *this);
+  return to_qrect(patchy::flood_fill(*document_, *document_->active_layer_id(), start.x(), start.y(), options));
+}
+
+QRect CanvasWidget::draw_mask_line(QPoint from, QPoint to, bool erase) {
+  return draw_mask_brush_segment(from, to, erase);
+}
+
+QRect CanvasWidget::draw_mask_gradient(QPoint from, QPoint to) {
+  if (document_ == nullptr) {
+    return {};
+  }
+
+  const auto clip_selection = selection_clips_grayscale_edits();
+  auto affected = clip_selection && selected_document_rect().has_value()
+                      ? *selected_document_rect()
+                      : QRect(0, 0, document_->width(), document_->height());
+  affected = affected.intersected(QRect(0, 0, document_->width(), document_->height()));
+  auto target = active_grayscale_edit_target(affected);
+  if (affected.isEmpty() || !target.has_value() || target->pixels == nullptr) {
+    return {};
+  }
+
+  const auto bounds = target->bounds;
+  affected = affected.intersected(bounds);
+  if (affected.isEmpty()) {
+    return {};
+  }
+
+  const auto gradient = current_gradient_options();
+  const auto stops = normalized_gradient_stops(gradient.stops);
+  const auto dx = static_cast<double>(to.x() - from.x());
+  const auto dy = static_cast<double>(to.y() - from.y());
+
+  QRect dirty;
+  for (int y = affected.top(); y <= affected.bottom(); ++y) {
+    for (int x = affected.left(); x <= affected.right(); ++x) {
+      const QPoint document_point(x, y);
+      if (!selection_allows(document_point)) {
+        continue;
+      }
+      const auto t = gradient_tool_position(gradient.method, static_cast<double>(x - from.x()),
+                                            static_cast<double>(y - from.y()), dx, dy);
+      const auto color = gradient_color_at(stops, gradient.opacity, gradient.reverse, t);
+      auto coverage = static_cast<float>(color.a) / 255.0F;
+      if (clip_selection) {
+        coverage *= static_cast<float>(selection_alpha_at(document_point)) / 255.0F;
+      }
+      if (coverage <= 0.0F) {
+        continue;
+      }
+      const auto value = mask_value_from_color(QColor(color.r, color.g, color.b));
+      auto* px = target->pixels->pixel(x - bounds.x(), y - bounds.y());
+      blend_mask_at(target->pixels->format(), px, value, coverage);
+      dirty = dirty.united(QRect(document_point, QSize(1, 1)));
+    }
+    tick_processing_operation();
+  }
+  return dirty;
+}
+
+QRect CanvasWidget::draw_mask_rectangle(QPoint from, QPoint to, bool erase) {
+  // The crisp 1 px outline is brush segments in the foreground gray: the classic stroke in
+  // the foreground color only.
+  const auto core = core_shape_style(shape_pixel_style_, primary_color_, brush_size_);
+  if (patchy::pixel_shape_style_is_classic(core) && !patchy::pixel_shape_style_draws_fill(core) &&
+      !shape_pixel_style_.stroke_paint.has_value() && shape_corner_radius_ <= 0 && shape_stroke_size(core) <= 1) {
+    const auto rect = normalized_rect(from, to);
+    QRect dirty;
+    dirty = dirty.united(draw_mask_line(rect.topLeft(), rect.topRight(), erase));
+    dirty = dirty.united(draw_mask_line(rect.topRight(), rect.bottomRight(), erase));
+    dirty = dirty.united(draw_mask_line(rect.bottomRight(), rect.bottomLeft(), erase));
+    dirty = dirty.united(draw_mask_line(rect.bottomLeft(), rect.topLeft(), erase));
+    return dirty;
+  }
+  return render_mask_shape(normalized_rect(from, to), erase, patchy::ShapeKind::Rectangle);
+}
+
+QRect CanvasWidget::draw_mask_ellipse(QPoint from, QPoint to, bool erase) {
+  const auto core = core_shape_style(shape_pixel_style_, primary_color_, brush_size_);
+  if (patchy::pixel_shape_style_is_classic(core) && !patchy::pixel_shape_style_draws_fill(core) &&
+      !shape_pixel_style_.stroke_paint.has_value() && shape_stroke_size(core) <= 1) {
+    const auto rect = normalized_rect(from, to);
+    constexpr int kSamples = 720;
+    const auto rx = std::max(1.0, static_cast<double>(rect.width()) / 2.0);
+    const auto ry = std::max(1.0, static_cast<double>(rect.height()) / 2.0);
+    const auto cx = static_cast<double>(rect.x()) + rx;
+    const auto cy = static_cast<double>(rect.y()) + ry;
+    QPoint previous(static_cast<int>(std::round(cx + rx)), static_cast<int>(std::round(cy)));
+    QRect dirty;
+    for (int i = 1; i <= kSamples; ++i) {
+      const auto angle = (static_cast<double>(i) / static_cast<double>(kSamples)) * 2.0 * kPi;
+      QPoint current(static_cast<int>(std::round(cx + std::cos(angle) * rx)),
+                     static_cast<int>(std::round(cy + std::sin(angle) * ry)));
+      dirty = dirty.united(draw_mask_line(previous, current, erase));
+      previous = current;
+    }
+    return dirty;
+  }
+  return render_mask_shape(normalized_rect(from, to), erase, patchy::ShapeKind::Ellipse);
+}
+
+// Shared single-pass renderer for layer-mask shapes — mirrors the core pixel-layer render_shape so
+// mask outlines/fills get the same antialiased edges, Soft feathering and rounded corners, with no
+// brush-stamp buildup.
+QRect CanvasWidget::render_mask_shape(QRect rect, bool erase, patchy::ShapeKind kind) {
+  if (document_ == nullptr) {
+    return {};
+  }
+  rect = rect.normalized();
+  if (rect.width() <= 0 || rect.height() <= 0) {
+    return {};
+  }
+
+  const auto core = core_shape_style(shape_pixel_style_, primary_color_, brush_size_);
+  if (!patchy::pixel_shape_style_is_classic(core)) {
+    // A shape layer's fill and stroke (GitHub issue 716): the same raster the layer writer
+    // composites, written as the paints' grays.
+    return draw_shape_path_pixels(
+        patchy::pixel_shape_path(to_core_rect(rect), kind,
+                                 kind == patchy::ShapeKind::Rectangle ? shape_corner_radius_ : 0),
+        erase);
+  }
+  const bool fill = patchy::pixel_shape_style_draws_fill(core);
+  patchy::EditOptions options;
+  options.fill_shapes = fill;
+  options.brush_size = shape_stroke_size(core);
+  options.brush_softness = brush_softness_;
+  if (kind == patchy::ShapeKind::Rectangle) {
+    options.shape_corner_radius = shape_corner_radius_;
+  }
+  const auto params = patchy::make_shape_coverage_params(to_core_rect(rect), options, kind);
+  const auto margin = params.fill ? (params.band * 0.5 + 1.0)
+                                  : (params.half_thickness + params.band * 0.5 + 1.0);
+  const auto m = static_cast<int>(std::ceil(margin));
+  const auto shape_bbox = rect.adjusted(-m, -m, m, m);
+  const auto affected = shape_bbox.intersected(QRect(0, 0, document_->width(), document_->height()));
+  if (affected.isEmpty()) {
+    return {};
+  }
+
+  auto target = active_grayscale_edit_target(affected);
+  if (!target.has_value() || target->pixels == nullptr) {
+    return {};
+  }
+  const auto bounds = target->bounds;
+  const auto value =
+      erase ? std::uint8_t{0}
+            : mask_value_from_color(shape_paint_preview_color(fill ? core.fill : core.stroke.content, primary_color_));
+  const auto opacity = static_cast<float>(brush_opacity_) / 100.0F;
+  QRect dirty;
+  for (int y = affected.top(); y <= affected.bottom(); ++y) {
+    for (int x = affected.left(); x <= affected.right(); ++x) {
+      const QPoint document_point(x, y);
+      if (!selection_allows(document_point)) {
+        continue;
+      }
+      auto coverage = opacity * patchy::shape_pixel_coverage(params, x, y);
+      if (selection_clips_grayscale_edits()) {
+        coverage *= static_cast<float>(selection_alpha_at(document_point)) / 255.0F;
+      }
+      if (coverage <= 0.0F) {
+        continue;
+      }
+      auto* px = target->pixels->pixel(x - bounds.x(), y - bounds.y());
+      blend_mask_at(target->pixels->format(), px, value, coverage);
+      dirty = dirty.united(QRect(document_point, QSize(1, 1)));
+    }
+    tick_processing_operation();
+  }
+  return dirty;
+}
+
+QRect CanvasWidget::flood_fill_mask(QPoint start) {
+  if (document_ == nullptr || !document_contains(start) || !selection_allows(start)) {
+    return {};
+  }
+  auto grayscale_target = active_grayscale_edit_target(QRect(0, 0, document_->width(), document_->height()));
+  if (!grayscale_target.has_value() || grayscale_target->pixels == nullptr) {
+    return {};
+  }
+
+  const auto bounds = grayscale_target->bounds;
+  auto* pixels = grayscale_target->pixels;
+  const auto width = pixels->width();
+  const auto height = pixels->height();
+  const QPoint local_start(start.x() - bounds.x(), start.y() - bounds.y());
+  if (local_start.x() < 0 || local_start.y() < 0 || local_start.x() >= width || local_start.y() >= height) {
+    return {};
+  }
+
+  // Mask flood: the tool's Tol and Contiguous apply through the same metric as the layer
+  // flood (one gray channel); the mask value is written verbatim, as mask painting does.
+  const auto target = *pixels->pixel(local_start.x(), local_start.y());
+  const auto replacement = mask_value_from_color(primary_color_);
+  // 16/32-bit masks compare and write their samples on the 0..255 scale at their depth.
+  const auto format = pixels->format();
+  const bool deep = format.bit_depth != BitDepth::UInt8;
+  const auto deep_target = mask_sample_at(format, pixels->pixel(local_start.x(), local_start.y()));
+  if (deep ? deep_target == static_cast<float>(replacement) : target == replacement) {
+    return {};
+  }
+  const auto tolerance = std::clamp(fill_tolerance_, 0, 255);
+  const auto matches = [&](int local_x, int local_y) {
+    if (deep) {
+      const auto delta = std::abs(mask_sample_at(format, pixels->pixel(local_x, local_y)) - deep_target);
+      return tolerance <= 0 ? delta == 0.0F : delta * delta <= static_cast<float>(tolerance * tolerance * 4);
+    }
+    return patchy::color_within_tolerance(pixels->pixel(local_x, local_y), &target, 1, tolerance);
+  };
+  enum : std::uint8_t { kUnvisited = 0, kInRegion = 1, kRejected = 2 };
+  std::vector<std::uint8_t> state(static_cast<std::size_t>(width) * static_cast<std::size_t>(height), kUnvisited);
+  const auto state_at = [&](int local_x, int local_y) -> std::uint8_t& {
+    return state[static_cast<std::size_t>(local_y) * static_cast<std::size_t>(width) +
+                 static_cast<std::size_t>(local_x)];
+  };
+  std::size_t progress_counter = 0;
+  const auto tick = [&] {
+    ++progress_counter;
+    if (progress_counter % 4096U == 0U) {
+      tick_processing_operation();
+    }
+  };
+  QRect dirty;
+  const auto write = [&](int local_x, int local_y) {
+    blend_mask_at(format, pixels->pixel(local_x, local_y), replacement, 1.0F);
+    dirty = dirty.united(QRect(QPoint(bounds.x() + local_x, bounds.y() + local_y), QSize(1, 1)));
+  };
+  if (fill_contiguous_) {
+    std::vector<QPoint> stack;
+    stack.push_back(local_start);
+    while (!stack.empty()) {
+      tick();
+      const auto local = stack.back();
+      stack.pop_back();
+      if (local.x() < 0 || local.y() < 0 || local.x() >= width || local.y() >= height) {
+        continue;
+      }
+      auto& cell = state_at(local.x(), local.y());
+      if (cell != kUnvisited) {
+        continue;
+      }
+      const QPoint document_point(bounds.x() + local.x(), bounds.y() + local.y());
+      if (!selection_allows(document_point) || !matches(local.x(), local.y())) {
+        cell = kRejected;
+        continue;
+      }
+      cell = kInRegion;
+      write(local.x(), local.y());
+      stack.push_back(local + QPoint(1, 0));
+      stack.push_back(local + QPoint(-1, 0));
+      stack.push_back(local + QPoint(0, 1));
+      stack.push_back(local + QPoint(0, -1));
+    }
+    return dirty;
+  }
+  for (int local_y = 0; local_y < height; ++local_y) {
+    for (int local_x = 0; local_x < width; ++local_x) {
+      tick();
+      if (!selection_allows(QPoint(bounds.x() + local_x, bounds.y() + local_y)) || !matches(local_x, local_y)) {
+        continue;
+      }
+      write(local_x, local_y);
+    }
+  }
+  return dirty;
+}
+
+namespace {
+
+// The alpha-weighted mean color of a sample square, or nothing when every pixel
+// is fully transparent.
+std::optional<QColor> average_sample_color(const QImage& image) {
+  double red = 0.0;
+  double green = 0.0;
+  double blue = 0.0;
+  double weight = 0.0;
+  for (int y = 0; y < image.height(); ++y) {
+    for (int x = 0; x < image.width(); ++x) {
+      const auto color = image.pixelColor(x, y);
+      const auto alpha = color.alphaF();
+      red += color.redF() * alpha;
+      green += color.greenF() * alpha;
+      blue += color.blueF() * alpha;
+      weight += alpha;
+    }
+  }
+  if (weight <= 0.0) {
+    return std::nullopt;
+  }
+  const auto channel = [weight](double sum) {
+    return static_cast<int>(std::clamp(std::lround(sum / weight * 255.0), 0L, 255L));
+  };
+  return QColor(channel(red), channel(green), channel(blue));
+}
+
+// A 32-bit document's pick (docs/high-bit-depth-color.md, "Color choice at 32 bits"): the
+// alpha-weighted mean of a depth render's linear floats, values above 1.0 kept; nothing
+// for another format or a fully transparent square.
+std::optional<LinearRgb> average_linear_sample(const QImage& image) {
+  const bool premultiplied = image.format() == QImage::Format_RGBA32FPx4_Premultiplied;
+  if (image.format() != QImage::Format_RGBA32FPx4 && !premultiplied) {
+    return std::nullopt;
+  }
+  LinearRgb sum{};
+  double weight = 0.0;
+  for (int y = 0; y < image.height(); ++y) {
+    const auto* row = reinterpret_cast<const float*>(image.constScanLine(y));
+    for (int x = 0; x < image.width(); ++x) {
+      const auto* px = row + static_cast<std::size_t>(x) * 4U;
+      const auto alpha = std::clamp(static_cast<double>(px[3]), 0.0, 1.0);
+      if (alpha <= 0.0) {
+        continue;
+      }
+      for (std::size_t c = 0; c < 3U; ++c) {
+        sum[c] += premultiplied ? static_cast<double>(px[c]) : static_cast<double>(px[c]) * alpha;
+      }
+      weight += alpha;
+    }
+  }
+  if (weight <= 0.0) {
+    return std::nullopt;
+  }
+  return LinearRgb{sum[0] / weight, sum[1] / weight, sum[2] / weight};
+}
+
+// The Current Layer pick of a 32-bit layer: its own linear values, weighted like
+// active_layer_sample_region (pixel alpha, mask, opacity).
+std::optional<LinearRgb> average_linear_layer_sample(const Layer& layer, QRect area) {
+  const auto& pixels = layer.pixels();
+  if (pixels.empty() || pixels.format().bit_depth != BitDepth::Float32 || pixels.format().channels < 3 ||
+      !layer.visible() || layer.opacity() <= 0.0F) {
+    return std::nullopt;
+  }
+  const auto bounds = layer_pixel_bounds(layer);
+  const auto rect = to_qrect(bounds).intersected(area);
+  LinearRgb sum{};
+  double weight = 0.0;
+  for (int y = rect.top(); y <= rect.bottom() && !rect.isEmpty(); ++y) {
+    for (int x = rect.left(); x <= rect.right(); ++x) {
+      const auto value = load_pixel(pixels.format(), pixels.pixel(x - bounds.x, y - bounds.y));
+      const auto alpha = static_cast<double>(value[3]) / 255.0 * layer_mask_alpha_at(layer, x, y) * layer.opacity();
+      if (alpha <= 0.0) {
+        continue;
+      }
+      for (std::size_t c = 0; c < 3U; ++c) {
+        sum[c] += static_cast<double>(value[c]) / 255.0 * alpha;
+      }
+      weight += alpha;
+    }
+  }
+  if (weight <= 0.0) {
+    return std::nullopt;
+  }
+  return LinearRgb{sum[0] / weight, sum[1] / weight, sum[2] / weight};
+}
+
+}  // namespace
+
+void CanvasWidget::begin_color_pick(QPoint widget_position, QPoint global_position) {
+  color_picking_ = true;
+  color_pick_layer_warned_ = false;
+  color_pick_reported_ = false;
+  // The loupe's bottom arc: the color this pick replaces, before any live update.
+  sample_loupe_previous_color_ = color_pick_to_background_ ? secondary_color_ : primary_color_;
+  grabMouse();
+  update_color_pick(widget_position, global_position);
+}
+
+void CanvasWidget::update_color_pick(QPoint widget_position, QPoint global_position) {
+  const auto point = document_position(widget_position);
+  if (document_contains(point)) {
+    pick_color(point);
+    refresh_sample_loupe(widget_position, point);
+    return;
+  }
+
+  clear_sample_loupe();  // off the document a pick reads the screen; no loupe there
+  if (const auto picked = screen_color_at_global_position(global_position); picked.has_value()) {
+    set_picked_color(*picked);
+  }
+}
+
+void CanvasWidget::end_color_pick() {
+  if (!color_picking_) {
+    return;
+  }
+  clear_sample_loupe();
+  color_picking_ = false;
+  color_pick_to_background_ = false;
+  if (QWidget::mouseGrabber() == this) {
+    releaseMouse();
+  }
+  update_tool_cursor();
+  if (color_pick_finished_callback_) {
+    color_pick_finished_callback_();
+  }
+}
+
+void CanvasWidget::set_picked_color(QColor picked, double intensity_stops) {
+  if (!picked.isValid()) {
+    return;
+  }
+  picked.setAlpha(255);
+  // A drag over flat color samples the same color move after move: the first report of
+  // the gesture always goes out, repeats of the color it already set do not (GitHub #478).
+  const auto current = color_pick_to_background_ ? secondary_color_ : primary_color_;
+  auto& intensity = color_pick_to_background_ ? paint_intensity_.background : paint_intensity_.foreground;
+  if (color_picking_ && color_pick_reported_ && picked == current && intensity_stops == intensity) {
+    return;
+  }
+  color_pick_reported_ = true;
+  // Set before the callbacks: their set_primary_color/set_secondary_color with the same
+  // color keeps it.
+  intensity = intensity_stops;
+  if (color_pick_to_background_) {
+    secondary_color_ = picked;
+    if (background_color_picked_callback_) {
+      background_color_picked_callback_(picked);
+    }
+    return;
+  }
+  primary_color_ = picked;
+  if (color_picked_callback_) {
+    color_picked_callback_(picked);
+  }
+}
+
+void CanvasWidget::pick_color(QPoint point) {
+  if (document_ == nullptr || !document_contains(point)) {
+    return;
+  }
+
+  const QRect area =
+      eyedropper_sample_rect(point, eyedropper_sample_size_, QSize(document_->width(), document_->height()));
+  // A 32-bit document picks its linear values, not the display (which the preview exposure
+  // scales): a color above 1.0 comes back as its base color and Intensity.
+  const bool linear_document = std::as_const(*document_).color_state().bit_depth == BitDepth::Float32;
+  const auto set_linear_or_display_pick = [this](QColor display, std::optional<LinearRgb> linear) {
+    if (!linear.has_value()) {
+      set_picked_color(display);
+      return;
+    }
+    const auto hdr = hdr_color_from_linear(*linear);
+    set_picked_color(QColor(hdr.base[0], hdr.base[1], hdr.base[2]), hdr.stops);
+  };
+  if (eyedropper_sample_layers_ == SampleLayers::CurrentLayer) {
+    // Current Layer: the active layer's own pixels (mask and opacity folded into
+    // alpha). A transparent spot leaves the color as it was, as in Photoshop.
+    const Layer* layer = active_pixel_layer();
+    if (layer == nullptr) {
+      if (!color_pick_layer_warned_) {
+        color_pick_layer_warned_ = true;
+        report_status_error(tr("Select a pixel layer to sample the current layer, or sample all layers"));
+      }
+      return;
+    }
+    if (const auto color = average_sample_color(active_layer_sample_region(*layer, area)); color.has_value()) {
+      set_linear_or_display_pick(*color, linear_document ? average_linear_layer_sample(*layer, area) : std::nullopt);
+    }
+    return;
+  }
+  if (eyedropper_sample_layers_ != SampleLayers::AllLayers) {
+    // Current & Below and the No Adjustments choices (GitHub issue 321): the compositor
+    // renders only the sample square with the excluded layers hidden, so a pick costs
+    // that square, never a full composite. The exclusion list is a walk of the layer tree.
+    const auto& document = std::as_const(*document_);
+    const auto excluded =
+        sample_layers_excluded_ids(document.layers(), document.active_layer_id(), eyedropper_sample_layers_);
+    if (!excluded.has_value()) {
+      if (!color_pick_layer_warned_) {
+        color_pick_layer_warned_ = true;
+        report_status_error(tr("Select a layer to sample it and the layers below, or sample all layers"));
+      }
+      return;
+    }
+    if (linear_document) {
+      const ScopedDocumentDepthRender depth_render;
+      if (const auto linear =
+              average_linear_sample(qimage_from_document_rect_with_hidden_layers(document, area, true, *excluded))) {
+        set_linear_or_display_pick(QColor(), linear);
+        return;
+      }
+    }
+    const auto image = qimage_from_document_rect_with_hidden_layers(document, area, true, *excluded);
+    set_picked_color(average_sample_color(image).value_or(QColor(Qt::transparent)));
+    return;
+  }
+  if (linear_document) {
+    const ScopedDocumentDepthRender depth_render;
+    if (const auto linear = average_linear_sample(qimage_from_document_rect(std::as_const(*document_), area, true))) {
+      set_linear_or_display_pick(QColor(), linear);
+      return;
+    }
+  }
+  if (area.width() == 1 && area.height() == 1) {
+    set_picked_color(compose_document_pixel(point.x(), point.y()));
+    return;
+  }
+  // Merged and fully transparent reads like the point sample there (black).
+  set_picked_color(average_sample_color(compose_document_rect(area)).value_or(QColor(Qt::transparent)));
+}
+
+// The sample square's outline (GitHub issue 319): the pixels a click averages,
+// snapped to the document grid, in the brush outline's cursor ink.
+std::optional<QRect> CanvasWidget::eyedropper_sample_outline_widget_rect() const {
+  if (!eyedropper_hover_position_valid_ || tool_ != CanvasTool::Eyedropper || document_ == nullptr ||
+      spacebar_panning_ || transient_read_callback_ || !eyedropper_sample_outline_visible(eyedropper_sample_size_, zoom_)) {
+    return std::nullopt;
+  }
+  const auto point = document_position(eyedropper_hover_widget_position_);
+  if (!document_contains(point)) {
+    return std::nullopt;
+  }
+  const auto area =
+      eyedropper_sample_rect(point, eyedropper_sample_size_, QSize(document_->width(), document_->height()));
+  const auto top_left = widget_position_f(QPointF(area.topLeft()));
+  const auto bottom_right = widget_position_f(QPointF(area.x() + area.width(), area.y() + area.height()));
+  return QRect(top_left.toPoint(), bottom_right.toPoint() - QPoint(1, 1));
+}
+
+void CanvasWidget::track_eyedropper_sample_outline(QPoint widget_position) {
+  if (tool_ != CanvasTool::Eyedropper && !eyedropper_hover_position_valid_) {
+    return;
+  }
+  const auto old_outline = eyedropper_sample_outline_widget_rect();
+  eyedropper_hover_widget_position_ = widget_position;
+  eyedropper_hover_position_valid_ = tool_ == CanvasTool::Eyedropper;
+  const auto new_outline = eyedropper_sample_outline_widget_rect();
+  if (old_outline != new_outline) {
+    update(old_outline.value_or(QRect()).united(new_outline.value_or(QRect())).adjusted(-2, -2, 2, 2));
+  }
+}
+
+void CanvasWidget::hide_eyedropper_sample_outline() {
+  if (const auto old_outline = eyedropper_sample_outline_widget_rect(); old_outline.has_value()) {
+    update(old_outline->adjusted(-2, -2, 2, 2));
+  }
+  eyedropper_hover_position_valid_ = false;
+}
+
+// The sample loupe (GitHub issue 320). Each pointer move reads only the lens's
+// small square of the displayed composite; the paint draws from that copy.
+QRect CanvasWidget::sample_loupe_viewport() const {
+  const int left = rulers_visible_ ? kLeftRulerWidth : 0;
+  const int top = rulers_visible_ ? kTopRulerHeight : 0;
+  const int right =
+      width() - (vertical_scroll_bar_ != nullptr && vertical_scroll_bar_->isVisible() ? vertical_scroll_bar_->width() : 0);
+  const int bottom = height() - (horizontal_scroll_bar_ != nullptr && horizontal_scroll_bar_->isVisible()
+                                     ? horizontal_scroll_bar_->height()
+                                     : 0);
+  return QRect(QPoint(left, top), QPoint(right - 1, bottom - 1));
+}
+
+std::optional<QRect> CanvasWidget::sample_loupe_widget_rect() const {
+  if (!sample_loupe_visible_) {
+    return std::nullopt;
+  }
+  return sample_loupe_geometry(QPointF(sample_loupe_pointer_), QRectF(sample_loupe_viewport()))
+      .bounds()
+      .toAlignedRect();
+}
+
+std::optional<std::pair<QColor, QColor>> CanvasWidget::sample_loupe_colors() const {
+  if (!sample_loupe_visible_) {
+    return std::nullopt;
+  }
+  return std::pair{color_pick_to_background_ ? secondary_color_ : primary_color_, sample_loupe_previous_color_};
+}
+
+void CanvasWidget::refresh_sample_loupe(QPoint widget_position, QPoint document_point) {
+  if (!eyedropper_show_sample_ring_ || !color_picking_ || document_ == nullptr) {
+    clear_sample_loupe();
+    return;
+  }
+  const auto old_rect = sample_loupe_widget_rect();
+  const QSize document_size(document_->width(), document_->height());
+  sample_loupe_view_rect_ = sample_loupe_view_rect(document_point, eyedropper_sample_size_);
+  sample_loupe_source_rect_ = sample_loupe_view_rect_.intersected(QRect(QPoint(0, 0), document_size));
+  sample_loupe_sample_rect_ = eyedropper_sample_rect(document_point, eyedropper_sample_size_, document_size);
+  auto pixels = compose_document_rect(sample_loupe_source_rect_);
+  if (pixels.format() == QImage::Format_RGBA32FPx4) {
+    // Never QPainter on linear floats: encode like the canvas does (docs/high-bit-depth.md).
+    pixels = display_image_from_deep_qimage(pixels, std::as_const(*document_).color_state().view_exposure_stops);
+  }
+  sample_loupe_pixels_ = std::move(pixels);
+  sample_loupe_pointer_ = widget_position;
+  sample_loupe_visible_ = true;
+  if (!sample_loupe_hides_cursor_) {
+    // The lens center is the pointer; the eyedropper glyph would cover the lens.
+    sample_loupe_hides_cursor_ = true;
+    setCursor(Qt::BlankCursor);
+  }
+  update(old_rect.value_or(QRect()).united(sample_loupe_widget_rect().value_or(QRect())).adjusted(-1, -1, 1, 1));
+}
+
+void CanvasWidget::clear_sample_loupe() {
+  if (const auto old_rect = sample_loupe_widget_rect(); old_rect.has_value()) {
+    update(old_rect->adjusted(-1, -1, 1, 1));
+  }
+  sample_loupe_visible_ = false;
+  sample_loupe_pixels_ = QImage();
+  if (sample_loupe_hides_cursor_) {
+    sample_loupe_hides_cursor_ = false;
+    update_tool_cursor();
+  }
+}
+
+void CanvasWidget::draw_sample_loupe(QPainter& painter) const {
+  const auto colors = sample_loupe_colors();
+  if (!colors.has_value()) {
+    return;
+  }
+  SampleLoupeContent content;
+  content.pixels = sample_loupe_pixels_;
+  content.view_rect = sample_loupe_view_rect_;
+  content.source_rect = sample_loupe_source_rect_;
+  content.sample_rect = sample_loupe_sample_rect_;
+  content.sample = colors->first;
+  content.previous = colors->second;
+  content.backdrop = backdrop_color();
+  const QPointF pointer(sample_loupe_pointer_);
+  paint_sample_loupe(painter, sample_loupe_geometry(pointer, QRectF(sample_loupe_viewport())), content, pointer);
+}
+
+void CanvasWidget::draw_eyedropper_sample_outline(QPainter& painter) const {
+  const auto outline = eyedropper_sample_outline_widget_rect();
+  if (!outline.has_value()) {
+    return;
+  }
+  painter.save();
+  painter.setRenderHint(QPainter::Antialiasing, false);
+  painter.setBrush(Qt::NoBrush);
+  // Dark outside, light inside, as the brush outline draws its footprint.
+  painter.setPen(QPen(QColor(25, 25, 25), 1));
+  painter.drawRect(outline->adjusted(-1, -1, 1, 1));
+  painter.setPen(QPen(QColor(255, 255, 255), 1));
+  painter.drawRect(*outline);
+  painter.restore();
+}
+
+// --- Pending pixel shapes (GitHub issue 716; docs/tools.md, "Pending pixel shapes") -------
+
+void CanvasWidget::set_pixel_shapes_stay_pending(bool pending) {
+  if (pixel_shapes_stay_pending_ == pending) {
+    return;
+  }
+  if (!pending) {
+    commit_pending_pixel_shape();
+  }
+  pixel_shapes_stay_pending_ = pending;
+}
+
+bool CanvasWidget::pixel_shapes_stay_pending() const noexcept {
+  return pixel_shapes_stay_pending_;
+}
+
+bool CanvasWidget::has_pending_pixel_shape() const noexcept {
+  return pending_pixel_shape_ != nullptr;
+}
+
+bool CanvasWidget::pending_pixel_shape_uses_channel_preview() const {
+  if (quick_mask_active_ || editing_smart_filter_mask()) {
+    return true;
+  }
+  const auto* channel = layer_edit_target_ == LayerEditTarget::DocumentChannel ? active_document_channel_const() : nullptr;
+  return channel != nullptr && channel->kind() == DocumentChannelKind::Alpha;
+}
+
+bool CanvasWidget::tool_keeps_pixel_shapes_pending() const noexcept {
+  return pixel_shapes_stay_pending_ &&
+         (tool_ == CanvasTool::Rectangle || tool_ == CanvasTool::Ellipse || tool_ == CanvasTool::Polygon ||
+          tool_ == CanvasTool::CustomShape);
+}
+
+std::optional<QRectF> CanvasWidget::pending_pixel_shape_box() const {
+  if (pending_pixel_shape_ == nullptr) {
+    return std::nullopt;
+  }
+  return pending_pixel_shape_->box;
+}
+
+double CanvasWidget::pending_pixel_shape_angle() const noexcept {
+  return pending_pixel_shape_ != nullptr ? pending_pixel_shape_->angle : 0.0;
+}
+
+void CanvasWidget::set_pending_pixel_shape_changed_callback(std::function<void()> callback) {
+  pending_pixel_shape_changed_callback_ = std::move(callback);
+}
+
+QRect CanvasWidget::pending_pixel_shape_widget_rect(QRectF box, double angle_degrees) const {
+  // The preview, a stroke outside the box, Soft's feather and the handle squares.
+  const double reach = (std::max(static_cast<double>(brush_size_),
+                                 shape_pixel_style_.line.has_value() ? shape_pixel_style_.line->width : 0.0) *
+                        2.0) +
+                       4.0;
+  const auto bounds = turned_rect_bounds(box, angle_degrees);
+  const auto widget_rect = widget_rect_for_document_rect(bounds.adjusted(-reach, -reach, reach, reach));
+  return widget_rect.toAlignedRect().adjusted(-12, -12, 12, 12);
+}
+
+void CanvasWidget::pending_pixel_shape_inputs_changed() {
+  if (pending_pixel_shape_ != nullptr) {
+    update();
+  }
+}
+
+void CanvasWidget::begin_pending_pixel_shape(CanvasTool tool, QRectF box, double polygon_angle) {
+  pending_pixel_shape_ = std::make_shared<PendingPixelShape>();
+  pending_pixel_shape_->tool = tool;
+  pending_pixel_shape_->layer_id = document_ != nullptr ? document_->active_layer_id() : std::nullopt;
+  pending_pixel_shape_->box = box;
+  pending_pixel_shape_->polygon_angle = polygon_angle;
+  update();
+  if (pending_pixel_shape_changed_callback_) {
+    pending_pixel_shape_changed_callback_();
+  }
+}
+
+void CanvasWidget::set_pending_pixel_shape_box(QRectF box) {
+  if (pending_pixel_shape_ != nullptr) {
+    set_pending_pixel_shape_geometry(box, pending_pixel_shape_->angle);
+  }
+}
+
+void CanvasWidget::set_pending_pixel_shape_geometry(QRectF box, double angle_degrees) {
+  if (pending_pixel_shape_ == nullptr ||
+      (pending_pixel_shape_->box == box && pending_pixel_shape_->angle == angle_degrees)) {
+    return;
+  }
+  update(pending_pixel_shape_widget_rect(pending_pixel_shape_->box, pending_pixel_shape_->angle));
+  pending_pixel_shape_->box = box;
+  pending_pixel_shape_->angle = angle_degrees;
+  update(pending_pixel_shape_widget_rect(box, angle_degrees));
+  if (pending_pixel_shape_changed_callback_) {
+    pending_pixel_shape_changed_callback_();
+  }
+}
+
+void CanvasWidget::set_pending_pixel_shape_size(QSize size) {
+  if (pending_pixel_shape_ == nullptr || size.width() < 1 || size.height() < 1) {
+    return;
+  }
+  auto box = pending_pixel_shape_->box;
+  const double angle = pending_pixel_shape_->angle;
+  if (angle == 0.0) {
+    box.setSize(QSizeF(size));
+  } else {
+    // A turned shape keeps its own top left corner where it is on the canvas: the new
+    // center lies half the new size from that corner, along the turned axes.
+    const auto turn = patchy::rotation_cos_sin(angle);
+    const auto turned = [&turn](QPointF offset) {
+      return QPointF((offset.x() * turn.cos) - (offset.y() * turn.sin),
+                     (offset.x() * turn.sin) + (offset.y() * turn.cos));
+    };
+    const auto corner = box.center() + turned(box.topLeft() - box.center());
+    const auto center = corner + turned(QPointF(size.width() / 2.0, size.height() / 2.0));
+    box = QRectF(center.x() - (size.width() / 2.0), center.y() - (size.height() / 2.0), size.width(), size.height());
+  }
+  set_pending_pixel_shape_box(box);
+}
+
+void CanvasWidget::cancel_pending_pixel_shape() {
+  if (pending_pixel_shape_ == nullptr) {
+    return;
+  }
+  if (shape_resize_drag_.has_value() && shape_resize_drag_->pixel_shape) {
+    shape_resize_drag_.reset();
+    clear_move_snap_guides();
+  }
+  pending_pixel_shape_.reset();
+  update_tool_cursor();
+  update();
+  if (pending_pixel_shape_changed_callback_) {
+    pending_pixel_shape_changed_callback_();
+  }
+}
+
+patchy::VectorPath CanvasWidget::pending_pixel_shape_path(const PendingPixelShape& shape) const {
+  const auto& box = shape.box;
+  // The shape's angle turns the finished path about the center of what it was built from.
+  const auto turn = [&shape](patchy::VectorPath path, QPointF center) {
+    if (shape.angle != 0.0 && !path.empty()) {
+      patchy::transform_vector_path(path, patchy::rotation_matrix_about(center.x(), center.y(), shape.angle));
+    }
+    return path;
+  };
+  switch (shape.tool) {
+    case CanvasTool::Polygon: {
+      // The polygon in the circle its drag drew; a box a handle stretched scales it.
+      const double radius = box.width() / 2.0;
+      patchy::VectorPath path;
+      path.subpaths.push_back(patchy::generate_polygon_subpath(box.center().x(), box.center().y(), radius,
+                                                               shape.polygon_angle, polygon_sides_,
+                                                               polygon_star_inset_));
+      if (std::abs(box.height() - box.width()) > 1e-6 && box.width() > 1e-6) {
+        const double scale = box.height() / box.width();
+        const double center_y = box.center().y();
+        patchy::transform_vector_path(path, {1.0, 0.0, 0.0, scale, 0.0, center_y - (center_y * scale)});
+      }
+      return turn(std::move(path), box.center());
+    }
+    case CanvasTool::CustomShape: {
+      if (custom_shape_path_ == nullptr || custom_shape_path_->empty()) {
+        return {};
+      }
+      auto path = *custom_shape_path_;
+      patchy::transform_vector_path(path, {box.width(), 0.0, 0.0, box.height(), box.x(), box.y()});
+      return turn(std::move(path), box.center());
+    }
+    default: {
+      const QRect rect(static_cast<int>(std::lround(box.left())), static_cast<int>(std::lround(box.top())),
+                       std::max(1, static_cast<int>(std::lround(box.width()))),
+                       std::max(1, static_cast<int>(std::lround(box.height()))));
+      const bool ellipse = shape.tool == CanvasTool::Ellipse;
+      // An upright rectangle or ellipse sits on whole pixels; a turned one keeps the box the
+      // drag left it, so a resize in its own frame does not jump by a rounding step.
+      if (shape.angle != 0.0) {
+        patchy::VectorPath path =
+            patchy::pixel_shape_path(patchy::Rect{0, 0, rect.width(), rect.height()},
+                                     ellipse ? patchy::ShapeKind::Ellipse : patchy::ShapeKind::Rectangle,
+                                     ellipse ? 0 : shape_corner_radius_);
+        const auto center = box.center();
+        patchy::translate_vector_path(path, center.x() - (rect.width() / 2.0), center.y() - (rect.height() / 2.0));
+        return turn(std::move(path), center);
+      }
+      return patchy::pixel_shape_path(to_core_rect(rect),
+                                      ellipse ? patchy::ShapeKind::Ellipse : patchy::ShapeKind::Rectangle,
+                                      ellipse ? 0 : shape_corner_radius_);
+    }
+  }
+}
+
+QRect CanvasWidget::paint_pending_pixel_shape(const PendingPixelShape& shape) {
+  // A turned shape is its turned path, painted by the shape layer's renderer like a polygon
+  // (the preview's own renderer, so the pixels are the ones shown).
+  if (shape.angle == 0.0 && (shape.tool == CanvasTool::Rectangle || shape.tool == CanvasTool::Ellipse)) {
+    // The same calls a release makes, so the two classic styles keep their bytes and a mask,
+  // a channel or Quick Mask is painted its own way.
+    const auto& box = shape.box;
+    const QRect rect(static_cast<int>(std::lround(box.left())), static_cast<int>(std::lround(box.top())),
+                     std::max(1, static_cast<int>(std::lround(box.width()))),
+                     std::max(1, static_cast<int>(std::lround(box.height()))));
+    return shape.tool == CanvasTool::Ellipse ? draw_ellipse(rect.topLeft(), rect.bottomRight(), false)
+                                             : draw_rectangle(rect.topLeft(), rect.bottomRight(), false);
+  }
+  const auto path = pending_pixel_shape_path(shape);
+  if (path.empty()) {
+    return {};
+  }
+  return draw_shape_path_pixels(path, false);
+}
+
+bool CanvasWidget::commit_pending_pixel_shape() {
+  if (pending_pixel_shape_ == nullptr) {
+    return false;
+  }
+  // Taken first: begin_edit and the host's history push both ask for a commit themselves.
+  const auto shape = std::move(pending_pixel_shape_);
+  pending_pixel_shape_.reset();
+  if (shape_resize_drag_.has_value() && shape_resize_drag_->pixel_shape) {
+    shape_resize_drag_.reset();
+    clear_move_snap_guides();
+  }
+  const auto preview_rect = pending_pixel_shape_widget_rect(shape->box, shape->angle);
+  if (pending_pixel_shape_changed_callback_) {
+    pending_pixel_shape_changed_callback_();
+  }
+  update_tool_cursor();
+  if (document_ == nullptr) {
+    update();
+    return false;
+  }
+  // Into the layer it was drawn on: the host may have made another one active already.
+  const auto active_now = document_->active_layer_id();
+  const bool retarget = shape->layer_id.has_value() && active_now != shape->layer_id;
+  if (retarget) {
+    if (std::as_const(*document_).find_layer(*shape->layer_id) == nullptr) {
+      update();
+      return false;  // its layer is gone
+    }
+    document_->set_active_layer(*shape->layer_id);
+  }
+  const auto restore_active_layer = qScopeGuard([this, retarget, active_now] {
+    if (retarget && document_ != nullptr && active_now.has_value() &&
+        std::as_const(*document_).find_layer(*active_now) != nullptr) {
+      document_->set_active_layer(*active_now);
+    }
+  });
+  if (!begin_edit(tr("Shape"))) {
+    update();
+    return false;
+  }
+  const auto processing = !editing_smart_filter_mask();
+  if (processing) {
+    begin_processing_operation();
+  }
+  const QRect dirty = paint_pending_pixel_shape(*shape);
+  if (processing) {
+    tick_processing_operation();
+  }
+  clear_brush_stroke_tracking();
+  QRect document_dirty = dirty;
+  if (document_ != nullptr) {
+    const QRect canvas(0, 0, document_->width(), document_->height());
+    const auto preview_document =
+        turned_rect_bounds(shape->box, shape->angle).toAlignedRect().adjusted(-2, -2, 2, 2).intersected(canvas);
+    document_dirty = dirty.isEmpty() ? preview_document : dirty.united(preview_document);
+  }
+  active_edit_target_changed_impl(QRegion(document_dirty));
+  update(preview_rect);
+  update();
+  if (processing) {
+    end_processing_operation();
+  }
+  return true;
+}
+
+void CanvasWidget::refresh_pending_pixel_shape_preview(PendingPixelShape& shape) const {
+  PendingPixelShape::Inputs inputs;
+  inputs.box = shape.box;
+  inputs.polygon_angle = shape.polygon_angle;
+  inputs.angle = shape.angle;
+  inputs.style = shape_pixel_style_;
+  inputs.foreground = primary_color_.rgba();
+  inputs.brush_size = brush_size_;
+  inputs.opacity = brush_opacity_;
+  inputs.softness = brush_softness_;
+  inputs.corner_radius = shape_corner_radius_;
+  inputs.sides = polygon_sides_;
+  inputs.star_inset = polygon_star_inset_;
+  inputs.custom_shape = custom_shape_path_.get();
+  inputs.grayscale = editing_grayscale_target();
+  inputs.document_size = document_ != nullptr ? QSize(document_->width(), document_->height()) : QSize();
+  if (shape.preview_inputs.has_value() && *shape.preview_inputs == inputs) {
+    return;
+  }
+  shape.preview_inputs = inputs;
+  shape.preview = QImage();
+  shape.preview_origin = QPoint();
+  if (document_ == nullptr || brush_opacity_ <= 0) {
+    return;
+  }
+  const auto path = pending_pixel_shape_path(shape);
+  if (path.empty()) {
+    return;
+  }
+  // The renderer a commit uses for everything but the two classic styles, whose edges it
+  // matches within antialiasing: the shape layer's own fill and stroke, with Soft's feather.
+  const auto core = core_shape_style(shape_pixel_style_, primary_color_, brush_size_);
+  patchy::EditOptions soft;
+  soft.brush_size = shape_stroke_size(core);
+  soft.brush_softness = brush_softness_;
+  const QRect canvas(0, 0, document_->width(), document_->height());
+  const auto raster = patchy::pixel_shape_raster(path, core, patchy::pixel_shape_soft_feather(soft),
+                                                 to_core_rect(canvas), shape_pixel_style_.patterns.get());
+  const auto bounds = to_qrect(raster.bounds).intersected(canvas);
+  if (bounds.isEmpty() || raster.pixels.empty()) {
+    return;
+  }
+  QImage image(bounds.size(), QImage::Format_ARGB32_Premultiplied);
+  image.fill(Qt::transparent);
+  const int opacity = brush_opacity_;
+  const bool grayscale = inputs.grayscale;
+  // The selection clips the paint as it clips the commit (a mask or a channel only when the
+  // selection clips grayscale edits).
+  const bool clipped = grayscale ? selection_clips_grayscale_edits() : has_selection();
+  for (int y = bounds.top(); y <= bounds.bottom(); ++y) {
+    auto* line = reinterpret_cast<QRgb*>(image.scanLine(y - bounds.top()));
+    for (int x = bounds.left(); x <= bounds.right(); ++x) {
+      const auto* source = raster.pixels.pixel(x - raster.bounds.x, y - raster.bounds.y);
+      if (source[3] == 0) {
+        continue;
+      }
+      int alpha = (static_cast<int>(source[3]) * opacity + 50) / 100;
+      if (clipped) {
+        const QPoint point(x, y);
+        if (!selection_allows(point)) {
+          continue;
+        }
+        alpha = (alpha * static_cast<int>(selection_alpha_at(point)) + 127) / 255;
+      }
+      if (alpha <= 0) {
+        continue;
+      }
+      int red = source[0];
+      int green = source[1];
+      int blue = source[2];
+      if (grayscale) {
+        red = green = blue = mask_value_from_color(QColor(red, green, blue));
+      }
+      line[x - bounds.left()] = qPremultiply(qRgba(red, green, blue, alpha));
+    }
+  }
+  shape.preview = std::move(image);
+  shape.preview_origin = bounds.topLeft();
+}
+
+void CanvasWidget::draw_pending_pixel_shape(QPainter& painter) const {
+  if (pending_pixel_shape_ == nullptr || document_ == nullptr) {
+    return;
+  }
+  auto& shape = *pending_pixel_shape_;
+  refresh_pending_pixel_shape_preview(shape);
+  if (!shape.preview.isNull() && !pending_pixel_shape_uses_channel_preview()) {
+    painter.save();
+    painter.setTransform(view_transform().to_widget(), true);
+    // Document pixels stay crisp when zoomed in, as the canvas shows them.
+    painter.setRenderHint(QPainter::SmoothPixmapTransform, zoom_ < 1.0);
+    painter.drawImage(QPointF(shape.preview_origin), shape.preview);
+    painter.restore();
+  }
+  // The shape's path outline, as a shape layer shows it under its tool.
+  if (extra_shown(ViewExtra::TargetPath)) {
+    QPainterPath outline;
+    for (const auto& subpath : pending_pixel_shape_path(shape).subpaths) {
+      const auto count = subpath.anchors.size();
+      if (count == 0U) {
+        continue;
+      }
+      const auto to_widget = [this](double x, double y) { return widget_position_f(QPointF(x, y)); };
+      outline.moveTo(to_widget(subpath.anchors[0].anchor_x, subpath.anchors[0].anchor_y));
+      const auto segments = subpath.closed ? count : count - 1U;
+      for (std::size_t index = 0; index < segments; ++index) {
+        const auto& from = subpath.anchors[index];
+        const auto& to = subpath.anchors[(index + 1U) % count];
+        outline.cubicTo(to_widget(from.out_x, from.out_y), to_widget(to.in_x, to.in_y),
+                        to_widget(to.anchor_x, to.anchor_y));
+      }
+      if (subpath.closed) {
+        outline.closeSubpath();
+      }
+    }
+    draw_path_preview_outline(painter, outline);
+  }
+}
+
+}  // namespace patchy::ui

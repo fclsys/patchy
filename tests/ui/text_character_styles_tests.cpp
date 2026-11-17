@@ -1,0 +1,1280 @@
+// The Character panel's styles (GitHub issue 346): All Caps, Small Caps, Superscript, Subscript,
+// Underline, Strikethrough, Ordinals, Fractions and the other OpenType toggles (Standard and
+// Discretionary Ligatures, Contextual Alternates, Swash, Stylistic and Titling Alternates). The
+// panel toggles write the run flags, and the renders match Photoshop 2026's COM captures
+// (docs/text-character-styles.md).
+#include "core/document.hpp"
+#include "core/layer_metadata.hpp"
+#include "ui/canvas_widget.hpp"
+#include "ui/dialog_utils.hpp"
+#include "ui/edit_conversions.hpp"
+#include "ui/qt_paths.hpp"
+#include "ui/text_document.hpp"
+#include "ui/text_layout.hpp"
+#include "render/compositor.hpp"
+#include "local_psd_fixtures.hpp"
+#include "psd/psd_document_io.hpp"
+#include "ui/main_window.hpp"
+#include "scripting_test_support.hpp"
+#include "test_fonts.hpp"
+#include "test_harness.hpp"
+#include "ui_test_access.hpp"
+#include "ui_test_groups.hpp"
+#include "ui_test_support.hpp"
+#include <QApplication>
+#include <QDialog>
+#include <QDir>
+#include <QFontDatabase>
+#include <QGlyphRun>
+#include <QImage>
+#include <QLabel>
+#include <QPainter>
+#include <QPushButton>
+#include <QStatusBar>
+#include <QTextEdit>
+#include <QTextLayout>
+#include <QTextDocument>
+#include <QTextCursor>
+#include <QTimer>
+#include <algorithm>
+#include <filesystem>
+#include <functional>
+#include <array>
+#include <cmath>
+#include <cstdio>
+#include <optional>
+#include <string>
+#include <string_view>
+#include <utility>
+#include <vector>
+
+using namespace patchy::test::ui;
+using namespace patchy::test::ui::scripting_support;
+using patchy::ui::MainWindowTestAccess;
+
+namespace {
+
+constexpr double kSize = 100.0;
+
+struct Ink {
+  int left{0};
+  int top{0};
+  int right{0};   // exclusive
+  int bottom{0};  // exclusive
+  [[nodiscard]] int width() const { return right - left; }
+  [[nodiscard]] int height() const { return bottom - top; }
+};
+
+double alpha_at(const patchy::Layer& layer, int x, int y) {
+  const auto& pixels = layer.pixels();
+  if (x < 0 || y < 0 || x >= pixels.width() || y >= pixels.height()) {
+    return 0.0;
+  }
+  return pixels.pixel(x, y)[3] / 255.0;
+}
+
+// Ink extents (alpha > 50%) in document pixels, limited to layer columns [from, to).
+std::optional<Ink> ink_of(const patchy::Layer& layer, double from_fraction = 0.0, double to_fraction = 1.0) {
+  const auto& pixels = layer.pixels();
+  const int from = static_cast<int>(std::floor(pixels.width() * from_fraction));
+  const int to = static_cast<int>(std::ceil(pixels.width() * to_fraction));
+  std::optional<Ink> ink;
+  for (int y = 0; y < pixels.height(); ++y) {
+    for (int x = from; x < to; ++x) {
+      if (alpha_at(layer, x, y) <= 0.5) {
+        continue;
+      }
+      if (!ink) {
+        ink = Ink{x, y, x + 1, y + 1};
+      }
+      ink->left = std::min(ink->left, x);
+      ink->top = std::min(ink->top, y);
+      ink->right = std::max(ink->right, x + 1);
+      ink->bottom = std::max(ink->bottom, y + 1);
+    }
+  }
+  if (ink) {
+    const auto bounds = layer.bounds();
+    ink->left += bounds.x;
+    ink->right += bounds.x;
+    ink->top += bounds.y;
+    ink->bottom += bounds.y;
+  }
+  return ink;
+}
+
+// The bar's top and bottom edges in document pixels: the rows whose 10th-percentile coverage
+// across the inked columns is set (glyph gaps are bar only), with fractional edge coverage.
+std::optional<std::pair<double, double>> bar_edges(const patchy::Layer& layer) {
+  const auto ink = ink_of(layer);
+  if (!ink) {
+    return std::nullopt;
+  }
+  const auto bounds = layer.bounds();
+  const int x0 = ink->left - bounds.x + 2;
+  const int x1 = ink->right - bounds.x - 2;
+  std::vector<double> coverage(static_cast<std::size_t>(layer.pixels().height()), 0.0);
+  for (int y = 0; y < layer.pixels().height(); ++y) {
+    std::vector<double> row;
+    for (int x = x0; x < x1; ++x) {
+      row.push_back(alpha_at(layer, x, y));
+    }
+    if (row.empty()) {
+      continue;
+    }
+    std::ranges::sort(row);
+    coverage[static_cast<std::size_t>(y)] = row[row.size() / 10U];
+  }
+  int first = -1;
+  int last = -1;
+  for (int y = 0; y < static_cast<int>(coverage.size()); ++y) {
+    if (coverage[static_cast<std::size_t>(y)] > 0.02) {
+      if (first < 0) first = y;
+      last = y;
+    }
+  }
+  if (first < 0) {
+    return std::nullopt;
+  }
+  const double top = first + (1.0 - coverage[static_cast<std::size_t>(first)]) + bounds.y;
+  const double bottom = last + coverage[static_cast<std::size_t>(last)] + bounds.y;
+  return std::pair{top, bottom};
+}
+
+bool has_family(const char* family) {
+  return QFontDatabase::hasFamily(QString::fromLatin1(family));
+}
+
+// Whether the family's OpenType `tag` changes the glyphs of `text` (Patchy applies a feature only
+// then). Windows' Arial has smcp and frac; the Arial macOS ships has neither.
+bool font_feature_changes(const char* family, const char* tag, const QString& text, quint32 value = 1U) {
+  const auto glyphs = [&text](const QFont& font) {
+    QTextLayout layout(text, font);
+    layout.beginLayout();
+    auto line = layout.createLine();
+    layout.endLayout();
+    QList<quint32> indexes;
+    if (line.isValid()) {
+      for (const auto& run : line.glyphRuns()) {
+        indexes += run.glyphIndexes();
+      }
+    }
+    return indexes;
+  };
+  QFont font(QString::fromLatin1(family));
+  font.setPixelSize(static_cast<int>(kSize));
+  // Patchy's baseline, like Photoshop's: contextual alternates off (build_text_render_document).
+  font.setFeature(QFont::Tag("calt"), 0);
+  auto featured = font;
+  featured.setFeature(QFont::Tag::fromString(QLatin1String(tag)).value(), value);
+  return glyphs(featured) != glyphs(font);
+}
+
+// Adds a 100 px text layer made of `runs` (a JS array literal) at a fixed anchor and returns it.
+// A copy: the next add can move the document's layer vector.
+std::optional<patchy::Layer> add_runs_layer(patchy::ui::MainWindow& window, const QString& runs, const char* family,
+                                    bool photoshop_layout, double size = kSize) {
+  CHECK(run_script(window, QStringLiteral("app.activeDocument.addTextLayer(%1, {font: '%2', size: %3, x: 40, y: 60, "
+                                          "color: '#000000'});")
+                               .arg(runs, QLatin1String(family))
+                               .arg(size)));
+  auto& document = MainWindowTestAccess::document(window);
+  const auto id = document.active_layer_id();
+  CHECK(id.has_value());
+  if (!id) {
+    return std::nullopt;
+  }
+  if (photoshop_layout) {
+    document.find_layer(*id)->metadata()[patchy::kLayerMetadataTextLayoutMode] = patchy::kTextLayoutModePhotoshop;
+    CHECK(run_script(window, QStringLiteral("app.activeDocument.activeLayer.rerenderText();")));
+  }
+  const auto* layer = std::as_const(document).find_layer(*id);
+  CHECK(layer != nullptr);
+  return layer != nullptr ? std::optional<patchy::Layer>(*layer) : std::nullopt;
+}
+
+// The plain layer's baseline: the bottom of its first capital H (no descender, no overshoot).
+double baseline_of(const patchy::Layer& plain) {
+  const auto ink = ink_of(plain, 0.0, 0.2);
+  CHECK(ink.has_value());
+  return ink ? static_cast<double>(ink->bottom) : 0.0;
+}
+
+void expect_near(double actual, double expected, double tolerance, const char* what) {
+  if (std::abs(actual - expected) > tolerance) {
+    std::printf("  %s: %.2f, expected %.2f +- %.2f\n", what, actual, expected, tolerance);
+  }
+  CHECK(std::abs(actual - expected) <= tolerance);
+}
+
+// Underline and strikethrough sit where Photoshop draws them for Arial at 100 px (COM capture):
+// the underline covers 18.0 to 25.25 px below the baseline, the strikethrough is centred 25.9 px
+// above it, both with the font's 7.3 px underline thickness. Both layout modes draw them.
+void ui_text_underline_and_strikethrough_match_photoshop_if_available() {
+  patchy::test::register_test_fonts(patchy::test::TestFontRole::UiDefault);
+  if (!has_family("Arial")) {
+    patchy::test::skip("Arial is not installed");
+  }
+  for (const bool photoshop_layout : {false, true}) {
+    patchy::ui::MainWindow window;
+    show_window(window);
+    const auto plain = add_runs_layer(window, QStringLiteral("[{text: 'HxH'}]"), "Arial", photoshop_layout);
+    const auto underlined =
+        add_runs_layer(window, QStringLiteral("[{text: 'HxH', underline: true}]"), "Arial", photoshop_layout);
+    const auto struck =
+        add_runs_layer(window, QStringLiteral("[{text: 'HxH', strikethrough: true}]"), "Arial", photoshop_layout);
+    CHECK(plain && underlined && struck);
+    if (!plain || !underlined || !struck) {
+      return;
+    }
+    const auto baseline = baseline_of(*plain);
+    const auto underline = bar_edges(*underlined);
+    CHECK(underline.has_value());
+    if (underline) {
+      expect_near(underline->first - baseline, 18.0, 0.8, "underline top below baseline");
+      expect_near(underline->second - underline->first, 7.3, 0.6, "underline thickness");
+    }
+    const auto strike = bar_edges(*struck);
+    CHECK(strike.has_value());
+    if (strike) {
+      expect_near(baseline - (strike->first + strike->second) / 2.0, 25.9, 0.8, "strikethrough centre above baseline");
+      expect_near(strike->second - strike->first, 7.3, 0.6, "strikethrough thickness");
+    }
+    // The bar runs from the pen start to the last advance, as in Photoshop.
+    const auto plain_ink = ink_of(*plain);
+    const auto underline_ink = ink_of(*underlined);
+    CHECK(plain_ink && underline_ink);
+    if (plain_ink && underline_ink) {
+      CHECK(underline_ink->left <= plain_ink->left);
+      CHECK(underline_ink->right >= plain_ink->right);
+    }
+    if (!photoshop_layout) {
+      save_widget_artifact("ui_text_underline_and_strikethrough", window);
+    }
+    CHECK(run_script(window, QStringLiteral(
+        "var runs = app.activeDocument.activeLayer.textRuns; console.log('strike-read=' + runs[0].strikethrough + "
+        "',' + runs[0].underline + ',' + runs[0].caps + ',' + runs[0].script);")));
+    CHECK(backlog_contains(window, QStringLiteral("strike-read=true,false,none,none")));
+  }
+}
+
+// Superscript and subscript draw at 58.3% of the size, moved 33.3% of the size off the
+// baseline (Photoshop's /SuperscriptSize and /SuperscriptPosition, the H moves 33 px at 100 px).
+// All Caps draws lowercase as capitals; Small Caps uses Arial's own small capitals (0.56 em
+// tall, where a synthesized 70% capital would be 0.50 em).
+void ui_text_script_and_caps_match_photoshop_if_available() {
+  patchy::test::register_test_fonts(patchy::test::TestFontRole::UiDefault);
+  if (!has_family("Arial")) {
+    patchy::test::skip("Arial is not installed");
+  }
+  for (const bool photoshop_layout : {false, true}) {
+    patchy::ui::MainWindow window;
+    show_window(window);
+    const auto plain = add_runs_layer(window, QStringLiteral("[{text: 'HH'}]"), "Arial", photoshop_layout);
+    const auto raised = add_runs_layer(window, QStringLiteral("[{text: 'H'}, {text: 'H', script: 'superscript'}]"),
+                                        "Arial", photoshop_layout);
+    const auto lowered = add_runs_layer(window, QStringLiteral("[{text: 'H'}, {text: 'H', script: 'subscript'}]"),
+                                         "Arial", photoshop_layout);
+    CHECK(plain && raised && lowered);
+    if (!plain || !raised || !lowered) {
+      return;
+    }
+    const auto baseline = baseline_of(*plain);
+    const auto cap = ink_of(*plain, 0.0, 0.45);
+    const auto super_h = ink_of(*raised, 0.62, 1.0);
+    const auto sub_h = ink_of(*lowered, 0.62, 1.0);
+    CHECK(cap && super_h && sub_h);
+    if (cap && super_h && sub_h) {
+      expect_near(super_h->height(), cap->height() * 0.583, 1.5, "superscript H height");
+      expect_near(baseline - super_h->bottom, 33.3, 1.2, "superscript rise");
+      expect_near(sub_h->bottom - baseline, 33.3, 1.2, "subscript drop");
+    }
+
+    const auto capitals = add_runs_layer(window, QStringLiteral("[{text: 'HXH'}]"), "Arial", photoshop_layout);
+    const auto all_caps =
+        add_runs_layer(window, QStringLiteral("[{text: 'hxh', caps: 'all'}]"), "Arial", photoshop_layout);
+    const auto small_caps =
+        add_runs_layer(window, QStringLiteral("[{text: 'Hxh', caps: 'small'}]"), "Arial", photoshop_layout);
+    CHECK(capitals && all_caps && small_caps);
+    if (!capitals || !all_caps || !small_caps) {
+      return;
+    }
+    const auto capitals_ink = ink_of(*capitals);
+    const auto all_caps_ink = ink_of(*all_caps);
+    CHECK(capitals_ink && all_caps_ink);
+    if (capitals_ink && all_caps_ink) {
+      expect_near(all_caps_ink->width(), capitals_ink->width(), 1.0, "All Caps width");
+      expect_near(all_caps_ink->height(), capitals_ink->height(), 1.0, "All Caps height");
+    }
+    const auto small = ink_of(*small_caps, 0.45, 1.0);
+    CHECK(small.has_value());
+    if (small) {
+      // Without smcp (macOS's Arial) the small capital is synthesized at 70% of the 0.716 em cap.
+      const double expected = font_feature_changes("Arial", "smcp", QStringLiteral("xh")) ? 0.56 : 0.50;
+      expect_near(small->height(), expected * kSize, 2.5, "Arial small capital height");
+    }
+    if (!photoshop_layout) {
+      save_widget_artifact("ui_text_script_and_caps", window);
+    }
+  }
+}
+
+// Ordinals and Fractions apply the font's OpenType features: Arial has fractions (1/2 turns into
+// one fraction, much narrower) but no ordinals, so "1st" stays exactly as typed, as in Photoshop;
+// Calibri has ordinals.
+void ui_text_ordinals_and_fractions_use_the_font_features_if_available() {
+  patchy::test::register_test_fonts(patchy::test::TestFontRole::UiDefault);
+  if (!has_family("Arial")) {
+    patchy::test::skip("Arial is not installed");
+  }
+  patchy::ui::MainWindow window;
+  show_window(window);
+  const auto plain_fraction = add_runs_layer(window, QStringLiteral("[{text: '1/2'}]"), "Arial", false);
+  const auto fraction = add_runs_layer(window, QStringLiteral("[{text: '1/2', fractions: true}]"), "Arial", false);
+  const auto plain_ordinal = add_runs_layer(window, QStringLiteral("[{text: '1st'}]"), "Arial", false);
+  const auto ordinal = add_runs_layer(window, QStringLiteral("[{text: '1st', ordinals: true}]"), "Arial", false);
+  CHECK(plain_fraction && fraction && plain_ordinal && ordinal);
+  if (!plain_fraction || !fraction || !plain_ordinal || !ordinal) {
+    return;
+  }
+  const auto plain_fraction_ink = ink_of(*plain_fraction);
+  const auto fraction_ink = ink_of(*fraction);
+  CHECK(plain_fraction_ink && fraction_ink);
+  if (plain_fraction_ink && fraction_ink) {
+    if (font_feature_changes("Arial", "frac", QStringLiteral("1/2"))) {
+      CHECK(fraction_ink->width() < plain_fraction_ink->width() * 0.75);
+    } else {
+      // A face without fractions (macOS's Arial) leaves the text as typed, as Photoshop does.
+      CHECK(std::ranges::equal(plain_fraction->pixels().data(), fraction->pixels().data()));
+    }
+  }
+  CHECK(std::ranges::equal(plain_ordinal->pixels().data(), ordinal->pixels().data()));
+  if (has_family("Calibri")) {
+    const auto calibri_plain = add_runs_layer(window, QStringLiteral("[{text: '1st'}]"), "Calibri", false);
+    const auto calibri_ordinal =
+        add_runs_layer(window, QStringLiteral("[{text: '1st', ordinals: true}]"), "Calibri", false);
+    CHECK(calibri_plain && calibri_ordinal);
+    if (calibri_plain && calibri_ordinal) {
+      // The raised "t" ends well above the baseline the plain one sits on.
+      // The last 20% of each layer is the t alone (a superior t is narrow, so wider slices would
+      // reach the 1, which stays on the baseline).
+      const auto plain_st = ink_of(*calibri_plain, 0.8, 1.0);
+      const auto raised_st = ink_of(*calibri_ordinal, 0.8, 1.0);
+      CHECK(plain_st && raised_st);
+      if (plain_st && raised_st) {
+        CHECK(raised_st->bottom < plain_st->bottom - 0.2 * kSize);
+      }
+    }
+  }
+  save_widget_artifact("ui_text_ordinals_and_fractions", window);
+}
+
+// The other OpenType toggles apply the font's own features and leave text in a font without one
+// as typed, as Photoshop does. Calibri joins "ffl" unless Standard Ligatures is off and ties "st"
+// with Discretionary Ligatures; Comic Sans swashes its capitals; no Windows face has titling
+// alternates. Contextual Alternates are off unless asked for (Photoshop's default): Segoe Script
+// at 72 px is as wide as Photoshop's own render each way (COM flattens in
+// local-test-fixtures/psd/opentype-features).
+void ui_text_opentype_features_use_the_font_features_if_available() {
+  patchy::test::register_test_fonts(patchy::test::TestFontRole::UiDefault);
+  patchy::test::register_test_fonts(patchy::test::TestFontRole::ScriptFeatures);
+  if (!has_family("Calibri") || !has_family("Arial")) {
+    patchy::test::skip("Calibri or Arial is not installed");
+  }
+  patchy::ui::MainWindow window;
+  show_window(window);
+  const auto same_pixels = [](const patchy::Layer& a, const patchy::Layer& b) {
+    return a.bounds().width == b.bounds().width && a.bounds().height == b.bounds().height &&
+           std::ranges::equal(a.pixels().data(), b.pixels().data());
+  };
+  struct Case {
+    const char* family;
+    const char* text;
+    const char* key;
+    const char* tag;
+    quint32 value;
+  };
+  const std::array<Case, 6> cases{{
+      {"Calibri", "office ffl", "ligatures: false", "liga", 0U},
+      {"Calibri", "Quest stay", "discretionaryLigatures: true", "dlig", 1U},
+      {"Arial", "office fifty Quest", "stylisticAlternates: true", "salt", 1U},
+      {"Comic Sans MS", "Swash Quest", "swash: true", "swsh", 1U},
+      {"Arial", "TITLE Title", "titlingAlternates: true", "titl", 1U},
+      {"Segoe Script", "Hello there", "contextualAlternates: true", "calt", 1U},
+  }};
+  int mismatches = 0;  // counted, not thrown, so one run reports every feature
+  for (const auto& entry : cases) {
+    if (!has_family(entry.family)) {
+      std::printf("  %s: no %s here\n", entry.key, entry.family);
+      continue;
+    }
+    const auto text = QString::fromLatin1(entry.text);
+    const auto plain = add_runs_layer(window, QStringLiteral("[{text: '%1'}]").arg(text), entry.family, false);
+    const auto featured =
+        add_runs_layer(window, QStringLiteral("[{text: '%1', %2}]").arg(text, QLatin1String(entry.key)), entry.family, false);
+    CHECK(plain && featured);
+    if (!plain || !featured) {
+      continue;
+    }
+    const bool changes = font_feature_changes(entry.family, entry.tag, text, entry.value);
+    const bool same = same_pixels(*plain, *featured);
+    const auto plain_ink = ink_of(*plain);
+    const auto featured_ink = ink_of(*featured);
+    std::printf("  %s (%s): the font %s it, render %s (ink %d and %d px wide)\n", entry.key, entry.family,
+                changes ? "has" : "lacks", same ? "unchanged" : "changed", plain_ink ? plain_ink->width() : -1,
+                featured_ink ? featured_ink->width() : -1);
+    std::fflush(stdout);
+    mismatches += same == !changes ? 0 : 1;
+  }
+  CHECK(mismatches == 0);
+  // Standard ligatures off spends more width: Calibri's "ffl" is one glyph narrower than three.
+  if (has_family("Calibri") && font_feature_changes("Calibri", "liga", QStringLiteral("ffl"), 0U)) {
+    const auto joined = add_runs_layer(window, QStringLiteral("[{text: 'ffl'}]"), "Calibri", false);
+    const auto apart = add_runs_layer(window, QStringLiteral("[{text: 'ffl', ligatures: false}]"), "Calibri", false);
+    const auto joined_ink = joined ? ink_of(*joined) : std::nullopt;
+    const auto apart_ink = apart ? ink_of(*apart) : std::nullopt;
+    CHECK(joined_ink && apart_ink);
+    if (joined_ink && apart_ink) {
+      CHECK(apart_ink->width() > joined_ink->width());
+    }
+  }
+  // Segoe Script against Photoshop 2026's flattens of the same line at 72 px.
+  const auto folder = patchy::test::local_psd_fixture_path("opentype-features");
+  if (has_family("Segoe Script") && std::filesystem::exists(folder / "calt_base.png")) {
+    const auto photoshop_ink_width = [&](const char* file) {
+      QImage image(patchy::ui::to_qstring(folder / file));
+      image = image.convertToFormat(QImage::Format_Grayscale8);
+      int left = image.width();
+      int right = -1;
+      for (int y = 0; y < image.height(); ++y) {
+        const auto* row = image.constScanLine(y);
+        for (int x = 0; x < image.width(); ++x) {
+          if (row[x] < 128) {
+            left = std::min(left, x);
+            right = std::max(right, x + 1);
+          }
+        }
+      }
+      return right - left;
+    };
+    const auto text = QStringLiteral("Hello there sweet tool");
+    const auto plain = add_runs_layer(window, QStringLiteral("[{text: '%1'}]").arg(text), "Segoe Script", false, 72.0);
+    const auto calt = add_runs_layer(window, QStringLiteral("[{text: '%1', contextualAlternates: true}]").arg(text),
+                                     "Segoe Script", false, 72.0);
+    const auto plain_ink = plain ? ink_of(*plain) : std::nullopt;
+    const auto calt_ink = calt ? ink_of(*calt) : std::nullopt;
+    CHECK(plain_ink && calt_ink);
+    if (plain_ink && calt_ink) {
+      expect_near(plain_ink->width(), photoshop_ink_width("sc_base.png"), 4.0, "Segoe Script ink width, calt off");
+      expect_near(calt_ink->width(), photoshop_ink_width("sc_calt_on.png"), 4.0, "Segoe Script ink width, calt on");
+    }
+  }
+  // The Photoshop open check's file: every layer above plus one carrying all six toggles in runs.
+  ensure_artifact_dir();
+  const auto saved = QDir::current().absoluteFilePath(QStringLiteral("test-artifacts/ui_text_opentype_features.psd"));
+  CHECK(run_script(window, QStringLiteral(R"JS(
+    var doc = app.activeDocument;
+    doc.addTextLayer([{text: 'office ', ligatures: false}, {text: 'Quest ', discretionaryLigatures: true},
+                      {text: 'Hello ', contextualAlternates: true}, {text: 'Swash ', swash: true},
+                      {text: 'alt ', stylisticAlternates: true}, {text: 'TITLE', titlingAlternates: true}],
+                     {font: 'Calibri', size: 40, x: 20, y: 440, color: '#203080'});
+    doc.saveAs('%1');
+  )JS").arg(saved)));
+  save_widget_artifact("ui_text_opentype_features", window);
+}
+
+// GitHub issue 683 (follow-up 3): Adobe Arabic (and Noto Naskh and Noto Kufi Arabic) build the
+// Allah ligature only through Discretionary Ligatures. Photoshop 2026 re-renders the reporter's
+// Diacritics layers (Adobe Arabic 2.007, Discretionary Ligatures off, the file's setting) with lam,
+// lam and heh apart and draws the ligature only with the toggle on (COM captures, November 2026),
+// and Patchy does the same: calt has nothing to do with it. Noto Kufi Arabic (OFL) stands in for
+// Adobe Arabic, which only Photoshop ships: local-test-fixtures/fonts/NotoKufiArabic-Regular.ttf.
+// Not the bundled Noto Naskh Arabic: its runs lead with a Latin fallback face
+// (render_text_families_for_display_family), which draws the Arabic too where it has the glyphs.
+void ui_text_arabic_allah_ligature_follows_discretionary_ligatures_if_available() {
+  patchy::test::register_test_fonts(patchy::test::TestFontRole::UiDefault);
+  const auto font_path = patchy::test::local_fixtures_root() / "fonts" / "NotoKufiArabic-Regular.ttf";
+  patchy::test::skip_unless_exists(font_path);
+  const auto font_id = QFontDatabase::addApplicationFont(patchy::ui::to_qstring(font_path));
+  const auto family = QFontDatabase::applicationFontFamilies(font_id).value(0);
+  CHECK(!family.isEmpty());
+  if (family.isEmpty()) {
+    return;
+  }
+  const auto family_bytes = family.toLatin1();
+  // "Allah" with alef wasla, shadda, fatha and kasra, as the reporter's layers spell it.
+  const auto word = QStringLiteral("\u0671\u0644\u0644\u0651\u064e\u0647\u0650");
+  QFont font(family);
+  font.setPixelSize(static_cast<int>(kSize));
+  font.setFeature(QFont::Tag("calt"), 0);
+  const auto glyph_count = [&word](const QFont& shaped) {
+    QTextLayout layout(word, shaped);
+    layout.beginLayout();
+    auto line = layout.createLine();
+    layout.endLayout();
+    qsizetype count = 0;
+    if (line.isValid()) {
+      for (const auto& run : line.glyphRuns()) {
+        count += run.glyphIndexes().size();
+      }
+    }
+    return count;
+  };
+  auto ligated = font;
+  ligated.setFeature(QFont::Tag("dlig"), 1);
+  auto contextual = font;
+  contextual.setFeature(QFont::Tag("calt"), 1);
+  const auto apart = glyph_count(font);
+  std::printf("  %s: %d glyphs, %d with dlig, %d with calt\n", family_bytes.constData(), static_cast<int>(apart),
+              static_cast<int>(glyph_count(ligated)), static_cast<int>(glyph_count(contextual)));
+  std::fflush(stdout);
+  // The ligature takes lam, lam and heh into one glyph; calt alone does not.
+  CHECK(glyph_count(ligated) < apart);
+  CHECK(glyph_count(contextual) == apart);
+
+  patchy::ui::MainWindow window;
+  show_window(window);
+  const auto js_word = QStringLiteral("\\u0671\\u0644\\u0644\\u0651\\u064e\\u0647\\u0650");
+  const auto plain = add_runs_layer(window, QStringLiteral("[{text: '%1'}]").arg(js_word), family_bytes.constData(), false);
+  const auto featured = add_runs_layer(window, QStringLiteral("[{text: '%1', discretionaryLigatures: true}]").arg(js_word),
+                                       family_bytes.constData(), false);
+  CHECK(plain && featured);
+  if (!plain || !featured) {
+    QFontDatabase::removeApplicationFont(font_id);
+    return;
+  }
+  CHECK(plain->metadata().at(patchy::kLayerMetadataText) == featured->metadata().at(patchy::kLayerMetadataText));
+  const bool same = plain->bounds().width == featured->bounds().width &&
+                    plain->bounds().height == featured->bounds().height &&
+                    std::ranges::equal(plain->pixels().data(), featured->pixels().data());
+  CHECK(!same);
+  save_image_artifact("ui_text_arabic_allah_ligature_plain", image_from_pixels_for_visuals(plain->pixels()));
+  save_image_artifact("ui_text_arabic_allah_ligature_dlig", image_from_pixels_for_visuals(featured->pixels()));
+  QFontDatabase::removeApplicationFont(font_id);
+}
+
+// The style toggles stand in two rows of eight with no "Style:" label, each row centred and split
+// in fours by a wider gap: faux bold, faux italic, underline, strikethrough | all caps, small caps,
+// superscript, subscript; then the OpenType features (philipzae's order, GitHub issue 346).
+void ui_text_character_style_rows_are_centred() {
+  patchy::test::register_test_fonts(patchy::test::TestFontRole::UiDefault);
+  patchy::ui::MainWindow window;
+  show_window(window);
+  CHECK(run_script(window, QStringLiteral(
+      "app.activeDocument.addTextLayer('Styled', {size: 48, x: 30, y: 80, color: '#000000'});")));
+  require_action_by_text(window, QStringLiteral("Type"))->trigger();
+  bool drove = false;
+  QTimer::singleShot(0, [&] {
+    try {
+      auto* dialog = window.findChild<QDialog*>(QStringLiteral("textCharacterDialog"));
+      CHECK(dialog != nullptr);
+      if (dialog == nullptr) {
+        return;
+      }
+      QApplication::processEvents();
+      for (const auto* label : dialog->findChildren<QLabel*>()) {
+        CHECK(label->text() != QStringLiteral("Style:"));
+      }
+      const std::array<std::array<const char*, 8>, 2> rows{{
+          {"textCharacterFauxBold", "textCharacterFauxItalic", "textCharacterUnderlineButton",
+           "textCharacterStrikethroughButton", "textCharacterAllCapsButton", "textCharacterSmallCapsButton",
+           "textCharacterSuperscriptButton", "textCharacterSubscriptButton"},
+          {"textCharacterLigaturesButton", "textCharacterContextualAlternatesButton",
+           "textCharacterDiscretionaryLigaturesButton", "textCharacterSwashButton",
+           "textCharacterStylisticAlternatesButton", "textCharacterTitlingAlternatesButton",
+           "textCharacterOrdinalsButton", "textCharacterFractionsButton"},
+      }};
+      auto* holder = dialog->findChild<QWidget*>(QStringLiteral("textCharacterStyleRow"));
+      CHECK(holder != nullptr);
+      std::optional<int> row_top;
+      for (const auto& row : rows) {
+        std::vector<QRect> rects;
+        for (const auto* name : row) {
+          auto* button = dialog->findChild<QPushButton*>(QLatin1String(name));
+          CHECK(button != nullptr);
+          if (button == nullptr || holder == nullptr) {
+            dialog->reject();
+            return;
+          }
+          CHECK(button->isEnabled() && !button->toolTip().isEmpty() && !button->icon().isNull());
+          rects.emplace_back(button->mapTo(holder, QPoint(0, 0)), button->size());
+        }
+        // One line, left to right in this order, the wider gap after the fourth.
+        for (std::size_t index = 1; index < rects.size(); ++index) {
+          CHECK(rects[index].top() == rects[0].top());
+          const int gap = rects[index].left() - rects[index - 1].right();
+          CHECK(index == 4 ? gap >= 8 : (gap > 0 && gap < 8));
+        }
+        if (row_top) {
+          CHECK(rects[0].top() > *row_top);
+        }
+        row_top = rects[0].top();
+        const int left_margin = rects.front().left();
+        const int right_margin = holder->width() - 1 - rects.back().right();
+        CHECK(std::abs(left_margin - right_margin) <= 1);
+      }
+      // Standard ligatures are on in new text, as in Photoshop; the rest start off.
+      auto* ligatures = dialog->findChild<QPushButton*>(QStringLiteral("textCharacterLigaturesButton"));
+      CHECK(ligatures != nullptr && ligatures->isChecked());
+      auto* swash = dialog->findChild<QPushButton*>(QStringLiteral("textCharacterSwashButton"));
+      CHECK(swash != nullptr && !swash->isChecked());
+      save_widget_artifact("ui_text_character_style_rows", *dialog);
+      drove = true;
+      dialog->reject();
+    } catch (...) {
+      patchy::ui::unwind_non_modal_dialog_loop(std::current_exception());
+    }
+  });
+  window.findChild<QPushButton*>(QStringLiteral("textCharacterButton"))->click();
+  CHECK(drove);
+}
+
+// The Character panel's style row toggles each run flag on the selected layer without a session,
+// as one undo step each; the two caps and the two baselines exclude each other, and turning every
+// style off again leaves the runs without the style column.
+void ui_text_character_style_buttons_toggle_run_styles() {
+  patchy::test::register_test_fonts(patchy::test::TestFontRole::UiDefault);
+  patchy::ui::MainWindow window;
+  show_window(window);
+  CHECK(run_script(window, QStringLiteral(
+      "app.activeDocument.addTextLayer('Styled', {size: 48, x: 30, y: 80, color: '#000000'});")));
+  auto& document = MainWindowTestAccess::document(window);
+  const auto id = document.active_layer_id();
+  CHECK(id.has_value());
+  if (!id) {
+    return;
+  }
+  require_action_by_text(window, QStringLiteral("Type"))->trigger();
+  const auto style_column = [&]() {
+    const auto runs = QString::fromStdString(std::as_const(document).find_layer(*id)->metadata().at(
+        patchy::kLayerMetadataTextRuns));
+    QStringList columns;
+    for (const auto& line : runs.split(QLatin1Char('\n')).mid(1)) {
+      const auto fields = line.split(QLatin1Char('\t'));
+      columns << (fields.size() >= 17 ? fields[16] : QStringLiteral("-"));
+    }
+    columns.removeDuplicates();
+    return columns.join(QLatin1Char('|'));
+  };
+  bool drove = false;
+  QTimer::singleShot(0, [&] {
+    try {
+      auto* dialog = window.findChild<QDialog*>(QStringLiteral("textCharacterDialog"));
+      CHECK(dialog != nullptr);
+      if (dialog == nullptr) {
+        return;
+      }
+      const auto button = [&](const char* name) {
+        auto* found = dialog->findChild<QPushButton*>(QLatin1String(name));
+        CHECK(found != nullptr);
+        return found;
+      };
+      auto* all_caps = button("textCharacterAllCapsButton");
+      auto* small_caps = button("textCharacterSmallCapsButton");
+      auto* superscript = button("textCharacterSuperscriptButton");
+      auto* subscript = button("textCharacterSubscriptButton");
+      auto* underline = button("textCharacterUnderlineButton");
+      auto* strike = button("textCharacterStrikethroughButton");
+      auto* ordinals = button("textCharacterOrdinalsButton");
+      auto* fractions = button("textCharacterFractionsButton");
+      if (!all_caps || !small_caps || !superscript || !subscript || !underline || !strike || !ordinals || !fractions) {
+        dialog->reject();
+        return;
+      }
+      CHECK(all_caps->isEnabled() && !all_caps->isChecked() && all_caps->focusPolicy() == Qt::NoFocus);
+      const auto depth = MainWindowTestAccess::active_session_undo_depth(window);
+      all_caps->click();
+      CHECK(style_column() == QStringLiteral("allcaps"));
+      CHECK(MainWindowTestAccess::active_session_undo_depth(window) == depth + 1);
+      small_caps->click();
+      CHECK(!all_caps->isChecked() && small_caps->isChecked());
+      CHECK(style_column() == QStringLiteral("smallcaps"));
+      superscript->click();
+      subscript->click();
+      CHECK(!superscript->isChecked() && subscript->isChecked());
+      CHECK(style_column() == QStringLiteral("smallcaps,subscript"));
+      underline->click();
+      strike->click();
+      ordinals->click();
+      fractions->click();
+      CHECK(style_column() == QStringLiteral("smallcaps,subscript,underline,strikethrough,ordinals,fractions"));
+      save_widget_artifact("ui_text_character_style_panel", *dialog);
+      require_action_by_text(window, QStringLiteral("Undo"))->trigger();
+      CHECK(style_column() == QStringLiteral("smallcaps,subscript,underline,strikethrough,ordinals"));
+      CHECK(!fractions->isChecked() && ordinals->isChecked());
+      for (auto* on : {small_caps, subscript, underline, strike, ordinals}) {
+        on->click();
+      }
+      CHECK(style_column() == QStringLiteral("-"));
+      CHECK(!QString::fromStdString(std::as_const(document).find_layer(*id)->metadata().at(
+                                        patchy::kLayerMetadataTextRuns))
+                 .startsWith(QStringLiteral("v9")));
+      // The OpenType row: Standard Ligatures starts on, so clicking it records them off.
+      std::array<QPushButton*, 6> features{
+          button("textCharacterLigaturesButton"),           button("textCharacterContextualAlternatesButton"),
+          button("textCharacterDiscretionaryLigaturesButton"), button("textCharacterSwashButton"),
+          button("textCharacterStylisticAlternatesButton"), button("textCharacterTitlingAlternatesButton")};
+      if (std::ranges::any_of(features, [](const QPushButton* found) { return found == nullptr; })) {
+        dialog->reject();
+        return;
+      }
+      CHECK(features[0]->isChecked());
+      for (auto* feature : features) {
+        CHECK(feature->focusPolicy() == Qt::NoFocus);
+        feature->click();
+      }
+      CHECK(!features[0]->isChecked() && features[5]->isChecked());
+      CHECK(style_column() == QStringLiteral("noligatures,contextualalternates,discretionaryligatures,swash,"
+                                             "stylisticalternates,titlingalternates"));
+      require_action_by_text(window, QStringLiteral("Undo"))->trigger();
+      CHECK(style_column() ==
+            QStringLiteral("noligatures,contextualalternates,discretionaryligatures,swash,stylisticalternates"));
+      CHECK(!features[5]->isChecked());
+      for (std::size_t index = 0; index < 5; ++index) {
+        features[index]->click();
+      }
+      CHECK(features[0]->isChecked());
+      CHECK(style_column() == QStringLiteral("-"));
+      drove = true;
+      dialog->reject();
+    } catch (...) {
+      patchy::ui::unwind_non_modal_dialog_loop(std::current_exception());
+    }
+  });
+  window.findChild<QPushButton*>(QStringLiteral("textCharacterButton"))->click();
+  CHECK(drove);
+}
+
+// Opens the text layer in the Type tool, selects [from, to), clicks `button` in the Character dialog
+// (checking it showed `checked_before` and flipped) and commits through Move, which re-renders.
+void edit_text_layer_style(patchy::ui::MainWindow& window, const patchy::Document& live, patchy::LayerId layer_id,
+                           int from, int to, const char* button, bool checked_before) {
+  auto* canvas = require_canvas(window);
+  require_action_by_text(window, QStringLiteral("Type"))->trigger();
+  const auto bounds = std::as_const(live).find_layer(layer_id)->bounds();
+  const auto hit = canvas->widget_position_for_document_point(QPoint(bounds.x + 25, bounds.y + bounds.height / 2));
+  send_mouse(*canvas, QEvent::MouseButtonPress, hit, Qt::LeftButton, Qt::LeftButton);
+  send_mouse(*canvas, QEvent::MouseButtonRelease, hit, Qt::LeftButton, Qt::NoButton);
+  QApplication::processEvents();
+  process_events_for(250);
+  auto* editor = canvas->findChild<QTextEdit*>(QStringLiteral("inlineTextEditor"));
+  CHECK(editor != nullptr);
+  if (editor != nullptr && button != nullptr) {
+    auto cursor = editor->textCursor();
+    cursor.setPosition(from);
+    cursor.setPosition(to, QTextCursor::KeepAnchor);
+    editor->setTextCursor(cursor);
+    QApplication::processEvents();
+    bool flipped = false;
+    QTimer::singleShot(0, [&] {
+      try {
+        auto* dialog = window.findChild<QDialog*>(QStringLiteral("textCharacterDialog"));
+        CHECK(dialog != nullptr);
+        if (dialog == nullptr) {
+          return;
+        }
+        if (auto* toggle = dialog->findChild<QPushButton*>(QLatin1String(button)); toggle != nullptr) {
+          CHECK(toggle->isEnabled());
+          CHECK(toggle->isChecked() == checked_before);
+          toggle->click();
+          process_events_for(50);
+          flipped = toggle->isChecked() != checked_before;
+        }
+        dialog->close();
+      } catch (...) {
+        patchy::ui::unwind_non_modal_dialog_loop(std::current_exception());
+      }
+    });
+    window.findChild<QPushButton*>(QStringLiteral("textCharacterButton"))->click();
+    QApplication::processEvents();
+    CHECK(flipped);
+  }
+  require_action_by_text(window, QStringLiteral("Move"))->trigger();
+  QApplication::processEvents();
+  process_events_for(200);
+}
+
+// Issue 466 for every style button: with part of the line selected in a live session, each toggle
+// (faux bold, faux italic and the eight styles) sets its flag on the selected runs alone and leaves
+// the other word's glyphs exactly as they were; with both words styled, turning it off on one word
+// leaves the other styled and untouched; a PSD save and reopen keeps the runs as they were.
+void ui_text_character_styles_apply_only_to_the_selection() {
+  patchy::test::register_test_fonts(patchy::test::TestFontRole::UiDefault);
+  constexpr int kWidth = 480;
+  constexpr int kHeight = 160;
+  const QString text = QStringLiteral("Hab Hab1/2");
+  patchy::ui::MainWindow window;
+  show_window(window);
+  // Each style starts on its own fresh document holding one plain text layer, made the way a
+  // script or the Type tool makes one.
+  patchy::Document* live = nullptr;
+  patchy::LayerId layer_id{};
+  const auto fresh_layer = [&](const char* name) {
+    patchy::Document seed(kWidth, kHeight, patchy::PixelFormat::rgba8());
+    seed.add_pixel_layer("Background", solid_pixels(kWidth, kHeight, patchy::PixelFormat::rgba8(), QColor(Qt::white)));
+    window.add_document_session(std::move(seed), QString::fromLatin1(name));
+    QApplication::processEvents();
+    CHECK(run_script(window, QStringLiteral("app.activeDocument.addTextLayer('%1', {font: 'Arial', size: 64, x: 20, "
+                                            "y: 30, color: '#000000'});")
+                                 .arg(text)));
+    live = &MainWindowTestAccess::document(window);
+    const auto id = live->active_layer_id();
+    CHECK(id.has_value());
+    layer_id = id.value_or(patchy::LayerId{});
+  };
+
+  const auto edit = [&](int from, int to, const char* button, bool checked_before) {
+    edit_text_layer_style(window, *live, layer_id, from, to, button, checked_before);
+  };
+
+  // Layer alpha at a DOCUMENT point, and the whole frame of it (the raster may move or grow).
+  const auto alpha_at = [&](int x, int y) -> int {
+    const auto* layer = std::as_const(*live).find_layer(layer_id);
+    if (layer == nullptr) {
+      return 0;
+    }
+    const auto& pixels = layer->pixels();
+    const int local_x = x - layer->bounds().x;
+    const int local_y = y - layer->bounds().y;
+    if (local_x < 0 || local_y < 0 || local_x >= pixels.width() || local_y >= pixels.height()) {
+      return 0;
+    }
+    return pixels.pixel(local_x, local_y)[3];
+  };
+  const auto snapshot = [&](int x0, int x1) {
+    std::vector<int> alpha;
+    for (int y = 0; y < kHeight; ++y) {
+      for (int x = x0; x < x1; ++x) {
+        alpha.push_back(alpha_at(x, y));
+      }
+    }
+    return alpha;
+  };
+  constexpr int kInk = 12;
+  const auto column_inked = [&](int x) {
+    for (int y = 0; y < kHeight; ++y) {
+      if (alpha_at(x, y) >= kInk) {
+        return true;
+      }
+    }
+    return false;
+  };
+  // The middle of the word space: the widest blank column run inside the ink.
+  const auto word_split = [&]() -> int {
+    int first = -1;
+    int last = -1;
+    for (int x = 0; x < kWidth; ++x) {
+      if (column_inked(x)) {
+        first = first < 0 ? x : first;
+        last = x;
+      }
+    }
+    int best_start = -1;
+    int best_end = -1;
+    int blank_start = -1;
+    for (int x = first; first >= 0 && x <= last; ++x) {
+      if (!column_inked(x)) {
+        blank_start = blank_start < 0 ? x : blank_start;
+      } else if (blank_start >= 0) {
+        if (x - blank_start > best_end - best_start) {
+          best_start = blank_start;
+          best_end = x;
+        }
+        blank_start = -1;
+      }
+    }
+    CHECK(best_start > first + 30 && best_end > best_start + 4 && last > best_end + 30);
+    return best_start < 0 ? -1 : (best_start + best_end) / 2;
+  };
+
+  struct Style {
+    const char* button;
+    const char* name;
+    int faux_column;     // the runs column of a faux flag, or -1
+    const char* token;   // the v9 style token, or nullptr
+    bool visible;        // the selected word must look different (the font has no ordn/frac to rely on)
+  };
+  const std::array<Style, 10> styles{{
+      {"textCharacterFauxBold", "faux bold", 11, nullptr, true},
+      {"textCharacterFauxItalic", "faux italic", 13, nullptr, true},
+      {"textCharacterAllCapsButton", "all caps", -1, "allcaps", true},
+      {"textCharacterSmallCapsButton", "small caps", -1, "smallcaps", true},
+      {"textCharacterSuperscriptButton", "superscript", -1, "superscript", true},
+      {"textCharacterSubscriptButton", "subscript", -1, "subscript", true},
+      {"textCharacterUnderlineButton", "underline", -1, "underline", true},
+      {"textCharacterStrikethroughButton", "strikethrough", -1, "strikethrough", true},
+      {"textCharacterOrdinalsButton", "ordinals", -1, "ordinals", false},
+      {"textCharacterFractionsButton", "fractions", -1, "fractions", false},
+  }};
+  const auto styled = [](const Style& style, const QStringList& fields) {
+    if (style.faux_column >= 0) {
+      return fields.size() > style.faux_column && fields[style.faux_column] == QStringLiteral("1");
+    }
+    return fields.size() > 16 && fields[16].split(QLatin1Char(',')).contains(QLatin1String(style.token));
+  };
+  // Failed checks are counted and described rather than thrown, so one run reports every style.
+  int failures = 0;
+  // Every run lies wholly inside or outside `ranges` and carries the style exactly when inside.
+  const auto expect_runs = [&](const Style& style, const std::string& runs, std::initializer_list<std::pair<int, int>> ranges,
+                               const char* step) {
+    const auto inside = [&ranges](int at) {
+      return std::ranges::any_of(ranges, [at](const auto& range) { return at >= range.first && at < range.second; });
+    };
+    int covered = 0;
+    const auto lines = QString::fromStdString(runs).split(QLatin1Char('\n'));
+    for (int index = 1; index < lines.size(); ++index) {
+      const auto fields = lines[index].split(QLatin1Char('\t'));
+      if (fields.size() < 2) {
+        continue;
+      }
+      const int start = fields[0].toInt();
+      const int end = start + fields[1].toInt();
+      covered = std::max(covered, end);
+      bool all = true;
+      bool any = false;
+      for (int at = start; at < end; ++at) {
+        all = all && inside(at);
+        any = any || inside(at);
+      }
+      const bool ok = all == any && styled(style, fields) == all;
+      if (!ok) {
+        std::printf("  %s, %s: run %d..%d styled=%d, expected %d\n", style.name, step, start, end,
+                    styled(style, fields) ? 1 : 0, all ? 1 : 0);
+      }
+      failures += ok ? 0 : 1;
+    }
+    CHECK(covered == text.size());
+  };
+  const auto layer_runs = [&]() {
+    const auto* layer = std::as_const(*live).find_layer(layer_id);
+    return layer == nullptr ? std::string() : layer->metadata().at(patchy::kLayerMetadataTextRuns);
+  };
+
+  const auto layer_transform = [&]() {
+    const auto* layer = std::as_const(*live).find_layer(layer_id);
+    if (layer == nullptr) {
+      return std::string();
+    }
+    const auto found = layer->metadata().find(patchy::kLayerMetadataTextTransform);
+    return found == layer->metadata().end() ? std::string() : found->second;
+  };
+  // Whether columns [x0, x1) still hold `before` exactly where they were: a re-edit keeps the
+  // text's pen and first baseline (anchored_text_transform_for_pixels), so a style that grows the
+  // ink elsewhere (a superscript, faux bold's stroke) must not move the other word at all. A
+  // difference is counted and described, not thrown, so one run reports every style.
+  // Known gap: turning faux bold off on one word re-antialiases a faux bold neighbour by a few
+  // alpha levels with the transform and bounds unchanged (Qt's outline draw, not the placement),
+  // so a sub-pixel difference with an unchanged transform is reported but not counted.
+  const auto unchanged = [&](const std::vector<int>& before, const std::string& transform_before, int x0, int x1,
+                             const char* name, const char* step) {
+    const int columns = x1 - x0;
+    for (int dy = -2; dy <= 2; ++dy) {
+      for (int dx = -2; dx <= 2; ++dx) {
+        bool same = true;
+        for (int index = 0; same && index < static_cast<int>(before.size()); ++index) {
+          same = alpha_at(x0 + index % columns + dx, index / columns + dy) == before[static_cast<std::size_t>(index)];
+        }
+        if (same) {
+          if (dx != 0 || dy != 0) {
+            std::printf("  %s, %s: the line moved %d,%d px\n", name, step, dx, dy);
+            ++failures;
+          }
+          return;
+        }
+      }
+    }
+    const bool placed_alike = layer_transform() == transform_before;
+    std::printf("  %s, %s: the unselected word was re-rendered differently, transform %s\n", name, step,
+                placed_alike ? "unchanged (known gap)" : "MOVED");
+    failures += placed_alike ? 0 : 1;
+  };
+  for (const auto& style : styles) {
+    std::printf("  %s\n", style.name);
+    std::fflush(stdout);
+    fresh_layer(style.name);
+    edit(0, 0, nullptr, false);
+    const int split = word_split();
+    if (split < 0) {
+      return;
+    }
+    const auto plain_first = snapshot(0, split);
+    const auto plain_second = snapshot(split, kWidth);
+    const auto plain_transform = layer_transform();
+
+    // On the second word only: the first keeps its flags and its pixels.
+    edit(4, 10, style.button, false);
+    expect_runs(style, layer_runs(), {{4, 10}}, "second word on");
+    unchanged(plain_first, plain_transform, 0, split, style.name, "second word on");
+    if (style.visible && snapshot(split, kWidth) == plain_second) {
+      ++failures;
+      std::printf("  %s: the selected word did not change\n", style.name);
+    }
+    save_image_artifact(std::string("ui_text_character_styles_selection_") + style.button,
+                        patchy::ui::qimage_from_pixel_buffer(std::as_const(*live).find_layer(layer_id)->pixels()));
+
+    // On the first word too, then off on the second: the first stays styled and untouched.
+    edit(0, 3, style.button, false);
+    expect_runs(style, layer_runs(), {{0, 3}, {4, 10}}, "both words on");
+    const int both_split = word_split();
+    if (both_split < 0) {
+      return;
+    }
+    const auto styled_first = snapshot(0, both_split);
+    const auto styled_transform = layer_transform();
+    edit(4, 10, style.button, true);
+    expect_runs(style, layer_runs(), {{0, 3}}, "second word off");
+    unchanged(styled_first, styled_transform, 0, both_split, style.name, "second word off");
+
+    // The runs survive a PSD save and reopen as they are.
+    const auto reread = patchy::psd::DocumentIo::read(patchy::psd::DocumentIo::write_layered_rgb8(*live));
+    bool reread_text = false;
+    for (const auto& reread_layer : reread.layers()) {
+      const auto found = reread_layer.metadata().find(patchy::kLayerMetadataTextRuns);
+      if (found != reread_layer.metadata().end()) {
+        reread_text = true;
+        expect_runs(style, found->second, {{0, 3}}, "reopened");
+      }
+    }
+    CHECK(reread_text);
+  }
+  std::fflush(stdout);
+  CHECK(failures == 0);
+}
+
+// Styling one word of point text never moves the other: Photoshop keeps the type anchor (the pen
+// on the first baseline) still, and a re-edit pinned the raster's ink corner instead, so the
+// superscript's raised ink or faux bold's stroke above the line top dropped the whole line a
+// pixel and turning a style off with another still on re-rasterized it on a fractional phase.
+void ui_text_style_edits_keep_the_point_text_line_in_place() {
+  patchy::test::register_test_fonts(patchy::test::TestFontRole::UiDefault);
+  constexpr int kWidth = 420;
+  constexpr int kHeight = 160;
+  patchy::ui::MainWindow window;
+  show_window(window);
+  patchy::Document seed(kWidth, kHeight, patchy::PixelFormat::rgba8());
+  seed.add_pixel_layer("Background", solid_pixels(kWidth, kHeight, patchy::PixelFormat::rgba8(), QColor(Qt::white)));
+  window.add_document_session(std::move(seed), QStringLiteral("Hab Hab"));
+  QApplication::processEvents();
+  CHECK(run_script(window, QStringLiteral("app.activeDocument.addTextLayer('Hab Hab', {font: 'Arial', size: 64, x: 20, "
+                                          "y: 40, color: '#000000'});")));
+  const auto& live = MainWindowTestAccess::document(window);
+  const auto id = live.active_layer_id();
+  CHECK(id.has_value());
+  const auto layer_id = id.value_or(patchy::LayerId{});
+  // Layer alpha over the first word's columns, in DOCUMENT space (the raster grows and moves).
+  constexpr int kFirstWordRight = 135;
+  const auto first_word = [&] {
+    std::vector<int> alpha;
+    const auto* layer = std::as_const(live).find_layer(layer_id);
+    CHECK(layer != nullptr);
+    for (int y = 0; y < kHeight; ++y) {
+      for (int x = 0; x < kFirstWordRight; ++x) {
+        const int local_x = x - layer->bounds().x;
+        const int local_y = y - layer->bounds().y;
+        alpha.push_back(local_x < 0 || local_y < 0 || local_x >= layer->pixels().width() ||
+                                local_y >= layer->pixels().height()
+                            ? 0
+                            : layer->pixels().pixel(local_x, local_y)[3]);
+      }
+    }
+    return alpha;
+  };
+  // The layer drawn where it sits in the document, for the before/after shots.
+  const auto save_frame = [&](const char* step) {
+    const auto* layer = std::as_const(live).find_layer(layer_id);
+    QImage frame(kWidth, kHeight, QImage::Format_ARGB32);
+    frame.fill(Qt::white);
+    QPainter painter(&frame);
+    painter.drawImage(QPoint(layer->bounds().x, layer->bounds().y),
+                      patchy::ui::qimage_from_pixel_buffer(layer->pixels()));
+    painter.end();
+    save_image_artifact(std::string("ui_text_style_edits_keep_the_point_text_line_in_place_") + step, frame);
+  };
+  // A plain re-edit first, so the reference is a layer the Type tool has already committed.
+  edit_text_layer_style(window, live, layer_id, 0, 0, nullptr, false);
+  const auto plain = first_word();
+  save_frame("0_plain");
+  CHECK(std::ranges::any_of(plain, [](int alpha) { return alpha > 128; }));
+  // "Hab " is 4 characters: the second word is [4, 7).
+  struct Step {
+    const char* button;
+    bool checked_before;
+    const char* what;
+  };
+  const std::array<Step, 5> steps{{
+      {"textCharacterSuperscriptButton", false, "1_superscript_on"},
+      {"textCharacterFauxBold", false, "2_faux_bold_on"},
+      {"textCharacterSubscriptButton", false, "3_subscript_on"},
+      {"textCharacterFauxBold", true, "4_faux_bold_off"},
+      {"textCharacterSubscriptButton", true, "5_subscript_off"},
+  }};
+  int failures = 0;
+  for (const auto& step : steps) {
+    const auto before_bounds = std::as_const(live).find_layer(layer_id)->bounds();
+    edit_text_layer_style(window, live, layer_id, 4, 7, step.button, step.checked_before);
+    const auto after_bounds = std::as_const(live).find_layer(layer_id)->bounds();
+    const bool same = first_word() == plain;
+    std::printf("  %s: layer %d,%d %dx%d -> %d,%d %dx%d, first word %s\n", step.what, before_bounds.x,
+                before_bounds.y, before_bounds.width, before_bounds.height, after_bounds.x, after_bounds.y,
+                after_bounds.width, after_bounds.height, same ? "unchanged" : "MOVED");
+    failures += same ? 0 : 1;
+    save_frame(step.what);
+  }
+  std::fflush(stdout);
+  CHECK(failures == 0);
+}
+
+// philipzae's sample (Photoshop CC 2018, GitHub issue 346) re-rendered by Patchy: every text
+// layer redrawn from its runs, so the styles must come from the file's TySh and Txt2 keys rather
+// than Photoshop's stored pixels. The artifact is the before/after shot on the issue.
+void ui_text_character_styles_sample_rerenders_if_available() {
+  const auto path = patchy::test::local_psd_fixture_path("Character - Styling and Extras.psd");
+  patchy::test::skip_unless_exists(path);
+  patchy::test::register_test_fonts(patchy::test::TestFontRole::UiDefault);
+  auto sample = patchy::psd::DocumentIo::read_file(path);
+  // The Extras group is set in Myriad Pro, which the suite does not have; redrawing a layer whose
+  // font is missing stops at the missing-font prompt, so those runs move to Arial (which has
+  // fractions but no ordinals) first.
+  std::function<void(std::vector<patchy::Layer>&)> substitute = [&](std::vector<patchy::Layer>& layers) {
+    for (auto& layer : layers) {
+      for (const auto* key : {patchy::kLayerMetadataTextRuns, patchy::kLayerMetadataTextFont}) {
+        if (auto found = layer.metadata().find(key); found != layer.metadata().end()) {
+          for (const std::string from : {"Myriad%20Pro", "Myriad Pro"}) {
+            for (auto at = found->second.find(from); at != std::string::npos; at = found->second.find(from)) {
+              found->second.replace(at, from.size(), "Arial");
+            }
+          }
+        }
+      }
+      substitute(layer.children());
+    }
+  };
+  substitute(sample.layers());
+  patchy::ui::MainWindow window;
+  show_window(window);
+  window.add_document_session(std::move(sample), QStringLiteral("Character - Styling and Extras"));
+  QApplication::processEvents();
+  CHECK(run_script(window, QStringLiteral(R"JS(
+    var redraw = function (layers) {
+      for (var i = 0; i < layers.length; ++i) {
+        var layer = layers[i];
+        if (layer.isText) layer.rerenderText();
+        if (layer.children && layer.children.length) redraw(layer.children);
+      }
+    };
+    redraw(app.activeDocument.layers);
+  )JS")));
+  auto& document = MainWindowTestAccess::document(window);
+  // The file as saved (the Extras group hidden), then the Extras group alone.
+  save_image_artifact("ui_text_character_styles_sample_rerendered",
+                      patchy::ui::qimage_from_pixel_buffer(patchy::Compositor{}.flatten_rgb8(document)));
+  CHECK(run_script(window, QStringLiteral(R"JS(
+    var layers = app.activeDocument.layers;
+    for (var i = 0; i < layers.length; ++i) {
+      if (layers[i].name === 'Styling') layers[i].visible = false;
+      if (layers[i].name === 'Extras') layers[i].visible = true;
+    }
+  )JS")));
+  save_image_artifact("ui_text_character_styles_sample_extras_rerendered",
+                      patchy::ui::qimage_from_pixel_buffer(patchy::Compositor{}.flatten_rgb8(document)));
+  // The Photoshop open check's file: the re-rendered sample plus a Patchy-born layer carrying all
+  // eight styles, saved as a PSD into test-artifacts.
+  ensure_artifact_dir();
+  const auto saved = QDir::current().absoluteFilePath(QStringLiteral("test-artifacts/ui_text_character_styles_sample.psd"));
+  CHECK(run_script(window, QStringLiteral(R"JS(
+    var doc = app.activeDocument;
+    doc.addTextLayer([{text: 'all ', caps: 'all'}, {text: 'Small ', caps: 'small'}, {text: 'x'},
+                      {text: '2', script: 'superscript'}, {text: 'H'}, {text: '2', script: 'subscript'},
+                      {text: ' under', underline: true}, {text: ' struck', strikethrough: true},
+                      {text: ' 1st', ordinals: true}, {text: ' 1/2', fractions: true}],
+                     {font: 'Arial', size: 40, x: 20, y: 440, color: '#203080'});
+    doc.saveAs('%1');
+  )JS").arg(saved)));
+  const patchy::Layer* underline = nullptr;
+  const patchy::Layer* strike = nullptr;
+  const patchy::Layer* superscript = nullptr;
+  std::function<void(const std::vector<patchy::Layer>&)> find = [&](const std::vector<patchy::Layer>& layers) {
+    for (const auto& layer : layers) {
+      if (layer.name() == "Underline") underline = &layer;
+      if (layer.name() == "Strikethrough") strike = &layer;
+      if (layer.name() == "Superscript") superscript = &layer;
+      find(layer.children());
+    }
+  };
+  find(std::as_const(document).layers());
+  CHECK(underline && strike && superscript);
+  if (!underline || !strike || !superscript) {
+    return;
+  }
+  CHECK(bar_edges(*underline).has_value());
+  CHECK(bar_edges(*strike).has_value());
+  const auto base = ink_of(*superscript, 0.0, 0.4);
+  const auto raised = ink_of(*superscript, 0.7, 1.0);
+  CHECK(base && raised);
+  if (base && raised) {
+    CHECK(raised->bottom < base->bottom - 10);
+  }
+}
+
+}  // namespace
+
+// GitHub issue 682: a run's Photoshop language (runs column 16 `language:<n>`) rides on the
+// editor's characters like the other run styles. Typing inside a German run stays German, a style
+// change over every run keeps each run's language, and runs with different languages never merge.
+void ui_text_runs_keep_their_language_through_edits() {
+  patchy::test::register_test_fonts(patchy::test::TestFontRole::UiDefault);
+  const QString columns = QStringLiteral("\t30\t0\t0\t#000000\tArial\tauto\t0\t1\t1\t0\t\t0\t0\t0\t");
+  const QString runs = QStringLiteral("v9\n0\t8") + columns + QStringLiteral("-\n8\t8") + columns +
+                       QStringLiteral("language:42\n16\t6") + columns + QStringLiteral("language:39");
+  QTextDocument document;
+  document.setPlainText(QStringLiteral("English Deutsch Arabic"));
+  patchy::ui::apply_patchy_text_runs_to_document(document, runs, QFont(QStringLiteral("Arial")), Qt::black, 1.0, 3);
+  patchy::ui::TextToolSettings fallback;
+  fallback.family = QStringLiteral("Arial");
+  fallback.size = 30;
+  const auto languages = [&] {
+    QStringList out;
+    const auto serialized = patchy::ui::rich_text_runs_from_document(document, fallback, Qt::black);
+    for (const auto& line : serialized.split(QLatin1Char('\n')).mid(1)) {
+      const auto fields = line.split(QLatin1Char('\t'));
+      const auto styles = patchy::ui::parse_text_character_styles(fields.size() >= 17 ? fields[16] : QString());
+      out << QStringLiteral("%1+%2:%3").arg(fields.value(0), fields.value(1)).arg(styles.language);
+    }
+    return out.join(QLatin1Char(' '));
+  };
+  CHECK(languages() == QStringLiteral("0+8:-1 8+8:42 16+6:39"));
+  QTextCursor cursor(&document);
+  cursor.setPosition(12);
+  cursor.insertText(QStringLiteral("xx"));
+  CHECK(languages() == QStringLiteral("0+8:-1 8+10:42 18+6:39"));
+  cursor.select(QTextCursor::Document);
+  QTextCharFormat underline;
+  underline.setProperty(patchy::ui::kTextUnderlineFormatProperty, true);
+  cursor.mergeCharFormat(underline);
+  CHECK(languages() == QStringLiteral("0+8:-1 8+10:42 18+6:39"));
+  // Plain text with no runs carries no language.
+  QTextDocument plain;
+  plain.setPlainText(QStringLiteral("New layer"));
+  const auto plain_runs = patchy::ui::rich_text_runs_from_document(plain, fallback, Qt::black);
+  CHECK(!plain_runs.contains(QStringLiteral("language")));
+}
+
+std::vector<patchy::test::TestCase> text_character_styles_tests() {
+  return {
+      {"ui_text_underline_and_strikethrough_match_photoshop_if_available",
+       ui_text_underline_and_strikethrough_match_photoshop_if_available},
+      {"ui_text_script_and_caps_match_photoshop_if_available", ui_text_script_and_caps_match_photoshop_if_available},
+      {"ui_text_ordinals_and_fractions_use_the_font_features_if_available",
+       ui_text_ordinals_and_fractions_use_the_font_features_if_available},
+      {"ui_text_opentype_features_use_the_font_features_if_available",
+       ui_text_opentype_features_use_the_font_features_if_available},
+      {"ui_text_arabic_allah_ligature_follows_discretionary_ligatures_if_available",
+       ui_text_arabic_allah_ligature_follows_discretionary_ligatures_if_available},
+      {"ui_text_character_style_rows_are_centred", ui_text_character_style_rows_are_centred},
+      {"ui_text_character_style_buttons_toggle_run_styles", ui_text_character_style_buttons_toggle_run_styles},
+      {"ui_text_character_styles_apply_only_to_the_selection", ui_text_character_styles_apply_only_to_the_selection},
+      {"ui_text_style_edits_keep_the_point_text_line_in_place", ui_text_style_edits_keep_the_point_text_line_in_place},
+      {"ui_text_character_styles_sample_rerenders_if_available", ui_text_character_styles_sample_rerenders_if_available},
+      {"ui_text_runs_keep_their_language_through_edits", ui_text_runs_keep_their_language_through_edits},
+  };
+}

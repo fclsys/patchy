@@ -1,0 +1,3087 @@
+// Engine-data (text engine) READ side of the PSD text codec: TySh engine-data
+// parsing (text, style/paragraph runs, fill color, anti-alias), Photoshop
+// font-name resolution (DirectWrite/registry/heuristic), the placeholder-glyph
+// preview renderer, and TySh descriptor-geometry extraction. Split out of
+// psd_document_io.cpp as a pure move.
+
+#include "psd/psd_document_io.hpp"
+#include "psd/psd_io_internal.hpp"
+
+#include "color/color_management.hpp"
+#include "core/adjustment_layer.hpp"
+#include "core/layer_metadata.hpp"
+#include "core/pattern_resource.hpp"
+#include "core/smart_object.hpp"
+#include "core/style_contour.hpp"
+#include "core/text_warp.hpp"
+#include "formats/acv_curves_io.hpp"
+#include "psd/psd_binary.hpp"
+#include "psd/psd_descriptor.hpp"
+#include "psd/psd_filter_effects.hpp"
+#include "psd/psd_layer_effects.hpp"
+#include "psd/psd_patterns.hpp"
+#include "psd/psd_smart_objects.hpp"
+#include "render/compositor.hpp"
+#include "support/string_utils.hpp"
+
+#include <algorithm>
+#include <array>
+#include <atomic>
+#include <bit>
+#include <cmath>
+#include <cctype>
+#include <charconv>
+#include <climits>
+#include <cstdlib>
+#include <fstream>
+#include <future>
+#include <iomanip>
+#include <iterator>
+#include <map>
+#include <memory>
+#include <optional>
+#include <sstream>
+#include <stdexcept>
+#include <string>
+#include <string_view>
+#include <thread>
+#include <utility>
+#include <vector>
+
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#include <dwrite.h>
+#include <wrl/client.h>
+#endif
+
+namespace patchy::psd {
+
+namespace {
+
+std::vector<std::uint8_t> unescape_engine_bytes(std::span<const std::uint8_t> bytes) {
+  std::vector<std::uint8_t> unescaped;
+  unescaped.reserve(bytes.size());
+  for (std::size_t index = 0; index < bytes.size(); ++index) {
+    const auto byte = bytes[index];
+    const auto ch = static_cast<char>(byte);
+    if (ch != '\\') {
+      unescaped.push_back(byte);
+      continue;
+    }
+    if (index + 1 >= bytes.size()) {
+      break;
+    }
+
+    const auto next = static_cast<char>(bytes[++index]);
+    if (next >= '0' && next <= '7') {
+      int value = next - '0';
+      for (int digit = 0; digit < 2 && index + 1 < bytes.size(); ++digit) {
+        const auto octal = static_cast<char>(bytes[index + 1]);
+        if (octal < '0' || octal > '7') {
+          break;
+        }
+        value = value * 8 + (octal - '0');
+        ++index;
+      }
+      unescaped.push_back(static_cast<std::uint8_t>(value & 0xFF));
+      continue;
+    }
+
+    switch (next) {
+      case 'r':
+        unescaped.push_back('\n');
+        break;
+      case 'n':
+        unescaped.push_back('\n');
+        break;
+      case 't':
+        unescaped.push_back('\t');
+        break;
+      case '\\':
+      case '(':
+      case ')':
+        unescaped.push_back(static_cast<std::uint8_t>(next));
+        break;
+      default:
+        unescaped.push_back(static_cast<std::uint8_t>(next));
+        break;
+    }
+  }
+  return unescaped;
+}
+
+std::string decode_engine_string(std::span<const std::uint8_t> bytes) {
+  const auto unescaped = unescape_engine_bytes(bytes);
+  if (unescaped.size() >= 2 && unescaped[0] == 0xFEU && unescaped[1] == 0xFFU) {
+    std::string decoded;
+    for (std::size_t index = 2; index + 1 < unescaped.size(); index += 2) {
+      const auto codepoint = (static_cast<std::uint32_t>(unescaped[index]) << 8U) |
+                             static_cast<std::uint32_t>(unescaped[index + 1]);
+      append_utf8(decoded, codepoint);
+    }
+    return decoded;
+  }
+  if (unescaped.size() >= 2 && unescaped[0] == 0xFFU && unescaped[1] == 0xFEU) {
+    std::string decoded;
+    for (std::size_t index = 2; index + 1 < unescaped.size(); index += 2) {
+      const auto codepoint = (static_cast<std::uint32_t>(unescaped[index + 1]) << 8U) |
+                             static_cast<std::uint32_t>(unescaped[index]);
+      append_utf8(decoded, codepoint);
+    }
+    return decoded;
+  }
+  return std::string(unescaped.begin(), unescaped.end());
+}
+
+std::string normalize_photoshop_text(std::string_view text) {
+  std::string normalized;
+  normalized.reserve(text.size());
+  for (std::size_t index = 0; index < text.size(); ++index) {
+    const auto ch = text[index];
+    if (ch == '\r') {
+      normalized.push_back('\n');
+      if (index + 1 < text.size() && text[index + 1] == '\n') {
+        ++index;
+      }
+      continue;
+    }
+    if (ch == '\n' || ch == '\x03') {
+      normalized.push_back('\n');
+      continue;
+    }
+    normalized.push_back(ch);
+  }
+  while (!normalized.empty() && normalized.back() == '\n') {
+    normalized.pop_back();
+  }
+  return normalized;
+}
+
+}  // namespace
+
+std::optional<std::string> extract_engine_data_text(std::span<const std::uint8_t> payload,
+                                                  bool allow_descriptor_fallback) {
+  constexpr std::string_view marker = "/Text";
+  const auto begin = reinterpret_cast<const char*>(payload.data());
+  const auto end = begin + payload.size();
+  auto found = std::search(begin, end, marker.begin(), marker.end());
+  while (found != end) {
+    auto cursor = found + static_cast<std::ptrdiff_t>(marker.size());
+    while (cursor < end && std::isspace(static_cast<unsigned char>(*cursor)) != 0) {
+      ++cursor;
+    }
+    if (cursor < end && *cursor == '(') {
+      ++cursor;
+      const auto text_begin = cursor;
+      int depth = 1;
+      bool escaped = false;
+      while (cursor < end && depth > 0) {
+        const auto ch = *cursor;
+        if (escaped) {
+          escaped = false;
+        } else if (ch == '\\') {
+          escaped = true;
+        } else if (ch == '(') {
+          ++depth;
+        } else if (ch == ')') {
+          --depth;
+          if (depth == 0) {
+            break;
+          }
+        }
+        ++cursor;
+      }
+      if (cursor > text_begin) {
+        auto text =
+            decode_engine_string(std::span<const std::uint8_t>(reinterpret_cast<const std::uint8_t*>(text_begin),
+                                                               static_cast<std::size_t>(cursor - text_begin)));
+        text = normalize_photoshop_text(text);
+        if (!text.empty()) {
+          return text;
+        }
+      }
+    }
+    found = std::search(cursor, end, marker.begin(), marker.end());
+  }
+  if (!allow_descriptor_fallback) return std::nullopt;
+  // Fully overflowed Photoshop area text has only a terminal paragraph in
+  // EngineData's Editor/Text. The TySh descriptor still carries the complete
+  // story (photoshop-area-empty.psd), including when the story itself is empty.
+  try {
+    BigEndianReader reader(payload);
+    if (reader.remaining() >= 56U && reader.read_u16() == 1U) {
+      reader.skip(48U);
+      if (reader.read_u16() == 50U && reader.read_u32() == 16U) {
+        const auto descriptor = read_descriptor(reader);
+        if (const auto* text = descriptor_value(descriptor, "Txt ");
+            text && text->type == DescriptorValue::Type::String) {
+          return normalize_photoshop_text(text->string_value);
+        }
+      }
+    }
+  } catch (const std::exception&) {
+  }
+  return std::nullopt;
+}
+
+std::optional<int> extract_engine_data_font_size(std::span<const std::uint8_t> payload) {
+  constexpr std::string_view marker = "/FontSize";
+  const auto begin = reinterpret_cast<const char*>(payload.data());
+  const auto end = begin + payload.size();
+  auto found = std::search(begin, end, marker.begin(), marker.end());
+  while (found != end) {
+    auto cursor = found + static_cast<std::ptrdiff_t>(marker.size());
+    while (cursor < end &&
+           (std::isspace(static_cast<unsigned char>(*cursor)) != 0 || *cursor == '[' || *cursor == '(')) {
+      ++cursor;
+    }
+    if (cursor < end) {
+      const auto remaining = static_cast<std::size_t>(end - cursor);
+      const std::string number(cursor, cursor + std::min<std::size_t>(remaining, 48U));
+      char* parsed_end = nullptr;
+      const auto parsed = std::strtod(number.c_str(), &parsed_end);
+      if (parsed_end != number.c_str() && std::isfinite(parsed) && parsed > 0.0) {
+        return std::clamp(static_cast<int>(std::lround(parsed)), 1, kMaxTextSizePixels);
+      }
+    }
+    found = std::search(cursor, end, marker.begin(), marker.end());
+  }
+  return std::nullopt;
+}
+
+namespace {
+
+std::optional<double> first_engine_number_after(std::string_view text, std::string_view marker) {
+  const auto found = text.find(marker);
+  if (found == std::string_view::npos) {
+    return std::nullopt;
+  }
+
+  auto cursor = found + marker.size();
+  while (cursor < text.size() && std::isspace(static_cast<unsigned char>(text[cursor])) != 0) {
+    ++cursor;
+  }
+  if (cursor >= text.size()) {
+    return std::nullopt;
+  }
+
+  const std::string number(text.substr(cursor, std::min<std::size_t>(text.size() - cursor, 48U)));
+  char* parsed_end = nullptr;
+  const auto parsed = std::strtod(number.c_str(), &parsed_end);
+  if (parsed_end == number.c_str() || !std::isfinite(parsed)) {
+    return std::nullopt;
+  }
+  return parsed;
+}
+
+std::vector<double> parse_engine_number_array(std::string_view text) {
+  std::vector<double> numbers;
+  std::size_t cursor = 0;
+  while (cursor < text.size()) {
+    while (cursor < text.size() &&
+           (std::isspace(static_cast<unsigned char>(text[cursor])) != 0 || text[cursor] == ',')) {
+      ++cursor;
+    }
+    if (cursor >= text.size()) {
+      break;
+    }
+
+    const std::string number(text.substr(cursor, std::min<std::size_t>(text.size() - cursor, 48U)));
+    char* parsed_end = nullptr;
+    const auto parsed = std::strtod(number.c_str(), &parsed_end);
+    if (parsed_end == number.c_str()) {
+      ++cursor;
+      continue;
+    }
+    if (std::isfinite(parsed)) {
+      numbers.push_back(parsed);
+    }
+    cursor += static_cast<std::size_t>(parsed_end - number.c_str());
+  }
+  return numbers;
+}
+
+std::uint8_t engine_color_component(double value, bool normalized) {
+  const auto scaled = normalized ? value * 255.0 : value;
+  return static_cast<std::uint8_t>(std::clamp(std::lround(scaled), 0L, 255L));
+}
+
+// Engine-data color /Type 1 is [alpha, red, green, blue]; /Type 2 (CMYK-mode documents)
+// is [alpha, cyan, magenta, yellow, black] as 0-1 ink fractions; /Type 0 (grayscale-mode
+// documents) is [alpha, lightness] with 0 = black.
+std::optional<RgbColor> rgb_color_from_engine_values(int type, const std::vector<double>& values,
+                                                     const CmykColorConverter& cmyk) {
+  if (type == 0) {
+    if (values.size() < 2U || !std::isfinite(values[1])) {
+      return std::nullopt;
+    }
+    return cmyk.rgb_from_gray(values[1]);
+  }
+  if (type == 2) {
+    if (values.size() < 5U ||
+        std::any_of(values.begin() + 1, values.begin() + 5, [](double value) { return !std::isfinite(value); })) {
+      return std::nullopt;
+    }
+    return cmyk.rgb_from_ink(values[1], values[2], values[3], values[4]);
+  }
+  if (values.size() < 4U) {
+    return std::nullopt;
+  }
+
+  const auto red = values[1];
+  const auto green = values[2];
+  const auto blue = values[3];
+  if (!std::isfinite(red) || !std::isfinite(green) || !std::isfinite(blue)) {
+    return std::nullopt;
+  }
+
+  const auto normalized = red <= 1.0 && green <= 1.0 && blue <= 1.0;
+  return RgbColor{engine_color_component(red, normalized), engine_color_component(green, normalized),
+                  engine_color_component(blue, normalized)};
+}
+
+}  // namespace
+
+std::optional<RgbColor> extract_engine_data_fill_color(std::span<const std::uint8_t> payload,
+                                                       const CmykColorConverter& cmyk) {
+  constexpr std::string_view marker = "/FillColor";
+  constexpr std::string_view values_marker = "/Values";
+  const std::string_view text(reinterpret_cast<const char*>(payload.data()), payload.size());
+
+  auto found = text.find(marker);
+  while (found != std::string_view::npos) {
+    const auto block_start = found + marker.size();
+    const auto block_close = text.find(">>", block_start);
+    const auto block = block_close == std::string_view::npos
+                           ? text.substr(found)
+                           : text.substr(found, block_close + 2U - found);
+    const auto type = first_engine_number_after(block, "/Type");
+    const auto type_value = type.has_value() ? static_cast<int>(std::lround(*type)) : 1;
+    if (type_value != 0 && type_value != 1 && type_value != 2) {
+      found = text.find(marker, block_start);
+      continue;
+    }
+
+    const auto values = block.find(values_marker);
+    if (values != std::string_view::npos) {
+      const auto open = block.find('[', values + values_marker.size());
+      const auto close = open == std::string_view::npos ? std::string_view::npos : block.find(']', open + 1U);
+      if (open != std::string_view::npos && close != std::string_view::npos && close > open) {
+        if (auto color = rgb_color_from_engine_values(
+                type_value, parse_engine_number_array(block.substr(open + 1U, close - open - 1U)), cmyk);
+            color.has_value()) {
+          return color;
+        }
+      }
+    }
+
+    found = text.find(marker, block_start);
+  }
+  return std::nullopt;
+}
+
+std::optional<int> extract_engine_data_anti_alias(std::span<const std::uint8_t> payload) {
+  const std::string_view text(reinterpret_cast<const char*>(payload.data()), payload.size());
+  if (const auto value = first_engine_number_after(text, "/AntiAlias"); value.has_value()) {
+    return std::clamp(static_cast<int>(std::lround(*value)), 0, 16);
+  }
+  return std::nullopt;
+}
+
+std::string rgb_hex_color(RgbColor color) {
+  constexpr std::array<char, 16> digits{'0', '1', '2', '3', '4', '5', '6', '7',
+                                       '8', '9', 'a', 'b', 'c', 'd', 'e', 'f'};
+  std::string result = "#000000";
+  result[1] = digits[color.red >> 4U];
+  result[2] = digits[color.red & 0x0FU];
+  result[3] = digits[color.green >> 4U];
+  result[4] = digits[color.green & 0x0FU];
+  result[5] = digits[color.blue >> 4U];
+  result[6] = digits[color.blue & 0x0FU];
+  return result;
+}
+
+namespace {
+
+int hex_digit_value(char ch) noexcept {
+  if (ch >= '0' && ch <= '9') {
+    return ch - '0';
+  }
+  if (ch >= 'a' && ch <= 'f') {
+    return 10 + ch - 'a';
+  }
+  if (ch >= 'A' && ch <= 'F') {
+    return 10 + ch - 'A';
+  }
+  return -1;
+}
+
+}  // namespace
+
+std::optional<RgbColor> rgb_color_from_hex(std::string_view text) {
+  if (text.size() != 7U || text[0] != '#') {
+    return std::nullopt;
+  }
+  const auto pair_value = [](char high, char low) -> std::optional<std::uint8_t> {
+    const auto hi = hex_digit_value(high);
+    const auto lo = hex_digit_value(low);
+    if (hi < 0 || lo < 0) {
+      return std::nullopt;
+    }
+    return static_cast<std::uint8_t>((hi << 4) | lo);
+  };
+  const auto red = pair_value(text[1], text[2]);
+  const auto green = pair_value(text[3], text[4]);
+  const auto blue = pair_value(text[5], text[6]);
+  if (!red.has_value() || !green.has_value() || !blue.has_value()) {
+    return std::nullopt;
+  }
+  return RgbColor{*red, *green, *blue};
+}
+
+std::string percent_decode(std::string_view text) {
+  std::string decoded;
+  decoded.reserve(text.size());
+  for (std::size_t index = 0; index < text.size(); ++index) {
+    if (text[index] == '%' && index + 2 < text.size()) {
+      const auto hi = hex_digit_value(text[index + 1]);
+      const auto lo = hex_digit_value(text[index + 2]);
+      if (hi >= 0 && lo >= 0) {
+        decoded.push_back(static_cast<char>((hi << 4) | lo));
+        index += 2;
+        continue;
+      }
+    }
+    decoded.push_back(text[index]);
+  }
+  return decoded;
+}
+
+namespace {
+
+std::string percent_encode(std::string_view text) {
+  constexpr std::array<char, 16> digits{'0', '1', '2', '3', '4', '5', '6', '7',
+                                       '8', '9', 'A', 'B', 'C', 'D', 'E', 'F'};
+  std::string encoded;
+  encoded.reserve(text.size());
+  for (const auto byte : text) {
+    const auto value = static_cast<unsigned char>(byte);
+    if ((value >= 'A' && value <= 'Z') || (value >= 'a' && value <= 'z') || (value >= '0' && value <= '9') ||
+        value == '-' || value == '_' || value == '.' || value == '~') {
+      encoded.push_back(static_cast<char>(value));
+      continue;
+    }
+    encoded.push_back('%');
+    encoded.push_back(digits[value >> 4U]);
+    encoded.push_back(digits[value & 0x0FU]);
+  }
+  return encoded;
+}
+
+std::optional<double> engine_number_after_key(std::string_view text, std::string_view marker) {
+  auto found = text.find(marker);
+  while (found != std::string_view::npos) {
+    auto cursor = found + marker.size();
+    if (cursor < text.size() &&
+        (std::isalnum(static_cast<unsigned char>(text[cursor])) != 0 || text[cursor] == '_' || text[cursor] == '-')) {
+      found = text.find(marker, cursor);
+      continue;
+    }
+    while (cursor < text.size() &&
+           (std::isspace(static_cast<unsigned char>(text[cursor])) != 0 || text[cursor] == '[' || text[cursor] == '(')) {
+      ++cursor;
+    }
+    if (cursor < text.size()) {
+      const std::string number(text.substr(cursor, std::min<std::size_t>(text.size() - cursor, 48U)));
+      char* parsed_end = nullptr;
+      const auto parsed = std::strtod(number.c_str(), &parsed_end);
+      if (parsed_end != number.c_str() && std::isfinite(parsed)) {
+        return parsed;
+      }
+    }
+    found = text.find(marker, cursor);
+  }
+  return std::nullopt;
+}
+
+bool engine_bool_after_key(std::string_view text, std::string_view marker, bool fallback = false) {
+  const auto found = text.find(marker);
+  if (found == std::string_view::npos) {
+    return fallback;
+  }
+  auto cursor = found + marker.size();
+  while (cursor < text.size() && std::isspace(static_cast<unsigned char>(text[cursor])) != 0) {
+    ++cursor;
+  }
+  if (text.substr(cursor, 4) == "true") {
+    return true;
+  }
+  if (text.substr(cursor, 5) == "false") {
+    return false;
+  }
+  return fallback;
+}
+
+// A small Photoshop enumeration (/FontCaps, /FontBaseline: 0, 1 or 2); anything else reads as
+// the fallback.
+int engine_choice_after_key(std::string_view text, std::string_view marker, int fallback) {
+  const auto value = engine_number_after_key(text, marker);
+  if (!value.has_value() || !std::isfinite(*value)) {
+    return fallback;
+  }
+  const auto choice = static_cast<int>(std::lround(*value));
+  return choice >= 0 && choice <= 2 ? choice : fallback;
+}
+
+std::optional<std::pair<std::size_t, std::size_t>> balanced_range_after(std::string_view text,
+                                                                        std::string_view marker,
+                                                                        char open, char close) {
+  const auto marker_pos = text.find(marker);
+  if (marker_pos == std::string_view::npos) {
+    return std::nullopt;
+  }
+  const auto open_pos = text.find(open, marker_pos + marker.size());
+  if (open_pos == std::string_view::npos) {
+    return std::nullopt;
+  }
+  int depth = 0;
+  bool escaped = false;
+  for (std::size_t index = open_pos; index < text.size(); ++index) {
+    const auto ch = text[index];
+    if (escaped) {
+      escaped = false;
+      continue;
+    }
+    if (ch == '\\') {
+      escaped = true;
+      continue;
+    }
+    if (ch == open) {
+      ++depth;
+    } else if (ch == close) {
+      --depth;
+      if (depth == 0) {
+        return std::pair{open_pos + 1U, index};
+      }
+    }
+  }
+  return std::nullopt;
+}
+
+std::vector<std::string_view> engine_dictionary_ranges(std::string_view text) {
+  std::vector<std::string_view> ranges;
+  std::size_t cursor = 0;
+  while (cursor + 1 < text.size()) {
+    const auto start = text.find("<<", cursor);
+    if (start == std::string_view::npos) {
+      break;
+    }
+    int depth = 0;
+    for (std::size_t index = start; index + 1 < text.size(); ++index) {
+      if (text[index] == '<' && text[index + 1] == '<') {
+        ++depth;
+        ++index;
+        continue;
+      }
+      if (text[index] == '>' && text[index + 1] == '>') {
+        --depth;
+        ++index;
+        if (depth == 0) {
+          ranges.push_back(text.substr(start, index + 1U - start));
+          cursor = index + 1U;
+          break;
+        }
+      }
+    }
+    if (cursor <= start) {
+      break;
+    }
+  }
+  return ranges;
+}
+
+std::optional<std::vector<std::uint8_t>> engine_parenthesized_bytes_after(std::string_view text,
+                                                                          std::string_view marker) {
+  auto found = text.find(marker);
+  while (found != std::string_view::npos) {
+    auto cursor = found + marker.size();
+    while (cursor < text.size() && std::isspace(static_cast<unsigned char>(text[cursor])) != 0) {
+      ++cursor;
+    }
+    if (cursor < text.size() && text[cursor] == '(') {
+      ++cursor;
+      const auto begin = cursor;
+      int depth = 1;
+      bool escaped = false;
+      while (cursor < text.size() && depth > 0) {
+        const auto ch = text[cursor];
+        if (escaped) {
+          escaped = false;
+        } else if (ch == '\\') {
+          escaped = true;
+        } else if (ch == '(') {
+          ++depth;
+        } else if (ch == ')') {
+          --depth;
+          if (depth == 0) {
+            break;
+          }
+        }
+        ++cursor;
+      }
+      if (cursor > begin) {
+        const auto* data = reinterpret_cast<const std::uint8_t*>(text.data() + begin);
+        return std::vector<std::uint8_t>(data, data + (cursor - begin));
+      }
+    }
+    found = text.find(marker, cursor);
+  }
+  return std::nullopt;
+}
+
+std::optional<RgbColor> extract_engine_fill_color_from_text(std::string_view text,
+                                                            const CmykColorConverter& cmyk) {
+  constexpr std::string_view marker = "/FillColor";
+  constexpr std::string_view values_marker = "/Values";
+  auto found = text.find(marker);
+  while (found != std::string_view::npos) {
+    const auto block_start = found + marker.size();
+    const auto block_close = text.find(">>", block_start);
+    const auto block = block_close == std::string_view::npos ? text.substr(found)
+                                                             : text.substr(found, block_close + 2U - found);
+    const auto type = engine_number_after_key(block, "/Type");
+    const auto type_value = type.has_value() ? static_cast<int>(std::lround(*type)) : 1;
+    if (type_value != 0 && type_value != 1 && type_value != 2) {
+      found = text.find(marker, block_start);
+      continue;
+    }
+
+    const auto values = block.find(values_marker);
+    if (values != std::string_view::npos) {
+      const auto open = block.find('[', values + values_marker.size());
+      const auto close = open == std::string_view::npos ? std::string_view::npos : block.find(']', open + 1U);
+      if (open != std::string_view::npos && close != std::string_view::npos && close > open) {
+        if (auto color = rgb_color_from_engine_values(
+                type_value, parse_engine_number_array(block.substr(open + 1U, close - open - 1U)), cmyk);
+            color.has_value()) {
+          return color;
+        }
+      }
+    }
+    found = text.find(marker, block_start);
+  }
+  return std::nullopt;
+}
+
+std::vector<std::string> extract_engine_font_names(std::span<const std::uint8_t> payload) {
+  std::vector<std::string> fonts;
+  const std::string_view text(reinterpret_cast<const char*>(payload.data()), payload.size());
+  const auto range = balanced_range_after(text, "/FontSet", '[', ']');
+  if (!range.has_value()) {
+    return fonts;
+  }
+  const auto block = text.substr(range->first, range->second - range->first);
+  for (const auto dictionary : engine_dictionary_ranges(block)) {
+    auto bytes = engine_parenthesized_bytes_after(dictionary, "/Name");
+    if (!bytes.has_value()) {
+      continue;
+    }
+    auto decoded = decode_engine_string(*bytes);
+    if (!decoded.empty()) {
+      fonts.push_back(std::move(decoded));
+    }
+  }
+  return fonts;
+}
+
+// ResolvedPhotoshopFont moved to the public psd/psd_text_runs.hpp (the .af
+// importer shares the heuristic resolver).
+
+// ASCII letters and digits lowercased, every non-ASCII byte kept as it is. Localized names are
+// often all CJK (DingMao's Chinese family name, KeYan's only family name): dropping their bytes
+// compacted both to the empty key, so the first such font answered for every other one (GitHub
+// issue 413).
+std::string compact_font_key(std::string_view value) {
+  std::string compact;
+  compact.reserve(value.size());
+  for (const auto ch : ascii_lower_copy(std::string(value))) {
+    const auto byte = static_cast<unsigned char>(ch);
+    if (byte >= 0x80U || std::isalnum(byte) != 0) {
+      compact.push_back(ch);
+    }
+  }
+  return compact;
+}
+
+std::string compact_font_key_with_bt_suffix(std::string key) {
+  const auto pos = key.find("bt");
+  if (pos == std::string::npos || pos + 2U >= key.size()) {
+    return key;
+  }
+  key.erase(pos, 2U);
+  key += "bt";
+  return key;
+}
+
+bool font_names_match(std::string_view lhs, std::string_view rhs) {
+  if (lhs.empty() || rhs.empty()) {
+    return false;
+  }
+  const auto lhs_compact = compact_font_key(lhs);
+  const auto rhs_compact = compact_font_key(rhs);
+  if (ascii_lower_copy(std::string(lhs)) == ascii_lower_copy(std::string(rhs))) {
+    return true;
+  }
+  // Names made only of punctuation and spaces say nothing: their empty keys must not match.
+  return !lhs_compact.empty() && !rhs_compact.empty() &&
+         (lhs_compact == rhs_compact ||
+          compact_font_key_with_bt_suffix(lhs_compact) == compact_font_key_with_bt_suffix(rhs_compact));
+}
+
+#ifdef _WIN32
+
+// Whether bold + italic can already say everything this face name says. Such a face is never
+// recorded as a style and never baked into the family (main_window.cpp's
+// text_style_is_flag_expressible mirrors this list). "Plain" and "Roman" are what older fonts
+// call their upright regular face (Letraset's Balmoral LET ships "Plain" as its only face).
+bool face_name_is_flag_expressible(std::string_view face) {
+  static constexpr std::array<std::string_view, 10> kFlagExpressible{
+      "regular", "normal", "plain", "roman", "bold", "italic", "oblique", "bold italic", "italic bold",
+      "bold oblique"};
+  const auto key = ascii_lower_copy(std::string(face));
+  return std::find(kFlagExpressible.begin(), kFlagExpressible.end(), key) != kFlagExpressible.end();
+}
+
+#endif
+
+bool strip_ascii_ci_suffix(std::string& value, std::string_view suffix) {
+  if (value.size() < suffix.size()) {
+    return false;
+  }
+  const auto tail = std::string_view(value).substr(value.size() - suffix.size());
+  if (ascii_lower_copy(std::string(tail)) != std::string(suffix)) {
+    return false;
+  }
+  value.resize(value.size() - suffix.size());
+  return true;
+}
+
+std::string humanized_postscript_family_name(std::string value) {
+  if (value.empty() || value.find(' ') != std::string::npos) {
+    return value;
+  }
+
+  std::string humanized;
+  humanized.reserve(value.size() + 4U);
+  for (std::size_t index = 0; index < value.size(); ++index) {
+    const auto ch = value[index];
+    if (index > 0U && std::isalnum(static_cast<unsigned char>(ch)) != 0) {
+      const auto previous = value[index - 1U];
+      const auto next = index + 1U < value.size() ? value[index + 1U] : '\0';
+      const bool lower_to_upper = std::islower(static_cast<unsigned char>(previous)) != 0 &&
+                                  std::isupper(static_cast<unsigned char>(ch)) != 0;
+      const bool acronym_to_word = std::isupper(static_cast<unsigned char>(previous)) != 0 &&
+                                   std::isupper(static_cast<unsigned char>(ch)) != 0 &&
+                                   std::islower(static_cast<unsigned char>(next)) != 0;
+      const bool alpha_digit_boundary =
+          (std::isalpha(static_cast<unsigned char>(previous)) != 0 && std::isdigit(static_cast<unsigned char>(ch)) != 0) ||
+          (std::isdigit(static_cast<unsigned char>(previous)) != 0 && std::isalpha(static_cast<unsigned char>(ch)) != 0);
+      if (lower_to_upper || acronym_to_word || alpha_digit_boundary) {
+        humanized.push_back(' ');
+      }
+    }
+    const auto output = (ch == '_' || ch == '-') ? ' ' : ch;
+    if (output == ' ' && (humanized.empty() || humanized.back() == ' ')) {
+      continue;
+    }
+    humanized.push_back(output);
+  }
+  return humanized;
+}
+
+}  // namespace
+
+// Public (psd_text_runs.hpp): suffix-strip + humanize a PostScript name. The
+// anonymous-namespace helpers above stay file-local.
+ResolvedPhotoshopFont heuristic_resolved_photoshop_font(std::string_view font_name) {
+  ResolvedPhotoshopFont resolved;
+  resolved.family = font_name.empty() ? std::string("Arial") : std::string(font_name);
+  struct StyleSuffix {
+    std::string_view suffix;
+    bool bold;
+    bool italic;
+  };
+  static constexpr std::array<StyleSuffix, 25> kStyleSuffixes = {{
+      {"-bolditalicmt", true, true},
+      {"-boldobliquemt", true, true},
+      {"-bolditalic", true, true},
+      {"-boldoblique", true, true},
+      {"-boldital", true, true},
+      {"-boldit", true, true},
+      {"-semibolditalic", true, true},
+      {"-demibolditalic", true, true},
+      {"-blackitalic", true, true},
+      {"-heavyitalic", true, true},
+      {"-extrabold", true, false},
+      {"-ultrabold", true, false},
+      {"-semibold", true, false},
+      {"-demibold", true, false},
+      {"-boldmt", true, false},
+      {"-bold", true, false},
+      {"-black", true, false},
+      {"-heavy", true, false},
+      {"-italicmt", false, true},
+      {"-obliquemt", false, true},
+      {"-italic", false, true},
+      {"-oblique", false, true},
+      {"-ital", false, true},
+      {"-it", false, true},
+      {"-regular", false, false},
+  }};
+
+  bool stripped = true;
+  while (stripped) {
+    stripped = false;
+    for (const auto& suffix : kStyleSuffixes) {
+      if (strip_ascii_ci_suffix(resolved.family, suffix.suffix)) {
+        resolved.bold = resolved.bold || suffix.bold;
+        resolved.italic = resolved.italic || suffix.italic;
+        stripped = true;
+        break;
+      }
+    }
+  }
+  (void)strip_ascii_ci_suffix(resolved.family, "-roman");
+  (void)strip_ascii_ci_suffix(resolved.family, "mt");
+  (void)strip_ascii_ci_suffix(resolved.family, "ps");
+  while (!resolved.family.empty() && (resolved.family.back() == '-' || resolved.family.back() == '_' ||
+                                      std::isspace(static_cast<unsigned char>(resolved.family.back())) != 0)) {
+    resolved.family.pop_back();
+  }
+  if (resolved.family.empty()) {
+    resolved.family = font_name.empty() ? std::string("Arial") : std::string(font_name);
+  } else {
+    resolved.family = humanized_postscript_family_name(std::move(resolved.family));
+  }
+  return resolved;
+}
+
+// Public (psd_text_runs.hpp): the whole name humanized, nothing stripped, for
+// callers that match it against a font database instead of guessing suffixes.
+std::string humanized_postscript_font_name(std::string_view font_name) {
+  return humanized_postscript_family_name(std::string(font_name));
+}
+
+#ifdef _WIN32
+
+std::optional<std::wstring> directwrite_localized_string(IDWriteLocalizedStrings* strings) {
+  if (strings == nullptr || strings->GetCount() == 0) {
+    return std::nullopt;
+  }
+  UINT32 index = 0;
+  BOOL exists = FALSE;
+  if (FAILED(strings->FindLocaleName(L"en-us", &index, &exists)) || !exists) {
+    index = 0;
+  }
+  UINT32 length = 0;
+  if (FAILED(strings->GetStringLength(index, &length))) {
+    return std::nullopt;
+  }
+  std::wstring value(static_cast<std::size_t>(length) + 1U, L'\0');
+  if (FAILED(strings->GetString(index, value.data(), length + 1U))) {
+    return std::nullopt;
+  }
+  value.resize(length);
+  if (value.empty()) {
+    return std::nullopt;
+  }
+  return value;
+}
+
+std::optional<std::string> directwrite_font_info_string(IDWriteFont* font, DWRITE_INFORMATIONAL_STRING_ID id) {
+  if (font == nullptr) {
+    return std::nullopt;
+  }
+  Microsoft::WRL::ComPtr<IDWriteLocalizedStrings> strings;
+  BOOL exists = FALSE;
+  if (FAILED(font->GetInformationalStrings(id, &strings, &exists)) || !exists || !strings) {
+    return std::nullopt;
+  }
+  const auto value = directwrite_localized_string(strings.Get());
+  if (!value.has_value()) {
+    return std::nullopt;
+  }
+  auto utf8 = utf8_from_wide(*value);
+  if (utf8.empty()) {
+    return std::nullopt;
+  }
+  return utf8;
+}
+
+// The reader's name matcher, shared with the writer's WIN32-name lookup (psd_text_write.cpp).
+bool directwrite_font_names_match(std::string_view lhs, std::string_view rhs) {
+  return font_names_match(lhs, rhs);
+}
+
+namespace {
+
+// Every locale's string of `strings` (UTF-8, empty ones dropped).
+std::vector<std::string> directwrite_strings_in_every_locale(IDWriteLocalizedStrings* strings) {
+  std::vector<std::string> values;
+  if (strings == nullptr) {
+    return values;
+  }
+  const auto count = strings->GetCount();
+  for (UINT32 index = 0; index < count; ++index) {
+    UINT32 length = 0;
+    if (FAILED(strings->GetStringLength(index, &length)) || length == 0) {
+      continue;
+    }
+    std::wstring value(static_cast<std::size_t>(length) + 1U, L'\0');
+    if (FAILED(strings->GetString(index, value.data(), length + 1U))) {
+      continue;
+    }
+    value.resize(length);
+    if (auto utf8 = utf8_from_wide(value); !utf8.empty()) {
+      values.push_back(std::move(utf8));
+    }
+  }
+  return values;
+}
+
+void append_directwrite_info_strings_in_every_locale(IDWriteFont* font, DWRITE_INFORMATIONAL_STRING_ID id,
+                                                     std::vector<std::string>& names) {
+  Microsoft::WRL::ComPtr<IDWriteLocalizedStrings> strings;
+  BOOL exists = FALSE;
+  if (SUCCEEDED(font->GetInformationalStrings(id, &strings, &exists)) && exists && strings) {
+    for (auto& value : directwrite_strings_in_every_locale(strings.Get())) {
+      names.push_back(std::move(value));
+    }
+  }
+}
+
+// Every family name `font` goes by, in every locale its name table carries: DirectWrite's own
+// family, the WIN32 (GDI) family and the typographic family. Font databases list a face under
+// the name for the USER'S locale, so a Chinese Windows shows DingMao.ttf as its Chinese
+// typographic family, a name the en-us strings the rest of this file reads never contain
+// (GitHub issue 413).
+std::vector<std::string> directwrite_family_names_in_every_locale(IDWriteFont* font) {
+  std::vector<std::string> names;
+  Microsoft::WRL::ComPtr<IDWriteFontFamily> font_family;
+  if (SUCCEEDED(font->GetFontFamily(&font_family)) && font_family) {
+    Microsoft::WRL::ComPtr<IDWriteLocalizedStrings> family_names;
+    if (SUCCEEDED(font_family->GetFamilyNames(&family_names)) && family_names) {
+      names = directwrite_strings_in_every_locale(family_names.Get());
+    }
+  }
+  append_directwrite_info_strings_in_every_locale(font, DWRITE_INFORMATIONAL_STRING_WIN32_FAMILY_NAMES, names);
+  append_directwrite_info_strings_in_every_locale(font, DWRITE_INFORMATIONAL_STRING_PREFERRED_FAMILY_NAMES, names);
+  return names;
+}
+
+Microsoft::WRL::ComPtr<IDWriteFontCollection> directwrite_system_font_collection() {
+  Microsoft::WRL::ComPtr<IDWriteFactory> factory;
+  if (FAILED(DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED, __uuidof(IDWriteFactory),
+                                 reinterpret_cast<IUnknown**>(factory.GetAddressOf())))) {
+    return {};
+  }
+  Microsoft::WRL::ComPtr<IDWriteFontCollection> collection;
+  if (FAILED(factory->GetSystemFontCollection(&collection)) || !collection) {
+    return {};
+  }
+  return collection;
+}
+
+}  // namespace
+
+// The installed face named by `name` in ANY locale: a full name in any language (one face, the
+// best answer), else a family name in any language (directwrite_family_names_in_every_locale),
+// where the face whose face name or WIN32 subfamily is `style` wins, then the face whose weight
+// and slope say what bold/italic say, then the family's first face. Null when nothing carries
+// the name. Callers ask the en-us lookups first; this finds a face by the localized family name
+// Qt's database shows on a non-English Windows. Shared with the writer (psd_text_write.cpp).
+Microsoft::WRL::ComPtr<IDWriteFont> directwrite_font_for_localized_name(IDWriteFontCollection* collection,
+                                                                        std::string_view name,
+                                                                        std::string_view style, bool bold,
+                                                                        bool italic) {
+  if (collection == nullptr || name.empty()) {
+    return {};
+  }
+  Microsoft::WRL::ComPtr<IDWriteFont> style_match;
+  Microsoft::WRL::ComPtr<IDWriteFont> flags_match;
+  Microsoft::WRL::ComPtr<IDWriteFont> first_match;
+  const auto family_count = collection->GetFontFamilyCount();
+  for (UINT32 family_index = 0; family_index < family_count; ++family_index) {
+    Microsoft::WRL::ComPtr<IDWriteFontFamily> font_family;
+    if (FAILED(collection->GetFontFamily(family_index, &font_family)) || !font_family) {
+      continue;
+    }
+    const auto font_count = font_family->GetFontCount();
+    for (UINT32 font_index = 0; font_index < font_count; ++font_index) {
+      Microsoft::WRL::ComPtr<IDWriteFont> font;
+      if (FAILED(font_family->GetFont(font_index, &font)) || !font ||
+          font->GetSimulations() != DWRITE_FONT_SIMULATIONS_NONE) {
+        continue;
+      }
+      std::vector<std::string> full_names;
+      append_directwrite_info_strings_in_every_locale(font.Get(), DWRITE_INFORMATIONAL_STRING_FULL_NAME, full_names);
+      if (std::any_of(full_names.begin(), full_names.end(),
+                      [name](const std::string& candidate) { return font_names_match(candidate, name); })) {
+        return font;
+      }
+      const auto families = directwrite_family_names_in_every_locale(font.Get());
+      if (!std::any_of(families.begin(), families.end(),
+                       [name](const std::string& candidate) { return font_names_match(candidate, name); })) {
+        continue;
+      }
+      if (!style.empty() && !style_match) {
+        std::vector<std::string> faces;
+        Microsoft::WRL::ComPtr<IDWriteLocalizedStrings> face_names;
+        if (SUCCEEDED(font->GetFaceNames(&face_names)) && face_names) {
+          faces = directwrite_strings_in_every_locale(face_names.Get());
+        }
+        append_directwrite_info_strings_in_every_locale(font.Get(), DWRITE_INFORMATIONAL_STRING_WIN32_SUBFAMILY_NAMES,
+                                                        faces);
+        if (std::any_of(faces.begin(), faces.end(),
+                        [style](const std::string& candidate) { return font_names_match(candidate, style); })) {
+          style_match = font;
+        }
+      }
+      const bool face_bold = font->GetWeight() >= DWRITE_FONT_WEIGHT_SEMI_BOLD;
+      const bool face_italic = font->GetStyle() != DWRITE_FONT_STYLE_NORMAL;
+      if (!flags_match && face_bold == bold && face_italic == italic) {
+        flags_match = font;
+      }
+      if (!first_match) {
+        first_match = font;
+      }
+    }
+  }
+  return style_match ? style_match : flags_match ? flags_match : first_match;
+}
+
+namespace {
+
+std::optional<ResolvedPhotoshopFont> registry_resolved_photoshop_font(std::string_view font_name);
+
+ResolvedPhotoshopFont directwrite_resolved_font(IDWriteFont* font, const std::string& family);
+
+// The face whose en-us PostScript name, full name or family + face is `font_name`, with the
+// en-us family it belongs to.
+std::optional<std::pair<Microsoft::WRL::ComPtr<IDWriteFont>, std::string>> directwrite_font_for_name(
+    IDWriteFontCollection* collection, std::string_view font_name) {
+  const auto family_count = collection->GetFontFamilyCount();
+  for (UINT32 family_index = 0; family_index < family_count; ++family_index) {
+    Microsoft::WRL::ComPtr<IDWriteFontFamily> font_family;
+    if (FAILED(collection->GetFontFamily(family_index, &font_family)) || !font_family) {
+      continue;
+    }
+    Microsoft::WRL::ComPtr<IDWriteLocalizedStrings> family_names;
+    if (FAILED(font_family->GetFamilyNames(&family_names)) || !family_names) {
+      continue;
+    }
+    const auto localized_family = directwrite_localized_string(family_names.Get());
+    if (!localized_family.has_value()) {
+      continue;
+    }
+    auto family = utf8_from_wide(*localized_family);
+    if (family.empty()) {
+      continue;
+    }
+
+    const auto font_count = font_family->GetFontCount();
+    for (UINT32 font_index = 0; font_index < font_count; ++font_index) {
+      Microsoft::WRL::ComPtr<IDWriteFont> font;
+      if (FAILED(font_family->GetFont(font_index, &font)) || !font) {
+        continue;
+      }
+      // Synthesized bold/oblique variants share the real face's PostScript and full names; a
+      // PSD can only name the real face, so its weight and face name must not come from a
+      // simulation.
+      if (font->GetSimulations() != DWRITE_FONT_SIMULATIONS_NONE) {
+        continue;
+      }
+      std::vector<std::string> candidates;
+      if (const auto postscript = directwrite_font_info_string(font.Get(), DWRITE_INFORMATIONAL_STRING_POSTSCRIPT_NAME);
+          postscript.has_value()) {
+        candidates.push_back(*postscript);
+      }
+      if (const auto full_name = directwrite_font_info_string(font.Get(), DWRITE_INFORMATIONAL_STRING_FULL_NAME);
+          full_name.has_value()) {
+        candidates.push_back(*full_name);
+      }
+      Microsoft::WRL::ComPtr<IDWriteLocalizedStrings> face_names;
+      if (SUCCEEDED(font->GetFaceNames(&face_names)) && face_names) {
+        if (const auto face = directwrite_localized_string(face_names.Get()); face.has_value()) {
+          auto face_utf8 = utf8_from_wide(*face);
+          if (!face_utf8.empty()) {
+            candidates.push_back(family + ' ' + face_utf8);
+            candidates.push_back(family + '-' + face_utf8);
+          }
+        }
+      }
+      if (std::any_of(candidates.begin(), candidates.end(), [font_name](const std::string& candidate) {
+            return font_names_match(candidate, font_name);
+          })) {
+        return std::pair{font, family};
+      }
+    }
+  }
+  return std::nullopt;
+}
+
+std::optional<ResolvedPhotoshopFont> directwrite_resolved_photoshop_font(std::string_view font_name) {
+  if (wide_from_utf8(font_name).empty()) {
+    return std::nullopt;
+  }
+  const auto collection = directwrite_system_font_collection();
+  if (!collection) {
+    return std::nullopt;
+  }
+  if (const auto found = directwrite_font_for_name(collection.Get(), font_name); found.has_value()) {
+    return directwrite_resolved_font(found->first.Get(), found->second);
+  }
+  return std::nullopt;
+}
+
+// A name only a non-English name record carries (directwrite_font_for_localized_name), resolved
+// like any other face: the reader stores the en-us names the rest of this file reads, so a
+// document reads the same on every system.
+std::optional<ResolvedPhotoshopFont> directwrite_localized_resolved_photoshop_font(std::string_view font_name) {
+  const auto collection = directwrite_system_font_collection();
+  if (!collection) {
+    return std::nullopt;
+  }
+  const auto font = directwrite_font_for_localized_name(collection.Get(), font_name, {}, false, false);
+  if (!font) {
+    return std::nullopt;
+  }
+  Microsoft::WRL::ComPtr<IDWriteFontFamily> font_family;
+  Microsoft::WRL::ComPtr<IDWriteLocalizedStrings> family_names;
+  if (FAILED(font->GetFontFamily(&font_family)) || !font_family ||
+      FAILED(font_family->GetFamilyNames(&family_names)) || !family_names) {
+    return std::nullopt;
+  }
+  const auto localized_family = directwrite_localized_string(family_names.Get());
+  if (!localized_family.has_value()) {
+    return std::nullopt;
+  }
+  const auto family = utf8_from_wide(*localized_family);
+  if (family.empty()) {
+    return std::nullopt;
+  }
+  return directwrite_resolved_font(font.Get(), family);
+}
+
+ResolvedPhotoshopFont directwrite_resolved_font(IDWriteFont* font, const std::string& family) {
+  const auto weight = font->GetWeight();
+  const bool italic = font->GetStyle() != DWRITE_FONT_STYLE_NORMAL;
+  // The face name as the font itself declares it, but ONLY when bold+italic cannot already
+  // say it. Recording "Italic" or "Bold" too would push almost every imported layer onto
+  // runs v5 for no gain and move the byte-stability canaries; the style column exists for
+  // the faces the flags cannot name (Demi, Book, Black, Condensed Light).
+  const auto declared_style = [&font]() -> std::string {
+    Microsoft::WRL::ComPtr<IDWriteLocalizedStrings> names;
+    if (FAILED(font->GetFaceNames(&names)) || !names) {
+      return {};
+    }
+    const auto face = directwrite_localized_string(names.Get());
+    if (!face.has_value()) {
+      return {};
+    }
+    auto value = utf8_from_wide(*face);
+    if (face_name_is_flag_expressible(value)) {
+      return {};
+    }
+    return value;
+  }();
+  // Only Regular (400) and Bold (700) survive being flattened into a family plus a bold
+  // flag. Every weight between them loses its face that way: Demi/Semi (600) flattened
+  // onto the family's BOLD face, which renders visibly heavier and taller than Photoshop
+  // (ITC Lubalin Graph Demi measured 995x868 against Photoshop's own 982x826 on the
+  // entry_poster.psd body copy). Keep the real face, and do NOT also set the bold flag:
+  // the name already carries the weight, and Qt would synthesise bold on top of it.
+  // Black/Heavy faces (weight >= 800) keep the face name the same way ("Arial Black" ->
+  // family "Arial", style "Black", ~15% wider than the Bold face it used to flatten to)
+  // and additionally keep the bold flag, so an uninstalled face still falls back to Bold.
+  // They used to return DirectWrite's FULL_NAME string early instead, which skipped the
+  // GDI-name normalization below: Futura Extra Black BT (a legacy face DirectWrite names
+  // by its full name) came back as the family "Futura Extra Black BT", a name no font
+  // database lists, so an unchanged edit of such a layer re-rendered in a substitute.
+  //
+  // Use "family + face" rather than the FULL_NAME string: that is the name Qt gives such a
+  // face when it splits it into its own family ("ITC Lubalin Graph Demi"), whereas
+  // FULL_NAME can be the PostScript-style name ("LubalinGraphITCbyBT-Demi"), which matches
+  // nothing in the font database and falls through to a substitute.
+  //
+  // Gate on declared_style, not on the raw face name: a face whose name the flags CAN
+  // express must never be baked into the family, whatever weight it declares. Bookman Old
+  // Style ships its whole family at weight 500, so "BookmanOldStyle-Italic" used to come
+  // back as family "Bookman Old Style Italic" - a name the font database cannot list
+  // faces for, which emptied the style picker and diverted Bold/Italic to faux.
+  const bool heavy = weight >= DWRITE_FONT_WEIGHT_EXTRA_BOLD;
+  auto resolved = weight != DWRITE_FONT_WEIGHT_NORMAL && weight != DWRITE_FONT_WEIGHT_BOLD &&
+                          !declared_style.empty()
+                      ? ResolvedPhotoshopFont{family + ' ' + declared_style, declared_style, heavy, italic}
+                      : ResolvedPhotoshopFont{family, declared_style,
+                                              weight >= DWRITE_FONT_WEIGHT_SEMI_BOLD, italic};
+  // Qt's Windows font database lists the GDI (name-table family/subfamily) names, which are
+  // DirectWrite's WIN32 informational strings, not the weight-stretch-style family and face
+  // DirectWrite derives. The two agree for most fonts, and for a face like Franklin Gothic
+  // Demi the derived "family + face" IS the GDI family. When they disagree nothing
+  // downstream can find the derived name: Balmoral LET (an old TrueType font whose only face
+  // is "Plain" at OS/2 weight class 5) is DirectWrite family "Balmoral LET Plain" with a
+  // synthesized "Medium" face, so the derived name "Balmoral LET Plain Medium" raised the
+  // missing-font prompt for an installed font; Franklin Gothic Medium is DirectWrite family
+  // "Franklin Gothic" + face "Medium" at weight 400, so it came back as the nonexistent family
+  // "Franklin Gothic". Store the WIN32 family instead, with the WIN32 subfamily as the face
+  // when the flags cannot express it; the flags then follow that subfamily's own words.
+  if (const auto win32_family =
+          directwrite_font_info_string(font, DWRITE_INFORMATIONAL_STRING_WIN32_FAMILY_NAMES);
+      win32_family.has_value() && !font_names_match(*win32_family, resolved.family)) {
+    const auto win32_face =
+        directwrite_font_info_string(font, DWRITE_INFORMATIONAL_STRING_WIN32_SUBFAMILY_NAMES)
+            .value_or(std::string());
+    const auto face_key = ascii_lower_copy(win32_face);
+    resolved.family = *win32_family;
+    resolved.style = face_name_is_flag_expressible(win32_face) ? std::string() : win32_face;
+    // Black and Heavy count as bold, as the renderer's own style-flag reading does
+    // (text_style_flags_for_name), so the uninstalled fallback of such a face stays Bold.
+    resolved.bold = face_key.find("bold") != std::string::npos ||
+                    face_key.find("black") != std::string::npos ||
+                    face_key.find("heavy") != std::string::npos;
+    resolved.italic = italic || face_key.find("italic") != std::string::npos ||
+                      face_key.find("oblique") != std::string::npos;
+  }
+  return resolved;
+}
+
+std::string trim_ascii_whitespace(std::string value) {
+  while (!value.empty() && std::isspace(static_cast<unsigned char>(value.back())) != 0) {
+    value.pop_back();
+  }
+  std::size_t first = 0;
+  while (first < value.size() && std::isspace(static_cast<unsigned char>(value[first])) != 0) {
+    ++first;
+  }
+  if (first > 0U) {
+    value.erase(0, first);
+  }
+  return value;
+}
+
+std::string registry_font_family_from_value_name(std::wstring_view value_name) {
+  auto family = trim_ascii_whitespace(utf8_from_wide(value_name));
+  const auto suffix = family.find(" (");
+  if (suffix != std::string::npos && !family.empty() && family.back() == ')') {
+    family.resize(suffix);
+    family = trim_ascii_whitespace(std::move(family));
+  }
+  return family;
+}
+
+void append_registry_font_families(HKEY root, const wchar_t* subkey, std::vector<std::string>& families) {
+  HKEY key = nullptr;
+  if (RegOpenKeyExW(root, subkey, 0, KEY_READ, &key) != ERROR_SUCCESS || key == nullptr) {
+    return;
+  }
+
+  DWORD index = 0;
+  std::wstring value_name(512, L'\0');
+  while (true) {
+    DWORD value_name_length = static_cast<DWORD>(value_name.size());
+    const auto result =
+        RegEnumValueW(key, index, value_name.data(), &value_name_length, nullptr, nullptr, nullptr, nullptr);
+    if (result == ERROR_NO_MORE_ITEMS) {
+      break;
+    }
+    if (result == ERROR_MORE_DATA) {
+      value_name.resize(value_name.size() * 2U);
+      continue;
+    }
+    if (result == ERROR_SUCCESS) {
+      auto family = registry_font_family_from_value_name(std::wstring_view(value_name.data(), value_name_length));
+      if (!family.empty()) {
+        families.push_back(std::move(family));
+      }
+    }
+    ++index;
+  }
+  RegCloseKey(key);
+}
+
+std::optional<ResolvedPhotoshopFont> registry_resolved_photoshop_font(std::string_view font_name) {
+  if (font_name.empty()) {
+    return std::nullopt;
+  }
+
+  const auto heuristic = heuristic_resolved_photoshop_font(font_name);
+  const std::array<std::string_view, 2> targets{font_name, heuristic.family};
+  std::vector<std::string> families;
+  append_registry_font_families(HKEY_CURRENT_USER, L"Software\\Microsoft\\Windows NT\\CurrentVersion\\Fonts",
+                                families);
+  append_registry_font_families(HKEY_LOCAL_MACHINE, L"SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Fonts",
+                                families);
+  for (auto& family : families) {
+    const bool matches = std::any_of(targets.begin(), targets.end(), [&family](std::string_view target) {
+      return !target.empty() && font_names_match(family, target);
+    });
+    if (matches) {
+      return ResolvedPhotoshopFont{std::move(family), heuristic.style, heuristic.bold, heuristic.italic};
+    }
+  }
+  return std::nullopt;
+}
+
+}  // namespace
+
+#endif
+
+namespace {
+
+// The app-installed font-database resolver (see psd_text_runs.hpp). Atomic only
+// because reads can run off the installing thread; it is set once at startup.
+std::atomic<PhotoshopFontResolver> installed_photoshop_font_resolver{nullptr};
+
+}  // namespace
+
+void set_photoshop_font_resolver(PhotoshopFontResolver resolver) {
+  installed_photoshop_font_resolver.store(resolver, std::memory_order_relaxed);
+}
+
+std::optional<ResolvedPhotoshopFont> installed_font_for_name(std::string_view name) {
+#ifdef _WIN32
+  if (auto resolved = directwrite_resolved_photoshop_font(name); resolved.has_value()) {
+    return resolved;
+  }
+  return directwrite_localized_resolved_photoshop_font(name);
+#else
+  (void)name;
+  return std::nullopt;
+#endif
+}
+
+std::vector<std::string> installed_font_family_names(std::string_view name) {
+#ifdef _WIN32
+  const auto collection = directwrite_system_font_collection();
+  if (!collection || wide_from_utf8(name).empty()) {
+    return {};
+  }
+  Microsoft::WRL::ComPtr<IDWriteFont> font;
+  if (auto found = directwrite_font_for_name(collection.Get(), name); found.has_value()) {
+    font = std::move(found->first);
+  } else {
+    font = directwrite_font_for_localized_name(collection.Get(), name, {}, false, false);
+  }
+  return font ? directwrite_family_names_in_every_locale(font.Get()) : std::vector<std::string>{};
+#else
+  (void)name;
+  return {};
+#endif
+}
+
+bool photoshop_font_names_match(std::string_view lhs, std::string_view rhs) {
+  return font_names_match(lhs, rhs);
+}
+
+ResolvedPhotoshopFont resolve_photoshop_font_name(std::string_view font_name) {
+#ifdef _WIN32
+  if (const auto resolved = directwrite_resolved_photoshop_font(font_name); resolved.has_value()) {
+    return *resolved;
+  }
+  if (const auto resolved = registry_resolved_photoshop_font(font_name); resolved.has_value()) {
+    return *resolved;
+  }
+  if (const auto resolved = directwrite_localized_resolved_photoshop_font(font_name); resolved.has_value()) {
+    return *resolved;
+  }
+#else
+  // DirectWrite's stand-in: the app's font-database resolver finds the real face
+  // for names the suffix heuristic below can only flatten to family + flags.
+  // Deliberately not consulted on Windows, whose chain above is the pinned baseline.
+  if (const auto resolver = installed_photoshop_font_resolver.load(std::memory_order_relaxed);
+      resolver != nullptr) {
+    if (const auto resolved = resolver(font_name); resolved.has_value()) {
+      return *resolved;
+    }
+  }
+#endif
+  return heuristic_resolved_photoshop_font(font_name);
+}
+
+namespace {
+
+// Auto-leading fraction from the normal paragraph sheet inside a ResourceDict (or the full
+// engine text); Photoshop's default is 1.2 (auto leading = 1.2 x font size).
+double engine_normal_paragraph_auto_leading_fraction(std::string_view resources) {
+  const auto set_range = balanced_range_after(resources, "/ParagraphSheetSet", '[', ']');
+  if (!set_range.has_value()) {
+    return 1.2;
+  }
+  const auto sheets =
+      engine_dictionary_ranges(resources.substr(set_range->first, set_range->second - set_range->first));
+  auto index = 0;
+  if (const auto value = engine_number_after_key(resources, "/TheNormalParagraphSheet");
+      value.has_value() && std::isfinite(*value) && *value >= 0.0 && *value <= 255.0) {
+    index = static_cast<int>(std::lround(*value));
+  }
+  if (sheets.empty() || static_cast<std::size_t>(index) >= sheets.size()) {
+    return 1.2;
+  }
+  const auto fraction = engine_number_after_key(sheets[static_cast<std::size_t>(index)], "/AutoLeading");
+  if (fraction.has_value() && std::isfinite(*fraction) && *fraction > 0.01 && *fraction < 10.0) {
+    return *fraction;
+  }
+  return 1.2;
+}
+
+// /AutoHyphenate of the normal paragraph sheet inside a ResourceDict, for a paragraph run that
+// leaves the key out; false when the sheet has none (Photoshop 2026's new-layer default).
+bool engine_normal_paragraph_auto_hyphenate(std::string_view resources) {
+  const auto set_range = balanced_range_after(resources, "/ParagraphSheetSet", '[', ']');
+  if (!set_range.has_value()) {
+    return false;
+  }
+  const auto sheets =
+      engine_dictionary_ranges(resources.substr(set_range->first, set_range->second - set_range->first));
+  auto index = 0;
+  if (const auto value = engine_number_after_key(resources, "/TheNormalParagraphSheet");
+      value.has_value() && std::isfinite(*value) && *value >= 0.0 && *value <= 255.0) {
+    index = static_cast<int>(std::lround(*value));
+  }
+  if (sheets.empty() || static_cast<std::size_t>(index) >= sheets.size()) {
+    return false;
+  }
+  return engine_bool_after_key(sheets[static_cast<std::size_t>(index)], "/AutoHyphenate", false);
+}
+
+// /EveryLineComposer of the normal paragraph sheet inside a ResourceDict, for a paragraph run
+// that leaves the key out; false (Adobe Single-line Composer) when the sheet has none.
+bool engine_normal_paragraph_every_line_composer(std::string_view resources) {
+  const auto set_range = balanced_range_after(resources, "/ParagraphSheetSet", '[', ']');
+  if (!set_range.has_value()) {
+    return false;
+  }
+  const auto sheets =
+      engine_dictionary_ranges(resources.substr(set_range->first, set_range->second - set_range->first));
+  auto index = 0;
+  if (const auto value = engine_number_after_key(resources, "/TheNormalParagraphSheet");
+      value.has_value() && std::isfinite(*value) && *value >= 0.0 && *value <= 255.0) {
+    index = static_cast<int>(std::lround(*value));
+  }
+  if (sheets.empty() || static_cast<std::size_t>(index) >= sheets.size()) {
+    return false;
+  }
+  return engine_bool_after_key(sheets[static_cast<std::size_t>(index)], "/EveryLineComposer", false);
+}
+
+// Parse the ResourceDict's normal style/paragraph sheets (see PsdTextEngineDefaults). The
+// fallbacks passed in are used when the engine data has no parsable ResourceDict (hand-built
+// engine data in old files and tests).
+PsdTextEngineDefaults extract_engine_text_defaults(std::span<const std::uint8_t> payload,
+                                                   double fallback_size,
+                                                   const CmykColorConverter& cmyk) {
+  PsdTextEngineDefaults defaults;
+  defaults.font_size = fallback_size;
+  const std::string_view engine(reinterpret_cast<const char*>(payload.data()), payload.size());
+  const auto resource_pos = engine.find("/ResourceDict");
+  if (resource_pos == std::string_view::npos) {
+    return defaults;
+  }
+  const auto resources = engine.substr(resource_pos);
+  const auto sheet_index = [](std::optional<double> value) {
+    if (!value.has_value() || !std::isfinite(*value) || *value < 0.0 || *value > 255.0) {
+      return 0;
+    }
+    return static_cast<int>(std::lround(*value));
+  };
+  if (const auto set_range = balanced_range_after(resources, "/StyleSheetSet", '[', ']');
+      set_range.has_value()) {
+    const auto sheets =
+        engine_dictionary_ranges(resources.substr(set_range->first, set_range->second - set_range->first));
+    const auto index = sheet_index(engine_number_after_key(resources, "/TheNormalStyleSheet"));
+    if (!sheets.empty() && static_cast<std::size_t>(index) < sheets.size()) {
+      const auto sheet = sheets[static_cast<std::size_t>(index)];
+      if (const auto size = engine_number_after_key(sheet, "/FontSize");
+          size.has_value() && std::isfinite(*size) && *size > 0.0) {
+        defaults.font_size = *size;
+      }
+      defaults.auto_leading = engine_bool_after_key(sheet, "/AutoLeading", true);
+      if (const auto leading = engine_number_after_key(sheet, "/Leading");
+          leading.has_value() && std::isfinite(*leading) && *leading > 0.0) {
+        defaults.leading = *leading;
+      }
+      if (const auto tracking = engine_number_after_key(sheet, "/Tracking");
+          tracking.has_value() && std::isfinite(*tracking)) {
+        defaults.tracking = *tracking;
+      }
+      if (const auto scale = engine_number_after_key(sheet, "/HorizontalScale");
+          scale.has_value() && std::isfinite(*scale) && *scale > 0.01 && *scale < 100.0) {
+        defaults.horizontal_scale = *scale;
+      }
+      if (const auto scale = engine_number_after_key(sheet, "/VerticalScale");
+          scale.has_value() && std::isfinite(*scale) && *scale > 0.01 && *scale < 100.0) {
+        defaults.vertical_scale = *scale;
+      }
+      if (const auto font_index = engine_number_after_key(sheet, "/Font"); font_index.has_value()) {
+        defaults.font_index = static_cast<int>(std::lround(*font_index));
+      }
+      if (const auto shift = engine_number_after_key(sheet, "/BaselineShift");
+          shift.has_value() && std::isfinite(*shift) && std::abs(*shift) < 100000.0) {
+        defaults.baseline_shift = *shift;
+      }
+      defaults.faux_bold = engine_bool_after_key(sheet, "/FauxBold");
+      defaults.faux_italic = engine_bool_after_key(sheet, "/FauxItalic");
+      defaults.font_caps = engine_choice_after_key(sheet, "/FontCaps", 0);
+      defaults.font_baseline = engine_choice_after_key(sheet, "/FontBaseline", 0);
+      defaults.underline = engine_bool_after_key(sheet, "/Underline");
+      defaults.strikethrough = engine_bool_after_key(sheet, "/Strikethrough");
+      defaults.ligatures = engine_bool_after_key(sheet, "/Ligatures", true);
+      defaults.discretionary_ligatures = engine_bool_after_key(sheet, "/DLigatures");
+      if (const auto language = engine_number_after_key(sheet, "/Language");
+          language.has_value() && *language >= 0.0 && *language < 256.0) {
+        defaults.language = static_cast<int>(std::lround(*language));
+      }
+      if (const auto baseline = engine_number_after_key(sheet, "/BaselineDirection"); baseline.has_value()) {
+        defaults.baseline_direction = static_cast<int>(std::lround(*baseline));
+      }
+      defaults.auto_kerning = engine_bool_after_key(sheet, "/AutoKerning", true);
+      if (const auto kerning = engine_number_after_key(sheet, "/Kerning");
+          kerning.has_value() && std::isfinite(*kerning) && std::abs(*kerning) <= 100000.0) {
+        defaults.kerning = *kerning;
+      }
+      defaults.fill_color = extract_engine_fill_color_from_text(sheet, cmyk);
+    }
+  }
+  defaults.auto_leading_fraction = engine_normal_paragraph_auto_leading_fraction(resources);
+  return defaults;
+}
+
+}  // namespace
+
+namespace {
+
+// Lays the 'Txt2' object's OpenType feature runs (Ordinals, Fractions, Contextual Alternates,
+// Swash, Titling and Stylistic Alternates) and languages over the TySh runs, splitting a TySh run where
+// a feature starts or stops inside it (the two run lists normally split at the same places).
+std::vector<PsdTextStyleRun> runs_with_text_object_features(std::vector<PsdTextStyleRun> runs,
+                                                            std::span<const TextStyleRunFeatures> features) {
+  std::vector<PsdTextStyleRun> result;
+  result.reserve(runs.size());
+  for (auto& run : runs) {
+    int position = run.start;
+    const int run_end = run.start + run.length;
+    int feature_start = 0;
+    for (std::size_t f = 0; f < features.size() && position < run_end; ++f) {
+      const int feature_end = f + 1 == features.size() ? std::max(run_end, feature_start + features[f].length)
+                                                       : feature_start + features[f].length;
+      const int piece_end = std::min(run_end, feature_end);
+      if (piece_end > position) {
+        auto piece = run;
+        piece.start = position;
+        piece.length = piece_end - position;
+        piece.ordinals = features[f].ordinals;
+        piece.fractions = features[f].fractions;
+        piece.contextual_alternates = features[f].contextual_alternates;
+        piece.swash = features[f].swash;
+        piece.titling_alternates = features[f].titling_alternates;
+        piece.stylistic_alternates = features[f].stylistic_alternates;
+        piece.language = features[f].language;
+        // The Middle Eastern settings live in the Txt2 object (Photoshop 2026 writes no TySh
+        // key for them); an older file's TySh /HindiNumbers stays when the sheets say nothing.
+        piece.digit_set = features[f].digit_set.value_or(piece.digit_set);
+        piece.diacritic_x_offset = features[f].diacritic_x_offset.value_or(piece.diacritic_x_offset);
+        piece.diacritic_y_offset = features[f].diacritic_y_offset.value_or(piece.diacritic_y_offset);
+        piece.mark_y_distance = features[f].mark_y_distance.value_or(piece.mark_y_distance);
+        piece.justification_alternates =
+            features[f].justification_alternates.value_or(piece.justification_alternates);
+        const auto& last = result.empty() ? piece : result.back();
+        if (!result.empty() && last.start + last.length == piece.start && last.ordinals == piece.ordinals &&
+            last.fractions == piece.fractions && last.contextual_alternates == piece.contextual_alternates &&
+            last.swash == piece.swash && last.titling_alternates == piece.titling_alternates &&
+            last.stylistic_alternates == piece.stylistic_alternates && last.language == piece.language &&
+            last.digit_set == piece.digit_set && last.diacritic_x_offset == piece.diacritic_x_offset &&
+            last.diacritic_y_offset == piece.diacritic_y_offset && last.mark_y_distance == piece.mark_y_distance &&
+            last.justification_alternates == piece.justification_alternates &&
+            piece.start > run.start) {
+          result.back().length += piece.length;
+        } else {
+          result.push_back(std::move(piece));
+        }
+        position = piece_end;
+      }
+      feature_start = feature_end;
+    }
+    if (position < run_end) {
+      auto rest = run;
+      rest.start = position;
+      rest.length = run_end - position;
+      result.push_back(std::move(rest));
+    }
+  }
+  return result;
+}
+
+// Lays the 'Txt2' object's kerning (one entry per style run of the object) over the TySh runs,
+// splitting a TySh run where the kerning changes inside it. Photoshop reads the object, not the
+// TySh: Photoshop 2026 writes /AutoKerning true into every TySh run, and an older file's TySh can
+// say manual beside a Metrics object.
+std::vector<PsdTextStyleRun> runs_with_text_object_kerning(std::vector<PsdTextStyleRun> runs,
+                                                           std::span<const TextStyleRunKerning> kerning) {
+  std::vector<PsdTextStyleRun> result;
+  result.reserve(runs.size());
+  for (auto& run : runs) {
+    int position = run.start;
+    const int run_end = run.start + run.length;
+    int entry_start = 0;
+    for (std::size_t k = 0; k < kerning.size() && position < run_end; ++k) {
+      const int entry_end = k + 1 == kerning.size() ? std::max(run_end, entry_start + kerning[k].length)
+                                                    : entry_start + kerning[k].length;
+      const int piece_end = std::min(run_end, entry_end);
+      if (piece_end > position) {
+        auto piece = run;
+        piece.start = position;
+        piece.length = piece_end - position;
+        if (kerning[k].mode.has_value()) {
+          piece.kerning_mode = *kerning[k].mode;
+          piece.kerning = piece.kerning_mode == kTextKerningManual ? kerning[k].kerning.value_or(0.0) : 0.0;
+        }
+        if (!result.empty() && piece.start > run.start && result.back().kerning_mode == piece.kerning_mode &&
+            result.back().kerning == piece.kerning) {
+          result.back().length += piece.length;
+        } else {
+          result.push_back(std::move(piece));
+        }
+        position = piece_end;
+      }
+      entry_start = entry_end;
+    }
+    if (position < run_end) {
+      auto rest = run;
+      rest.start = position;
+      rest.length = run_end - position;
+      result.push_back(std::move(rest));
+    }
+  }
+  return result;
+}
+
+}  // namespace
+
+std::optional<std::vector<PsdTextStyleRun>> extract_engine_text_runs(std::span<const std::uint8_t> payload,
+                                                                     std::string_view text,
+                                                                     int fallback_size,
+                                                                     RgbColor fallback_color,
+                                                                     const CmykColorConverter& cmyk,
+                                                                     std::span<const TextParagraphFontSize> paragraph_font_sizes,
+                                                                     std::span<const TextStyleRunFeatures> style_features,
+                                                                     std::span<const TextStyleRunKerning> style_kerning) {
+  const std::string_view engine(reinterpret_cast<const char*>(payload.data()), payload.size());
+  const auto style_pos = engine.find("/StyleRun");
+  if (style_pos == std::string_view::npos) {
+    return std::nullopt;
+  }
+  const auto style_block = engine.substr(style_pos);
+  const auto run_lengths_range = balanced_range_after(style_block, "/RunLengthArray", '[', ']');
+  const auto run_array_range = balanced_range_after(style_block, "/RunArray", '[', ']');
+  if (!run_lengths_range.has_value() || !run_array_range.has_value()) {
+    return std::nullopt;
+  }
+
+  const auto length_values = parse_engine_number_array(
+      style_block.substr(run_lengths_range->first, run_lengths_range->second - run_lengths_range->first));
+  auto dictionaries = engine_dictionary_ranges(style_block.substr(run_array_range->first,
+                                                                  run_array_range->second - run_array_range->first));
+  if (length_values.empty() || dictionaries.empty()) {
+    return std::nullopt;
+  }
+
+  const auto font_names = extract_engine_font_names(payload);
+  const auto defaults = extract_engine_text_defaults(payload, static_cast<double>(fallback_size), cmyk);
+  const auto text_utf16_length = static_cast<int>(utf8_to_utf16(text).size());
+  std::vector<PsdTextStyleRun> runs;
+  runs.reserve(std::min(length_values.size(), dictionaries.size()));
+  int start = 0;
+  for (std::size_t index = 0; index < length_values.size() && index < dictionaries.size(); ++index) {
+    const auto length = std::max(0, static_cast<int>(std::lround(length_values[index])));
+    if (length <= 0) {
+      continue;
+    }
+    if (start >= text_utf16_length) {
+      break;
+    }
+    PsdTextStyleRun run;
+    run.start = start;
+    run.length = std::min(length, text_utf16_length - start);
+    const auto explicit_size = engine_number_after_key(dictionaries[index], "/FontSize");
+    run.size = std::clamp(explicit_size.value_or(defaults.font_size), 1.0, static_cast<double>(kMaxTextSizePixels));
+    run.color = extract_engine_fill_color_from_text(dictionaries[index], cmyk)
+                    .value_or(defaults.fill_color.value_or(fallback_color));
+    // /FauxBold is a synthetic embolden of the named face, not "use the family's bold face".
+    // Folding it into run.bold picked the real Bold face, which is a different (wider, heavier)
+    // typeface: Georgia Bold Italic renders "Dungeon:" 63px wide against Photoshop's faux-bolded
+    // Georgia Italic at 58. It rides its own flag and is rendered as a stroke; see faux bold in
+    // docs/text-render-calibration.md.
+    run.faux_bold = engine_bool_after_key(dictionaries[index], "/FauxBold", defaults.faux_bold);
+    // Same split for the slant: it thickens/slants the run's OWN face. Folding it into
+    // run.italic picked the family's real Italic face, a different typeface again.
+    run.faux_italic = engine_bool_after_key(dictionaries[index], "/FauxItalic", defaults.faux_italic);
+    run.baseline_direction = static_cast<int>(std::lround(
+        engine_number_after_key(dictionaries[index], "/BaselineDirection").value_or(defaults.baseline_direction)));
+    if (const auto shift = engine_number_after_key(dictionaries[index], "/BaselineShift")
+                               .value_or(defaults.baseline_shift);
+        std::isfinite(shift) && std::abs(shift) < 100000.0) {
+      run.baseline_shift = shift;
+    }
+    // Character-panel styles (GitHub issue 346). Ordinals and Fractions are not in the TySh at
+    // all; they come from the 'Txt2' object below.
+    run.font_caps = engine_choice_after_key(dictionaries[index], "/FontCaps", defaults.font_caps);
+    run.font_baseline = engine_choice_after_key(dictionaries[index], "/FontBaseline", defaults.font_baseline);
+    run.underline = engine_bool_after_key(dictionaries[index], "/Underline", defaults.underline);
+    run.strikethrough = engine_bool_after_key(dictionaries[index], "/Strikethrough", defaults.strikethrough);
+    // Standard and discretionary ligatures are the two OpenType toggles the TySh carries; the
+    // other four come from the 'Txt2' object with ordinals and fractions.
+    run.ligatures = engine_bool_after_key(dictionaries[index], "/Ligatures", defaults.ligatures);
+    run.discretionary_ligatures =
+        engine_bool_after_key(dictionaries[index], "/DLigatures", defaults.discretionary_ligatures);
+    // Hyphenation and spelling language (GitHub issue 682), kept in the Txt2 numbering. The
+    // 'Txt2' object's /38 overrides it below when the layer has one: the TySh table is older and
+    // shorter (it has no Chinese or Japanese, which Photoshop writes as 0).
+    {
+      std::optional<int> tysh_language = defaults.language;
+      if (const auto language = engine_number_after_key(dictionaries[index], "/Language");
+          language.has_value() && *language >= 0.0 && *language < 256.0) {
+        tysh_language = static_cast<int>(std::lround(*language));
+      }
+      if (tysh_language.has_value()) {
+        const auto language = photoshop_txt2_language_from_tysh(*tysh_language);
+        if (language != kPhotoshopTextDefaultLanguage) {
+          run.language = language;
+        }
+      }
+    }
+    // Older Photoshop versions write /HindiNumbers beside the Txt2 digit set (true for Hindi and
+    // Farsi digits; GitHub issue 683). It only matters for a layer without a Txt2 object, whose
+    // /70 names the exact set and overrides this below.
+    if (engine_bool_after_key(dictionaries[index], "/HindiNumbers", false)) {
+      run.digit_set = 2;
+    }
+    // Kerning: a TySh run is manual when it says /AutoKerning false, with the number in /Kerning
+    // (0 = no kerning). Photoshop 2026 writes true and 0 here whatever the setting is and keeps
+    // the real one (Metrics, Optical, manual) in the Txt2 object, which overrides this below when
+    // the layer has one (docs/txt2-kept-settings.md, "Kerning").
+    if (!engine_bool_after_key(dictionaries[index], "/AutoKerning", defaults.auto_kerning)) {
+      run.kerning_mode = kTextKerningManual;
+      const auto kerning = engine_number_after_key(dictionaries[index], "/Kerning").value_or(defaults.kerning);
+      run.kerning = std::isfinite(kerning) && std::abs(kerning) <= 100000.0 ? kerning : 0.0;
+    }
+    run.auto_leading = engine_bool_after_key(dictionaries[index], "/AutoLeading", defaults.auto_leading);
+    // Photoshop records a stale /Leading value even for auto-leading runs; only a fixed
+    // (non-auto) run's leading participates in layout.
+    if (!run.auto_leading) {
+      if (const auto leading = engine_number_after_key(dictionaries[index], "/Leading").value_or(defaults.leading);
+          std::isfinite(leading) && leading > 0.0) {
+        run.leading = leading;
+      }
+    }
+    if (const auto tracking = engine_number_after_key(dictionaries[index], "/Tracking").value_or(defaults.tracking);
+        std::isfinite(tracking) && std::abs(tracking) < 10000.0) {
+      run.tracking = tracking;
+    }
+    if (const auto scale =
+            engine_number_after_key(dictionaries[index], "/HorizontalScale").value_or(defaults.horizontal_scale);
+        std::isfinite(scale) && scale > 0.01 && scale < 100.0) {
+      run.horizontal_scale = scale;
+    }
+    if (const auto scale =
+            engine_number_after_key(dictionaries[index], "/VerticalScale").value_or(defaults.vertical_scale);
+        std::isfinite(scale) && scale > 0.01 && scale < 100.0) {
+      run.vertical_scale = scale;
+    }
+    const auto font_index = engine_number_after_key(dictionaries[index], "/Font");
+    const auto font = font_index.has_value() ? static_cast<int>(std::lround(*font_index))
+                                             : defaults.font_index.value_or(-1);
+    if (font >= 0 && static_cast<std::size_t>(font) < font_names.size()) {
+      const auto resolved = resolve_photoshop_font_name(font_names[static_cast<std::size_t>(font)]);
+      run.family = resolved.family;
+      run.style = resolved.style;
+      run.bold = run.bold || resolved.bold;
+      run.italic = run.italic || resolved.italic;
+    }
+    if (run.family.empty()) {
+      run.family = "Arial";
+    }
+    if (explicit_size.has_value() || paragraph_font_sizes.empty()) {
+      runs.push_back(std::move(run));
+    } else {
+      // No /FontSize: the size comes from the paragraph's style ('Txt2' "Basic Paragraph" /32)
+      // before the normal style sheet, so a run split by paragraphs of different sizes splits
+      // too (GitHub issue 345: 12 pt at 300 PPI lives only there, as 50 px).
+      const int run_end = run.start + run.length;
+      int paragraph_start = 0;
+      for (std::size_t p = 0; p < paragraph_font_sizes.size() && paragraph_start < run_end; ++p) {
+        const bool last = p + 1 == paragraph_font_sizes.size();
+        const int paragraph_end = last ? run_end : paragraph_start + paragraph_font_sizes[p].length;
+        const int piece_start = std::max(run.start, paragraph_start);
+        const int piece_end = std::min(run_end, paragraph_end);
+        paragraph_start = paragraph_end;
+        if (piece_end <= piece_start) continue;
+        const auto size = std::clamp(paragraph_font_sizes[p].size.value_or(defaults.font_size), 1.0,
+                                     static_cast<double>(kMaxTextSizePixels));
+        if (!runs.empty() && piece_start > run.start && runs.back().size == size) {
+          runs.back().length += piece_end - piece_start;
+          continue;
+        }
+        auto piece = run;
+        piece.start = piece_start;
+        piece.length = piece_end - piece_start;
+        piece.size = size;
+        runs.push_back(std::move(piece));
+      }
+    }
+    start += length;
+  }
+
+  if (runs.empty()) {
+    return std::nullopt;
+  }
+  if (!style_features.empty()) {
+    runs = runs_with_text_object_features(std::move(runs), style_features);
+  }
+  if (!style_kerning.empty()) {
+    runs = runs_with_text_object_kerning(std::move(runs), style_kerning);
+  }
+  return runs;
+}
+
+std::optional<std::vector<PsdTextParagraphRun>> extract_engine_paragraph_runs(std::span<const std::uint8_t> payload,
+                                                                              std::string_view text) {
+  const std::string_view engine(reinterpret_cast<const char*>(payload.data()), payload.size());
+  const auto paragraph_pos = engine.find("/ParagraphRun");
+  if (paragraph_pos == std::string_view::npos) {
+    return std::nullopt;
+  }
+  const auto paragraph_block = engine.substr(paragraph_pos);
+  const auto run_lengths_range = balanced_range_after(paragraph_block, "/RunLengthArray", '[', ']');
+  const auto run_array_range = balanced_range_after(paragraph_block, "/RunArray", '[', ']');
+  if (!run_lengths_range.has_value() || !run_array_range.has_value()) {
+    return std::nullopt;
+  }
+
+  const auto length_values = parse_engine_number_array(
+      paragraph_block.substr(run_lengths_range->first, run_lengths_range->second - run_lengths_range->first));
+  auto dictionaries = engine_dictionary_ranges(paragraph_block.substr(run_array_range->first,
+                                                                      run_array_range->second - run_array_range->first));
+  if (length_values.empty() || dictionaries.empty()) {
+    return std::nullopt;
+  }
+
+  const auto text_utf16_length = static_cast<int>(utf8_to_utf16(text).size());
+  const auto resource_pos = engine.find("/ResourceDict");
+  const auto resources = resource_pos == std::string_view::npos ? std::string_view{} : engine.substr(resource_pos);
+  const auto default_auto_leading_fraction = engine_normal_paragraph_auto_leading_fraction(resources);
+  const bool default_auto_hyphenate = engine_normal_paragraph_auto_hyphenate(resources);
+  const bool default_every_line_composer = engine_normal_paragraph_every_line_composer(resources);
+  std::vector<PsdTextParagraphRun> runs;
+  int start = 0;
+  for (std::size_t index = 0; index < length_values.size() && index < dictionaries.size(); ++index) {
+    const auto length = std::max(0, static_cast<int>(std::lround(length_values[index])));
+    if (length <= 0) {
+      continue;
+    }
+    if (start >= text_utf16_length) {
+      break;
+    }
+    PsdTextParagraphRun run;
+    run.start = start;
+    run.length = std::min(length, text_utf16_length - start);
+    run.justification =
+        std::clamp(static_cast<int>(std::lround(engine_number_after_key(dictionaries[index], "/Justification").value_or(0.0))),
+                   0, 6);
+    run.first_line_indent = engine_number_after_key(dictionaries[index], "/FirstLineIndent").value_or(0.0);
+    run.start_indent = engine_number_after_key(dictionaries[index], "/StartIndent").value_or(0.0);
+    run.end_indent = engine_number_after_key(dictionaries[index], "/EndIndent").value_or(0.0);
+    run.space_before = engine_number_after_key(dictionaries[index], "/SpaceBefore").value_or(0.0);
+    run.space_after = engine_number_after_key(dictionaries[index], "/SpaceAfter").value_or(0.0);
+    run.auto_leading_fraction = default_auto_leading_fraction;
+    if (const auto fraction = engine_number_after_key(dictionaries[index], "/AutoLeading");
+        fraction.has_value() && std::isfinite(*fraction) && *fraction > 0.01 && *fraction < 10.0) {
+      run.auto_leading_fraction = *fraction;
+    }
+    // Hyphenate and its settings (GitHub issue 683): Photoshop writes them on every paragraph
+    // run; one that leaves /AutoHyphenate out takes the normal paragraph sheet's. Kept, never
+    // applied (Patchy does not hyphenate). The Txt2 object's /9 to /15 override these.
+    run.auto_hyphenate = engine_bool_after_key(dictionaries[index], "/AutoHyphenate", default_auto_hyphenate);
+    // The line composer (Every-line or Single-line), kept the same way; the Txt2 object's /29
+    // overrides it.
+    run.every_line_composer =
+        engine_bool_after_key(dictionaries[index], "/EveryLineComposer", default_every_line_composer);
+    const auto hyphen_count = [&](std::string_view key, int fallback) {
+      const auto value = engine_number_after_key(dictionaries[index], key);
+      return value.has_value() && std::isfinite(*value) && *value >= 0.0 && *value <= 1000.0
+                 ? static_cast<int>(std::lround(*value))
+                 : fallback;
+    };
+    run.hyphenated_word_size = hyphen_count("/HyphenatedWordSize", run.hyphenated_word_size);
+    run.pre_hyphen = hyphen_count("/PreHyphen", run.pre_hyphen);
+    run.post_hyphen = hyphen_count("/PostHyphen", run.post_hyphen);
+    run.consecutive_hyphens = hyphen_count("/ConsecutiveHyphens", run.consecutive_hyphens);
+    if (const auto zone = engine_number_after_key(dictionaries[index], "/Zone");
+        zone.has_value() && std::isfinite(*zone) && *zone >= 0.0 && *zone <= 100000.0) {
+      run.hyphenation_zone = *zone;
+    }
+    // An explicit TySh direction (0 = left to right, 1 = right to left): Patchy writes
+    // /ParagraphDirection, Photon Studio /Direction (GitHub issue 683). Photoshop writes
+    // neither; its direction is the Txt2 /33, which the layer records apply over this.
+    auto direction = engine_number_after_key(dictionaries[index], "/ParagraphDirection");
+    if (!direction.has_value()) {
+      direction = engine_number_after_key(dictionaries[index], "/Direction");
+    }
+    if (direction.has_value() && std::isfinite(*direction)) {
+      run.direction = std::lround(*direction) == 1 ? "rtl" : "ltr";
+    }
+    runs.push_back(run);
+    start += length;
+  }
+
+  if (runs.empty()) {
+    return std::nullopt;
+  }
+  return runs;
+}
+
+namespace {
+
+bool text_run_size_is_integral(const PsdTextStyleRun& run) {
+  return std::abs(run.size - std::round(run.size)) < 0.0001;
+}
+
+}  // namespace
+
+bool text_run_has_character_styles(const PsdTextStyleRun& run) noexcept {
+  return run.font_caps != 0 || run.font_baseline != 0 || run.underline || run.strikethrough || run.ordinals ||
+         run.fractions || !run.ligatures || run.contextual_alternates || run.discretionary_ligatures || run.swash ||
+         run.stylistic_alternates || run.titling_alternates || run.language.has_value() ||
+         text_run_has_middle_eastern_settings(run) || text_run_has_kept_kerning(run);
+}
+
+bool text_run_has_kept_kerning(const PsdTextStyleRun& run) noexcept {
+  return run.kerning_mode == kTextKerningManual || run.kerning_mode == kTextKerningOptical;
+}
+
+bool text_run_has_middle_eastern_settings(const PsdTextStyleRun& run) noexcept {
+  return run.digit_set != 0 || run.diacritic_x_offset != 0.0 || run.diacritic_y_offset != 0.0 ||
+         run.mark_y_distance != 100.0 || run.justification_alternates;
+}
+
+namespace {
+
+// Txt2 /38 -> TySh /Language where the two differ (Photoshop 2026 COM captures of 48 languages,
+// docs/txt2.md "Languages"). Every Txt2 index not listed and below 29 is the same in both.
+struct LanguagePair {
+  int txt2;
+  int tysh;
+};
+constexpr std::array<LanguagePair, 12> kRenumberedTextLanguages{{
+    {42, 4},   // German (standard, 2006 reform)
+    {44, 6},   // German (Swiss)
+    {45, 14},  // English (Canada): the TySh has no Canadian English
+    {43, 15},  // Dutch (2005 reform)
+    {31, 29},  // Croatian
+    {32, 30},  // Hebrew
+    {33, 31},  // Slovenian
+    {36, 34},  // Lithuanian
+    {37, 35},  // Latvian
+    {38, 36},  // Slovak
+    {39, 37},  // Arabic
+    {41, 37},  // Farsi
+}};
+
+}  // namespace
+
+int photoshop_tysh_language_from_txt2(int language) noexcept {
+  for (const auto& pair : kRenumberedTextLanguages) {
+    if (pair.txt2 == language) {
+      return pair.tysh;
+    }
+  }
+  // 0 to 28 share their numbers (14 is English UK in both); the rest (Chinese 29, Japanese 30,
+  // Estonian 40, Thai 46, Vietnamese 47, Hindi 49, Indonesian 62, Korean 63, ...) have no TySh
+  // entry and Photoshop writes 0 for them.
+  return language >= 0 && language <= 28 ? language : 0;
+}
+
+int photoshop_txt2_language_from_tysh(int language) noexcept {
+  // The first pair naming a TySh index wins (Arabic before Farsi; English UK stays 14).
+  if (language == 14) {
+    return 14;
+  }
+  for (const auto& pair : kRenumberedTextLanguages) {
+    if (pair.tysh == language) {
+      return pair.txt2;
+    }
+  }
+  return language;
+}
+
+namespace {
+
+// A whole token as a finite number (strtod: floating-point from_chars is not on every toolchain).
+std::optional<double> run_token_number(std::string_view token) {
+  if (token.empty() || token.size() > 40U) {
+    return std::nullopt;
+  }
+  const std::string copy(token);
+  char* end = nullptr;
+  const auto value = std::strtod(copy.c_str(), &end);
+  if (end != copy.c_str() + copy.size() || !std::isfinite(value)) {
+    return std::nullopt;
+  }
+  return value;
+}
+
+}  // namespace
+
+std::string serialize_text_run_character_styles(const PsdTextStyleRun& run) {
+  std::string tokens;
+  const auto add = [&tokens](std::string_view token) {
+    if (!tokens.empty()) {
+      tokens += ',';
+    }
+    tokens += token;
+  };
+  if (run.font_caps == 2) add("allcaps");
+  if (run.font_caps == 1) add("smallcaps");
+  if (run.font_baseline == 1) add("superscript");
+  if (run.font_baseline == 2) add("subscript");
+  if (run.underline) add("underline");
+  if (run.strikethrough) add("strikethrough");
+  if (run.ordinals) add("ordinals");
+  if (run.fractions) add("fractions");
+  if (!run.ligatures) add("noligatures");
+  if (run.contextual_alternates) add("contextualalternates");
+  if (run.discretionary_ligatures) add("discretionaryligatures");
+  if (run.swash) add("swash");
+  if (run.stylistic_alternates) add("stylisticalternates");
+  if (run.titling_alternates) add("titlingalternates");
+  if (run.language.has_value()) add("language:" + std::to_string(*run.language));
+  if (run.digit_set != 0) add("digits:" + std::to_string(run.digit_set));
+  if (run.diacritic_x_offset != 0.0) add("diacx:" + serialize_paragraph_metric(run.diacritic_x_offset));
+  if (run.diacritic_y_offset != 0.0) add("diacy:" + serialize_paragraph_metric(run.diacritic_y_offset));
+  if (run.mark_y_distance != 100.0) add("marky:" + serialize_paragraph_metric(run.mark_y_distance));
+  if (run.justification_alternates) add("justalt");
+  if (run.kerning_mode == kTextKerningOptical) add("kern:optical");
+  if (run.kerning_mode == kTextKerningManual) {
+    add("kern:" + serialize_paragraph_metric(std::isfinite(run.kerning) ? run.kerning : 0.0));
+  }
+  return tokens.empty() ? std::string("-") : tokens;
+}
+
+void parse_text_run_character_styles(std::string_view field, PsdTextStyleRun& run) {
+  run.font_caps = 0;
+  run.font_baseline = 0;
+  run.underline = false;
+  run.strikethrough = false;
+  run.ordinals = false;
+  run.fractions = false;
+  run.ligatures = true;
+  run.contextual_alternates = false;
+  run.discretionary_ligatures = false;
+  run.swash = false;
+  run.stylistic_alternates = false;
+  run.titling_alternates = false;
+  run.language.reset();
+  run.digit_set = 0;
+  run.diacritic_x_offset = 0.0;
+  run.diacritic_y_offset = 0.0;
+  run.mark_y_distance = 100.0;
+  run.justification_alternates = false;
+  run.kerning_mode = kTextKerningMetrics;
+  run.kerning = 0.0;
+  const auto offset_value = [](std::string_view digits) -> std::optional<double> {
+    const auto value = run_token_number(digits);
+    return value.has_value() && std::abs(*value) <= 100000.0 ? value : std::nullopt;
+  };
+  while (!field.empty()) {
+    const auto comma = field.find(',');
+    const auto token = field.substr(0, comma);
+    field = comma == std::string_view::npos ? std::string_view{} : field.substr(comma + 1U);
+    if (token == "allcaps") {
+      run.font_caps = 2;
+    } else if (token == "smallcaps") {
+      run.font_caps = 1;
+    } else if (token == "superscript") {
+      run.font_baseline = 1;
+    } else if (token == "subscript") {
+      run.font_baseline = 2;
+    } else if (token == "underline") {
+      run.underline = true;
+    } else if (token == "strikethrough") {
+      run.strikethrough = true;
+    } else if (token == "ordinals") {
+      run.ordinals = true;
+    } else if (token == "fractions") {
+      run.fractions = true;
+    } else if (token == "noligatures") {
+      run.ligatures = false;
+    } else if (token == "contextualalternates") {
+      run.contextual_alternates = true;
+    } else if (token == "discretionaryligatures") {
+      run.discretionary_ligatures = true;
+    } else if (token == "swash") {
+      run.swash = true;
+    } else if (token == "stylisticalternates") {
+      run.stylistic_alternates = true;
+    } else if (token == "titlingalternates") {
+      run.titling_alternates = true;
+    } else if (token.starts_with("language:")) {
+      int value = -1;
+      const auto digits = token.substr(9);
+      const auto [end, error] = std::from_chars(digits.data(), digits.data() + digits.size(), value);
+      if (error == std::errc{} && end == digits.data() + digits.size() && valid_photoshop_text_language(value)) {
+        run.language = value;
+      }
+    } else if (token.starts_with("digits:")) {
+      if (const auto value = offset_value(token.substr(7)); value && *value >= 0.0 && *value <= 15.0) {
+        run.digit_set = static_cast<int>(std::lround(*value));
+      }
+    } else if (token.starts_with("diacx:")) {
+      run.diacritic_x_offset = offset_value(token.substr(6)).value_or(0.0);
+    } else if (token.starts_with("diacy:")) {
+      run.diacritic_y_offset = offset_value(token.substr(6)).value_or(0.0);
+    } else if (token.starts_with("marky:")) {
+      run.mark_y_distance = offset_value(token.substr(6)).value_or(100.0);
+    } else if (token == "justalt") {
+      run.justification_alternates = true;
+    } else if (token == "kern:optical") {
+      run.kerning_mode = kTextKerningOptical;
+      run.kerning = 0.0;
+    } else if (token.starts_with("kern:")) {
+      if (const auto value = offset_value(token.substr(5)); value.has_value()) {
+        run.kerning_mode = kTextKerningManual;
+        run.kerning = *value;
+      }
+    }
+  }
+}
+
+// v1: start len size bold italic color family (int size, no leading)
+// v2: v1 + fixed leading (double)
+// v3: v2 with double size, leading may be the literal "auto" (auto leading: paragraph
+//     auto-leading fraction x size), + tracking (Photoshop 1/1000-em units), + the character
+//     panel's horizontal/vertical glyph scales (fractions, 1.0 = none).
+// v4: v3 + Photoshop's faux bold flag (synthetic embolden of the named face). Every column is
+//     read by index, so a v3 reader simply ignores it; the version token only ever rises when a
+//     run actually carries faux bold, which keeps existing files byte-identical.
+// v5: v4 + the face/style name (percent-encoded), for the styles bold+italic cannot name.
+//     Written only when a run really carries one, for the same byte-stability reason.
+// v6: v5 + Photoshop's faux italic flag (synthetic slant of the named face).
+// v9: v8 + the character-panel styles (column 16, serialize_text_run_character_styles), only when
+//     a run carries one.
+std::string serialize_patchy_text_runs(std::span<const PsdTextStyleRun> runs) {
+  const bool include_leading = std::any_of(runs.begin(), runs.end(), [](const PsdTextStyleRun& run) {
+    return run.leading.has_value() && std::isfinite(*run.leading) && *run.leading > 0.0;
+  });
+  // v7: the rotated-Roman flag (BaselineDirection 2), only when a run carries it.
+  const bool include_character_styles =
+      std::any_of(runs.begin(), runs.end(), [](const PsdTextStyleRun& run) { return text_run_has_character_styles(run); });
+  const bool include_shift = include_character_styles ||
+      std::any_of(runs.begin(), runs.end(), [](const PsdTextStyleRun& run) {
+        return std::isfinite(run.baseline_shift) && std::abs(run.baseline_shift) > 0.0001;
+      });
+  const bool include_rotated = include_shift ||
+      std::any_of(runs.begin(), runs.end(), [](const PsdTextStyleRun& run) { return run.baseline_direction == 2; });
+  const bool include_faux_italic = include_rotated ||
+      std::any_of(runs.begin(), runs.end(), [](const PsdTextStyleRun& run) { return run.faux_italic; });
+  const bool include_style = include_faux_italic ||
+      std::any_of(runs.begin(), runs.end(), [](const PsdTextStyleRun& run) { return !run.style.empty(); });
+  const bool include_faux_bold = include_style ||
+      std::any_of(runs.begin(), runs.end(), [](const PsdTextStyleRun& run) { return run.faux_bold; });
+  const bool photoshop_layout = include_faux_bold ||
+      std::any_of(runs.begin(), runs.end(), [](const PsdTextStyleRun& run) {
+        return run.auto_leading || std::abs(run.tracking) > 0.0001 || !text_run_size_is_integral(run) ||
+               std::abs(run.horizontal_scale - 1.0) > 0.0001 || std::abs(run.vertical_scale - 1.0) > 0.0001;
+      });
+  std::string serialized =
+      include_character_styles ? "v9" : include_shift ? "v8" : include_rotated
+          ? "v7"
+          : include_faux_italic
+          ? "v6"
+          : (include_style ? "v5"
+                           : (include_faux_bold ? "v4"
+                                                : (photoshop_layout ? "v3" : (include_leading ? "v2" : "v1"))));
+  for (const auto& run : runs) {
+    serialized += '\n';
+    serialized += std::to_string(run.start);
+    serialized += '\t';
+    serialized += std::to_string(run.length);
+    serialized += '\t';
+    if (photoshop_layout) {
+      serialized += serialize_paragraph_metric(run.size);
+    } else {
+      serialized += std::to_string(static_cast<int>(std::lround(run.size)));
+    }
+    serialized += '\t';
+    serialized += run.bold ? '1' : '0';
+    serialized += '\t';
+    serialized += run.italic ? '1' : '0';
+    serialized += '\t';
+    serialized += rgb_hex_color(run.color);
+    serialized += '\t';
+    serialized += percent_encode(run.family);
+    if (photoshop_layout) {
+      serialized += '\t';
+      // A run with neither auto leading nor a usable fixed value renders auto (Photoshop
+      // files always carry one or the other).
+      if (run.auto_leading || !run.leading.has_value()) {
+        serialized += "auto";
+      } else {
+        serialized += serialize_paragraph_metric(*run.leading);
+      }
+      serialized += '\t';
+      serialized += serialize_paragraph_metric(run.tracking);
+      serialized += '\t';
+      serialized += serialize_paragraph_metric(run.horizontal_scale);
+      serialized += '\t';
+      serialized += serialize_paragraph_metric(run.vertical_scale);
+      if (include_faux_bold) {
+        serialized += '\t';
+        serialized += run.faux_bold ? '1' : '0';
+      }
+      if (include_style) {
+        serialized += '\t';
+        serialized += percent_encode(run.style);
+      }
+      if (include_faux_italic) {
+        serialized += '\t';
+        serialized += run.faux_italic ? '1' : '0';
+      }
+      if (include_rotated) {
+        serialized += '\t';
+        serialized += run.baseline_direction == 2 ? '2' : '0';
+      }
+      if (include_shift) {
+        serialized += '\t';
+        serialized += serialize_paragraph_metric(run.baseline_shift);
+      }
+      if (include_character_styles) {
+        serialized += '\t';
+        serialized += serialize_text_run_character_styles(run);
+      }
+    } else if (include_leading) {
+      serialized += '\t';
+      serialized += serialize_paragraph_metric(run.leading.value_or(0.0));
+    }
+  }
+  return serialized;
+}
+
+namespace {
+
+std::string patchy_alignment_name_from_justification(int justification) {
+  switch (justification) {
+    case 1:
+      return "right";
+    case 2:
+      return "center";
+    case 3:
+      return "justify";
+    // Photoshop's other justify modes differ only in the last line (PS 2026 DOM readback of
+    // issue 672's file: 4 last right, 5 last centered, 6 justify all).
+    case 4:
+      return "justifyRight";
+    case 5:
+      return "justifyCenter";
+    case 6:
+      return "justifyAll";
+    default:
+      return "left";
+  }
+}
+
+bool paragraph_run_has_layout(const PsdTextParagraphRun& run) noexcept {
+  constexpr double kEpsilon = 0.000001;
+  return std::abs(run.first_line_indent) > kEpsilon || std::abs(run.start_indent) > kEpsilon ||
+         std::abs(run.end_indent) > kEpsilon || std::abs(run.space_before) > kEpsilon ||
+         std::abs(run.space_after) > kEpsilon;
+}
+
+}  // namespace
+
+std::string serialize_paragraph_metric(double value) {
+  if (!std::isfinite(value) || std::abs(value) < 0.000001) {
+    return "0";
+  }
+  std::ostringstream stream;
+  stream << std::setprecision(17) << value;
+  return stream.str();
+}
+
+namespace {
+
+struct CodePointRange {
+  std::uint32_t first;
+  std::uint32_t last;
+};
+
+// Strong right-to-left letters (bidi classes R and AL), letters only: the Hebrew and Arabic
+// points, Arabic-Indic digits and combining marks in between are weak or neutral and skipped.
+constexpr CodePointRange kStrongRightToLeft[] = {
+    {0x05BE, 0x05BE}, {0x05C0, 0x05C0}, {0x05C3, 0x05C3}, {0x05C6, 0x05C6}, {0x05D0, 0x05FF},
+    {0x0608, 0x0608}, {0x060B, 0x060B}, {0x060D, 0x060D}, {0x061B, 0x064A}, {0x066D, 0x066F},
+    {0x0671, 0x06D5}, {0x06E5, 0x06E6}, {0x06EE, 0x06EF}, {0x06FA, 0x0710}, {0x0712, 0x072F},
+    {0x074D, 0x07A5}, {0x07B1, 0x07B1}, {0x07C0, 0x07EA}, {0x07F4, 0x07F5}, {0x07FA, 0x0815},
+    {0x0830, 0x0858}, {0x0860, 0x08C9}, {0x200F, 0x200F}, {0xFB1D, 0xFB1D}, {0xFB1F, 0xFB28},
+    {0xFB2A, 0xFD3D}, {0xFD40, 0xFDFF}, {0xFE70, 0xFEFE}, {0x10800, 0x10FFF}, {0x1E800, 0x1EFFF},
+};
+
+// Strong left-to-right letters (bidi class L) of the common scripts; anything else (digits,
+// punctuation, symbols, spaces, marks, emoji) is not strong.
+constexpr CodePointRange kStrongLeftToRight[] = {
+    {0x0041, 0x005A}, {0x0061, 0x007A}, {0x00AA, 0x00AA}, {0x00B5, 0x00B5}, {0x00BA, 0x00BA},
+    {0x00C0, 0x00D6}, {0x00D8, 0x00F6}, {0x00F8, 0x02B8}, {0x0370, 0x0373}, {0x0376, 0x037D},
+    {0x037F, 0x0383}, {0x0386, 0x0386}, {0x0388, 0x03F5}, {0x03F7, 0x0482}, {0x048A, 0x058F},
+    {0x0900, 0x0DFF}, {0x0E00, 0x0FFF}, {0x1000, 0x1FFF}, {0x200E, 0x200E}, {0x2C00, 0x2DFF},
+    {0x3041, 0x9FFF}, {0xA000, 0xD7FF}, {0xF900, 0xFB1C}, {0xFF21, 0xFF3A}, {0xFF41, 0xFF5A},
+    {0xFF66, 0xFFDC}, {0x10000, 0x107FF}, {0x11000, 0x1E7FF}, {0x20000, 0x3FFFF},
+};
+
+bool code_point_in(std::span<const CodePointRange> ranges, std::uint32_t code_point) {
+  return std::any_of(ranges.begin(), ranges.end(), [code_point](const CodePointRange& range) {
+    return code_point >= range.first && code_point <= range.last;
+  });
+}
+
+}  // namespace
+
+std::string first_strong_text_direction(std::span<const std::uint16_t> utf16) {
+  for (std::size_t index = 0; index < utf16.size(); ++index) {
+    std::uint32_t code_point = utf16[index];
+    if (code_point >= 0xD800 && code_point <= 0xDBFF && index + 1U < utf16.size() && utf16[index + 1U] >= 0xDC00 &&
+        utf16[index + 1U] <= 0xDFFF) {
+      code_point = 0x10000U + ((code_point - 0xD800U) << 10U) + (utf16[index + 1U] - 0xDC00U);
+      ++index;
+    }
+    if (code_point_in(kStrongRightToLeft, code_point)) {
+      return "rtl";
+    }
+    if (code_point_in(kStrongLeftToRight, code_point)) {
+      return "ltr";
+    }
+  }
+  return {};
+}
+
+void swap_right_to_left_paragraph_indents(std::span<PsdTextParagraphRun> runs) noexcept {
+  for (auto& run : runs) {
+    if (run.direction == "rtl") {
+      std::swap(run.start_indent, run.end_indent);
+    }
+  }
+}
+
+// v1: start len alignment; v2: + indent/space metrics; v3: + auto-leading fraction;
+// v4: + paragraph direction ("auto", "ltr" or "rtl"); v5: + composer (Txt2 /35, written only
+// when a paragraph is not World-Ready); v6: + the kept Photoshop settings (column 11,
+// serialize_paragraph_run_settings). Every column is read by index and the version token rises
+// only when a run needs the column, so files without an explicit direction stay byte-identical.
+std::string serialize_patchy_paragraph_runs(std::span<const PsdTextParagraphRun> runs) {
+  const bool include_settings = std::any_of(runs.begin(), runs.end(), [](const PsdTextParagraphRun& run) {
+    return serialize_paragraph_run_settings(run) != "-";
+  });
+  const bool include_composer = include_settings ||
+      std::any_of(runs.begin(), runs.end(), [](const PsdTextParagraphRun& run) { return run.composer != 1; });
+  const bool include_direction = include_composer ||
+      std::any_of(runs.begin(), runs.end(), [](const PsdTextParagraphRun& run) {
+        return run.direction == "ltr" || run.direction == "rtl";
+      });
+  const bool include_fraction = include_direction ||
+      std::any_of(runs.begin(), runs.end(), [](const PsdTextParagraphRun& run) {
+        return std::abs(run.auto_leading_fraction - 1.2) > 0.0001;
+      });
+  const bool include_layout =
+      include_fraction ||
+      std::any_of(runs.begin(), runs.end(), [](const PsdTextParagraphRun& run) { return paragraph_run_has_layout(run); });
+  std::string serialized = include_settings
+      ? "v6"
+      : (include_composer
+             ? "v5"
+             : (include_direction ? "v4" : (include_fraction ? "v3" : (include_layout ? "v2" : "v1"))));
+  for (const auto& run : runs) {
+    serialized += '\n';
+    serialized += std::to_string(run.start);
+    serialized += '\t';
+    serialized += std::to_string(run.length);
+    serialized += '\t';
+    serialized += patchy_alignment_name_from_justification(run.justification);
+    if (include_layout) {
+      serialized += '\t';
+      serialized += serialize_paragraph_metric(run.first_line_indent);
+      serialized += '\t';
+      serialized += serialize_paragraph_metric(run.start_indent);
+      serialized += '\t';
+      serialized += serialize_paragraph_metric(run.end_indent);
+      serialized += '\t';
+      serialized += serialize_paragraph_metric(run.space_before);
+      serialized += '\t';
+      serialized += serialize_paragraph_metric(run.space_after);
+    }
+    if (include_fraction) {
+      serialized += '\t';
+      serialized += serialize_paragraph_metric(run.auto_leading_fraction);
+    }
+    if (include_direction) {
+      serialized += '\t';
+      serialized += run.direction == "ltr" || run.direction == "rtl" ? run.direction : "auto";
+    }
+    if (include_composer) {
+      serialized += '\t';
+      serialized += std::to_string(run.composer);
+    }
+    if (include_settings) {
+      serialized += '\t';
+      serialized += serialize_paragraph_run_settings(run);
+    }
+  }
+  return serialized;
+}
+
+std::string serialize_paragraph_run_settings(const PsdTextParagraphRun& run) {
+  std::string tokens;
+  const auto add = [&tokens](std::string_view token) {
+    if (!tokens.empty()) {
+      tokens += ',';
+    }
+    tokens += token;
+  };
+  if (run.auto_hyphenate) add("hyphenate");
+  if (run.hyphenated_word_size != 6 || run.pre_hyphen != 2 || run.post_hyphen != 2 || run.consecutive_hyphens != 8 ||
+      run.hyphenation_zone != 36.0 || !run.hyphenate_capitalized) {
+    add("hyphenation:" + std::to_string(run.hyphenated_word_size) + ':' + std::to_string(run.pre_hyphen) + ':' +
+        std::to_string(run.post_hyphen) + ':' + std::to_string(run.consecutive_hyphens) + ':' +
+        serialize_paragraph_metric(run.hyphenation_zone) + ':' + (run.hyphenate_capitalized ? '1' : '0'));
+  }
+  if (run.kashida_width != 2) add("kashida:" + std::to_string(run.kashida_width));
+  if (run.every_line_composer) add("everyline");
+  return tokens.empty() ? std::string("-") : tokens;
+}
+
+void copy_paragraph_run_settings(const PsdTextParagraphRun& from, PsdTextParagraphRun& to) noexcept {
+  to.auto_hyphenate = from.auto_hyphenate;
+  to.hyphenated_word_size = from.hyphenated_word_size;
+  to.pre_hyphen = from.pre_hyphen;
+  to.post_hyphen = from.post_hyphen;
+  to.consecutive_hyphens = from.consecutive_hyphens;
+  to.hyphenation_zone = from.hyphenation_zone;
+  to.hyphenate_capitalized = from.hyphenate_capitalized;
+  to.kashida_width = from.kashida_width;
+  to.every_line_composer = from.every_line_composer;
+}
+
+void parse_paragraph_run_settings(std::string_view field, PsdTextParagraphRun& run) {
+  copy_paragraph_run_settings(PsdTextParagraphRun{}, run);
+  const auto number = [](std::string_view digits) -> std::optional<double> {
+    const auto value = run_token_number(digits);
+    return value.has_value() && *value >= 0.0 && *value <= 100000.0 ? value : std::nullopt;
+  };
+  while (!field.empty()) {
+    const auto comma = field.find(',');
+    const auto token = field.substr(0, comma);
+    field = comma == std::string_view::npos ? std::string_view{} : field.substr(comma + 1U);
+    if (token == "hyphenate") {
+      run.auto_hyphenate = true;
+    } else if (token.starts_with("hyphenation:")) {
+      // Six colon-separated values; a token with any other shape is ignored whole.
+      std::array<double, 6> values{};
+      auto rest = token.substr(12);
+      std::size_t count = 0;
+      bool valid = true;
+      bool more = true;
+      while (valid && more && count < values.size()) {
+        const auto colon = rest.find(':');
+        const auto value = number(rest.substr(0, colon));
+        valid = value.has_value();
+        if (valid) {
+          values[count++] = *value;
+        }
+        more = colon != std::string_view::npos;
+        rest = more ? rest.substr(colon + 1U) : std::string_view{};
+      }
+      if (valid && !more && count == values.size() && values[0] <= 1000.0 && values[1] <= 1000.0 &&
+          values[2] <= 1000.0 && values[3] <= 1000.0) {
+        run.hyphenated_word_size = static_cast<int>(std::lround(values[0]));
+        run.pre_hyphen = static_cast<int>(std::lround(values[1]));
+        run.post_hyphen = static_cast<int>(std::lround(values[2]));
+        run.consecutive_hyphens = static_cast<int>(std::lround(values[3]));
+        run.hyphenation_zone = values[4];
+        run.hyphenate_capitalized = values[5] != 0.0;
+      }
+    } else if (token.starts_with("kashida:")) {
+      if (const auto value = number(token.substr(8)); value && *value <= 4.0) {
+        run.kashida_width = static_cast<int>(std::lround(*value));
+      }
+    } else if (token == "everyline") {
+      run.every_line_composer = true;
+    }
+  }
+}
+
+namespace {
+
+void append_html_escaped(std::string& output, std::uint32_t codepoint) {
+  switch (codepoint) {
+    case '&':
+      output += "&amp;";
+      return;
+    case '<':
+      output += "&lt;";
+      return;
+    case '>':
+      output += "&gt;";
+      return;
+    case '"':
+      output += "&quot;";
+      return;
+    case '\n':
+      output += "<br />";
+      return;
+    default:
+      append_utf8(output, codepoint);
+      return;
+  }
+}
+
+void append_utf8_range_as_html(std::string& output, std::string_view text, int start_units, int length_units) {
+  const auto end_units = start_units + length_units;
+  int utf16_position = 0;
+  for (std::size_t index = 0; index < text.size();) {
+    const auto lead = static_cast<unsigned char>(text[index]);
+    std::uint32_t codepoint = 0x3FU;
+    std::size_t consumed = 1;
+    if (lead < 0x80U) {
+      codepoint = lead;
+    } else if ((lead & 0xE0U) == 0xC0U && index + 1 < text.size()) {
+      codepoint = ((lead & 0x1FU) << 6U) | (static_cast<unsigned char>(text[index + 1]) & 0x3FU);
+      consumed = 2;
+    } else if ((lead & 0xF0U) == 0xE0U && index + 2 < text.size()) {
+      codepoint = ((lead & 0x0FU) << 12U) | ((static_cast<unsigned char>(text[index + 1]) & 0x3FU) << 6U) |
+                  (static_cast<unsigned char>(text[index + 2]) & 0x3FU);
+      consumed = 3;
+    } else if ((lead & 0xF8U) == 0xF0U && index + 3 < text.size()) {
+      codepoint = ((lead & 0x07U) << 18U) | ((static_cast<unsigned char>(text[index + 1]) & 0x3FU) << 12U) |
+                  ((static_cast<unsigned char>(text[index + 2]) & 0x3FU) << 6U) |
+                  (static_cast<unsigned char>(text[index + 3]) & 0x3FU);
+      consumed = 4;
+    }
+    const auto units = codepoint > 0xFFFFU ? 2 : 1;
+    if (utf16_position >= start_units && utf16_position < end_units) {
+      append_html_escaped(output, codepoint);
+    }
+    utf16_position += units;
+    index += consumed;
+    if (utf16_position >= end_units) {
+      break;
+    }
+  }
+}
+
+std::string css_escaped_family(std::string_view family) {
+  std::string escaped;
+  escaped.reserve(family.size());
+  for (const auto ch : family) {
+    if (ch == '\'' || ch == '\\') {
+      escaped.push_back('\\');
+    }
+    escaped.push_back(ch);
+  }
+  return escaped;
+}
+
+}  // namespace
+
+std::string html_from_text_runs(std::string_view text, std::span<const PsdTextStyleRun> runs,
+                                std::span<const PsdTextParagraphRun> paragraph_runs) {
+  const auto justification = paragraph_runs.empty() ? 0 : paragraph_runs.front().justification;
+  // CSS knows one justify; the last-line modes are paragraph-runs metadata only.
+  const auto alignment =
+      justification >= 3 ? std::string("justify") : patchy_alignment_name_from_justification(justification);
+  std::string html =
+      "<!DOCTYPE HTML><html><head><meta name=\"qrichtext\" content=\"1\" /></head>"
+      "<body style=\"margin:0px;\"><p style=\"margin:0px; text-align:";
+  html += alignment;
+  html += ";\">";
+  for (const auto& run : runs) {
+    html += "<span style=\" font-family:'";
+    html += css_escaped_family(run.family);
+    html += "'; font-size:";
+    html += std::to_string(std::max(1, static_cast<int>(std::lround(run.size))));
+    html += "px;";
+    if (run.bold) {
+      html += " font-weight:700;";
+    }
+    if (run.italic) {
+      html += " font-style:italic;";
+    }
+    html += " color:";
+    html += rgb_hex_color(run.color);
+    html += ";\">";
+    append_utf8_range_as_html(html, text, run.start, run.length);
+    html += "</span>";
+  }
+  html += "</p></body></html>";
+  return html;
+}
+
+namespace {
+
+const std::array<std::uint8_t, 7>* glyph_for(char ch) {
+  static const std::map<char, std::array<std::uint8_t, 7>> glyphs = {
+      {'0', {0x0E, 0x11, 0x13, 0x15, 0x19, 0x11, 0x0E}},
+      {'1', {0x04, 0x0C, 0x04, 0x04, 0x04, 0x04, 0x0E}},
+      {'2', {0x0E, 0x11, 0x01, 0x02, 0x04, 0x08, 0x1F}},
+      {'3', {0x1E, 0x01, 0x01, 0x0E, 0x01, 0x01, 0x1E}},
+      {'4', {0x02, 0x06, 0x0A, 0x12, 0x1F, 0x02, 0x02}},
+      {'5', {0x1F, 0x10, 0x10, 0x1E, 0x01, 0x01, 0x1E}},
+      {'6', {0x06, 0x08, 0x10, 0x1E, 0x11, 0x11, 0x0E}},
+      {'7', {0x1F, 0x01, 0x02, 0x04, 0x08, 0x08, 0x08}},
+      {'8', {0x0E, 0x11, 0x11, 0x0E, 0x11, 0x11, 0x0E}},
+      {'9', {0x0E, 0x11, 0x11, 0x0F, 0x01, 0x02, 0x0C}},
+      {'A', {0x0E, 0x11, 0x11, 0x1F, 0x11, 0x11, 0x11}},
+      {'B', {0x1E, 0x11, 0x11, 0x1E, 0x11, 0x11, 0x1E}},
+      {'C', {0x0E, 0x11, 0x10, 0x10, 0x10, 0x11, 0x0E}},
+      {'D', {0x1E, 0x11, 0x11, 0x11, 0x11, 0x11, 0x1E}},
+      {'E', {0x1F, 0x10, 0x10, 0x1E, 0x10, 0x10, 0x1F}},
+      {'F', {0x1F, 0x10, 0x10, 0x1E, 0x10, 0x10, 0x10}},
+      {'G', {0x0E, 0x11, 0x10, 0x17, 0x11, 0x11, 0x0F}},
+      {'H', {0x11, 0x11, 0x11, 0x1F, 0x11, 0x11, 0x11}},
+      {'I', {0x0E, 0x04, 0x04, 0x04, 0x04, 0x04, 0x0E}},
+      {'J', {0x07, 0x02, 0x02, 0x02, 0x12, 0x12, 0x0C}},
+      {'K', {0x11, 0x12, 0x14, 0x18, 0x14, 0x12, 0x11}},
+      {'L', {0x10, 0x10, 0x10, 0x10, 0x10, 0x10, 0x1F}},
+      {'M', {0x11, 0x1B, 0x15, 0x15, 0x11, 0x11, 0x11}},
+      {'N', {0x11, 0x19, 0x15, 0x13, 0x11, 0x11, 0x11}},
+      {'O', {0x0E, 0x11, 0x11, 0x11, 0x11, 0x11, 0x0E}},
+      {'P', {0x1E, 0x11, 0x11, 0x1E, 0x10, 0x10, 0x10}},
+      {'Q', {0x0E, 0x11, 0x11, 0x11, 0x15, 0x12, 0x0D}},
+      {'R', {0x1E, 0x11, 0x11, 0x1E, 0x14, 0x12, 0x11}},
+      {'S', {0x0F, 0x10, 0x10, 0x0E, 0x01, 0x01, 0x1E}},
+      {'T', {0x1F, 0x04, 0x04, 0x04, 0x04, 0x04, 0x04}},
+      {'U', {0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x0E}},
+      {'V', {0x11, 0x11, 0x11, 0x11, 0x11, 0x0A, 0x04}},
+      {'W', {0x11, 0x11, 0x11, 0x15, 0x15, 0x15, 0x0A}},
+      {'X', {0x11, 0x11, 0x0A, 0x04, 0x0A, 0x11, 0x11}},
+      {'Y', {0x11, 0x11, 0x0A, 0x04, 0x04, 0x04, 0x04}},
+      {'Z', {0x1F, 0x01, 0x02, 0x04, 0x08, 0x10, 0x1F}},
+      {'!', {0x04, 0x04, 0x04, 0x04, 0x04, 0x00, 0x04}},
+      {'?', {0x0E, 0x11, 0x01, 0x02, 0x04, 0x00, 0x04}},
+      {'-', {0x00, 0x00, 0x00, 0x1F, 0x00, 0x00, 0x00}},
+      {'.', {0x00, 0x00, 0x00, 0x00, 0x00, 0x0C, 0x0C}},
+      {',', {0x00, 0x00, 0x00, 0x00, 0x0C, 0x04, 0x08}},
+      {':', {0x00, 0x0C, 0x0C, 0x00, 0x0C, 0x0C, 0x00}},
+      {'/', {0x01, 0x01, 0x02, 0x04, 0x08, 0x10, 0x10}},
+  };
+  const auto upper = static_cast<char>(std::toupper(static_cast<unsigned char>(ch)));
+  const auto found = glyphs.find(upper);
+  return found == glyphs.end() ? nullptr : &found->second;
+}
+
+}  // namespace
+
+PixelBuffer render_placeholder_text(std::string_view text, std::int32_t width, std::int32_t height) {
+  width = std::max<std::int32_t>(width, static_cast<std::int32_t>(std::min<std::size_t>(text.size(), 64) * 14U + 8U));
+  height = std::max<std::int32_t>(height, 28);
+  PixelBuffer pixels(width, height, PixelFormat::rgba8());
+  pixels.clear(0);
+
+  constexpr int scale = 2;
+  constexpr int glyph_width = 5;
+  constexpr int glyph_height = 7;
+  const int advance = (glyph_width + 1) * scale;
+  int cursor_x = 2;
+  int cursor_y = 4;
+  for (const auto ch : text) {
+    if (ch == '\r') {
+      continue;
+    }
+    if (ch == '\n') {
+      cursor_x = 2;
+      cursor_y += (glyph_height + 2) * scale;
+      continue;
+    }
+    if (ch == ' ') {
+      cursor_x += advance;
+      continue;
+    }
+    if (cursor_x + glyph_width * scale >= width) {
+      cursor_x = 2;
+      cursor_y += (glyph_height + 2) * scale;
+    }
+    if (cursor_y + glyph_height * scale >= height) {
+      break;
+    }
+
+    const auto* glyph = glyph_for(ch);
+    if (glyph != nullptr) {
+      for (int gy = 0; gy < glyph_height; ++gy) {
+        for (int gx = 0; gx < glyph_width; ++gx) {
+          if (((*glyph)[static_cast<std::size_t>(gy)] & (1U << (glyph_width - 1 - gx))) == 0U) {
+            continue;
+          }
+          for (int sy = 0; sy < scale; ++sy) {
+            for (int sx = 0; sx < scale; ++sx) {
+              const auto x = cursor_x + gx * scale + sx;
+              const auto y = cursor_y + gy * scale + sy;
+              if (x >= 0 && y >= 0 && x < width && y < height) {
+                auto* px = pixels.pixel(x, y);
+                px[0] = 0;
+                px[1] = 0;
+                px[2] = 0;
+                px[3] = 255;
+              }
+            }
+          }
+        }
+      }
+    }
+    cursor_x += advance;
+  }
+  return pixels;
+}
+
+bool has_visible_alpha(const PixelBuffer& pixels) {
+  if (pixels.empty() || pixels.format().bit_depth != BitDepth::UInt8) {
+    return false;
+  }
+  if (pixels.format().channels < 4) {
+    for (const auto byte : pixels.data()) {
+      if (byte != 0U) {
+        return true;
+      }
+    }
+    return false;
+  }
+  for (std::size_t offset = 3; offset < pixels.data().size(); offset += pixels.format().channels) {
+    if (pixels.data()[offset] != 0U) {
+      return true;
+    }
+  }
+  return false;
+}
+
+std::optional<Rect> visible_pixel_local_bounds(const PixelBuffer& pixels) {
+  if (pixels.empty() || pixels.format().bit_depth != BitDepth::UInt8 || pixels.format().channels < 3) {
+    return std::nullopt;
+  }
+  if (pixels.format().channels < 4) {
+    return Rect{0, 0, pixels.width(), pixels.height()};
+  }
+
+  std::int32_t min_x = pixels.width();
+  std::int32_t min_y = pixels.height();
+  std::int32_t max_x = -1;
+  std::int32_t max_y = -1;
+  for (std::int32_t y = 0; y < pixels.height(); ++y) {
+    for (std::int32_t x = 0; x < pixels.width(); ++x) {
+      if (pixels.pixel(x, y)[3] == 0U) {
+        continue;
+      }
+      min_x = std::min(min_x, x);
+      min_y = std::min(min_y, y);
+      max_x = std::max(max_x, x);
+      max_y = std::max(max_y, y);
+    }
+  }
+  if (max_x < min_x || max_y < min_y) {
+    return std::nullopt;
+  }
+  return Rect{min_x, min_y, max_x - min_x + 1, max_y - min_y + 1};
+}
+
+std::optional<PsdTextBoundsD> visible_text_local_bounds_from_layer_pixels(const Layer& layer, const Rect& visible,
+                                                                          const std::array<double, 6>& transform) {
+  const auto determinant = transform[0] * transform[3] - transform[1] * transform[2];
+  if (!std::isfinite(determinant) || std::abs(determinant) < 0.000001) {
+    return std::nullopt;
+  }
+  const auto map_doc_to_local = [&transform, determinant](double x, double y) {
+    const auto dx = x - transform[4];
+    const auto dy = y - transform[5];
+    return std::array<double, 2>{(transform[3] * dx - transform[2] * dy) / determinant,
+                                 (-transform[1] * dx + transform[0] * dy) / determinant};
+  };
+
+  const auto left = static_cast<double>(layer.bounds().x + visible.x);
+  const auto top = static_cast<double>(layer.bounds().y + visible.y);
+  const auto right = static_cast<double>(layer.bounds().x + visible.x + visible.width);
+  const auto bottom = static_cast<double>(layer.bounds().y + visible.y + visible.height);
+  const std::array<std::array<double, 2>, 4> points = {
+      map_doc_to_local(left, top),
+      map_doc_to_local(right, top),
+      map_doc_to_local(right, bottom),
+      map_doc_to_local(left, bottom),
+  };
+
+  auto min_x = points.front()[0];
+  auto max_x = points.front()[0];
+  auto min_y = points.front()[1];
+  auto max_y = points.front()[1];
+  for (const auto& point : points) {
+    if (!std::isfinite(point[0]) || !std::isfinite(point[1])) {
+      return std::nullopt;
+    }
+    min_x = std::min(min_x, point[0]);
+    max_x = std::max(max_x, point[0]);
+    min_y = std::min(min_y, point[1]);
+    max_y = std::max(max_y, point[1]);
+  }
+  if (max_x <= min_x || max_y <= min_y) {
+    return std::nullopt;
+  }
+  return PsdTextBoundsD{min_x, min_y, max_x, max_y};
+}
+
+int estimate_text_size_from_alpha(const PixelBuffer& pixels) {
+  if (pixels.empty() || pixels.format().bit_depth != BitDepth::UInt8 || pixels.format().channels < 4) {
+    return 48;
+  }
+
+  std::vector<int> visible_runs;
+  bool in_run = false;
+  int run_start = 0;
+  int blank_rows = 0;
+  for (std::int32_t y = 0; y < pixels.height(); ++y) {
+    bool row_has_ink = false;
+    for (std::int32_t x = 0; x < pixels.width(); ++x) {
+      if (pixels.pixel(x, y)[3] >= 8) {
+        row_has_ink = true;
+        break;
+      }
+    }
+
+    if (row_has_ink) {
+      if (!in_run) {
+        in_run = true;
+        run_start = y;
+      }
+      blank_rows = 0;
+      continue;
+    }
+
+    if (in_run) {
+      ++blank_rows;
+      if (blank_rows >= 3) {
+        visible_runs.push_back(std::max(1, y - blank_rows + 1 - run_start));
+        in_run = false;
+        blank_rows = 0;
+      }
+    }
+  }
+  if (in_run) {
+    visible_runs.push_back(std::max(1, pixels.height() - blank_rows - run_start));
+  }
+
+  if (visible_runs.empty()) {
+    return 48;
+  }
+
+  std::sort(visible_runs.begin(), visible_runs.end());
+  const auto median_ink_height = visible_runs[visible_runs.size() / 2U];
+  return std::clamp(static_cast<int>(std::lround(static_cast<double>(median_ink_height) * 1.35)), 8, 220);
+}
+
+namespace {
+
+std::optional<Rect> descriptor_bounds_rect(const DescriptorObject& object, std::string_view key) {
+  const auto* bounds = descriptor_object(object, key);
+  if (bounds == nullptr) {
+    return std::nullopt;
+  }
+  const auto left = descriptor_number(*bounds, "Left", 0.0);
+  const auto top = descriptor_number(*bounds, "Top ", 0.0);
+  const auto right = descriptor_number(*bounds, "Rght", left);
+  const auto bottom = descriptor_number(*bounds, "Btom", top);
+  const auto width = static_cast<std::int32_t>(std::max(0.0, std::round(right - left)));
+  const auto height = static_cast<std::int32_t>(std::max(0.0, std::round(bottom - top)));
+  if (width <= 0 || height <= 0) {
+    return std::nullopt;
+  }
+  return Rect{static_cast<std::int32_t>(std::round(left)), static_cast<std::int32_t>(std::round(top)), width, height};
+}
+
+std::optional<PsdTextBoundsD> descriptor_bounds(const DescriptorObject& object, std::string_view key) {
+  const auto* bounds = descriptor_object(object, key);
+  if (bounds == nullptr) {
+    return std::nullopt;
+  }
+  const auto left = descriptor_number(*bounds, "Left", 0.0);
+  const auto top = descriptor_number(*bounds, "Top ", 0.0);
+  const auto right = descriptor_number(*bounds, "Rght", left);
+  const auto bottom = descriptor_number(*bounds, "Btom", top);
+  if (!std::isfinite(left) || !std::isfinite(top) || !std::isfinite(right) || !std::isfinite(bottom)) {
+    return std::nullopt;
+  }
+  return PsdTextBoundsD{left, top, right, bottom};
+}
+
+std::optional<PsdTextBoundsD> extract_engine_box_bounds(std::span<const std::uint8_t> payload) {
+  const std::string_view text(reinterpret_cast<const char*>(payload.data()), payload.size());
+  const auto range = balanced_range_after(text, "/BoxBounds", '[', ']');
+  if (!range.has_value()) {
+    return std::nullopt;
+  }
+  const auto values = parse_engine_number_array(text.substr(range->first, range->second - range->first));
+  if (values.size() < 4U) {
+    return std::nullopt;
+  }
+  return PsdTextBoundsD{values[0], values[1], values[2], values[3]};
+}
+
+bool engine_data_describes_box_text(std::span<const std::uint8_t> payload) {
+  const std::string_view text(reinterpret_cast<const char*>(payload.data()), payload.size());
+  return text.find("/BoxBounds") != std::string_view::npos && text.find("/ShapeType 1") != std::string_view::npos;
+}
+
+}  // namespace
+
+std::optional<PsdTextGeometry> extract_type_tool_geometry(std::span<const std::uint8_t> payload) {
+  try {
+    BigEndianReader reader(payload);
+    if (reader.remaining() < 2U + 6U * 8U + 2U + 4U) {
+      return std::nullopt;
+    }
+    PsdTextGeometry geometry;
+    (void)reader.read_u16();
+    for (double& value : geometry.transform) {
+      value = read_f64(reader);
+    }
+    (void)reader.read_u16();
+    (void)reader.read_u32();
+    const auto descriptor = read_descriptor(reader);
+    geometry.bounds = descriptor_bounds(descriptor, "bounds").value_or(geometry.bounds);
+    geometry.bounding_box = descriptor_bounds(descriptor, "boundingBox").value_or(geometry.bounds);
+    if (const auto* text_index = descriptor_value(descriptor, "TextIndex");
+        text_index != nullptr && text_index->type == DescriptorValue::Type::Integer) {
+      geometry.text_index = text_index->integer_value;
+    }
+    if (const auto* orientation = descriptor_value(descriptor, "Ornt");
+        orientation != nullptr && orientation->type == DescriptorValue::Type::Enum) {
+      geometry.vertical = orientation->enum_value == "Vrtc";
+    }
+    // The warp descriptor follows the text descriptor (Warp Text: style + bend +
+    // distortions, acting over the 'bounds' box). A malformed warp degrades to "no
+    // warp" without losing the text geometry.
+    try {
+      if (reader.remaining() >= 6U) {
+        (void)reader.read_u16();  // warp version (1)
+        (void)reader.read_u32();  // descriptor version (16)
+        const auto warp_descriptor = read_descriptor(reader);
+        TextWarp warp;
+        if (const auto* style = descriptor_value(warp_descriptor, "warpStyle");
+            style != nullptr && style->type == DescriptorValue::Type::Enum) {
+          warp.style = style->enum_value;
+        }
+        warp.value = descriptor_number(warp_descriptor, "warpValue", 0.0);
+        warp.perspective = descriptor_number(warp_descriptor, "warpPerspective", 0.0);
+        warp.perspective_other = descriptor_number(warp_descriptor, "warpPerspectiveOther", 0.0);
+        if (const auto* rotate = descriptor_value(warp_descriptor, "warpRotate");
+            rotate != nullptr && rotate->type == DescriptorValue::Type::Enum) {
+          warp.rotate = rotate->enum_value;
+        }
+        warp.bounds_left = geometry.bounds.left;
+        warp.bounds_top = geometry.bounds.top;
+        warp.bounds_right = geometry.bounds.right;
+        warp.bounds_bottom = geometry.bounds.bottom;
+        if (!text_warp_is_identity(warp)) {
+          geometry.warp = std::move(warp);
+        }
+      }
+    } catch (const std::exception&) {
+    }
+    geometry.box_bounds = extract_engine_box_bounds(payload).value_or(PsdTextBoundsD{
+        0.0, 0.0, std::max(1.0, geometry.bounds.right - geometry.bounds.left), std::max(1.0, geometry.bounds.bottom)});
+    if (payload.size() >= 16U) {
+      const auto tail_offset = payload.size() - 16U;
+      for (std::size_t index = 0; index < geometry.tail_bounds.size(); ++index) {
+        geometry.tail_bounds[index] = static_cast<int>(static_cast<std::int32_t>(
+            (static_cast<std::uint32_t>(payload[tail_offset + index * 4U]) << 24U) |
+            (static_cast<std::uint32_t>(payload[tail_offset + index * 4U + 1U]) << 16U) |
+            (static_cast<std::uint32_t>(payload[tail_offset + index * 4U + 2U]) << 8U) |
+            static_cast<std::uint32_t>(payload[tail_offset + index * 4U + 3U])));
+      }
+    }
+    return geometry;
+  } catch (const std::exception&) {
+    return std::nullopt;
+  }
+}
+
+std::optional<int> extract_type_tool_anti_alias(std::span<const std::uint8_t> payload) {
+  try {
+    BigEndianReader reader(payload);
+    if (reader.remaining() < 2U + 6U * 8U + 2U + 4U) {
+      return std::nullopt;
+    }
+    (void)reader.read_u16();
+    for (int i = 0; i < 6; ++i) {
+      (void)read_f64(reader);
+    }
+    (void)reader.read_u16();
+    (void)reader.read_u32();
+    const auto descriptor = read_descriptor(reader);
+    const auto* method = descriptor_value(descriptor, "AntA");
+    if (method == nullptr || method->type != DescriptorValue::Type::Enum) {
+      return std::nullopt;
+    }
+    // The enum values Photoshop writes (write side: photoshop_anti_alias_enum).
+    const std::string_view name = method->enum_value;
+    if (name == "Anno") return kTextAntiAliasNone;
+    if (name == "AnCr") return kTextAntiAliasCrisp;
+    if (name == "AnSt") return kTextAntiAliasStrong;
+    if (name == "AnSm") return kTextAntiAliasSmooth;
+    if (name == "antiAliasSharp") return kTextAntiAliasSharp;
+    if (name == "antiAliasPlatformLCD") return kTextAntiAliasWindowsLcd;
+    if (name == "antiAliasPlatformGray") return kTextAntiAliasWindows;
+    return std::nullopt;
+  } catch (const std::exception&) {
+    return std::nullopt;
+  }
+}
+
+std::optional<Rect> extract_type_tool_text_box(std::span<const std::uint8_t> payload) {
+  if (!engine_data_describes_box_text(payload)) {
+    return std::nullopt;
+  }
+  if (const auto box_bounds = extract_engine_box_bounds(payload); box_bounds.has_value()) {
+    const auto left = static_cast<std::int32_t>(std::round(box_bounds->left));
+    const auto top = static_cast<std::int32_t>(std::round(box_bounds->top));
+    const auto width = static_cast<std::int32_t>(std::max(0.0, std::round(box_bounds->right - box_bounds->left)));
+    const auto height = static_cast<std::int32_t>(std::max(0.0, std::round(box_bounds->bottom - box_bounds->top)));
+    if (width > 0 && height > 0) {
+      return Rect{left, top, width, height};
+    }
+  }
+  try {
+    BigEndianReader reader(payload);
+    if (reader.remaining() < 2U + 6U * 8U + 2U + 4U) {
+      return std::nullopt;
+    }
+    (void)reader.read_u16();
+    for (int i = 0; i < 6; ++i) {
+      (void)read_f64(reader);
+    }
+    (void)reader.read_u16();
+    (void)reader.read_u32();
+    const auto descriptor = read_descriptor(reader);
+    if (auto bounds = descriptor_bounds_rect(descriptor, "bounds"); bounds.has_value()) {
+      return bounds;
+    }
+    return descriptor_bounds_rect(descriptor, "boundingBox");
+  } catch (const std::exception&) {
+    return std::nullopt;
+  }
+}
+
+}  // namespace patchy::psd

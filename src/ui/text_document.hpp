@@ -1,0 +1,188 @@
+#pragma once
+// Text document construction and run formatting shared by editing and rendering.
+// No window or canvas ownership crosses this interface.
+#include "core/text_path.hpp"
+#include "core/vector_shape.hpp"
+#include "ui/text_font_service.hpp"
+#include <QColor>
+#include <QFont>
+#include <QString>
+#include <QTextDocument>
+#include <QTextCharFormat>
+#include <algorithm>
+#include <cmath>
+#include <cstdint>
+#include <memory>
+#include <optional>
+namespace patchy::ui {
+inline constexpr int kMinimumTextBoxDocumentSize = 16;
+
+// The whole-pixel layout width (or height) of a Photoshop text frame edge: BoxBounds mapped
+// through the TySh matrix, rounded up so a fractional box (100.3) never wraps a line Photoshop
+// fits. The matrix doubles carry rounding noise (psd-tools type-layer.psd: xx
+// 1.0000000000000002 makes its 32 px box 32.000000000000007), which a plain ceil grew to 33,
+// and Qt then centred the line half a pixel right of Photoshop's
+// (docs/text-render-calibration.md, "Tracking and alignment").
+[[nodiscard]] inline int psd_text_frame_extent_pixels(double extent) {
+  constexpr double kMatrixNoise = 1e-6;
+  return std::max(kMinimumTextBoxDocumentSize, static_cast<int>(std::ceil(extent - kMatrixNoise)));
+}
+// True when the settings describe text along a path (a horizontal story with a valid contour).
+struct TextToolSettings;
+[[nodiscard]] bool text_settings_on_path(const TextToolSettings& settings);
+
+struct TextToolSettings {
+  QString text;
+  QString html;
+  QString family;
+  int size{36};
+  bool bold{false};
+  bool italic{false};
+  int anti_alias{3};
+  bool boxed{false};
+  int box_width{0};
+  int box_height{0};
+  // Photoshop leading-model layout (kLayerMetadataTextLayoutMode == "photoshop"): baselines
+  // advance by each entered line's max leading instead of Qt's natural spacing.
+  bool photoshop_layout{false};
+  // Vertical type (kLayerMetadataTextOrientation == "vertical"): upright glyphs stacked in
+  // columns that advance right to left. See ui/text_layout.hpp.
+  bool vertical{false};
+  std::optional<VectorPath> area{std::nullopt};
+  // Text along a path (docs/path-text.md): the contour in text-local coordinates and the range
+  // the first line is set in. Excludes `area` and `boxed`; vertical type is not set on paths.
+  std::optional<VectorPath> path{std::nullopt};
+  TextPathRange path_range{};
+  // Box text normally hides the lines whose baseline is past the frame (GitHub issue 621). The
+  // imported-text metric calibration keeps them: a too-wide substituted font shows as extra lines.
+  bool keep_overflow_lines{false};
+};
+
+
+// The document a text layer is rasterized from, plus the font/width the layout was built against.
+// Built by build_text_render_document -- the single construction shared by the rasterizer and the
+// caret/selection layout so glyphs and caret geometry can never diverge.
+struct TextRenderDocument {
+  std::unique_ptr<QTextDocument> document;
+  QFont font;
+  int text_width{0};
+};
+
+
+// Paragraph alignment names: patchy.text.paragraph_runs column 2 and the script API's align
+// values, persisted, so never rename one. left, center, right, then Photoshop's justify modes,
+// which differ only in the last line: justify (last line left), justifyCenter, justifyRight and
+// justifyAll (the last line spread too). A justified block is Qt::AlignJustify plus its
+// kTextBlockJustifyLastLineProperty.
+QString paragraph_alignment_name(const QTextBlockFormat& format);
+// The canonical spelling of an alignment name (any letter case), empty when it is none.
+QString canonical_paragraph_alignment_name(const QString& name);
+// Qt's horizontal alignment for a name: every justify mode is Qt::AlignJustify.
+Qt::Alignment paragraph_alignment_from_name(const QString& name);
+// Sets the alignment and the justified last line of `format` (an unknown name is left).
+void set_paragraph_alignment(QTextBlockFormat& format, const QString& name);
+
+// What holds a paragraph's lines, for the alignment the controls offer: a text box (area text
+// too) takes every mode; point text and text on a path are one line with no justify choice.
+enum class TextAlignmentFlow { Box, Point, Path };
+
+// Stored names are logical, as Qt and Photoshop keep them: "left" is the paragraph's start edge,
+// which is the right in a right-to-left paragraph, and justifyRight sets the last line at the
+// end edge. The controls show and take sides. This swaps left with right and justify with
+// justifyRight for a right-to-left paragraph and is its own inverse, so it turns a stored name
+// into the shown one and a picked one into the stored one.
+QString paragraph_alignment_name_for_direction(const QString& name, Qt::LayoutDirection direction);
+// The plain alignment a justify mode comes to where there is no justify choice (GitHub issue
+// 717): point text sets every mode at its start edge; a line on a path follows the mode's last
+// line (Photoshop draws it so), with Justify all read as Left. Other names pass through.
+QString plain_paragraph_alignment_name(const QString& name, TextAlignmentFlow flow);
+// The name the alignment controls show for a stored one: the plain alignment outside a box,
+// then the side for the paragraph's direction.
+QString shown_paragraph_alignment_name(const QString& stored, Qt::LayoutDirection direction,
+                                       TextAlignmentFlow flow);
+// The name to store for one a control picked: the inverse of shown_paragraph_alignment_name.
+// A justify mode picked for point or path text is stored as its plain alignment.
+QString stored_paragraph_alignment_name(const QString& shown, Qt::LayoutDirection direction,
+                                        TextAlignmentFlow flow);
+void set_text_display_family(QTextCharFormat& format, const QString& family);
+QString text_display_family_from_format(const QTextCharFormat& format, const QString& fallback);
+QTextCharFormat text_format_with_smoothing(QTextCharFormat format, int anti_alias);
+void apply_text_smoothing_to_document(QTextDocument& document, int anti_alias);
+void set_stretch_for_advance_ratio(QFont& font, double ratio, int naive_value);
+void scale_document_font_sizes(QTextDocument& document, double scale);
+std::unique_ptr<QTextDocument> copy_text_document_formats(const QTextDocument& source);
+QString rich_text_runs_from_document(const QTextDocument& document, const TextToolSettings& fallback,
+                                     QColor fallback_color);
+// A runs-list version header ("v1" .. "v9", or a later one).
+bool is_text_runs_version_line(const QString& line);
+// The character-panel styles of one format (runs v9 column 16, GitHub issue 346): caps 1 Small
+// Caps, 2 All Caps; baseline 1 superscript, 2 subscript.
+struct TextCharacterStyles {
+  int caps{0};
+  int baseline{0};
+  bool underline{false};
+  bool strikethrough{false};
+  bool ordinals{false};
+  bool fractions{false};
+  bool ligatures{true};
+  bool contextual_alternates{false};
+  bool discretionary_ligatures{false};
+  bool swash{false};
+  bool stylistic_alternates{false};
+  bool titling_alternates{false};
+  // Photoshop's hyphenation and spelling language, Txt2 numbering; -1 unset (GitHub issue 682).
+  // Patchy draws nothing from it: it is kept so a Photoshop file's text keeps its tag.
+  int language{-1};
+  // Photoshop's Middle Eastern settings (digit set, diacritic x and y offsets, mark distance
+  // from the baseline, Justification Alternates), kept for the file like the language (GitHub
+  // issue 683; psd::PsdTextStyleRun has the values).
+  int digit_set{0};
+  double diacritic_x_offset{0.0};
+  double diacritic_y_offset{0.0};
+  double mark_y_distance{100.0};
+  bool justification_alternates{false};
+  // Photoshop's kerning (0 manual with `kerning` in 1/1000 em, 1 Metrics, 2 Optical), kept for
+  // the file the same way; Patchy draws with the font's own pair kerning.
+  int kerning_mode{1};
+  double kerning{0.0};
+  [[nodiscard]] bool any() const noexcept {
+    return caps != 0 || baseline != 0 || underline || strikethrough || ordinals || fractions || !ligatures ||
+           contextual_alternates || discretionary_ligatures || swash || stylistic_alternates || titling_alternates ||
+           language >= 0 || digit_set != 0 || diacritic_x_offset != 0.0 || diacritic_y_offset != 0.0 ||
+           mark_y_distance != 100.0 || justification_alternates || kerning_mode != 1;
+  }
+  // Any OpenType feature request other than Photoshop's defaults (ligatures on, the rest off).
+  [[nodiscard]] bool any_features() const noexcept {
+    return ordinals || fractions || !ligatures || contextual_alternates || discretionary_ligatures || swash ||
+           stylistic_alternates || titling_alternates;
+  }
+  friend bool operator==(const TextCharacterStyles&, const TextCharacterStyles&) = default;
+};
+TextCharacterStyles text_character_styles_from_format(const QTextCharFormat& format);
+void set_text_character_styles_on_format(QTextCharFormat& format, const TextCharacterStyles& styles);
+QString serialize_text_character_styles(const TextCharacterStyles& styles);
+TextCharacterStyles parse_text_character_styles(const QString& field);
+// Render documents (build_text_render_document): turns the character styles into fonts, baseline
+// shifts and OpenType feature fragments. Underline and strikethrough stay flags; the render plan
+// draws them. Vertical text takes the caps only.
+void apply_text_character_styles_to_document(QTextDocument& document, bool vertical);
+// A render-document fragment drawn from its own featured shaping, and the font that shaping uses.
+bool text_format_has_render_features(const QTextCharFormat& format);
+QFont text_render_featured_font(const QTextCharFormat& format);
+QString paragraph_runs_from_document(const QTextDocument& document);
+void apply_paragraph_runs_to_document(QTextDocument& document, const QString& paragraph_runs, double scale = 1.0);
+void apply_patchy_text_runs_to_document(QTextDocument& document, const QString& runs_text, const QFont& fallback_font,
+                                        QColor fallback_color, double scale, int anti_alias);
+QString document_html_from_text_runs(const QString& text, const QString& rich_text_runs,
+                                     const TextToolSettings& fallback, QColor fallback_color);
+// `replacements` (Resolve Missing Fonts) swaps only the families it names and leaves every other
+// missing family as it is; without it each missing family moves to the face drawing it.
+void substitute_missing_document_font_families(QTextDocument& document,
+                                               const TextFontReplacements* replacements = nullptr);
+TextRenderDocument build_text_render_document(const TextToolSettings& settings, QColor color,
+                                              std::int32_t max_width, const QString& paragraph_runs,
+                                              const QString& rich_text_runs, double metric_scale,
+                                              double layout_scale = 1.0, double box_scale = 1.0);
+QString first_text_run_style_name(const QString& rich_text_runs);
+
+}  // namespace patchy::ui

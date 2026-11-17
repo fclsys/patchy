@@ -1,0 +1,4811 @@
+#include "ui/appearance_properties.hpp"
+#include "ui/app_settings.hpp"
+#include "ui/layer_style_dialog.hpp"
+#include "ui/layer_style_dialog_controls.hpp"
+#include "ui/layer_style_gradient_controls.hpp"
+#include "ui/layer_style_effect_pages.hpp"
+
+#include "core/contour_editing.hpp"
+#include "core/contour_presets.hpp"
+#include "core/pattern_presets.hpp"
+#include "core/style_contour.hpp"
+#include "ui/blend_if_range_editor.hpp"
+#include "ui/blend_mode_ui.hpp"
+#include "ui/canvas_widget.hpp"
+#include "ui/coalesced_preview_emitter.hpp"
+#include "ui/color_panel.hpp"
+#include "ui/contour_editor_dialog.hpp"
+#include "ui/contour_library.hpp"
+#include "ui/dialog_utils.hpp"
+#include "ui/gradient_stops_editor.hpp"
+#include "ui/modifier_names.hpp"
+#include "ui/pattern_library.hpp"
+#include "ui/pattern_manager_dialog.hpp"
+#include "ui/photo_pattern_presets.hpp"
+#include "ui/preset_grid_widget.hpp"
+#include "psd/asl_io.hpp"
+#include "ui/style_browser.hpp"
+#include "ui/style_library.hpp"
+#include "ui/ui_profile.hpp"
+#include "ui/style_manager_dialog.hpp"
+#include "ui/theme_palette.hpp"
+#include "ui/theme_qss.hpp"
+#include "ui/localization.hpp"
+#include "ui/measurement_units.hpp"
+#include "ui/ui_text_size.hpp"
+
+#include <QAbstractButton>
+#include <QAbstractItemView>
+#include <QApplication>
+#include <QCheckBox>
+#include <QColor>
+#include <QComboBox>
+#include <QDialog>
+#include <QDialogButtonBox>
+#include <QEvent>
+#include <QFormLayout>
+#include <QFrame>
+#include <QGuiApplication>
+#include <QGroupBox>
+#include <QHBoxLayout>
+#include <QHash>
+#include <QIcon>
+#include <QIconEngine>
+#include <QImage>
+#include <QInputDialog>
+#include <QLabel>
+#include <QLineEdit>
+#include <QListWidget>
+#include <QMenu>
+#include <QMessageBox>
+#include <QMouseEvent>
+#include <QObject>
+#include <QPainter>
+#include <QPen>
+#include <QPixmap>
+#include <QPointer>
+#include <QPolygonF>
+#include <QPushButton>
+#include <QRadioButton>
+#include <QResizeEvent>
+#include <QScreen>
+#include <QScrollArea>
+#include <QScrollBar>
+#include <QSignalBlocker>
+#include <QSize>
+#include <QSizePolicy>
+#include <QSlider>
+#include <QSpinBox>
+#include <QStackedWidget>
+#include <QString>
+#include <QStyle>
+#include <QStyleOption>
+#include <QTimer>
+#include <QToolButton>
+#include <QTreeWidget>
+#include <QVBoxLayout>
+#include <QWidget>
+
+#include <algorithm>
+#include <array>
+#include <chrono>
+#include <cmath>
+#include <cstdint>
+#include <cstring>
+#include <functional>
+#include <memory>
+#include <optional>
+#include <type_traits>
+#include <utility>
+
+namespace patchy::ui {
+
+using namespace layer_style_detail;
+
+namespace {
+
+class GradientCanvasRepositionFilter final : public QObject {
+public:
+  GradientCanvasRepositionFilter(CanvasWidget *canvas, Rect layer_bounds,
+                                 std::function<bool()> enabled,
+                                 std::function<void(float, float)> moved,
+                                 QObject *parent)
+      : QObject(parent), canvas_(canvas), layer_bounds_(layer_bounds),
+        enabled_(std::move(enabled)), moved_(std::move(moved)) {
+    canvas_->installEventFilter(this);
+  }
+
+protected:
+  bool eventFilter(QObject *watched, QEvent *event) override {
+    if (watched != canvas_)
+      return QObject::eventFilter(watched, event);
+    if (event->type() == QEvent::MouseButtonPress) {
+      const auto *mouse = static_cast<QMouseEvent *>(event);
+      if (mouse->button() != Qt::LeftButton || !enabled_())
+        return false;
+      dragging_ = true;
+      last_position_ = mouse->position();
+      canvas_->grabMouse();
+      return true;
+    }
+    if (event->type() == QEvent::MouseMove && dragging_) {
+      const auto *mouse = static_cast<QMouseEvent *>(event);
+      const auto delta = mouse->position() - last_position_;
+      last_position_ = mouse->position();
+      if (!canvas_->view_axis_aligned()) {
+        // A rotated view: the drag in document pixels, whatever its screen direction.
+        const auto document_delta = canvas_->view_transform().map_vector_to_document(delta);
+        moved_(static_cast<float>(document_delta.x() * 100.0 / std::max(1, layer_bounds_.width)),
+               static_cast<float>(document_delta.y() * 100.0 / std::max(1, layer_bounds_.height)));
+        return true;
+      }
+      const auto origin = canvas_->widget_position_for_document_point(
+          QPoint(layer_bounds_.x, layer_bounds_.y));
+      const auto opposite = canvas_->widget_position_for_document_point(
+          QPoint(layer_bounds_.x + std::max(1, layer_bounds_.width),
+                 layer_bounds_.y + std::max(1, layer_bounds_.height)));
+      const auto pixels_per_document_x = std::max(
+          0.0001, std::abs(opposite.x() - origin.x()) /
+                      static_cast<double>(std::max(1, layer_bounds_.width)));
+      const auto pixels_per_document_y = std::max(
+          0.0001, std::abs(opposite.y() - origin.y()) /
+                      static_cast<double>(std::max(1, layer_bounds_.height)));
+      moved_(static_cast<float>(delta.x() / pixels_per_document_x * 100.0 /
+                                std::max(1, layer_bounds_.width)),
+             static_cast<float>(delta.y() / pixels_per_document_y * 100.0 /
+                                std::max(1, layer_bounds_.height)));
+      return true;
+    }
+    if (event->type() == QEvent::MouseButtonRelease && dragging_) {
+      dragging_ = false;
+      canvas_->releaseMouse();
+      return true;
+    }
+    return false;
+  }
+
+private:
+  CanvasWidget *canvas_{};
+  Rect layer_bounds_{};
+  std::function<bool()> enabled_;
+  std::function<void(float, float)> moved_;
+  bool dragging_{false};
+  QPointF last_position_{};
+};
+
+// One settings page in the options stack. A QStackedWidget is as large as its
+// largest page (its layout, hint and height-for-width ask every page), so a
+// short page sat in a pane as tall as the tallest one and scrolled over empty
+// space (GitHub issue 606 follow-up 4). Pages other than the current one report
+// no size, so the stack and its scroll area size to the page that shows;
+// `full_minimum_size()` still gives a page's real minimum, which
+// OptionsPaneScreenCap uses so the dialog and pane keep the tallest page's
+// size and changing pages never resizes the window.
+class LayerStyleSettingsPage final : public QWidget {
+public:
+  using QWidget::QWidget;
+
+  void set_counts_toward_size(bool counts) {
+    if (counts_ != counts) {
+      counts_ = counts;
+      updateGeometry();
+    }
+  }
+
+  [[nodiscard]] QSize full_minimum_size() const {
+    return QWidget::minimumSizeHint().expandedTo(minimumSize());
+  }
+
+  [[nodiscard]] QSize sizeHint() const override { return counts_ ? QWidget::sizeHint() : QSize(0, 0); }
+  [[nodiscard]] QSize minimumSizeHint() const override {
+    return counts_ ? QWidget::minimumSizeHint() : QSize(0, 0);
+  }
+  [[nodiscard]] int heightForWidth(int width) const override {
+    return counts_ ? QWidget::heightForWidth(width) : 0;
+  }
+
+private:
+  bool counts_{true};
+};
+
+// The minimum size that holds every page of the options stack, whichever page
+// shows (see LayerStyleSettingsPage).
+QSize options_stack_full_minimum_size(const QStackedWidget& stack) {
+  QSize size(0, 0);
+  for (int index = 0; index < stack.count(); ++index) {
+    const auto* widget = stack.widget(index);
+    const auto* page = dynamic_cast<const LayerStyleSettingsPage*>(widget);
+    size = size.expandedTo(page != nullptr ? page->full_minimum_size() : widget->minimumSizeHint());
+  }
+  const auto margins = stack.contentsMargins();
+  return size.grownBy(margins);
+}
+
+// Only the current page counts toward the stack's size.
+void fit_options_stack_to_current_page(QStackedWidget& stack) {
+  for (int index = 0; index < stack.count(); ++index) {
+    if (auto* page = dynamic_cast<LayerStyleSettingsPage*>(stack.widget(index)); page != nullptr) {
+      page->set_counts_toward_size(index == stack.currentIndex());
+    }
+  }
+  if (stack.layout() != nullptr) {
+    stack.layout()->invalidate();
+  }
+  stack.updateGeometry();
+}
+
+// GitHub issue 190: on a 768 px screen the tallest settings page ran the
+// dialog past the bottom edge, OK and Cancel included. The pages sit in a
+// scroll area whose minimum follows the stacked pages up to `budget` (what the
+// screen leaves for the pane), so on a tall screen the dialog opens and grows
+// exactly as tall as its tallest page needs, and on a short one the pane
+// scrolls instead. A page that changes size later re-syncs through its
+// LayoutRequest. The budget is measured before the dialog shows; when the
+// shown dialog still overflows `max_height` (Qt's own sizing adds what the
+// measurement missed), the first Show takes the overflow out of the pane.
+// A screen narrower than the dialog's minimum width (larger Linux fonts plus
+// the capped pane's scroll bar made it 803 px on an 800 px screen) takes the
+// width overflow out of the pane the same way, which then scrolls sideways.
+// GitHub issue 536: once shown, the pane keeps only a small minimum height, so
+// the user can drag the dialog shorter than its tallest page and the pane
+// scrolls; `restored_size` (the size the user last left it at) applies then.
+class OptionsPaneScreenCap final : public QObject {
+public:
+  // `open_height` (0: none) caps the height the dialog first opens at below the
+  // screen cap (GitHub issue 606); the user can still drag it up to `max_size`.
+  OptionsPaneScreenCap(QDialog& dialog, QScrollArea& scroll, QStackedWidget& pages, int budget, QSize max_size,
+                       QSize restored_size, int open_height = 0)
+      : QObject(&scroll), dialog_(dialog), scroll_(scroll), pages_(pages), budget_(budget),
+        max_size_(max_size), restored_size_(restored_size), open_height_(open_height) {
+    pages.installEventFilter(this);
+    dialog.installEventFilter(this);
+    sync();
+  }
+
+  // The size the dialog last gave itself (its first Show, a page that grew
+  // it); invalid until shown. A different size at close is the user's.
+  [[nodiscard]] QSize own_size() const { return own_size_; }
+
+  // A widget outside the scroll area (the Style Presets list) whose opening
+  // minimum height drops to `shown_minimum` once the dialog is resizable, so
+  // it shrinks with the dialog instead of holding it tall.
+  void set_shrink_after_show(QWidget& widget, int shown_minimum) {
+    shrink_after_show_ = &widget;
+    shrink_after_show_minimum_ = shown_minimum;
+  }
+
+protected:
+  bool eventFilter(QObject* watched, QEvent* event) override {
+    if (watched == &pages_ && event->type() == QEvent::LayoutRequest) {
+      sync();
+    } else if (watched == &dialog_ && event->type() == QEvent::Show && !fitted_) {
+      fitted_ = true;
+      fit_to_screen();
+      make_resizable();
+      own_size_ = dialog_.size();
+    }
+    return QObject::eventFilter(watched, event);
+  }
+
+private:
+  // The new pane minimum has to reach the dialog's own minimum before a
+  // resize, or the resize clamps to the stale one: the dialog's top layout
+  // still counts as activated, so drop every cached hint on the way up.
+  void refresh_dialog_minimum() {
+    for (QWidget* widget = &scroll_; widget != nullptr && widget != &dialog_; widget = widget->parentWidget()) {
+      widget->updateGeometry();
+    }
+    for (auto* layout : dialog_.findChildren<QLayout*>()) {
+      layout->invalidate();
+    }
+    dialog_.layout()->activate();
+  }
+
+  void make_resizable() {
+    if (dialog_.layout() == nullptr) {
+      return;
+    }
+    const auto pages = options_stack_full_minimum_size(pages_);
+    shown_pages_height_ = pages.height();
+    // The scroll bar room the resizable pane keeps must not push the dialog
+    // past a narrow screen: take what does not fit out of the pane, which
+    // then scrolls sideways (the issue 190 width rule).
+    if (!max_size_.isEmpty() && width_budget_ == 0) {
+      const auto extra = pages.width() + scroll_.verticalScrollBar()->sizeHint().width() - scroll_.minimumWidth();
+      const auto slack = std::max(0, max_size_.width() - dialog_.minimumWidth());
+      if (extra > slack) {
+        width_budget_ = std::max(kMinimumBudget, scroll_.minimumWidth() + slack);
+        scroll_.setHorizontalScrollBarPolicy(Qt::ScrollBarAsNeeded);
+      }
+    }
+    resizable_ = true;
+    if (shrink_after_show_ != nullptr) {
+      shrink_after_show_->setMinimumHeight(std::min(shrink_after_show_->minimumHeight(), shrink_after_show_minimum_));
+    }
+    sync();
+    refresh_dialog_minimum();
+    if (restored_size_.isValid()) {
+      auto size = restored_size_;
+      if (!max_size_.isEmpty()) {
+        size = size.boundedTo(max_size_);
+      }
+      dialog_.resize(size.expandedTo(dialog_.minimumSize()));
+    }
+  }
+
+  // A page that grows after the dialog showed (a Stroke switched to Gradient)
+  // grows the dialog by what it now lacks, up to the screen cap, as long as the
+  // pane showed the whole page before; a pane the user shrank keeps scrolling.
+  void grow_for_taller_pages(int pages_height) {
+    const auto previous = shown_pages_height_;
+    shown_pages_height_ = pages_height;
+    if (!dialog_.isVisible() || pages_height <= previous || scroll_.viewport()->height() < previous) {
+      return;
+    }
+    const auto missing = pages_height - scroll_.viewport()->height();
+    if (missing <= 0) {
+      return;
+    }
+    auto height = dialog_.height() + missing;
+    if (!max_size_.isEmpty()) {
+      height = std::max(dialog_.height(), std::min(height, max_size_.height()));
+    }
+    dialog_.resize(dialog_.width(), height);
+    own_size_ = dialog_.size();
+  }
+
+  void fit_to_screen() {
+    if (max_size_.isEmpty() || dialog_.layout() == nullptr) {
+      return;
+    }
+    dialog_.layout()->activate();
+    const auto height_cap =
+        open_height_ > 0 ? std::min(open_height_, max_size_.height()) : max_size_.height();
+    const auto height_overflow = dialog_.height() - height_cap;
+    const auto width_overflow = dialog_.width() - max_size_.width();
+    if (height_overflow <= 0 && width_overflow <= 0) {
+      return;
+    }
+    if (height_overflow > 0) {
+      budget_ = std::max(kMinimumBudget, std::min(budget_, scroll_.minimumHeight() - height_overflow));
+    }
+    if (width_overflow > 0) {
+      width_budget_ = std::max(kMinimumBudget, scroll_.minimumWidth() - width_overflow);
+      scroll_.setHorizontalScrollBarPolicy(Qt::ScrollBarAsNeeded);
+    }
+    sync();
+    refresh_dialog_minimum();
+    dialog_.resize(width_overflow > 0 ? std::max(max_size_.width(), dialog_.minimumWidth()) : dialog_.width(),
+                   height_overflow > 0 ? std::max(height_cap, dialog_.minimumHeight())
+                                       : dialog_.height());
+  }
+
+  void sync() {
+    const auto minimum = options_stack_full_minimum_size(pages_);
+    if (resizable_) {
+      grow_for_taller_pages(minimum.height());
+    }
+    // Once resizable, the pane may always end up scrolling, so it keeps room
+    // for the scroll bar beside the widest page.
+    const bool capped = resizable_ || minimum.height() > budget_;
+    // A capped pane shows its scroll bar beside the pages, never over them.
+    auto width = minimum.width() + (capped ? scroll_.verticalScrollBar()->sizeHint().width() : 0);
+    if (width_budget_ > 0) {
+      width = std::min(width, width_budget_);
+    }
+    const QSize size(width, resizable_ ? std::min(kMinimumBudget, minimum.height())
+                                       : (capped ? budget_ : minimum.height()));
+    if (scroll_.minimumSize() != size) {
+      scroll_.setMinimumSize(size);
+    }
+  }
+
+  static constexpr int kMinimumBudget = 120;
+  QDialog& dialog_;
+  QScrollArea& scroll_;
+  QStackedWidget& pages_;
+  int budget_;
+  int width_budget_{0};  // 0 until a too-narrow screen sets one
+  QSize max_size_;
+  QSize restored_size_;
+  int open_height_{0};
+  QSize own_size_;
+  int shown_pages_height_{0};
+  QPointer<QWidget> shrink_after_show_;
+  int shrink_after_show_minimum_{0};
+  bool fitted_{false};
+  bool resizable_{false};
+};
+
+LayerDropShadow builtin_default_drop_shadow() {
+  LayerDropShadow shadow;
+  shadow.enabled = true;
+  shadow.color = RgbColor{0, 0, 0};
+  shadow.opacity = 0.75F;
+  shadow.angle_degrees = 120.0F;
+  shadow.distance = 5.0F;
+  shadow.spread = 0.0F;
+  shadow.size = 5.0F;
+  return shadow;
+}
+
+LayerInnerShadow builtin_default_inner_shadow() {
+  LayerInnerShadow shadow;
+  shadow.enabled = true;
+  shadow.color = RgbColor{0, 0, 0};
+  shadow.opacity = 0.75F;
+  shadow.angle_degrees = 120.0F;
+  shadow.distance = 5.0F;
+  shadow.choke = 0.0F;
+  shadow.size = 5.0F;
+  return shadow;
+}
+
+LayerOuterGlow builtin_default_outer_glow() {
+  LayerOuterGlow glow;
+  glow.enabled = true;
+  glow.blend_mode = BlendMode::Normal;
+  glow.color = RgbColor{255, 255, 190};
+  glow.opacity = 0.75F;
+  glow.spread = 0.0F;
+  glow.size = 5.0F;
+  return glow;
+}
+
+LayerInnerGlow builtin_default_inner_glow() {
+  LayerInnerGlow glow;
+  glow.enabled = true;
+  glow.blend_mode = BlendMode::Screen;
+  glow.color = RgbColor{255, 255, 190};
+  glow.opacity = 0.75F;
+  glow.choke = 0.0F;
+  glow.size = 5.0F;
+  glow.source = LayerInnerGlowSource::Edge;
+  return glow;
+}
+
+LayerColorOverlay builtin_default_color_overlay() {
+  LayerColorOverlay overlay;
+  overlay.enabled = true;
+  overlay.blend_mode = BlendMode::Normal;
+  overlay.color = RgbColor{255, 0, 0};
+  overlay.opacity = 1.0F;
+  return overlay;
+}
+
+LayerGradientFill builtin_default_gradient_fill() {
+  LayerGradientFill fill;
+  fill.enabled = true;
+  fill.blend_mode = BlendMode::Normal;
+  fill.opacity = 1.0F;
+  fill.gradient = default_layer_style_gradient();
+  return fill;
+}
+
+LayerStroke builtin_default_stroke() {
+  LayerStroke stroke;
+  stroke.enabled = true;
+  stroke.blend_mode = BlendMode::Normal;
+  stroke.color = RgbColor{255, 0, 0};
+  stroke.opacity = 1.0F;
+  stroke.size = 3.0F;
+  stroke.position = LayerStrokePosition::Outside;
+  return stroke;
+}
+
+LayerBevelEmboss builtin_default_bevel_emboss() {
+  LayerBevelEmboss bevel;
+  bevel.enabled = true;
+  bevel.highlight_blend_mode = BlendMode::Screen;
+  bevel.highlight_color = RgbColor{255, 255, 255};
+  bevel.highlight_opacity = 0.75F;
+  bevel.shadow_blend_mode = BlendMode::Multiply;
+  bevel.shadow_color = RgbColor{0, 0, 0};
+  bevel.shadow_opacity = 0.75F;
+  bevel.angle_degrees = 120.0F;
+  bevel.altitude_degrees = 30.0F;
+  bevel.depth = 1.0F;
+  bevel.size = 5.0F;
+  bevel.direction_up = true;
+  return bevel;
+}
+
+LayerSatin builtin_default_satin() {
+  LayerSatin satin;
+  satin.enabled = true;
+  return satin;
+}
+
+LayerPatternOverlay builtin_default_pattern_overlay() {
+  LayerPatternOverlay overlay;
+  overlay.enabled = true;
+  const auto presets = builtin_pattern_presets();
+  if (!presets.empty()) {
+    overlay.pattern_id = presets.front().id;
+    overlay.pattern_name = presets.front().english_name;
+  }
+  return overlay;
+}
+
+// The values Save as Default stored for each effect (GitHub issue 606): one
+// instance per effect list, loaded when the dialog opens. An empty list means
+// the built-in default above.
+LayerStyle& stored_effect_defaults() {
+  static LayerStyle defaults;
+  return defaults;
+}
+
+template <typename Effect>
+Effect stored_or_builtin(const std::vector<Effect>& stored, Effect (*builtin)()) {
+  if (stored.empty()) {
+    return builtin();
+  }
+  auto effect = stored.front();
+  effect.enabled = true;
+  return effect;
+}
+
+LayerDropShadow default_drop_shadow() { return stored_or_builtin(stored_effect_defaults().drop_shadows, builtin_default_drop_shadow); }
+LayerInnerShadow default_inner_shadow() { return stored_or_builtin(stored_effect_defaults().inner_shadows, builtin_default_inner_shadow); }
+LayerOuterGlow default_outer_glow() { return stored_or_builtin(stored_effect_defaults().outer_glows, builtin_default_outer_glow); }
+LayerInnerGlow default_inner_glow() { return stored_or_builtin(stored_effect_defaults().inner_glows, builtin_default_inner_glow); }
+LayerColorOverlay default_color_overlay() { return stored_or_builtin(stored_effect_defaults().color_overlays, builtin_default_color_overlay); }
+LayerGradientFill default_gradient_fill() { return stored_or_builtin(stored_effect_defaults().gradient_fills, builtin_default_gradient_fill); }
+LayerStroke default_stroke() { return stored_or_builtin(stored_effect_defaults().strokes, builtin_default_stroke); }
+LayerBevelEmboss default_bevel_emboss() { return stored_or_builtin(stored_effect_defaults().bevels, builtin_default_bevel_emboss); }
+LayerSatin default_satin() { return stored_or_builtin(stored_effect_defaults().satins, builtin_default_satin); }
+LayerPatternOverlay default_pattern_overlay() { return stored_or_builtin(stored_effect_defaults().pattern_overlays, builtin_default_pattern_overlay); }
+
+// Thumbnail of a pattern tile for picker items (small tiles repeat 2x2 so they
+// still read at icon size).
+QIcon pattern_preset_icon(const PixelBuffer& tile, int extent = 24) {
+  if (tile.empty() || tile.format().channels < 4) {
+    return {};
+  }
+  QImage image(tile.width(), tile.height(), QImage::Format_RGBA8888);
+  for (std::int32_t y = 0; y < tile.height(); ++y) {
+    std::memcpy(image.scanLine(y), tile.pixel(0, y), static_cast<std::size_t>(tile.width()) * 4U);
+  }
+  QImage canvas_image(extent, extent, QImage::Format_RGBA8888);
+  canvas_image.fill(Qt::transparent);
+  QPainter painter(&canvas_image);
+  const auto repeats = tile.width() < extent || tile.height() < extent ? 2 : 1;
+  const auto cell_w = extent / repeats;
+  const auto cell_h = extent / repeats;
+  for (int ry = 0; ry < repeats; ++ry) {
+    for (int rx = 0; rx < repeats; ++rx) {
+      painter.drawImage(QRect(rx * cell_w, ry * cell_h, cell_w, cell_h), image);
+    }
+  }
+  painter.end();
+  return QIcon(QPixmap::fromImage(canvas_image));
+}
+
+[[nodiscard]] bool pattern_tiles_equal(const PixelBuffer& lhs, const PixelBuffer& rhs) {
+  return lhs.width() == rhs.width() && lhs.height() == rhs.height() &&
+         lhs.format() == rhs.format() && lhs.data().size() == rhs.data().size() &&
+         std::equal(lhs.data().begin(), lhs.data().end(), rhs.data().begin());
+}
+
+constexpr int kPatternIdRole = Qt::UserRole;
+constexpr int kPatternPersistNameRole = Qt::UserRole + 1;
+constexpr int kPatternPickerIndexRole = Qt::UserRole + 2;
+constexpr int kPatternPickerIsLeafRole = Qt::UserRole + 3;
+constexpr const char *kContourCustomId = "custom";
+// Item data of a contour from the user's library: this prefix, then its storage id.
+constexpr const char *kContourUserPrefix = "user:";
+constexpr int kStyleSwatchExtent = 72;
+
+// A press on the curve swatch at the left of a contour picker opens the contour
+// editor; the rest of the picker opens its list as before.
+class ContourSwatchClickFilter final : public QObject {
+public:
+  ContourSwatchClickFilter(QComboBox* combo, std::function<void()> edit)
+      : QObject(combo), combo_(combo), edit_(std::move(edit)) {}
+
+  [[nodiscard]] static QRect swatch_rect(const QComboBox& combo) {
+    const int width = combo.iconSize().width() + 10;
+    return combo.layoutDirection() == Qt::RightToLeft ? QRect(combo.width() - width, 0, width, combo.height())
+                                                      : QRect(0, 0, width, combo.height());
+  }
+
+  bool eventFilter(QObject* watched, QEvent* event) override {
+    if (watched == combo_ && combo_->isEnabled() &&
+        (event->type() == QEvent::MouseButtonPress || event->type() == QEvent::MouseButtonDblClick)) {
+      const auto* mouse = static_cast<QMouseEvent*>(event);
+      if (mouse->button() == Qt::LeftButton && swatch_rect(*combo_).contains(mouse->position().toPoint())) {
+        // Queued: the editor runs its own event loop, which must not start inside this filter.
+        QTimer::singleShot(0, combo_, edit_);
+        return true;
+      }
+    }
+    return QObject::eventFilter(watched, event);
+  }
+
+private:
+  QComboBox* combo_;
+  std::function<void()> edit_;
+};
+
+// QComboBox does not present hierarchical models as an expandable tree on all
+// Qt styles. Keep its flat model for the selected-value display and existing
+// combo-box behavior, but replace the drop-down with a folder-aware tree.
+class PatternPickerCombo final : public QComboBox {
+public:
+  explicit PatternPickerCombo(QWidget *parent = nullptr) : QComboBox(parent) {}
+
+  void clear_patterns() {
+    entries_.clear();
+    QComboBox::clear();
+  }
+
+  void add_pattern(const QIcon &icon, const QString &flat_label,
+                   const QString &display_name, const QString &pattern_id,
+                   const QString &persist_name, const QString &folder = {}) {
+    QComboBox::addItem(icon, flat_label, pattern_id);
+    setItemData(count() - 1, persist_name, kPatternPersistNameRole);
+    entries_.push_back({display_name, folder});
+  }
+
+  void add_pattern(const QString &flat_label, const QString &display_name,
+                   const QString &pattern_id, const QString &persist_name,
+                   const QString &folder = {}) {
+    add_pattern({}, flat_label, display_name, pattern_id, persist_name, folder);
+  }
+
+  void showPopup() override {
+    if (!isEnabled() || entries_.empty()) {
+      return;
+    }
+    hidePopup();
+
+    auto *popup = new QFrame(this, Qt::Popup);
+    popup->setAttribute(Qt::WA_DeleteOnClose);
+    popup->setObjectName(objectName() + QStringLiteral("Popup"));
+    popup->setFrameShape(QFrame::StyledPanel);
+    auto *layout = new QVBoxLayout(popup);
+    layout->setContentsMargins(1, 1, 1, 1);
+    layout->setSpacing(0);
+    auto *tree = new QTreeWidget(popup);
+    tree->setObjectName(objectName() + QStringLiteral("Tree"));
+    tree->setHeaderHidden(true);
+    tree->setRootIsDecorated(true);
+    tree->setIconSize(iconSize());
+    tree->setUniformRowHeights(true);
+    layout->addWidget(tree);
+
+    QHash<QString, QTreeWidgetItem *> folders;
+    const auto selected_folder =
+        currentIndex() >= 0 &&
+                currentIndex() < static_cast<int>(entries_.size())
+            ? entries_[static_cast<std::size_t>(currentIndex())].folder
+            : QString{};
+    for (int index = 0; index < static_cast<int>(entries_.size()); ++index) {
+      const auto &entry = entries_[static_cast<std::size_t>(index)];
+      QTreeWidgetItem *parent_item = nullptr;
+      if (!entry.folder.isEmpty()) {
+        parent_item = folders.value(entry.folder, nullptr);
+        if (parent_item == nullptr) {
+          parent_item = new QTreeWidgetItem(tree, QStringList{entry.folder});
+          parent_item->setIcon(0, style()->standardIcon(QStyle::SP_DirIcon));
+          folders.insert(entry.folder, parent_item);
+          if (!folder_expansion_.contains(entry.folder)) {
+            folder_expansion_.insert(entry.folder,
+                                     entry.folder == selected_folder);
+          }
+          parent_item->setExpanded(folder_expansion_.value(entry.folder));
+        }
+      }
+
+      auto *item =
+          parent_item != nullptr
+              ? new QTreeWidgetItem(parent_item,
+                                    QStringList{entry.display_name})
+              : new QTreeWidgetItem(tree, QStringList{entry.display_name});
+      item->setIcon(0, itemIcon(index));
+      item->setData(0, kPatternPickerIndexRole, index);
+      item->setData(0, kPatternPickerIsLeafRole, true);
+      if (index == currentIndex()) {
+        tree->setCurrentItem(item);
+      }
+    }
+
+    QObject::connect(tree, &QTreeWidget::itemExpanded, popup,
+                     [this](QTreeWidgetItem *item) {
+                       if (item->childCount() > 0) {
+                         folder_expansion_.insert(item->text(0), true);
+                       }
+                     });
+    QObject::connect(tree, &QTreeWidget::itemCollapsed, popup,
+                     [this](QTreeWidgetItem *item) {
+                       if (item->childCount() > 0) {
+                         folder_expansion_.insert(item->text(0), false);
+                       }
+                     });
+    const auto select_pattern = [this, popup](QTreeWidgetItem *item) {
+      const auto index = item->data(0, kPatternPickerIndexRole).toInt();
+      setCurrentIndex(index);
+      emit activated(index);
+      popup->close();
+    };
+    QObject::connect(tree, &QTreeWidget::itemClicked, popup,
+                     [select_pattern](QTreeWidgetItem *item, int) {
+                       if (!item->data(0, kPatternPickerIsLeafRole).toBool()) {
+                         item->setExpanded(!item->isExpanded());
+                         return;
+                       }
+                       select_pattern(item);
+                     });
+    QObject::connect(tree, &QTreeWidget::itemActivated, popup,
+                     [select_pattern](QTreeWidgetItem *item, int) {
+                       if (item->data(0, kPatternPickerIsLeafRole).toBool()) {
+                         select_pattern(item);
+                       }
+                     });
+
+    popup_ = popup;
+    auto visible_rows = tree->topLevelItemCount();
+    for (int index = 0; index < tree->topLevelItemCount(); ++index) {
+      const auto *item = tree->topLevelItem(index);
+      if (item->isExpanded()) {
+        visible_rows += item->childCount();
+      }
+    }
+    const auto popup_width = std::max(width(), 320);
+    // A short folder must not collapse the picker into a cramped two-row menu.
+    // Keep enough vertical room to browse and compare thumbnails; longer
+    // libraries remain bounded and scroll inside the tree.
+    const auto popup_height = std::clamp(visible_rows * 30 + 4, 280, 420);
+    popup->resize(popup_width, popup_height);
+
+    position_popup_below(*this, *popup);
+    popup->show();
+    tree->setFocus(Qt::PopupFocusReason);
+    if (tree->currentItem() != nullptr) {
+      tree->scrollToItem(tree->currentItem());
+    }
+  }
+
+  void hidePopup() override {
+    if (popup_ != nullptr) {
+      popup_->close();
+      popup_.clear();
+    }
+  }
+
+private:
+  struct Entry {
+    QString display_name;
+    QString folder;
+  };
+
+  std::vector<Entry> entries_;
+  QHash<QString, bool> folder_expansion_;
+  QPointer<QFrame> popup_;
+};
+
+// The Styles grid's "No Style" cell (the list's No Style row); never a library id.
+constexpr char kNoStyleGridId[] = "patchy.layerStyle.noStyle";
+
+// The No Style cell's thumbnail: an empty card crossed out, drawn in the theme's text role.
+QIcon no_style_grid_icon(int extent) {
+  QPixmap pixmap(extent, extent);
+  pixmap.fill(Qt::transparent);
+  QPainter painter(&pixmap);
+  painter.setRenderHint(QPainter::Antialiasing);
+  const auto color = theme().text_primary;
+  painter.setPen(QPen(color, 2));
+  const QRectF card(extent * 0.18, extent * 0.18, extent * 0.64, extent * 0.64);
+  painter.drawRoundedRect(card, 4, 4);
+  painter.drawLine(card.bottomLeft(), card.topRight());
+  return QIcon(pixmap);
+}
+
+enum class LayerStyleCategoryPage {
+  Blending = 0,
+  BevelEmboss,
+  Stroke,
+  InnerShadow,
+  InnerGlow,
+  Satin,
+  ColorOverlay,
+  GradientOverlay,
+  OuterGlow,
+  DropShadow,
+  PatternOverlay,
+  BevelContour,
+  BevelTexture,
+  // Appended: enum values are QStackedWidget indices, so the Styles page is
+  // created last even though its category row is listed first.
+  Styles
+};
+
+// The Styles row shares LayerStyleEffectKind::None with Blending Options; this
+// distinct effect-index marker lets rebuild_category_list re-select it.
+constexpr int kStylesCategoryIndex = -2;
+
+enum class LayerStyleEffectKind {
+  None = 0,
+  BevelEmboss,
+  Stroke,
+  InnerShadow,
+  InnerGlow,
+  Satin,
+  ColorOverlay,
+  GradientOverlay,
+  OuterGlow,
+  DropShadow,
+  PatternOverlay,
+  BevelContour,
+  BevelTexture
+};
+
+// One contour picker (GitHub issue 726): its list, the host's custom curve, and the
+// Edit and Library buttons beside it. `kind` and `leaf` name the property for batch edits.
+struct ContourPickerTools {
+  QComboBox* combo{};
+  StyleContour* custom{};
+  LayerStyleEffectKind kind{LayerStyleEffectKind::None};
+  const char* leaf{""};
+  QPushButton* edit{};
+  QPushButton* library{};
+};
+
+std::string effect_property_prefix(LayerStyleEffectKind kind, int index) {
+  const char* name = "";
+  switch (kind) {
+    case LayerStyleEffectKind::BevelEmboss: name = "bevels"; break;
+    case LayerStyleEffectKind::BevelContour: return "bevels.0.contour";
+    case LayerStyleEffectKind::BevelTexture: return "bevels.0.texture";
+    case LayerStyleEffectKind::Stroke: name = "strokes"; break;
+    case LayerStyleEffectKind::InnerShadow: name = "inner_shadows"; break;
+    case LayerStyleEffectKind::InnerGlow: name = "inner_glows"; break;
+    case LayerStyleEffectKind::Satin: name = "satins"; break;
+    case LayerStyleEffectKind::ColorOverlay: name = "color_overlays"; break;
+    case LayerStyleEffectKind::GradientOverlay: name = "gradient_fills"; break;
+    case LayerStyleEffectKind::OuterGlow: name = "outer_glows"; break;
+    case LayerStyleEffectKind::DropShadow: name = "drop_shadows"; break;
+    case LayerStyleEffectKind::PatternOverlay: name = "pattern_overlays"; break;
+    case LayerStyleEffectKind::None: return {};
+  }
+  return std::string(name) + "." + std::to_string(std::max(0, index));
+}
+
+// Save as Default's settings keys, layerStyle/effectDefaults/<token> (persisted
+// identifiers: never rename). Each value is a one-style .asl blob holding the
+// one effect; the drop shadow's Patchy-only long-shadow fields, which .asl
+// cannot carry, sit in their own keys beside it.
+const char* effect_defaults_token(LayerStyleEffectKind kind) {
+  switch (kind) {
+    case LayerStyleEffectKind::BevelEmboss: return "bevelEmboss";
+    case LayerStyleEffectKind::Stroke: return "stroke";
+    case LayerStyleEffectKind::InnerShadow: return "innerShadow";
+    case LayerStyleEffectKind::InnerGlow: return "innerGlow";
+    case LayerStyleEffectKind::Satin: return "satin";
+    case LayerStyleEffectKind::ColorOverlay: return "colorOverlay";
+    case LayerStyleEffectKind::GradientOverlay: return "gradientOverlay";
+    case LayerStyleEffectKind::PatternOverlay: return "patternOverlay";
+    case LayerStyleEffectKind::OuterGlow: return "outerGlow";
+    case LayerStyleEffectKind::DropShadow: return "dropShadow";
+    case LayerStyleEffectKind::BevelContour:
+    case LayerStyleEffectKind::BevelTexture:
+    case LayerStyleEffectKind::None:
+      break;
+  }
+  return nullptr;
+}
+
+QString effect_defaults_key(const char* token) {
+  return QStringLiteral("layerStyle/effectDefaults/%1").arg(QLatin1String(token));
+}
+
+constexpr std::array kEffectDefaultKinds{
+    LayerStyleEffectKind::BevelEmboss,  LayerStyleEffectKind::Stroke,         LayerStyleEffectKind::InnerShadow,
+    LayerStyleEffectKind::InnerGlow,    LayerStyleEffectKind::Satin,          LayerStyleEffectKind::ColorOverlay,
+    LayerStyleEffectKind::GradientOverlay, LayerStyleEffectKind::PatternOverlay, LayerStyleEffectKind::OuterGlow,
+    LayerStyleEffectKind::DropShadow};
+
+template <typename Effect>
+void adopt_front(std::vector<Effect>& target, const std::vector<Effect>& source) {
+  if (!source.empty()) {
+    target.assign(1, source.front());
+  }
+}
+
+void adopt_effect_defaults(LayerStyle& target, const LayerStyle& source) {
+  adopt_front(target.bevels, source.bevels);
+  adopt_front(target.strokes, source.strokes);
+  adopt_front(target.inner_shadows, source.inner_shadows);
+  adopt_front(target.inner_glows, source.inner_glows);
+  adopt_front(target.satins, source.satins);
+  adopt_front(target.color_overlays, source.color_overlays);
+  adopt_front(target.gradient_fills, source.gradient_fills);
+  adopt_front(target.pattern_overlays, source.pattern_overlays);
+  adopt_front(target.outer_glows, source.outer_glows);
+  adopt_front(target.drop_shadows, source.drop_shadows);
+}
+
+template <typename Effect>
+void keep_only(std::vector<Effect>& effects, bool keep, std::size_t index) {
+  if (!keep || index >= effects.size()) {
+    effects.clear();
+    return;
+  }
+  auto effect = effects[index];
+  effect.enabled = true;
+  effects.assign(1, effect);
+}
+
+// `source` reduced to its one `kind` effect at `index`.
+LayerStyle single_effect_style(const LayerStyle& source, LayerStyleEffectKind kind, std::size_t index) {
+  LayerStyle single;
+  single.bevels = source.bevels;
+  single.strokes = source.strokes;
+  single.inner_shadows = source.inner_shadows;
+  single.inner_glows = source.inner_glows;
+  single.satins = source.satins;
+  single.color_overlays = source.color_overlays;
+  single.gradient_fills = source.gradient_fills;
+  single.pattern_overlays = source.pattern_overlays;
+  single.outer_glows = source.outer_glows;
+  single.drop_shadows = source.drop_shadows;
+  keep_only(single.bevels, kind == LayerStyleEffectKind::BevelEmboss, index);
+  keep_only(single.strokes, kind == LayerStyleEffectKind::Stroke, index);
+  keep_only(single.inner_shadows, kind == LayerStyleEffectKind::InnerShadow, index);
+  keep_only(single.inner_glows, kind == LayerStyleEffectKind::InnerGlow, index);
+  keep_only(single.satins, kind == LayerStyleEffectKind::Satin, index);
+  keep_only(single.color_overlays, kind == LayerStyleEffectKind::ColorOverlay, index);
+  keep_only(single.gradient_fills, kind == LayerStyleEffectKind::GradientOverlay, index);
+  keep_only(single.pattern_overlays, kind == LayerStyleEffectKind::PatternOverlay, index);
+  keep_only(single.outer_glows, kind == LayerStyleEffectKind::OuterGlow, index);
+  keep_only(single.drop_shadows, kind == LayerStyleEffectKind::DropShadow, index);
+  // The Bevel & Emboss page's defaults leave its Contour and Texture
+  // sub-options (their own pages) at the built-in values.
+  for (auto& bevel : single.bevels) {
+    const auto builtin = builtin_default_bevel_emboss();
+    bevel.contour = builtin.contour;
+    bevel.texture = builtin.texture;
+  }
+  return single;
+}
+
+void load_stored_effect_defaults() {
+  auto& defaults = stored_effect_defaults();
+  defaults = LayerStyle{};
+  auto settings = app_settings();
+  for (const auto kind : kEffectDefaultKinds) {
+    const auto bytes = settings.value(effect_defaults_key(effect_defaults_token(kind))).toByteArray();
+    if (bytes.isEmpty()) {
+      continue;
+    }
+    std::string error;
+    const auto parsed = psd::read_asl(
+        std::span(reinterpret_cast<const std::uint8_t*>(bytes.constData()), static_cast<std::size_t>(bytes.size())),
+        error);
+    if (!parsed.has_value() || parsed->styles.empty()) {
+      continue;
+    }
+    auto single = single_effect_style(parsed->styles.front().style, kind, 0);
+    if (kind == LayerStyleEffectKind::DropShadow && !single.drop_shadows.empty()) {
+      auto& shadow = single.drop_shadows.front();
+      shadow.continuous = settings.value(effect_defaults_key("dropShadowContinuous"), false).toBool();
+      shadow.fade = static_cast<float>(settings.value(effect_defaults_key("dropShadowFade"), 0.0).toDouble());
+    }
+    adopt_effect_defaults(defaults, single);
+  }
+}
+
+void store_effect_default(LayerStyleEffectKind kind, const LayerStyle& source, std::size_t index) {
+  const auto* token = effect_defaults_token(kind);
+  if (token == nullptr) {
+    return;
+  }
+  const auto single = single_effect_style(source, kind, index);
+  const std::array styles{psd::AslStyle{{}, {}, single, std::nullopt}};
+  const auto bytes = psd::write_asl(styles, {});
+  auto settings = app_settings();
+  settings.setValue(effect_defaults_key(token),
+                    QByteArray(reinterpret_cast<const char*>(bytes.data()), static_cast<qsizetype>(bytes.size())));
+  if (kind == LayerStyleEffectKind::DropShadow && !single.drop_shadows.empty()) {
+    settings.setValue(effect_defaults_key("dropShadowContinuous"), single.drop_shadows.front().continuous);
+    settings.setValue(effect_defaults_key("dropShadowFade"), static_cast<double>(single.drop_shadows.front().fade));
+  }
+  adopt_effect_defaults(stored_effect_defaults(), single);
+}
+
+// Whether Save as Default has stored values for `kind` (GitHub issue 726
+// follow-up: Restore Built-in Default is offered only then).
+bool has_stored_effect_default(LayerStyleEffectKind kind) {
+  const auto& defaults = stored_effect_defaults();
+  switch (kind) {
+    case LayerStyleEffectKind::BevelEmboss: return !defaults.bevels.empty();
+    case LayerStyleEffectKind::Stroke: return !defaults.strokes.empty();
+    case LayerStyleEffectKind::InnerShadow: return !defaults.inner_shadows.empty();
+    case LayerStyleEffectKind::InnerGlow: return !defaults.inner_glows.empty();
+    case LayerStyleEffectKind::Satin: return !defaults.satins.empty();
+    case LayerStyleEffectKind::ColorOverlay: return !defaults.color_overlays.empty();
+    case LayerStyleEffectKind::GradientOverlay: return !defaults.gradient_fills.empty();
+    case LayerStyleEffectKind::PatternOverlay: return !defaults.pattern_overlays.empty();
+    case LayerStyleEffectKind::OuterGlow: return !defaults.outer_glows.empty();
+    case LayerStyleEffectKind::DropShadow: return !defaults.drop_shadows.empty();
+    case LayerStyleEffectKind::BevelContour:
+    case LayerStyleEffectKind::BevelTexture:
+    case LayerStyleEffectKind::None:
+      break;
+  }
+  return false;
+}
+
+// Forgets the values Save as Default stored for `kind`: its settings keys go,
+// and default_<effect>() returns the built-in values again.
+void clear_stored_effect_default(LayerStyleEffectKind kind) {
+  const auto* token = effect_defaults_token(kind);
+  if (token == nullptr) {
+    return;
+  }
+  auto settings = app_settings();
+  settings.remove(effect_defaults_key(token));
+  auto& defaults = stored_effect_defaults();
+  switch (kind) {
+    case LayerStyleEffectKind::BevelEmboss: defaults.bevels.clear(); break;
+    case LayerStyleEffectKind::Stroke: defaults.strokes.clear(); break;
+    case LayerStyleEffectKind::InnerShadow: defaults.inner_shadows.clear(); break;
+    case LayerStyleEffectKind::InnerGlow: defaults.inner_glows.clear(); break;
+    case LayerStyleEffectKind::Satin: defaults.satins.clear(); break;
+    case LayerStyleEffectKind::ColorOverlay: defaults.color_overlays.clear(); break;
+    case LayerStyleEffectKind::GradientOverlay: defaults.gradient_fills.clear(); break;
+    case LayerStyleEffectKind::PatternOverlay: defaults.pattern_overlays.clear(); break;
+    case LayerStyleEffectKind::OuterGlow: defaults.outer_glows.clear(); break;
+    case LayerStyleEffectKind::DropShadow:
+      defaults.drop_shadows.clear();
+      settings.remove(effect_defaults_key("dropShadowContinuous"));
+      settings.remove(effect_defaults_key("dropShadowFade"));
+      break;
+    case LayerStyleEffectKind::BevelContour:
+    case LayerStyleEffectKind::BevelTexture:
+    case LayerStyleEffectKind::None:
+      break;
+  }
+}
+
+template <typename Effect>
+void reset_effect(std::vector<Effect>& effects, std::size_t index, Effect (*make_default)()) {
+  if (index < effects.size()) {
+    const auto enabled = effects[index].enabled;
+    effects[index] = make_default();
+    effects[index].enabled = enabled;
+  }
+}
+
+// Puts the stored (or built-in) default in place of the `kind` effect at
+// `index`, keeping whether it is on (Load Default, Restore Built-in Default).
+void reset_effect_to_default(LayerStyle& style, LayerStyleEffectKind kind, std::size_t index) {
+  switch (kind) {
+    case LayerStyleEffectKind::BevelEmboss:
+      if (index < style.bevels.size()) {
+        auto& bevel = style.bevels[index];
+        auto reset = default_bevel_emboss();
+        reset.enabled = bevel.enabled;
+        reset.contour = bevel.contour;
+        reset.texture = bevel.texture;
+        bevel = reset;
+      }
+      break;
+    case LayerStyleEffectKind::Stroke: reset_effect(style.strokes, index, default_stroke); break;
+    case LayerStyleEffectKind::InnerShadow: reset_effect(style.inner_shadows, index, default_inner_shadow); break;
+    case LayerStyleEffectKind::InnerGlow: reset_effect(style.inner_glows, index, default_inner_glow); break;
+    case LayerStyleEffectKind::Satin: reset_effect(style.satins, index, default_satin); break;
+    case LayerStyleEffectKind::ColorOverlay: reset_effect(style.color_overlays, index, default_color_overlay); break;
+    case LayerStyleEffectKind::GradientOverlay: reset_effect(style.gradient_fills, index, default_gradient_fill); break;
+    case LayerStyleEffectKind::PatternOverlay:
+      reset_effect(style.pattern_overlays, index, default_pattern_overlay);
+      break;
+    case LayerStyleEffectKind::OuterGlow: reset_effect(style.outer_glows, index, default_outer_glow); break;
+    case LayerStyleEffectKind::DropShadow: reset_effect(style.drop_shadows, index, default_drop_shadow); break;
+    case LayerStyleEffectKind::BevelContour:
+    case LayerStyleEffectKind::BevelTexture:
+    case LayerStyleEffectKind::None:
+      break;
+  }
+}
+
+// Blending Options' check boxes: `left` in one column and `right` beside it
+// when the row is wide enough for both, all in one column otherwise (GitHub
+// issue 606). The widget places its boxes itself, so its minimum stays the
+// one-column width and a narrow dialog never has to grow for the second column.
+class CheckBoxColumns final : public QWidget {
+public:
+  CheckBoxColumns(QWidget* parent, std::vector<QCheckBox*> left, std::vector<QCheckBox*> right)
+      : QWidget(parent), left_(std::move(left)), right_(std::move(right)) {
+    for (auto* box : left_) {
+      box->setParent(this);
+    }
+    for (auto* box : right_) {
+      box->setParent(this);
+    }
+    QSizePolicy policy(QSizePolicy::Preferred, QSizePolicy::Preferred);
+    policy.setHeightForWidth(true);
+    setSizePolicy(policy);
+  }
+
+  [[nodiscard]] bool two_columns() const { return fits_two_columns(width()); }
+  [[nodiscard]] bool hasHeightForWidth() const override { return true; }
+  [[nodiscard]] int heightForWidth(int width) const override {
+    return fits_two_columns(width) ? std::max(column_height(left_), column_height(right_))
+                                   : column_height(left_) + kSpacing + column_height(right_);
+  }
+  // The height follows the current width: the forms these sit in size rows
+  // from the hints, so the hints say how tall the boxes are at this width
+  // (resizeEvent asks for a new layout when the column count changes).
+  [[nodiscard]] QSize sizeHint() const override {
+    const auto width = std::max(this->width(), column_width(left_) + kGap + column_width(right_));
+    return {column_width(left_) + kGap + column_width(right_), heightForWidth(width)};
+  }
+  [[nodiscard]] QSize minimumSizeHint() const override {
+    return {std::max(column_width(left_), column_width(right_)), heightForWidth(width())};
+  }
+
+protected:
+  void resizeEvent(QResizeEvent* event) override {
+    QWidget::resizeEvent(event);
+    if (const auto two = fits_two_columns(width()); two != placed_two_columns_) {
+      placed_two_columns_ = two;
+      updateGeometry();
+    }
+    place();
+  }
+  bool event(QEvent* event) override {
+    if (event->type() == QEvent::LayoutRequest || event->type() == QEvent::StyleChange ||
+        event->type() == QEvent::FontChange) {
+      updateGeometry();
+      place();
+    }
+    return QWidget::event(event);
+  }
+
+private:
+  static constexpr int kSpacing = 6;
+  static constexpr int kGap = 24;
+
+  [[nodiscard]] static int column_width(const std::vector<QCheckBox*>& boxes) {
+    int width = 0;
+    for (const auto* box : boxes) {
+      width = std::max(width, box->sizeHint().width());
+    }
+    return width;
+  }
+  [[nodiscard]] static int column_height(const std::vector<QCheckBox*>& boxes) {
+    int height = 0;
+    for (const auto* box : boxes) {
+      height += box->sizeHint().height();
+    }
+    return height + kSpacing * std::max(0, static_cast<int>(boxes.size()) - 1);
+  }
+  [[nodiscard]] bool fits_two_columns(int width) const {
+    return width >= column_width(left_) + kGap + column_width(right_);
+  }
+  void place_column(const std::vector<QCheckBox*>& boxes, int x, int y) const {
+    for (auto* box : boxes) {
+      const auto hint = box->sizeHint();
+      box->setGeometry(x, y, std::max(hint.width(), 0), hint.height());
+      y += hint.height() + kSpacing;
+    }
+  }
+  void place() const {
+    if (fits_two_columns(width())) {
+      place_column(left_, 0, 0);
+      place_column(right_, column_width(left_) + kGap, 0);
+    } else {
+      place_column(left_, 0, 0);
+      place_column(right_, 0, column_height(left_) + kSpacing);
+    }
+  }
+
+  std::vector<QCheckBox*> left_;
+  std::vector<QCheckBox*> right_;
+  bool placed_two_columns_{false};
+};
+
+// Every form label on every page shares the widest label's width, so all the
+// fields start at one indent (GitHub issue 606). Run again once shown: the
+// theme sheet's text size only reaches the labels then.
+void align_page_label_columns(QWidget& pages) {
+  std::vector<QWidget*> labels;
+  int widest = 0;
+  for (auto* form : pages.findChildren<QFormLayout*>()) {
+    for (int row = 0; row < form->rowCount(); ++row) {
+      auto* item = form->itemAt(row, QFormLayout::LabelRole);
+      auto* label = item != nullptr ? item->widget() : nullptr;
+      if (label == nullptr) {
+        continue;
+      }
+      label->setMinimumWidth(0);
+      labels.push_back(label);
+      widest = std::max(widest, label->sizeHint().width());
+    }
+  }
+  for (auto* label : labels) {
+    label->setMinimumWidth(widest);
+  }
+}
+
+constexpr int kLayerStylePageRole = Qt::UserRole + 1;
+constexpr int kLayerStyleEffectKindRole = Qt::UserRole + 2;
+constexpr int kLayerStyleEffectIndexRole = Qt::UserRole + 3;
+
+// Grows the vector with defaults until `index` exists (the former per-effect
+// ensure_* lambda family, shared by the enabled-state and save paths).
+template <typename Effect>
+Effect& ensure_effect(std::vector<Effect>& effects, int index, Effect (*make_default)()) {
+  while (index >= 0 && effects.size() <= static_cast<std::size_t>(index)) {
+    effects.push_back(make_default());
+  }
+  return effects[static_cast<std::size_t>(std::max(0, index))];
+}
+
+// Uniform access to the stackable per-effect vectors (Stroke, the shadows and
+// glows, Satin, the overlays), keyed by LayerStyleEffectKind: count drives the
+// remove-instance button, add_instance backs "+", remove_instance backs "-".
+// Bevel & Emboss and its sub-options are not stackable and have no entry.
+struct LayerStyleEffectVectorOps {
+  std::size_t (*count)(const LayerStyle& source);
+  // Inserts a copy of source_index (or a default when empty), enabled, after
+  // the source row; returns the inserted index.
+  int (*add_instance)(LayerStyle& target, int source_index);
+  // Erases index when present; returns the index to select next.
+  int (*remove_instance)(LayerStyle& target, int index);
+  void (*duplicate_for_batch)(LayerStyle& target, const LayerStyle& reference, int index);
+};
+
+template <auto Member, auto MakeDefault>
+constexpr LayerStyleEffectVectorOps effect_vector_ops() {
+  return {
+      [](const LayerStyle& source) { return (source.*Member).size(); },
+      [](LayerStyle& target, int source_index) {
+        auto& vector = target.*Member;
+        auto value = MakeDefault();
+        if (!vector.empty()) {
+          value = vector[static_cast<std::size_t>(
+              std::clamp(source_index, 0, static_cast<int>(vector.size()) - 1))];
+        }
+        value.enabled = true;
+        const auto insert_index =
+            vector.empty() ? 0 : std::clamp(source_index + 1, 0, static_cast<int>(vector.size()));
+        vector.insert(vector.begin() + insert_index, std::move(value));
+        return insert_index;
+      },
+      [](LayerStyle& target, int index) {
+        auto& vector = target.*Member;
+        if (index >= 0 && vector.size() > static_cast<std::size_t>(index)) {
+          vector.erase(vector.begin() + index);
+        }
+        return vector.empty() ? 0 : std::min(index, static_cast<int>(vector.size()) - 1);
+      },
+      [](LayerStyle& target, const LayerStyle& reference, int index) {
+        auto& values = target.*Member;
+        const auto& templates = reference.*Member;
+        const auto slot = static_cast<std::size_t>(std::max(0, index));
+        auto value = slot < values.size() ? values[slot] :
+                     slot < templates.size() ? templates[slot] : MakeDefault();
+        value.enabled = true;
+        // With no occurrence on the reference, '+' adds the first instance.
+        const auto insertion = templates.empty() ? 0U : slot + 1U;
+        while (values.size() < insertion) {
+          auto disabled = MakeDefault(); disabled.enabled = false;
+          values.push_back(std::move(disabled));
+        }
+        values.insert(values.begin() + static_cast<std::ptrdiff_t>(insertion), std::move(value));
+      },
+  };
+}
+
+const LayerStyleEffectVectorOps* effect_vector_ops_for_kind(LayerStyleEffectKind kind) {
+  switch (kind) {
+    case LayerStyleEffectKind::Stroke: {
+      static constexpr auto ops = effect_vector_ops<&LayerStyle::strokes, default_stroke>();
+      return &ops;
+    }
+    case LayerStyleEffectKind::InnerShadow: {
+      static constexpr auto ops =
+          effect_vector_ops<&LayerStyle::inner_shadows, default_inner_shadow>();
+      return &ops;
+    }
+    case LayerStyleEffectKind::InnerGlow: {
+      static constexpr auto ops = effect_vector_ops<&LayerStyle::inner_glows, default_inner_glow>();
+      return &ops;
+    }
+    case LayerStyleEffectKind::Satin: {
+      static constexpr auto ops = effect_vector_ops<&LayerStyle::satins, default_satin>();
+      return &ops;
+    }
+    case LayerStyleEffectKind::ColorOverlay: {
+      static constexpr auto ops =
+          effect_vector_ops<&LayerStyle::color_overlays, default_color_overlay>();
+      return &ops;
+    }
+    case LayerStyleEffectKind::GradientOverlay: {
+      static constexpr auto ops =
+          effect_vector_ops<&LayerStyle::gradient_fills, default_gradient_fill>();
+      return &ops;
+    }
+    case LayerStyleEffectKind::PatternOverlay: {
+      static constexpr auto ops =
+          effect_vector_ops<&LayerStyle::pattern_overlays, default_pattern_overlay>();
+      return &ops;
+    }
+    case LayerStyleEffectKind::OuterGlow: {
+      static constexpr auto ops = effect_vector_ops<&LayerStyle::outer_glows, default_outer_glow>();
+      return &ops;
+    }
+    case LayerStyleEffectKind::DropShadow: {
+      static constexpr auto ops =
+          effect_vector_ops<&LayerStyle::drop_shadows, default_drop_shadow>();
+      return &ops;
+    }
+    case LayerStyleEffectKind::BevelEmboss:
+    case LayerStyleEffectKind::BevelContour:
+    case LayerStyleEffectKind::BevelTexture:
+    case LayerStyleEffectKind::None:
+      break;
+  }
+  return nullptr;
+}
+
+QListWidgetItem* add_layer_style_category(QListWidget* list, const QString& text, bool checkable, bool checked,
+                                           LayerStyleCategoryPage page,
+                                           LayerStyleEffectKind kind = LayerStyleEffectKind::None,
+                                           int effect_index = -1) {
+  auto* item = new QListWidgetItem(text, list);
+  item->setData(kLayerStylePageRole, static_cast<int>(page));
+  item->setData(kLayerStyleEffectKindRole, static_cast<int>(kind));
+  item->setData(kLayerStyleEffectIndexRole, effect_index);
+  if (checkable) {
+    item->setFlags(item->flags() | Qt::ItemIsUserCheckable);
+    item->setCheckState(checked ? Qt::Checked : Qt::Unchecked);
+  } else {
+    item->setFlags(item->flags() & ~Qt::ItemIsUserCheckable);
+  }
+  return item;
+}
+
+}  // namespace
+
+void clear_stored_layer_style_effect_defaults() {
+  app_settings().remove(QStringLiteral("layerStyle/effectDefaults"));
+  stored_effect_defaults() = LayerStyle{};
+}
+
+std::optional<LayerStyleSettings> request_layer_style_settings(
+    QWidget* parent, const Layer& layer, std::function<void(const LayerStyleSettings&)> preview_changed,
+    PatternStore* document_patterns, PatternLibrary* pattern_library, StyleLibrary* style_library,
+    std::function<void(const QString& name, const PixelBuffer& tile)> open_pattern_as_image,
+    GradientLibrary *gradient_library, RgbColor foreground,
+    RgbColor background, const AppearanceDialogContext<LayerStyleSettings>* batch, BitDepth document_depth,
+    std::optional<LayerStyleEffect> start_effect, std::size_t start_effect_index, bool enable_start_effect,
+    ContourLibrary* contour_library) {
+  const auto request_started = std::chrono::steady_clock::now();
+  load_stored_effect_defaults();
+  const LayerStyleSettings original_settings{
+      static_cast<int>(std::round(layer.opacity() * 100.0F)),
+      layer.blend_mode(),
+      layer.layer_style(),
+      layer.blend_if(),
+      false,
+      static_cast<int>(std::round(layer.fill_opacity() * 100.0F)),
+      layer.channel_restriction_supported() ? layer.restricted_channels() : std::uint8_t{0},
+      layer_knockout_setting(layer).value_or(0U)};
+  auto batch_edits = std::make_shared<AppearanceEdits<LayerStyleSettings>>();
+  std::optional<LayerStyleSettings> last_displayed;
+  std::vector<std::string> explicit_fields;
+  std::function<void()> reset_batch_capture;
+  std::function<void()> refresh_batch_mixed;
+  auto style = layer.layer_style();
+  auto blend_if = layer.blend_if();
+  const auto blend_if_payload_status = layer.blend_if_payload_status();
+  bool replace_unsupported_blend_if = false;
+  auto shadow = style.drop_shadows.empty() ? default_drop_shadow() : style.drop_shadows.front();
+  auto inner_shadow = style.inner_shadows.empty() ? default_inner_shadow() : style.inner_shadows.front();
+  auto outer_glow = style.outer_glows.empty() ? default_outer_glow() : style.outer_glows.front();
+  auto inner_glow = style.inner_glows.empty() ? default_inner_glow() : style.inner_glows.front();
+  auto color_overlay = style.color_overlays.empty() ? default_color_overlay() : style.color_overlays.front();
+  auto gradient = style.gradient_fills.empty() ? default_gradient_fill() : style.gradient_fills.front();
+  auto stroke = style.strokes.empty() ? default_stroke() : style.strokes.front();
+  auto bevel = style.bevels.empty() ? default_bevel_emboss() : style.bevels.front();
+  auto satin = style.satins.empty() ? default_satin() : style.satins.front();
+  auto pattern_overlay =
+      style.pattern_overlays.empty() ? default_pattern_overlay() : style.pattern_overlays.front();
+  // Manager selections whose Photoshop id collides with different embedded
+  // pixels receive a document-local id. Keep those resources alive across
+  // Preview-off callbacks, where MainWindow restores the original store.
+  std::vector<PatternResource> transient_manager_patterns;
+  if (style.pattern_overlays.empty() && pattern_library != nullptr &&
+      pattern_library->find_entry_by_pattern_id(QString::fromStdString(pattern_overlay.pattern_id)) == nullptr) {
+    if (!pattern_library->entries().empty()) {
+      const auto& first = pattern_library->entries().front();
+      pattern_overlay.pattern_id = first.id.toStdString();
+      pattern_overlay.pattern_name = first.name.toStdString();
+    } else if (document_patterns != nullptr && !document_patterns->patterns.empty()) {
+      pattern_overlay.pattern_id = document_patterns->patterns.front().id;
+      pattern_overlay.pattern_name = document_patterns->patterns.front().name;
+    } else {
+      pattern_overlay.pattern_id.clear();
+      pattern_overlay.pattern_name.clear();
+    }
+  }
+  // Imported non-preset curves survive picker round trips: each picker keeps
+  // the original custom curve and only a deliberate preset pick replaces it.
+  StyleContour custom_gloss_contour = bevel.gloss_contour;
+  StyleContour custom_bevel_sub_contour = bevel.contour.contour;
+  StyleContour custom_shadow_contour = shadow.contour;
+  // A Noise gradient has no stops by design: keep its seed and ranges and let
+  // the controls show the Noise page (a Photoshop file's noise overlay opened as
+  // the default white-to-black ramp, GitHub issue 262). Only a stop gradient
+  // with no stops falls back to the default ramp.
+  if (gradient.gradient.form == GradientDefinitionForm::Solid && gradient.gradient.color_stops.empty()) {
+    gradient.gradient = default_layer_style_gradient();
+  }
+  if (stroke.uses_gradient && stroke.gradient.form == GradientDefinitionForm::Solid &&
+      stroke.gradient.color_stops.empty()) {
+    stroke.gradient = default_layer_style_gradient();
+  }
+
+  QDialog dialog(parent);
+  dialog.setObjectName(QStringLiteral("patchyLayerStyleDialog"));
+  // Height below any plausible layout minimum: Qt clamps up to the minimum, so
+  // the dialog opens exactly as tall as its tallest settings page needs (up to
+  // the screen cap applied before it runs).
+  dialog.resize(840, 560);
+  auto* root = install_dark_dialog_chrome(dialog, new QVBoxLayout(&dialog), QObject::tr("Layer Style"),
+                                          DialogChromeCloseMode::Accept);
+
+  auto* name_row = new QHBoxLayout();
+  name_row->addWidget(new QLabel(QObject::tr("Name:"), &dialog));
+  auto* name = new QLineEdit(QString::fromStdString(layer.name()), &dialog);
+  name->setObjectName(QStringLiteral("layerStyleLayerNameEdit"));
+  name->setReadOnly(true);
+  name_row->addWidget(name, 1);
+  root->addLayout(name_row);
+  if (batch && batch->selected_count > 1) {
+    auto* summary = new QLabel(appearance_selection_summary(batch->selected_count, batch->originals.size(),
+        QString::fromStdString(layer.name()), batch->skipped_reason), &dialog);
+    summary->setObjectName(QStringLiteral("layerStyleSelectionSummary"));
+    summary->setWordWrap(true);
+    if (!batch->notices.isEmpty()) summary->setText(summary->text() + QStringLiteral("\n") + batch->notices);
+    root->addWidget(summary);
+  }
+
+  // A pattern reference resolves if its tile is embedded in the document or is
+  // one of Patchy's built-in presets (materialized into the document on apply).
+  const auto pattern_reference_resolves = [document_patterns, pattern_library](const std::string& id) {
+    if (id.empty()) {
+      return false;
+    }
+    if (document_patterns != nullptr && document_patterns->find(id) != nullptr) {
+      return true;
+    }
+    if (pattern_library != nullptr &&
+        pattern_library->find_entry_by_pattern_id(QString::fromStdString(id)) != nullptr) {
+      return true;
+    }
+    return is_bundled_pattern_id(id);
+  };
+  std::vector<std::string> missing_pattern_names;
+  const auto note_missing_pattern = [&](const std::string& id, const std::string& effect_name, bool enabled) {
+    if (!enabled || id.empty() || pattern_reference_resolves(id)) {
+      return;
+    }
+    auto label = effect_name.empty() ? id : effect_name;
+    if (std::find(missing_pattern_names.begin(), missing_pattern_names.end(), label) ==
+        missing_pattern_names.end()) {
+      missing_pattern_names.push_back(std::move(label));
+    }
+  };
+  for (const auto& effect : style.pattern_overlays) {
+    note_missing_pattern(effect.pattern_id, effect.pattern_name, effect.enabled);
+  }
+  // Bevel textures with unresolvable patterns are presented unchecked (the
+  // Photoshop semantics), so they raise no banner here; re-checking the row
+  // surfaces the live missing-pattern warning below.
+  QLabel* missing_pattern_warning = nullptr;
+  if (!missing_pattern_names.empty()) {
+    QStringList names;
+    for (const auto& missing : missing_pattern_names) {
+      names << QString::fromStdString(missing);
+    }
+    auto* warning = new QLabel(&dialog);
+    missing_pattern_warning = warning;
+    warning->setObjectName(QStringLiteral("layerStyleMissingPatternWarning"));
+    warning->setWordWrap(true);
+    warning->setProperty("warningBanner", true);
+    warning->setText(
+        QObject::tr("Pattern \"%1\" is not embedded in this document, so the "
+                    "effect that references it cannot "
+                    "render until you choose another pattern.")
+            .arg(names.join(QStringLiteral("\", \""))));
+    set_themed_style(*warning, QStringLiteral(
+        "QLabel#layerStyleMissingPatternWarning { background: @warning_banner_bg; border: "
+        "1px solid @warning_banner_border; "
+        "border-radius: 3px; color: @warning_banner_text; padding: 7px 9px; }"));
+    root->addWidget(warning);
+  }
+  const bool has_unsupported_satin_contour =
+      std::any_of(style.satins.begin(), style.satins.end(), [](const LayerSatin& effect) {
+        return effect.unsupported_contour_options;
+      });
+  if (has_unsupported_satin_contour) {
+    auto* warning = new QLabel(
+        QObject::tr("Photoshop Satin custom contours and contour anti-aliasing "
+                    "are preserved until you edit layer "
+                    "styles. Patchy previews and saves edited Satin with the "
+                    "non-anti-aliased Linear contour."),
+        &dialog);
+    warning->setObjectName(QStringLiteral("layerStyleSatinContourWarning"));
+    warning->setWordWrap(true);
+    warning->setProperty("warningBanner", true);
+    set_themed_style(*warning, QStringLiteral(
+        "QLabel#layerStyleSatinContourWarning { background: @warning_banner_bg; border: "
+        "1px solid @warning_banner_border; "
+        "border-radius: 3px; color: @warning_banner_text; padding: 7px 9px; }"));
+    root->addWidget(warning);
+  }
+  // Patchy-only marker (docs/ui-conventions.md): the calm info banner is shown
+  // while the loaded Drop Shadow has Continuous on. Photoshop opens such a
+  // file without complaint and renders a plain shadow at Distance instead.
+  const auto continuous_shadow_explanation =
+      patchy_only_explanation(QObject::tr("renders a regular drop shadow at the Distance value"));
+  auto* patchy_only_banner = new QLabel(continuous_shadow_explanation, &dialog);
+  patchy_only_banner->setObjectName(QStringLiteral("layerStylePatchyOnlyBanner"));
+  patchy_only_banner->setWordWrap(true);
+  patchy_only_banner->setProperty("infoBanner", true);
+  set_themed_style(*patchy_only_banner, QStringLiteral(
+      "QLabel#layerStylePatchyOnlyBanner { background: @info_banner_bg; border: "
+      "1px solid @info_banner_border; "
+      "border-radius: 3px; color: @info_banner_text; padding: 7px 9px; }"));
+  patchy_only_banner->setVisible(false);
+  root->addWidget(patchy_only_banner);
+  QLabel* blend_if_unsupported_warning = nullptr;
+  QPushButton* replace_blend_if_button = nullptr;
+  if (blend_if_payload_status == BlendIfPayloadStatus::Unsupported) {
+    auto* warning_row = new QWidget(&dialog);
+    warning_row->setObjectName(QStringLiteral("layerStyleBlendIfUnsupportedWarningRow"));
+    auto* warning_layout = new QHBoxLayout(warning_row);
+    warning_layout->setContentsMargins(8, 6, 8, 6);
+    warning_layout->setSpacing(8);
+    blend_if_unsupported_warning = new QLabel(
+        QObject::tr("This layer contains Photoshop Blend If data for an "
+                    "unsupported color mode or payload shape. "
+                    "Patchy preserves it unchanged and does not preview it "
+                    "unless you replace it."),
+        warning_row);
+    blend_if_unsupported_warning->setObjectName(QStringLiteral("layerStyleBlendIfUnsupportedWarning"));
+    blend_if_unsupported_warning->setWordWrap(true);
+    blend_if_unsupported_warning->setProperty("warningBanner", true);
+    warning_layout->addWidget(blend_if_unsupported_warning, 1);
+    replace_blend_if_button = new QPushButton(QObject::tr("Replace with Editable Defaults"), warning_row);
+    replace_blend_if_button->setObjectName(QStringLiteral("layerStyleBlendIfReplaceButton"));
+    warning_layout->addWidget(replace_blend_if_button, 0, Qt::AlignVCenter);
+    set_themed_style(*warning_row, QStringLiteral("QWidget#layerStyleBlendIfUnsupportedWarningRow { "
+                       "background: @warning_banner_bg; border: 1px solid @warning_banner_border; "
+        "border-radius: 3px; }"));
+    root->addWidget(warning_row);
+  }
+
+  const auto boundary_blend_if = decode_layer_blend_if(layer.raw_psd_group_boundary_blending_ranges());
+  if (!layer.raw_psd_group_boundary_blending_ranges().empty() &&
+      (boundary_blend_if.status == BlendIfPayloadStatus::Unsupported ||
+       !blend_if_is_identity(boundary_blend_if.settings))) {
+    auto* warning = new QLabel(
+        QObject::tr("This folder's closing PSD record contains "
+                               "separate Blend If data. Patchy preserves that "
+                               "boundary data unchanged; the controls below "
+                               "edit only the visible folder record."),
+        &dialog);
+    warning->setObjectName(QStringLiteral("layerStyleBlendIfBoundaryWarning"));
+    warning->setWordWrap(true);
+    warning->setProperty("warningBanner", true);
+    set_themed_style(*warning, QStringLiteral(
+        "QLabel#layerStyleBlendIfBoundaryWarning { background: @warning_banner_bg; "
+        "border: 1px solid @warning_banner_border; "
+        "border-radius: 3px; color: @warning_banner_text; padding: 7px 9px; }"));
+    root->addWidget(warning);
+  }
+
+  auto* body = new QHBoxLayout();
+  root->addLayout(body, 1);
+
+  auto* categories = new QListWidget(&dialog);
+  categories->setObjectName(QStringLiteral("layerStyleCategoryList"));
+  // Both bounds grow by what the text size adds to the widest row (GitHub issue 495), so a
+  // list at its minimum still fits the longest effect name.
+  const int category_growth = ui_text_length(230) - 230;
+  categories->setMinimumWidth(210 + category_growth);
+  categories->setMaximumWidth(230 + category_growth);
+  auto* category_pane = new QWidget(&dialog);
+  auto* category_layout = new QVBoxLayout(category_pane);
+  category_layout->setContentsMargins(0, 0, 0, 0);
+  category_layout->setSpacing(6);
+  category_layout->addWidget(categories, 1);
+  // The row under the effect list (GitHub issue 726 follow-up): the style
+  // swatch at the left; beside it the Remove Selected Instance button at the
+  // top right, right under the list it acts on, and the Preview box at the
+  // bottom (preview_slot; the box is made further down), on the OK/Cancel line.
+  // The effect list's column and the options column both run to the dialog's
+  // bottom edge, so the swatch, Preview, OK and Cancel share one bottom line.
+  auto* category_actions = new QHBoxLayout();
+  category_actions->setContentsMargins(0, 0, 0, 0);
+  category_actions->setSpacing(8);
+  // Style preview swatch (GitHub issue 726): the current settings on the style
+  // presets' sample, under the effect list. Changes coalesce on a short timer,
+  // so a slider drag renders at most once per tick, and the render is always a
+  // kStyleSwatchExtent square, whatever the document's size.
+  auto* style_swatch = new QLabel(category_pane);
+  style_swatch->setObjectName(QStringLiteral("layerStyleSwatch"));
+  style_swatch->setFixedSize(kStyleSwatchExtent + 2, kStyleSwatchExtent + 2);
+  style_swatch->setAlignment(Qt::AlignCenter);
+  style_swatch->setToolTip(QObject::tr("The current style on a sample"));
+  style_swatch->setAccessibleName(QObject::tr("Style preview"));
+  set_themed_style(*style_swatch,
+                   QStringLiteral("QLabel#layerStyleSwatch { border: 1px solid @field_border; }"));
+  category_actions->addWidget(style_swatch);
+  const auto render_style_swatch = [style_swatch, document_patterns, pattern_library](const LayerStyleSettings& settings) {
+    std::vector<PatternResource> swatch_patterns;
+    std::vector<std::string> referenced_ids;
+    collect_referenced_pattern_ids(settings.style, referenced_ids);
+    for (const auto& id : referenced_ids) {
+      if (document_patterns != nullptr) {
+        if (const auto* resource = document_patterns->find(id); resource != nullptr) {
+          swatch_patterns.push_back(*resource);
+          continue;
+        }
+      }
+      if (pattern_library != nullptr) {
+        if (auto resource = pattern_library->resource(QString::fromStdString(id)); resource.has_value()) {
+          swatch_patterns.push_back(std::move(*resource));
+        }
+      }
+    }
+    style_swatch->setPixmap(render_style_preview(
+        settings.style,
+        psd::AslBlendSettings{settings.opacity, settings.blend_mode, settings.blend_if, settings.fill_opacity},
+        swatch_patterns, kStyleSwatchExtent));
+  };
+  auto* style_swatch_timer = new QTimer(&dialog);
+  style_swatch_timer->setObjectName(QStringLiteral("layerStyleSwatchTimer"));
+  style_swatch_timer->setSingleShot(true);
+  style_swatch_timer->setInterval(40);
+  const auto style_swatch_pending = std::make_shared<std::optional<LayerStyleSettings>>();
+  QObject::connect(style_swatch_timer, &QTimer::timeout, &dialog, [render_style_swatch, style_swatch_pending] {
+    if (style_swatch_pending->has_value()) {
+      const auto settings = std::move(**style_swatch_pending);
+      style_swatch_pending->reset();
+      render_style_swatch(settings);
+    }
+  });
+  const auto schedule_style_swatch = [style_swatch_timer, style_swatch_pending](const LayerStyleSettings& settings) {
+    *style_swatch_pending = settings;
+    if (!style_swatch_timer->isActive()) {
+      style_swatch_timer->start();
+    }
+  };
+  auto* category_side = new QVBoxLayout();
+  category_side->setContentsMargins(0, 0, 0, 0);
+  category_side->setSpacing(0);
+  auto* category_side_top = new QHBoxLayout();
+  category_side_top->setContentsMargins(0, 0, 0, 0);
+  category_side_top->addStretch(1);
+  auto* remove_selected_instance = new QPushButton(category_pane);
+  remove_selected_instance->setObjectName(QStringLiteral("layerStyleRemoveSelectedInstanceButton"));
+  remove_selected_instance->setIcon(dialog.style()->standardIcon(QStyle::SP_TrashIcon));
+  remove_selected_instance->setFixedSize(26, 24);
+  remove_selected_instance->setToolTip(QObject::tr("Remove Selected Instance"));
+  category_side_top->addWidget(remove_selected_instance);
+  category_side->addLayout(category_side_top);
+  category_side->addStretch(1);
+  auto* preview_slot = new QHBoxLayout();
+  preview_slot->setContentsMargins(0, 0, 0, 0);
+  category_side->addLayout(preview_slot);
+  category_actions->addLayout(category_side, 1);
+  category_layout->addLayout(category_actions);
+  body->addWidget(category_pane);
+
+  // The settings pages scroll when the screen is too short for the tallest
+  // one (GitHub issue 190); OptionsPaneScreenCap sizes the pane below.
+  auto* options_scroll = new QScrollArea(&dialog);
+  options_scroll->setObjectName(QStringLiteral("layerStyleOptionsScroll"));
+  options_scroll->setWidgetResizable(true);
+  options_scroll->setFrameShape(QFrame::NoFrame);
+  options_scroll->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
+  set_themed_style(*options_scroll,
+                   QStringLiteral("QScrollArea#layerStyleOptionsScroll { background: transparent; }"
+                                  "QScrollArea#layerStyleOptionsScroll > QWidget > QWidget { "
+                                  "background: transparent; }"));
+  auto* controls = new QStackedWidget(options_scroll);
+  controls->setObjectName(QStringLiteral("layerStyleOptionsStack"));
+  options_scroll->setWidget(controls);
+  // Style Presets lives beside the scroll area, not in it (GitHub issue 606
+  // follow-up): only its preset list scrolls, and New Style, Manage Styles and
+  // the view buttons under it always show. Its page in `controls` stays as an
+  // empty placeholder so the stack's current page still names the category.
+  auto* options_pane = new QStackedWidget(&dialog);
+  options_pane->setObjectName(QStringLiteral("layerStyleOptionsPane"));
+  options_pane->addWidget(options_scroll);
+  auto* styles_pane = new QWidget(options_pane);
+  styles_pane->setObjectName(QStringLiteral("layerStyleStylesPane"));
+  auto* styles_layout = new QVBoxLayout(styles_pane);
+  styles_layout->setContentsMargins(0, 0, 0, 0);
+  styles_layout->setSpacing(10);
+  options_pane->addWidget(styles_pane);
+  // The pane, then the OK/Cancel row under it (the footer, added below). The
+  // per-effect default buttons live at the bottom of each effect page, inside
+  // the scroll area (GitHub issue 726 follow-up); see add_default_buttons.
+  auto* options_column = new QWidget(&dialog);
+  options_column->setObjectName(QStringLiteral("layerStyleOptionsColumn"));
+  auto* options_column_layout = new QVBoxLayout(options_column);
+  options_column_layout->setContentsMargins(0, 0, 0, 0);
+  options_column_layout->setSpacing(6);
+  options_column_layout->addWidget(options_pane, 1);
+  body->addWidget(options_column, 1);
+  auto make_page = [controls](const QString& object_name) {
+    auto* page = new LayerStyleSettingsPage(controls);
+    page->setObjectName(object_name);
+    auto* layout = new QVBoxLayout(page);
+    layout->setContentsMargins(0, 0, 0, 0);
+    layout->setSpacing(10);
+    controls->addWidget(page);
+    return layout;
+  };
+  LayerStyleGradientContext gradient_context{
+      dialog, gradient_library, foreground, background, batch != nullptr, batch_edits,
+      explicit_fields, reset_batch_capture, [&](bool stroke_gradient) {
+        const auto* current = categories->currentItem();
+        const auto index = current ? current->data(kLayerStyleEffectIndexRole).toInt() : 0;
+        return effect_property_prefix(stroke_gradient ? LayerStyleEffectKind::Stroke
+            : LayerStyleEffectKind::GradientOverlay, index) + ".gradient.definition";
+      }};
+
+  auto* blending_layout = make_page(QStringLiteral("layerStyleBlendingPage"));
+  auto* bevel_layout = make_page(QStringLiteral("layerStyleBevelEmbossPage"));
+  auto* stroke_layout = make_page(QStringLiteral("layerStyleStrokePage"));
+  auto* inner_shadow_layout = make_page(QStringLiteral("layerStyleInnerShadowPage"));
+  auto* inner_glow_layout = make_page(QStringLiteral("layerStyleInnerGlowPage"));
+  auto* satin_layout = make_page(QStringLiteral("layerStyleSatinPage"));
+  auto* color_overlay_layout = make_page(QStringLiteral("layerStyleColorOverlayPage"));
+  auto* gradient_layout = make_page(QStringLiteral("layerStyleGradientOverlayPage"));
+  auto* outer_glow_layout = make_page(QStringLiteral("layerStyleOuterGlowPage"));
+  auto* shadow_layout = make_page(QStringLiteral("layerStyleDropShadowPage"));
+  auto* pattern_overlay_layout = make_page(QStringLiteral("layerStylePatternOverlayPage"));
+  auto* bevel_contour_layout = make_page(QStringLiteral("layerStyleBevelContourPage"));
+  auto* bevel_texture_layout = make_page(QStringLiteral("layerStyleBevelTexturePage"));
+  auto* styles_placeholder = make_page(QStringLiteral("layerStyleStylesPage"))->parentWidget();
+  // Only the page that shows sizes the stack, so a page that fits the pane
+  // shows no scroll bar (GitHub issue 606 follow-up 4).
+  QObject::connect(controls, &QStackedWidget::currentChanged, controls,
+                   [controls](int) { fit_options_stack_to_current_page(*controls); });
+  fit_options_stack_to_current_page(*controls);
+
+  // --- Styles page: the preset browser -------------------------------------
+  // List (the folder tree with names) or Grid (thumbnails, the name in the
+  // tooltip), remembered under layerStyle/stylesGridView; Grid by default.
+  const QScreen* list_screen = parent != nullptr ? parent->screen() : QGuiApplication::primaryScreen();
+  const auto available_height = list_screen != nullptr ? list_screen->availableGeometry().height() : 800;
+  auto* styles_views = new QStackedWidget(styles_pane);
+  styles_views->setObjectName(QStringLiteral("layerStyleStylesViews"));
+  // About 500 px of presets where the screen has room; a short screen gets less
+  // so the dialog still fits it (GitHub issue 190). Once shown the list may
+  // shrink with the dialog (the buttons below it stay put); see
+  // OptionsPaneScreenCap.
+  styles_views->setMinimumHeight(std::clamp(available_height / 2, 240, 500));
+  auto* styles_browser = new StyleBrowserWidget(style_library, styles_views);
+  styles_browser->setObjectName(QStringLiteral("layerStyleStylesBrowser"));
+  styles_browser->set_icon_extent(48);
+  styles_browser->set_show_no_style_entry(true);
+  styles_views->addWidget(styles_browser);
+  auto* styles_grid = new PresetGridWidget(styles_views);
+  styles_grid->setObjectName(QStringLiteral("layerStyleStylesGrid"));
+  styles_grid->setIconSize(QSize(48, 48));
+  styles_grid->set_cell_extent(56);
+  styles_grid->set_folder_click_toggles(true);
+  styles_grid->setSelectionMode(QAbstractItemView::ExtendedSelection);
+  styles_grid->setContextMenuPolicy(Qt::CustomContextMenu);
+  styles_grid->set_folder_label_callback(
+      [](const QString& folder, int count) { return QObject::tr("%1 (%2)").arg(folder).arg(count); });
+  styles_grid->set_entries_callback([style_library] {
+    std::vector<PresetTreeEntry> rows;
+    rows.push_back({QString::fromLatin1(kNoStyleGridId), QObject::tr("No Style (remove all effects)"),
+                    no_style_grid_icon(48), QObject::tr("No Style (remove all effects)"), QString()});
+    if (style_library != nullptr) {
+      for (const auto& entry : style_library->entries()) {
+        const auto name = style_library_entry_display_name(entry);
+        rows.push_back({entry.storage_id, name, QIcon(entry.thumbnail), name, entry.folder});
+      }
+    }
+    return rows;
+  });
+  styles_views->addWidget(styles_grid);
+  styles_grid->reload();
+  if (style_library != nullptr) {
+    QObject::connect(style_library, &StyleLibrary::changed, styles_grid,
+                     [styles_grid] { styles_grid->reload(styles_grid->current_id()); });
+  }
+  QObject::connect(styles_grid, &QWidget::customContextMenuRequested, styles_grid,
+                   [styles_grid, styles_browser](const QPoint& position) {
+                     auto* item = styles_grid->itemAt(position);
+                     if (item == nullptr || PresetGridWidget::item_entry_id(item) == QLatin1String(kNoStyleGridId)) {
+                       return;
+                     }
+                     if (!item->isSelected()) {
+                       styles_grid->setCurrentItem(item);
+                     }
+                     auto ids = styles_grid->selected_ids();
+                     ids.removeAll(QString::fromLatin1(kNoStyleGridId));
+                     const auto folder = PresetGridWidget::is_folder_item(item) ? item->data(Qt::UserRole).toString()
+                                                                                : QString();
+                     styles_browser->exec_export_menu(styles_grid->viewport()->mapToGlobal(position), ids,
+                                                      !folder.isEmpty(), folder);
+                   });
+  styles_layout->addWidget(styles_views, 1);
+  auto* styles_buttons = new QHBoxLayout();
+  auto* new_style_button = new QPushButton(QObject::tr("New Style…"), &dialog);
+  new_style_button->setObjectName(QStringLiteral("layerStyleNewStyleButton"));
+  new_style_button->setToolTip(
+      QObject::tr("Save the current effects (and optionally blending options) "
+                  "as a preset"));
+  auto* manage_styles_button = new QPushButton(QObject::tr("Manage Styles…"), &dialog);
+  manage_styles_button->setObjectName(QStringLiteral("layerStyleManageStylesButton"));
+  styles_buttons->addWidget(new_style_button);
+  styles_buttons->addWidget(manage_styles_button);
+  auto* styles_info = new QLabel(&dialog);
+  styles_info->setObjectName(QStringLiteral("layerStyleStylesInfoIcon"));
+  styles_info->setPixmap(dialog.style()->standardIcon(QStyle::SP_MessageBoxInformation).pixmap(16, 16));
+  styles_info->setToolTip(QObject::tr("Right-click a folder or style to export it as a Photoshop .asl file."));
+  styles_info->setAccessibleName(styles_info->toolTip());
+  styles_buttons->addWidget(styles_info);
+  styles_buttons->addStretch(1);
+  auto* styles_list_view = new QToolButton(&dialog);
+  styles_list_view->setObjectName(QStringLiteral("layerStyleStylesListViewButton"));
+  styles_list_view->setText(QObject::tr("List"));
+  styles_list_view->setToolTip(QObject::tr("Show the styles as a list with their names"));
+  styles_list_view->setCheckable(true);
+  auto* styles_grid_view = new QToolButton(&dialog);
+  styles_grid_view->setObjectName(QStringLiteral("layerStyleStylesGridViewButton"));
+  styles_grid_view->setText(QObject::tr("Grid"));
+  styles_grid_view->setToolTip(QObject::tr("Show the styles as a grid of thumbnails"));
+  styles_grid_view->setCheckable(true);
+  styles_buttons->addWidget(styles_list_view);
+  styles_buttons->addWidget(styles_grid_view);
+  styles_layout->addLayout(styles_buttons);
+  const auto show_styles_view = [styles_views, styles_browser, styles_grid, styles_list_view,
+                                 styles_grid_view](bool grid) {
+    styles_views->setCurrentWidget(grid ? static_cast<QWidget*>(styles_grid) : styles_browser);
+    styles_list_view->setChecked(!grid);
+    styles_grid_view->setChecked(grid);
+  };
+  show_styles_view(stored_layer_style_styles_grid_view());
+  QObject::connect(styles_list_view, &QToolButton::clicked, &dialog, [show_styles_view] {
+    show_styles_view(false);
+    set_stored_layer_style_styles_grid_view(false);
+  });
+  QObject::connect(styles_grid_view, &QToolButton::clicked, &dialog, [show_styles_view] {
+    show_styles_view(true);
+    set_stored_layer_style_styles_grid_view(true);
+  });
+  new_style_button->setEnabled(style_library != nullptr);
+  manage_styles_button->setEnabled(style_library != nullptr);
+  styles_browser->reload();
+
+  // Pattern pickers list document-embedded resources first, then the persistent
+  // user library. A direct dialog caller that supplies no library retains the
+  // built-in fallback used before the Pattern Manager existed.
+  const auto pattern_entry_display_name = [](const PatternLibraryEntry& entry) {
+    if (const auto* preset = find_builtin_pattern_preset(entry.id.toStdString());
+        preset != nullptr && entry.name == QString::fromLatin1(preset->english_name)) {
+      return translate_data_text(preset->english_name);
+    }
+    return entry.name;
+  };
+  const auto populate_pattern_combo = [&](QComboBox* picker, const std::string& current_id,
+                                          const std::string& current_name) {
+    auto* combo = static_cast<PatternPickerCombo*>(picker);
+    const QSignalBlocker blocker(combo);
+    combo->clear_patterns();
+    if (document_patterns != nullptr) {
+      for (const auto& resource : document_patterns->patterns) {
+        const auto name = QString::fromStdString(resource.name);
+        const auto readable = document_pattern_display_name(resource);
+        const auto display = readable.isEmpty() ? QString::fromStdString(resource.id) : readable;
+        combo->add_pattern(pattern_preset_icon(resource.tile), display, display,
+                           QString::fromStdString(resource.id), name);
+      }
+    }
+    if (pattern_library != nullptr) {
+      for (const auto& entry : pattern_library->entries()) {
+        if (document_patterns != nullptr && document_patterns->find(entry.id.toStdString()) != nullptr) {
+          continue;
+        }
+        const auto display = pattern_entry_display_name(entry);
+        const auto label = entry.folder.isEmpty() ? display
+                                                   : QObject::tr("%1 / %2").arg(entry.folder, display);
+        combo->add_pattern(QIcon(entry.thumbnail), label, display, entry.id, entry.name,
+                           entry.folder);
+      }
+    } else {
+      for (const auto& preset : builtin_pattern_presets()) {
+        if (document_patterns != nullptr && document_patterns->find(preset.id) != nullptr) {
+          continue;
+        }
+        const auto display = translate_data_text(preset.english_name);
+        combo->add_pattern(pattern_preset_icon(generate_builtin_pattern_tile(preset.id)), display,
+                           display, QString::fromLatin1(preset.id),
+                           QString::fromLatin1(preset.english_name), default_patterns_folder_name());
+      }
+    }
+    const auto current = QString::fromStdString(current_id);
+    auto index = combo->findData(current, kPatternIdRole);
+    if (index < 0 && !current.isEmpty()) {
+      // Unresolvable reference: keep it selectable so opening and accepting the
+      // dialog never silently rewrites the file's pattern id.
+      const auto display = current_name.empty() ? current_id : current_name;
+      const auto missing = QObject::tr("%1 (missing)").arg(QString::fromStdString(display));
+      combo->add_pattern(missing, missing, current, QString::fromStdString(current_name));
+      index = combo->count() - 1;
+    }
+    combo->setCurrentIndex(index >= 0 ? index : (combo->count() > 0 ? 0 : -1));
+  };
+  auto make_pattern_combo = [&](QWidget* combo_parent, const QString& object_name,
+                                const std::string& current_id, const std::string& current_name) {
+    auto* combo = new PatternPickerCombo(combo_parent);
+    combo->setObjectName(object_name);
+    combo->setIconSize(QSize(24, 24));
+    populate_pattern_combo(combo, current_id, current_name);
+    return combo;
+  };
+  auto pattern_combo_id = [](const QComboBox* combo) {
+    return combo->currentData(kPatternIdRole).toString().toStdString();
+  };
+  auto pattern_combo_persist_name = [](const QComboBox* combo) {
+    return combo->currentData(kPatternPersistNameRole).toString().toStdString();
+  };
+  auto set_pattern_combo_id = [](QComboBox* combo, const std::string& id) {
+    const auto index = combo->findData(QString::fromStdString(id), kPatternIdRole);
+    combo->setCurrentIndex(index >= 0 ? index : 0);
+  };
+
+  // Contour pickers: the built-in shapes, then the user's saved contours, with a
+  // leading "Custom" entry while the host-retained custom curve is neither (an
+  // imported Photoshop curve, or one drawn in the contour editor). That curve is
+  // only replaced by a new custom curve, never by picking a listed contour.
+  auto listed_contour = [contour_library](const StyleContour& value) {
+    return find_builtin_contour_preset(value) != nullptr ||
+           (contour_library != nullptr && contour_library->find_matching(value) != nullptr);
+  };
+  auto fill_contour_combo = [contour_library, listed_contour](QComboBox* combo, const StyleContour& current,
+                                                              const StyleContour& custom_value) {
+    const QSignalBlocker blocker(combo);
+    combo->clear();
+    if (!listed_contour(custom_value)) {
+      combo->addItem(contour_preset_icon(custom_value), QObject::tr("Custom"),
+                     QString::fromLatin1(kContourCustomId));
+    }
+    for (const auto& preset : builtin_contour_presets()) {
+      combo->addItem(contour_preset_icon(preset.contour), translate_data_text(preset.english_name),
+                     QString::fromLatin1(preset.id));
+    }
+    if (contour_library != nullptr && !contour_library->entries().empty()) {
+      combo->insertSeparator(combo->count());
+      for (const auto& entry : contour_library->entries()) {
+        combo->addItem(contour_preset_icon(entry.contour), entry.name,
+                       QLatin1String(kContourUserPrefix) + entry.storage_id);
+      }
+    }
+    int index = -1;
+    if (const auto* matching = find_builtin_contour_preset(current); matching != nullptr) {
+      index = combo->findData(QString::fromLatin1(matching->id));
+    } else if (const auto* entry = contour_library != nullptr ? contour_library->find_matching(current) : nullptr;
+               entry != nullptr) {
+      index = combo->findData(QLatin1String(kContourUserPrefix) + entry->storage_id);
+    } else {
+      index = combo->findData(QString::fromLatin1(kContourCustomId));
+    }
+    combo->setCurrentIndex(std::max(0, index));
+    combo->view()->setMinimumWidth(combo->view()->sizeHintForColumn(0) + 2 * combo->view()->frameWidth() +
+                                   combo->style()->pixelMetric(QStyle::PM_ScrollBarExtent));
+  };
+  auto make_contour_combo = [&](QWidget* combo_parent, const QString& object_name,
+                                const StyleContour& current, const StyleContour& custom_value) {
+    auto* combo = new QComboBox(combo_parent);
+    combo->setObjectName(object_name);
+    combo->setIconSize(QSize(32, 24));
+    combo->setToolTip(QObject::tr("Click the curve to edit this contour"));
+    // The list stretches with its row, but its minimum stays short, so the Edit
+    // and Library buttons fit beside it without widening the dialog and a long
+    // saved name cannot. The drop-down still shows every name in full
+    // (fill_contour_combo sizes it).
+    combo->setSizeAdjustPolicy(QComboBox::AdjustToMinimumContentsLengthWithIcon);
+    combo->setMinimumContentsLength(10);
+    fill_contour_combo(combo, current, custom_value);
+    return combo;
+  };
+  auto contour_combo_value = [contour_library](const QComboBox* combo, const StyleContour& custom_value) {
+    const auto id = combo->currentData().toString();
+    if (id == QLatin1String(kContourCustomId)) {
+      return custom_value;
+    }
+    if (id.startsWith(QLatin1String(kContourUserPrefix))) {
+      const auto* entry =
+          contour_library != nullptr
+              ? contour_library->find_entry(id.mid(static_cast<qsizetype>(std::strlen(kContourUserPrefix))))
+              : nullptr;
+      return entry != nullptr ? entry->contour : custom_value;
+    }
+    if (const auto* preset = find_builtin_contour_preset(id.toStdString()); preset != nullptr) {
+      return preset->contour;
+    }
+    return custom_value;
+  };
+  // Shows `value` in a picker: its listed entry, or Custom with `value` as the
+  // new host-retained curve.
+  auto load_contour_picker = [listed_contour, fill_contour_combo](QComboBox* combo, StyleContour& custom_value,
+                                                                  const StyleContour& value) {
+    if (!listed_contour(value)) {
+      custom_value = value;
+    }
+    fill_contour_combo(combo, value, custom_value);
+  };
+
+  auto* blending_group = new QGroupBox(QObject::tr("Blending Options"), controls);
+  auto* blending_form = new QFormLayout(blending_group);
+  auto* blend = new QComboBox(blending_group);
+  blend->setObjectName(QStringLiteral("layerStyleBlendModeCombo"));
+  add_blend_mode_items(blend, layer.kind() == LayerKind::Group ? BlendModeMenu::Folder : BlendModeMenu::Layer);
+  // A Paint.NET mode the layer already uses stays choosable while the dialog is open.
+  set_non_photoshop_blend_modes_offered(blend, {layer.blend_mode()});
+  enable_blend_mode_items_for_depth(blend, document_depth);
+  blend->setCurrentIndex(std::max(0, blend->findData(static_cast<int>(layer.blend_mode()))));
+  blending_form->addRow(QObject::tr("Blend Mode:"), blend);
+  auto* opacity = add_slider_spin_row(blending_form, blending_group, QObject::tr("Opacity:"),
+                                      QStringLiteral("layerStyleOpacitySpin"), 0, 100,
+                                      static_cast<int>(std::round(layer.opacity() * 100.0F)), QStringLiteral("%"));
+  add_form_section(blending_form, blending_group, QString(), QStringLiteral("layerStyleOpacitySection"));
+  auto* fill_opacity = add_slider_spin_row(
+      blending_form, blending_group, QObject::tr("Fill Opacity:"),
+      QStringLiteral("layerStyleFillOpacitySpin"), 0, 100,
+      static_cast<int>(std::round(layer.fill_opacity() * 100.0F)), QStringLiteral("%"));
+  fill_opacity->setEnabled(layer.kind() != LayerKind::Group);
+  // Advanced Blending "Channels": checked = the channel composites, so the
+  // model's kRestrict* bits are the UNCHECKED boxes.
+  auto* channels_row = new QWidget(blending_group);
+  auto* channels_layout = new QHBoxLayout(channels_row);
+  channels_layout->setContentsMargins(0, 0, 0, 0);
+  channels_layout->setSpacing(12);
+  auto* channel_red = new QCheckBox(QObject::tr("R"), channels_row);
+  channel_red->setObjectName(QStringLiteral("layerStyleChannelRedCheck"));
+  auto* channel_green = new QCheckBox(QObject::tr("G"), channels_row);
+  channel_green->setObjectName(QStringLiteral("layerStyleChannelGreenCheck"));
+  auto* channel_blue = new QCheckBox(QObject::tr("B"), channels_row);
+  channel_blue->setObjectName(QStringLiteral("layerStyleChannelBlueCheck"));
+  const auto channel_restriction_supported = layer.channel_restriction_supported();
+  const auto initial_restricted_channels =
+      channel_restriction_supported ? layer.restricted_channels() : std::uint8_t{0};
+  const auto channels_tooltip =
+      channel_restriction_supported
+          ? QObject::tr("An unchecked channel keeps the layers below instead of compositing")
+          : QObject::tr("This layer preserves Photoshop channel restrictions Patchy cannot edit "
+                        "for this file's color mode");
+  for (auto* check : {channel_red, channel_green, channel_blue}) {
+    check->setToolTip(channels_tooltip);
+    check->setEnabled(channel_restriction_supported);
+    channels_layout->addWidget(check);
+  }
+  channel_red->setChecked((initial_restricted_channels & kRestrictRed) == 0U);
+  channel_green->setChecked((initial_restricted_channels & kRestrictGreen) == 0U);
+  channel_blue->setChecked((initial_restricted_channels & kRestrictBlue) == 0U);
+  channels_layout->addStretch(1);
+  blending_form->addRow(QObject::tr("Channels:"), channels_row);
+  // Advanced Blending "Knockout" (the native 'knko' mode the compositor
+  // renders, docs/blend-modes-groups.md): the layer's shape cuts through the layers
+  // below it to its group's backdrop (Shallow) or to the Background (Deep).
+  auto* knockout = new QComboBox(blending_group);
+  knockout->setObjectName(QStringLiteral("layerStyleKnockoutCombo"));
+  knockout->addItem(QObject::tr("None"), 0);
+  knockout->addItem(QObject::tr("Shallow"), 1);
+  knockout->addItem(QObject::tr("Deep"), 2);
+  const auto knockout_setting = layer_knockout_setting(layer);
+  knockout->setCurrentIndex(std::max(0, knockout->findData(static_cast<int>(knockout_setting.value_or(0U)))));
+  knockout->setEnabled(knockout_setting.has_value());
+  knockout->setToolTip(
+      knockout_setting.has_value()
+          ? QObject::tr("Shallow cuts through the layers below to the bottom of this layer's group; "
+                        "Deep cuts through to the Background, or to transparency without one")
+          : QObject::tr("This layer preserves a Photoshop knockout setting Patchy cannot edit"));
+  blending_form->addRow(QObject::tr("Knockout:"), knockout);
+  const auto current_restricted_channels = [=]() -> std::uint8_t {
+    if (!channel_restriction_supported) {
+      return 0;
+    }
+    std::uint8_t restricted = 0;
+    if (!channel_red->isChecked()) {
+      restricted |= kRestrictRed;
+    }
+    if (!channel_green->isChecked()) {
+      restricted |= kRestrictGreen;
+    }
+    if (!channel_blue->isChecked()) {
+      restricted |= kRestrictBlue;
+    }
+    return restricted;
+  };
+  auto* show_effects = new QCheckBox(QObject::tr("Show Effects"), blending_group);
+  show_effects->setObjectName(QStringLiteral("layerStyleShowEffectsCheck"));
+  show_effects->setChecked(style.effects_visible);
+  auto* mask_hides_effects = new QCheckBox(QObject::tr("Layer Mask Hides Effects"), blending_group);
+  mask_hides_effects->setObjectName(QStringLiteral("layerStyleMaskHidesEffectsCheck"));
+  mask_hides_effects->setChecked(style.layer_mask_hides_effects);
+  mask_hides_effects->setToolTip(
+      QObject::tr("Clip drop shadows, glows, and strokes with the layer mask "
+                  "instead of only shaping them"));
+  auto* vector_mask_hides_effects = new QCheckBox(QObject::tr("Vector Mask Hides Effects"), blending_group);
+  vector_mask_hides_effects->setObjectName(QStringLiteral("layerStyleVectorMaskHidesEffectsCheck"));
+  vector_mask_hides_effects->setChecked(style.vector_mask_hides_effects);
+  vector_mask_hides_effects->setToolTip(
+      QObject::tr("Hide drop shadows, glows, and strokes where the vector mask hides the layer, "
+                  "instead of letting the vector mask shape them"));
+  auto* blend_interior = new QCheckBox(QObject::tr("Blend Interior Effects as Group"), blending_group);
+  blend_interior->setObjectName(QStringLiteral("layerStyleBlendInteriorCheck"));
+  blend_interior->setChecked(style.blend_interior_elements);
+  blend_interior->setToolTip(
+      QObject::tr("Put the layer's blend mode over its overlays, satin, and inner glow "
+                  "instead of letting them blend with their own modes"));
+  auto* blend_clipped = new QCheckBox(QObject::tr("Blend Clipped Layers as Group"), blending_group);
+  blend_clipped->setObjectName(QStringLiteral("layerStyleBlendClippedCheck"));
+  blend_clipped->setChecked(style.blend_clipped_elements);
+  blend_clipped->setToolTip(
+      QObject::tr("Keep the layers clipped to this one under its interior effects; turn this off "
+                  "together with Blend Interior Effects as Group to draw them over the overlays instead"));
+  auto* blending_checks = new CheckBoxColumns(blending_group, {blend_interior, blend_clipped},
+                                              {mask_hides_effects, vector_mask_hides_effects, show_effects});
+  blending_checks->setObjectName(QStringLiteral("layerStyleBlendingChecks"));
+  blending_form->addRow(QString(), blending_checks);
+  blending_layout->addWidget(blending_group);
+
+  struct BlendIfRowWidgets {
+    struct SpinControl {
+      QSpinBox* spin{nullptr};
+    };
+
+    BlendIfRangeEditorWidget* editor{nullptr};
+    SpinControl black_low;
+    SpinControl black_high;
+    SpinControl white_low;
+    SpinControl white_high;
+  };
+
+  // Blend If is part of the Blending Options section (GitHub issue 606): a
+  // line above it and "Blend If:" with its channel combo in the page's label
+  // and field columns; the This Layer and Underlying Layer rows below span the
+  // whole section width (issue 606 follow-up 2).
+  add_form_section(blending_form, blending_group, QString(), QStringLiteral("layerStyleBlendIfSection"));
+  auto* blend_if_channel_widget = new QWidget(blending_group);
+  blend_if_channel_widget->setObjectName(QStringLiteral("layerStyleBlendIfChannelRow"));
+  auto* blend_if_channel_row = new QHBoxLayout(blend_if_channel_widget);
+  blend_if_channel_row->setContentsMargins(0, 0, 0, 0);
+  auto* blend_if_group = new QWidget(blending_group);
+  blend_if_group->setObjectName(QStringLiteral("layerStyleBlendIfGroup"));
+  auto* blend_if_layout = new QVBoxLayout(blend_if_group);
+  blend_if_layout->setContentsMargins(0, 0, 0, 0);
+  blend_if_layout->setSpacing(4);
+  auto* blend_if_channel = new QComboBox(blend_if_channel_widget);
+  blend_if_channel->setObjectName(QStringLiteral("layerStyleBlendIfChannelCombo"));
+  blend_if_channel->addItem(QObject::tr("Gray"), static_cast<int>(BlendIfChannel::Gray));
+  blend_if_channel->addItem(QObject::tr("Red"), static_cast<int>(BlendIfChannel::Red));
+  blend_if_channel->addItem(QObject::tr("Green"), static_cast<int>(BlendIfChannel::Green));
+  blend_if_channel->addItem(QObject::tr("Blue"), static_cast<int>(BlendIfChannel::Blue));
+  blend_if_channel_row->addWidget(blend_if_channel, 1);
+  auto* reset_blend_if_channel = new QPushButton(QObject::tr("Reset Channel"), blend_if_channel_widget);
+  reset_blend_if_channel->setObjectName(QStringLiteral("layerStyleBlendIfResetChannelButton"));
+  blend_if_channel_row->addWidget(reset_blend_if_channel);
+  blending_form->addRow(QObject::tr("Blend If:"), blend_if_channel_widget);
+
+  const auto blend_if_value_style = QStringLiteral(R"(
+    QSpinBox {
+      background: @field_bg;
+      border: 1px solid @field_inset_border;
+      border-top-color: @field_bevel_top;
+      border-radius: 2px;
+      color: @text_bright;
+      padding: 0 5px;
+    }
+    QSpinBox:disabled {
+      background: @spinbox_disabled_bg;
+      color: @spinbox_disabled_text;
+    }
+  )");
+  auto make_blend_if_spin = [&](QWidget* parent_widget, const QString& object_name,
+                                const QString& accessible_name) {
+    BlendIfRowWidgets::SpinControl control;
+    auto* spin = new QSpinBox(parent_widget);
+    spin->setObjectName(object_name);
+    spin->setRange(0, 255);
+    spin->setAccessibleName(accessible_name);
+    configure_dialog_spinbox(spin, 48);
+    spin->setFixedWidth(48);
+    set_themed_style(*spin, blend_if_value_style);
+    control.spin = spin;
+    return control;
+  };
+
+  // "This Layer:   Black: [ ] to [ ]   White: [ ] to [ ]", then the ramp.
+  auto make_blend_if_row = [&](const QString& title, const QString& label_text, const QString& object_prefix,
+                               const QString& editor_object_name) {
+    BlendIfRowWidgets row;
+    auto* values = new QHBoxLayout();
+    values->setSpacing(5);
+    auto* title_label = new QLabel(label_text, blend_if_group);
+    title_label->setStyleSheet(QStringLiteral("font-weight: 600;"));
+    values->addWidget(title_label);
+    values->addStretch(1);
+    row.editor = new BlendIfRangeEditorWidget(blend_if_group);
+    row.editor->setObjectName(editor_object_name);
+    row.editor->set_accessibility_text(
+        QObject::tr("%1 Blend If range").arg(title),
+        resolve_modifier_names(QObject::tr("Use Page Up or Page Down to select a handle, arrow keys "
+                                           "to move it, and %ALT%-drag to "
+                                           "split a joined handle.")));
+    auto* black_label = new QLabel(QObject::tr("Black:"), blend_if_group);
+    values->addWidget(black_label);
+    row.black_low = make_blend_if_spin(
+        blend_if_group, object_prefix + QStringLiteral("BlackLowSpin"),
+        QObject::tr("%1 black transition start").arg(title));
+    row.black_high = make_blend_if_spin(
+        blend_if_group, object_prefix + QStringLiteral("BlackHighSpin"),
+        QObject::tr("%1 black transition end").arg(title));
+    black_label->setBuddy(row.black_low.spin);
+    values->addWidget(row.black_low.spin);
+    values->addWidget(new QLabel(QObject::tr("to"), blend_if_group));
+    values->addWidget(row.black_high.spin);
+    values->addSpacing(14);
+    auto* white_label = new QLabel(QObject::tr("White:"), blend_if_group);
+    values->addWidget(white_label);
+    row.white_low = make_blend_if_spin(
+        blend_if_group, object_prefix + QStringLiteral("WhiteLowSpin"),
+        QObject::tr("%1 white transition start").arg(title));
+    row.white_high = make_blend_if_spin(
+        blend_if_group, object_prefix + QStringLiteral("WhiteHighSpin"),
+        QObject::tr("%1 white transition end").arg(title));
+    white_label->setBuddy(row.white_low.spin);
+    values->addWidget(row.white_low.spin);
+    values->addWidget(new QLabel(QObject::tr("to"), blend_if_group));
+    values->addWidget(row.white_high.spin);
+    blend_if_layout->addLayout(values);
+    blend_if_layout->addWidget(row.editor);
+    return row;
+  };
+
+  auto blend_if_this = make_blend_if_row(QObject::tr("This Layer"), QObject::tr("This Layer:"),
+                                         QStringLiteral("layerStyleBlendIfThis"),
+                                         QStringLiteral("layerStyleBlendIfThisEditor"));
+  auto blend_if_underlying =
+      make_blend_if_row(QObject::tr("Underlying Layer"), QObject::tr("Underlying Layer:"),
+                        QStringLiteral("layerStyleBlendIfUnderlying"),
+                        QStringLiteral("layerStyleBlendIfUnderlyingEditor"));
+  const auto set_blend_if_enabled = [blend_if_group, blend_if_channel_widget, blending_form](bool enabled) {
+    blend_if_group->setEnabled(enabled);
+    blend_if_channel_widget->setEnabled(enabled);
+    if (auto* label = blending_form->labelForField(blend_if_channel_widget); label != nullptr) {
+      label->setEnabled(enabled);
+    }
+  };
+  blending_form->addRow(blend_if_group);
+  set_blend_if_enabled(blend_if_payload_status != BlendIfPayloadStatus::Unsupported);
+
+  bool loading_blend_if_controls = false;
+  const auto current_blend_if_channel_index = [&] {
+    return static_cast<std::size_t>(std::clamp(blend_if_channel->currentData().toInt(), 0, 3));
+  };
+  const auto set_blend_if_row = [&](BlendIfRowWidgets& row, BlendIfThresholds thresholds) {
+    const QSignalBlocker black_low_blocker(row.black_low.spin);
+    const QSignalBlocker black_high_blocker(row.black_high.spin);
+    const QSignalBlocker white_low_blocker(row.white_low.spin);
+    const QSignalBlocker white_high_blocker(row.white_high.spin);
+    for (auto* spin : {row.black_low.spin, row.black_high.spin, row.white_low.spin, row.white_high.spin}) {
+      spin->setRange(0, 255);
+    }
+    row.black_low.spin->setValue(thresholds.black_low);
+    row.black_high.spin->setValue(thresholds.black_high);
+    row.white_low.spin->setValue(thresholds.white_low);
+    row.white_high.spin->setValue(thresholds.white_high);
+    row.black_low.spin->setRange(0, thresholds.black_high);
+    row.black_high.spin->setRange(thresholds.black_low, thresholds.white_low);
+    row.white_low.spin->setRange(thresholds.black_high, thresholds.white_high);
+    row.white_high.spin->setRange(thresholds.white_low, 255);
+    row.editor->set_thresholds(thresholds);
+  };
+  const auto load_blend_if_controls = [&] {
+    loading_blend_if_controls = true;
+    const auto channel_index = current_blend_if_channel_index();
+    const auto channel = static_cast<BlendIfChannel>(channel_index);
+    blend_if_this.editor->set_ramp_channel(channel);
+    blend_if_underlying.editor->set_ramp_channel(channel);
+    set_blend_if_row(blend_if_this, blend_if.channels[channel_index].this_layer);
+    set_blend_if_row(blend_if_underlying, blend_if.channels[channel_index].underlying_layer);
+    loading_blend_if_controls = false;
+  };
+  load_blend_if_controls();
+
+  // Preview is transient dialog state, independent of Photoshop's persisted
+  // master effects switch (Show Effects above). It stays visible on every page.
+  auto* preview_check = new QCheckBox(QObject::tr("Preview"), &dialog);
+  preview_check->setObjectName(QStringLiteral("layerStylePreviewCheck"));
+  preview_check->setChecked(true);
+  preview_check->setToolTip(QObject::tr("Show the changes on the canvas while this dialog is open"));
+  preview_slot->addWidget(preview_check);
+  preview_slot->addStretch(1);
+  blending_layout->addStretch(1);
+
+  // Builders return handles; these aggregates and gradient_context remain
+  // alive until the modal dialog has finished delivering all callbacks.
+  LayerStylePageContext page_context{dialog, controls, gradient_context,
+      make_contour_combo, make_pattern_combo, patchy_only_banner, continuous_shadow_explanation};
+
+  auto bevel_page = build_bevel_page(page_context, bevel_layout, bevel, custom_gloss_contour);
+  auto& bevel_style = bevel_page.bevel_style;
+  auto& bevel_technique = bevel_page.bevel_technique;
+  auto& bevel_size = bevel_page.bevel_size;
+  auto& bevel_soften = bevel_page.bevel_soften;
+  auto& bevel_depth = bevel_page.bevel_depth;
+  auto& bevel_angle = bevel_page.bevel_angle;
+  auto& bevel_altitude = bevel_page.bevel_altitude;
+  auto& bevel_direction = bevel_page.bevel_direction;
+  auto& bevel_gloss_contour = bevel_page.bevel_gloss_contour;
+  auto& bevel_gloss_anti_aliased = bevel_page.bevel_gloss_anti_aliased;
+  auto& bevel_highlight_color = bevel_page.bevel_highlight_color;
+  auto& bevel_highlight_blend = bevel_page.bevel_highlight_blend;
+  auto& bevel_highlight_opacity = bevel_page.bevel_highlight_opacity;
+  auto& bevel_highlight_color_button = bevel_page.bevel_highlight_color_button;
+  auto& bevel_shadow_color = bevel_page.bevel_shadow_color;
+  auto& bevel_shadow_blend = bevel_page.bevel_shadow_blend;
+  auto& bevel_shadow_opacity = bevel_page.bevel_shadow_opacity;
+  auto& bevel_shadow_color_button = bevel_page.bevel_shadow_color_button;
+  auto update_bevel_color_previews = [&] {
+    update_color_preview_label(bevel_highlight_color_button, bevel_highlight_color.red,
+                               bevel_highlight_color.green, bevel_highlight_color.blue);
+    update_color_preview_label(bevel_shadow_color_button, bevel_shadow_color.red,
+                               bevel_shadow_color.green, bevel_shadow_color.blue);
+  };
+  update_bevel_color_previews();
+
+  auto bevel_contour_page = build_bevel_contour_page(page_context, bevel_contour_layout, bevel, custom_bevel_sub_contour);
+  auto& bevel_contour_combo = bevel_contour_page.bevel_contour_combo;
+  auto& bevel_contour_anti_aliased = bevel_contour_page.bevel_contour_anti_aliased;
+  auto& bevel_contour_range = bevel_contour_page.bevel_contour_range;
+
+  auto bevel_texture_page = build_bevel_texture_page(page_context, bevel_texture_layout, bevel);
+  auto& bevel_texture_pattern = bevel_texture_page.bevel_texture_pattern;
+  auto& bevel_texture_manage = bevel_texture_page.bevel_texture_manage;
+  auto& bevel_texture_scale = bevel_texture_page.bevel_texture_scale;
+  auto& bevel_texture_depth = bevel_texture_page.bevel_texture_depth;
+  auto& bevel_texture_invert = bevel_texture_page.bevel_texture_invert;
+  auto& bevel_texture_link = bevel_texture_page.bevel_texture_link;
+  auto& bevel_texture_snap = bevel_texture_page.bevel_texture_snap;
+
+  auto pattern_overlay_page = build_pattern_overlay_page(page_context, pattern_overlay_layout, pattern_overlay);
+  auto& pattern_overlay_blend = pattern_overlay_page.pattern_overlay_blend;
+  auto& pattern_overlay_opacity = pattern_overlay_page.pattern_overlay_opacity;
+  auto& pattern_overlay_pattern = pattern_overlay_page.pattern_overlay_pattern;
+  auto& pattern_overlay_manage = pattern_overlay_page.pattern_overlay_manage;
+  auto& pattern_overlay_angle = pattern_overlay_page.pattern_overlay_angle;
+  auto& pattern_overlay_scale = pattern_overlay_page.pattern_overlay_scale;
+  auto& pattern_overlay_link = pattern_overlay_page.pattern_overlay_link;
+  auto& pattern_overlay_snap = pattern_overlay_page.pattern_overlay_snap;
+
+  auto stroke_page = build_stroke_page(page_context, stroke_layout, stroke);
+  auto& stroke_size = stroke_page.stroke_size;
+  auto& stroke_position = stroke_page.stroke_position;
+  auto& stroke_blend = stroke_page.stroke_blend;
+  auto& stroke_opacity = stroke_page.stroke_opacity;
+  auto& stroke_overprint = stroke_page.stroke_overprint;
+  auto& stroke_fill = stroke_page.stroke_fill;
+  auto& stroke_rows = stroke_page.stroke_rows;
+  auto& stroke_red = stroke_page.stroke_red;
+  auto& stroke_green = stroke_page.stroke_green;
+  auto& stroke_blue = stroke_page.stroke_blue;
+  auto& stroke_gradient_controls = stroke_page.stroke_gradient_controls;
+  auto& update_stroke_fill_visibility = stroke_page.update_stroke_fill_visibility;
+
+  auto inner_shadow_page = build_inner_shadow_page(page_context, inner_shadow_layout, inner_shadow);
+  auto& inner_shadow_blend = inner_shadow_page.inner_shadow_blend;
+  auto& inner_shadow_opacity = inner_shadow_page.inner_shadow_opacity;
+  auto& inner_shadow_angle = inner_shadow_page.inner_shadow_angle;
+  auto& inner_shadow_distance = inner_shadow_page.inner_shadow_distance;
+  auto& inner_shadow_size = inner_shadow_page.inner_shadow_size;
+  auto& inner_shadow_choke = inner_shadow_page.inner_shadow_choke;
+  auto& inner_shadow_rows = inner_shadow_page.inner_shadow_rows;
+  auto& inner_shadow_red = inner_shadow_page.inner_shadow_red;
+  auto& inner_shadow_green = inner_shadow_page.inner_shadow_green;
+  auto& inner_shadow_blue = inner_shadow_page.inner_shadow_blue;
+  auto& add_inner_shadow = inner_shadow_page.add_inner_shadow;
+  auto& remove_inner_shadow = inner_shadow_page.remove_inner_shadow;
+
+  auto inner_glow_page = build_inner_glow_page(page_context, inner_glow_layout, inner_glow);
+  auto& inner_glow_blend = inner_glow_page.inner_glow_blend;
+  auto& inner_glow_technique = inner_glow_page.inner_glow_technique;
+  auto& inner_glow_opacity = inner_glow_page.inner_glow_opacity;
+  auto& inner_glow_size = inner_glow_page.inner_glow_size;
+  auto& inner_glow_choke = inner_glow_page.inner_glow_choke;
+  auto& inner_glow_range = inner_glow_page.inner_glow_range;
+  auto& inner_glow_source = inner_glow_page.inner_glow_source;
+  auto& inner_glow_rows = inner_glow_page.inner_glow_rows;
+  auto& inner_glow_red = inner_glow_page.inner_glow_red;
+  auto& inner_glow_green = inner_glow_page.inner_glow_green;
+  auto& inner_glow_blue = inner_glow_page.inner_glow_blue;
+  auto& add_inner_glow = inner_glow_page.add_inner_glow;
+  auto& remove_inner_glow = inner_glow_page.remove_inner_glow;
+
+  auto satin_page = build_satin_page(page_context, satin_layout, satin);
+  auto& satin_blend = satin_page.satin_blend;
+  auto& satin_opacity = satin_page.satin_opacity;
+  auto& satin_angle = satin_page.satin_angle;
+  auto& satin_distance = satin_page.satin_distance;
+  auto& satin_size = satin_page.satin_size;
+  auto& satin_invert = satin_page.satin_invert;
+  auto& satin_rows = satin_page.satin_rows;
+  auto& satin_red = satin_page.satin_red;
+  auto& satin_green = satin_page.satin_green;
+  auto& satin_blue = satin_page.satin_blue;
+
+  auto color_overlay_page = build_color_overlay_page(page_context, color_overlay_layout, color_overlay);
+  auto& color_overlay_blend = color_overlay_page.color_overlay_blend;
+  auto& color_overlay_opacity = color_overlay_page.color_overlay_opacity;
+  auto& color_overlay_red = color_overlay_page.color_overlay_red;
+  auto& color_overlay_green = color_overlay_page.color_overlay_green;
+  auto& color_overlay_blue = color_overlay_page.color_overlay_blue;
+  auto& color_overlay_rows = color_overlay_page.color_overlay_rows;
+
+  auto gradient_page = build_gradient_page(page_context, gradient_layout, gradient);
+  auto& gradient_blend = gradient_page.gradient_blend;
+  auto& gradient_opacity = gradient_page.gradient_opacity;
+  auto& gradient_controls = gradient_page.gradient_controls;
+
+  auto outer_glow_page = build_outer_glow_page(page_context, outer_glow_layout, outer_glow);
+  auto& outer_glow_blend = outer_glow_page.outer_glow_blend;
+  auto& outer_glow_technique = outer_glow_page.outer_glow_technique;
+  auto& outer_glow_opacity = outer_glow_page.outer_glow_opacity;
+  auto& outer_glow_size = outer_glow_page.outer_glow_size;
+  auto& outer_glow_spread = outer_glow_page.outer_glow_spread;
+  auto& outer_glow_range = outer_glow_page.outer_glow_range;
+  auto& outer_glow_rows = outer_glow_page.outer_glow_rows;
+  auto& outer_glow_red = outer_glow_page.outer_glow_red;
+  auto& outer_glow_green = outer_glow_page.outer_glow_green;
+  auto& outer_glow_blue = outer_glow_page.outer_glow_blue;
+
+  auto shadow_page = build_shadow_page(page_context, shadow_layout, shadow, custom_shadow_contour);
+  auto& shadow_blend = shadow_page.shadow_blend;
+  auto& shadow_opacity = shadow_page.shadow_opacity;
+  auto& shadow_angle = shadow_page.shadow_angle;
+  auto& shadow_distance = shadow_page.shadow_distance;
+  auto& shadow_size = shadow_page.shadow_size;
+  auto& shadow_spread = shadow_page.shadow_spread;
+  auto& shadow_continuous = shadow_page.shadow_continuous;
+  auto& shadow_fade = shadow_page.shadow_fade;
+  auto& sync_continuous_controls = shadow_page.sync_continuous_controls;
+  auto& shadow_conceals = shadow_page.shadow_conceals;
+  auto& shadow_contour = shadow_page.shadow_contour;
+  auto& shadow_anti_aliased = shadow_page.shadow_anti_aliased;
+  // The Edit and Library buttons sit between each contour list and its
+  // Anti-aliased box (GitHub issue 726); they are wired up further down, once
+  // emit_preview exists.
+  std::vector<ContourPickerTools> contour_pickers(3);
+  const auto bind_contour_picker = [&contour_pickers](std::size_t slot, QComboBox* combo, StyleContour* custom,
+                                                      LayerStyleEffectKind kind, const char* leaf) {
+    contour_pickers[slot].combo = combo;
+    contour_pickers[slot].custom = custom;
+    contour_pickers[slot].kind = kind;
+    contour_pickers[slot].leaf = leaf;
+  };
+  bind_contour_picker(0, bevel_gloss_contour, &custom_gloss_contour, LayerStyleEffectKind::BevelEmboss, "gloss_contour");
+  bind_contour_picker(1, bevel_contour_combo, &custom_bevel_sub_contour, LayerStyleEffectKind::BevelContour, "contour");
+  bind_contour_picker(2, shadow_contour, &custom_shadow_contour, LayerStyleEffectKind::DropShadow, "contour");
+  for (auto& picker : contour_pickers) {
+    auto* row = picker.combo->parentWidget();
+    const auto stem = picker.combo->objectName();
+    picker.edit = new QPushButton(QObject::tr("Edit…"), row);
+    picker.edit->setObjectName(stem + QStringLiteral("EditButton"));
+    picker.edit->setToolTip(QObject::tr("Edit this contour's curve"));
+    picker.library = new QPushButton(QObject::tr("Library"), row);
+    picker.library->setObjectName(stem + QStringLiteral("LibraryButton"));
+    picker.library->setToolTip(QObject::tr("Save this contour under a name, or load and save contour files"));
+    if (auto* row_layout = qobject_cast<QBoxLayout*>(row->layout()); row_layout != nullptr) {
+      const auto at = row_layout->indexOf(picker.combo) + 1;
+      row_layout->insertWidget(at, picker.edit);
+      row_layout->insertWidget(at + 1, picker.library);
+    }
+    QWidget::setTabOrder(picker.combo, picker.edit);
+    QWidget::setTabOrder(picker.edit, picker.library);
+  }
+  auto& shadow_rows = shadow_page.shadow_rows;
+  auto& shadow_red = shadow_page.shadow_red;
+  auto& shadow_green = shadow_page.shadow_green;
+  auto& shadow_blue = shadow_page.shadow_blue;
+
+  // Save as Default, Load Default and Restore Built-in Default for each effect
+  // page (GitHub issue 606; wording, the third button and the place from issue
+  // 726's follow-up). Each page carries its own row at the bottom of its
+  // content, inside the scroll area, so the buttons scroll with the page; Style
+  // Presets, Blending Options, Contour and Texture have none. The object names
+  // keep their first wording (tests and scripts find the buttons by them).
+  struct DefaultButtons {
+    LayerStyleEffectKind kind;
+    QPushButton* make;
+    QPushButton* reset;
+    QPushButton* restore;
+  };
+  std::vector<DefaultButtons> default_buttons;
+  const auto add_default_buttons = [&](LayerStyleEffectKind kind, const QString& object_prefix,
+                                       QBoxLayout* page_layout) {
+    auto* row = new QWidget(page_layout->parentWidget());
+    row->setObjectName(object_prefix + QStringLiteral("DefaultsRow"));
+    auto* row_layout = new QHBoxLayout(row);
+    // The buttons start where the page's labels start: inside its group box.
+    int indent = 0;
+    if (auto* first = page_layout->count() > 0 ? page_layout->itemAt(0)->widget() : nullptr;
+        first != nullptr && first->layout() != nullptr) {
+      indent = first->layout()->contentsMargins().left();
+    }
+    row_layout->setContentsMargins(indent, 0, 0, 0);
+    row_layout->setSpacing(6);
+    auto* make = new QPushButton(QObject::tr("Save as Default"), row);
+    make->setObjectName(object_prefix + QStringLiteral("MakeDefaultButton"));
+    make->setToolTip(QObject::tr("Use these settings whenever this effect is added"));
+    auto* reset = new QPushButton(QObject::tr("Load Default"), row);
+    reset->setObjectName(object_prefix + QStringLiteral("ResetToDefaultButton"));
+    reset->setToolTip(QObject::tr(
+        "Put back your saved default for this effect, or Patchy's own settings when you have not saved one"));
+    auto* restore = new QPushButton(QObject::tr("Restore Built-in Default"), row);
+    restore->setObjectName(object_prefix + QStringLiteral("RestoreBuiltInDefaultButton"));
+    restore->setToolTip(
+        QObject::tr("Forget your saved default for this effect and put back Patchy's own settings"));
+    restore->setEnabled(has_stored_effect_default(kind));
+    row_layout->addWidget(make);
+    row_layout->addWidget(reset);
+    row_layout->addWidget(restore);
+    row_layout->addStretch(1);
+    // After the page's last control, before its trailing stretch.
+    auto at = page_layout->count();
+    if (at > 0 && page_layout->itemAt(at - 1)->spacerItem() != nullptr) {
+      --at;
+    }
+    page_layout->insertWidget(at, row);
+    default_buttons.push_back({kind, make, reset, restore});
+  };
+  // The Stroke page scrolls on its own (layerStyleStrokeScroll): its row goes
+  // inside that inner page, after the stroke group.
+  auto* stroke_scroll_page = dialog.findChild<QWidget*>(QStringLiteral("layerStyleStrokeScrollPage"));
+  auto* stroke_content_layout =
+      stroke_scroll_page != nullptr ? qobject_cast<QBoxLayout*>(stroke_scroll_page->layout()) : nullptr;
+  add_default_buttons(LayerStyleEffectKind::BevelEmboss, QStringLiteral("layerStyleBevel"), bevel_layout);
+  add_default_buttons(LayerStyleEffectKind::Stroke, QStringLiteral("layerStyleStroke"),
+                      stroke_content_layout != nullptr ? stroke_content_layout : stroke_layout);
+  add_default_buttons(LayerStyleEffectKind::InnerShadow, QStringLiteral("layerStyleInnerShadow"),
+                      inner_shadow_layout);
+  add_default_buttons(LayerStyleEffectKind::InnerGlow, QStringLiteral("layerStyleInnerGlow"), inner_glow_layout);
+  add_default_buttons(LayerStyleEffectKind::Satin, QStringLiteral("layerStyleSatin"), satin_layout);
+  add_default_buttons(LayerStyleEffectKind::ColorOverlay, QStringLiteral("layerStyleColorOverlay"),
+                      color_overlay_layout);
+  add_default_buttons(LayerStyleEffectKind::GradientOverlay, QStringLiteral("layerStyleGradient"), gradient_layout);
+  add_default_buttons(LayerStyleEffectKind::PatternOverlay, QStringLiteral("layerStylePatternOverlay"),
+                      pattern_overlay_layout);
+  add_default_buttons(LayerStyleEffectKind::OuterGlow, QStringLiteral("layerStyleOuterGlow"), outer_glow_layout);
+  add_default_buttons(LayerStyleEffectKind::DropShadow, QStringLiteral("layerStyleDropShadow"), shadow_layout);
+
+  auto item_page = [](const QListWidgetItem* item) {
+    return item == nullptr ? LayerStyleCategoryPage::Blending
+                           : static_cast<LayerStyleCategoryPage>(item->data(kLayerStylePageRole).toInt());
+  };
+  auto item_kind = [](const QListWidgetItem* item) {
+    return item == nullptr ? LayerStyleEffectKind::None
+                           : static_cast<LayerStyleEffectKind>(item->data(kLayerStyleEffectKindRole).toInt());
+  };
+  auto item_effect_index = [](const QListWidgetItem* item) {
+    return item == nullptr ? -1 : item->data(kLayerStyleEffectIndexRole).toInt();
+  };
+  auto item_checked = [](const QListWidgetItem* item) {
+    return item != nullptr && item->checkState() == Qt::Checked;
+  };
+  auto set_combo_data = [](QComboBox* combo, int data) {
+    combo->setCurrentIndex(std::max(0, combo->findData(data)));
+  };
+  auto indexed_object_name = [](const QString& base_name, int index) {
+    return index <= 0 ? base_name : base_name + QString::number(index + 1);
+  };
+  auto is_stackable_kind = [](LayerStyleEffectKind kind) {
+    return effect_vector_ops_for_kind(kind) != nullptr;
+  };
+  auto ensure_bevel = [](LayerStyle& target, int index) -> LayerBevelEmboss& {
+    return ensure_effect(target.bevels, index, default_bevel_emboss);
+  };
+  auto apply_enabled_states = [&](LayerStyle& result) {
+    for (int row = 0; row < categories->count(); ++row) {
+      auto* category = categories->item(row);
+      const auto enabled = item_checked(category);
+      const auto index = item_effect_index(category);
+      switch (item_kind(category)) {
+        case LayerStyleEffectKind::BevelEmboss:
+          if (enabled || !result.bevels.empty()) {
+            ensure_bevel(result, index).enabled = enabled;
+          }
+          break;
+        case LayerStyleEffectKind::Stroke:
+          if (enabled || result.strokes.size() > static_cast<std::size_t>(std::max(0, index))) {
+            ensure_effect(result.strokes, index, default_stroke).enabled = enabled;
+          }
+          break;
+        case LayerStyleEffectKind::InnerShadow:
+          if (enabled || result.inner_shadows.size() > static_cast<std::size_t>(std::max(0, index))) {
+            ensure_effect(result.inner_shadows, index, default_inner_shadow).enabled = enabled;
+          }
+          break;
+        case LayerStyleEffectKind::InnerGlow:
+          if (enabled || result.inner_glows.size() > static_cast<std::size_t>(std::max(0, index))) {
+            ensure_effect(result.inner_glows, index, default_inner_glow).enabled = enabled;
+          }
+          break;
+        case LayerStyleEffectKind::Satin:
+          if (enabled || result.satins.size() > static_cast<std::size_t>(std::max(0, index))) {
+            ensure_effect(result.satins, index, default_satin).enabled = enabled;
+          }
+          break;
+        case LayerStyleEffectKind::ColorOverlay:
+          if (enabled || result.color_overlays.size() > static_cast<std::size_t>(std::max(0, index))) {
+            ensure_effect(result.color_overlays, index, default_color_overlay).enabled = enabled;
+          }
+          break;
+        case LayerStyleEffectKind::GradientOverlay:
+          if (enabled || result.gradient_fills.size() > static_cast<std::size_t>(std::max(0, index))) {
+            ensure_effect(result.gradient_fills, index, default_gradient_fill).enabled = enabled;
+          }
+          break;
+        case LayerStyleEffectKind::PatternOverlay:
+          if (enabled || result.pattern_overlays.size() > static_cast<std::size_t>(std::max(0, index))) {
+            ensure_effect(result.pattern_overlays, index, default_pattern_overlay).enabled = enabled;
+          }
+          break;
+        case LayerStyleEffectKind::OuterGlow:
+          if (enabled || result.outer_glows.size() > static_cast<std::size_t>(std::max(0, index))) {
+            ensure_effect(result.outer_glows, index, default_outer_glow).enabled = enabled;
+          }
+          break;
+        case LayerStyleEffectKind::DropShadow:
+          if (enabled || result.drop_shadows.size() > static_cast<std::size_t>(std::max(0, index))) {
+            ensure_effect(result.drop_shadows, index, default_drop_shadow).enabled = enabled;
+          }
+          break;
+        case LayerStyleEffectKind::BevelContour:
+          // The sub-option checkbox never force-enables the bevel itself: a
+          // bevel created just to carry the flag stays disabled (PS behavior).
+          if (enabled || !result.bevels.empty()) {
+            const auto had_bevel = !result.bevels.empty();
+            auto& target = ensure_bevel(result, 0);
+            if (!had_bevel) {
+              target.enabled = false;
+            }
+            target.contour.enabled = enabled;
+          }
+          break;
+        case LayerStyleEffectKind::BevelTexture:
+          if (enabled || !result.bevels.empty()) {
+            const auto had_bevel = !result.bevels.empty();
+            auto& target = ensure_bevel(result, 0);
+            if (!had_bevel) {
+              target.enabled = false;
+            }
+            target.texture.enabled = enabled;
+          }
+          break;
+        case LayerStyleEffectKind::None:
+          break;
+      }
+    }
+  };
+  auto save_controls_to_style = [&](LayerStyle& result, const QListWidgetItem* category) {
+    const auto index = item_effect_index(category);
+    if (index < 0) {
+      return;
+    }
+    const auto enabled = item_checked(category);
+    switch (item_kind(category)) {
+      case LayerStyleEffectKind::BevelEmboss: {
+        if (batch == nullptr && !enabled && result.bevels.empty()) {
+          return;
+        }
+        auto& target = ensure_bevel(result, index);
+        target.enabled = enabled;
+        target.style = static_cast<BevelEmbossStyleKind>(bevel_style->currentData().toInt());
+        target.technique = static_cast<BevelTechnique>(bevel_technique->currentData().toInt());
+        target.size = static_cast<float>(bevel_size->value());
+        target.soften = static_cast<float>(bevel_soften->value());
+        target.depth = static_cast<float>(bevel_depth->value()) / 100.0F;
+        target.angle_degrees = static_cast<float>(bevel_angle->value());
+        target.altitude_degrees = static_cast<float>(bevel_altitude->value());
+        target.direction_up = bevel_direction.first->isChecked();
+        target.highlight_blend_mode =
+            static_cast<BlendMode>(bevel_highlight_blend->currentData().toInt());
+        target.highlight_color = bevel_highlight_color;
+        target.highlight_opacity = static_cast<float>(bevel_highlight_opacity->value()) / 100.0F;
+        target.shadow_blend_mode = static_cast<BlendMode>(bevel_shadow_blend->currentData().toInt());
+        target.shadow_color = bevel_shadow_color;
+        target.shadow_opacity = static_cast<float>(bevel_shadow_opacity->value()) / 100.0F;
+        target.gloss_contour = contour_combo_value(bevel_gloss_contour, custom_gloss_contour);
+        target.gloss_anti_aliased = bevel_gloss_anti_aliased->isChecked();
+        break;
+      }
+      case LayerStyleEffectKind::BevelContour: {
+        if (batch == nullptr && !enabled && result.bevels.empty()) {
+          return;
+        }
+        const auto had_bevel = !result.bevels.empty();
+        auto& target = ensure_bevel(result, 0);
+        if (!had_bevel) {
+          target.enabled = false;
+        }
+        target.contour.enabled = enabled;
+        target.contour.contour = contour_combo_value(bevel_contour_combo, custom_bevel_sub_contour);
+        target.contour.anti_aliased = bevel_contour_anti_aliased->isChecked();
+        target.contour.range = static_cast<float>(bevel_contour_range->value()) / 100.0F;
+        break;
+      }
+      case LayerStyleEffectKind::BevelTexture: {
+        if (batch == nullptr && !enabled && result.bevels.empty()) {
+          return;
+        }
+        const auto had_bevel = !result.bevels.empty();
+        auto& target = ensure_bevel(result, 0);
+        if (!had_bevel) {
+          target.enabled = false;
+        }
+        target.texture.enabled = enabled;
+        target.texture.pattern_id = pattern_combo_id(bevel_texture_pattern);
+        target.texture.pattern_name = pattern_combo_persist_name(bevel_texture_pattern);
+        target.texture.scale = static_cast<float>(bevel_texture_scale->value()) / 100.0F;
+        target.texture.depth = static_cast<float>(bevel_texture_depth->value()) / 100.0F;
+        target.texture.invert = bevel_texture_invert->isChecked();
+        target.texture.link_with_layer = bevel_texture_link->isChecked();
+        target.texture.phase_x = bevel.texture.phase_x;
+        target.texture.phase_y = bevel.texture.phase_y;
+        break;
+      }
+      case LayerStyleEffectKind::Stroke: {
+        if (batch == nullptr && !enabled && result.strokes.size() <= static_cast<std::size_t>(index)) {
+          return;
+        }
+        auto& target = ensure_effect(result.strokes, index, default_stroke);
+        target.enabled = enabled;
+        target.size = static_cast<float>(stroke_size->value());
+        target.blend_mode = static_cast<BlendMode>(stroke_blend->currentData().toInt());
+        target.opacity = static_cast<float>(stroke_opacity->value()) / 100.0F;
+        target.color = RgbColor{static_cast<std::uint8_t>(stroke_red->value()),
+                                static_cast<std::uint8_t>(stroke_green->value()),
+                                static_cast<std::uint8_t>(stroke_blue->value())};
+        target.position = static_cast<LayerStrokePosition>(stroke_position->currentData().toInt());
+        target.overprint = stroke_overprint->isChecked();
+        target.uses_gradient = stroke_fill->currentData().toBool();
+        target.gradient = stroke_gradient_controls->value();
+        break;
+      }
+      case LayerStyleEffectKind::InnerShadow: {
+        if (batch == nullptr && !enabled && result.inner_shadows.size() <= static_cast<std::size_t>(index)) {
+          return;
+        }
+        auto& target = ensure_effect(result.inner_shadows, index, default_inner_shadow);
+        target.enabled = enabled;
+        target.blend_mode = static_cast<BlendMode>(inner_shadow_blend->currentData().toInt());
+        target.opacity = static_cast<float>(inner_shadow_opacity->value()) / 100.0F;
+        target.angle_degrees = static_cast<float>(inner_shadow_angle->value());
+        target.distance = static_cast<float>(inner_shadow_distance->value());
+        target.size = static_cast<float>(inner_shadow_size->value());
+        target.choke = static_cast<float>(inner_shadow_choke->value());
+        target.color = RgbColor{static_cast<std::uint8_t>(inner_shadow_red->value()),
+                                static_cast<std::uint8_t>(inner_shadow_green->value()),
+                                static_cast<std::uint8_t>(inner_shadow_blue->value())};
+        break;
+      }
+      case LayerStyleEffectKind::InnerGlow: {
+        if (batch == nullptr && !enabled && result.inner_glows.size() <= static_cast<std::size_t>(index)) {
+          return;
+        }
+        auto& target = ensure_effect(result.inner_glows, index, default_inner_glow);
+        target.enabled = enabled;
+        target.blend_mode = static_cast<BlendMode>(inner_glow_blend->currentData().toInt());
+        target.opacity = static_cast<float>(inner_glow_opacity->value()) / 100.0F;
+        target.size = static_cast<float>(inner_glow_size->value());
+        target.choke = static_cast<float>(inner_glow_choke->value());
+        target.technique = static_cast<LayerGlowTechnique>(inner_glow_technique->currentData().toInt());
+        target.range = static_cast<float>(inner_glow_range->value());
+        target.source = inner_glow_source.first->isChecked() ? LayerInnerGlowSource::Center : LayerInnerGlowSource::Edge;
+        target.color = RgbColor{static_cast<std::uint8_t>(inner_glow_red->value()),
+                                static_cast<std::uint8_t>(inner_glow_green->value()),
+                                static_cast<std::uint8_t>(inner_glow_blue->value())};
+        break;
+      }
+      case LayerStyleEffectKind::Satin: {
+        if (batch == nullptr && !enabled && result.satins.size() <= static_cast<std::size_t>(index)) {
+          return;
+        }
+        auto& target = ensure_effect(result.satins, index, default_satin);
+        target.enabled = enabled;
+        target.blend_mode = static_cast<BlendMode>(satin_blend->currentData().toInt());
+        target.opacity = static_cast<float>(satin_opacity->value()) / 100.0F;
+        target.angle_degrees = static_cast<float>(satin_angle->value());
+        target.distance = static_cast<float>(satin_distance->value());
+        target.size = static_cast<float>(satin_size->value());
+        target.invert = satin_invert->isChecked();
+        target.color = RgbColor{static_cast<std::uint8_t>(satin_red->value()),
+                                static_cast<std::uint8_t>(satin_green->value()),
+                                static_cast<std::uint8_t>(satin_blue->value())};
+        break;
+      }
+      case LayerStyleEffectKind::ColorOverlay: {
+        if (batch == nullptr && !enabled && result.color_overlays.size() <= static_cast<std::size_t>(index)) {
+          return;
+        }
+        auto& target = ensure_effect(result.color_overlays, index, default_color_overlay);
+        target.enabled = enabled;
+        target.blend_mode = static_cast<BlendMode>(color_overlay_blend->currentData().toInt());
+        target.opacity = static_cast<float>(color_overlay_opacity->value()) / 100.0F;
+        target.color = RgbColor{static_cast<std::uint8_t>(color_overlay_red->value()),
+                                static_cast<std::uint8_t>(color_overlay_green->value()),
+                                static_cast<std::uint8_t>(color_overlay_blue->value())};
+        break;
+      }
+      case LayerStyleEffectKind::GradientOverlay: {
+        if (batch == nullptr && !enabled && result.gradient_fills.size() <= static_cast<std::size_t>(index)) {
+          return;
+        }
+        auto& target = ensure_effect(result.gradient_fills, index, default_gradient_fill);
+        target.enabled = enabled;
+        target.blend_mode = static_cast<BlendMode>(gradient_blend->currentData().toInt());
+        target.opacity = static_cast<float>(gradient_opacity->value()) / 100.0F;
+        target.gradient = gradient_controls->value();
+        break;
+      }
+      case LayerStyleEffectKind::PatternOverlay: {
+        if (batch == nullptr && !enabled && result.pattern_overlays.size() <= static_cast<std::size_t>(index)) {
+          return;
+        }
+        auto& target = ensure_effect(result.pattern_overlays, index, default_pattern_overlay);
+        target.enabled = enabled;
+        target.blend_mode = static_cast<BlendMode>(pattern_overlay_blend->currentData().toInt());
+        target.opacity = static_cast<float>(pattern_overlay_opacity->value()) / 100.0F;
+        target.pattern_id = pattern_combo_id(pattern_overlay_pattern);
+        target.pattern_name = pattern_combo_persist_name(pattern_overlay_pattern);
+        target.angle_degrees = static_cast<float>(pattern_overlay_angle->value());
+        target.scale = static_cast<float>(pattern_overlay_scale->value()) / 100.0F;
+        target.link_with_layer = pattern_overlay_link->isChecked();
+        target.phase_x = pattern_overlay.phase_x;
+        target.phase_y = pattern_overlay.phase_y;
+        break;
+      }
+      case LayerStyleEffectKind::OuterGlow: {
+        if (batch == nullptr && !enabled && result.outer_glows.size() <= static_cast<std::size_t>(index)) {
+          return;
+        }
+        auto& target = ensure_effect(result.outer_glows, index, default_outer_glow);
+        target.enabled = enabled;
+        target.blend_mode = static_cast<BlendMode>(outer_glow_blend->currentData().toInt());
+        target.technique = static_cast<LayerGlowTechnique>(outer_glow_technique->currentData().toInt());
+        target.opacity = static_cast<float>(outer_glow_opacity->value()) / 100.0F;
+        target.size = static_cast<float>(outer_glow_size->value());
+        target.spread = static_cast<float>(outer_glow_spread->value());
+        target.range = static_cast<float>(outer_glow_range->value());
+        target.color = RgbColor{static_cast<std::uint8_t>(outer_glow_red->value()),
+                                static_cast<std::uint8_t>(outer_glow_green->value()),
+                                static_cast<std::uint8_t>(outer_glow_blue->value())};
+        break;
+      }
+      case LayerStyleEffectKind::DropShadow: {
+        if (batch == nullptr && !enabled && result.drop_shadows.size() <= static_cast<std::size_t>(index)) {
+          return;
+        }
+        auto& target = ensure_effect(result.drop_shadows, index, default_drop_shadow);
+        target.enabled = enabled;
+        target.blend_mode = static_cast<BlendMode>(shadow_blend->currentData().toInt());
+        target.opacity = static_cast<float>(shadow_opacity->value()) / 100.0F;
+        target.angle_degrees = static_cast<float>(shadow_angle->value());
+        target.distance = static_cast<float>(shadow_distance->value());
+        target.size = static_cast<float>(shadow_size->value());
+        target.spread = static_cast<float>(shadow_spread->value());
+        target.layer_conceals = shadow_conceals->isChecked();
+        target.contour = contour_combo_value(shadow_contour, custom_shadow_contour);
+        target.anti_aliased = shadow_anti_aliased->isChecked();
+        target.continuous = shadow_continuous->isChecked();
+        target.fade = static_cast<float>(shadow_fade->value());
+        target.color = RgbColor{static_cast<std::uint8_t>(shadow_red->value()),
+                                static_cast<std::uint8_t>(shadow_green->value()),
+                                static_cast<std::uint8_t>(shadow_blue->value())};
+        break;
+      }
+      case LayerStyleEffectKind::None:
+        break;
+    }
+  };
+
+  bool loading_controls = false;
+  bool rebuilding_categories = false;
+  std::function<LayerStyleSettings(const QListWidgetItem*)> build_current_settings_for_item;
+  std::function<void(bool)> emit_preview;
+  std::function<void(const QListWidgetItem*)> load_controls_from_style;
+  std::function<void(LayerStyleEffectKind, int)> rebuild_category_list;
+
+  build_current_settings_for_item = [&](const QListWidgetItem* category) {
+    LayerStyle result = style;
+    result.effects_visible = show_effects->isChecked();
+    result.layer_mask_hides_effects = mask_hides_effects->isChecked();
+    result.vector_mask_hides_effects = vector_mask_hides_effects->isChecked();
+    result.blend_interior_elements = blend_interior->isChecked();
+    result.blend_clipped_elements = blend_clipped->isChecked();
+    apply_enabled_states(result);
+    save_controls_to_style(result, category);
+    // Accepting any style edit regenerates the complete native lfx2 descriptor.
+    // Every modeled Satin is therefore written with the Linear contour, even
+    // when a different effect page is active.
+    if (batch == nullptr) for (auto& satin : result.satins) {
+      satin.unsupported_contour_options = false;
+    }
+    return LayerStyleSettings{opacity->value(), static_cast<BlendMode>(blend->currentData().toInt()),
+                              std::move(result), blend_if, replace_unsupported_blend_if,
+                              fill_opacity->value(), current_restricted_channels(),
+                              static_cast<std::uint8_t>(knockout->currentData().toInt())};
+  };
+  auto build_current_settings = [&]() {
+    return build_current_settings_for_item(categories->currentItem());
+  };
+
+  load_controls_from_style = [&](const QListWidgetItem* category) {
+    loading_controls = true;
+    const auto page_index = static_cast<int>(item_page(category));
+    if (controls->currentIndex() != page_index) {
+      // Every page opens at its top (GitHub issue 606 follow-up 3), not at the
+      // scroll position the last page left in the shared scroll area.
+      controls->setCurrentIndex(page_index);
+      options_scroll->verticalScrollBar()->setValue(0);
+      options_scroll->horizontalScrollBar()->setValue(0);
+    }
+    options_pane->setCurrentWidget(controls->currentWidget() == styles_placeholder
+                                       ? styles_pane
+                                       : static_cast<QWidget*>(options_scroll));
+    const auto kind = item_kind(category);
+    const auto index = std::max(0, item_effect_index(category));
+    const auto* stack_ops = effect_vector_ops_for_kind(kind);
+    remove_selected_instance->setEnabled(stack_ops != nullptr && stack_ops->count(style) > 0U);
+
+    switch (kind) {
+      case LayerStyleEffectKind::BevelEmboss: {
+        const auto value = style.bevels.size() > static_cast<std::size_t>(index) ? style.bevels[static_cast<std::size_t>(index)]
+                                                                                 : default_bevel_emboss();
+        set_combo_data(bevel_style, static_cast<int>(value.style));
+        set_combo_data(bevel_technique, static_cast<int>(value.technique));
+        bevel_size->setValue(static_cast<int>(std::round(value.size)));
+        bevel_soften->setValue(static_cast<int>(std::round(value.soften)));
+        bevel_depth->setValue(static_cast<int>(std::round(value.depth * 100.0F)));
+        bevel_angle->setValue(static_cast<int>(std::round(value.angle_degrees)));
+        bevel_altitude->setValue(static_cast<int>(std::round(value.altitude_degrees)));
+        bevel_direction.set_first(value.direction_up);
+        set_combo_data(bevel_highlight_blend, static_cast<int>(value.highlight_blend_mode));
+        bevel_highlight_color = value.highlight_color;
+        bevel_highlight_opacity->setValue(static_cast<int>(std::round(value.highlight_opacity * 100.0F)));
+        set_combo_data(bevel_shadow_blend, static_cast<int>(value.shadow_blend_mode));
+        bevel_shadow_color = value.shadow_color;
+        bevel_shadow_opacity->setValue(static_cast<int>(std::round(value.shadow_opacity * 100.0F)));
+        load_contour_picker(bevel_gloss_contour, custom_gloss_contour, value.gloss_contour);
+        bevel_gloss_anti_aliased->setChecked(value.gloss_anti_aliased);
+        update_bevel_color_previews();
+        break;
+      }
+      case LayerStyleEffectKind::BevelContour: {
+        const auto value = style.bevels.empty() ? default_bevel_emboss() : style.bevels.front();
+        load_contour_picker(bevel_contour_combo, custom_bevel_sub_contour, value.contour.contour);
+        bevel_contour_anti_aliased->setChecked(value.contour.anti_aliased);
+        bevel_contour_range->setValue(
+            std::clamp(static_cast<int>(std::round(value.contour.range * 100.0F)), 1, 100));
+        break;
+      }
+      case LayerStyleEffectKind::BevelTexture: {
+        const auto value = style.bevels.empty() ? default_bevel_emboss() : style.bevels.front();
+        set_pattern_combo_id(bevel_texture_pattern, value.texture.pattern_id);
+        bevel_texture_scale->setValue(
+            std::clamp(static_cast<int>(std::round(value.texture.scale * 100.0F)), 1, 1000));
+        bevel_texture_depth->setValue(
+            std::clamp(static_cast<int>(std::round(value.texture.depth * 100.0F)), -1000, 1000));
+        bevel_texture_invert->setChecked(value.texture.invert);
+        bevel_texture_link->setChecked(value.texture.link_with_layer);
+        bevel.texture.phase_x = value.texture.phase_x;
+        bevel.texture.phase_y = value.texture.phase_y;
+        break;
+      }
+      case LayerStyleEffectKind::Stroke: {
+        const auto value =
+            style.strokes.size() > static_cast<std::size_t>(index) ? style.strokes[static_cast<std::size_t>(index)]
+                                                                   : default_stroke();
+        stroke_size->setValue(static_cast<int>(std::round(value.size)));
+        set_combo_data(stroke_blend, static_cast<int>(value.blend_mode));
+        stroke_opacity->setValue(static_cast<int>(std::round(value.opacity * 100.0F)));
+        stroke_red->setValue(value.color.red);
+        stroke_green->setValue(value.color.green);
+        stroke_blue->setValue(value.color.blue);
+        set_combo_data(stroke_position, static_cast<int>(value.position));
+        stroke_overprint->setChecked(value.overprint);
+        stroke_fill->setCurrentIndex(value.uses_gradient ? 1 : 0);
+        stroke_gradient_controls->load(value.gradient);
+        update_stroke_fill_visibility();
+        break;
+      }
+      case LayerStyleEffectKind::InnerShadow: {
+        const auto value = style.inner_shadows.size() > static_cast<std::size_t>(index)
+                               ? style.inner_shadows[static_cast<std::size_t>(index)]
+                               : default_inner_shadow();
+        set_combo_data(inner_shadow_blend, static_cast<int>(value.blend_mode));
+        inner_shadow_opacity->setValue(static_cast<int>(std::round(value.opacity * 100.0F)));
+        inner_shadow_angle->setValue(static_cast<int>(std::round(value.angle_degrees)));
+        inner_shadow_distance->setValue(static_cast<int>(std::round(value.distance)));
+        inner_shadow_size->setValue(static_cast<int>(std::round(value.size)));
+        inner_shadow_choke->setValue(static_cast<int>(std::round(value.choke)));
+        inner_shadow_red->setValue(value.color.red);
+        inner_shadow_green->setValue(value.color.green);
+        inner_shadow_blue->setValue(value.color.blue);
+        break;
+      }
+      case LayerStyleEffectKind::InnerGlow: {
+        const auto value = style.inner_glows.size() > static_cast<std::size_t>(index)
+                               ? style.inner_glows[static_cast<std::size_t>(index)]
+                               : default_inner_glow();
+        set_combo_data(inner_glow_blend, static_cast<int>(value.blend_mode));
+        inner_glow_opacity->setValue(static_cast<int>(std::round(value.opacity * 100.0F)));
+        inner_glow_size->setValue(static_cast<int>(std::round(value.size)));
+        inner_glow_choke->setValue(static_cast<int>(std::round(value.choke)));
+        set_combo_data(inner_glow_technique, static_cast<int>(value.technique));
+        inner_glow_range->setValue(std::clamp(static_cast<int>(std::round(value.range)), 1, 100));
+        inner_glow_source.set_first(value.source == LayerInnerGlowSource::Center);
+        inner_glow_red->setValue(value.color.red);
+        inner_glow_green->setValue(value.color.green);
+        inner_glow_blue->setValue(value.color.blue);
+        break;
+      }
+      case LayerStyleEffectKind::Satin: {
+        const auto value = style.satins.size() > static_cast<std::size_t>(index)
+                               ? style.satins[static_cast<std::size_t>(index)]
+                               : default_satin();
+        set_combo_data(satin_blend, static_cast<int>(value.blend_mode));
+        satin_opacity->setValue(static_cast<int>(std::round(value.opacity * 100.0F)));
+        satin_angle->setValue(static_cast<int>(std::round(value.angle_degrees)));
+        satin_distance->setValue(static_cast<int>(std::round(value.distance)));
+        satin_size->setValue(static_cast<int>(std::round(value.size)));
+        satin_invert->setChecked(value.invert);
+        satin_red->setValue(value.color.red);
+        satin_green->setValue(value.color.green);
+        satin_blue->setValue(value.color.blue);
+        break;
+      }
+      case LayerStyleEffectKind::ColorOverlay: {
+        const auto value = style.color_overlays.size() > static_cast<std::size_t>(index)
+                               ? style.color_overlays[static_cast<std::size_t>(index)]
+                               : default_color_overlay();
+        set_combo_data(color_overlay_blend, static_cast<int>(value.blend_mode));
+        color_overlay_opacity->setValue(static_cast<int>(std::round(value.opacity * 100.0F)));
+        color_overlay_red->setValue(value.color.red);
+        color_overlay_green->setValue(value.color.green);
+        color_overlay_blue->setValue(value.color.blue);
+        break;
+      }
+      case LayerStyleEffectKind::GradientOverlay: {
+        auto value = style.gradient_fills.size() > static_cast<std::size_t>(index)
+                         ? style.gradient_fills[static_cast<std::size_t>(index)]
+                         : default_gradient_fill();
+        if (value.gradient.form == GradientDefinitionForm::Solid && value.gradient.color_stops.empty()) {
+          value.gradient = default_layer_style_gradient();
+        }
+        set_combo_data(gradient_blend, static_cast<int>(value.blend_mode));
+        gradient_opacity->setValue(static_cast<int>(std::round(value.opacity * 100.0F)));
+        gradient_controls->load(value.gradient);
+        break;
+      }
+      case LayerStyleEffectKind::PatternOverlay: {
+        const auto value = style.pattern_overlays.size() > static_cast<std::size_t>(index)
+                               ? style.pattern_overlays[static_cast<std::size_t>(index)]
+                               : default_pattern_overlay();
+        pattern_overlay = value;
+        set_combo_data(pattern_overlay_blend, static_cast<int>(value.blend_mode));
+        pattern_overlay_opacity->setValue(static_cast<int>(std::round(value.opacity * 100.0F)));
+        set_pattern_combo_id(pattern_overlay_pattern, value.pattern_id);
+        pattern_overlay_angle->setValue(
+            std::clamp(static_cast<int>(std::round(value.angle_degrees)), -180, 180));
+        pattern_overlay_scale->setValue(
+            std::clamp(static_cast<int>(std::round(value.scale * 100.0F)), 1, 1000));
+        pattern_overlay_link->setChecked(value.link_with_layer);
+        break;
+      }
+      case LayerStyleEffectKind::OuterGlow: {
+        const auto value =
+            style.outer_glows.size() > static_cast<std::size_t>(index) ? style.outer_glows[static_cast<std::size_t>(index)]
+                                                                       : default_outer_glow();
+        set_combo_data(outer_glow_blend, static_cast<int>(value.blend_mode));
+        set_combo_data(outer_glow_technique, static_cast<int>(value.technique));
+        outer_glow_opacity->setValue(static_cast<int>(std::round(value.opacity * 100.0F)));
+        outer_glow_size->setValue(static_cast<int>(std::round(value.size)));
+        outer_glow_spread->setValue(static_cast<int>(std::round(value.spread)));
+        outer_glow_range->setValue(std::clamp(static_cast<int>(std::round(value.range)), 1, 100));
+        outer_glow_red->setValue(value.color.red);
+        outer_glow_green->setValue(value.color.green);
+        outer_glow_blue->setValue(value.color.blue);
+        break;
+      }
+      case LayerStyleEffectKind::DropShadow: {
+        const auto value = style.drop_shadows.size() > static_cast<std::size_t>(index)
+                               ? style.drop_shadows[static_cast<std::size_t>(index)]
+                               : default_drop_shadow();
+        set_combo_data(shadow_blend, static_cast<int>(value.blend_mode));
+        shadow_opacity->setValue(static_cast<int>(std::round(value.opacity * 100.0F)));
+        shadow_angle->setValue(static_cast<int>(std::round(value.angle_degrees)));
+        shadow_distance->setValue(static_cast<int>(std::round(value.distance)));
+        shadow_size->setValue(static_cast<int>(std::round(value.size)));
+        shadow_spread->setValue(static_cast<int>(std::round(value.spread)));
+        shadow_conceals->setChecked(value.layer_conceals);
+        load_contour_picker(shadow_contour, custom_shadow_contour, value.contour);
+        shadow_anti_aliased->setChecked(value.anti_aliased);
+        shadow_continuous->setChecked(value.continuous);
+        shadow_fade->setValue(static_cast<int>(std::round(value.fade)));
+        sync_continuous_controls();
+        shadow_red->setValue(value.color.red);
+        shadow_green->setValue(value.color.green);
+        shadow_blue->setValue(value.color.blue);
+        break;
+      }
+      case LayerStyleEffectKind::None:
+        break;
+    }
+
+    stroke_rows.update_preview();
+    color_overlay_rows.update_preview();
+    gradient_controls->update_previews();
+    stroke_gradient_controls->update_previews();
+    outer_glow_rows.update_preview();
+    inner_glow_rows.update_preview();
+    satin_rows.update_preview();
+    shadow_rows.update_preview();
+    inner_shadow_rows.update_preview();
+    loading_controls = false;
+    if (reset_batch_capture) reset_batch_capture();
+    if (refresh_batch_mixed) refresh_batch_mixed();
+  };
+
+  auto add_effect_instance = [&](LayerStyleEffectKind kind, int source_index) {
+    const auto* ops = effect_vector_ops_for_kind(kind);
+    if (batch && ops) {
+      const auto recipe = style;
+      batch_edits->append({{}, [ops, recipe, source_index](LayerStyleSettings& target) {
+        ops->duplicate_for_batch(target.style, recipe, source_index);
+      }});
+    }
+    return ops != nullptr ? ops->add_instance(style, source_index) : 0;
+  };
+
+  auto remove_effect_instance = [&](LayerStyleEffectKind kind, int index) {
+    const auto* ops = effect_vector_ops_for_kind(kind);
+    if (batch && ops) batch_edits->append({{}, [ops, index](LayerStyleSettings& target) {
+      ops->remove_instance(target.style, index);
+    }});
+    return ops != nullptr ? ops->remove_instance(style, index) : 0;
+  };
+
+  auto category_check_object_name = [&](LayerStyleEffectKind kind, int index) {
+    switch (kind) {
+      case LayerStyleEffectKind::BevelEmboss:
+        return indexed_object_name(QStringLiteral("layerStyleBevelEmbossCategoryCheck"), index);
+      case LayerStyleEffectKind::Stroke:
+        return indexed_object_name(QStringLiteral("layerStyleStrokeCategoryCheck"), index);
+      case LayerStyleEffectKind::InnerShadow:
+        return indexed_object_name(QStringLiteral("layerStyleInnerShadowCategoryCheck"), index);
+      case LayerStyleEffectKind::InnerGlow:
+        return indexed_object_name(QStringLiteral("layerStyleInnerGlowCategoryCheck"), index);
+      case LayerStyleEffectKind::Satin:
+        return indexed_object_name(QStringLiteral("layerStyleSatinCategoryCheck"), index);
+      case LayerStyleEffectKind::ColorOverlay:
+        return indexed_object_name(QStringLiteral("layerStyleColorOverlayCategoryCheck"), index);
+      case LayerStyleEffectKind::GradientOverlay:
+        return indexed_object_name(QStringLiteral("layerStyleGradientOverlayCategoryCheck"), index);
+      case LayerStyleEffectKind::PatternOverlay:
+        return indexed_object_name(QStringLiteral("layerStylePatternOverlayCategoryCheck"), index);
+      case LayerStyleEffectKind::OuterGlow:
+        return indexed_object_name(QStringLiteral("layerStyleOuterGlowCategoryCheck"), index);
+      case LayerStyleEffectKind::DropShadow:
+        return indexed_object_name(QStringLiteral("layerStyleDropShadowCategoryCheck"), index);
+      case LayerStyleEffectKind::BevelContour:
+        return indexed_object_name(QStringLiteral("layerStyleBevelContourCategoryCheck"), index);
+      case LayerStyleEffectKind::BevelTexture:
+        return indexed_object_name(QStringLiteral("layerStyleBevelTextureCategoryCheck"), index);
+      case LayerStyleEffectKind::None:
+        break;
+    }
+    return QString();
+  };
+  auto add_button_object_name = [&](LayerStyleEffectKind kind, int index) {
+    switch (kind) {
+      case LayerStyleEffectKind::Stroke:
+        return indexed_object_name(QStringLiteral("layerStyleAddStrokeInstanceButton"), index);
+      case LayerStyleEffectKind::InnerShadow:
+        return indexed_object_name(QStringLiteral("layerStyleAddInnerShadowInstanceButton"), index);
+      case LayerStyleEffectKind::InnerGlow:
+        return indexed_object_name(QStringLiteral("layerStyleAddInnerGlowInstanceButton"), index);
+      case LayerStyleEffectKind::Satin:
+        return indexed_object_name(QStringLiteral("layerStyleAddSatinInstanceButton"), index);
+      case LayerStyleEffectKind::ColorOverlay:
+        return indexed_object_name(QStringLiteral("layerStyleAddColorOverlayInstanceButton"), index);
+      case LayerStyleEffectKind::GradientOverlay:
+        return indexed_object_name(QStringLiteral("layerStyleAddGradientOverlayInstanceButton"), index);
+      case LayerStyleEffectKind::PatternOverlay:
+        return indexed_object_name(QStringLiteral("layerStyleAddPatternOverlayInstanceButton"), index);
+      case LayerStyleEffectKind::OuterGlow:
+        return indexed_object_name(QStringLiteral("layerStyleAddOuterGlowInstanceButton"), index);
+      case LayerStyleEffectKind::DropShadow:
+        return indexed_object_name(QStringLiteral("layerStyleAddDropShadowInstanceButton"), index);
+      case LayerStyleEffectKind::BevelEmboss:
+      case LayerStyleEffectKind::BevelContour:
+      case LayerStyleEffectKind::BevelTexture:
+      case LayerStyleEffectKind::None:
+        break;
+    }
+    return QString();
+  };
+  auto add_button_tooltip = [](LayerStyleEffectKind kind) {
+    switch (kind) {
+      case LayerStyleEffectKind::Stroke:
+        return QObject::tr("Add Stroke");
+      case LayerStyleEffectKind::InnerShadow:
+        return QObject::tr("Add Inner Shadow");
+      case LayerStyleEffectKind::InnerGlow:
+        return QObject::tr("Add Inner Glow");
+      case LayerStyleEffectKind::Satin:
+        return QObject::tr("Add Satin");
+      case LayerStyleEffectKind::ColorOverlay:
+        return QObject::tr("Add Color Overlay");
+      case LayerStyleEffectKind::GradientOverlay:
+        return QObject::tr("Add Gradient Overlay");
+      case LayerStyleEffectKind::PatternOverlay:
+        return QObject::tr("Add Pattern Overlay");
+      case LayerStyleEffectKind::OuterGlow:
+        return QObject::tr("Add Outer Glow");
+      case LayerStyleEffectKind::DropShadow:
+        return QObject::tr("Add Drop Shadow");
+      case LayerStyleEffectKind::BevelEmboss:
+      case LayerStyleEffectKind::BevelContour:
+      case LayerStyleEffectKind::BevelTexture:
+      case LayerStyleEffectKind::None:
+        break;
+    }
+    return QString();
+  };
+
+  // The row widgets are opaque and cover their QListWidget items completely, so
+  // the built-in
+  // ::item:selected background would only peek out around the widget edges.
+  // Selection is therefore painted on the row widgets themselves, like the
+  // layers panel does.
+  auto restyle_category_rows = [categories] {
+    for (int row = 0; row < categories->count(); ++row) {
+      auto* item = categories->item(row);
+      auto* row_widget = categories->itemWidget(item);
+      if (row_widget == nullptr) {
+        continue;
+      }
+      // The QLabel/QCheckBox backgrounds must be explicitly transparent: once
+      // the row's stylesheet applies to them, they would otherwise fill with
+      // the inherited palette.
+      set_themed_style(*row_widget, 
+          item->isSelected()
+              ? QStringLiteral("QWidget#layerStyleCategoryRow { background: "
+                               "@category_selected_bg; border: 1px solid @category_selected_border; }"
+                               "QWidget#layerStyleCategoryRow QLabel {"
+                               " background: transparent; color: @text_on_accent; "
+                               "font-weight: 600; }"
+                               "QWidget#layerStyleCategoryRow QCheckBox { "
+                               "background: transparent; }")
+              : QStringLiteral("QWidget#layerStyleCategoryRow { background: @field_bg_large;"
+                               " border: 0; border-bottom: 1px solid @category_list_item_border; }"
+                    "QWidget#layerStyleCategoryRow QLabel { background: "
+                    "transparent; color: @text_primary; }"
+                    "QWidget#layerStyleCategoryRow QCheckBox { background: "
+                    "transparent; }"));
+    }
+  };
+
+  // The rows decide the list's floor too: the design width scaled by the text size falls
+  // short of the longest name in a wider face (German Bevel & Emboss at 125% on Linux).
+  const auto fit_categories_to_rows = [categories] {
+    int widest_row = 0;
+    for (int row = 0; row < categories->count(); ++row) {
+      if (auto* widget = categories->itemWidget(categories->item(row)); widget != nullptr) {
+        widest_row = std::max(widest_row, widget->sizeHint().width());
+      }
+    }
+    const int rows_width = widest_row + 2 * categories->frameWidth();
+    if (rows_width > categories->minimumWidth()) {
+      categories->setMinimumWidth(rows_width);
+      categories->setMaximumWidth(std::max(categories->maximumWidth(), rows_width));
+    }
+  };
+
+  rebuild_category_list = [&](LayerStyleEffectKind select_kind, int select_index) {
+    rebuilding_categories = true;
+    const QSignalBlocker blocker(categories);
+    for (int row = 0; row < categories->count(); ++row) {
+      auto* item = categories->item(row);
+      auto* row_widget = categories->itemWidget(item);
+      if (row_widget == nullptr) {
+        continue;
+      }
+      categories->removeItemWidget(item);
+      delete row_widget;
+    }
+    categories->clear();
+    int selected_row = 0;
+
+    auto install_category_widget = [&](QListWidgetItem* item, const QString& check_object_name,
+                                       bool indented = false) {
+      auto* row = new QWidget(categories);
+      row->setObjectName(QStringLiteral("layerStyleCategoryRow"));
+      row->setAttribute(Qt::WA_StyledBackground, true);
+      row->setMinimumHeight(30);
+      auto* layout = new QHBoxLayout(row);
+      // Sub-option rows (Bevel's Contour/Texture) indent under their parent.
+      layout->setContentsMargins(indented ? 28 : 10, 0, 10, 0);
+      layout->setSpacing(4);
+      QCheckBox* check = nullptr;
+      if (!check_object_name.isEmpty()) {
+        // The checkbox holds only the indicator; the name lives in a separate
+        // label so clicking the name selects the row without toggling the
+        // effect on/off.
+        check = new QCheckBox(row);
+        check->setObjectName(check_object_name);
+        check->setChecked(item->checkState() == Qt::Checked);
+        check->setMinimumHeight(24);
+        layout->addWidget(check, 0, Qt::AlignVCenter);
+      }
+      auto* label = new QLabel(item->text(), row);
+      label->setMinimumHeight(24);
+      label->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Fixed);
+      layout->addWidget(label, 1, Qt::AlignVCenter);
+      const auto kind = item_kind(item);
+      if (is_stackable_kind(kind)) {
+        auto* add_instance = new QPushButton(QStringLiteral("+"), row);
+        add_instance->setObjectName(add_button_object_name(kind, item_effect_index(item)));
+        add_instance->setToolTip(add_button_tooltip(kind));
+        configure_compact_symbol_button(add_instance);
+        layout->addWidget(add_instance, 0, Qt::AlignVCenter);
+        QObject::connect(add_instance, &QPushButton::clicked, &dialog, [&, item, kind] {
+          const auto pending_style = build_current_settings_for_item(categories->currentItem()).style;
+          const auto source_index = item_effect_index(item);
+          QTimer::singleShot(0, &dialog, [&, pending_style, kind, source_index] {
+            style = pending_style;
+            const auto new_index = add_effect_instance(kind, source_index);
+            rebuild_category_list(kind, new_index);
+            load_controls_from_style(categories->currentItem());
+            emit_preview(true);
+          });
+        });
+      }
+      item->setSizeHint(QSize(0, 30));
+      categories->setItemWidget(item, row);
+      if (check != nullptr) {
+        QObject::connect(check, &QCheckBox::toggled, &dialog, [categories, item](bool checked) {
+          item->setCheckState(checked ? Qt::Checked : Qt::Unchecked);
+          categories->setCurrentItem(item);
+        });
+      }
+    };
+
+    auto add_row = [&](const QString& text, LayerStyleCategoryPage page, LayerStyleEffectKind kind, int index,
+                       bool checked, bool checkable, bool indented = false) {
+      auto* item = add_layer_style_category(categories, text, checkable, checked, page, kind, index);
+      install_category_widget(item, checkable ? category_check_object_name(kind, index) : QString(), indented);
+      if (kind == select_kind && index == select_index) {
+        selected_row = categories->row(item);
+      }
+      return item;
+    };
+
+    add_row(QObject::tr("Style Presets"), LayerStyleCategoryPage::Styles, LayerStyleEffectKind::None,
+            kStylesCategoryIndex, true, false);
+    add_row(QObject::tr("Blending Options"), LayerStyleCategoryPage::Blending, LayerStyleEffectKind::None, -1, true, false);
+    add_row(QObject::tr("Bevel & Emboss"), LayerStyleCategoryPage::BevelEmboss,
+            LayerStyleEffectKind::BevelEmboss, 0, !style.bevels.empty() && style.bevels.front().enabled, true);
+    add_row(QObject::tr("Contour"), LayerStyleCategoryPage::BevelContour, LayerStyleEffectKind::BevelContour, 0,
+            !style.bevels.empty() && style.bevels.front().contour.enabled, true, true);
+    // Photoshop presents a Texture sub-option whose pattern cannot be resolved
+    // as UNCHECKED (pinned on tips.psd, July 2026: useTexture=true in lfx2 with
+    // a pattern in neither the document nor the presets shows and renders as
+    // texture-off), so mirror that instead of a checked-but-unrenderable row.
+    add_row(QObject::tr("Texture"), LayerStyleCategoryPage::BevelTexture, LayerStyleEffectKind::BevelTexture, 0,
+            !style.bevels.empty() && style.bevels.front().texture.enabled &&
+                pattern_reference_resolves(style.bevels.front().texture.pattern_id),
+            true, true);
+
+    auto add_vector_rows = [&](const QString& text, LayerStyleCategoryPage page, LayerStyleEffectKind kind,
+                               const auto& vector) {
+      if (vector.empty()) {
+        add_row(text, page, kind, 0, false, true);
+        return;
+      }
+      for (std::size_t index = 0; index < vector.size(); ++index) {
+        add_row(text, page, kind, static_cast<int>(index), vector[index].enabled, true);
+      }
+    };
+    add_vector_rows(QObject::tr("Stroke"), LayerStyleCategoryPage::Stroke, LayerStyleEffectKind::Stroke, style.strokes);
+    add_vector_rows(QObject::tr("Inner Shadow"), LayerStyleCategoryPage::InnerShadow,
+                    LayerStyleEffectKind::InnerShadow, style.inner_shadows);
+    add_vector_rows(QObject::tr("Inner Glow"), LayerStyleCategoryPage::InnerGlow, LayerStyleEffectKind::InnerGlow,
+                    style.inner_glows);
+    add_vector_rows(QObject::tr("Satin"), LayerStyleCategoryPage::Satin, LayerStyleEffectKind::Satin, style.satins);
+    add_vector_rows(QObject::tr("Color Overlay"), LayerStyleCategoryPage::ColorOverlay,
+                    LayerStyleEffectKind::ColorOverlay, style.color_overlays);
+    add_vector_rows(QObject::tr("Gradient Overlay"), LayerStyleCategoryPage::GradientOverlay,
+                    LayerStyleEffectKind::GradientOverlay, style.gradient_fills);
+    add_vector_rows(QObject::tr("Pattern Overlay"), LayerStyleCategoryPage::PatternOverlay,
+                    LayerStyleEffectKind::PatternOverlay, style.pattern_overlays);
+    add_vector_rows(QObject::tr("Outer Glow"), LayerStyleCategoryPage::OuterGlow, LayerStyleEffectKind::OuterGlow,
+                    style.outer_glows);
+    add_vector_rows(QObject::tr("Drop Shadow"), LayerStyleCategoryPage::DropShadow, LayerStyleEffectKind::DropShadow,
+                    style.drop_shadows);
+
+    categories->setCurrentRow(std::clamp(selected_row, 0, std::max(0, categories->count() - 1)));
+    // Signals are blocked during the rebuild, so sync the row selection styling
+    // directly.
+    restyle_category_rows();
+    fit_categories_to_rows();
+    // The sheet's text size reaches the rows once the dialog is shown: measure again then.
+    QTimer::singleShot(0, &dialog, fit_categories_to_rows);
+    rebuilding_categories = false;
+  };
+
+  CoalescedPreviewEmitter<LayerStyleSettings> preview_emitter(
+      dialog, [&](const LayerStyleSettings& settings) {
+        if (document_patterns != nullptr) {
+          for (const auto& resource : transient_manager_patterns) {
+            document_patterns->adopt(resource);
+          }
+        }
+        if (preview_changed) {
+          preview_changed(settings);
+        }
+      });
+
+  emit_preview = [&](bool immediate) {
+    if (loading_controls || rebuilding_categories) {
+      return;
+    }
+    stroke_rows.update_preview();
+    update_bevel_color_previews();
+    color_overlay_rows.update_preview();
+    gradient_controls->update_previews();
+    stroke_gradient_controls->update_previews();
+    outer_glow_rows.update_preview();
+    inner_glow_rows.update_preview();
+    satin_rows.update_preview();
+    shadow_rows.update_preview();
+    inner_shadow_rows.update_preview();
+    auto settings = build_current_settings();
+    if (batch) {
+      const auto properties = layer_style_properties(settings);
+      if (!explicit_fields.empty()) {
+        for (const auto& property : properties)
+          if (std::find(explicit_fields.begin(), explicit_fields.end(), property.key) != explicit_fields.end())
+            batch_edits->append(property.capture(settings));
+      } else if (last_displayed) {
+        capture_appearance_edits(*batch_edits, properties, *last_displayed, settings);
+      }
+      explicit_fields.clear();
+      last_displayed = settings;
+      settings.edits = std::make_shared<const AppearanceEdits<LayerStyleSettings>>(*batch_edits);
+    }
+    style = settings.style;
+    schedule_style_swatch(settings);
+    auto preview_settings = batch || preview_check->isChecked() ? settings : original_settings;
+    if (batch) preview_settings.preview_enabled = preview_check->isChecked();
+    if (refresh_batch_mixed) refresh_batch_mixed();
+    if (immediate) {
+      preview_emitter.flush(std::move(preview_settings));
+    } else {
+      preview_emitter.schedule(std::move(preview_settings));
+    }
+  };
+
+  reset_batch_capture = [&] { if (batch) last_displayed = build_current_settings(); };
+
+  const auto connect_blend_if_row = [&](BlendIfRowWidgets& row, bool this_layer) {
+    auto* row_ptr = &row;
+    row.editor->changed = [&, row_ptr, this_layer](BlendIfThresholds thresholds, bool immediate) {
+      if (loading_blend_if_controls) {
+        return;
+      }
+      auto& ranges = blend_if.channels[current_blend_if_channel_index()];
+      (this_layer ? ranges.this_layer : ranges.underlying_layer) = thresholds;
+      loading_blend_if_controls = true;
+      set_blend_if_row(*row_ptr, thresholds);
+      loading_blend_if_controls = false;
+      emit_preview(immediate);
+    };
+    const auto update_from_spins = [&, row_ptr, this_layer] {
+      if (loading_blend_if_controls) {
+        return;
+      }
+      const BlendIfThresholds thresholds{
+          static_cast<std::uint8_t>(row_ptr->black_low.spin->value()),
+          static_cast<std::uint8_t>(row_ptr->black_high.spin->value()),
+          static_cast<std::uint8_t>(row_ptr->white_low.spin->value()),
+          static_cast<std::uint8_t>(row_ptr->white_high.spin->value()),
+      };
+      auto& ranges = blend_if.channels[current_blend_if_channel_index()];
+      (this_layer ? ranges.this_layer : ranges.underlying_layer) = thresholds;
+      loading_blend_if_controls = true;
+      set_blend_if_row(*row_ptr, thresholds);
+      loading_blend_if_controls = false;
+      emit_preview(false);
+    };
+    for (auto* spin : {row.black_low.spin, row.black_high.spin, row.white_low.spin, row.white_high.spin}) {
+      QObject::connect(spin, qOverload<int>(&QSpinBox::valueChanged), &dialog,
+                       [update_from_spins](int) { update_from_spins(); });
+    }
+  };
+  connect_blend_if_row(blend_if_this, true);
+  connect_blend_if_row(blend_if_underlying, false);
+  QObject::connect(blend_if_channel, &QComboBox::currentIndexChanged, &dialog,
+                   [&](int) { load_blend_if_controls(); });
+  QObject::connect(reset_blend_if_channel, &QPushButton::clicked, &dialog, [&] {
+    blend_if.channels[current_blend_if_channel_index()] = {};
+    load_blend_if_controls();
+    emit_preview(true);
+  });
+  if (replace_blend_if_button != nullptr) {
+    QObject::connect(replace_blend_if_button, &QPushButton::clicked, &dialog, [&] {
+      replace_unsupported_blend_if = true;
+      blend_if = {};
+      set_blend_if_enabled(true);
+      replace_blend_if_button->setEnabled(false);
+      if (blend_if_unsupported_warning != nullptr) {
+        blend_if_unsupported_warning->setText(
+            QObject::tr(
+                             "The preserved Photoshop Blend If payload will be "
+                             "replaced with editable RGB defaults "
+                        "when you choose OK."));
+      }
+      load_blend_if_controls();
+      emit_preview(true);
+    });
+  }
+  gradient_controls->changed = [&emit_preview](bool immediate) { emit_preview(immediate); };
+  stroke_gradient_controls->changed = [&emit_preview](bool immediate) { emit_preview(immediate); };
+  QObject::connect(categories, &QListWidget::itemSelectionChanged, &dialog, restyle_category_rows);
+  QObject::connect(categories, &QListWidget::currentItemChanged, &dialog,
+                   [&](QListWidgetItem* current, QListWidgetItem* previous) {
+                     if (loading_controls || rebuilding_categories) {
+                       return;
+                     }
+                     if (previous != nullptr) {
+                       style = build_current_settings_for_item(previous).style;
+                     }
+                     load_controls_from_style(current);
+                     emit_preview(true);
+                   });
+  QObject::connect(categories, &QListWidget::itemChanged, &dialog, [&](QListWidgetItem* changed) {
+    if (batch && !loading_controls && !rebuilding_categories)
+      explicit_fields = {effect_property_prefix(item_kind(changed), item_effect_index(changed)) + ".enabled"};
+    if (auto* widget = categories->itemWidget(changed); widget != nullptr) {
+      if (auto* check = widget->findChild<QCheckBox*>(); check != nullptr) {
+        const QSignalBlocker blocker(check);
+        check->setChecked(changed->checkState() == Qt::Checked);
+      }
+    }
+    emit_preview(true);
+  });
+  rebuild_category_list(LayerStyleEffectKind::None, -1);
+  load_controls_from_style(categories->currentItem());
+  QObject::connect(blend, &QComboBox::currentIndexChanged, &dialog, [&emit_preview](int) { emit_preview(true); });
+  QObject::connect(opacity, qOverload<int>(&QSpinBox::valueChanged), &dialog,
+                   [&emit_preview](int) { emit_preview(false); });
+  QObject::connect(fill_opacity, qOverload<int>(&QSpinBox::valueChanged), &dialog,
+                   [&emit_preview](int) { emit_preview(false); });
+  QObject::connect(preview_check, &QCheckBox::toggled, &dialog, [&emit_preview](bool) { emit_preview(true); });
+  QObject::connect(show_effects, &QCheckBox::toggled, &dialog, [&emit_preview](bool) { emit_preview(true); });
+  QObject::connect(mask_hides_effects, &QCheckBox::toggled, &dialog, [&emit_preview](bool) { emit_preview(true); });
+  QObject::connect(vector_mask_hides_effects, &QCheckBox::toggled, &dialog,
+                   [&emit_preview](bool) { emit_preview(true); });
+  QObject::connect(knockout, &QComboBox::currentIndexChanged, &dialog, [&emit_preview](int) { emit_preview(true); });
+  QObject::connect(blend_interior, &QCheckBox::toggled, &dialog, [&emit_preview](bool) { emit_preview(true); });
+  QObject::connect(blend_clipped, &QCheckBox::toggled, &dialog, [&emit_preview](bool) { emit_preview(true); });
+  for (auto* channel_check : {channel_red, channel_green, channel_blue}) {
+    QObject::connect(channel_check, &QCheckBox::toggled, &dialog, [&emit_preview](bool) { emit_preview(true); });
+  }
+  for (auto* spin : {bevel_size, bevel_soften, bevel_depth, bevel_angle, bevel_altitude, bevel_highlight_opacity,
+                     bevel_shadow_opacity, bevel_contour_range, bevel_texture_scale, bevel_texture_depth,
+                     pattern_overlay_opacity, pattern_overlay_angle, pattern_overlay_scale,
+                     stroke_size, stroke_opacity, stroke_red, stroke_green, stroke_blue,
+                     color_overlay_opacity, color_overlay_red, color_overlay_green, color_overlay_blue,
+                     gradient_opacity, outer_glow_opacity, outer_glow_size, outer_glow_spread, outer_glow_range,
+                     outer_glow_red,
+                     outer_glow_green, outer_glow_blue, inner_glow_opacity, inner_glow_size, inner_glow_choke,
+                     inner_glow_range, inner_glow_red, inner_glow_green, inner_glow_blue, satin_opacity,
+                     satin_angle, satin_distance,
+                     satin_size, satin_red, satin_green, satin_blue, shadow_opacity, shadow_angle, shadow_distance,
+                     shadow_size, shadow_spread, shadow_fade, shadow_red,
+                     shadow_green, shadow_blue, inner_shadow_opacity, inner_shadow_angle, inner_shadow_distance,
+                     inner_shadow_size, inner_shadow_choke, inner_shadow_red, inner_shadow_green, inner_shadow_blue}) {
+    QObject::connect(spin, qOverload<int>(&QSpinBox::valueChanged), &dialog,
+                     [&emit_preview](int) { emit_preview(false); });
+  }
+  QObject::connect(bevel_direction.first, &QRadioButton::toggled, &dialog,
+                   [&emit_preview](bool) { emit_preview(true); });
+  QObject::connect(bevel_style, &QComboBox::currentIndexChanged, &dialog,
+                   [&emit_preview](int) { emit_preview(true); });
+  QObject::connect(bevel_technique, &QComboBox::currentIndexChanged, &dialog,
+                   [&emit_preview](int) { emit_preview(true); });
+  QObject::connect(bevel_highlight_blend, &QComboBox::currentIndexChanged, &dialog,
+                   [&emit_preview](int) { emit_preview(true); });
+  QObject::connect(bevel_shadow_blend, &QComboBox::currentIndexChanged, &dialog,
+                   [&emit_preview](int) { emit_preview(true); });
+  QObject::connect(bevel_gloss_contour, &QComboBox::currentIndexChanged, &dialog,
+                   [&emit_preview](int) { emit_preview(true); });
+  QObject::connect(bevel_gloss_anti_aliased, &QCheckBox::toggled, &dialog,
+                   [&emit_preview](bool) { emit_preview(true); });
+  QObject::connect(bevel_contour_combo, &QComboBox::currentIndexChanged, &dialog,
+                   [&emit_preview](int) { emit_preview(true); });
+  QObject::connect(bevel_contour_anti_aliased, &QCheckBox::toggled, &dialog,
+                   [&emit_preview](bool) { emit_preview(true); });
+  bevel_texture_manage->setEnabled(pattern_library != nullptr);
+  pattern_overlay_manage->setEnabled(pattern_library != nullptr);
+  const auto open_pattern_manager = [&](QComboBox* target_combo) {
+    if (pattern_library == nullptr) {
+      return;
+    }
+    const auto bevel_id = pattern_combo_id(bevel_texture_pattern);
+    const auto bevel_name = pattern_combo_persist_name(bevel_texture_pattern);
+    const auto overlay_id = pattern_combo_id(pattern_overlay_pattern);
+    const auto overlay_name = pattern_combo_persist_name(pattern_overlay_pattern);
+    const auto selected_storage_id = request_pattern_manager(
+        &dialog, *pattern_library, target_combo->currentData(kPatternIdRole).toString(),
+        open_pattern_as_image);
+    QString selected_pattern_id;
+    QString selected_pattern_name;
+    if (!selected_storage_id.isEmpty()) {
+      const auto* entry = pattern_library->find_entry(selected_storage_id);
+      const auto selected_resource = pattern_library->resource_for_entry(selected_storage_id);
+      if (entry != nullptr && selected_resource.has_value()) {
+        auto resource = *selected_resource;
+        selected_pattern_name = entry->name;
+        if (document_patterns != nullptr) {
+          if (const auto* embedded = document_patterns->find(resource.id);
+              embedded != nullptr && !pattern_tiles_equal(embedded->tile, resource.tile)) {
+            // A style stores only the Photoshop id, so two different tiles with
+            // the same id cannot coexist in one document. Give the selected
+            // library tile a document-local id and materialize it immediately;
+            // MainWindow restores this transient insertion on cancel.
+            const auto prior = std::find_if(
+                transient_manager_patterns.begin(), transient_manager_patterns.end(),
+                [&resource](const PatternResource& candidate) {
+                  return candidate.name == resource.name &&
+                         pattern_tiles_equal(candidate.tile, resource.tile);
+                });
+            if (prior != transient_manager_patterns.end()) {
+              resource = *prior;
+            } else {
+              do {
+                resource.id = generate_pattern_uuid();
+              } while (document_patterns->find(resource.id) != nullptr ||
+                       pattern_library->find_entry_by_pattern_id(
+                           QString::fromStdString(resource.id)) != nullptr);
+              resource.provenance = PatternProvenance::Authored;
+              transient_manager_patterns.push_back(resource);
+            }
+            document_patterns->adopt(resource);
+          }
+        }
+        selected_pattern_id = QString::fromStdString(resource.id);
+      }
+    }
+    populate_pattern_combo(bevel_texture_pattern, bevel_id, bevel_name);
+    populate_pattern_combo(pattern_overlay_pattern, overlay_id, overlay_name);
+    if (!selected_pattern_id.isEmpty()) {
+      set_pattern_combo_id(target_combo, selected_pattern_id.toStdString());
+      if (target_combo->currentIndex() >= 0 && !selected_pattern_name.isEmpty()) {
+        target_combo->setItemData(target_combo->currentIndex(), selected_pattern_name,
+                                  kPatternPersistNameRole);
+      }
+    }
+    emit_preview(true);
+    if (missing_pattern_warning != nullptr) {
+      const auto current_style = build_current_settings().style;
+      auto has_missing = false;
+      for (const auto& effect : current_style.pattern_overlays) {
+        has_missing = has_missing ||
+                      (effect.enabled && !effect.pattern_id.empty() &&
+                       !pattern_reference_resolves(effect.pattern_id));
+      }
+      for (const auto& effect : current_style.bevels) {
+        has_missing = has_missing ||
+                      (effect.enabled && effect.texture.enabled && !effect.texture.pattern_id.empty() &&
+                       !pattern_reference_resolves(effect.texture.pattern_id));
+      }
+      missing_pattern_warning->setVisible(has_missing);
+    }
+  };
+  QObject::connect(bevel_texture_manage, &QPushButton::clicked, &dialog,
+                   [&] { open_pattern_manager(bevel_texture_pattern); });
+  QObject::connect(pattern_overlay_manage, &QPushButton::clicked, &dialog,
+                   [&] { open_pattern_manager(pattern_overlay_pattern); });
+
+  // --- Styles page behavior -------------------------------------------------
+  const auto apply_style_library_entry = [&](const QString& storage_id) {
+    if (style_library == nullptr) {
+      return;
+    }
+    const auto* entry = style_library->find_entry(storage_id);
+    if (entry == nullptr) {
+      return;
+    }
+    auto applied = entry->style;
+    // Materialize the preset's pattern tiles. A library tile whose id already
+    // belongs to different document pixels is re-identified (the Pattern
+    // Manager collision path) and the applied style's references follow it.
+    if (document_patterns != nullptr) {
+      for (const auto& library_resource : style_library->patterns_for_entry(storage_id)) {
+        auto resource = library_resource;
+        if (const auto* embedded = document_patterns->find(resource.id);
+            embedded != nullptr && !pattern_tiles_equal(embedded->tile, resource.tile)) {
+          const auto original_id = resource.id;
+          const auto prior = std::find_if(
+              transient_manager_patterns.begin(), transient_manager_patterns.end(),
+              [&resource](const PatternResource& candidate) {
+                return candidate.name == resource.name &&
+                       pattern_tiles_equal(candidate.tile, resource.tile);
+              });
+          if (prior != transient_manager_patterns.end()) {
+            resource = *prior;
+          } else {
+            do {
+              resource.id = generate_pattern_uuid();
+            } while (document_patterns->find(resource.id) != nullptr ||
+                     (pattern_library != nullptr &&
+                      pattern_library->find_entry_by_pattern_id(
+                          QString::fromStdString(resource.id)) != nullptr));
+            resource.provenance = PatternProvenance::Authored;
+            transient_manager_patterns.push_back(resource);
+          }
+          for (auto& overlay : applied.pattern_overlays) {
+            if (overlay.pattern_id == original_id) {
+              overlay.pattern_id = resource.id;
+            }
+          }
+          for (auto& bevel_effect : applied.bevels) {
+            if (bevel_effect.texture.pattern_id == original_id) {
+              bevel_effect.texture.pattern_id = resource.id;
+            }
+          }
+        }
+        document_patterns->adopt(resource);
+      }
+    }
+    // Presets replace the effects; the dialog-level blending pieces a preset
+    // does not carry stay as the user set them.
+    applied.layer_mask_hides_effects = mask_hides_effects->isChecked();
+    applied.vector_mask_hides_effects = vector_mask_hides_effects->isChecked();
+    applied.blend_interior_elements = blend_interior->isChecked();
+    applied.blend_clipped_elements = blend_clipped->isChecked();
+    applied.effects_visible = true;
+    loading_controls = true;
+    show_effects->setChecked(true);
+    loading_controls = false;
+    style = std::move(applied);
+    if (entry->blend_settings.has_value()) {
+      loading_controls = true;
+      opacity->setValue(entry->blend_settings->opacity);
+      fill_opacity->setValue(entry->blend_settings->fill_opacity);
+      set_combo_data(blend, static_cast<int>(entry->blend_settings->blend_mode));
+      loading_controls = false;
+      // Preserved-unsupported Blend If payloads stay untouched unless the user
+      // explicitly replaced them (the existing warning-banner flow).
+      if (blend_if_payload_status != BlendIfPayloadStatus::Unsupported ||
+          replace_unsupported_blend_if) {
+        blend_if = entry->blend_settings->blend_if;
+        load_blend_if_controls();
+      }
+    }
+    if (batch) {
+      const auto recipe = style;
+      const auto blending = entry->blend_settings;
+      batch_edits->append({{}, [recipe, blending](LayerStyleSettings& target) {
+        auto replacement = recipe;
+        replacement.layer_mask_hides_effects = target.style.layer_mask_hides_effects;
+        replacement.vector_mask_hides_effects = target.style.vector_mask_hides_effects;
+        replacement.blend_interior_elements = target.style.blend_interior_elements;
+        replacement.blend_clipped_elements = target.style.blend_clipped_elements;
+        target.style = std::move(replacement);
+        if (blending) {
+          target.opacity = blending->opacity;
+          target.opacity_edited = true;
+          target.fill_opacity = blending->fill_opacity;
+          target.fill_opacity_edited = true;
+          target.blend_mode = blending->blend_mode;
+          target.blend_if = blending->blend_if;
+        }
+      }});
+    }
+    rebuild_category_list(LayerStyleEffectKind::None, kStylesCategoryIndex);
+    load_controls_from_style(categories->currentItem());
+    emit_preview(true);
+  };
+  QObject::connect(styles_browser, &StyleBrowserWidget::style_clicked, &dialog,
+                   apply_style_library_entry);
+  QObject::connect(styles_browser, &StyleBrowserWidget::style_double_clicked, &dialog,
+                   apply_style_library_entry);
+  std::function<void()> clear_all_styles;
+  styles_grid->set_entry_clicked_callback([&](const QString& id) {
+    if (id == QLatin1String(kNoStyleGridId)) {
+      clear_all_styles();
+    } else {
+      apply_style_library_entry(id);
+    }
+  });
+  clear_all_styles = [&] {
+    LayerStyle cleared;
+    cleared.effects_visible = show_effects->isChecked();
+    cleared.layer_mask_hides_effects = mask_hides_effects->isChecked();
+    cleared.vector_mask_hides_effects = vector_mask_hides_effects->isChecked();
+    cleared.blend_interior_elements = blend_interior->isChecked();
+    cleared.blend_clipped_elements = blend_clipped->isChecked();
+    style = std::move(cleared);
+    if (batch) batch_edits->append({{}, [](LayerStyleSettings& target) {
+      LayerStyle empty;
+      empty.effects_visible = target.style.effects_visible;
+      empty.layer_mask_hides_effects = target.style.layer_mask_hides_effects;
+      empty.vector_mask_hides_effects = target.style.vector_mask_hides_effects;
+      empty.blend_interior_elements = target.style.blend_interior_elements;
+      empty.blend_clipped_elements = target.style.blend_clipped_elements;
+      target.style = std::move(empty);
+    }});
+    rebuild_category_list(LayerStyleEffectKind::None, kStylesCategoryIndex);
+    load_controls_from_style(categories->currentItem());
+    emit_preview(true);
+  };
+  QObject::connect(styles_browser, &StyleBrowserWidget::no_style_clicked, &dialog, [&] { clear_all_styles(); });
+  QObject::connect(manage_styles_button, &QPushButton::clicked, &dialog, [&] {
+    if (style_library == nullptr) {
+      return;
+    }
+    const auto storage_id = request_style_manager(&dialog, *style_library);
+    if (!storage_id.isEmpty()) {
+      styles_browser->reload(storage_id);
+      styles_grid->reload(storage_id);
+      apply_style_library_entry(storage_id);
+    }
+  });
+  QObject::connect(new_style_button, &QPushButton::clicked, &dialog, [&] {
+    if (style_library == nullptr) {
+      return;
+    }
+    QDialog prompt(&dialog);
+    prompt.setObjectName(QStringLiteral("layerStyleNewStyleDialog"));
+    prompt.setWindowTitle(QObject::tr("New Style"));
+    auto* form = new QFormLayout(&prompt);
+    auto* name_edit = new QLineEdit(&prompt);
+    name_edit->setObjectName(QStringLiteral("layerStyleNewStyleNameEdit"));
+    name_edit->setText(QObject::tr("Style %1").arg(style_library->entries().size() + 1));
+    name_edit->selectAll();
+    form->addRow(QObject::tr("Name:"), name_edit);
+    auto* folder_combo = new QComboBox(&prompt);
+    folder_combo->setObjectName(QStringLiteral("layerStyleNewStyleFolderCombo"));
+    folder_combo->setEditable(true);
+    folder_combo->addItem(QString());
+    folder_combo->addItems(style_library->folders());
+    form->addRow(QObject::tr("Folder:"), folder_combo);
+    auto* include_blend = new QCheckBox(
+        QObject::tr("Include blending options (opacity, Fill, blend mode, Blend If)"), &prompt);
+    include_blend->setObjectName(QStringLiteral("layerStyleNewStyleIncludeBlendCheck"));
+    form->addRow(QString(), include_blend);
+    auto* prompt_buttons =
+        new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel, &prompt);
+    form->addRow(prompt_buttons);
+    QObject::connect(prompt_buttons, &QDialogButtonBox::accepted, &prompt, &QDialog::accept);
+    QObject::connect(prompt_buttons, &QDialogButtonBox::rejected, &prompt, &QDialog::reject);
+    if (prompt.exec() != QDialog::Accepted || name_edit->text().trimmed().isEmpty()) {
+      return;
+    }
+    const auto settings = build_current_settings();
+    std::optional<psd::AslBlendSettings> blend_settings;
+    if (include_blend->isChecked()) {
+      blend_settings = psd::AslBlendSettings{settings.opacity, settings.blend_mode,
+                                             settings.blend_if, settings.fill_opacity};
+    }
+    // Carry the referenced tiles so the preset stays self-contained.
+    std::vector<PatternResource> preset_patterns;
+    std::vector<std::string> referenced_ids;
+    collect_referenced_pattern_ids(settings.style, referenced_ids);
+    for (const auto& id : referenced_ids) {
+      if (document_patterns != nullptr) {
+        if (const auto* resource = document_patterns->find(id); resource != nullptr) {
+          preset_patterns.push_back(*resource);
+          continue;
+        }
+      }
+      if (pattern_library != nullptr) {
+        if (auto resource = pattern_library->resource(QString::fromStdString(id));
+            resource.has_value()) {
+          preset_patterns.push_back(std::move(*resource));
+          continue;
+        }
+      }
+      if (auto bundled = bundled_pattern_resource(id); bundled.has_value()) {
+        preset_patterns.push_back(std::move(*bundled));
+      }
+    }
+    const auto storage_id =
+        style_library->add_style(name_edit->text(), settings.style, blend_settings,
+                                 preset_patterns, folder_combo->currentText());
+    if (storage_id.isEmpty()) {
+      QMessageBox::warning(
+          &dialog, QObject::tr("New Style"),
+          QObject::tr("Could not save the style. Check that the style library "
+                      "folder is writable."));
+      return;
+    }
+    styles_browser->reload(storage_id);
+  });
+  QObject::connect(bevel_texture_pattern, &QComboBox::currentIndexChanged, &dialog,
+                   [&emit_preview](int) { emit_preview(true); });
+  QObject::connect(bevel_texture_invert, &QCheckBox::toggled, &dialog,
+                   [&emit_preview](bool) { emit_preview(true); });
+  QObject::connect(bevel_texture_link, &QCheckBox::toggled, &dialog,
+                   [&emit_preview](bool) { emit_preview(true); });
+  QObject::connect(bevel_texture_snap, &QPushButton::clicked, &dialog, [&] {
+    bevel.texture.phase_x = 0.0F;
+    bevel.texture.phase_y = 0.0F;
+    if (batch) explicit_fields = {"bevels.0.texture.phase_x", "bevels.0.texture.phase_y"};
+    emit_preview(true);
+  });
+  QObject::connect(pattern_overlay_blend, &QComboBox::currentIndexChanged, &dialog,
+                   [&emit_preview](int) { emit_preview(true); });
+  QObject::connect(pattern_overlay_pattern, &QComboBox::currentIndexChanged, &dialog,
+                   [&emit_preview](int) { emit_preview(true); });
+  QObject::connect(pattern_overlay_link, &QCheckBox::toggled, &dialog,
+                   [&emit_preview](bool) { emit_preview(true); });
+  QObject::connect(pattern_overlay_snap, &QPushButton::clicked, &dialog, [&] {
+    pattern_overlay.phase_x = 0.0F;
+    pattern_overlay.phase_y = 0.0F;
+    if (batch) {
+      const auto prefix = effect_property_prefix(LayerStyleEffectKind::PatternOverlay,
+                                                 item_effect_index(categories->currentItem()));
+      explicit_fields = {prefix + ".phase_x", prefix + ".phase_y"};
+    }
+    emit_preview(true);
+  });
+  QObject::connect(color_overlay_blend, &QComboBox::currentIndexChanged, &dialog,
+                   [&emit_preview](int) { emit_preview(true); });
+  QObject::connect(outer_glow_blend, &QComboBox::currentIndexChanged, &dialog,
+                   [&emit_preview](int) { emit_preview(true); });
+  QObject::connect(outer_glow_technique, &QComboBox::currentIndexChanged, &dialog,
+                   [&emit_preview](int) { emit_preview(true); });
+  QObject::connect(inner_glow_blend, &QComboBox::currentIndexChanged, &dialog,
+                   [&emit_preview](int) { emit_preview(true); });
+  QObject::connect(inner_glow_technique, &QComboBox::currentIndexChanged, &dialog,
+                   [&emit_preview](int) { emit_preview(true); });
+  QObject::connect(inner_glow_source.first, &QRadioButton::toggled, &dialog,
+                   [&emit_preview](bool) { emit_preview(true); });
+  QObject::connect(satin_blend, &QComboBox::currentIndexChanged, &dialog,
+                   [&emit_preview](int) { emit_preview(true); });
+  QObject::connect(satin_invert, &QCheckBox::toggled, &dialog,
+                   [&emit_preview](bool) { emit_preview(true); });
+  QObject::connect(shadow_blend, &QComboBox::currentIndexChanged, &dialog,
+                   [&emit_preview](int) { emit_preview(true); });
+  QObject::connect(shadow_conceals, &QCheckBox::toggled, &dialog,
+                   [&emit_preview](bool) { emit_preview(true); });
+  QObject::connect(shadow_contour, &QComboBox::currentIndexChanged, &dialog,
+                   [&emit_preview](int) { emit_preview(true); });
+
+  // Contour tools (GitHub issue 726): each picker's Edit button, a click on its
+  // curve swatch, and the Library menu (the user's saved contours and Photoshop
+  // .shc files). Every picker's value is read before the library changes and
+  // shown again after, so a contour that was deleted stays on its effect as
+  // Custom.
+  const auto contour_picker_values = [&] {
+    std::vector<StyleContour> values;
+    for (const auto& picker : contour_pickers) {
+      values.push_back(contour_combo_value(picker.combo, *picker.custom));
+    }
+    return values;
+  };
+  const auto show_contour_picker_values = [&](const std::vector<StyleContour>& values) {
+    for (std::size_t index = 0; index < contour_pickers.size(); ++index) {
+      load_contour_picker(contour_pickers[index].combo, *contour_pickers[index].custom, values[index]);
+    }
+  };
+  const auto preview_contour_change = [&](const ContourPickerTools& picker, bool immediate) {
+    if (batch) {
+      const auto* current = categories->currentItem();
+      const auto index = item_kind(current) == picker.kind ? item_effect_index(current) : 0;
+      explicit_fields = {effect_property_prefix(picker.kind, index) + "." + picker.leaf};
+    }
+    emit_preview(immediate);
+  };
+  const auto edit_contour = [&](ContourPickerTools& picker) {
+    const auto custom_before = *picker.custom;
+    const auto value_before = contour_combo_value(picker.combo, *picker.custom);
+    std::optional<AppearanceEdits<LayerStyleSettings>> edits_before;
+    if (batch) {
+      edits_before = *batch_edits;
+    }
+    const auto show = [&](const StyleContour& value, bool immediate) {
+      load_contour_picker(picker.combo, *picker.custom, value);
+      preview_contour_change(picker, immediate);
+    };
+    const auto edited =
+        request_contour_edit(&dialog, value_before, [&show](const StyleContour& value) { show(value, false); });
+    if (edited.has_value()) {
+      show(*edited, true);
+      return;
+    }
+    // Cancel: the picker, the host's custom curve and the batch edits go back.
+    *picker.custom = custom_before;
+    fill_contour_combo(picker.combo, value_before, *picker.custom);
+    if (batch && edits_before.has_value()) {
+      *batch_edits = *edits_before;
+      reset_batch_capture();
+    }
+    emit_preview(true);
+  };
+  const auto request_contour_name = [&](const QString& title, const QString& initial) -> std::optional<QString> {
+    QInputDialog prompt(&dialog);
+    prompt.setObjectName(QStringLiteral("layerStyleContourNameDialog"));
+    prompt.setWindowTitle(title);
+    prompt.setLabelText(QObject::tr("Name:"));
+    prompt.setInputMode(QInputDialog::TextInput);
+    prompt.setTextValue(initial);
+    if (exec_dialog(prompt) != QDialog::Accepted || prompt.textValue().trimmed().isEmpty()) {
+      return std::nullopt;
+    }
+    return prompt.textValue().trimmed();
+  };
+  const auto selected_user_contour = [&](const ContourPickerTools& picker) -> const ContourLibraryEntry* {
+    const auto id = picker.combo->currentData().toString();
+    if (contour_library == nullptr || !id.startsWith(QLatin1String(kContourUserPrefix))) {
+      return nullptr;
+    }
+    return contour_library->find_entry(id.mid(static_cast<qsizetype>(std::strlen(kContourUserPrefix))));
+  };
+  for (std::size_t picker_index = 0; picker_index < contour_pickers.size(); ++picker_index) {
+    auto* picker = &contour_pickers[picker_index];
+    QObject::connect(picker->edit, &QPushButton::clicked, &dialog, [&edit_contour, picker] { edit_contour(*picker); });
+    picker->combo->installEventFilter(
+        new ContourSwatchClickFilter(picker->combo, [&edit_contour, picker] { edit_contour(*picker); }));
+    auto* menu = new QMenu(picker->library);
+    menu->setObjectName(picker->combo->objectName() + QStringLiteral("LibraryMenu"));
+    auto* new_action = menu->addAction(QObject::tr("New Contour…"));
+    new_action->setObjectName(QStringLiteral("contourLibraryNewAction"));
+    auto* rename_action = menu->addAction(QObject::tr("Rename Contour…"));
+    rename_action->setObjectName(QStringLiteral("contourLibraryRenameAction"));
+    auto* delete_action = menu->addAction(QObject::tr("Delete Contour"));
+    delete_action->setObjectName(QStringLiteral("contourLibraryDeleteAction"));
+    menu->addSeparator();
+    auto* load_action = menu->addAction(QObject::tr("Load Contours…"));
+    load_action->setObjectName(QStringLiteral("contourLibraryLoadAction"));
+    auto* save_action = menu->addAction(QObject::tr("Save Contours…"));
+    save_action->setObjectName(QStringLiteral("contourLibrarySaveAction"));
+    picker->library->setMenu(menu);
+    picker->library->setEnabled(contour_library != nullptr);
+    const auto sync_menu = [&selected_user_contour, contour_library, picker, rename_action, delete_action, save_action] {
+      const bool user_contour = selected_user_contour(*picker) != nullptr;
+      rename_action->setEnabled(user_contour);
+      delete_action->setEnabled(user_contour);
+      save_action->setEnabled(contour_library != nullptr && !contour_library->entries().empty());
+    };
+    sync_menu();
+    QObject::connect(menu, &QMenu::aboutToShow, &dialog, sync_menu);
+    if (contour_library == nullptr) {
+      continue;
+    }
+    QObject::connect(new_action, &QAction::triggered, &dialog, [&, picker, picker_index] {
+      const auto contour_name = request_contour_name(
+          QObject::tr("New Contour"), QObject::tr("Contour %1").arg(contour_library->entries().size() + 1U));
+      if (!contour_name.has_value()) {
+        return;
+      }
+      auto values = contour_picker_values();
+      const auto id = contour_library->add_contour(*contour_name, values[picker_index]);
+      const auto* entry = contour_library->find_entry(id);
+      if (entry == nullptr) {
+        show_critical_message(&dialog, QObject::tr("New Contour"), QObject::tr("Could not save the contour."),
+                              QStringLiteral("layerStyleContourErrorDialog"));
+        return;
+      }
+      // The picker now shows the saved contour (whole levels, under its name).
+      values[picker_index] = entry->contour;
+      show_contour_picker_values(values);
+      preview_contour_change(*picker, true);
+    });
+    QObject::connect(rename_action, &QAction::triggered, &dialog, [&, picker] {
+      const auto* entry = selected_user_contour(*picker);
+      if (entry == nullptr) {
+        return;
+      }
+      const auto storage_id = entry->storage_id;
+      const auto contour_name = request_contour_name(QObject::tr("Rename Contour"), entry->name);
+      if (!contour_name.has_value()) {
+        return;
+      }
+      auto values = contour_picker_values();
+      if (!contour_library->rename_contour(storage_id, *contour_name)) {
+        show_critical_message(&dialog, QObject::tr("Rename Contour"), QObject::tr("Could not rename the contour."),
+                              QStringLiteral("layerStyleContourErrorDialog"));
+        return;
+      }
+      if (const auto* renamed = contour_library->find_entry(storage_id); renamed != nullptr) {
+        for (auto& value : values) {
+          if (style_contours_same_shape(value, renamed->contour)) {
+            value.name = renamed->contour.name;
+          }
+        }
+      }
+      show_contour_picker_values(values);
+      emit_preview(true);
+    });
+    QObject::connect(delete_action, &QAction::triggered, &dialog, [&, picker] {
+      const auto* entry = selected_user_contour(*picker);
+      if (entry == nullptr) {
+        return;
+      }
+      // The effects keep the curve: it shows as Custom once it is off the list.
+      const auto values = contour_picker_values();
+      if (contour_library->remove_contour(entry->storage_id)) {
+        show_contour_picker_values(values);
+      }
+    });
+    QObject::connect(load_action, &QAction::triggered, &dialog, [&] {
+      const auto path = get_open_file_name(&dialog, QObject::tr("Load Contours"), {},
+                                           QObject::tr("Photoshop Contours (*.shc)"), nullptr,
+                                           QStringLiteral("layerStyleLoadContoursFileDialog"));
+      if (path.isEmpty()) {
+        return;
+      }
+      const auto values = contour_picker_values();
+      QString error;
+      QStringList warnings;
+      (void)contour_library->import_shc(path, error, warnings);
+      show_contour_picker_values(values);
+      if (!error.isEmpty()) {
+        show_critical_message(&dialog, QObject::tr("Load Contours"), error,
+                              QStringLiteral("layerStyleContourErrorDialog"));
+      } else if (!warnings.isEmpty()) {
+        show_information_message(&dialog, QObject::tr("Load Contours"), warnings.join(QLatin1Char('\n')),
+                                 QStringLiteral("layerStyleContourWarningsDialog"));
+      }
+    });
+    QObject::connect(save_action, &QAction::triggered, &dialog, [&] {
+      const auto ids = request_contours_to_save(&dialog, *contour_library);
+      if (ids.isEmpty()) {
+        return;
+      }
+      auto path = get_save_file_name(&dialog, QObject::tr("Save Contours"), QObject::tr("Contours.shc"),
+                                     QObject::tr("Photoshop Contours (*.shc)"), nullptr,
+                                     QStringLiteral("layerStyleSaveContoursFileDialog"));
+      if (path.isEmpty()) {
+        return;
+      }
+      if (!path.endsWith(QStringLiteral(".shc"), Qt::CaseInsensitive)) {
+        path += QStringLiteral(".shc");
+      }
+      QString error;
+      if (!contour_library->export_shc(ids, path, error)) {
+        show_critical_message(&dialog, QObject::tr("Save Contours"), error,
+                              QStringLiteral("layerStyleContourErrorDialog"));
+        return;
+      }
+      offer_browser_download_for_saved_file(path);
+    });
+  }
+  QObject::connect(shadow_anti_aliased, &QCheckBox::toggled, &dialog,
+                   [&emit_preview](bool) { emit_preview(true); });
+  QObject::connect(shadow_continuous, &QCheckBox::toggled, &dialog, [&emit_preview, sync_continuous_controls](bool) {
+    sync_continuous_controls();
+    emit_preview(true);
+  });
+  QObject::connect(inner_shadow_blend, &QComboBox::currentIndexChanged, &dialog,
+                   [&emit_preview](int) { emit_preview(true); });
+  QObject::connect(stroke_position, &QComboBox::currentIndexChanged, &dialog,
+                   [&emit_preview](int) { emit_preview(true); });
+  QObject::connect(stroke_blend, &QComboBox::currentIndexChanged, &dialog,
+                   [&emit_preview](int) { emit_preview(true); });
+  QObject::connect(stroke_overprint, &QCheckBox::toggled, &dialog,
+                   [&emit_preview](bool) { emit_preview(true); });
+  QObject::connect(stroke_fill, &QComboBox::currentIndexChanged, &dialog, [&](int) {
+    update_stroke_fill_visibility();
+    emit_preview(true);
+  });
+  QObject::connect(gradient_blend, &QComboBox::currentIndexChanged, &dialog,
+                   [&emit_preview](int) { emit_preview(true); });
+  const auto connect_color_row_picker = [&](const RgbColorRowWidgets& rows, const QString& title) {
+    QObject::connect(rows.picker, &QAbstractButton::clicked, &dialog, [&, rows, title] {
+      const auto original = rows.value();
+      const auto saved_edits = *batch_edits;
+      const auto key = effect_property_prefix(item_kind(categories->currentItem()),
+          item_effect_index(categories->currentItem())) + ".color";
+      const auto apply = [&](QColor color) {
+        const QSignalBlocker red(rows.red), green(rows.green), blue(rows.blue);
+        rows.set_value({static_cast<std::uint8_t>(color.red()), static_cast<std::uint8_t>(color.green()),
+                        static_cast<std::uint8_t>(color.blue())});
+        if (batch) explicit_fields = {key};
+        emit_preview(true);
+      };
+      bool selected = false;
+      const auto chosen = request_patchy_color(&dialog,
+          QColor(original.red, original.green, original.blue), title, apply, &selected);
+      if (!chosen) {
+        const QSignalBlocker red(rows.red), green(rows.green), blue(rows.blue);
+        rows.set_value(original);
+        *batch_edits = saved_edits;
+        reset_batch_capture();
+        emit_preview(true);
+      } else if (selected || !batch) apply(*chosen);
+    });
+  };
+  connect_color_row_picker(stroke_rows, QObject::tr("Choose Stroke Color"));
+  auto choose_bevel_color = [&](RgbColor& target, const QString& title) {
+    const auto original = target;
+    const auto saved_edits = *batch_edits;
+    const auto key = effect_property_prefix(LayerStyleEffectKind::BevelEmboss, 0) +
+        (&target == &bevel_highlight_color ? ".highlight_color" : ".shadow_color");
+    bool selected = false;
+    auto apply_color = [&](QColor color) {
+      if (!color.isValid()) {
+        return;
+      }
+      target = RgbColor{static_cast<std::uint8_t>(color.red()), static_cast<std::uint8_t>(color.green()),
+                        static_cast<std::uint8_t>(color.blue())};
+      update_bevel_color_previews();
+    };
+    const auto chosen = request_patchy_color(&dialog, QColor(original.red, original.green, original.blue), title,
+                                             [&](QColor color) {
+                                               apply_color(color);
+                                               if (batch) explicit_fields = {key};
+                                               emit_preview(false);
+                                             }, &selected);
+    if (!chosen.has_value()) {
+      apply_color(QColor(original.red, original.green, original.blue));
+      *batch_edits = saved_edits;
+      reset_batch_capture();
+      emit_preview(true);
+      return;
+    }
+    if (selected || !batch) {
+      apply_color(*chosen);
+      if (batch) explicit_fields = {key};
+      emit_preview(true);
+    }
+  };
+  QObject::connect(bevel_highlight_color_button, &QPushButton::clicked, &dialog, [&] {
+    choose_bevel_color(bevel_highlight_color, QObject::tr("Choose Highlight Color"));
+  });
+  QObject::connect(bevel_shadow_color_button, &QPushButton::clicked, &dialog, [&] {
+    choose_bevel_color(bevel_shadow_color, QObject::tr("Choose Shadow Color"));
+  });
+  connect_color_row_picker(color_overlay_rows, QObject::tr("Choose Color Overlay Color"));
+  connect_color_row_picker(outer_glow_rows, QObject::tr("Choose Outer Glow Color"));
+  connect_color_row_picker(inner_glow_rows, QObject::tr("Choose Inner Glow Color"));
+  connect_color_row_picker(satin_rows, QObject::tr("Choose Satin Color"));
+  connect_color_row_picker(shadow_rows, QObject::tr("Choose Drop Shadow Color"));
+  connect_color_row_picker(inner_shadow_rows, QObject::tr("Choose Inner Shadow Color"));
+  auto add_selected_instance = [&](LayerStyleEffectKind fallback_kind) {
+    const auto* current = categories->currentItem();
+    const auto kind = is_stackable_kind(item_kind(current)) ? item_kind(current) : fallback_kind;
+    const auto source_index = item_effect_index(current) >= 0 ? item_effect_index(current) : 0;
+    style = build_current_settings().style;
+    const auto new_index = add_effect_instance(kind, source_index);
+    rebuild_category_list(kind, new_index);
+    load_controls_from_style(categories->currentItem());
+    emit_preview(true);
+  };
+  auto remove_selected_stackable_instance = [&] {
+    const auto* current = categories->currentItem();
+    const auto kind = item_kind(current);
+    if (!is_stackable_kind(kind)) {
+      return;
+    }
+    style = build_current_settings().style;
+    const auto next_index = remove_effect_instance(kind, item_effect_index(current));
+    rebuild_category_list(kind, next_index);
+    load_controls_from_style(categories->currentItem());
+    emit_preview(true);
+  };
+  QObject::connect(add_inner_shadow, &QPushButton::clicked, &dialog, [&] {
+    add_selected_instance(LayerStyleEffectKind::InnerShadow);
+  });
+  QObject::connect(remove_inner_shadow, &QPushButton::clicked, &dialog, remove_selected_stackable_instance);
+  QObject::connect(add_inner_glow, &QPushButton::clicked, &dialog, [&] {
+    add_selected_instance(LayerStyleEffectKind::InnerGlow);
+  });
+  QObject::connect(remove_inner_glow, &QPushButton::clicked, &dialog, remove_selected_stackable_instance);
+  QObject::connect(remove_selected_instance, &QPushButton::clicked, &dialog, remove_selected_stackable_instance);
+  // Load Default and Restore Built-in Default: the stored (or built-in) values
+  // go onto the current instance, which keeps whether it is on.
+  const auto load_default_into_page = [&](LayerStyleEffectKind kind) {
+    auto* current = categories->currentItem();
+    if (item_kind(current) != kind) {
+      return;
+    }
+    const auto index = std::max(0, item_effect_index(current));
+    style = build_current_settings().style;
+    reset_effect_to_default(style, kind, static_cast<std::size_t>(index));
+    load_controls_from_style(current);
+    if (batch) {
+      // Every field of the effect counts as edited on each selected layer.
+      const auto prefix = effect_property_prefix(kind, index) + ".";
+      explicit_fields.clear();
+      for (const auto& property : layer_style_properties(build_current_settings())) {
+        if (property.key.starts_with(prefix) && !property.key.ends_with(".enabled")) {
+          explicit_fields.push_back(property.key);
+        }
+      }
+    }
+    emit_preview(true);
+  };
+  for (const auto& buttons_for_page : default_buttons) {
+    const auto kind = buttons_for_page.kind;
+    auto* restore_button = buttons_for_page.restore;
+    QObject::connect(buttons_for_page.make, &QPushButton::clicked, &dialog, [&, kind, restore_button] {
+      const auto* current = categories->currentItem();
+      if (item_kind(current) != kind) {
+        return;
+      }
+      // The page's values even while the effect is off and not in the style yet.
+      auto snapshot = build_current_settings().style;
+      const auto index = std::max(0, item_effect_index(current));
+      switch (kind) {
+        case LayerStyleEffectKind::BevelEmboss: ensure_bevel(snapshot, index); break;
+        case LayerStyleEffectKind::Stroke: ensure_effect(snapshot.strokes, index, default_stroke); break;
+        case LayerStyleEffectKind::InnerShadow: ensure_effect(snapshot.inner_shadows, index, default_inner_shadow); break;
+        case LayerStyleEffectKind::InnerGlow: ensure_effect(snapshot.inner_glows, index, default_inner_glow); break;
+        case LayerStyleEffectKind::Satin: ensure_effect(snapshot.satins, index, default_satin); break;
+        case LayerStyleEffectKind::ColorOverlay:
+          ensure_effect(snapshot.color_overlays, index, default_color_overlay);
+          break;
+        case LayerStyleEffectKind::GradientOverlay:
+          ensure_effect(snapshot.gradient_fills, index, default_gradient_fill);
+          break;
+        case LayerStyleEffectKind::PatternOverlay:
+          ensure_effect(snapshot.pattern_overlays, index, default_pattern_overlay);
+          break;
+        case LayerStyleEffectKind::OuterGlow: ensure_effect(snapshot.outer_glows, index, default_outer_glow); break;
+        case LayerStyleEffectKind::DropShadow: ensure_effect(snapshot.drop_shadows, index, default_drop_shadow); break;
+        case LayerStyleEffectKind::BevelContour:
+        case LayerStyleEffectKind::BevelTexture:
+        case LayerStyleEffectKind::None:
+          break;
+      }
+      save_controls_to_style(snapshot, current);
+      store_effect_default(kind, snapshot, static_cast<std::size_t>(index));
+      restore_button->setEnabled(true);
+    });
+    QObject::connect(buttons_for_page.reset, &QPushButton::clicked, &dialog,
+                     [&load_default_into_page, kind] { load_default_into_page(kind); });
+    QObject::connect(buttons_for_page.restore, &QPushButton::clicked, &dialog, [&, kind, restore_button] {
+      if (item_kind(categories->currentItem()) != kind) {
+        return;
+      }
+      clear_stored_effect_default(kind);
+      restore_button->setEnabled(false);
+      load_default_into_page(kind);
+    });
+  }
+  auto* buttons = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel, &dialog);
+  // OK as wide as Cancel (GitHub issue 606), whatever the language makes either.
+  const auto equalize_buttons = [buttons] { equalize_dialog_button_widths(buttons); };
+  equalize_buttons();
+  // OK/Cancel sit under the options pane, in its column; Preview is beside the
+  // style swatch in the effect list's column, on the same line.
+  auto* footer = new QHBoxLayout();
+  if (batch && batch->selected_count > 1) {
+    auto* apply_all = new QPushButton(QObject::tr("Apply All Settings to Selected Layers"), &dialog);
+    apply_all->setObjectName(QStringLiteral("layerStyleApplyAllButton"));
+    footer->addWidget(apply_all);
+    QObject::connect(apply_all, &QPushButton::clicked, &dialog, [&] {
+      auto recipe = build_current_settings();
+      recipe.opacity_edited = true;
+      recipe.fill_opacity_edited = true;
+      // Template-only pages do not create disabled placeholder effects.
+      recipe.style = batch_edits->applied(batch->originals.front()).style;
+      batch_edits->append({{}, [recipe](LayerStyleSettings& target) { target = recipe; }});
+      reset_batch_capture();
+      emit_preview(true);
+    });
+  }
+  footer->addStretch(1);
+  footer->addWidget(buttons);
+  // The dark chrome is frameless, so the corner grip is the resize handle
+  // (GitHub issue 606 follow-up 3), as in Preferences.
+  auto* size_grip = new VisibleSizeGrip(&dialog);
+  size_grip->setObjectName(QStringLiteral("layerStyleSizeGrip"));
+  footer->addWidget(size_grip, 0, Qt::AlignBottom);
+  options_column_layout->addLayout(footer);
+  // As tall as the OK/Cancel row, so the Preview box centers on that row's line.
+  preview_check->setFixedHeight(std::max(footer->sizeHint().height(), preview_check->sizeHint().height()));
+  QObject::connect(buttons, &QDialogButtonBox::accepted, &dialog, &QDialog::accept);
+  QObject::connect(buttons, &QDialogButtonBox::rejected, &dialog, &QDialog::reject);
+
+  if (parent != nullptr) {
+    const auto canvases = parent->findChildren<CanvasWidget *>();
+    const auto visible =
+        std::find_if(canvases.begin(), canvases.end(),
+                     [](CanvasWidget *canvas) { return canvas->isVisible(); });
+    if (visible != canvases.end()) {
+      auto *overlay_gradient_state = gradient_controls.get();
+      auto *stroke_gradient_state = stroke_gradient_controls.get();
+      auto active_gradient_controls =
+          [categories, stroke_fill, overlay_gradient_state, item_kind,
+           stroke_gradient_state]() -> LayerStyleGradientControls * {
+        const auto *current = categories->currentItem();
+        if (item_kind(current) == LayerStyleEffectKind::GradientOverlay)
+          return overlay_gradient_state;
+        if (item_kind(current) == LayerStyleEffectKind::Stroke &&
+            stroke_fill->currentData().toBool())
+          return stroke_gradient_state;
+        return nullptr;
+      };
+      new GradientCanvasRepositionFilter(
+          *visible, layer.bounds(),
+          [active_gradient_controls] {
+            return active_gradient_controls() != nullptr;
+          },
+          [active_gradient_controls](float delta_x, float delta_y) {
+            if (auto *state = active_gradient_controls(); state != nullptr) {
+              state->offset_x->setValue(state->offset_x->value() +
+                                        static_cast<int>(std::lround(delta_x)));
+              state->offset_y->setValue(state->offset_y->value() +
+                                        static_cast<int>(std::lround(delta_y)));
+            }
+          },
+          &dialog);
+    }
+  }
+
+  if (batch) {
+    using Binding = std::pair<QWidget*, std::function<std::string()>>;
+    auto bindings = std::make_shared<std::vector<Binding>>();
+    const auto bind = [&](QWidget* widget, std::function<std::string()> key, bool intent = true) {
+      bindings->emplace_back(widget, key);
+      if (intent) install_appearance_edit_intent(widget, [&, key] {
+        if (loading_controls || rebuilding_categories) return;
+        explicit_fields = {key()};
+        emit_preview(true);
+      });
+    };
+    const auto global = [&](QWidget* widget, const std::string& key) {
+      bind(widget, [key] { return key; });
+    };
+    const auto effect = [&](QWidget* widget, LayerStyleEffectKind kind, const std::string& leaf, bool intent = true) {
+      bind(widget, [&, kind, leaf] {
+        const auto* current = categories->currentItem();
+        const auto index = item_kind(current) == kind ? item_effect_index(current) : 0;
+        return effect_property_prefix(kind, index) + "." + leaf;
+      }, intent);
+    };
+    global(blend, "blend_mode");
+    global(opacity, "opacity");
+    global(fill_opacity, "fill_opacity");
+    global(show_effects, "style.effects_visible");
+    global(mask_hides_effects, "style.layer_mask_hides_effects");
+    global(vector_mask_hides_effects, "style.vector_mask_hides_effects");
+    global(knockout, "knockout");
+    global(blend_interior, "style.blend_interior_elements");
+    global(blend_clipped, "style.blend_clipped_elements");
+    global(channel_red, "restricted_channels.0");
+    global(channel_green, "restricted_channels.1");
+    global(channel_blue, "restricted_channels.2");
+    effect(bevel_style, LayerStyleEffectKind::BevelEmboss, "style");
+    effect(bevel_technique, LayerStyleEffectKind::BevelEmboss, "technique");
+    effect(bevel_size, LayerStyleEffectKind::BevelEmboss, "size");
+    effect(bevel_soften, LayerStyleEffectKind::BevelEmboss, "soften");
+    effect(bevel_depth, LayerStyleEffectKind::BevelEmboss, "depth");
+    effect(bevel_angle, LayerStyleEffectKind::BevelEmboss, "angle_degrees");
+    effect(bevel_altitude, LayerStyleEffectKind::BevelEmboss, "altitude_degrees");
+    effect(bevel_direction.first, LayerStyleEffectKind::BevelEmboss, "direction_up");
+    effect(bevel_direction.second, LayerStyleEffectKind::BevelEmboss, "direction_up");
+    effect(bevel_highlight_blend, LayerStyleEffectKind::BevelEmboss, "highlight_blend_mode");
+    effect(bevel_highlight_opacity, LayerStyleEffectKind::BevelEmboss, "highlight_opacity");
+    effect(bevel_shadow_blend, LayerStyleEffectKind::BevelEmboss, "shadow_blend_mode");
+    effect(bevel_shadow_opacity, LayerStyleEffectKind::BevelEmboss, "shadow_opacity");
+    effect(bevel_gloss_contour, LayerStyleEffectKind::BevelEmboss, "gloss_contour");
+    effect(bevel_gloss_anti_aliased, LayerStyleEffectKind::BevelEmboss, "gloss_anti_aliased");
+    effect(bevel_contour_combo, LayerStyleEffectKind::BevelContour, "contour");
+    effect(bevel_contour_range, LayerStyleEffectKind::BevelContour, "range");
+    effect(bevel_contour_anti_aliased, LayerStyleEffectKind::BevelContour, "anti_aliased");
+    effect(bevel_texture_pattern, LayerStyleEffectKind::BevelTexture, "pattern_id");
+    effect(bevel_texture_scale, LayerStyleEffectKind::BevelTexture, "scale");
+    effect(bevel_texture_depth, LayerStyleEffectKind::BevelTexture, "depth");
+    effect(bevel_texture_invert, LayerStyleEffectKind::BevelTexture, "invert");
+    effect(bevel_texture_link, LayerStyleEffectKind::BevelTexture, "link_with_layer");
+    effect(pattern_overlay_blend, LayerStyleEffectKind::PatternOverlay, "blend_mode");
+    effect(pattern_overlay_opacity, LayerStyleEffectKind::PatternOverlay, "opacity");
+    effect(pattern_overlay_pattern, LayerStyleEffectKind::PatternOverlay, "pattern_id");
+    effect(pattern_overlay_angle, LayerStyleEffectKind::PatternOverlay, "angle_degrees");
+    effect(pattern_overlay_scale, LayerStyleEffectKind::PatternOverlay, "scale");
+    effect(pattern_overlay_link, LayerStyleEffectKind::PatternOverlay, "link_with_layer");
+    effect(stroke_blend, LayerStyleEffectKind::Stroke, "blend_mode");
+    effect(stroke_size, LayerStyleEffectKind::Stroke, "size");
+    effect(stroke_opacity, LayerStyleEffectKind::Stroke, "opacity");
+    effect(stroke_position, LayerStyleEffectKind::Stroke, "position");
+    effect(stroke_overprint, LayerStyleEffectKind::Stroke, "overprint");
+    effect(stroke_fill, LayerStyleEffectKind::Stroke, "uses_gradient");
+    effect(color_overlay_blend, LayerStyleEffectKind::ColorOverlay, "blend_mode");
+    effect(color_overlay_opacity, LayerStyleEffectKind::ColorOverlay, "opacity");
+    effect(gradient_blend, LayerStyleEffectKind::GradientOverlay, "blend_mode");
+    effect(gradient_opacity, LayerStyleEffectKind::GradientOverlay, "opacity");
+    effect(outer_glow_blend, LayerStyleEffectKind::OuterGlow, "blend_mode");
+    effect(outer_glow_technique, LayerStyleEffectKind::OuterGlow, "technique");
+    effect(outer_glow_opacity, LayerStyleEffectKind::OuterGlow, "opacity");
+    effect(outer_glow_size, LayerStyleEffectKind::OuterGlow, "size");
+    effect(outer_glow_spread, LayerStyleEffectKind::OuterGlow, "spread");
+    effect(outer_glow_range, LayerStyleEffectKind::OuterGlow, "range");
+    effect(inner_glow_blend, LayerStyleEffectKind::InnerGlow, "blend_mode");
+    effect(inner_glow_technique, LayerStyleEffectKind::InnerGlow, "technique");
+    effect(inner_glow_source.first, LayerStyleEffectKind::InnerGlow, "source");
+    effect(inner_glow_source.second, LayerStyleEffectKind::InnerGlow, "source");
+    effect(inner_glow_opacity, LayerStyleEffectKind::InnerGlow, "opacity");
+    effect(inner_glow_size, LayerStyleEffectKind::InnerGlow, "size");
+    effect(inner_glow_choke, LayerStyleEffectKind::InnerGlow, "choke");
+    effect(inner_glow_range, LayerStyleEffectKind::InnerGlow, "range");
+    effect(satin_blend, LayerStyleEffectKind::Satin, "blend_mode");
+    effect(satin_opacity, LayerStyleEffectKind::Satin, "opacity");
+    effect(satin_angle, LayerStyleEffectKind::Satin, "angle_degrees");
+    effect(satin_distance, LayerStyleEffectKind::Satin, "distance");
+    effect(satin_size, LayerStyleEffectKind::Satin, "size");
+    effect(satin_invert, LayerStyleEffectKind::Satin, "invert");
+    effect(shadow_blend, LayerStyleEffectKind::DropShadow, "blend_mode");
+    effect(shadow_opacity, LayerStyleEffectKind::DropShadow, "opacity");
+    effect(shadow_angle, LayerStyleEffectKind::DropShadow, "angle_degrees");
+    effect(shadow_distance, LayerStyleEffectKind::DropShadow, "distance");
+    effect(shadow_size, LayerStyleEffectKind::DropShadow, "size");
+    effect(shadow_spread, LayerStyleEffectKind::DropShadow, "spread");
+    effect(shadow_conceals, LayerStyleEffectKind::DropShadow, "layer_conceals");
+    effect(shadow_contour, LayerStyleEffectKind::DropShadow, "contour");
+    effect(shadow_anti_aliased, LayerStyleEffectKind::DropShadow, "anti_aliased");
+    effect(shadow_continuous, LayerStyleEffectKind::DropShadow, "continuous");
+    effect(shadow_fade, LayerStyleEffectKind::DropShadow, "fade");
+    effect(inner_shadow_blend, LayerStyleEffectKind::InnerShadow, "blend_mode");
+    effect(inner_shadow_opacity, LayerStyleEffectKind::InnerShadow, "opacity");
+    effect(inner_shadow_angle, LayerStyleEffectKind::InnerShadow, "angle_degrees");
+    effect(inner_shadow_distance, LayerStyleEffectKind::InnerShadow, "distance");
+    effect(inner_shadow_size, LayerStyleEffectKind::InnerShadow, "size");
+    effect(inner_shadow_choke, LayerStyleEffectKind::InnerShadow, "choke");
+    effect(stroke_rows.red, LayerStyleEffectKind::Stroke, "color", true);
+    effect(stroke_rows.green, LayerStyleEffectKind::Stroke, "color", true);
+    effect(stroke_rows.blue, LayerStyleEffectKind::Stroke, "color", true);
+    effect(stroke_rows.picker, LayerStyleEffectKind::Stroke, "color", false);
+    effect(color_overlay_rows.red, LayerStyleEffectKind::ColorOverlay, "color", true);
+    effect(color_overlay_rows.green, LayerStyleEffectKind::ColorOverlay, "color", true);
+    effect(color_overlay_rows.blue, LayerStyleEffectKind::ColorOverlay, "color", true);
+    effect(color_overlay_rows.picker, LayerStyleEffectKind::ColorOverlay, "color", false);
+    effect(outer_glow_rows.red, LayerStyleEffectKind::OuterGlow, "color", true);
+    effect(outer_glow_rows.green, LayerStyleEffectKind::OuterGlow, "color", true);
+    effect(outer_glow_rows.blue, LayerStyleEffectKind::OuterGlow, "color", true);
+    effect(outer_glow_rows.picker, LayerStyleEffectKind::OuterGlow, "color", false);
+    effect(inner_glow_rows.red, LayerStyleEffectKind::InnerGlow, "color", true);
+    effect(inner_glow_rows.green, LayerStyleEffectKind::InnerGlow, "color", true);
+    effect(inner_glow_rows.blue, LayerStyleEffectKind::InnerGlow, "color", true);
+    effect(inner_glow_rows.picker, LayerStyleEffectKind::InnerGlow, "color", false);
+    effect(satin_rows.red, LayerStyleEffectKind::Satin, "color", true);
+    effect(satin_rows.green, LayerStyleEffectKind::Satin, "color", true);
+    effect(satin_rows.blue, LayerStyleEffectKind::Satin, "color", true);
+    effect(satin_rows.picker, LayerStyleEffectKind::Satin, "color", false);
+    effect(shadow_rows.red, LayerStyleEffectKind::DropShadow, "color", true);
+    effect(shadow_rows.green, LayerStyleEffectKind::DropShadow, "color", true);
+    effect(shadow_rows.blue, LayerStyleEffectKind::DropShadow, "color", true);
+    effect(shadow_rows.picker, LayerStyleEffectKind::DropShadow, "color", false);
+    effect(inner_shadow_rows.red, LayerStyleEffectKind::InnerShadow, "color", true);
+    effect(inner_shadow_rows.green, LayerStyleEffectKind::InnerShadow, "color", true);
+    effect(inner_shadow_rows.blue, LayerStyleEffectKind::InnerShadow, "color", true);
+    effect(inner_shadow_rows.picker, LayerStyleEffectKind::InnerShadow, "color", false);
+    effect(bevel_highlight_color_button, LayerStyleEffectKind::BevelEmboss, "highlight_color", false);
+    effect(bevel_shadow_color_button, LayerStyleEffectKind::BevelEmboss, "shadow_color", false);
+    const auto gradient_bindings = [&](LayerStyleGradientControls* fields, LayerStyleEffectKind kind) {
+      effect(fields->reverse, kind, "gradient.reverse");
+      effect(fields->dither, kind, "gradient.dither");
+      effect(fields->align, kind, "gradient.align_with_layer");
+      effect(fields->interpolation, kind, "gradient.interpolation");
+      effect(fields->style_combo, kind, "gradient.type");
+      effect(fields->angle, kind, "gradient.angle_degrees");
+      effect(fields->scale, kind, "gradient.scale");
+      effect(fields->offset_x, kind, "gradient.offset_x_percent");
+      effect(fields->offset_y, kind, "gradient.offset_y_percent");
+      effect(fields->form_combo, kind, "gradient.definition");
+      effect(fields->smoothness, kind, "gradient.definition");
+      effect(fields->noise_seed, kind, "gradient.definition");
+      effect(fields->noise_roughness, kind, "gradient.definition");
+      effect(fields->noise_transparency, kind, "gradient.definition");
+      effect(fields->noise_restrict, kind, "gradient.definition");
+      effect(fields->noise_color_model, kind, "gradient.definition");
+      effect(fields->stop_location, kind, "gradient.definition");
+      effect(fields->stop_opacity, kind, "gradient.definition");
+      effect(fields->stop_midpoint, kind, "gradient.definition");
+      for (auto* widget : fields->noise_minimum) effect(widget, kind, "gradient.definition");
+      for (auto* widget : fields->noise_maximum) effect(widget, kind, "gradient.definition");
+      effect(fields->stop_swatch, kind, "gradient.definition", false);
+      effect(fields->stop_hex, kind, "gradient.definition", false);
+      effect(fields->editor, kind, "gradient.definition", false);
+    };
+    gradient_bindings(gradient_controls.get(), LayerStyleEffectKind::GradientOverlay);
+    gradient_bindings(stroke_gradient_controls.get(), LayerStyleEffectKind::Stroke);
+    const auto blend_row_bindings = [&](BlendIfRowWidgets& row, const std::string& side) {
+      const auto field = [&](QWidget* widget, const std::string& leaf) {
+        bind(widget, [&, side, leaf] {
+          return "blend_if." + std::to_string(current_blend_if_channel_index()) + "." + side + "." + leaf;
+        });
+      };
+      field(row.black_low.spin, "black_low"); field(row.black_high.spin, "black_high");
+      field(row.white_low.spin, "white_low"); field(row.white_high.spin, "white_high");
+    };
+    blend_row_bindings(blend_if_this, "this_layer");
+    blend_row_bindings(blend_if_underlying, "underlying_layer");
+    refresh_batch_mixed = [&, bindings] {
+      std::vector<LayerStyleSettings> current;
+      for (const auto& original : batch->originals) current.push_back(batch_edits->applied(original));
+      if (current.empty()) return;
+      const auto properties = layer_style_properties(build_current_settings());
+      for (const auto& [widget, key] : *bindings) {
+        const auto name = key();
+        const auto property = std::find_if(properties.begin(), properties.end(), [&](const auto& field) { return field.key == name; });
+        const bool mixed = property != properties.end() && std::any_of(current.begin() + 1, current.end(),
+            [&](const auto& value) { return !property->equal(current.front(), value); });
+        set_appearance_mixed(widget, mixed);
+      }
+      for (int row = 0; row < categories->count(); ++row) {
+        auto* item = categories->item(row);
+        if (item_kind(item) == LayerStyleEffectKind::None) continue;
+        const auto prefix = effect_property_prefix(item_kind(item), item_effect_index(item)) + ".";
+        const bool different = std::any_of(properties.begin(), properties.end(), [&](const auto& property) {
+          return property.key.starts_with(prefix) && std::any_of(current.begin() + 1, current.end(),
+              [&](const auto& value) { return !property.equal(current.front(), value); });
+        });
+        if (auto* widget = categories->itemWidget(item)) {
+          set_appearance_mixed(widget, different);
+          const auto kind = item_kind(item);
+          const auto* ops = effect_vector_ops_for_kind(kind);
+          const auto index = static_cast<std::size_t>(std::max(0, item_effect_index(item)));
+          const auto present = std::count_if(current.begin(), current.end(), [&](const auto& settings) {
+            return ops ? ops->count(settings.style) > index : !settings.style.bevels.empty();
+          });
+          const auto presence = QObject::tr("Present on %1 of %2 layers").arg(present).arg(current.size());
+          widget->setToolTip(presence + (different ? QStringLiteral("\n") +
+              QObject::tr("Mixed: selected layers have different values") : QString()));
+          widget->setAccessibleDescription(widget->toolTip());
+          if (auto* label = widget->findChild<QLabel*>()) {
+            const auto occurrence = ops && ops->count(current.front().style) > 1
+                ? QStringLiteral(" %1").arg(index + 1) : QString();
+            label->setText(item->text() + occurrence + QStringLiteral(" (%1/%2)").arg(present).arg(current.size()));
+          }
+        }
+      }
+    };
+    reset_batch_capture();
+    refresh_batch_mixed();
+  }
+
+  // The Layers panel footer menu (GitHub issue 94): select the effect's first
+  // row, then tick it the way its checkbox does, so the preview and the batch
+  // capture see an ordinary user edit.
+  if (start_effect.has_value()) {
+    const auto start_kind = [&] {
+      switch (*start_effect) {
+        case LayerStyleEffect::BevelEmboss: return LayerStyleEffectKind::BevelEmboss;
+        case LayerStyleEffect::Stroke: return LayerStyleEffectKind::Stroke;
+        case LayerStyleEffect::InnerShadow: return LayerStyleEffectKind::InnerShadow;
+        case LayerStyleEffect::InnerGlow: return LayerStyleEffectKind::InnerGlow;
+        case LayerStyleEffect::Satin: return LayerStyleEffectKind::Satin;
+        case LayerStyleEffect::ColorOverlay: return LayerStyleEffectKind::ColorOverlay;
+        case LayerStyleEffect::GradientOverlay: return LayerStyleEffectKind::GradientOverlay;
+        case LayerStyleEffect::PatternOverlay: return LayerStyleEffectKind::PatternOverlay;
+        case LayerStyleEffect::OuterGlow: return LayerStyleEffectKind::OuterGlow;
+        case LayerStyleEffect::DropShadow: return LayerStyleEffectKind::DropShadow;
+      }
+      return LayerStyleEffectKind::None;
+    }();
+    for (int row = 0; row < categories->count(); ++row) {
+      auto* item = categories->item(row);
+      if (item_kind(item) != start_kind || item_effect_index(item) != static_cast<int>(start_effect_index)) {
+        continue;
+      }
+      categories->setCurrentItem(item);
+      if (enable_start_effect && item->checkState() != Qt::Checked) {
+        item->setCheckState(Qt::Checked);
+      }
+      break;
+    }
+  }
+
+  align_page_label_columns(*controls);
+  // The theme sheet reaches the labels and buttons once the dialog shows.
+  QTimer::singleShot(0, &dialog, [controls, equalize_buttons] {
+    align_page_label_columns(*controls);
+    equalize_buttons();
+  });
+
+  // GitHub issue 190: measure what the dialog needs around the settings pane
+  // with the pane at its full height, then give the pane what the screen
+  // leaves (the Shape Appearance recipe: available height minus 40). The
+  // dialog is not shown yet, so cached size hints are cleared by hand first.
+  const QScreen* screen = parent != nullptr ? parent->screen() : nullptr;
+  if (screen == nullptr) {
+    screen = QGuiApplication::primaryScreen();
+  }
+  const auto layouts = dialog.findChildren<QLayout*>();
+  for (auto* child : dialog.findChildren<QWidget*>()) {
+    child->updateGeometry();
+  }
+  for (auto* layout : layouts) {
+    layout->invalidate();
+  }
+  const auto pages_full_minimum = options_stack_full_minimum_size(*controls);
+  const auto pages_minimum = pages_full_minimum.height();
+  options_scroll->setMinimumSize(pages_full_minimum);
+  for (auto* layout : layouts) {
+    layout->invalidate();
+  }
+  const auto natural_minimum = dialog.layout()->totalMinimumSize();
+  int pane_budget = pages_minimum;
+  int max_height = 0;
+  int max_width = 0;
+  int open_height = 0;
+  if (screen != nullptr) {
+    const auto available = screen->availableGeometry();
+    max_height = std::max(320, available.height() - 40);
+    max_width = available.width();
+    const auto width = std::min(dialog.width(), std::max(natural_minimum.width(), available.width()));
+    // The notices above the pages word-wrap, so their height depends on the
+    // width the dialog opens with; the plain minimum counts one line each.
+    auto natural_height = natural_minimum.height();
+    if (dialog.layout()->hasHeightForWidth()) {
+      natural_height = std::max(natural_height, dialog.layout()->totalMinimumHeightForWidth(width));
+    }
+    // GitHub issue 606: it opens no taller than three quarters of the screen
+    // (the pane scrolls the rest); the user can still drag it up to the cap.
+    open_height = std::min(max_height, std::max(520, available.height() * 3 / 4));
+    pane_budget = std::max(120, pages_minimum - std::max(0, natural_height - open_height));
+    dialog.resize(width, std::min(dialog.height(), open_height));
+  }
+  auto* pane_cap = new OptionsPaneScreenCap(dialog, *options_scroll, *controls, pane_budget,
+                                            QSize(max_width, max_height), stored_layer_style_dialog_size(),
+                                            open_height);
+  pane_cap->set_shrink_after_show(*styles_views, 160);
+
+  log_ui_profile("layer_style_dialog_build",
+                 std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() -
+                                                           request_started)
+                     .count());
+  render_style_swatch(build_current_settings());
+  const auto exec_started = std::chrono::steady_clock::now();
+  const auto dialog_result = run_non_modal_dialog(dialog);
+  if (const auto own_size = pane_cap->own_size(); own_size.isValid() && dialog.size() != own_size) {
+    set_stored_layer_style_dialog_size(dialog.size());
+  }
+  log_ui_profile("layer_style_dialog_exec",
+                 std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() -
+                                                           exec_started)
+                     .count());
+  if (dialog_result != QDialog::Accepted) {
+    return std::nullopt;
+  }
+
+  if (document_patterns != nullptr) {
+    for (const auto& resource : transient_manager_patterns) {
+      document_patterns->adopt(resource);
+    }
+  }
+
+  auto result = build_current_settings();
+  if (batch) result.edits = std::make_shared<const AppearanceEdits<LayerStyleSettings>>(*batch_edits);
+  return result;
+}
+
+
+}  // namespace patchy::ui

@@ -1,0 +1,1005 @@
+#include "ui/curves_editor.hpp"
+
+#include "core/pixel_depth.hpp"
+#include "ui/dialog_utils.hpp"
+#include "ui/theme_palette.hpp"
+#include "ui/ui_text_size.hpp"
+
+#include <QFocusEvent>
+#include <QHBoxLayout>
+#include <QIcon>
+#include <QKeyEvent>
+#include <QLabel>
+#include <QMouseEvent>
+#include <QPainter>
+#include <QPainterPath>
+#include <QPixmap>
+#include <QPushButton>
+#include <QSignalBlocker>
+#include <QSizePolicy>
+#include <QSpinBox>
+#include <QTabBar>
+#include <QVBoxLayout>
+
+#include <algorithm>
+#include <array>
+#include <cmath>
+#include <cstddef>
+#include <cstdint>
+#include <iterator>
+#include <limits>
+#include <numeric>
+#include <utility>
+
+namespace patchy::ui {
+
+namespace {
+
+constexpr std::array<CurvesChannel, 4> kCurvesChannels{
+    CurvesChannel::Rgb, CurvesChannel::Red, CurvesChannel::Green, CurvesChannel::Blue};
+constexpr std::size_t kMaximumCurvePoints = 19U;
+
+int channel_index(CurvesChannel channel) {
+  switch (channel) {
+    case CurvesChannel::Red:
+      return 1;
+    case CurvesChannel::Green:
+      return 2;
+    case CurvesChannel::Blue:
+      return 3;
+    case CurvesChannel::Rgb:
+      return 0;
+  }
+  return 0;
+}
+
+CurvesChannel channel_from_index(int index) {
+  return kCurvesChannels[static_cast<std::size_t>(std::clamp(index, 0, 3))];
+}
+
+QColor channel_color(CurvesChannel channel, bool active) {
+  QColor color;
+  switch (channel) {
+    case CurvesChannel::Red:
+      color = QColor(246, 92, 92);  // color-literal-ok: the Red channel's hue
+      break;
+    case CurvesChannel::Green:
+      color = QColor(82, 218, 126);  // color-literal-ok: the Green channel's hue
+      break;
+    case CurvesChannel::Blue:
+      color = QColor(94, 145, 255);  // color-literal-ok: the Blue channel's hue
+      break;
+    case CurvesChannel::Rgb:
+      // The composite curve is chrome ink, not a channel hue.
+      color = theme().curves_graph_ink;
+      break;
+  }
+  color.setAlpha(active ? 255 : 105);
+  return color;
+}
+
+QColor histogram_color(CurvesChannel channel) {
+  auto color = channel_color(channel, true);
+  // Opaque enough that a one-column clipping spike reads clearly, like PS.
+  color.setAlpha(150);
+  return color;
+}
+
+CurvesAdjustment normalized_adjustment(const CurvesAdjustment& adjustment) {
+  CurvesAdjustment result;
+  for (const auto channel : kCurvesChannels) {
+    set_curve_points_for_channel(result, channel, curve_points_for_channel(adjustment, channel));
+  }
+  return result;
+}
+
+CurveControlPoints identity_curve_points() {
+  return CurveControlPoints{{0, 0}, {255, 255}};
+}
+
+const std::array<std::uint32_t, 256>& histogram_for_channel(const CurvesHistograms& histograms,
+                                                            CurvesChannel channel) {
+  switch (channel) {
+    case CurvesChannel::Red:
+      return histograms.red;
+    case CurvesChannel::Green:
+      return histograms.green;
+    case CurvesChannel::Blue:
+      return histograms.blue;
+    case CurvesChannel::Rgb:
+      return histograms.rgb;
+  }
+  return histograms.rgb;
+}
+
+}  // namespace
+
+CurvesHistograms curves_histograms_from_pixels(const PixelBuffer* source,
+                                               std::span<const std::uint8_t> external_alpha) {
+  CurvesHistograms result;
+  if (source != nullptr && !source->empty() && source->format().bit_depth != BitDepth::UInt8 &&
+      source->format().channels >= 3) {
+    // 16/32-bit sources (docs/high-bit-depth.md): 256 bins of the display values, as
+    // Photoshop's deep histograms show.
+    const auto narrowed = convert_pixel_buffer_depth(*source, BitDepth::UInt8, SampleKind::Color);
+    return curves_histograms_from_pixels(&narrowed, external_alpha);
+  }
+  if (source == nullptr || source->empty() || source->format().bit_depth != BitDepth::UInt8 ||
+      source->format().channels < 3) {
+    return result;
+  }
+
+  const auto width = std::max<std::int32_t>(0, source->width());
+  const auto height = std::max<std::int32_t>(0, source->height());
+  const auto pixel_count = static_cast<std::size_t>(width) * static_cast<std::size_t>(height);
+  if (!external_alpha.empty() && external_alpha.size() != pixel_count) {
+    return result;
+  }
+  const auto channels = source->format().channels;
+  // One box-averaged sample per 2x2 block, the same light averaging as
+  // Photoshop's cache-level-2 histograms. Averaging fills channel values absent
+  // from quantized sources (no comb gaps); the kernel must stay small because a
+  // larger one collapses noisy channels into a few towering bins that
+  // misrepresent the distribution even under the clipped display.
+  for (std::int32_t block_y = 0; block_y < height; block_y += 2) {
+    const auto block_bottom = std::min<std::int32_t>(height, block_y + 2);
+    for (std::int32_t block_x = 0; block_x < width; block_x += 2) {
+      const auto block_right = std::min<std::int32_t>(width, block_x + 2);
+      std::uint32_t sum_red = 0;
+      std::uint32_t sum_green = 0;
+      std::uint32_t sum_blue = 0;
+      std::uint32_t opaque = 0;
+      for (std::int32_t y = block_y; y < block_bottom; ++y) {
+        for (std::int32_t x = block_x; x < block_right; ++x) {
+          const auto* pixel = source->pixel(x, y);
+          const auto pixel_index =
+              static_cast<std::size_t>(y) * static_cast<std::size_t>(width) + static_cast<std::size_t>(x);
+          if ((!external_alpha.empty() && external_alpha[pixel_index] == 0) ||
+              (external_alpha.empty() && channels >= 4 && pixel[3] == 0)) {
+            continue;
+          }
+          sum_red += pixel[0];
+          sum_green += pixel[1];
+          sum_blue += pixel[2];
+          ++opaque;
+        }
+      }
+      if (opaque == 0) {
+        continue;
+      }
+      const auto half = opaque / 2;
+      ++result.red[static_cast<std::size_t>((sum_red + half) / opaque)];
+      ++result.green[static_cast<std::size_t>((sum_green + half) / opaque)];
+      ++result.blue[static_cast<std::size_t>((sum_blue + half) / opaque)];
+    }
+  }
+  // Photoshop's composite histogram is the sum of the channel counts, not luma.
+  for (std::size_t index = 0; index < result.rgb.size(); ++index) {
+    const auto total = static_cast<std::uint64_t>(result.red[index]) + result.green[index] + result.blue[index];
+    result.rgb[index] =
+        static_cast<std::uint32_t>(std::min<std::uint64_t>(total, std::numeric_limits<std::uint32_t>::max()));
+  }
+  return result;
+}
+
+double histogram_display_ceiling(std::uint64_t total_samples, std::uint64_t non_empty_bins) {
+  if (total_samples == 0 || non_empty_bins == 0) {
+    return 0.0;
+  }
+  // Photoshop's Levels dialog (measured September 2026 with synthetic
+  // histograms of known counts): with all 256 bins occupied, bins holding
+  // 1/80, 1/96, 1/128, 1/192 and 1/256 of the samples drew 80, 67, 50, 34 and
+  // 25 px of a 100 px plot and everything from 1/64 up filled it; with only 12
+  // occupied bins the same shares drew about 21 times shorter, and with 122
+  // occupied bins (20 of them holding a single sample) the ceiling landed at
+  // 4 * total / 122 to within 1%. Linear with this ceiling, not sqrt or log:
+  // those kept the shape of a spike-free histogram but crushed every midtone
+  // peak once a clipping spike set the scale (issue 32).
+  return static_cast<double>(kHistogramCeilingMeanMultiple) * static_cast<double>(total_samples) /
+         static_cast<double>(non_empty_bins);
+}
+
+QColor channel_histogram_color(CurvesChannel channel) {
+  return histogram_color(channel);
+}
+
+void set_channel_tab_swatches(QTabBar& tabs) {
+  // Channel hues are content (the channel itself), like the histogram bars; the frame
+  // uses the theme's field border.
+  constexpr int kSwatch = 10;
+  const auto ratio = std::max(1.0, tabs.devicePixelRatioF());
+  tabs.setIconSize(QSize(kSwatch, kSwatch));
+  for (int index = 1; index < std::min(tabs.count(), 4); ++index) {
+    QPixmap pixmap(QSize(kSwatch, kSwatch) * ratio);
+    pixmap.setDevicePixelRatio(ratio);
+    pixmap.fill(Qt::transparent);
+    QPainter painter(&pixmap);
+    painter.setRenderHint(QPainter::Antialiasing, true);
+    painter.setPen(QPen(theme().field_inset_border, 1.0));
+    painter.setBrush(channel_color(channel_from_index(index), true));
+    painter.drawRoundedRect(QRectF(0.5, 0.5, kSwatch - 1.0, kSwatch - 1.0), 2.0, 2.0);
+    painter.end();
+    tabs.setTabIcon(index, QIcon(pixmap));
+  }
+}
+
+double histogram_display_fraction(std::uint64_t count, double ceiling) {
+  if (!(ceiling > 0.0) || count == 0) {
+    return 0.0;
+  }
+  return std::min(1.0, static_cast<double>(count) / ceiling);
+}
+
+class CurvesGraphWidget final : public QWidget {
+public:
+  explicit CurvesGraphWidget(QWidget* parent = nullptr) : QWidget(parent) {
+    setObjectName(QStringLiteral("curvesGraph"));
+    // Short enough that the Input/Output column beside it sets the dialog's minimum height
+    // (#592 follow-up 3); the graph stays square inside whatever it is given.
+    setMinimumSize(300, 160);
+    setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Expanding);
+    setFocusPolicy(Qt::StrongFocus);
+    setMouseTracking(true);
+    setAccessibleName(QObject::tr("Curves graph"));
+    setToolTip(QObject::tr("Click to add a point. Drag points or use the arrow keys to adjust them."));
+    set_adjustment(CurvesAdjustment{});
+  }
+
+  void set_adjustment(const CurvesAdjustment& adjustment) {
+    adjustment_ = normalized_adjustment(adjustment);
+    for (const auto channel : kCurvesChannels) {
+      curve_luts_[static_cast<std::size_t>(channel_index(channel))] =
+          build_curve_lut(curve_points_for_channel(adjustment_, channel));
+    }
+    clamp_selected_point();
+    update();
+  }
+
+  void set_histograms(CurvesHistograms histograms) {
+    histograms_ = std::move(histograms);
+    update();
+  }
+
+  void set_active_channel(CurvesChannel channel) {
+    active_channel_ = channel;
+    clamp_selected_point();
+    update();
+  }
+
+  void set_selected_point(int index) {
+    selected_point_ = index;
+    clamp_selected_point();
+    update();
+  }
+
+  void set_sample_input(std::optional<int> input) {
+    sample_input_ = input.has_value() ? std::optional<int>{std::clamp(*input, 0, 255)} : std::nullopt;
+    update();
+  }
+
+  [[nodiscard]] QSize sizeHint() const override {
+    return QSize(360, 360);
+  }
+
+  std::function<void(int)> point_selected;
+  std::function<int(int, int)> point_add_requested;
+  std::function<void(int, int, int, bool)> point_change_requested;
+  std::function<void(int)> point_delete_requested;
+  std::function<void(int)> point_cycle_requested;
+
+protected:
+  void paintEvent(QPaintEvent* event) override {
+    Q_UNUSED(event);
+    QPainter painter(this);
+    painter.setRenderHint(QPainter::Antialiasing, true);
+    painter.fillRect(rect(), theme().curves_graph_bg);
+
+    const auto graph = graph_rect();
+    painter.fillRect(graph, theme().curves_graph_well_bg);
+    draw_histogram(painter, graph);
+    draw_grid(painter, graph);
+
+    for (const auto channel : kCurvesChannels) {
+      if (channel != active_channel_) {
+        draw_curve(painter, graph, channel, false);
+      }
+    }
+    draw_curve(painter, graph, active_channel_, true);
+    draw_sample_marker(painter, graph);
+    draw_points(painter, graph);
+
+    painter.setRenderHint(QPainter::Antialiasing, false);
+    painter.setPen(QPen(hasFocus() ? theme().curves_graph_focus : theme().curves_graph_border, hasFocus() ? 2 : 1));
+    painter.setBrush(Qt::NoBrush);
+    painter.drawRect(graph.adjusted(0, 0, -1, -1));
+
+    painter.setPen(theme().curves_graph_label_text);
+    // The axis labels' boxes, and the margins graph_rect() leaves for them, grow with the
+    // interface text size (GitHub issue 495).
+    const int label_height = ui_text_length(18);
+    const int side_label_width = ui_text_length(24);
+    painter.drawText(QRect(graph.left(), graph.bottom() + 5, 40, label_height), Qt::AlignLeft | Qt::AlignTop,
+                     QStringLiteral("0"));
+    painter.drawText(QRect(graph.right() - 40, graph.bottom() + 5, 40, label_height),
+                     Qt::AlignRight | Qt::AlignTop, QStringLiteral("255"));
+    painter.drawText(QRect(graph.left() - side_label_width - 3, graph.top() - 2, side_label_width, label_height),
+                     Qt::AlignRight | Qt::AlignTop, QStringLiteral("255"));
+  }
+
+  void focusInEvent(QFocusEvent* event) override {
+    QWidget::focusInEvent(event);
+    update();
+  }
+
+  void focusOutEvent(QFocusEvent* event) override {
+    QWidget::focusOutEvent(event);
+    update();
+  }
+
+  void mousePressEvent(QMouseEvent* event) override {
+    if (event->button() != Qt::LeftButton || !graph_rect().contains(event->position().toPoint())) {
+      QWidget::mousePressEvent(event);
+      return;
+    }
+    setFocus(Qt::MouseFocusReason);
+    const auto position = event->position();
+    auto index = hit_point(position);
+    if (index < 0 && point_add_requested) {
+      index = point_add_requested(input_for_x(position.x()), output_for_y(position.y()));
+    }
+    if (index >= 0) {
+      active_drag_point_ = index;
+      selected_point_ = index;
+      if (point_selected) {
+        point_selected(index);
+      }
+      update();
+      event->accept();
+      return;
+    }
+    QWidget::mousePressEvent(event);
+  }
+
+  void mouseMoveEvent(QMouseEvent* event) override {
+    if (active_drag_point_ >= 0 && (event->buttons() & Qt::LeftButton) != 0 && point_change_requested) {
+      point_change_requested(active_drag_point_, input_for_x(event->position().x()), output_for_y(event->position().y()),
+                             false);
+      event->accept();
+      return;
+    }
+    QWidget::mouseMoveEvent(event);
+  }
+
+  void mouseReleaseEvent(QMouseEvent* event) override {
+    if (event->button() == Qt::LeftButton && active_drag_point_ >= 0) {
+      const auto index = active_drag_point_;
+      active_drag_point_ = -1;
+      if (point_change_requested) {
+        point_change_requested(index, input_for_x(event->position().x()), output_for_y(event->position().y()), true);
+      }
+      event->accept();
+      return;
+    }
+    QWidget::mouseReleaseEvent(event);
+  }
+
+  void keyPressEvent(QKeyEvent* event) override {
+    if ((event->key() == Qt::Key_PageUp || event->key() == Qt::Key_PageDown) && point_cycle_requested) {
+      point_cycle_requested(event->key() == Qt::Key_PageUp ? -1 : 1);
+      event->accept();
+      return;
+    }
+    if (event->key() == Qt::Key_Delete || event->key() == Qt::Key_Backspace) {
+      if (point_delete_requested) {
+        point_delete_requested(selected_point_);
+      }
+      event->accept();
+      return;
+    }
+
+    int input_delta = 0;
+    int output_delta = 0;
+    const auto step = (event->modifiers() & Qt::ShiftModifier) != 0 ? 10 : 1;
+    switch (event->key()) {
+      case Qt::Key_Left:
+        input_delta = -step;
+        break;
+      case Qt::Key_Right:
+        input_delta = step;
+        break;
+      case Qt::Key_Up:
+        output_delta = step;
+        break;
+      case Qt::Key_Down:
+        output_delta = -step;
+        break;
+      default:
+        QWidget::keyPressEvent(event);
+        return;
+    }
+
+    const auto& points = curve_points_for_channel(adjustment_, active_channel_);
+    if (selected_point_ >= 0 && selected_point_ < static_cast<int>(points.size()) && point_change_requested) {
+      const auto& point = points[static_cast<std::size_t>(selected_point_)];
+      point_change_requested(selected_point_, point.input + input_delta, point.output + output_delta, true);
+    }
+    event->accept();
+  }
+
+private:
+  [[nodiscard]] QRect graph_rect() const {
+    const auto available = rect().adjusted(ui_text_length(31), 10, -10, -ui_text_length(28));
+    const auto side = std::max(1, std::min(available.width(), available.height()));
+    const auto left = available.left() + (available.width() - side) / 2;
+    const auto top = available.top() + (available.height() - side) / 2;
+    return QRect(left, top, side, side);
+  }
+
+  [[nodiscard]] double x_for_input(int input) const {
+    const auto graph = graph_rect();
+    return static_cast<double>(graph.left()) +
+           static_cast<double>(std::clamp(input, 0, 255)) * static_cast<double>(graph.width() - 1) / 255.0;
+  }
+
+  [[nodiscard]] double y_for_output(int output) const {
+    const auto graph = graph_rect();
+    return static_cast<double>(graph.bottom()) -
+           static_cast<double>(std::clamp(output, 0, 255)) * static_cast<double>(graph.height() - 1) / 255.0;
+  }
+
+  [[nodiscard]] int input_for_x(double x) const {
+    const auto graph = graph_rect();
+    const auto normalized =
+        std::clamp((x - static_cast<double>(graph.left())) / static_cast<double>(std::max(1, graph.width() - 1)),
+                   0.0, 1.0);
+    return std::clamp(static_cast<int>(std::lround(normalized * 255.0)), 0, 255);
+  }
+
+  [[nodiscard]] int output_for_y(double y) const {
+    const auto graph = graph_rect();
+    const auto normalized =
+        std::clamp((static_cast<double>(graph.bottom()) - y) /
+                       static_cast<double>(std::max(1, graph.height() - 1)),
+                   0.0, 1.0);
+    return std::clamp(static_cast<int>(std::lround(normalized * 255.0)), 0, 255);
+  }
+
+  [[nodiscard]] int hit_point(QPointF position) const {
+    const auto& points = curve_points_for_channel(adjustment_, active_channel_);
+    int nearest = -1;
+    auto nearest_distance = std::numeric_limits<double>::max();
+    for (int index = 0; index < static_cast<int>(points.size()); ++index) {
+      const auto& point = points[static_cast<std::size_t>(index)];
+      const auto dx = position.x() - x_for_input(point.input);
+      const auto dy = position.y() - y_for_output(point.output);
+      const auto distance = dx * dx + dy * dy;
+      if (distance <= 100.0 && distance < nearest_distance) {
+        nearest = index;
+        nearest_distance = distance;
+      }
+    }
+    return nearest;
+  }
+
+  void draw_histogram(QPainter& painter, const QRect& graph) const {
+    const auto& histogram = histogram_for_channel(histograms_, active_channel_);
+    std::uint64_t total = 0;
+    std::uint64_t non_empty = 0;
+    for (const auto count : histogram) {
+      total += count;
+      non_empty += count > 0 ? 1 : 0;
+    }
+    const auto ceiling = histogram_display_ceiling(total, non_empty);
+    if (!(ceiling > 0.0)) {
+      return;
+    }
+    // Crisp unantialiased columns inset one pixel from the frame: a clipping
+    // spike in an endpoint bin is only one or two columns wide, and it must
+    // not soften into invisibility or vanish under the border stroke.
+    painter.setRenderHint(QPainter::Antialiasing, false);
+    const auto plot = graph.adjusted(1, 0, -1, 0);
+    const auto width = std::max(1, plot.width());
+    const auto color = histogram_color(active_channel_);
+    for (int x = 0; x < width; ++x) {
+      const auto first_bin = std::clamp((x * 256) / width, 0, 255);
+      const auto last_bin = std::clamp(((x + 1) * 256) / width, first_bin + 1, 256);
+      std::uint32_t count = 0;
+      for (int bin = first_bin; bin < last_bin; ++bin) {
+        count = std::max(count, histogram[static_cast<std::size_t>(bin)]);
+      }
+      if (count == 0) {
+        continue;
+      }
+      // Linear in the count with a ceiling of four times the mean non-empty
+      // bin, the way Photoshop's Curves/Levels dialogs draw it: a clipping
+      // spike tops out instead of setting the scale, so the rest of the
+      // distribution stays readable (the Histogram panel is linear to the
+      // tallest bin).
+      const auto scaled = histogram_display_fraction(count, ceiling);
+      const auto bar_height =
+          std::max(1, static_cast<int>(std::lround(scaled * static_cast<double>(graph.height() - 1))));
+      painter.fillRect(QRect(plot.left() + x, graph.bottom() - bar_height + 1, 1, bar_height), color);
+    }
+    painter.setRenderHint(QPainter::Antialiasing, true);
+  }
+
+  void draw_grid(QPainter& painter, const QRect& graph) const {
+    painter.setRenderHint(QPainter::Antialiasing, false);
+    for (int division = 1; division < 4; ++division) {
+      const auto x = graph.left() + division * (graph.width() - 1) / 4;
+      const auto y = graph.top() + division * (graph.height() - 1) / 4;
+      const auto alpha = division == 2 ? 86 : 50;
+      auto grid = theme().curves_graph_grid;
+      grid.setAlpha(alpha);
+      painter.setPen(QPen(grid, 1));
+      painter.drawLine(x, graph.top(), x, graph.bottom());
+      painter.drawLine(graph.left(), y, graph.right(), y);
+    }
+    painter.setPen(QPen(theme().curves_graph_diagonal, 1, Qt::DashLine));
+    painter.drawLine(graph.bottomLeft(), graph.topRight());
+    painter.setRenderHint(QPainter::Antialiasing, true);
+  }
+
+  void draw_curve(QPainter& painter, const QRect& graph, CurvesChannel channel, bool active) const {
+    const auto& lut = curve_luts_[static_cast<std::size_t>(channel_index(channel))];
+    QPainterPath path;
+    path.moveTo(graph.left(), y_for_output(lut[0]));
+    for (int input = 1; input < 256; ++input) {
+      path.lineTo(x_for_input(input), y_for_output(lut[static_cast<std::size_t>(input)]));
+    }
+    painter.setBrush(Qt::NoBrush);
+    if (active) {
+      painter.setPen(QPen(theme().curves_graph_curve_halo, 4.0, Qt::SolidLine, Qt::RoundCap, Qt::RoundJoin));
+      painter.drawPath(path);
+    }
+    painter.setPen(QPen(channel_color(channel, active), active ? 2.2 : 1.2, Qt::SolidLine, Qt::RoundCap,
+                        Qt::RoundJoin));
+    painter.drawPath(path);
+  }
+
+  void draw_points(QPainter& painter, const QRect& graph) const {
+    Q_UNUSED(graph);
+    const auto& points = curve_points_for_channel(adjustment_, active_channel_);
+    for (int index = 0; index < static_cast<int>(points.size()); ++index) {
+      const auto& point = points[static_cast<std::size_t>(index)];
+      const QPointF center(x_for_input(point.input), y_for_output(point.output));
+      const auto selected = index == selected_point_;
+      painter.setPen(
+          QPen(selected ? theme().curves_graph_focus : channel_color(active_channel_, true), selected ? 2.2 : 1.4));
+      painter.setBrush(selected ? theme().curves_graph_point_selected_bg : theme().curves_graph_point_bg);
+      painter.drawEllipse(center, selected ? 6.0 : 4.3, selected ? 6.0 : 4.3);
+    }
+  }
+
+  void draw_sample_marker(QPainter& painter, const QRect& graph) const {
+    if (!sample_input_.has_value()) {
+      return;
+    }
+    const auto x = x_for_input(*sample_input_);
+    painter.setRenderHint(QPainter::Antialiasing, false);
+    painter.setPen(QPen(theme().curves_graph_sample_marker, 1, Qt::DashLine));
+    painter.drawLine(QPointF(x, graph.top()), QPointF(x, graph.bottom()));
+    painter.setRenderHint(QPainter::Antialiasing, true);
+  }
+
+  void clamp_selected_point() {
+    const auto& points = curve_points_for_channel(adjustment_, active_channel_);
+    selected_point_ = points.empty() ? -1 : std::clamp(selected_point_, 0, static_cast<int>(points.size()) - 1);
+  }
+
+  CurvesAdjustment adjustment_{};
+  CurvesHistograms histograms_{};
+  CurvesChannel active_channel_{CurvesChannel::Rgb};
+  std::array<std::array<std::uint8_t, 256>, 4> curve_luts_{};
+  int selected_point_{0};
+  int active_drag_point_{-1};
+  std::optional<int> sample_input_{};
+};
+
+namespace {
+
+// The fields and buttons of the column beside the graph share one width (labels keep theirs).
+void equalize_column_widths(QVBoxLayout& column) {
+  int width = 0;
+  for (int index = 0; index < column.count(); ++index) {
+    if (auto* widget = column.itemAt(index)->widget(); widget != nullptr && qobject_cast<QLabel*>(widget) == nullptr) {
+      width = std::max(width, widget->sizeHint().width());
+    }
+  }
+  for (int index = 0; index < column.count(); ++index) {
+    if (auto* widget = column.itemAt(index)->widget(); widget != nullptr && qobject_cast<QLabel*>(widget) == nullptr) {
+      widget->setFixedWidth(width);
+    }
+  }
+}
+
+}  // namespace
+
+CurvesEditorWidget::CurvesEditorWidget(QWidget* parent) : QWidget(parent) {
+  setObjectName(QStringLiteral("curvesEditor"));
+  setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Expanding);
+
+  auto* root = new QVBoxLayout(this);
+  root->setContentsMargins(0, 0, 0, 0);
+  root->setSpacing(7);
+
+  channel_tabs_ = new QTabBar(this);
+  channel_tabs_->setObjectName(QStringLiteral("curvesChannelTabs"));
+  channel_tabs_->setDrawBase(false);
+  channel_tabs_->setExpanding(true);
+  channel_tabs_->addTab(QObject::tr("RGB"));
+  channel_tabs_->addTab(QObject::tr("Red"));
+  channel_tabs_->addTab(QObject::tr("Green"));
+  channel_tabs_->addTab(QObject::tr("Blue"));
+  set_channel_tab_swatches(*channel_tabs_);
+  root->addWidget(channel_tabs_);
+
+  // The graph with a column on its right (#592): Input and Output, each label above its
+  // field, then after a gap Auto, Reset and whatever the host adds (Before).
+  auto* body = new QHBoxLayout();
+  body->setSpacing(10);
+  graph_ = new CurvesGraphWidget(this);
+  body->addWidget(graph_, 1);
+  column_ = new QVBoxLayout();
+  column_->setSpacing(4);
+  auto* input_label = new QLabel(QObject::tr("Input:"), this);
+  column_->addWidget(input_label);
+  input_spin_ = new QSpinBox(this);
+  input_spin_->setObjectName(QStringLiteral("curvesInputSpin"));
+  input_spin_->setRange(0, 255);
+  configure_dialog_spinbox(input_spin_, 72);
+  input_label->setBuddy(input_spin_);
+  column_->addWidget(input_spin_);
+  column_->addSpacing(6);
+  auto* output_label = new QLabel(QObject::tr("Output:"), this);
+  column_->addWidget(output_label);
+  output_spin_ = new QSpinBox(this);
+  output_spin_->setObjectName(QStringLiteral("curvesOutputSpin"));
+  output_spin_->setRange(0, 255);
+  configure_dialog_spinbox(output_spin_, 72);
+  output_label->setBuddy(output_spin_);
+  column_->addWidget(output_spin_);
+  column_->addSpacing(18);
+  auto_button_ = new QPushButton(QObject::tr("Auto"), this);
+  auto_button_->setObjectName(QStringLiteral("curvesAutoButton"));
+  auto_button_->setToolTip(QObject::tr("Set the active channel from its histogram"));
+  column_->addWidget(auto_button_);
+  reset_button_ = new QPushButton(QObject::tr("Reset"), this);
+  reset_button_->setObjectName(QStringLiteral("curvesResetButton"));
+  reset_button_->setToolTip(QObject::tr("Reset all channels"));
+  column_->addWidget(reset_button_);
+  column_->addStretch(1);
+  equalize_column_widths(*column_);
+  body->addLayout(column_);
+  root->addLayout(body, 1);
+
+  graph_->point_selected = [this](int index) { select_point(index); };
+  graph_->point_add_requested = [this](int input, int output) { return add_point(input, output); };
+  graph_->point_change_requested =
+      [this](int index, int input, int output, bool finished) { change_point(index, input, output, finished); };
+  graph_->point_delete_requested = [this](int index) { delete_point(index); };
+  graph_->point_cycle_requested = [this](int direction) { cycle_point(direction); };
+
+  QObject::connect(channel_tabs_, &QTabBar::currentChanged, this, [this](int index) {
+    if (updating_controls_) {
+      return;
+    }
+    set_active_channel(channel_from_index(index));
+    if (active_channel_changed) {
+      active_channel_changed(active_channel_);
+    }
+  });
+  QObject::connect(input_spin_, qOverload<int>(&QSpinBox::valueChanged), this, [this](int value) {
+    if (updating_controls_) {
+      return;
+    }
+    change_point(selected_point_, value, output_spin_->value(), false);
+  });
+  QObject::connect(output_spin_, qOverload<int>(&QSpinBox::valueChanged), this, [this](int value) {
+    if (updating_controls_) {
+      return;
+    }
+    change_point(selected_point_, input_spin_->value(), value, false);
+  });
+  QObject::connect(input_spin_, &QSpinBox::editingFinished, this,
+                   [this] { propose_adjustment(adjustment_, true); });
+  QObject::connect(output_spin_, &QSpinBox::editingFinished, this,
+                   [this] { propose_adjustment(adjustment_, true); });
+  QObject::connect(reset_button_, &QPushButton::clicked, this, [this] { reset_curves(); });
+  QObject::connect(auto_button_, &QPushButton::clicked, this, [this] { auto_curve(); });
+
+  normalize_and_store(CurvesAdjustment{});
+  sync_children();
+}
+
+void CurvesEditorWidget::set_adjustment(const CurvesAdjustment& adjustment) {
+  normalize_and_store(adjustment);
+  sync_children();
+}
+
+void CurvesEditorWidget::set_histograms(CurvesHistograms histograms) {
+  histograms_ = std::move(histograms);
+  graph_->set_histograms(histograms_);
+  const auto& histogram = active_histogram();
+  auto_button_->setEnabled(
+      std::any_of(histogram.begin(), histogram.end(), [](std::uint32_t count) { return count != 0; }));
+}
+
+void CurvesEditorWidget::set_active_channel(CurvesChannel channel) {
+  int previous_input = 0;
+  const auto& previous_points = curve_points_for_channel(adjustment_, active_channel_);
+  if (selected_point_ >= 0 && selected_point_ < static_cast<int>(previous_points.size())) {
+    previous_input = previous_points[static_cast<std::size_t>(selected_point_)].input;
+  }
+  active_channel_ = channel;
+  const auto& points = curve_points_for_channel(adjustment_, active_channel_);
+  if (points.empty()) {
+    selected_point_ = -1;
+  } else {
+    selected_point_ = 0;
+    auto nearest_distance = std::numeric_limits<int>::max();
+    for (int index = 0; index < static_cast<int>(points.size()); ++index) {
+      const auto distance = std::abs(points[static_cast<std::size_t>(index)].input - previous_input);
+      if (distance < nearest_distance) {
+        selected_point_ = index;
+        nearest_distance = distance;
+      }
+    }
+  }
+  sync_children();
+}
+
+void CurvesEditorWidget::set_selected_point(int index) {
+  select_point(index);
+}
+
+bool CurvesEditorWidget::begin_tonal_sample(int input) {
+  if (tonal_sample_start_.has_value()) {
+    cancel_tonal_sample();
+  }
+  input = std::clamp(input, 0, 255);
+  tonal_sample_start_ = adjustment_;
+  tonal_sample_input_ = input;
+  tonal_sample_output_ = build_curve_lut(curve_points_for_channel(adjustment_, active_channel_))
+                             [static_cast<std::size_t>(input)];
+  tonal_sample_point_ = add_point(input, tonal_sample_output_);
+  if (tonal_sample_point_ < 0) {
+    tonal_sample_start_.reset();
+    graph_->set_sample_input(std::nullopt);
+    return false;
+  }
+  graph_->set_sample_input(input);
+  return true;
+}
+
+void CurvesEditorWidget::update_tonal_sample(int output_delta, bool finished) {
+  if (!tonal_sample_start_.has_value() || tonal_sample_point_ < 0) {
+    return;
+  }
+  change_point(tonal_sample_point_, tonal_sample_input_, tonal_sample_output_ + output_delta, finished);
+  if (finished) {
+    tonal_sample_start_.reset();
+    tonal_sample_point_ = -1;
+    graph_->set_sample_input(std::nullopt);
+  }
+}
+
+void CurvesEditorWidget::cancel_tonal_sample() {
+  if (!tonal_sample_start_.has_value()) {
+    graph_->set_sample_input(std::nullopt);
+    return;
+  }
+  auto original = std::move(*tonal_sample_start_);
+  tonal_sample_start_.reset();
+  tonal_sample_point_ = -1;
+  graph_->set_sample_input(std::nullopt);
+  propose_adjustment(std::move(original), true);
+}
+
+void CurvesEditorWidget::apply_external_adjustment(const CurvesAdjustment& adjustment, bool finished) {
+  tonal_sample_start_.reset();
+  tonal_sample_point_ = -1;
+  graph_->set_sample_input(std::nullopt);
+  propose_adjustment(adjustment, finished);
+}
+
+const CurvesAdjustment& CurvesEditorWidget::adjustment() const noexcept {
+  return adjustment_;
+}
+
+CurvesChannel CurvesEditorWidget::active_channel() const noexcept {
+  return active_channel_;
+}
+
+int CurvesEditorWidget::selected_point() const noexcept {
+  return selected_point_;
+}
+
+QSize CurvesEditorWidget::sizeHint() const {
+  // The graph (about 330 square at its hint) plus the Input/Output column (#592).
+  return QSize(440, 360);
+}
+
+void CurvesEditorWidget::add_column_button(QPushButton* button) {
+  button->setParent(this);
+  column_->insertWidget(column_->count() - 1, button);
+  equalize_column_widths(*column_);
+}
+
+void CurvesEditorWidget::normalize_and_store(const CurvesAdjustment& adjustment) {
+  adjustment_ = normalized_adjustment(adjustment);
+  const auto& points = curve_points_for_channel(adjustment_, active_channel_);
+  selected_point_ = points.empty() ? -1 : std::clamp(selected_point_, 0, static_cast<int>(points.size()) - 1);
+}
+
+void CurvesEditorWidget::sync_children() {
+  updating_controls_ = true;
+  {
+    const QSignalBlocker blocker(channel_tabs_);
+    channel_tabs_->setCurrentIndex(channel_index(active_channel_));
+  }
+  graph_->set_adjustment(adjustment_);
+  graph_->set_histograms(histograms_);
+  graph_->set_active_channel(active_channel_);
+  graph_->set_selected_point(selected_point_);
+  sync_numeric_controls();
+  const auto& histogram = active_histogram();
+  auto_button_->setEnabled(
+      std::any_of(histogram.begin(), histogram.end(), [](std::uint32_t count) { return count != 0; }));
+  updating_controls_ = false;
+}
+
+void CurvesEditorWidget::sync_numeric_controls() {
+  const auto& points = curve_points_for_channel(adjustment_, active_channel_);
+  const auto valid = selected_point_ >= 0 && selected_point_ < static_cast<int>(points.size());
+  const QSignalBlocker input_blocker(input_spin_);
+  const QSignalBlocker output_blocker(output_spin_);
+  input_spin_->setEnabled(valid);
+  output_spin_->setEnabled(valid);
+  if (!valid) {
+    input_spin_->setRange(0, 255);
+    input_spin_->setValue(0);
+    output_spin_->setValue(0);
+    return;
+  }
+  const auto& point = points[static_cast<std::size_t>(selected_point_)];
+  const auto minimum_input =
+      selected_point_ > 0 ? points[static_cast<std::size_t>(selected_point_ - 1)].input + 1 : 0;
+  const auto maximum_input = selected_point_ + 1 < static_cast<int>(points.size())
+                                 ? points[static_cast<std::size_t>(selected_point_ + 1)].input - 1
+                                 : 255;
+  input_spin_->setRange(minimum_input, maximum_input);
+  input_spin_->setValue(point.input);
+  output_spin_->setRange(0, 255);
+  output_spin_->setValue(point.output);
+}
+
+void CurvesEditorWidget::propose_adjustment(CurvesAdjustment adjustment, bool gesture_finished) {
+  normalize_and_store(adjustment);
+  sync_children();
+  if (adjustment_changed) {
+    adjustment_changed(adjustment_, gesture_finished);
+  }
+}
+
+int CurvesEditorWidget::add_point(int input, int output) {
+  auto points = curve_points_for_channel(adjustment_, active_channel_);
+  input = std::clamp(input, 0, 255);
+  output = std::clamp(output, 0, 255);
+  for (int index = 0; index < static_cast<int>(points.size()); ++index) {
+    if (points[static_cast<std::size_t>(index)].input == input) {
+      select_point(index);
+      return index;
+    }
+  }
+  if (points.size() >= kMaximumCurvePoints) {
+    return -1;
+  }
+  const auto insertion = std::lower_bound(points.begin(), points.end(), input,
+                                          [](const CurveControlPoint& point, int value) { return point.input < value; });
+  const auto index = static_cast<int>(std::distance(points.begin(), insertion));
+  points.insert(insertion, CurveControlPoint{input, output});
+  auto proposed = adjustment_;
+  set_curve_points_for_channel(proposed, active_channel_, std::move(points));
+  selected_point_ = index;
+  propose_adjustment(std::move(proposed), false);
+  return selected_point_;
+}
+
+void CurvesEditorWidget::select_point(int index) {
+  const auto& points = curve_points_for_channel(adjustment_, active_channel_);
+  selected_point_ = points.empty() ? -1 : std::clamp(index, 0, static_cast<int>(points.size()) - 1);
+  graph_->set_selected_point(selected_point_);
+  updating_controls_ = true;
+  sync_numeric_controls();
+  updating_controls_ = false;
+}
+
+void CurvesEditorWidget::change_point(int index, int input, int output, bool gesture_finished) {
+  auto points = curve_points_for_channel(adjustment_, active_channel_);
+  if (index < 0 || index >= static_cast<int>(points.size())) {
+    return;
+  }
+  output = std::clamp(output, 0, 255);
+  const auto minimum_input = index > 0 ? points[static_cast<std::size_t>(index - 1)].input + 1 : 0;
+  const auto maximum_input = index + 1 < static_cast<int>(points.size())
+                                 ? points[static_cast<std::size_t>(index + 1)].input - 1
+                                 : 255;
+  input = std::clamp(input, minimum_input, maximum_input);
+  points[static_cast<std::size_t>(index)] = CurveControlPoint{input, output};
+  auto proposed = adjustment_;
+  set_curve_points_for_channel(proposed, active_channel_, std::move(points));
+  selected_point_ = index;
+  propose_adjustment(std::move(proposed), gesture_finished);
+}
+
+void CurvesEditorWidget::delete_point(int index) {
+  auto points = curve_points_for_channel(adjustment_, active_channel_);
+  if (index <= 0 || index + 1 >= static_cast<int>(points.size())) {
+    return;
+  }
+  points.erase(points.begin() + index);
+  auto proposed = adjustment_;
+  set_curve_points_for_channel(proposed, active_channel_, std::move(points));
+  selected_point_ = std::max(0, index - 1);
+  propose_adjustment(std::move(proposed), true);
+}
+
+void CurvesEditorWidget::cycle_point(int direction) {
+  const auto& points = curve_points_for_channel(adjustment_, active_channel_);
+  if (points.empty()) {
+    return;
+  }
+  const auto count = static_cast<int>(points.size());
+  selected_point_ = (selected_point_ + (direction < 0 ? -1 : 1) + count) % count;
+  select_point(selected_point_);
+}
+
+void CurvesEditorWidget::reset_curves() {
+  CurvesAdjustment reset;
+  for (const auto channel : kCurvesChannels) {
+    set_curve_points_for_channel(reset, channel, identity_curve_points());
+  }
+  selected_point_ = 0;
+  propose_adjustment(std::move(reset), true);
+}
+
+void CurvesEditorWidget::auto_curve() {
+  const auto& histogram = active_histogram();
+  const auto total = std::accumulate(histogram.begin(), histogram.end(), std::uint64_t{0});
+  if (total == 0) {
+    return;
+  }
+  const auto threshold = std::max<std::uint64_t>(1, total / 1000U);
+  std::uint64_t cumulative = 0;
+  int black = 0;
+  for (; black < 255; ++black) {
+    cumulative += histogram[static_cast<std::size_t>(black)];
+    if (cumulative > threshold) {
+      break;
+    }
+  }
+  cumulative = 0;
+  int white = 255;
+  for (; white > black; --white) {
+    cumulative += histogram[static_cast<std::size_t>(white)];
+    if (cumulative > threshold) {
+      break;
+    }
+  }
+  if (white <= black) {
+    return;
+  }
+
+  CurveControlPoints points{{black, 0}, {white, 255}};
+  auto proposed = adjustment_;
+  set_curve_points_for_channel(proposed, active_channel_, std::move(points));
+  selected_point_ = 0;
+  propose_adjustment(std::move(proposed), true);
+}
+
+const std::array<std::uint32_t, 256>& CurvesEditorWidget::active_histogram() const {
+  return histogram_for_channel(histograms_, active_channel_);
+}
+
+}  // namespace patchy::ui

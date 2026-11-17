@@ -1,0 +1,212 @@
+# Blend modes
+
+Everything a new blend mode touches, and the calibrated rounding rules. `BlendMode` (core/layer.hpp) is append-only: the enum rides combo item data, casts, and file maps keyed on the existing order, so only append (see the universal invariants in `AGENTS.md`).
+
+Related documents:
+
+- [blend-modes-groups.md](blend-modes-groups.md): group compositing (Pass Through fades, isolation, styled groups, channel restrictions) and Knockout.
+- [blend-modes-cmyk.md](blend-modes-cmyk.md): imported 8-bit CMYK stacks composited on their inks, the RGB-renderer fallbacks and the untagged working profile.
+
+## Adding a mode: the full checklist
+
+Adding a blend mode means updating ALL of:
+
+- `blend_math.cpp`: the 8-bit pixel math (including `composite_special_fill_rgb` when the mode is one of Photoshop's special-Fill modes).
+- `blend_math_deep.cpp`: the float math for 16/32-bit documents (`blend_rgb_deep`, `composite_special_fill_rgb_deep`). Its switches have `default:` arms, so `-Wswitch` will not flag a missing mode. Decide whether the mode stays unclamped in the Linear (32-bit) domain.
+- `blend_mode_supported_at_depth` (core/document_depth.cpp): whether Photoshop accepts the mode on a layer or group in a 32-bit document. Photoshop 2026 refuses to open a 32-bit PSD using an unsupported mode, so Patchy substitutes Normal on conversion, disables the mode in the Layers panel and Layer Style menus at 32 bits, throws from script `blendMode`, and writes Normal (`writable_layer_blend_mode`); see [high-bit-depth.md](high-bit-depth.md).
+- `blend_mode_ui.cpp`: the name switch AND the `kBlendModes` array. Display order is decoupled from enum order via combo item data; insert the new mode at its Photoshop menu position; a group's first mode is in `blend_mode_starts_group` (separator rows, no item data, #456). `BlendModeMenu::Filter` drops the modes a recipe or Smart Filter step cannot execute.
+- The three PSD maps: the 4-char blend key map (whose read direction also carries the CS-era descriptor charID aliases like 'Drkn') AND the lfx2 stringID map, in BOTH read and write directions (lfx2 blend modes are written as full stringIDs, never 4-char codes; see [ps-compat.md](ps-compat.md)).
+- The Aseprite map in both directions.
+- `script_api.cpp`: `kBlendModeIds` is INDEXED BY THE ENUM ORDINAL, so its size literal has to grow with the enum and the new id appends at the end. Scripts hard-code these strings.
+- `svg_io_internal.hpp`: `blend_mode_css` has a `default:` returning the empty string, which is what raises the SVG rasterization barrier. Nothing to do unless CSS can express the mode.
+- `af_document_io.cpp`: read-only Affinity map (`map_blend_mode`). The wire enum is VERSIONED: a version-0 base table shared by layer `Blnd` and effect `BlnM`, versioned id reuse for later modes, and a version-6 renumbering that matches the JS-facing table; the full record is in [af-format.md](af-format.md#blend-modes). Affinity-only modes remap through `approximate_blend_mode` to the closest existing mode (probe-scored; Average folds half opacity, ContrastNegate stays Normal + notice, and Erase folds into an isolated group + inverse-alpha group mask, see Erase in [af-format.md](af-format.md#erase-blend-mode)), deliberately NEVER new BlendMode values, so every import stays PSD-savable. Leave an entry alone unless a real Affinity file pins it (blend-sweep-v0.afphoto and the af-spike blend_probes renders are the evidence).
+- `recipe_blend_mode_supported` (`filters/filter_registry.hpp`): decide explicitly whether recipes and Smart Filters can execute the mode. It is the one guard; never reintroduce an ordinal range or a second copy.
+- `translations/patchy_<code>.ts` (every language): the display name, after `scripts\update-translations.ps1` adds the entry ([localization.md](localization.md)).
+
+Most of the exhaustive `switch (mode)` maps are caught by `-Wswitch` because they have no `default:`. The ones that are NOT: the `if`-chains in `blend_mode_from_key` and `blend_mode_from_descriptor_enum`, the `kBlendModes` array, and `kBlendModeIds`. Check those four, and `blend_math_deep.cpp`, by hand.
+
+## Calibrated math rules
+
+- Non-separable modes (Hue/Saturation/Color/Luminosity) use the PDF-spec set_lum/set_sat algorithm.
+- Exclusion rounds the s*d/255 product BEFORE doubling; Divide rounds to nearest, and its 0/0 corner follows the destination (d=0 gives 0 even at s=0; psd-tools' `divide.psd`). Both verified against Photoshop and Aseprite.
+- Color Burn and Color Dodge round their quotient to NEAREST half-up (the
+  `(2a+b)/(2b)` form, same as Aseprite's DIV_UN8), and the 0/0 division corner
+  follows the destination: Burn returns 255 at d=255 even when s=0, Dodge
+  returns 0 at d=0 even when s=255 (the special-case ORDER matters: checking
+  s first mismatches). Bit-exact on the full 256x256 Photoshop 2026 captures
+  (flooring is off by one on ~16k entries each); pinned by
+  `blend_math_color_burn_dodge_match_photoshop_captures`. The special-Fill
+  256-scale Burn/Dodge kernels in `composite_special_fill_rgb` are calibrated
+  separately and do not follow this rule.
+- `aseprite_blend_modes_match_aseprite_render` pins the Aseprite-parity set in-suite.
+
+## Vivid/Linear Light, Hard Mix, Darker/Lighter Color
+
+Calibrated against full 256x256 Photoshop 2026 flatten captures (crossed gray
+gradients per mode, COM-scripted; `blend_math_new_modes_match_photoshop_captures`
+pins sampled triples in-suite). The capture tables and the COM script that
+regenerates them live machine-local in `local-test-fixtures/ps-blend-captures/`.
+The pinned kernels, all bit-exact on the capture except where noted:
+
+- **Vivid Light** is NOT the textbook burn(2s)/dodge(2s-255): the burn half
+  doubles the source as round(s*255/128) and rounds its ramp half DOWN; the
+  dodge half doubles as round((s-128)*255/127) and rounds half UP.
+- **Linear Light** is d + 2s - 256 (not the textbook -255), clamped.
+- **Hard Mix** thresholds the TEXTBOOK floor-rounded vivid light at >127, not
+  Photoshop's own vivid-light kernel (both pinned by capture).
+- **Darker/Lighter Color** compare rounded 0.3/0.59/0.11 luma and keep the
+  destination on ties. Gray inputs are exact; on color inputs a handful of
+  exact half-luma boundary pixels (21 of 131072 captured) differ because
+  Photoshop's float evaluation splits halves inconsistently. Deliberate: the
+  integer rule is toolchain-deterministic.
+- These five are absent from Aseprite's format: the .ase writer marks them
+  lossy (Normal), like LinearBurn/PinLight.
+- **Special-Fill for the three light modes** (calibrated against 256x256
+  Photoshop 2026 flatten captures at Fill 1/10/25/40/49/50/51/60/75/90/99
+  percent, bit-exact on every capture; `blend_mode_has_special_fill` covers all
+  eight of Photoshop's special modes). With `fb = lround(fill * 255)`:
+  - **Fill 0 is identity for all three** (Photoshop skips the invisible
+    layer). Only Linear Light needs the explicit guard: its kernel's -1
+    constant would otherwise darken by one.
+  - **Linear Light** is `clamp(d + round((2s - 255) * fb / 255) - 1)`. The -1
+    reveals the fade's true neutral is 127.5, not 128 (at low Fill the s=128
+    row darkens d by exactly 1); at fb=255 the formula collapses to the pinned
+    `d + 2s - 256`.
+  - **Vivid Light** fades each half's 100%-kernel integer term, NOT the source
+    byte: dodge divisor = `255 - round(round((s-128)*255/127) * fb/255)`, burn
+    doubled = `255 - round((255 - round(s*255/128)) * fb/255)`; the ramps keep
+    their 100% rounding (burn half down, dodge half up).
+  - **Hard Mix below 100% Fill is a steep ramp, not a threshold**:
+    `clamp(round((d - A) * 255 / (255 - fb2)))` with anchor
+    `A = round((255-s) * fb2 / 255)` and `fb2 = fb - (fb >= 128)`
+    (equivalently `round(fb * 254/255)`; the nine-fill sweep pinned the step
+    uniquely, fill 49% -> fb2 125 vs fill 50% -> fb2 127).
+  - The alpha split is the shared special-Fill one: the blend result carries
+    the full `coverage x opacity` weight while Fill scales only output-alpha
+    growth and the transparent-backdrop source term. COM probes (vivid at
+    Fill 50 under opacity 50 and under a uniform mask) match
+    `lerp(d, kernel, coverage)` exactly. Note Photoshop quantizes opacity to a
+    byte before weighting (50% = 128/255); Patchy keeps float opacity, a
+    global <=1/255 divergence.
+  - Pinned by `blend_math_light_modes_special_fill_match_photoshop_captures`
+    and the light-mode rows of `compositor_fill_opacity_matches_photoshop_modes`.
+    The capture PNGs (`cal_fill_*.png`) and `calibrate_fill_blends.ps1` live
+    machine-local in `local-test-fixtures/ps-blend-captures/`.
+
+## Dissolve
+
+Dissolve is the one mode that is NOT a colour function. Coverage becomes the
+probability that a pixel is painted at all: the pixel is either fully painted
+through Normal or not painted, so a Dissolve layer never produces a blended
+intermediate value. It therefore cannot live in `blend_rgb`, which takes
+neither alpha nor a coordinate. `blend_rgb` returns the source for Dissolve so
+that the callers with no pixel coordinate (the filter fade loops) degrade to
+Normal.
+
+The math is `dissolve_coverage(x, y, alpha, field)` in `blend_math.cpp`, and the
+compositor applies it. **Patchy's noise field is its own, not a reconstruction of
+Photoshop's**: a compatible rendering, the same standing as Add Noise, Mosaic
+and Plastic Wrap. The threshold is `splitmix64(x | y << 32 ^ salt)` compared on
+an explicit 24-bit integer scale against `lround(alpha * 2^24)`, which keeps the
+uniform mapping exact on every toolchain (the AGENTS.md determinism invariant)
+and makes coverage monotone in alpha, so raising Opacity only adds pixels
+instead of reshuffling the pattern.
+
+- **The field is a pure function of the DOCUMENT coordinate.** That is what lets
+  a dirty-rect repaint, a strip-parallel render and a full flatten all reproduce
+  the same pattern; `image_document_io.cpp` states the clip-equals-full
+  invariant the patch machinery depends on. Never make this stateful, and never
+  key it on a layer-local or buffer-local coordinate.
+- **Each dissolved effect uses its own `DissolveField` salt**, so a dissolved
+  drop shadow and a dissolved outer glow on one layer do not dither onto
+  identical pixels. The layer's own pixels, its vector stroke, and a Dissolve
+  group's merged result all share `DissolveField::Layer`.
+- Applied at: the base pixel pass and the vector stroke pass, both
+  `IsolatedClipGroupTarget` merges (a Dissolve GROUP dithers its merged result,
+  so children still composite against each other at full strength),
+  `composite_adjustment_layer`, and the two effect choke points
+  `composite_effect_color` and `fold_effect_color`. The inline satin fold in the
+  base pass handles it separately, deliberately: routing that fold through
+  `fold_effect_color` would also give it the burn/dodge opacity pre-fold and
+  move pinned satin bytes.
+- **Fill and Opacity are not special-cased.** Dissolve is not one of Photoshop's
+  eight special-Fill modes, so both simply compound into the probability
+  (`coverage x opacity x fill`), which is what the compositor already computes.
+- **Clip coverage stays undithered.** The threshold runs after
+  `record_clip_coverage`, because a clipping run is masked by the base's
+  transparency and not by what the base actually painted (ps-compat.md).
+- Adjustment layers otherwise ignore their blend mode entirely. Dissolve is the
+  one mode honored there, because it is a coverage decision: the adjustment
+  lands whole on a dithered subset of pixels.
+
+Three deliberate divergences from Photoshop:
+
+- **Zoomed out, the canvas shows a wash rather than noise.** `display_mip_cache_`
+  smooth-downscales a full-resolution composite, so below 100% zoom the dither
+  box-filters into uniform partial-opacity grey. Photoshop dissolves at screen
+  resolution. Flatten and every export are correct; this is preview-only, and
+  there is no reduced-resolution composite hook to intercept.
+- **Inside a Smart Object the field is Smart-Object-local**, since the nested
+  document composites in its own coordinate space. Moving the Smart Object on
+  the parent canvas does not re-dither its interior.
+- **Recipes and Smart Filters exclude Dissolve** (`recipe_blend_mode_supported`).
+  Their blend step mixes through integer weights rather than making a coverage
+  decision, so Dissolve there would need its own design; the filter combos hide
+  it instead of offering a mode that gets rejected on save.
+
+Aseprite has no dissolve, so the .ase writer marks it lossy (Normal) like the
+other unrepresentable modes. Pinned by
+`blend_dissolve_coverage_is_deterministic_and_uniform`,
+`compositor_dissolve_is_anchored_to_document_coordinates`,
+`compositor_dissolve_compounds_fill_and_opacity`,
+`compositor_dissolve_dithers_layer_effects` and the UI suite's
+`ui_dissolve_clipped_render_matches_full_render`.
+
+## Paint.NET modes
+
+Reflect, Glow, Negation and Xor (GitHub issue 379) exist for Paint.NET import ([pdn-format.md](pdn-format.md)). They are bit-exact against Paint.NET's own flattened exports (4.21 via pypdn's renders, 5.1.12 via `test-fixtures/pdn/blend-modes.pdn`), with `s` the layer and `d` the backdrop:
+
+- Reflect: 255 when `s` is 255, else min(255, floor(d*d / (255 - s))).
+- Glow: Reflect with the operands swapped (255 when `d` is 255).
+- Negation: 255 - |255 - s - d|.
+- Xor: `s ^ d` per byte; the 16/32-bit kernel rounds to bytes first.
+
+Where they appear and what files keep them:
+
+- No blend menu lists them, so nobody picks a mode a PSD cannot keep. A layer or folder combo (the Layers panel, Layer Style's Blending Options) shows one, after Photoshop's modes, only while a layer it edits uses it (`set_non_photoshop_blend_modes_offered`; in the Layers panel, any selected layer). Switching the layer to another mode removes the row; undo brings it back. Stepping a closed combo (arrows, Home/End, Page Up/Down, the wheel; `BlendModeArrowKeys`) never lands on them, though it leaves one; nor do Next/Previous Blend Mode (`step_layer_blend_mode`, Shift+Plus or Shift+=, Shift+Minus; #476), which wrap (a tool's Mode: [brushes.md](brushes.md)). Layer-effect menus (`BlendModeMenu::Effect`), recipes and Smart Filters (`recipe_blend_mode_supported`), the brush Mode menu and New Layer never show them. Pinned by `ui_pdn_files_open_with_layers_and_by_content` and `ui_blend_mode_combos_step_past_paint_dot_net_modes`.
+- They are 8 and 16-bit only (`blend_mode_supported_at_depth` refuses them at 32 bits).
+- PSD (layer key and lfx2 stringID), layered TIFF and Aseprite cannot store them: see [Layered saves](#layered-saves). Document recovery's PSB snapshots carry Normal.
+- Script ids `reflect`, `glow`, `negation`, `xor` append to `kBlendModeIds`.
+- The Affinity importer keeps its probe-scored remaps (Negation -> Exclusion, Reflect -> Overlay, Glow -> Linear Light): an Affinity file should stay PSD-savable, and no Affinity render pins those modes to Paint.NET's kernels.
+
+Paint.NET's Multiply, Screen and Overlay round where the Photoshop-calibrated kernels floor, and its Color Burn/Dodge floor where they round, so those imports differ by at most one level, apart from Burn's and Dodge's corners ([pdn-format.md](pdn-format.md#blend-calibration)); the kernels stay Photoshop's.
+
+## GIMP modes
+
+Seventeen modes exist for GIMP .xcf import: Grain Extract and Grain Merge (byte kernels in blend_math.cpp), GIMP's HSV, HSL and LCh color-model modes, Luminance, Luma Darken/Lighten Only, and Multiply, Addition, Subtract and Divide in linear light (`core/gimp_blend_modes.cpp`, run per pixel from `blend_rgb` and `blend_rgb_deep`). Their formulas and calibration are in [xcf.md](xcf.md#gimps-own-modes). They follow every rule of the Paint.NET modes above: no blend menu lists them (`set_non_photoshop_blend_modes_offered`), 8 and 16-bit only, permanent script ids (see [scripting-api-changes.md](scripting-api-changes.md)), and PSD, layered TIFF and Aseprite saves write them as Normal or bake them. OpenRaster bakes them like any mode it has no name for.
+
+## Krita modes
+
+Nine modes exist for Krita .kra import, per-channel kernels in `core/krita_blend_modes.cpp`: Soft
+Light (SVG) (the W3C formula, Krita's "Soft Light"), Additive-Subtractive, Arc Tangent, Geometric
+Mean, Allanon, Parallel, Hard Overlay, Interpolation and Easy Dodge, each measured on Krita 5.3's
+render of all 65536 8-bit pairs (formulas: [kra.md](kra.md#blend-modes)). They follow every rule of
+the Paint.NET and GIMP modes above. OpenRaster writes them under Krita's names
+(`krita:soft_light_svg` and so on), with its save warning for Krita names.
+
+## Layered saves
+
+`src/formats/layered_blend_support.{hpp,cpp}` (Qt-free) knows which modes each layered save format stores (`layered_format_stores_blend_mode`):
+
+- Photoshop records (PSD, PSB, layered TIFF): everything but Paint.NET's four and GIMP's seventeen, Pass Through on folders only, and at 32 bits only what `blend_mode_supported_at_depth` allows.
+- Aseprite: what `aseprite::stores_blend_mode` maps (no Linear Burn, Pin/Vivid/Linear Light, Hard Mix, Darker/Lighter Color, Dissolve, Paint.NET's four, GIMP's seventeen). Aseprite folders always isolate, so a Pass Through folder counts only when it holds a visible layer in another mode than Normal.
+
+`find_unsupported_blend_modes` lists the modes and the layers (hidden ones too). When it finds any, an interactive save to one of those formats asks first (`unsupportedBlendModesMessageBox`, MainWindow::save_document_to_path): Keep the Look (default) bakes, Save as Normal writes the layers as Normal, Cancel writes nothing. Scripts never see the prompt: saveAs option `unsupportedBlendModes` is `"normal"` (default) or `"bake"`. The answer travels as `ImageSaveOptions::bake_unsupported_blend_modes`, never persisted; `DocumentSaveCoordinator::write_prepared` applies it to the save snapshot only and adds a notice either way. OpenRaster keeps its own baking ([ora.md](ora.md)).
+
+The bake (`bake_unsupported_blend_modes`), per unit: render the composite below the unit (B) and with it (R) in the context it composites in, then write a Normal, 100% pixel layer N with N over B = R. Where B is opaque N is R, opaque wherever the unit changed a pixel; under partial cover N's alpha and colour solve the source-over equation (alpha quantized up to 1/255); pixels the unit left alone stay transparent, so the layers below still show and stay editable there.
+
+- A unit is one layer, a clipping run that holds an affected layer (base and clipped layers merge), or a whole folder whose own mode is affected. A Pass Through folder with opacity, a mask or a style that holds affected content also bakes whole.
+- Context: a Pass Through folder, or a Normal one at full opacity with no mask, style or Blend If, continues its parent's composite (source-over is associative); other folders isolate, so their children render in a document of that folder's children alone.
+- Hidden layers only switch to Normal. A unit that changes no pixel keeps its layers and switches to Normal.
+- Deep documents bake through the 8-bit composite, converted back to the document's depth.
+- Trade-off (told in the prompt): a baked layer holds what was below it wherever it changed it, so later edits below do not show through there, and a merged unit loses its separate layers. The saved composite matches Patchy's within one level; a contrast mode above a baked layer can double that (two levels under Overlay). Pinned by `layered_blend_bake_round_trips_through_psd` and `ui_save_asks_about_unsupported_blend_modes`.

@@ -1,0 +1,192 @@
+#include "formats/heif_document_io.hpp"
+
+#include "support/string_utils.hpp"
+#include "support/translate_noop.hpp"
+
+#include <algorithm>
+#include <array>
+#include <cstring>
+#include <stdexcept>
+
+namespace patchy::heif {
+
+namespace {
+
+// HEVC-coded HEIF brands (ISO/IEC 23008-12 + vendor practice). iPhone stills are "heic",
+// Sony/Fujifilm .hif use "heix"/"msf1", generic single/multi-image files use "mif1"/"msf1".
+// AVIF brands are deliberately absent.
+constexpr std::array<std::string_view, 10> kHeifBrands = {
+    "heic", "heix", "hevc", "hevx", "heim", "heis", "hevm", "hevs", "mif1", "msf1",
+};
+
+[[nodiscard]] bool is_heif_brand(std::span<const std::uint8_t> bytes, std::size_t offset) {
+  if (offset + 4 > bytes.size()) {
+    return false;
+  }
+  const std::string_view brand(reinterpret_cast<const char*>(bytes.data() + offset), 4);
+  return std::find(kHeifBrands.begin(), kHeifBrands.end(), brand) != kHeifBrands.end();
+}
+
+}  // namespace
+
+const std::vector<std::string>& heif_extensions() {
+  // ".hif" is the Sony/Fujifilm in-camera HEIF extension; the same decoders handle it.
+  static const std::vector<std::string> extensions = {"heic", "heif", "hif"};
+  return extensions;
+}
+
+bool is_heif_extension(std::string_view extension) {
+  const auto normalized = normalized_extension(extension, false);
+  const auto& extensions = heif_extensions();
+  return std::find(extensions.begin(), extensions.end(), normalized) != extensions.end();
+}
+
+bool sniff(std::span<const std::uint8_t> bytes) {
+  // ISOBMFF: u32 BE box size, "ftyp", 4-byte major brand, u32 minor version, then 4-byte
+  // compatible brands to the end of the box. Accept when the major brand or any
+  // compatible brand is an HEVC-coded HEIF brand.
+  if (bytes.size() < 16 || std::memcmp(bytes.data() + 4, "ftyp", 4) != 0) {
+    return false;
+  }
+  const std::size_t box_size = (static_cast<std::size_t>(bytes[0]) << 24U) |
+                               (static_cast<std::size_t>(bytes[1]) << 16U) |
+                               (static_cast<std::size_t>(bytes[2]) << 8U) |
+                               static_cast<std::size_t>(bytes[3]);
+  if (box_size < 16 || (box_size % 4) != 0) {
+    return false;
+  }
+  // An AVIF major brand decides the file even though its compatible brands list the generic
+  // mif1/msf1: those files belong to the AVIF reader (docs/avif.md).
+  const std::string_view major(reinterpret_cast<const char*>(bytes.data() + 8), 4);
+  if (major == "avif" || major == "avis") {
+    return false;
+  }
+  if (is_heif_brand(bytes, 8)) {
+    return true;
+  }
+  const auto brands_end = std::min<std::size_t>(box_size, bytes.size());
+  for (std::size_t offset = 16; offset + 4 <= brands_end; offset += 4) {
+    if (is_heif_brand(bytes, offset)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+std::optional<std::uint16_t> nclx_transfer_characteristics(std::span<const std::uint8_t> bytes) {
+  const auto read_u32 = [&](std::size_t offset) {
+    return (static_cast<std::uint32_t>(bytes[offset]) << 24U) | (static_cast<std::uint32_t>(bytes[offset + 1]) << 16U) |
+           (static_cast<std::uint32_t>(bytes[offset + 2]) << 8U) | static_cast<std::uint32_t>(bytes[offset + 3]);
+  };
+  // Walk the top-level boxes to the meta box, so image data in mdat is never searched.
+  std::size_t offset = 0;
+  while (offset + 8 <= bytes.size()) {
+    std::uint64_t size = read_u32(offset);
+    std::size_t header = 8;
+    if (size == 1) {
+      if (offset + 16 > bytes.size()) {
+        return std::nullopt;
+      }
+      size = (static_cast<std::uint64_t>(read_u32(offset + 8)) << 32U) | read_u32(offset + 12);
+      header = 16;
+    } else if (size == 0) {
+      size = bytes.size() - offset;
+    }
+    if (size < header || size > bytes.size() - offset) {
+      return std::nullopt;
+    }
+    if (std::memcmp(bytes.data() + offset + 4, "meta", 4) == 0) {
+      // colr boxes live in iprp/ipco; the first nclx one carries the primary image's
+      // signalling (gain maps and thumbnails follow it).
+      const auto meta = bytes.subspan(offset + header, static_cast<std::size_t>(size) - header);
+      static constexpr std::array<std::uint8_t, 8> kColrNclx = {'c', 'o', 'l', 'r', 'n', 'c', 'l', 'x'};
+      const auto found = std::search(meta.begin(), meta.end(), kColrNclx.begin(), kColrNclx.end());
+      const auto at = static_cast<std::size_t>(found - meta.begin());
+      if (found == meta.end() || at + 8 + 4 > meta.size()) {
+        return std::nullopt;
+      }
+      return static_cast<std::uint16_t>((meta[at + 10] << 8U) | meta[at + 11]);
+    }
+    offset += static_cast<std::size_t>(size);
+  }
+  return std::nullopt;
+}
+
+OrientedImage apply_exif_orientation(std::span<const std::uint8_t> rgba, std::int32_t width,
+                                     std::int32_t height, int orientation, std::size_t bytes_per_pixel) {
+  const std::size_t bpp = bytes_per_pixel;
+  if (width <= 0 || height <= 0 || bpp == 0 ||
+      rgba.size() < static_cast<std::size_t>(width) * static_cast<std::size_t>(height) * bpp) {
+    throw std::runtime_error(PATCHY_TRANSLATE_NOOP("QObject", "HEIF orientation input buffer is too small"));
+  }
+  if (orientation < 1 || orientation > 8) {
+    orientation = 1;
+  }
+  const bool swaps_axes = orientation >= 5;
+  OrientedImage out;
+  out.width = swaps_axes ? height : width;
+  out.height = swaps_axes ? width : height;
+  out.rgba.resize(static_cast<std::size_t>(out.width) * static_cast<std::size_t>(out.height) * bpp);
+
+  // EXIF semantics: the value describes where the stored 0th row/column appear visually.
+  // For each output (display) pixel, compute the source pixel that belongs there.
+  for (std::int32_t oy = 0; oy < out.height; ++oy) {
+    auto* destination = out.rgba.data() + static_cast<std::size_t>(oy) * static_cast<std::size_t>(out.width) * bpp;
+    for (std::int32_t ox = 0; ox < out.width; ++ox, destination += bpp) {
+      std::int32_t sx = ox;
+      std::int32_t sy = oy;
+      switch (orientation) {
+        case 2:  // mirrored horizontally
+          sx = width - 1 - ox;
+          break;
+        case 3:  // rotated 180
+          sx = width - 1 - ox;
+          sy = height - 1 - oy;
+          break;
+        case 4:  // mirrored vertically
+          sy = height - 1 - oy;
+          break;
+        case 5:  // transposed (stored row 0 = visual left, column 0 = visual top)
+          sx = oy;
+          sy = ox;
+          break;
+        case 6:  // rotate stored image 90 CW to display
+          sx = oy;
+          sy = height - 1 - ox;
+          break;
+        case 7:  // transverse (stored row 0 = visual right, column 0 = visual bottom)
+          sx = width - 1 - oy;
+          sy = height - 1 - ox;
+          break;
+        case 8:  // rotate stored image 90 CCW to display
+          sx = width - 1 - oy;
+          sy = ox;
+          break;
+        default:
+          break;
+      }
+      const auto* source =
+          rgba.data() + (static_cast<std::size_t>(sy) * static_cast<std::size_t>(width) + static_cast<std::size_t>(sx)) * bpp;
+      std::memcpy(destination, source, bpp);
+    }
+  }
+  return out;
+}
+
+#if !defined(_WIN32) && !defined(PATCHY_HEIF_WEBCODECS) && !defined(PATCHY_HEIF_HOST_LIBHEIF) &&     !defined(PATCHY_HEIF_IMAGEIO)
+
+// The node-only wasm-core build keeps this stub because node has no browser VideoDecoder.
+// macOS compiles heif_document_io_mac.cpp (PATCHY_HEIF_IMAGEIO) and Linux
+// heif_document_io_linux.cpp (PATCHY_HEIF_HOST_LIBHEIF) instead (CMakeLists.txt).
+FormatReadResult read_heif(std::span<const std::uint8_t> bytes) {
+  (void)bytes;
+#if defined(__EMSCRIPTEN__)
+  throw std::runtime_error(PATCHY_TRANSLATE_NOOP("QObject", "Unable to decode this HEIC image outside a browser."));
+#else
+  throw std::runtime_error(PATCHY_TRANSLATE_NOOP("QObject", "This build of Patchy cannot decode HEIC images."));
+#endif
+}
+
+#endif  // !_WIN32 && !PATCHY_HEIF_WEBCODECS && !PATCHY_HEIF_HOST_LIBHEIF && !PATCHY_HEIF_IMAGEIO
+
+}  // namespace patchy::heif

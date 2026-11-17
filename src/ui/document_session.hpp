@@ -1,0 +1,156 @@
+#pragma once
+
+// One open document and everything the window tracks about it: history, save state,
+// view/canvas binding, float-window placement, and Smart Object parentage. Owned by
+// MainWindow's session list (docs/code-organization.md, "Session lifetime"); other
+// code refers to a session by `session_id`, never by pointer, because the list erases
+// on tab close.
+
+#include "core/document.hpp"
+#include "core/layer.hpp"
+#include "core/layer_tree.hpp"
+#include "core/perspective_planes.hpp"
+#include "ui/session_history.hpp"
+#include "ui/canvas_types.hpp"
+#include "ui/image_save_options.hpp"
+
+#include <QString>
+#include <QStringList>
+
+#include <cstddef>
+#include <cstdint>
+#include <optional>
+#include <set>
+#include <string>
+#include <utility>
+#include <vector>
+
+namespace patchy::ui {
+
+class CanvasWidget;
+class DocumentFloatWindow;
+
+// The Layers panel's filter menu (GitHub issue 671, docs/layer-panel-filter.md):
+// the criteria that, with the name text, decide which layers get rows. Within a group a layer
+// matches any ticked item; the groups, Selected only and the name text must all match.
+// Session-only: never written to a file or to settings.
+inline constexpr std::uint32_t kLayerFilterPixel = 1U << 0U;
+inline constexpr std::uint32_t kLayerFilterText = 1U << 1U;
+inline constexpr std::uint32_t kLayerFilterShape = 1U << 2U;
+inline constexpr std::uint32_t kLayerFilterAdjustment = 1U << 3U;  // adjustment and fill layers
+inline constexpr std::uint32_t kLayerFilterSmartObject = 1U << 4U;
+inline constexpr std::uint32_t kLayerFilterFolder = 1U << 5U;
+inline constexpr std::uint32_t kLayerFilterHasMask = 1U << 0U;  // a layer mask or a vector mask
+inline constexpr std::uint32_t kLayerFilterHasStyle = 1U << 1U;
+inline constexpr std::uint32_t kLayerFilterHidden = 1U << 2U;
+inline constexpr std::uint32_t kLayerFilterLocked = 1U << 3U;
+inline constexpr std::uint32_t kLayerFilterLinked = 1U << 4U;           // linked to another layer
+inline constexpr std::uint32_t kLayerFilterHasSmartFilters = 1U << 5U;  // carries a Smart Filter stack
+inline constexpr std::uint32_t kLayerFilterHasBlendMode = 1U << 6U;     // a mode other than the one it starts with
+struct LayerListFilter {
+  std::uint32_t kinds{0};       // kLayerFilterPixel...kLayerFilterFolder
+  std::uint32_t properties{0};  // kLayerFilterHasMask...kLayerFilterHasBlendMode
+  std::uint32_t colors{0};      // bit (1 << LayerColorLabel)
+  bool selected_only{false};
+  // The layers Selected only lists, besides the active layer. Follows selection changes made
+  // outside the panel (reveal_layer_in_layer_list, select_layers_in_layer_list); clicks in the
+  // panel leave it, so the rows stay to pick among.
+  std::set<LayerId> selected_ids;
+  [[nodiscard]] bool active() const noexcept {
+    return kinds != 0U || properties != 0U || colors != 0U || selected_only;
+  }
+};
+
+struct DocumentSession {
+  using HistoryState = SessionHistory::State;
+
+
+  Document document;
+  QString title;
+  QString path;
+  // The file at `path` opened by its content because its name says another format or none
+  // (GitHub issue 362): the extension of what it really is ("psd"). Save goes to Save As
+  // with that extension suggested, so a mislabeled file never gets bytes its name hides;
+  // cleared once a save gives the document a file of its own.
+  QString content_extension;
+  // The notes the reader left when this session's file opened (dropped or approximated
+  // features, the import notes the status bar shows); scripts read them as doc.importNotes.
+  QStringList import_notes;
+  // Added in the background (SessionActivation::Background): its canvas has never been
+  // shown, so it has no real size to fit to yet. The first activation fits it.
+  bool fit_view_on_first_activation{false};
+  std::optional<ImageSaveOptions> image_save_options;
+  // Image > Mode > CMYK Proof (docs/cmyk.md): the canvas shows this document through the
+  // working CMYK profile, and saves to JPEG, TIFF and flattened PDF write CMYK. Session-only:
+  // never stored in a file.
+  bool cmyk_proof{false};
+  // Filter > Perspective Planes' planes (docs/perspective-planes.md). Session-only: kept
+  // while the document is open, never written to a file.
+  std::vector<PerspectivePlane> perspective_planes;
+  // The user agreed to save this CMYK Proof document in RGB to a format without a CMYK
+  // form; the warning is not repeated in this session.
+  bool cmyk_proof_rgb_save_accepted{false};
+  // Preferences > Metadata and Watermarks: Skip in the "add your name and copyright"
+  // prompt holds for this document until it closes, so repeated saves do not ask again.
+  bool personal_save_metadata_skipped{false};
+  QString image_save_options_path;
+  QString image_save_options_extension;
+  // Stable identity for cross-session references (ids, not pointers: the session list
+  // erases on tab close, so pointers into it must never be stored).
+  std::int64_t session_id{0};
+  // Present on an Edit Smart Object Contents child tab: which session and source
+  // uuid a Save commits back into. `external` marks a linked-file child (a normal
+  // disk-backed session whose Save writes the file first, then refreshes the
+  // parent's previews).
+  struct SmartObjectLink {
+    std::int64_t parent_session_id{0};
+    std::string source_uuid;
+    bool external{false};
+    // Edit Contents regenerates PSD UUIDs. Retain the lineage so parent
+    // history navigation can reconnect the open child to a restored source.
+    std::vector<std::string> source_uuid_history{};
+  };
+  std::optional<SmartObjectLink> smart_object_link;
+  CanvasWidget* canvas{nullptr};
+  // Non-null while the document is floated in its own top-level window; the
+  // canvas lives inside it instead of the tab widget. The window is a
+  // MainWindow child (widget tree owns it); the session only points at it.
+  DocumentFloatWindow* float_window{nullptr};
+  // Tab position to restore on Dock to Tabs (clamped; -1 when never floated).
+  int floated_from_tab_index{-1};
+  SessionHistory history;
+  std::set<LayerId> collapsed_layer_groups;
+  // Layers whose effect rows are open in the Layers panel (GitHub issue 256 follow-up): closed by
+  // default. Seeded from the file at open and written back on save like the folders (issue 361).
+  std::set<LayerId> expanded_layer_effects;
+  // Layers whose Smart Filter rows are closed in the Layers panel: open by default (issue 361).
+  std::set<LayerId> collapsed_smart_filters;
+  // The Layers panel filter menu's criteria for this document (issue 671); the name text is
+  // the panel's own field.
+  LayerListFilter layer_filter;
+  // Alt-click eye isolation. `saved` is the pre-isolation visibility snapshot
+  // (pre-order); `applied` is the state right after isolating, so any outside
+  // visibility change invalidates the restore and the next Alt-click starts a
+  // fresh isolation instead.
+  struct VisibilityIsolation {
+    LayerId isolated_id{0};
+    std::vector<std::pair<LayerId, bool>> saved;
+    std::vector<std::pair<LayerId, bool>> applied;
+  };
+  std::optional<VisibilityIsolation> visibility_isolation;
+  std::int64_t revision{0};
+  std::int64_t saved_revision{0};
+
+  // The document as a layered save writes it: a copy-on-write copy whose groups carry the
+  // Layers panel's open/closed state (`collapsed_layer_groups`, which layer metadata only
+  // seeds at open), so the file reopens with the folders the user left open (issue 179), and
+  // whose layers carry the open/closed state of their layer style and Smart Filter rows (issue 361).
+  [[nodiscard]] Document document_for_write() const {
+    Document copy = document;
+    apply_layer_group_disclosure(copy.layers(), collapsed_layer_groups);
+    apply_layer_fx_disclosure(copy.layers(), expanded_layer_effects, collapsed_smart_filters);
+    return copy;
+  }
+};
+
+}  // namespace patchy::ui

@@ -1,0 +1,756 @@
+// CanvasWidget's tool cursor policy, split out of canvas_widget.cpp:
+// update_tool_cursor (the per-tool switch with the cached brush cursors),
+// apply_selection_cursor_for_mode and apply_zoom_cursor, and the selection /
+// magic-wand cursor builders with their per-mode function-local caches. Pure
+// function moves from canvas_widget.cpp; behavior must stay identical.
+
+#include "ui/canvas_widget.hpp"
+
+#include "core/pixel_tools.hpp"
+#include "ui/canvas_types.hpp"
+#include "ui/canvas_widget_shared.hpp"
+#include "ui/tool_modifier_style.hpp"
+#include "ui/theme_script_host.hpp"
+#include "ui/tool_cursors.hpp"
+
+#include <QApplication>
+#include <QColor>
+#include <QCursor>
+#include <QPainter>
+#include <QPainterPath>
+#include <QPen>
+#include <QPixmap>
+#include <QPoint>
+#include <QPointF>
+#include <QRect>
+#include <QRectF>
+#include <Qt>
+
+#include <algorithm>
+#include <array>
+#include <cmath>
+#include <cstdio>
+#include <cstring>
+#include <utility>
+
+namespace patchy::ui {
+
+namespace {
+
+// The wand glyph is drawn within the top-left 24x24; the pixmap is larger to
+// leave room for the lower-right selection-mode badge.
+constexpr int kMagicWandCursorSize = 32;
+constexpr int kMagicWandCursorHotspotX = 6;
+constexpr int kMagicWandCursorHotspotY = 6;
+constexpr int kMaxBrushCursorExtent = kMaxBrushSize + 5;
+
+// The Clone/Healing source cursor while Alt is held (GitHub issue 380): the canvas
+// source marker's ring and crosshair, dark halo under light ink, so the cursor reads as
+// "set the source here". Tool cursors are exempt from the theme roles.
+QCursor build_retouch_source_cursor() {
+  constexpr int kSize = 25;
+  QPixmap pixmap(kSize, kSize);
+  pixmap.fill(Qt::transparent);
+  QPainter painter(&pixmap);
+  painter.setRenderHint(QPainter::Antialiasing);
+  const QPointF center(12.5, 12.5);
+  constexpr double kRadius = 6.0;
+  for (const auto& pen : {QPen(QColor(20, 23, 28, 220), 3.0), QPen(QColor(245, 248, 252), 1.4)}) {
+    painter.setPen(pen);
+    painter.setBrush(Qt::NoBrush);
+    painter.drawEllipse(center, kRadius, kRadius);
+    painter.drawLine(QPointF(center.x() - kRadius - 4.0, center.y()), QPointF(center.x() - 2.0, center.y()));
+    painter.drawLine(QPointF(center.x() + 2.0, center.y()), QPointF(center.x() + kRadius + 4.0, center.y()));
+    painter.drawLine(QPointF(center.x(), center.y() - kRadius - 4.0), QPointF(center.x(), center.y() - 2.0));
+    painter.drawLine(QPointF(center.x(), center.y() + 2.0), QPointF(center.x(), center.y() + kRadius + 4.0));
+  }
+  painter.end();
+  return QCursor(pixmap, 12, 12);
+}
+
+// A thin, antialiased black crosshair with a white halo, matching the default
+// cross cursor. Used for every combine mode so toggling a modifier never
+// recolours or shifts it (Replace just omits the badge).
+QCursor build_selection_tool_cursor(CanvasWidget::SelectionMode mode) {
+  constexpr int kSize = 32;
+  constexpr double kArm = 9.0;
+  QPixmap pixmap(kSize, kSize);
+  pixmap.fill(Qt::transparent);
+  QPainter painter(&pixmap);
+  painter.setRenderHint(QPainter::Antialiasing);
+  const QPointF hotspot(10.0, 10.0);
+  const auto cross = [&](const QColor& color, double width) {
+    painter.setPen(QPen(color, width, Qt::SolidLine, Qt::RoundCap));
+    painter.drawLine(hotspot + QPointF(-kArm, 0.0), hotspot + QPointF(kArm, 0.0));
+    painter.drawLine(hotspot + QPointF(0.0, -kArm), hotspot + QPointF(0.0, kArm));
+  };
+  cross(kSelectionCursorHalo, kSelectionCursorHaloWidth);
+  cross(kSelectionCursorInk, kSelectionCursorWidth);
+  paint_selection_mode_badge(painter, mode, QPointF(23.0, 23.0));
+  painter.end();
+  return QCursor(pixmap, static_cast<int>(hotspot.x()), static_cast<int>(hotspot.y()));
+}
+
+QCursor build_magic_wand_cursor(CanvasWidget::SelectionMode mode) {
+  QPixmap pixmap(kMagicWandCursorSize, kMagicWandCursorSize);
+  pixmap.fill(Qt::transparent);
+
+  QPainter painter(&pixmap);
+  painter.setRenderHint(QPainter::Antialiasing);
+  const QPointF hotspot(kMagicWandCursorHotspotX, kMagicWandCursorHotspotY);
+
+  painter.setPen(QPen(QColor(18, 20, 24), 4.2, Qt::SolidLine, Qt::RoundCap));
+  painter.drawLine(hotspot + QPointF(3.0, 3.0), QPointF(21.0, 21.0));
+  painter.setPen(QPen(QColor(245, 248, 252), 2.1, Qt::SolidLine, Qt::RoundCap));
+  painter.drawLine(hotspot + QPointF(3.0, 3.0), QPointF(21.0, 21.0));
+
+  painter.setPen(QPen(QColor(18, 20, 24), 3.0, Qt::SolidLine, Qt::RoundCap));
+  painter.drawLine(hotspot + QPointF(-5.0, 0.0), hotspot + QPointF(-1.5, 0.0));
+  painter.drawLine(hotspot + QPointF(1.5, 0.0), hotspot + QPointF(5.0, 0.0));
+  painter.drawLine(hotspot + QPointF(0.0, -5.0), hotspot + QPointF(0.0, -1.5));
+  painter.drawLine(hotspot + QPointF(0.0, 1.5), hotspot + QPointF(0.0, 5.0));
+  painter.setPen(QPen(QColor(80, 170, 255), 1.4, Qt::SolidLine, Qt::RoundCap));
+  painter.drawLine(hotspot + QPointF(-5.0, 0.0), hotspot + QPointF(-1.5, 0.0));
+  painter.drawLine(hotspot + QPointF(1.5, 0.0), hotspot + QPointF(5.0, 0.0));
+  painter.drawLine(hotspot + QPointF(0.0, -5.0), hotspot + QPointF(0.0, -1.5));
+  painter.drawLine(hotspot + QPointF(0.0, 1.5), hotspot + QPointF(0.0, 5.0));
+
+  painter.setPen(QPen(QColor(80, 170, 255), 1.5, Qt::SolidLine, Qt::RoundCap));
+  painter.drawLine(QPointF(17.0, 4.0), QPointF(17.0, 8.0));
+  painter.drawLine(QPointF(15.0, 6.0), QPointF(19.0, 6.0));
+  painter.drawLine(QPointF(21.0, 10.0), QPointF(21.0, 13.0));
+  painter.drawLine(QPointF(19.5, 11.5), QPointF(22.5, 11.5));
+  // Badge goes lower-left, clear of the wand handle and sparkle.
+  paint_selection_mode_badge(painter, mode, QPointF(10.0, 25.0));
+  painter.end();
+
+  return QCursor(pixmap, kMagicWandCursorHotspotX, kMagicWandCursorHotspotY);
+}
+
+// Badge for the pen's context action. Add/Delete reuse the selection-badge
+// glyphs (+/-) so the two cursor families never drift apart; Convert draws the
+// corner/smooth caret and Close a small ring, all with the same halo/ink pass.
+void paint_pen_action_badge(QPainter& painter, CanvasWidget::PenHoverAction action,
+                            QPointF center) {
+  using PenHoverAction = CanvasWidget::PenHoverAction;
+  switch (action) {
+    case PenHoverAction::Add:
+      paint_selection_mode_badge(painter, CanvasWidget::SelectionMode::Add, center);
+      return;
+    case PenHoverAction::Delete:
+      paint_selection_mode_badge(painter, CanvasWidget::SelectionMode::Subtract, center);
+      return;
+    case PenHoverAction::Convert: {
+      constexpr double kGlyphHalf = 3.0;
+      const auto stroke = [&](const QColor& color, double width) {
+        painter.setPen(QPen(color, width, Qt::SolidLine, Qt::RoundCap));
+        painter.drawLine(center + QPointF(-kGlyphHalf, kGlyphHalf),
+                         center + QPointF(0.0, -kGlyphHalf));
+        painter.drawLine(center + QPointF(0.0, -kGlyphHalf),
+                         center + QPointF(kGlyphHalf, kGlyphHalf));
+      };
+      stroke(kSelectionCursorHalo, kSelectionCursorHaloWidth);
+      stroke(kSelectionCursorInk, kSelectionCursorWidth);
+      return;
+    }
+    case PenHoverAction::Close: {
+      const auto stroke = [&](const QColor& color, double width) {
+        painter.setPen(QPen(color, width, Qt::SolidLine, Qt::RoundCap));
+        painter.setBrush(Qt::NoBrush);
+        painter.drawEllipse(center, 2.8, 2.8);
+      };
+      stroke(kSelectionCursorHalo, kSelectionCursorHaloWidth);
+      stroke(kSelectionCursorInk, kSelectionCursorWidth);
+      return;
+    }
+    case PenHoverAction::Continue: {
+      // A small solid anchor square: continue from this point.
+      const QRectF square(center.x() - 2.5, center.y() - 2.5, 5.0, 5.0);
+      painter.setPen(QPen(kSelectionCursorHalo, kSelectionCursorHaloWidth - 1.0));
+      painter.setBrush(kSelectionCursorInk);
+      painter.drawRect(square);
+      return;
+    }
+    case PenHoverAction::Draw:
+      return;
+  }
+}
+
+// The pen cursor is the selection tools' crosshair plus a context-action badge
+// (what a click would do: add/delete an anchor, convert it, close the path).
+// The crosshair is identical for all five states so badge changes never shift
+// or re-weight the cursor under the pointer.
+QCursor build_pen_tool_cursor(CanvasWidget::PenHoverAction action) {
+  constexpr int kSize = 32;
+  constexpr double kArm = 9.0;
+  QPixmap pixmap(kSize, kSize);
+  pixmap.fill(Qt::transparent);
+  QPainter painter(&pixmap);
+  painter.setRenderHint(QPainter::Antialiasing);
+  const QPointF hotspot(10.0, 10.0);
+  const auto cross = [&](const QColor& color, double width) {
+    painter.setPen(QPen(color, width, Qt::SolidLine, Qt::RoundCap));
+    painter.drawLine(hotspot + QPointF(-kArm, 0.0), hotspot + QPointF(kArm, 0.0));
+    painter.drawLine(hotspot + QPointF(0.0, -kArm), hotspot + QPointF(0.0, kArm));
+  };
+  cross(kSelectionCursorHalo, kSelectionCursorHaloWidth);
+  cross(kSelectionCursorInk, kSelectionCursorWidth);
+  paint_pen_action_badge(painter, action, QPointF(23.0, 23.0));
+  painter.end();
+  return QCursor(pixmap, static_cast<int>(hotspot.x()), static_cast<int>(hotspot.y()));
+}
+
+// The Gradient tool's handle cursors (GitHub issue 663 follow-up): the pen's crosshair with
+// its plus badge where a click on the line adds a stop and its minus badge while a dragged
+// stop would be deleted, so the two families read alike. Drawn at the screen's scale (1x or
+// 2x), so they stay crisp on high-DPI displays.
+QCursor build_gradient_stop_cursor(CanvasWidget::PenHoverAction action, int scale) {
+  constexpr int kSize = 32;
+  constexpr double kArm = 9.0;
+  QPixmap pixmap(kSize * scale, kSize * scale);
+  pixmap.setDevicePixelRatio(scale);
+  pixmap.fill(Qt::transparent);
+  QPainter painter(&pixmap);
+  painter.setRenderHint(QPainter::Antialiasing);
+  const QPointF hotspot(10.0, 10.0);
+  const auto cross = [&](const QColor& color, double width) {
+    painter.setPen(QPen(color, width, Qt::SolidLine, Qt::RoundCap));
+    painter.drawLine(hotspot + QPointF(-kArm, 0.0), hotspot + QPointF(kArm, 0.0));
+    painter.drawLine(hotspot + QPointF(0.0, -kArm), hotspot + QPointF(0.0, kArm));
+  };
+  cross(kSelectionCursorHalo, kSelectionCursorHaloWidth);
+  cross(kSelectionCursorInk, kSelectionCursorWidth);
+  paint_pen_action_badge(painter, action, QPointF(23.0, 23.0));
+  painter.end();
+  return QCursor(pixmap, static_cast<int>(hotspot.x()), static_cast<int>(hotspot.y()));
+}
+
+QCursor pen_tool_cursor(CanvasWidget::PenHoverAction action) {
+  static const std::array<QCursor, 6> cursors = [] {
+    std::array<QCursor, 6> result;
+    for (std::size_t i = 0; i < result.size(); ++i) {
+      result[i] = build_pen_tool_cursor(static_cast<CanvasWidget::PenHoverAction>(i));
+    }
+    return result;
+  }();
+  return cursors[static_cast<std::size_t>(action)];
+}
+
+// Cursors are cached per combine mode: update_tool_cursor() runs on every mouse
+// move, so we build the four variants once instead of re-rasterising each time.
+QCursor selection_tool_cursor(CanvasWidget::SelectionMode mode) {
+  static const std::array<QCursor, 4> cursors = [] {
+    std::array<QCursor, 4> result;
+    for (std::size_t i = 0; i < result.size(); ++i) {
+      result[i] = build_selection_tool_cursor(static_cast<CanvasWidget::SelectionMode>(i));
+    }
+    return result;
+  }();
+  return cursors[static_cast<std::size_t>(mode)];
+}
+
+QCursor magic_wand_cursor(CanvasWidget::SelectionMode mode) {
+  static const std::array<QCursor, 4> cursors = [] {
+    std::array<QCursor, 4> result;
+    for (std::size_t i = 0; i < result.size(); ++i) {
+      result[i] = build_magic_wand_cursor(static_cast<CanvasWidget::SelectionMode>(i));
+    }
+    return result;
+  }();
+  return cursors[static_cast<std::size_t>(mode)];
+}
+
+}  // namespace
+
+CanvasWidget::PenHoverAction CanvasWidget::apply_pen_cursor(QPointF widget_point,
+                                                            Qt::KeyboardModifiers modifiers) {
+  // Ctrl = temporary Direct Select: the arrow advertises the mode, and the
+  // badge classification is skipped mid-gesture so drags never flicker it.
+  if ((modifiers & Qt::ControlModifier) != 0 || pen_temp_direct_select_ ||
+      pen_session_drag_anchor_ >= 0) {
+    setCursor(direct_select_cursor());
+    return PenHoverAction::Draw;
+  }
+  const auto hit = pen_hover_hit(widget_point, document_position_f(widget_point), modifiers);
+  // The anchor tools advertise their one edit everywhere (a miss just does
+  // nothing), so their badge never flickers with the hit test.
+  switch (tool_) {
+    case CanvasTool::AddAnchor:
+      setCursor(pen_tool_cursor(PenHoverAction::Add));
+      return hit.action;
+    case CanvasTool::DeleteAnchor:
+      setCursor(pen_tool_cursor(PenHoverAction::Delete));
+      return hit.action;
+    case CanvasTool::ConvertPoint:
+      setCursor(pen_tool_cursor(PenHoverAction::Convert));
+      return hit.action;
+    default:
+      break;
+  }
+  setCursor(pen_tool_cursor(hit.action));
+  return hit.action;
+}
+
+bool CanvasWidget::apply_selection_cursor_for_mode(SelectionMode mode) {
+  switch (tool_) {
+    case CanvasTool::MagicWand:
+      setCursor(magic_wand_cursor(mode));
+      return true;
+    case CanvasTool::Marquee:
+    case CanvasTool::EllipticalMarquee:
+    case CanvasTool::Lasso:
+    case CanvasTool::PolygonLasso:
+    case CanvasTool::MagneticLasso:
+    case CanvasTool::PatchTool:
+    case CanvasTool::ContentAwareMove:
+      // Same drawn crosshair in every mode (only the badge differs), so toggling
+      // Shift/Alt never makes the crosshair jump or change weight.
+      setCursor(selection_tool_cursor(mode));
+      return true;
+    case CanvasTool::ObjectSelect:
+      // No Intersect mode (like Quick Select): Shift+Alt shows the Add badge.
+      setCursor(selection_tool_cursor(mode == SelectionMode::Intersect ? SelectionMode::Add : mode));
+      return true;
+    case CanvasTool::QuickSelect:
+      if (brush_outline_uses_overlay()) {
+        // Too big for an OS cursor: the circle follows the pointer as a canvas overlay and
+        // the pointer is only its center cross (GitHub issue 533).
+        setCursor(brush_center_cross_cursor());
+        if (brush_hover_position_valid_) {
+          update(brush_hover_outline_rect().adjusted(-2, -2, 2, 2));
+        }
+        return true;
+      }
+      // Quick Select clamps Intersect to Add.
+      setCursor(quick_select_cursor(mode == SelectionMode::Intersect ? SelectionMode::Add : mode));
+      return true;
+    default:
+      return false;
+  }
+}
+
+void CanvasWidget::apply_hand_cursor(Qt::KeyboardModifiers modifiers) {
+  if (hand_click_zooms(modifiers)) {
+    apply_zoom_cursor((modifiers & Qt::AltModifier) != 0);
+  } else {
+    setCursor(Qt::OpenHandCursor);
+  }
+}
+
+void CanvasWidget::apply_zoom_cursor(bool zoom_out) {
+  QPixmap pixmap(24, 24);
+  pixmap.fill(Qt::transparent);
+  QPainter painter(&pixmap);
+  painter.setRenderHint(QPainter::Antialiasing);
+  // Two passes: a dark stroke first to lay a halo, then the light ink on top so
+  // the magnifier (and its +/- badge) stays legible over any canvas colour. The
+  // badge is a + for zoom in and a - for zoom out (Alt held, or the Zoom Out
+  // mode without Alt).
+  const auto draw = [&](const QPen& pen) {
+    painter.setPen(pen);
+    painter.drawEllipse(QRect(4, 4, 11, 11));
+    painter.drawLine(13, 13, 21, 21);
+    painter.drawLine(7, 10, 13, 10);
+    if (!zoom_out) {
+      painter.drawLine(10, 7, 10, 13);
+    }
+  };
+  draw(QPen(QColor(20, 23, 28), 3));
+  draw(QPen(QColor(245, 248, 252), 1.6));
+  painter.end();
+  setCursor(QCursor(pixmap, 10, 10));
+}
+
+void CanvasWidget::apply_move_tool_cursor(QPoint widget_position) {
+  if (transforming_layer_) {
+    apply_session_transform_cursor(widget_position, transform_cursor_modifiers_);
+    return;
+  }
+  if (const auto rect = move_transform_controls_rect(); rect.has_value()) {
+    const auto handle = transform_handle_at(widget_position, *rect, 0.0, TransformHitZones::EdgesAndCorners);
+    if (handle != TransformHandle::None && handle != TransformHandle::Move) {
+      if (!apply_move_box_handle_cursor(widget_position, transform_cursor_modifiers_)) {
+        set_transform_cursor_at(widget_position, handle, *rect, 0.0);
+      }
+      return;
+    }
+  }
+  // The four-way cursor promises a drag (GitHub issue 170); where a press starts
+  // a layer selection rectangle instead, the move pointer says so.
+  if (moving_layer_ || move_press_drags_at(widget_position)) {
+    setCursor(Qt::SizeAllCursor);
+  } else {
+    setCursor(move_pointer_cursor());
+  }
+}
+
+void CanvasWidget::update_tool_cursor() {
+  ZoomTraceScope trace("tool_cursor", zoom_);
+  if (dragging_guide_) {
+    apply_guide_drag_cursor();  // a guide drag owns the cursor until it ends (GitHub issue 472)
+    return;
+  }
+  if (sample_loupe_hides_cursor_) {
+    setCursor(Qt::BlankCursor);  // the sample loupe stands in for the pointer (GitHub issue 320)
+    return;
+  }
+  if (ruler_hover_ && rulers_visible_ && !spacebar_panning_ && !transient_read_callback_) {
+    setCursor(Qt::ArrowCursor);  // the rulers and their corner, whatever the tool (GitHub issue 472)
+    return;
+  }
+  if (spacebar_panning_ || tool_ == CanvasTool::Pan) {
+    apply_hand_cursor(QApplication::keyboardModifiers());
+    return;
+  }
+  if (tool_ == CanvasTool::RotateView) {
+    setCursor(rotating_view_ ? QCursor(Qt::ClosedHandCursor) : rotate_cursor());
+    return;
+  }
+  if (transient_read_callback_) {
+    setCursor(transient_read_cursor_);
+    return;
+  }
+  if (apply_preview_point_cursor()) {
+    return;
+  }
+  if (tool_ == CanvasTool::Move) {
+    apply_move_tool_cursor(last_mouse_position_);
+    return;
+  }
+  if (tool_ == CanvasTool::Artboard) {
+    update_artboard_tool_cursor(last_mouse_position_);
+    return;
+  }
+  if (pen_family_tool_active()) {
+    const auto modifiers =
+        pen_cursor_modifier_override_.value_or(QApplication::keyboardModifiers());
+    apply_pen_cursor(QPointF(last_mouse_position_), modifiers);
+    return;
+  }
+  if (shape_tool_active() && (shape_ctrl_path_select_ || shape_temp_path_select_)) {
+    setCursor(path_select_cursor());  // Ctrl: temporary Path Select (GitHub issue 312)
+    return;
+  }
+  // Over a resize handle of the active shape's box or one of its drag points, or dragging
+  // one (GitHub issue 690).
+  if ((shape_tool_active() || shape_handle_drag_active()) && apply_shape_resize_cursor(last_mouse_position_)) {
+    return;
+  }
+  if (tool_ == CanvasTool::Polygon || tool_ == CanvasTool::CustomShape || tool_ == CanvasTool::RedEye) {
+    setCursor(theme_tool_cursor(tool_).value_or(QCursor(Qt::CrossCursor)));
+    return;
+  }
+  if (tool_ == CanvasTool::Ruler) {
+    update_ruler_cursor(last_mouse_position_);
+    return;
+  }
+  if (tool_ == CanvasTool::PerspectiveCrop) {
+    update_perspective_crop_cursor(last_mouse_position_);
+    return;
+  }
+  if (tool_ == CanvasTool::Crop) {
+    if (crop_drag_handle_ != TransformHandle::None) {
+      // Mid-drag the grabbed handle owns the cursor (Space released during the
+      // drag lands here through set_tool), whatever is under the pointer now.
+      if (spacebar_repositioning_drag_rect_) {
+        setCursor(Qt::SizeAllCursor);
+      } else {
+        set_crop_handle_cursor(crop_drag_handle_, true);
+      }
+      return;
+    }
+    if (crop_straightening_ || (crop_session_active_ && crop_straighten_armed_)) {
+      // Straighten (GitHub issue 702): a press draws a line, wherever it lands.
+      setCursor(Qt::CrossCursor);
+      return;
+    }
+    if (crop_session_active_) {
+      // Session hover feedback: resize cursors over the handles, move inside,
+      // and the rotate hint everywhere off the box (the straighten gesture).
+      const auto handle = crop_handle_at(last_mouse_position_);
+      // Inside the box (a drag moves the image) a theme cursor may stand in; the
+      // handle and rotate cursors are the box's edit feedback and stay.
+      if (const auto themed = theme_tool_cursor(tool_); themed.has_value() && handle == TransformHandle::Move) {
+        setCursor(*themed);
+        return;
+      }
+      if (handle == TransformHandle::None) {
+        setCursor(transform_rotate_cursor_at(last_mouse_position_, QRectF(crop_rect_), crop_angle_, false));
+      } else {
+        set_crop_handle_cursor(handle, false);
+      }
+      return;
+    }
+    // The idle pointer is the one a theme may replace (theme_script_host.hpp); the
+    // handle and rotate cursors above stay, they are the box's feedback.
+    setCursor(theme_tool_cursor(tool_).value_or(QCursor(Qt::CrossCursor)));
+    return;
+  }
+  if (tool_ == CanvasTool::PathSelect || tool_ == CanvasTool::DirectSelect) {
+    apply_arrow_cursor();
+    return;
+  }
+  // Alt turns a paint/shape/fill tool into a temporary colour picker; show the
+  // eyedropper so the mode is obvious. Placed before the brush branches so it
+  // also overrides the large-brush overlay crosshair while Alt is held. The
+  // standalone Eyedropper tool uses the same cursor unconditionally.
+  const bool alt_held = alt_color_pick_cursor_override_.has_value()
+                            ? *alt_color_pick_cursor_override_
+                            : tool_modifier_held(ToolModifierRole::ColorPick, tool_,
+                                                 QApplication::keyboardModifiers());
+  if (tool_ == CanvasTool::Eyedropper) {
+    // The badge names the color a click sets, Alt inverting the Sets option.
+    setCursor(eyedropper_target_cursor(
+        eyedropper_target_is_background(alt_held ? Qt::KeyboardModifiers(Qt::AltModifier) : Qt::NoModifier)));
+    return;
+  }
+  if (tool_has_ctrl_temporary_move(tool_) && !painting_) {
+    // Every painting tool's temporary Move under Ctrl (GitHub issues 380, 421; Alt where the
+    // tool modifiers put the pick or source on Ctrl, issue 302), checked before the
+    // eyedropper: Ctrl+Alt is not the Move.
+    const auto modifiers = retouch_cursor_modifier_override_.value_or(QApplication::keyboardModifiers());
+    const auto move_modifier = tool_modifier(ToolModifierRole::TemporaryMove, tool_);
+    if (moving_layer_ || move_drag_pending_ || paint_ctrl_click_.has_value() ||
+        (modifiers.testFlag(move_modifier) && !modifiers.testFlag(other_tool_modifier(move_modifier)))) {
+      setCursor(Qt::SizeAllCursor);
+      return;
+    }
+  }
+  if (alt_held && tool_uses_alt_left_for_color_pick(tool_)) {
+    setCursor(eyedropper_cursor());
+    return;
+  }
+  if (retouch_source_tool_active() && !painting_) {
+    // Clone and Healing (GitHub issue 380): the source cursor under Alt, and the
+    // not-allowed cursor where a press would be refused.
+    const auto modifiers = retouch_cursor_modifier_override_.value_or(QApplication::keyboardModifiers());
+    if (tool_modifier_held(ToolModifierRole::RetouchSource, tool_, modifiers)) {
+      static const QCursor source_cursor = build_retouch_source_cursor();
+      setCursor(source_cursor);
+      return;
+    }
+    if (retouch_press_would_refuse()) {
+      setCursor(Qt::ForbiddenCursor);
+      return;
+    }
+  }
+  // Over a marquee resize handle the resize cursor wins whatever modifier is
+  // held (Alt there mirrors, it does not subtract), so a Shift/Alt press while
+  // hovering a handle agrees with the mouse-move path (GitHub issue 66).
+  if (tool_ == CanvasTool::Marquee || tool_ == CanvasTool::EllipticalMarquee) {
+    if (const auto handle = marquee_resize_handle_at(last_mouse_position_); handle != TransformHandle::None) {
+      set_transform_cursor_for_handle(handle);
+      return;
+    }
+  }
+  // Marquee/elliptical/lasso/wand show a crosshair (or wand) badged with the
+  // active combine mode (+ add, - subtract, x intersect) from the toolbar mode
+  // and live Shift/Alt.
+  if (apply_selection_cursor_for_mode(selection_operation(QApplication::keyboardModifiers()))) {
+    return;
+  }
+  if (tool_ == CanvasTool::TypeMask) {
+    // Type Mask (GitHub issue 670): always the I-beam; it never moves or opens a text layer.
+    setCursor(theme_tool_cursor(tool_).value_or(QCursor(Qt::IBeamCursor)));
+    return;
+  }
+  if (tool_ == CanvasTool::Text) {
+    // Ctrl+drag moves text (GitHub issue 216): the four-way cursor while it drags, and while
+    // Ctrl is held over a text layer a press would move.
+    if (text_layer_move_active_ ||
+        (text_ctrl_cursor_override_.value_or(false) && text_layer_move_target_at(last_mouse_position_))) {
+      setCursor(Qt::SizeAllCursor);
+      return;
+    }
+    // The cursor names what a press here works on, new text or existing alike (GitHub issue
+    // 717): a line, a shape's inside, or free text. It asks the function the press asks.
+    switch (type_tool_target_at(document_position(last_mouse_position_)).kind) {
+      case TypeToolTargetKind::NewPathText:
+      case TypeToolTargetKind::EditPathText:
+        setCursor(text_path_cursor());
+        break;
+      case TypeToolTargetKind::NewAreaText:
+      case TypeToolTargetKind::EditAreaText:
+        setCursor(text_area_cursor());
+        break;
+      case TypeToolTargetKind::NewText:
+      case TypeToolTargetKind::EditText:
+        setCursor(theme_tool_cursor(tool_).value_or(QCursor(Qt::IBeamCursor)));
+        break;
+    }
+    return;
+  }
+  if (tool_ == CanvasTool::Zoom) {
+    apply_zoom_cursor(zoom_tool_zoom_out_active(QApplication::keyboardModifiers()));
+    return;
+  }
+  if (brush_outline_hidden()) {
+    // Show Outline is off (GitHub issue 517): only the small center cross, the one every
+    // brush pointer carries, at any size and zoom (GitHub issue 533 follow-up).
+    setCursor(brush_center_cross_cursor());
+    return;
+  }
+  if (brush_outline_uses_overlay()) {
+    // Too big for an OS cursor: the outline follows the pointer as a canvas overlay and the
+    // pointer is only the center cross, never a second system crosshair (GitHub issue 533).
+    setCursor(brush_center_cross_cursor());
+    if (brush_hover_position_valid_) {
+      update(brush_hover_outline_rect().adjusted(-2, -2, 2, 2));
+    }
+    return;
+  }
+  if (tool_paints_with_brush_tip(tool_) && brush_tip_ != nullptr) {
+    if (apply_brush_tip_cursor()) {
+      return;
+    }
+  }
+  if (tool_uses_brush_footprint_cursor(tool_)) {
+    const auto use_cached_brush_cursor = [&](bool one_pixel, int diameter, int extent) {
+      if (brush_cursor_cache_.has_value() && brush_cursor_cache_->tool == tool_ &&
+          brush_cursor_cache_->brush_size == brush_size_ &&
+          brush_cursor_cache_->brush_softness == brush_softness_ &&
+          brush_cursor_cache_->diameter == diameter && brush_cursor_cache_->extent == extent &&
+          brush_cursor_cache_->one_pixel == one_pixel &&
+          brush_cursor_cache_->view_rotation == view_rotation_degrees_) {
+        setCursor(brush_cursor_cache_->cursor);
+        return true;
+      }
+      return false;
+    };
+    const auto cache_brush_cursor = [&](bool one_pixel, int diameter, int extent, QCursor cursor) {
+      brush_cursor_cache_ = BrushCursorCache{tool_,  brush_size_, brush_softness_,         diameter,
+                                             extent, one_pixel,   view_rotation_degrees_, std::move(cursor)};
+      setCursor(brush_cursor_cache_->cursor);
+    };
+
+    if (brush_size_ == 1) {
+      const auto pixel_extent = std::max(3, static_cast<int>(std::round(zoom_)));
+      const auto extent = std::clamp(pixel_extent + 7, 17, kMaxBrushCursorExtent);
+      if (use_cached_brush_cursor(true, pixel_extent, extent)) {
+        return;
+      }
+      QPixmap pixmap(extent, extent);
+      pixmap.fill(Qt::transparent);
+      QPainter painter(&pixmap);
+      painter.setRenderHint(QPainter::Antialiasing, false);
+      const QPoint center(extent / 2, extent / 2);
+      const QRect pixel_rect(center.x() - pixel_extent / 2, center.y() - pixel_extent / 2,
+                             pixel_extent, pixel_extent);
+      painter.setBrush(Qt::NoBrush);
+      painter.setPen(QPen(tool_ == CanvasTool::Eraser ? QColor(255, 255, 255) : QColor(25, 25, 25), 1));
+      painter.drawRect(pixel_rect);
+      painter.setPen(QPen(tool_ == CanvasTool::Eraser ? QColor(25, 25, 25) : QColor(255, 255, 255), 1));
+      painter.drawRect(pixel_rect.adjusted(1, 1, -1, -1));
+      paint_brush_center_cross(painter, center);
+      painter.end();
+      cache_brush_cursor(true, pixel_extent, extent, QCursor(pixmap, center.x(), center.y()));
+      return;
+    }
+    const auto diameter = std::max(3, static_cast<int>(std::round(static_cast<double>(brush_size_) * zoom_)));
+    // A turned square reaches past its side, so the pixmap takes the turned box.
+    const auto screen_size = brush_outline_screen_size();
+    const auto extent =
+        std::clamp(std::max({diameter, screen_size.width(), screen_size.height()}) + 5, 17, kMaxBrushCursorExtent);
+    if (use_cached_brush_cursor(false, diameter, extent)) {
+      return;
+    }
+    QPixmap pixmap(extent, extent);
+    pixmap.fill(Qt::transparent);
+    QPainter painter(&pixmap);
+    painter.setRenderHint(QPainter::Antialiasing);
+    const QPoint center(extent / 2, extent / 2);
+    const auto radius = std::max(2, std::min(diameter, extent - 5) / 2);
+    const bool square = brush_shape_ == patchy::BrushShape::Square && tool_paints_with_brush_tip(tool_);
+    // A flattened round brush shows its ellipse, turned by its angle like the dab (issue 708).
+    const bool flattened = !square && brush_base_roundness_ < 99 && tool_stroke_uses_tip_shape(tool_);
+    const auto draw_footprint = [&](int half) {
+      if (square) {
+        painter.save();
+        painter.translate(center);
+        // The tip's own angle, turned with a rotated view.
+        painter.rotate(brush_base_angle_degrees_ + view_rotation_degrees_);
+        painter.drawRect(QRectF(-half, -half, 2.0 * half, 2.0 * half));
+        painter.restore();
+      } else if (flattened) {
+        painter.save();
+        painter.translate(center);
+        painter.rotate(brush_base_angle_degrees_ + view_rotation_degrees_);
+        painter.drawEllipse(QPointF(0.0, 0.0), static_cast<double>(half),
+                            std::max(0.5, half * brush_base_roundness_ / 100.0));
+        painter.restore();
+      } else {
+        painter.drawEllipse(center, half, half);
+      }
+    };
+    painter.setPen(QPen(tool_ == CanvasTool::Eraser ? QColor(255, 255, 255) : QColor(25, 25, 25), 1));
+    painter.setBrush(Qt::NoBrush);
+    draw_footprint(radius);
+    painter.setPen(QPen(tool_ == CanvasTool::Eraser ? QColor(25, 25, 25) : QColor(255, 255, 255), 1));
+    draw_footprint(std::max(1, radius - 1));
+    if (brush_softness_ > 0 && tool_ != CanvasTool::Eraser) {
+      const auto edge_width = std::max(1, static_cast<int>(std::round(static_cast<double>(radius) *
+                                                                      static_cast<double>(brush_softness_) / 100.0)));
+      const auto inner_radius = std::max(1, radius - edge_width);
+      QPen softness_pen(QColor(105, 150, 210, 175), 1, Qt::DashLine);
+      painter.setPen(softness_pen);
+      draw_footprint(inner_radius);
+    }
+    // Drawn after the dashed softness ring, it used to take that pen's faint blue.
+    paint_brush_center_cross(painter, center);
+    painter.end();
+    cache_brush_cursor(false, diameter, extent, QCursor(pixmap, center.x(), center.y()));
+    return;
+  }
+  setCursor(Qt::CrossCursor);
+}
+
+QCursor CanvasWidget::gradient_handle_qcursor(GradientHandleCursor kind) const {
+  const int scale = devicePixelRatioF() > 1.0 ? 2 : 1;
+  const auto cached = [scale](CanvasWidget::PenHoverAction action) {
+    static const std::array<std::array<QCursor, 2>, 2> cursors = [] {
+      std::array<std::array<QCursor, 2>, 2> result;
+      for (int s = 0; s < 2; ++s) {
+        result[0][static_cast<std::size_t>(s)] = build_gradient_stop_cursor(CanvasWidget::PenHoverAction::Add, s + 1);
+        result[1][static_cast<std::size_t>(s)] =
+            build_gradient_stop_cursor(CanvasWidget::PenHoverAction::Delete, s + 1);
+      }
+      return result;
+    }();
+    return cursors[action == CanvasWidget::PenHoverAction::Add ? 0U : 1U][static_cast<std::size_t>(scale - 1)];
+  };
+  switch (kind) {
+    case GradientHandleCursor::AddStop:
+      return cached(PenHoverAction::Add);
+    case GradientHandleCursor::DeleteStop:
+      return cached(PenHoverAction::Delete);
+    case GradientHandleCursor::Move:
+      return QCursor(Qt::SizeAllCursor);
+    case GradientHandleCursor::AlongLine: {
+      // The resize arrow nearest the line's direction on screen (stops and midpoints slide
+      // along it).
+      const auto handles = gradient_fill_handles();
+      if (!handles.has_value()) {
+        return QCursor(Qt::SizeHorCursor);
+      }
+      const auto start = widget_position_f(QPointF(handles->line.start_x, handles->line.start_y));
+      const auto end = widget_position_f(QPointF(handles->line.end_x, handles->line.end_y));
+      auto degrees = std::atan2(-(end.y() - start.y()), end.x() - start.x()) * 180.0 / 3.14159265358979323846;
+      degrees = std::fmod(degrees + 360.0, 180.0);
+      if (degrees < 22.5 || degrees >= 157.5) {
+        return QCursor(Qt::SizeHorCursor);
+      }
+      if (degrees < 67.5) {
+        return QCursor(Qt::SizeBDiagCursor);
+      }
+      if (degrees < 112.5) {
+        return QCursor(Qt::SizeVerCursor);
+      }
+      return QCursor(Qt::SizeFDiagCursor);
+    }
+    case GradientHandleCursor::None:
+      break;
+  }
+  return cursor();
+}
+
+}  // namespace patchy::ui

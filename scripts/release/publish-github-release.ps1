@@ -1,0 +1,428 @@
+<#
+Publishes one Patchy release to GitHub Releases: tag v<version>, the desktop artifacts
+under their stable names, and a SHA256SUMS.txt.
+
+  scripts\release\publish-github-release.bat            (normal release, after release-all.bat)
+  scripts\release\publish-github-release.ps1 -Version 0.98 -Target <full sha> -AssetDir <dir>
+                                                        (backfill / republish from saved files)
+
+Flow: locate the assets -> write SHA256SUMS.txt -> take the release notes from the
+version's "What's New" entry in README.md -> create the release as a DRAFT with the
+assets attached -> read the release back and compare every asset's size with the
+local file -> only then publish it (which is when GitHub creates the tag) and mark it
+Latest. A draft is invisible to visitors, so a failed or partial upload never shows up
+as a shipped release. Re-running after a failure reuses the existing draft and
+re-uploads with --clobber.
+
+GitHub Releases is the only download location (rtsoft.com stopped mirroring the files with
+1.25; it keeps the Flatpak repository and the web build, upload-to-rtsoft.bat).
+The README table and latest_version.json use the /releases/latest/download/<name>
+permalinks, which only work because the asset names never change between versions.
+
+Assets, taken from -AssetDir (default build\package):
+  PatchyWindowsInstaller.exe, PatchyWindowsNoInstaller.zip           (stable names)
+  PatchyWindowsArm64Installer.exe, PatchyWindowsArm64NoInstaller.zip (stable names)
+  Patchy-<version>.dmg -> PatchyMacOS.dmg, Patchy-<version>.flatpak -> PatchyLinux.flatpak,
+  Patchy-<version>-aarch64.flatpak -> PatchyLinuxArm64.flatpak,
+  Patchy-<version>-x86_64.AppImage(.zsync) -> PatchyLinux.AppImage(.zsync)
+  PatchyGeglSources.zip (build-release.bat; the source of the GEGL the packages carry,
+  which its licenses require beside the downloads: docs/gegl-filters.md, "Sources")
+  PatchyLinuxScannerSources.zip (release-linux.ps1; the source of the SANE and libgphoto2
+  the Flatpak carries: docs/legal-licensing.md, "Scanner and camera libraries in the Flatpak")
+  (the mac and Linux builders write versioned files; stable-name copies left in
+  build\package by an older run are whatever shipped then, so they are never used
+  here. When -AssetDir already holds the stable names and no
+  versioned file, the stable names are used as-is: that is the backfill case.)
+
+Without -Target the release commit must be HEAD, clean, and already pushed to
+origin/main: the tag must point at the commit that produced the build. Leave
+latest_version.json at the previous version until this release is public and its
+downloads are verified, then announce it in a separate manifest-only commit.
+With -Target (backfill), the build commit only has to be on origin/main.
+
+Requires gh (authenticated: gh auth status) and git on PATH. Windows PowerShell 5.1 and
+pwsh 7 both work. Exit code 0 only after the release is public and verified.
+#>
+param(
+  [string]$Version,
+  [string]$Target,
+  [string]$AssetDir,
+  [string]$Repo = 'SethRobinson/Patchy',
+  [switch]$SkipAppImage,
+  [switch]$SkipLinuxArm64,
+  [switch]$SkipGeglSources,
+  [switch]$SkipLinuxScannerSources
+)
+# 'Continue', not 'Stop': native stderr chatter (git, gh) would otherwise become a
+# terminating NativeCommandError under Windows PowerShell 5.1. Every native call
+# below checks $LASTEXITCODE explicitly.
+$ErrorActionPreference = 'Continue'
+
+function Fail([string]$message) {
+  Write-Host ''
+  Write-Host "GITHUB RELEASE FAILED: $message"
+  Write-Host 'Nothing public changed unless a line above says the release was published.'
+  exit 1
+}
+
+$repoRoot = (git rev-parse --show-toplevel 2>$null)
+if ($LASTEXITCODE -ne 0 -or -not $repoRoot) { Fail 'not inside the Patchy git checkout' }
+$repoRoot = $repoRoot.Trim()
+Set-Location $repoRoot
+
+# A profile can alias gh to Get-History (Seth's does); make sure gh below means gh.exe.
+Remove-Item Alias:gh -Force -ErrorAction SilentlyContinue
+$ghExe = Get-Command gh.exe -CommandType Application -ErrorAction SilentlyContinue
+if (-not $ghExe) { Fail 'gh.exe (GitHub CLI) is not on PATH' }
+Set-Alias -Name gh -Value $ghExe.Source -Scope Script
+gh auth status 2>&1 | Out-Null
+if ($LASTEXITCODE -ne 0) { Fail 'gh is not logged in (run: gh auth login)' }
+
+# Version: same extraction as build-release.bat, from CMakeLists.txt.
+if (-not $Version) {
+  $cmake = Get-Content -Raw -LiteralPath 'CMakeLists.txt'
+  $match = [regex]::Match($cmake, 'project\s*\([\s\S]*?\bVERSION\s+([0-9]+(?:\.[0-9]+){1,3})', 'IgnoreCase')
+  if (-not $match.Success) { Fail 'could not read the project VERSION from CMakeLists.txt' }
+  $Version = $match.Groups[1].Value
+}
+if ($Version -notmatch '^[0-9]+(\.[0-9]+){1,3}$') { Fail "'$Version' is not a dotted version" }
+$tag = "v$Version"
+$title = "Patchy $Version"
+
+# The metainfo inside the Linux packages must describe this version: screenshot URLs pinned
+# to this tag (or to an older tag whose images are unchanged) and a <release> entry
+# (scripts\release\check-metainfo.py). Publishing creates the tag the pins name. A backfill
+# (-Target) republishes a commit as it was, so its metainfo is not re-checked.
+if (-not $Target) {
+  # The first python on PATH: with several (a conda install and the Store stub, say), the
+  # whole list once went to & as one command that did not exist, the check never ran, and
+  # the stale exit code read as a pass (1.20). The preset exit code makes that a failure.
+  $python = Get-Command python -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
+  if (-not $python) { Fail 'python is not on PATH (scripts\release\check-metainfo.py needs Python 3)' }
+  $global:LASTEXITCODE = 1
+  & $python.Source (Join-Path $PSScriptRoot 'check-metainfo.py') --version $Version
+  if ($LASTEXITCODE -ne 0) { Fail 'packaging/linux/com.rtsoft.patchy.metainfo.xml does not describe this release (errors above; python scripts\release\check-metainfo.py --fix, commit, push, rerun)' }
+}
+
+# Commit the tag will point at.
+git fetch origin --quiet
+if ($LASTEXITCODE -ne 0) { Fail 'git fetch origin failed' }
+if ($Target) {
+  $sha = (git rev-parse --verify "$Target^{commit}" 2>$null)
+  if ($LASTEXITCODE -ne 0 -or -not $sha) { Fail "-Target '$Target' is not a commit in this checkout" }
+  $sha = $sha.Trim()
+  git merge-base --is-ancestor $sha origin/main
+  if ($LASTEXITCODE -ne 0) { Fail "target commit $sha is not on origin/main (push it first)" }
+} else {
+  $dirty = (git status --porcelain --untracked-files=no)
+  if ($dirty) { Fail 'the working tree has uncommitted changes; commit the release first' }
+  $sha = (git rev-parse HEAD).Trim()
+  $remote = (git rev-parse origin/main).Trim()
+  if ($sha -ne $remote) { Fail "HEAD ($sha) is not origin/main ($remote); push the release commit first" }
+}
+Write-Host "Release $tag from commit $sha"
+
+# Assets.
+if (-not $AssetDir) { $AssetDir = Join-Path $repoRoot 'build\package' }
+if (-not (Test-Path -LiteralPath $AssetDir -PathType Container)) { Fail "asset directory not found: $AssetDir" }
+$AssetDir = (Resolve-Path -LiteralPath $AssetDir).Path
+
+function Resolve-Asset([string]$stableName, [string]$versionedName) {
+  if ($versionedName) {
+    $versioned = Join-Path $AssetDir $versionedName
+    if (Test-Path -LiteralPath $versioned -PathType Leaf) { return $versioned }
+    # Any other versioned file in the folder means the build for this version failed
+    # or was skipped; the stable name would then be last release's staging copy.
+    $stale = @(Get-ChildItem -LiteralPath $AssetDir -Filter ($versionedName -replace [regex]::Escape($Version), '*') -File)
+    if ($stale.Count -gt 0) {
+      Fail "$versionedName is missing but $($stale[0].Name) is present: rebuild for $Version"
+    }
+  }
+  $stable = Join-Path $AssetDir $stableName
+  if (Test-Path -LiteralPath $stable -PathType Leaf) { return $stable }
+  Fail "missing release asset: $stableName in $AssetDir"
+}
+
+$assets = [ordered]@{
+  'PatchyWindowsInstaller.exe'   = Resolve-Asset 'PatchyWindowsInstaller.exe' $null
+  'PatchyWindowsNoInstaller.zip' = Resolve-Asset 'PatchyWindowsNoInstaller.zip' $null
+  'PatchyWindowsArm64Installer.exe'   = Resolve-Asset 'PatchyWindowsArm64Installer.exe' $null
+  'PatchyWindowsArm64NoInstaller.zip' = Resolve-Asset 'PatchyWindowsArm64NoInstaller.zip' $null
+  'PatchyMacOS.dmg'              = Resolve-Asset 'PatchyMacOS.dmg' "Patchy-$Version.dmg"
+  'PatchyLinux.flatpak'          = Resolve-Asset 'PatchyLinux.flatpak' "Patchy-$Version.flatpak"
+}
+# The aarch64 Flatpak (packaging/linux/README.md, "aarch64"). -SkipLinuxArm64 is only for
+# backfilling a release from before it shipped (1.27).
+if (-not $SkipLinuxArm64) {
+  $assets['PatchyLinuxArm64.flatpak'] = Resolve-Asset 'PatchyLinuxArm64.flatpak' "Patchy-$Version-aarch64.flatpak"
+}
+# -SkipGeglSources is only for backfilling a release from before Patchy shipped its own GEGL.
+if (-not $SkipGeglSources) {
+  $geglSources = Resolve-Asset 'PatchyGeglSources.zip' $null
+  $assets['PatchyGeglSources.zip'] = $geglSources
+  # A stale zip must not ship beside new packages: make-gegl-sources.ps1 writes it after both
+  # Windows packages, and it must hold exactly the archives sources.lock lists now.
+  foreach ($windowsPackage in @('PatchyWindowsInstaller.exe', 'PatchyWindowsArm64Installer.exe')) {
+    if ((Get-Item -LiteralPath $geglSources).LastWriteTimeUtc -lt (Get-Item -LiteralPath $assets[$windowsPackage]).LastWriteTimeUtc) {
+      Fail "PatchyGeglSources.zip is older than $windowsPackage; rerun scripts\release\make-gegl-sources.ps1"
+    }
+  }
+  $locked = @(Get-Content -LiteralPath (Join-Path $repoRoot 'scripts\dev\gegl\sources.lock') |
+    Where-Object { $_.Trim() -and -not $_.Trim().StartsWith('#') } | ForEach-Object { 'sources/' + ($_.Trim() -split '\s+')[0] })
+  Add-Type -AssemblyName System.IO.Compression.FileSystem
+  $zipFile = [System.IO.Compression.ZipFile]::OpenRead($geglSources)
+  try { $zipped = @($zipFile.Entries | Where-Object { $_.FullName.StartsWith('sources/') } | ForEach-Object { $_.FullName }) }
+  finally { $zipFile.Dispose() }
+  if ($zipped.Count -eq 0) { Fail 'PatchyGeglSources.zip holds no source archives; rerun make-gegl-sources.ps1' }
+  $difference = @(Compare-Object -ReferenceObject $locked -DifferenceObject $zipped)
+  if ($difference.Count -gt 0) {
+    Fail "PatchyGeglSources.zip does not hold exactly the archives in sources.lock ($($difference.InputObject -join ', ')); rerun make-gegl-sources.ps1"
+  }
+}
+# The source of sane-backends and libgphoto2, which the Flatpak bundles carry (GPL-2+ and
+# LGPL-2.1+: the source goes with every Flatpak release; docs/legal-licensing.md).
+# -SkipLinuxScannerSources is only for backfilling a release from before the Flatpak carried them.
+if (-not $SkipLinuxScannerSources) {
+  $scannerSources = Resolve-Asset 'PatchyLinuxScannerSources.zip' $null
+  $assets['PatchyLinuxScannerSources.zip'] = $scannerSources
+  # make-linux-scanner-sources.ps1 runs at the end of release-linux.ps1: a zip older than the
+  # Flatpak bundles is from an earlier release.
+  foreach ($flatpak in @('PatchyLinux.flatpak', 'PatchyLinuxArm64.flatpak')) {
+    if ($assets.Contains($flatpak) -and
+        (Get-Item -LiteralPath $scannerSources).LastWriteTimeUtc -lt (Get-Item -LiteralPath $assets[$flatpak]).LastWriteTimeUtc) {
+      Fail "PatchyLinuxScannerSources.zip is older than $flatpak; rerun scripts\release\make-linux-scanner-sources.ps1"
+    }
+  }
+  # It must hold exactly the release archives the manifest's sane-backends and libgphoto2
+  # modules build from, and say it belongs to this version.
+  $expected = @()
+  $module = $null
+  foreach ($line in Get-Content -LiteralPath (Join-Path $repoRoot 'packaging\linux\flatpak\com.rtsoft.patchy.yml')) {
+    if ($line -match '^  - name:\s*(\S+)\s*$') { $module = $Matches[1]; continue }
+    if ($line.Trim() -and $line -notmatch '^    ') { $module = $null; continue }
+    if ($module -in @('sane-backends', 'libgphoto2') -and $line -match '^\s*url:\s*(\S+)') {
+      $expected += 'sources/' + ($Matches[1] -split '/')[-1]
+    }
+  }
+  if ($expected.Count -lt 2) { Fail 'could not read the sane-backends and libgphoto2 archives from the Flatpak manifest' }
+  Add-Type -AssemblyName System.IO.Compression.FileSystem
+  $zipFile = [System.IO.Compression.ZipFile]::OpenRead($scannerSources)
+  try {
+    $zipped = @($zipFile.Entries | Where-Object { $_.FullName.StartsWith('sources/') } | ForEach-Object { $_.FullName })
+    $readmeEntry = $zipFile.GetEntry('README.txt')
+    $readmeText = ''
+    if ($readmeEntry) {
+      $reader = New-Object System.IO.StreamReader($readmeEntry.Open())
+      try { $readmeText = $reader.ReadToEnd() } finally { $reader.Dispose() }
+    }
+  } finally { $zipFile.Dispose() }
+  $difference = @(Compare-Object -ReferenceObject $expected -DifferenceObject $zipped)
+  if ($zipped.Count -eq 0 -or $difference.Count -gt 0) {
+    Fail "PatchyLinuxScannerSources.zip does not hold exactly the manifest's scanner archives ($($difference.InputObject -join ', ')); rerun make-linux-scanner-sources.ps1"
+  }
+  if ($readmeText -notmatch ("Patchy " + [regex]::Escape($Version) + "\r?\n")) {
+    Fail "PatchyLinuxScannerSources.zip was made for another version (its README does not name Patchy $Version); rerun make-linux-scanner-sources.ps1"
+  }
+}
+# The AppImage and its zsync file (docs/appimage.md). The zsync file names the AppImage
+# by its published name, so the two always ship together. -SkipAppImage is only for
+# backfilling a release from before the AppImage existed.
+if (-not $SkipAppImage) {
+  $assets['PatchyLinux.AppImage'] = Resolve-Asset 'PatchyLinux.AppImage' "Patchy-$Version-x86_64.AppImage"
+  $assets['PatchyLinux.AppImage.zsync'] = Resolve-Asset 'PatchyLinux.AppImage.zsync' "Patchy-$Version-x86_64.AppImage.zsync"
+}
+
+# Stage under the published names in a scratch folder (gh names an asset after its
+# file), never inside build\package, where stable-name copies from older runs may sit.
+$stage = Join-Path $repoRoot "build\github-release\$tag"
+if (Test-Path -LiteralPath $stage) { Remove-Item -LiteralPath $stage -Recurse -Force }
+New-Item -ItemType Directory -Path $stage | Out-Null
+$sums = New-Object System.Collections.Generic.List[string]
+# Hash through .NET directly, not Get-FileHash: under pwsh 7 the inherited PSModulePath
+# makes Windows PowerShell 5.1 load an incompatible Microsoft.PowerShell.Utility and the
+# cmdlet is "not recognized" (the first v0.98 backfill published a SHA256SUMS.txt with
+# empty hashes that way). The .bat wrapper also resets PSModulePath, like release-worker.bat.
+function Get-Sha256Hex([string]$path) {
+  $sha = [System.Security.Cryptography.SHA256]::Create()
+  $stream = [System.IO.File]::OpenRead($path)
+  try {
+    $bytes = $sha.ComputeHash($stream)
+  } finally {
+    $stream.Dispose()
+    $sha.Dispose()
+  }
+  return ([System.BitConverter]::ToString($bytes) -replace '-', '').ToLowerInvariant()
+}
+foreach ($name in $assets.Keys) {
+  $source = $assets[$name]
+  $dest = Join-Path $stage $name
+  Copy-Item -LiteralPath $source -Destination $dest
+  $hash = Get-Sha256Hex $dest
+  if ($hash -notmatch '^[0-9a-f]{64}$') { Fail "could not hash $name" }
+  $sums.Add("$hash  $name")
+  if ($name -eq 'PatchyWindowsInstaller.exe') {
+    $installerSize = (Get-Item -LiteralPath $dest).Length
+    $installerSha256 = $hash
+  }
+  if ($name -eq 'PatchyWindowsArm64Installer.exe') {
+    $arm64InstallerSize = (Get-Item -LiteralPath $dest).Length
+    $arm64InstallerSha256 = $hash
+  }
+  if ($name -eq 'PatchyLinux.AppImage') {
+    $appImageSize = (Get-Item -LiteralPath $dest).Length
+    $appImageSha256 = $hash
+  }
+  Write-Host ("  {0,-30} {1,12:N0} bytes  sha256 {2}  <- {3}" -f $name, (Get-Item -LiteralPath $dest).Length, $hash, $source)
+}
+$sumsPath = Join-Path $stage 'SHA256SUMS.txt'
+[IO.File]::WriteAllText($sumsPath, (($sums -join "`n") + "`n"))
+$uploads = @($assets.Keys | ForEach-Object { Join-Path $stage $_ }) + @($sumsPath)
+
+# Release notes: this version's "What's New" entry (README.md, or RELEASE-HISTORY.md
+# once it has moved there) plus the download table.
+function Get-WhatsNew([string]$path) {
+  if (-not (Test-Path -LiteralPath $path)) { return $null }
+  $lines = Get-Content -LiteralPath $path
+  $start = -1
+  for ($i = 0; $i -lt $lines.Count; $i++) {
+    # README uses "### <version> - <date>", RELEASE-HISTORY.md "## <version> - <date>".
+    if ($lines[$i] -match ('^#{2,3} ' + [regex]::Escape($Version) + '(\s|$)')) { $start = $i; break }
+  }
+  if ($start -lt 0) { return $null }
+  $body = New-Object System.Collections.Generic.List[string]
+  for ($i = $start + 1; $i -lt $lines.Count; $i++) {
+    if ($lines[$i] -match '^#{1,3} ' -or $lines[$i] -match '^\[Older releases\]') { break }
+    $body.Add($lines[$i])
+  }
+  $heading = $lines[$start] -replace '^#{2,3} ', ''
+  return @{ heading = $heading; body = (($body -join "`n").Trim()) }
+}
+$notes = Get-WhatsNew 'README.md'
+if (-not $notes) { $notes = Get-WhatsNew 'RELEASE-HISTORY.md' }
+$notesText = ''
+if ($notes -and $notes.body) {
+  $notesText = "## What's new in " + $notes.heading + "`n`n" + $notes.body + "`n`n"
+} else {
+  Write-Host "WARNING: no '### $Version' entry found in README.md or RELEASE-HISTORY.md; notes carry only the download table"
+}
+$base = "https://github.com/$Repo/releases/download/$tag"
+$appImageRow = ''
+if (-not $SkipAppImage) {
+  $appImageRow = "`n| Linux AppImage (Ubuntu 22.04 or newer) | [PatchyLinux.AppImage]($base/PatchyLinux.AppImage) |"
+}
+$linuxArm64Row = ''
+if (-not $SkipLinuxArm64) {
+  $linuxArm64Row = "`n| Linux ARM64 Flatpak bundle (Raspberry Pi 5 and other 64-bit ARM) | [PatchyLinuxArm64.flatpak]($base/PatchyLinuxArm64.flatpak) |"
+}
+$geglSourcesSentence = ''
+if (-not $SkipGeglSources) {
+  $geglSourcesSentence = " The source of the GEGL libraries the packages carry (GNU LGPL and GPL) is [PatchyGeglSources.zip]($base/PatchyGeglSources.zip)."
+}
+if (-not $SkipLinuxScannerSources) {
+  $geglSourcesSentence += " The source of the scanner and camera libraries in the Flatpak (sane-backends, GNU GPL; libgphoto2, GNU LGPL) is [PatchyLinuxScannerSources.zip]($base/PatchyLinuxScannerSources.zip)."
+}
+$notesText += @"
+## Downloads
+
+| Platform | File |
+| --- | --- |
+| Windows 10/11 (64-bit) installer | [PatchyWindowsInstaller.exe]($base/PatchyWindowsInstaller.exe) |
+| Windows 10/11 (64-bit) portable zip | [PatchyWindowsNoInstaller.zip]($base/PatchyWindowsNoInstaller.zip) |
+| Windows 11 on Arm (ARM64) installer | [PatchyWindowsArm64Installer.exe]($base/PatchyWindowsArm64Installer.exe) |
+| Windows 11 on Arm (ARM64) portable zip | [PatchyWindowsArm64NoInstaller.zip]($base/PatchyWindowsArm64NoInstaller.zip) |
+| macOS 12+ (Apple Silicon) | [PatchyMacOS.dmg]($base/PatchyMacOS.dmg) |
+| Linux (x86_64) Flatpak bundle | [PatchyLinux.flatpak]($base/PatchyLinux.flatpak) |$linuxArm64Row$appImageRow
+
+Windows builds are code signed; the macOS app is signed and notarized. Checksums are in [SHA256SUMS.txt]($base/SHA256SUMS.txt).$geglSourcesSentence The browser version runs at [patchyimageeditor.com](https://www.patchyimageeditor.com).
+"@
+if (-not $SkipAppImage) {
+  # Install lines for the AppImage; docs/install-linux.md's AppImage section has the
+  # per-distro FUSE packages and the menu entry.
+  $notesText += @"
+
+## Linux
+
+AppImage (one file, updates itself; keep it in a folder you can write to):
+
+``````sh
+mkdir -p ~/Applications && cd ~/Applications
+wget -O PatchyLinux.AppImage $base/PatchyLinux.AppImage
+chmod +x PatchyLinux.AppImage
+./PatchyLinux.AppImage
+``````
+
+If it cannot mount itself, install FUSE 3 (``sudo apt install fuse3``, ``sudo dnf install fuse3``, ``sudo pacman -S fuse3``) or run it with ``--appimage-extract-and-run``. Menu entry and other distros: [Linux install guide, AppImage](https://github.com/$Repo/blob/main/docs/install-linux.md#appimage).
+
+Flatpak (updates with ``flatpak update``; the same command installs the ARM64 build on 64-bit ARM, such as a Raspberry Pi 5):
+
+``````sh
+flatpak install --user https://rtsoft.com/flatpak/com.rtsoft.patchy.flatpakref
+``````
+"@
+}
+$notesPath = Join-Path $stage 'release-notes.md'
+[IO.File]::WriteAllText($notesPath, $notesText)
+
+# Create the draft, or reuse one left by a failed run. A public release with this tag
+# is never touched: bump the version instead.
+$existing = gh release view $tag --repo $Repo --json isDraft,url 2>$null | ConvertFrom-Json
+if ($LASTEXITCODE -eq 0 -and $existing) {
+  if (-not $existing.isDraft) { Fail "release $tag already exists and is public: $($existing.url)" }
+  Write-Host "Reusing draft release $tag; re-uploading assets"
+  gh release upload $tag --repo $Repo --clobber @uploads
+  if ($LASTEXITCODE -ne 0) { Fail 'asset upload failed' }
+  gh release edit $tag --repo $Repo --target $sha --title $title --notes-file $notesPath | Out-Null
+  if ($LASTEXITCODE -ne 0) { Fail 'updating the draft failed' }
+} else {
+  Write-Host "Creating draft release $tag ($($uploads.Count) assets)"
+  gh release create $tag --repo $Repo --draft --target $sha --title $title --notes-file $notesPath @uploads
+  if ($LASTEXITCODE -ne 0) { Fail 'gh release create failed (the draft, if any, can be reused by re-running)' }
+}
+
+# Verify what landed before anyone can see it.
+$view = gh release view $tag --repo $Repo --json assets,isDraft,url 2>$null | ConvertFrom-Json
+if ($LASTEXITCODE -ne 0 -or -not $view) { Fail 'could not read the draft back' }
+$bad = @()
+foreach ($path in $uploads) {
+  $name = [IO.Path]::GetFileName($path)
+  $local = Get-Item -LiteralPath $path
+  $remote = @($view.assets | Where-Object { $_.name -eq $name })
+  if ($remote.Count -ne 1) { $bad += "$name missing on GitHub"; continue }
+  if ([int64]$remote[0].size -ne $local.Length) { $bad += "$name size $($remote[0].size) on GitHub, $($local.Length) locally" }
+}
+$expected = $uploads.Count
+if (@($view.assets).Count -ne $expected) { $bad += "expected $expected assets, GitHub has $(@($view.assets).Count)" }
+if ($bad.Count -gt 0) { Fail ("draft verification failed: " + ($bad -join '; ') + ". Re-run to re-upload.") }
+Write-Host "Verified $expected assets on the draft"
+
+gh release edit $tag --repo $Repo --draft=false --latest | Out-Null
+if ($LASTEXITCODE -ne 0) { Fail 'publishing the draft failed; it is still a draft on GitHub' }
+$final = gh release view $tag --repo $Repo --json isDraft,url,tagName 2>$null | ConvertFrom-Json
+if ($LASTEXITCODE -ne 0 -or -not $final -or $final.isDraft) { Fail 'release did not become public' }
+git fetch origin --tags --quiet
+Write-Host ''
+Write-Host "Published $($final.tagName): $($final.url)"
+Write-Host "Latest permalinks: https://github.com/$Repo/releases/latest/download/<asset name>"
+# The one-click update (docs/auto-update.md) needs these in the announcement commit.
+Write-Host ''
+Write-Host 'For the windows entry of latest_version.json:'
+Write-Host "      `"installer_url`": `"$base/PatchyWindowsInstaller.exe`","
+Write-Host "      `"installer_size`": $installerSize,"
+Write-Host "      `"installer_sha256`": `"$installerSha256`""
+Write-Host ''
+Write-Host 'For the windows-arm64 entry of latest_version.json (same version as windows):'
+Write-Host "      `"download_url`": `"https://github.com/$Repo/releases/latest/download/PatchyWindowsArm64Installer.exe`","
+Write-Host "      `"installer_url`": `"$base/PatchyWindowsArm64Installer.exe`","
+Write-Host "      `"installer_size`": $arm64InstallerSize,"
+Write-Host "      `"installer_sha256`": `"$arm64InstallerSha256`""
+if (-not $SkipAppImage) {
+  # The AppImage one-click update (docs/auto-update.md, "AppImage"): the versioned URL, so
+  # the file behind it never changes.
+  Write-Host ''
+  Write-Host 'For the linux entry of latest_version.json:'
+  Write-Host "      `"appimage_url`": `"https://github.com/$Repo/releases/latest/download/PatchyLinux.AppImage`","
+  Write-Host "      `"appimage_install_url`": `"$base/PatchyLinux.AppImage`","
+  Write-Host "      `"appimage_install_size`": $appImageSize,"
+  Write-Host "      `"appimage_install_sha256`": `"$appImageSha256`""
+}
+exit 0

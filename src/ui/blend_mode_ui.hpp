@@ -1,0 +1,111 @@
+#pragma once
+
+#include "core/layer.hpp"
+#include "core/paint_mode.hpp"
+#include "core/pixel_buffer.hpp"
+
+#include <QComboBox>
+#include <QString>
+
+#include <cstdint>
+#include <functional>
+#include <vector>
+
+namespace patchy::ui {
+
+// Which menu is being built. Layer offers every selectable mode; Filter drops
+// the ones a recipe / Smart Filter blend step cannot execute (currently
+// Dissolve), so the combo never offers a mode that would be rejected on save.
+// Folder is Layer with Pass Through first: only a folder can pass through, and
+// folders are created and imported in it (GitHub issue 235). Effect is the layer-effect
+// list. No menu lists Paint.NET's modes (GitHub issue 379) or GIMP's grain modes: see
+// set_non_photoshop_blend_modes_offered.
+enum class BlendModeMenu : std::uint8_t { Layer, Filter, Folder, Effect };
+
+[[nodiscard]] QString blend_mode_name(BlendMode mode);
+// Rows a blend mode list shows before it scrolls: every mode on most screens. The list
+// opens below the box and is cut to the screen's available area, scrolling, on a small one
+// (use_scrolling_list_popup, GitHub issue 414).
+inline constexpr int kBlendModeListPopupRows = 40;
+// Fills `combo` with the modes in Photoshop's menu order, a separator between the groups
+// (Normal/Dissolve, darken, lighten, contrast, comparative, component; GitHub issue 456),
+// and makes Left/Right step it like Up/Down (Qt handles only Up/Down on a combo box),
+// both closed and with the list open; stepping never lands on a separator. The list is
+// the scrolling list form (kBlendModeListPopupRows). Separator rows carry no item data:
+// read a row's mode through findData or skip is_blend_mode_separator rows.
+void add_blend_mode_items(QComboBox* combo, BlendModeMenu menu = BlendModeMenu::Layer);
+[[nodiscard]] bool is_blend_mode_separator(const QComboBox* combo, int index);
+// The row one step of `direction` (+1 down the list, -1 up) from the current row lands on,
+// with the closed combo's stepping rules (separators, disabled rows and Paint.NET's modes
+// skipped), wrapping from the last stop to the first and back (#476); the current row itself
+// when no other row is a stop.
+[[nodiscard]] int blend_mode_step_index(const QComboBox* combo, int direction);
+// Moves the combo to `index` as one keyboard or wheel step (the closed combo's arrows, Home/End,
+// Page Up/Down and wheel, Next/Previous Blend Mode). A currentIndexChanged handler can ask
+// blend_mode_combo_stepping() and defer its expensive work: steps come in quick runs (#476).
+void step_blend_mode_combo_to(QComboBox* combo, int index);
+[[nodiscard]] bool blend_mode_combo_stepping(const QComboBox* combo);
+// Renames a blend mode list's rows in the current language, separators left alone.
+void retranslate_blend_mode_items(QComboBox* combo);
+// For a combo that serves layers and folders in turn (the Layers panel's): adds Pass
+// Through as the first item when `offered` and it is missing, and removes it otherwise.
+void set_blend_mode_pass_through_offered(QComboBox* combo, bool offered);
+// Paint.NET's Reflect, Glow, Negation and Xor (GitHub issue 379) and GIMP's Grain Extract
+// and Grain Merge (docs/xcf.md) appear in a layer or folder combo only while a layer it
+// edits uses one: shows exactly the modes in `in_use` that Photoshop lacks, after
+// Photoshop's list and a separator, and removes the rest (the separator too). Stepping the closed combo (arrows, wheel) never
+// lands on them.
+void set_non_photoshop_blend_modes_offered(QComboBox* combo, const std::vector<BlendMode>& in_use);
+// The Brush tool's Mode menu (core/paint_mode.hpp): Normal, Dissolve, Behind, Clear, then
+// the layer list's groups in the same order. Item data is paint_mode_item_data; the same
+// Left/Right stepping as add_blend_mode_items. retranslate_paint_mode_items renames them.
+[[nodiscard]] QString paint_mode_name(PaintMode mode);
+[[nodiscard]] int paint_mode_item_data(PaintMode mode);
+[[nodiscard]] PaintMode paint_mode_from_item_data(int data);
+void add_paint_mode_items(QComboBox* combo);
+void retranslate_paint_mode_items(QComboBox* combo);
+// Disables the layer blend modes a document of `depth` cannot use (32-bit documents,
+// blend_mode_supported_at_depth) and re-enables the rest; Qt's stepping skips them.
+void enable_blend_mode_items_for_depth(QComboBox* combo, BitDepth depth);
+
+// A combo box that reports its list opening and closing (the Layers panel's live blend
+// preview, GitHub issue 367). popup_shown runs before the list appears, so the highlight
+// Qt sets on opening already finds the handler ready. popup_hidden runs once the list is
+// gone, before a chosen item's currentIndexChanged; it also runs when the list closes
+// without hidePopup (the window losing focus), and may run twice for one close.
+//
+// It can also narrow below its longest entry (GitHub issue 693, set_shrink_widths): the
+// closed box then ends the current entry in "..." and its tooltip adds the whole name.
+class PopupAwareComboBox final : public QComboBox {
+public:
+  using QComboBox::QComboBox;
+  std::function<void()> popup_shown;
+  std::function<void()> popup_hidden;
+  void showPopup() override;
+  void hidePopup() override;
+
+  // Lets a layout narrow the box: `natural` is the width it asks for (sizeHint) and
+  // `minimum` the narrowest it may get (minimumSizeHint). 0 and 0 restore Qt's own hints.
+  void set_shrink_widths(int natural, int minimum);
+  // The box width Qt asks for: the longest entry plus the frame and arrow.
+  [[nodiscard]] int longest_entry_box_width() const;
+  // What the closed box draws: the current entry, shortened when the box is too narrow.
+  [[nodiscard]] QString displayed_text() const;
+  // What hovering shows: the tooltip, with the whole entry on a second line while the
+  // box shortens it.
+  [[nodiscard]] QString hover_text() const;
+  [[nodiscard]] QSize sizeHint() const override;
+  [[nodiscard]] QSize minimumSizeHint() const override;
+
+protected:
+  bool eventFilter(QObject* watched, QEvent* event) override;
+  bool event(QEvent* event) override;
+  void paintEvent(QPaintEvent* event) override;
+
+private:
+  QObject* watched_popup_{nullptr};
+  int natural_width_{0};
+  int shrink_minimum_width_{0};
+};
+
+}  // namespace patchy::ui
